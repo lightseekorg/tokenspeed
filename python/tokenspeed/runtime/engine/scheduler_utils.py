@@ -562,6 +562,12 @@ def packed_block_tables_from_forward_op(
     stage is returned too, so a backend planning from the tables reads them
     without a D2H sync.
 
+    Structural contract checks run whenever bounds or expected groups are
+    supplied. Every page ID is scanned against the bounds when they are
+    supplied; at long contexts the scan costs as much as the packing, so
+    callers pass bounds only when they mean to scan
+    (``CacheBatchMetadata.from_forward_op``'s ``validate_page_ids``).
+
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
         device: Destination device for the packed tensor.

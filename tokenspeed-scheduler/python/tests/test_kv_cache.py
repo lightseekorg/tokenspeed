@@ -133,6 +133,23 @@ def test_forward_batch_uses_per_group_block_tables_as_the_only_page_table():
     assert not hasattr(op, "sizes")
 
 
+def test_block_table_arrays_keep_their_snapshot_alive():
+    import gc
+
+    scheduler = ts.Scheduler(_make_config())
+    scheduler.submit_requests([_make_spec("r1", num_pages=2)])
+    plan = scheduler.next_execution_plan()
+    op = _find_forward_op(plan)
+    arrays = op.block_tables_arrays()
+    expected = dict(op.block_tables)
+    assert all(not array.flags.writeable for array in arrays.values())
+
+    del op, plan, scheduler
+    gc.collect()
+    for group_id, array in arrays.items():
+        assert array.tolist() == expected[group_id]
+
+
 def test_pages_to_zero_arrays_view_the_plan_without_python_ints():
     import numpy as np
 

@@ -78,17 +78,23 @@ bool holdsHeadOfLine(const Request& request) {
 template <typename Operation>
 void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
-    operation.block_tables = BuildBlockTables(coordinator, request.BlockTablesRef(), group_ids);
+    const auto& tables = request.BlockTablesRef();
+    _assert(tables.size() == group_ids.size(), "forward tables/group_ids size mismatch");
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
+            "forward tables/coordinator size mismatch");
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        operation.block_tables.emplace(
+            group_ids[i], ForwardBlockTable{coordinator.Allocator(static_cast<std::int32_t>(i)), tables[i]});
+    }
 }
 
-void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
-                                 const std::vector<std::span<const std::int32_t>>& prefix_pages,
+void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes, const Request& request,
                                  std::int32_t filled_prefix_pages) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(prefix_hashes.size());
     _assert(filled_prefix_pages > first_new_prefix_page, "caller must pre-check page-hash progress");
     const std::string previous_hash = prefix_hashes.empty() ? std::string{} : prefix_hashes.back();
     std::vector<std::string> new_hashes =
-        AdvancePrefixHashes(prefix_pages, first_new_prefix_page, previous_hash, filled_prefix_pages);
+        ComputePrefixHashes(request.PrefixPages(first_new_prefix_page, filled_prefix_pages), previous_hash);
     prefix_hashes.insert(prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                          std::make_move_iterator(new_hashes.end()));
 }
@@ -164,7 +170,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
-        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
+        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request, filled_prefix_pages);
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
     std::optional<TailPublication> tail;
@@ -240,8 +246,8 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
         operation.extend_state_checkpoint_len = checkpoint - info.already_scheduled_len;
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
             if (const CacheBlockRef& block = cache_progress.state_checkpoint_blocks[i]) {
-                operation.block_tables[group_ids[i]].push_back(
-                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block));
+                operation.block_tables.at(group_ids[i]).checkpoint_page_id =
+                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block);
             }
         }
     }
@@ -392,8 +398,9 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
 }
 
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTracking(
-    ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
-    std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments) {
+    ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, std::span<const GroupDemand> demands,
+    const RequestProgress& progress, bool evict_blocks_past_segments) {
+    fsm::CacheProgress& cache_progress = request.CacheProgressRef();
     if (progress.completed_pages) {
         registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
     } else {
@@ -417,7 +424,6 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
         // Keeping an input for a later turn is optional. It must not stop
         // this request from obtaining the blocks its next forward needs.
         cache_progress.retained_input_checkpoint.clear();
-        request.CacheProgressRef().retained_input_checkpoint.clear();
         feedback.admission_failed = false;
         admission = attempt();
     }
@@ -641,7 +647,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     remaining = static_cast<std::int32_t>(
         std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - first_pos)));
-    fsm::CacheProgress cache_progress = request->CacheProgress();
+    fsm::CacheProgress& cache_progress = request->CacheProgressRef();
     std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
                                                      remaining, cache_progress.junction_tokens);
     if (prefill_tokens == 0) {
@@ -659,6 +665,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     // other chunk end publishes only its completed full pages.
     const bool ends_at_junction = cache_progress.junction_tokens > 0 && first_pos == cache_progress.junction_tokens;
     const bool ends_at_state_checkpoint = state_checkpoint > 0 && first_pos == state_checkpoint;
+    StagedCacheProgress staged{cache_progress};
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;
     }
@@ -689,22 +696,21 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
         AdmissionFeedback checkpoint_feedback;
-        admission = admitWithKvEventTracking(plan, checkpoint_feedback, *request, cache_progress,
-                                             chunk_demands(prefill_tokens, true), progress,
-                                             /*evict_blocks_past_segments=*/false);
+        admission = admitWithKvEventTracking(plan, checkpoint_feedback, *request, chunk_demands(prefill_tokens, true),
+                                             progress, /*evict_blocks_past_segments=*/false);
         if (!admission) {
             writes_checkpoint = false;
             prefill_tokens = state_checkpoint - first_pos;
         }
     }
     if (!admission) {
-        admission = admitWithKvEventTracking(plan, feedback, *request, cache_progress,
-                                             chunk_demands(prefill_tokens, false), progress,
+        admission = admitWithKvEventTracking(plan, feedback, *request, chunk_demands(prefill_tokens, false), progress,
                                              /*evict_blocks_past_segments=*/true);
     }
     if (!admission) {
         return std::nullopt;
     }
+    staged.Commit();
     const bool completes_prefill = prefill_tokens == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
     if (writes_checkpoint) {
@@ -716,8 +722,6 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         cache_progress.retained_input_checkpoint =
             coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
     }
-
-    request->CacheProgressRef() = std::move(cache_progress);
     return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
 }
 
@@ -768,24 +772,24 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
                                                                           : StateStep::Kind::kRelease};
-    fsm::CacheProgress& current_progress = request->CacheProgressRef();
+    fsm::CacheProgress& cache_progress = request->CacheProgressRef();
     const bool completed_page = num_computed_tokens / coordinator_.PrefixGranularity() >
-                                static_cast<std::int32_t>(current_progress.prefix_hashes.size());
+                                static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const bool completed_checkpoint =
-        current_progress.state_checkpoint_tokens > 0 && num_computed_tokens >= current_progress.state_checkpoint_tokens;
+        cache_progress.state_checkpoint_tokens > 0 && num_computed_tokens >= cache_progress.state_checkpoint_tokens;
     // Between publication points, consuming an existing reserve cannot fail
-    // and does not change the hash chain. Keep the rollback copy for admission.
+    // and does not change the hash chain, so it needs no admission.
     if (!completed_page && !completed_checkpoint && state_step.kind != StateStep::Kind::kRotate &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
         if (state_step.kind == StateStep::Kind::kRelease) {
             coordinator_.ReleaseStateInputs(tables);
         }
-        current_progress.published_state_checkpoint_blocks.clear();
+        cache_progress.published_state_checkpoint_blocks.clear();
         return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
     }
 
-    fsm::CacheProgress cache_progress = current_progress;
+    StagedCacheProgress staged{cache_progress};
     const RequestProgress progress =
         AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                config_.StreamsDeviceCacheToHost() && first_decode,
@@ -794,10 +798,11 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
 
     std::vector<GroupDemand> demands =
         MakeGroupDemands(tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{reserve_tokens}}, state_step);
-    if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress,
+    if (!admitWithKvEventTracking(plan, feedback, *request, demands, progress,
                                   /*evict_blocks_past_segments=*/true)) {
         return std::nullopt;
     }
+    staged.Commit();
 
     if (first_decode && cache_progress.retained_input_checkpoint.empty()) {
         const std::int32_t checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
@@ -806,7 +811,6 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                 coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, checkpoint);
         }
     }
-    request->CacheProgressRef() = std::move(cache_progress);
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
 

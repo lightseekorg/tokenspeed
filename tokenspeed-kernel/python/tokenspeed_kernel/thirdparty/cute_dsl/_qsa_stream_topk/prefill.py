@@ -919,10 +919,11 @@ class PrefillTopK(QueryGroups):
                     col = (vector - q_head * 16) * 8
                     q_row = q_head // _HEADS
                     head = q_head - q_row * _HEADS
+                    # Runtime strides scale in int64; the in-row column stays int32.
                     source = (
                         query.iterator
-                        + (row_base + q_row) * q_stride_row
-                        + head * q_stride_head
+                        + cutlass.Int64(row_base + q_row) * q_stride_row
+                        + cutlass.Int64(head) * q_stride_head
                         + col
                     )
                     logical_byte = (
@@ -1024,7 +1025,13 @@ class PrefillTopK(QueryGroups):
                             source_slot = cute.arch.shuffle_sync(
                                 slot, iteration * 2 + lane_idx // 16
                             )
-                            source = keys.iterator + source_slot * _HEAD_DIM + col
+                            # Slot ids fit int32, but their element offsets
+                            # pass 2**31 at 2**24 slots: widen before scaling.
+                            source = (
+                                keys.iterator
+                                + cutlass.Int64(source_slot) * _HEAD_DIM
+                                + col
+                            )
                             logical_byte = (
                                 row * 128
                                 + (col % 64) * 2

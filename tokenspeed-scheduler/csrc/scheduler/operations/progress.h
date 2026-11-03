@@ -20,11 +20,17 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "cache/core/cache_types.h"
 #include "fsm/forward_states.h"
 #include "scheduler/request.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
@@ -54,5 +60,55 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
                                        bool stream_completed_to_host, PublicationPoint point,
                                        bool allow_state_checkpoint);
+
+// A scheduling attempt advances its request's cache progress in place; unless
+// the attempt commits, the advance is undone when this goes out of scope. The
+// hash chain only grows during an attempt (AdvanceRequestProgress appends the
+// completed pages' hashes), so undoing truncates it: an attempt no longer
+// works on a copy of the whole chain, one string per page. The other fields
+// are restored from copies, except the retained input checkpoint: admission
+// may release that optional hold for capacity, and the release stands when
+// the attempt fails anyway.
+class StagedCacheProgress {
+public:
+    explicit StagedCacheProgress(fsm::CacheProgress& live)
+        : live_{live},
+          prefix_pages_{live.prefix_hashes.size()},
+          access_epoch_{live.access_epoch},
+          junction_tokens_{live.junction_tokens},
+          resumed_tail_hash_{live.resumed_tail_hash},
+          state_checkpoint_tokens_{live.state_checkpoint_tokens},
+          state_checkpoint_blocks_{live.state_checkpoint_blocks},
+          published_state_checkpoint_blocks_{live.published_state_checkpoint_blocks} {}
+    StagedCacheProgress(const StagedCacheProgress&) = delete;
+    StagedCacheProgress& operator=(const StagedCacheProgress&) = delete;
+    ~StagedCacheProgress() {
+        if (committed_) {
+            return;
+        }
+        FatalCheck(live_.prefix_hashes.size() >= prefix_pages_, "a scheduling attempt only appends to the hash chain");
+        live_.prefix_hashes.erase(live_.prefix_hashes.begin() + static_cast<std::ptrdiff_t>(prefix_pages_),
+                                  live_.prefix_hashes.end());
+        live_.access_epoch = access_epoch_;
+        live_.junction_tokens = junction_tokens_;
+        live_.resumed_tail_hash = std::move(resumed_tail_hash_);
+        live_.state_checkpoint_tokens = state_checkpoint_tokens_;
+        live_.state_checkpoint_blocks = std::move(state_checkpoint_blocks_);
+        live_.published_state_checkpoint_blocks = std::move(published_state_checkpoint_blocks_);
+    }
+
+    void Commit() noexcept { committed_ = true; }
+
+private:
+    fsm::CacheProgress& live_;
+    std::size_t prefix_pages_;
+    std::uint64_t access_epoch_;
+    std::int32_t junction_tokens_;
+    std::optional<std::string> resumed_tail_hash_;
+    std::int32_t state_checkpoint_tokens_;
+    std::vector<CacheBlockRef> state_checkpoint_blocks_;
+    std::vector<CacheBlockRef> published_state_checkpoint_blocks_;
+    bool committed_{false};
+};
 
 }  // namespace tokenspeed

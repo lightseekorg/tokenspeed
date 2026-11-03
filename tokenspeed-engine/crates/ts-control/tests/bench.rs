@@ -125,12 +125,16 @@ fn bench_commit_decode() {
 
 /// A whole scheduling round's shape: `rows` requests of `prompt` tokens on
 /// `page`-token KV pages, each generating `generate` tokens and replaced by
-/// a new request once it finishes (0: it decodes for the whole run).
+/// a new request once it finishes (0: it decodes for the whole run). With
+/// speculative decoding, a decode row verifies `verify_width` tokens a round
+/// and keeps `accepted` of them; without, both are 1.
 struct RoundShape {
     rows: usize,
     prompt: usize,
     page: usize,
     generate: usize,
+    verify_width: usize,
+    accepted: usize,
     warmup_rounds: usize,
     rounds: usize,
 }
@@ -171,11 +175,14 @@ cfg.num_device_pages = {pages} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={page},
                                         total_pages={pages} + 1, attn_kind=ts.AttnKind.Full)]
+cfg.decode_input_tokens = {verify_width}
+cfg.overlap_schedule_depth = 1
 result = ts.Scheduler(cfg)
 "#,
         page = shape.page,
         rows = shape.rows,
         tokens = shape.rows * (shape.prompt + 16),
+        verify_width = shape.verify_width,
     );
     Python::attach(|py| {
         let globals = PyDict::new(py);
@@ -185,10 +192,14 @@ result = ts.Scheduler(cfg)
     })
 }
 
-/// A device whose forwards land at once, one token per row. Plans go to
-/// another thread, which frees them, as the host's forward thread does.
+/// A device whose forwards land at once: a prefill row keeps one token, a
+/// decode row stores its verify window and keeps `accepted` tokens of it.
+/// Plans go to another thread, which frees them, as the host's forward
+/// thread does.
 struct InstantDevice {
     plans: mpsc::Sender<ExecutionPlan>,
+    verify_width: usize,
+    accepted: i32,
 }
 
 impl DataPlane for InstantDevice {
@@ -205,10 +216,12 @@ impl DataPlane for InstantDevice {
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
         let _ = self.plans.send(plan);
         Ok(dispatch.forward.map(|batch| {
-            let rows = batch.request_ids.len();
+            let decodes = batch.request_ids.len() - batch.num_extends;
+            let mut output_lengths = vec![1; batch.num_extends];
+            output_lengths.extend(std::iter::repeat_n(self.accepted, decodes));
             ForwardResult {
-                output_tokens: vec![7; rows],
-                output_lengths: vec![1; rows],
+                output_tokens: vec![7; batch.num_extends + decodes * self.verify_width],
+                output_lengths,
                 ..ForwardResult::default()
             }
         }))
@@ -310,7 +323,6 @@ impl Frontend for ChurningFrontend {
             .map(|_| {
                 // As long as the UUIDs frontends name requests with.
                 let rid = format!("{:08x}-9f09-89be-5c9d-5d65f086d356", self.submitted);
-                self.submitted += 1;
                 let mut request = TokenizedGenerateReqInput::new(
                     rid,
                     SamplingParams {
@@ -318,8 +330,14 @@ impl Frontend for ChurningFrontend {
                         ..SamplingParams::default()
                     },
                 );
-                request.input_ids = Some((1..=self.prompt as i32).collect());
+                // A distinct first token gives every request its own prefix
+                // hash chain: no row shares a published block with another,
+                // as with real traffic.
+                let mut input_ids: Vec<i32> = (1..=self.prompt as i32).collect();
+                input_ids[0] = 1_000_000 + self.submitted as i32;
+                request.input_ids = Some(input_ids);
                 request.stream = true;
+                self.submitted += 1;
                 EngineRequest::Add(Box::new(request))
             })
             .collect()
@@ -345,10 +363,12 @@ fn bench_rounds(name: &str, shape: RoundShape) {
     let generated = if shape.generate > 0 {
         shape.generate
     } else {
-        shape.warmup_rounds + shape.rounds + 1
+        (shape.warmup_rounds + shape.rounds + 1) * shape.accepted
     };
-    // Every row may hold its whole request at once.
-    let pages = shape.rows * (shape.prompt + generated + 2 * shape.page) / shape.page + 64;
+    // Every row may hold its whole request, and a verify window past it.
+    let pages = shape.rows * (shape.prompt + generated + shape.verify_width + 2 * shape.page)
+        / shape.page
+        + 64;
     let listener = Listener::bind("127.0.0.1").unwrap();
     let address = format!("127.0.0.1:{}", listener.port().unwrap());
     let ranks = Ranks {
@@ -412,7 +432,11 @@ fn bench_rounds(name: &str, shape: RoundShape) {
     };
     let mut event_loop = EventLoop::new(
         round_scheduler(&shape, pages),
-        InstantDevice { plans },
+        InstantDevice {
+            plans,
+            verify_width: shape.verify_width,
+            accepted: shape.accepted as i32,
+        },
         ChurningFrontend {
             prompt: shape.prompt,
             max_new_tokens: generated as i64,
@@ -420,7 +444,14 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             submitted: 0,
             encoder,
         },
-        OutputProcessor::new(None, 1, Some(1 << 24), Role::Plain, NO_FINISH_LOG, None),
+        OutputProcessor::new(
+            (shape.verify_width > 1).then_some(shape.verify_width),
+            1,
+            Some(1 << 24),
+            Role::Plain,
+            NO_FINISH_LOG,
+            None,
+        ),
         config,
         ranks,
         Subsystems::default(),
@@ -456,6 +487,8 @@ fn bench_round_decode() {
             prompt: 2048,
             page: 64,
             generate: 0,
+            verify_width: 1,
+            accepted: 1,
             warmup_rounds: 200,
             rounds: 1000,
         },
@@ -475,8 +508,51 @@ fn bench_round_churn() {
             prompt: 512,
             page: 64,
             generate: 64,
+            verify_width: 1,
+            accepted: 1,
             warmup_rounds: 200,
             rounds: 2000,
+        },
+    );
+}
+
+/// [`bench_round_decode`] at a long context: 64 rows of 128K-token prompts,
+/// where the round's work that grows with the context dominates.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_decode_long() {
+    bench_rounds(
+        "round, decode, 128K",
+        RoundShape {
+            rows: 64,
+            prompt: 128 * 1024,
+            page: 64,
+            generate: 0,
+            verify_width: 1,
+            accepted: 1,
+            warmup_rounds: 20,
+            rounds: 300,
+        },
+    );
+}
+
+/// [`bench_round_decode_long`] with speculative decoding: each row verifies
+/// six tokens a round and keeps five, so it crosses a page boundary five
+/// times as often.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_decode_long_spec() {
+    bench_rounds(
+        "round, decode, 128K, speculative",
+        RoundShape {
+            rows: 64,
+            prompt: 128 * 1024,
+            page: 64,
+            generate: 0,
+            verify_width: 6,
+            accepted: 5,
+            warmup_rounds: 20,
+            rounds: 300,
         },
     );
 }

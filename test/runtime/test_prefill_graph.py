@@ -871,10 +871,14 @@ class TestDummyGroupTablesTest:
         assert (seen["positions"].shape[0]) == (128)
         assert ("full_attention") in (seen["block_tables"])
 
-    def test_block_ids_are_checked_against_the_groups_real_block_count(self):
+    def test_block_ids_are_checked_against_the_groups_real_block_count(
+        self, monkeypatch
+    ):
         """The probe's default arena has ~20x slack, so an id error would not
         reach the packer. Shrink it until the bound is tight and confirm the
-        packer -- not this test -- is what rejects an out-of-range id."""
+        packer -- not this test -- is what rejects an out-of-range id.
+        Capture scans its tables whatever TOKENSPEED_VALIDATE_PAGE_IDS says."""
+        monkeypatch.setenv("TOKENSPEED_VALIDATE_PAGE_IDS", "0")
         spec = _spec("full_attention", block_granularity=64)
         # 2 blocks + the reserved null one: bs=2 fits, bs=3 does not.
         self._dummy_batch_probe(

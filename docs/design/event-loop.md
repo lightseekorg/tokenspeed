@@ -64,7 +64,8 @@ comes back, so the loop sees only its own operations.
 
 Scheduler load travels on the same output wire, including an empty batch at
 startup and at most once per second without token outputs. Reports carry
-running and waiting counts and resident, active, and total LCM blocks. The
+running and waiting counts and resident, active, and total LCM blocks; the
+active count is at most 100 ms old (see the page gauges below). The
 native frontend timestamps receipt and exposes a complete per-rank snapshot
 set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
@@ -546,11 +547,16 @@ Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
-`active_lcm_blocks()` walks every live request's block tables, so a serving
-round reads the scheduler's counts once for the frontend's load report, and
-once more as it planned only when the metrics or a batch line read them (they
-share that read). The idle check reads them only when the loop holds no
-request, in-flight forward or open cache op.
+`active_lcm_blocks()` walks every live request's block tables, which at long
+contexts costs more than the rest of a round, so the loop takes it at most
+once per 100 ms and the frontend's load report, the metrics and the batch line
+share that value; a round with no request running takes it again (it then
+costs nothing), so an engine that goes idle reports none active at once, and
+does not keep it, so the first round with requests takes a fresh one. The
+scheduler's other counts (`sizes()`) are a pass over its requests per state:
+a round takes them for the load report, and as it planned only when the
+metrics or a batch line read them (they share that read); the idle check takes
+them only when the loop holds no request, in-flight forward or open cache op.
 
 ## Subsystems in detail
 
@@ -846,4 +852,6 @@ a changed snapshot is also sent in an empty output batch. Client cancellation
 can reap the final request without producing a final token, so reporting only
 nonempty outputs would leave routing and drain checks with a stale running
 count. An unchanged idle load is sent at most once per second as a heartbeat,
-so the frontend can distinguish an idle engine from a stale connection.
+so the frontend can distinguish an idle engine from a stale connection. The
+active page count in it is reused for up to 100 ms (see the page gauges),
+far inside the three seconds the frontend considers a report fresh.
