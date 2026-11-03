@@ -1376,7 +1376,10 @@ def iris_pull_oneshot(
         tile_id += NUM_PROGRAMS
 
     # Do not return while a peer program can still be reading this rank's
-    # input. The next producer reuses the same symmetric buffer.
+    # input. The next producer reuses the same symmetric buffer. Each
+    # subgroup's peer reads returned before it stored their sum; the barrier
+    # holds the release until every subgroup has stored.
+    gl.barrier()
     completion_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(
         ready_flags,

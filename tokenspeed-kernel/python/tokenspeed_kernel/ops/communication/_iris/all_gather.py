@@ -393,6 +393,7 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
     block_k: gl.constexpr,
     input_published: gl.constexpr,
     num_warps: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Gather BF16 feature shards, apply RMSNorm, and quantize to MXFP4.
 
@@ -420,6 +421,12 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
             local,
             mask=offsets < local_width,
         )
+        # A barrier does not wait for memory, and the one-thread release below
+        # waits only for its own subgroup's stores before writing back L2. So
+        # each subgroup first waits until its stores reach L2 (s_waitcnt
+        # vmcnt(0) on gfx950).
+        WAIT_STORES(args=[], constraints="=r,~{memory}")
+        gl.barrier()
 
     epoch_ptr = ready_flags + row * WORLD_SIZE + rank
     ready_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
@@ -491,6 +498,9 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
         K_SWIZZLE=8,
     )
 
+    # Each subgroup's peer reads returned before it stored their result; the
+    # barrier holds the release until every subgroup has stored.
+    gl.barrier()
     done_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_peers(ready_flags, row, done_epoch, heaps, rank, num_warps)
 
