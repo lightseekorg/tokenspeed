@@ -70,7 +70,9 @@ if current_platform().is_cdna4:
         FIRST_KERNEL_SITE,
         fail_stop,
         poll_check,
+        poll_pairs,
         poll_stop_site,
+        store_pairs,
         vote,
     )
 else:  # host-side sizes only
@@ -83,11 +85,15 @@ SITE_XN = SITE_OWN1 + 1
 SITE_OWN4_OWN = SITE_OWN1 + 2
 SITE_OWN4 = SITE_OWN1 + 3
 SITE_FIN = SITE_OWN1 + 4
+SITE_RED = SITE_OWN1 + 5
+SITE_H6_SUMS = SITE_OWN1 + 6
 _SITE_OWN1 = gl.constexpr(SITE_OWN1)
 _SITE_XN = gl.constexpr(SITE_XN)
 _SITE_OWN4_OWN = gl.constexpr(SITE_OWN4_OWN)
 _SITE_OWN4 = gl.constexpr(SITE_OWN4)
 _SITE_FIN = gl.constexpr(SITE_FIN)
+_SITE_RED = gl.constexpr(SITE_RED)
+_SITE_H6_SUMS = gl.constexpr(SITE_H6_SUMS)
 _ERROR_ABORT = gl.constexpr(ERROR_ABORT)
 _ERROR_CALLER = gl.constexpr(ERROR_CALLER)
 # Rows every area is sized for, whatever a launch's rows (8 or 16 today), so
@@ -124,6 +130,12 @@ H4_OWN_WORDS = MAX_ROWS * TOPK * _SLICE_WORDS
 H6_LOCAL = HIDDEN // WORLD_SIZE
 H6_SLOT = MAX_ROWS * H6_LOCAL
 H6_WORDS = WORLD_SIZE * H6_SLOT // 2
+# The FFN boundary's per-row norm sums: UNP (b, x) -> RED x (local pairs),
+# RED x -> every rank (tagged int64 words), like the H1 sums.
+SUMS = 4
+RED_SENDERS = 8
+RED_IN_WORDS = WORLD_SIZE * RED_SENDERS * MAX_ROWS * SUMS  # int64, local
+H6_SUM_WORDS = WORLD_SIZE * WORLD_SIZE * MAX_ROWS * SUMS  # int64, symmetric
 
 _WORLD = gl.constexpr(WORLD_SIZE)
 _MAX_ROWS = gl.constexpr(MAX_ROWS)
@@ -139,6 +151,7 @@ _ROUTES_WORDS = gl.constexpr(ROUTES_WORDS)
 _H4_OWN_WORDS = gl.constexpr(H4_OWN_WORDS)
 _H6_WORDS = gl.constexpr(H6_WORDS)
 _H6_SLOT = gl.constexpr(H6_SLOT)
+_SUMS = gl.constexpr(SUMS)
 HIDDEN_LOCAL = gl.constexpr(H6_LOCAL)
 _SLICE = gl.constexpr(_SLICE_WORDS)
 _LAMPORT_EMPTY = gl.constexpr(LAMPORT_EMPTY_WORD)
@@ -193,6 +206,10 @@ class MuseNativeView:
             (local).
         routes: H4 / H5 [copy][column-route stage words], uint32 (symmetric).
         h6: H6 [copy][source][row * 1024], BF16 (symmetric).
+        red_in: UNP's norm-sum partials [xcd][sender][row][4], int64 pairs
+            (local, epoch-tagged).
+        h6_sums: RED's norm sums [rank][xcd][row][4], int64 tagged words
+            (symmetric, epoch-tagged).
     """
 
     heaps: gl.tuple
@@ -204,9 +221,13 @@ class MuseNativeView:
     h4_own: gl.tensor
     routes: gl.tensor
     h6: gl.tensor
+    red_in: gl.tensor
+    h6_sums: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6):
+    def __init__(
+        self, heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
+    ):
         self.heaps = heaps
         self.rank = rank
         self.box = box
@@ -216,6 +237,8 @@ class MuseNativeView:
         self.h4_own = h4_own
         self.routes = routes
         self.h6 = h6
+        self.red_in = red_in
+        self.h6_sums = h6_sums
 
 
 @gluon.jit
@@ -551,6 +574,94 @@ def h6_sink(
 
 
 @gluon.jit
+def unp_sums_publish(view, launch, sums, sender, rows):
+    """UNP ``sender`` (0-7) of this XCD publishes its FP32 [16, SUMS] norm-sum
+    partials (rows < rows) to its XCD's RED: one (value, tag) pair each."""
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [16, 4], [gl.num_warps(), 1], [1, 0]
+    )
+    values = gl.convert_layout(sums, layout).to(gl.int32, bitcast=True)
+    row = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
+    which = gl.arange(0, _SUMS, layout=gl.SliceLayout(0, layout))
+    slot = ((launch.xcd * 8 + sender) * _MAX_ROWS + row[:, None]) * _SUMS + which[
+        None, :
+    ]
+    valid = (row < rows)[:, None] & (which >= 0)[None, :]
+    store_pairs(view.red_in + slot, values, launch, valid, "gpu")
+
+
+@gluon.jit
+def red_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PEER_CACHE: gl.constexpr,):  # fmt: skip
+    """RED of this XCD: wait for its 8 senders' partials of rows < rows (at
+    most 16), add them in FP32 (the same reduction on every rank), and push
+    the [row][SUMS] totals as tagged int64 words to slot (RANK, xcd) of every
+    rank's h6_sums; rows [rows, MAX_ROWS) of the slot are zeroed (TAG-LIVE).
+    Needs 8 waves (one pair per lane)."""
+    gl.static_assert(gl.num_warps() == 8)
+    poll: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [8, 1], [1, 0])
+    sender = gl.arange(0, 8, layout=gl.SliceLayout(1, poll))
+    entry = gl.arange(0, 16 * _SUMS, layout=gl.SliceLayout(0, poll))
+    slot = ((launch.xcd * 8 + sender[:, None]) * _MAX_ROWS) * _SUMS + entry[None, :]
+    valid = (sender >= 0)[:, None] & (entry // _SUMS < rows)[None, :]
+    values, seen = poll_pairs(view.red_in + slot, valid, launch, "gpu")
+    if not seen:
+        on_expiry(launch, poll_stop_site(launch, _SITE_RED), 0)
+    totals = gl.sum(values.to(gl.float32, bitcast=True), 0)  # [16 * SUMS]
+    push: gl.constexpr = gl.BlockedLayout([1, 4], [32, 2], [gl.num_warps(), 1], [1, 0])
+    row = gl.arange(0, _MAX_ROWS, layout=gl.SliceLayout(1, push))
+    which = gl.arange(0, _SUMS, layout=gl.SliceLayout(0, push))
+    flat = row[:, None] * _SUMS + which[None, :]
+    total = gl.convert_layout(
+        gl.reshape(totals, [16, _SUMS]),
+        gl.BlockedLayout([1, 4], [16, 4], [gl.num_warps(), 1], [1, 0]),
+    )
+    # Rows 16-31 of a [32, SUMS] slot hold zeros (and tag 0): never current.
+    padded = gl.join(total, gl.zeros_like(total))
+    padded = gl.convert_layout(
+        gl.reshape(gl.permute(padded, [2, 0, 1]), [_MAX_ROWS, _SUMS]), push
+    )
+    live = (row < rows)[:, None] & (which >= 0)[None, :]
+    words = gl.where(
+        live,
+        (launch.tag.to(gl.int64) << 32)
+        | (padded.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF),
+        0,
+    )
+    destination_slot = (RANK * 8 + launch.xcd) * (_MAX_ROWS * _SUMS) + flat
+    peers = _peer_addresses(view.h6_sums, view.heaps, RANK)
+    for peer in gl.static_range(_WORLD):
+        destination = gl.multiple_of(peers[peer].to(gl.pointer_type(gl.int64)), 16)
+        if peer == RANK:
+            gl.amd.cdna4.buffer_store(words, destination, destination_slot, cache=".wt")
+        else:
+            gl.amd.cdna4.buffer_store(
+                words, destination, destination_slot, cache=PEER_CACHE
+            )
+
+
+@gluon.jit
+def h6_sums_wait(view, launch, row, on_expiry: gl.constexpr):
+    """The FFN boundary's norm sums of ``row`` from every rank's 8 REDs:
+    FP32 [64 sources (rank, xcd), SUMS], polled on their tags (one pair per
+    lane), returned with the sources over a wave's lanes and the SUMS sums
+    of a source in one lane (deferred_norm_scales_gfx950's layout)."""
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [16, 4], [gl.num_warps(), 1], [1, 0]
+    )
+    source = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
+    which = gl.arange(0, _SUMS, layout=gl.SliceLayout(0, layout))
+    slot = (source[:, None] * _MAX_ROWS + row) * _SUMS + which[None, :]
+    valid = (source >= 0)[:, None] & (which >= 0)[None, :]
+    values, seen = poll_pairs(view.h6_sums + slot, valid, launch, "sys")
+    if not seen:
+        on_expiry(launch, poll_stop_site(launch, _SITE_H6_SUMS), row)
+    sums_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
+    return gl.convert_layout(values.to(gl.float32, bitcast=True), sums_layout)
+
+
+@gluon.jit
 def iris_fail_stop(launch, site, detail):
     """The fused layer's ``on_expiry``: stop every rank's waits, then record
     the failure and trap (fail_stop); never returns.
@@ -602,6 +713,10 @@ class MuseNativeIrisState:
         self.h6 = peers.ctx.empty((2 * H6_WORDS,), dtype=torch.int32)
         for area in (self.h1, self.h3, self.routes, self.h6):
             area.fill_(empty)
+        self.h6_sums = peers.ctx.zeros((H6_SUM_WORDS,), dtype=torch.int64)
+        self.red_in = torch.zeros(
+            (RED_IN_WORDS,), dtype=torch.int64, device=peers.device
+        )
         self.box = torch.full(
             (2 * BOX_WORDS,), BOX_EMPTY_WORD - (1 << 32), dtype=torch.int32,
             device=peers.device,
@@ -631,13 +746,14 @@ class MuseNativeIrisState:
             + allocation_bytes((2 * ROUTES_WORDS,), torch.int32)
             + allocation_bytes((2 * H6_WORDS,), torch.int32)
             + allocation_bytes((ERROR_WORDS,), torch.int32)
+            + allocation_bytes((H6_SUM_WORDS,), torch.int64)
         )
 
     def view_args(self) -> tuple:
         """Kernel arguments that build :class:`MuseNativeView` in order:
         ``heaps`` (a tuple of 8 int64), rank, then box, h1, h1_sums, h3,
-        h4_own, routes, h6."""
+        h4_own, routes, h6, red_in, h6_sums."""
         return (
             self.heaps, self.peers.rank, self.box, self.h1, self.h1_sums, self.h3,
-            self.h4_own, self.routes, self.h6,
+            self.h4_own, self.routes, self.h6, self.red_in, self.h6_sums,
         )  # fmt: skip
