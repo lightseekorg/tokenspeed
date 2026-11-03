@@ -890,6 +890,7 @@ def muse_attntail_own(
         stage,
         offsets,
         valid[:, None],
+        gl.program_id(0),
         RANK,
         WORLD_SIZE,
         MAX_SHARD_ELEMENTS,
