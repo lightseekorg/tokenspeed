@@ -808,6 +808,51 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     }
 }
 
+// A prompt in three chunks on 4-token pages: its first admission prepays the
+// whole prompt and its generation, the block of its partial last page
+// [8, 10) included, and reserves the copy-in block for that block with it.
+// The later chunks allocate nothing, and the first decode publishes the
+// prompt end and copies the published block into the copy-in block.
+class MultiChunkCopyInSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.prefix_granularity = 4;
+        cfg.cache_groups.front().block_granularity = 4;
+        cfg.disable_l2_cache = true;
+        cfg.max_scheduled_tokens = 4;
+        return cfg;
+    }
+
+    // Parents held neither by a request's table nor as evictable cache.
+    std::int32_t HeldOutsideTables() const {
+        return config_.device_allocator.NumUsableBlocks() - scheduler_->AvailableLcmBlocks() -
+               scheduler_->ActiveLcmBlocks();
+    }
+};
+
+TEST_F(MultiChunkCopyInSuite, TheFirstAdmissionReservesThePromptEndsCopyIn) {
+    Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(10, 1), .max_new_tokens = 2});
+    const ExecutionPlan first = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(first)->input_lengths, std::vector<std::int32_t>{4});
+    EXPECT_EQ(first.pages_to_zero.at("full_attention").size(), 3u) << "the prompt and its generation, prepaid";
+    EXPECT_EQ(HeldOutsideTables(), 1) << "the copy-in block of the page [8, 12)";
+    SendForwardDone("r");
+    for (const std::int32_t tokens : {4, 2}) {
+        const ExecutionPlan chunk = PlanOnce();
+        ASSERT_EQ(FindForwardBatch(chunk)->input_lengths, std::vector<std::int32_t>{tokens});
+        EXPECT_TRUE(chunk.pages_to_zero.at("full_attention").empty()) << "a later chunk needs no block";
+        EXPECT_EQ(HeldOutsideTables(), 1);
+        SendForwardDone("r", tokens == 2 ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+    }
+    const ExecutionPlan decode = PlanOnce();
+    ASSERT_NE(FindForwardBatch(decode), nullptr);
+    EXPECT_EQ(decode.pages_to_copy.at("full_attention").size(), 1u) << "the prompt end's block moves to its copy";
+    EXPECT_TRUE(decode.pages_to_zero.at("full_attention").empty());
+    EXPECT_EQ(HeldOutsideTables(), 0);
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+}
+
 TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 2;

@@ -4134,8 +4134,9 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
         {.table = &tables[0], .extent = StateStep{StateStep::Kind::kRotate}},
         {.table = &tables[1], .extent = StateStep{StateStep::Kind::kRotate}},
     };
-    auto admitted = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
-                                      /*next_copy_in_tokens=*/std::nullopt, std::nullopt, false, "session");
+    auto admitted =
+        coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
+                          /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false, "session");
     ASSERT_TRUE(admitted);
     const std::vector<std::string> hashes{"checkpoint"};
     const CacheKey device_key{.group_id = 0, .content_hash = hashes[0]};

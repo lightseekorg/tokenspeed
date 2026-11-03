@@ -141,13 +141,12 @@ groups' hit `T` reaches past the longest state checkpoint `T_s`
 (`AdmissionResult::junction_tokens`, kept in `CacheProgress::junction_tokens`
 until a chunk passes it), the first chunk after `T_s` ends exactly at `T`, so
 the natural checkpoint it leaves coincides with KV already cached and the next
-prompt sharing that prefix resumes at `T` in every group. A chunk that ends at
-the junction publishes like a prompt end (`PublicationPoint::kOwnerContinues`:
-KV tail and state) and moves off the published blocks; every other chunk end
-publishes only its completed full pages. The move-off copies each published
-tail block into a copy-in block the admission of the chunk that reaches the
-junction reserved beside its own blocks, so the publication needs no block
-the pool may no longer have (`cache-concepts.md`, copy-in).
+prompt sharing that prefix resumes at `T` in every group. The next chunk's
+admission publishes that checkpoint (`PublicationPoint::kStateCheckpoint`):
+the state under the junction's key, but not the KV there, which is cached
+already, so the owner keeps writing its partial block and needs no copy-in
+(`cache-concepts.md`, copy-in). Every other chunk end publishes only its
+completed full pages.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
@@ -267,10 +266,11 @@ admission states what the pair does through the group's `StateStep`
   fresh block the peer's transfer fills.
 
 **Natural checkpoints.** A state is published only at a point where its owner
-stops writing it — the same `PublicationPoint` that publishes the KV tail
+stops writing it — a `PublicationPoint` other than an ordinary chunk end
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1), and a finish or retraction on every role (`kFinal`: the P's
+junction (§1; the KV there is cached already, so only the state is
+published), and a finish or retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state). An
 ordinary chunk end or decode step publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
@@ -599,13 +599,13 @@ blocks a **tail handover** holds for the length of one admission
 that stay pinned as sources until the copies land. A tail is at most `P − 1`
 tokens, so that is `ceil((P − 1) / g)` blocks on a role that prefills locally
 and `floor((P − 1) / g)` on the D role (its partial block is a fresh page,
-not a copy); a sliding group caps it at its lookback. A role whose requests
-reach a publication point they keep writing past — the fused role (its
-prompt end, and a junction), the P role with a State group (a junction) —
-adds the same count again for the **copy-in blocks** (`copyInReserveBlocks`,
-`cache-concepts.md`, copy-in): the admission that reaches the point holds
-them beside its tables until the next one copies the published blocks into
-them, and that admission can be a hitter's that still pins its copy
+not a copy); a sliding group caps it at its lookback. The fused role, whose
+first decode publishes the prompt end and keeps writing past it, adds the
+same count again for the **copy-in blocks** (`copyInReserveBlocks`,
+`cache-concepts.md`, copy-in): the request holds them beside its tables from
+the admission that allocates the blocks they serve -- the first, in
+full-history groups -- until that decode copies the published blocks into
+them, and the first admission can be a hitter's that still pins its copy
 sources. The charges are bucket-blind, so a sharded group whose copy's
 bucket is full while other buckets have holes can still make such an
 admission wait.
@@ -1228,14 +1228,14 @@ pages:
   `plan.pages_to_zero`. The op also names the blob slot and the request's
   **new** request-pool index: the runtime imports the slot-state blob into
   that row.
-- A victim held copy-in blocks for a publication point its next admission
-  keeps writing past (§1, `cache-concepts.md`, copy-in) when it was taken
-  between reaching the point and passing it — after its prompt, before its
-  first decode, or at a junction. They hold no bytes, so the image does not
-  carry them: the retraction releases them, and the restore reserves the
-  point's copy-in blocks again, each in the bucket of the rebuilt slot it
-  serves, inside the same planner pass. The copy-in fills them whole, so
-  they are not zeroed either.
+- A victim taken before its first decode held copy-in blocks for its prompt
+  end (`cache-concepts.md`, copy-in). They hold no bytes, so the image does
+  not carry them: the retraction releases them with the tables, and the
+  restore reserves them again with the blocks they serve, inside the same
+  planner pass -- for a rebuilt slot of the partial page at the image's
+  frontier in that slot's bucket, for a slot the reserve's growth fills (a
+  victim taken mid-prompt) as a pair with its block. The copy-in fills them
+  whole, so they are not zeroed either.
 - The request moves to **`fsm::Restoring`**: it holds the rebuilt tables (a
   `ForwardResources` bundle, so it occupies capacity like any resident), the
   image and the op id, is never scheduled, never a victim and never a
@@ -1450,16 +1450,18 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   is never zeroed.
 - A published block is never written again: a tail's blocks are copied into
   the hitter's table (or loaded from Host into private pages), an owner that
-  keeps writing past a publication point moves to copies of the blocks it
-  published, in the copy-in blocks it reserved, and never takes a block
-  another request published into its table, and a restore copies the imaged
-  tail blocks instead of claiming them (1, cache-concepts.md).
+  keeps writing past its published prompt end moves to copies of the blocks
+  it published, in the copy-in blocks it holds, and never takes a block
+  another request published into its table, a chunk end cut at a junction
+  publishes no KV block, and a restore copies the imaged tail blocks instead
+  of claiming them (1, cache-concepts.md).
 - A request whose admission prepaid its generation never needs a block it did
   not reserve: the decode slot is reserved on the completing chunk, a State
-  group's rotation swaps a released block for a fresh one, and the owner's
-  copy-in blocks are reserved by the admission that reaches the publication
-  point (1). Without this a pool full of retraction-exempt requests wedges at
-  their first decodes.
+  group's rotation swaps a released block for a fresh one, and each copy-in
+  block of the prompt end is reserved with the block it serves -- in
+  full-history groups by the first admission, which prepays the prompt (1,
+  cache-concepts.md). Without this a pool full of retraction-exempt requests
+  wedges at their first decodes.
   A sliding-window group's growth can outrun its reserve (1); the
   empty-round retraction keeps such a pool live (2).
 - A store either pins its Device sources until the ack or is stream-ordered;

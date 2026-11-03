@@ -124,13 +124,14 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
 // Admits every History group with the same demand prototype as a new request;
 // a State group takes `state_step` (kRotate: a prefill step, the shape of a
 // first admission).
-// An admission whose forward reaches next_copy_in_tokens, a point the
-// request's next admission publishes and keeps writing past: it reserves that
-// point's copy-in blocks (AdmissionResult::copy_in_blocks).
+// An admission that spends `copy_in_blocks`, the copy-in blocks the request
+// holds for the point its progress publishes (OwnerTail::kCopiedIn), and
+// reserves those of `copy_in_point` for the slots whose blocks it allocates
+// (AdmissionResult::copy_in_blocks).
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
     CacheCoordinator& coordinator, std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe&& prefix,
     GroupDemand prototype, const RequestProgress& progress, StateStep state_step,
-    std::optional<std::int32_t> next_copy_in_tokens) {
+    std::span<std::vector<CacheBlockRef>> copy_in_blocks, std::optional<CacheCoordinator::CopyInPoint> copy_in_point) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (std::size_t i = 0; i < tables.size(); ++i) {
@@ -142,7 +143,7 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
         }
         demands.push_back(demand);
     }
-    return coordinator.Admit(std::move(prefix), demands, progress, next_copy_in_tokens,
+    return coordinator.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point,
                              /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
                              /*session_id=*/{});
 }
@@ -152,7 +153,7 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
     GroupDemand prototype, const RequestProgress& progress,
     StateStep state_step = StateStep{StateStep::Kind::kRotate}) {
     return AdmitForTest(coordinator, tables, std::move(prefix), prototype, progress, state_step,
-                        /*next_copy_in_tokens=*/std::nullopt);
+                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt);
 }
 
 // The overloads without progress admit a request that has computed nothing

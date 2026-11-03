@@ -264,19 +264,21 @@ private:
     AdmissionMatch matchPrefixAtAdmission(Request* request);
     // Records an admission's fresh pages (to zero) and copies on the plan.
     void recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result);
-    // next_copy_in_tokens as for CacheCoordinator::Admit.
+    // copy_in_blocks and copy_in_point as for CacheCoordinator::Admit.
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,
                                                            const RequestProgress& progress,
-                                                           std::optional<std::int32_t> next_copy_in_tokens,
+                                                           std::span<std::vector<CacheBlockRef>> copy_in_blocks,
+                                                           std::optional<CacheCoordinator::CopyInPoint> copy_in_point,
                                                            std::optional<std::uint64_t> request_access_epoch,
                                                            bool evict_blocks_past_segments);
     // Admits a scheduled request's next step against its live cache progress,
-    // which the caller has advanced for the step (StagedCacheProgress).
+    // which the caller has advanced for the step (StagedCacheProgress). The
+    // publication of a prompt end spends the copy-in blocks the request holds.
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, std::span<const GroupDemand> demands,
-        const RequestProgress& progress, std::optional<std::int32_t> next_copy_in_tokens,
+        const RequestProgress& progress, std::optional<CacheCoordinator::CopyInPoint> copy_in_point,
         bool evict_blocks_past_segments);
     void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);

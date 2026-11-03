@@ -70,14 +70,6 @@ struct CacheProgress {
     // index keeps them cached. A retraction drops them once its publication
     // is applied (a Retracted request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
-    // Per cache group, the copy-in blocks the admission whose forward reaches
-    // a publication point the request keeps writing past (a prompt end, a
-    // junction) reserved for that point (CacheCoordinator::AdmissionResult::
-    // copy_in_blocks). The next admission, which publishes the point, spends
-    // them (CompletedPages::copy_in_blocks) and the rest are released then.
-    // Empty when no such point is next. A retraction drops them; the restore
-    // reserves them again.
-    std::vector<std::vector<CacheBlockRef>> copy_in_blocks;
     // One aligned input checkpoint and its non-replayable sliding windows.
     // Kept while the request runs: restricted State cannot publish a decode
     // frontier to replace it. Admission may release this optional hold for
@@ -143,6 +135,14 @@ struct ForwardResources {
     std::int32_t prefix_granularity{};
     ReqPoolIndex req_pool_index;
     std::vector<BlockTable> block_tables;
+    // Per cache group, the copy-in blocks the request holds for its prompt
+    // end, which its first decode publishes and keeps writing past: aligned
+    // to CacheCoordinator::CopyInSlots, each reserved by the admission that
+    // allocated the block of its slot, null until then. The first decode
+    // spends them (CacheCoordinator::Admit); they go with the tables, so a
+    // retraction releases them and a restore reserves them again. Empty
+    // when the request reserves none.
+    std::vector<std::vector<CacheBlockRef>> copy_in_blocks;
     CacheProgress cache_progress;
     // Forwards scheduled for this request whose results have not come back.
     // More than one is normal under the overlap schedule, which plans the

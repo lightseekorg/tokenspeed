@@ -112,20 +112,13 @@ std::int64_t CapacityModel::tailHandoverBlocks(std::size_t group_index) const {
 }
 
 std::int64_t CapacityModel::copyInReserveBlocks(std::size_t group_index) const {
-    // Blocks a request holds beyond its history for one round: from the
-    // admission whose forward reaches a publication point it keeps writing
-    // past to the next admission, which copies the point's published tail
-    // blocks into them -- one per published tail block. Only a role that
-    // prefills locally reaches such a point: the fused role's prompt end, and
-    // a junction, which only a State group gives. That admission can be a
-    // hitter's too, whose pinned copy sources (tailHandoverBlocks) it holds
-    // beside these, so the two charges add up.
-    const bool has_state_group = std::ranges::any_of(
-        config_.cache_groups, [](const CacheGroupConfig& group) { return group.attn_kind == AttnKind::kState; });
-    if (config_.role == Role::kFused || (config_.role == Role::kP && has_state_group)) {
-        return tailHandoverBlocks(group_index);
-    }
-    return 0;
+    // Blocks a fused request holds beyond its history until its first decode
+    // publishes its prompt end and copies the published tail blocks into
+    // them -- one per published tail block, each reserved with the block it
+    // serves. The first admission can be a hitter's, whose pinned copy
+    // sources (tailHandoverBlocks) it holds beside these, so the two charges
+    // add up.
+    return config_.role == Role::kFused ? tailHandoverBlocks(group_index) : 0;
 }
 
 std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t token_limit) const {

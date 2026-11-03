@@ -1469,14 +1469,22 @@ void CacheCoordinator::validateProgress(const RequestProgress& progress) const {
         _assert(*progress.num_computed_tokens == hashed_pages * prefix_granularity_ + completed.tail->tail_tokens,
                 "the tail ends at the request's computed frontier");
     }
-    if (completed.owner_continues && completed.tail) {
-        _assert(completed.copy_in_blocks.size() == groups_.size(),
-                "an owner that keeps writing past a tail carries its copy-in blocks");
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const BlockRange slots = CopyInSlots(i, *progress.num_computed_tokens);
-            _assert(completed.copy_in_blocks[i].size() == static_cast<std::size_t>(slots.past_end - slots.first),
-                    "one copy-in block per copy-in slot");
-        }
+}
+
+void CacheCoordinator::validateCopyInBlocks(const RequestProgress& progress,
+                                            std::span<const std::vector<CacheBlockRef>> copy_in_blocks) const {
+    const bool copies_in = progress.completed_pages && progress.completed_pages->tail &&
+                           progress.completed_pages->owner_tail == OwnerTail::kCopiedIn;
+    if (!copies_in) {
+        _assert(copy_in_blocks.empty(), "only an owner copying in past its tail spends copy-in blocks");
+        return;
+    }
+    _assert(copy_in_blocks.size() == groups_.size(), "an owner copying in past its tail holds its copy-in blocks");
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const BlockRange slots = CopyInSlots(i, *progress.num_computed_tokens);
+        _assert(copy_in_blocks[i].size() == static_cast<std::size_t>(slots.past_end - slots.first) &&
+                    std::ranges::all_of(copy_in_blocks[i], [](const CacheBlockRef& block) { return bool(block); }),
+                "the owner holds a copy-in block for every copy-in slot");
     }
 }
 
@@ -1484,8 +1492,8 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
                                             std::uint64_t access_epoch) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     _assert(progress.completed_pages.has_value(), "publication requires completed pages");
-    _assert(!progress.completed_pages->owner_continues,
-            "a publication outside an admission has no capacity for the owner's fresh block");
+    _assert(progress.completed_pages->owner_tail == OwnerTail::kFinal,
+            "a publication outside an admission publishes a final frontier");
     validateProgress(progress);
     const CompletedPages& completed = *progress.completed_pages;
     linkPublication(completed);
@@ -2494,8 +2502,12 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
     }
     const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(group_index));
     const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
+    // A tail the owner keeps publishes no KV block: only the State groups
+    // publish there, under its hash.
     const std::int32_t tail_blocks =
-        completed.tail ? TailBlocksFor(static_cast<std::int32_t>(group_index), completed.tail->tail_tokens) : 0;
+        completed.tail && completed.owner_tail != OwnerTail::kKept
+            ? TailBlocksFor(static_cast<std::int32_t>(group_index), completed.tail->tail_tokens)
+            : 0;
     const auto history_range = [&](std::int32_t first_block, std::int32_t past_end_block) {
         PublishedRange range{.first_cache_block = first_block, .boundary_kind = completed.boundary_kind};
         for (std::int32_t block = first_block; block < past_end_block; ++block) {
@@ -2566,7 +2578,7 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
     // request published first. Every other published block dedupes onto the
     // canonical one, which the table then holds.
     const BlockRange own_tail =
-        Tier == CacheTier::kDevice && completed.owner_continues && completed.tail
+        completed.tail && completed.owner_tail == OwnerTail::kCopiedIn
             ? CopyInSlots(group_index, static_cast<std::int32_t>(completed.prefix_hashes.size()) * prefix_granularity_ +
                                            completed.tail->tail_tokens)
             : BlockRange{};

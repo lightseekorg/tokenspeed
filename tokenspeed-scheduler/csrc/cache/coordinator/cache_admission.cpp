@@ -58,24 +58,33 @@ struct VictimSet {
     bool is_request_reclaim{false};
 };
 
+// A copy-in block an admission reserves: the table slot it serves and the
+// bucket it takes, the bucket of that slot's block -- for a slot the
+// admission's dense growth fills, the bucket the fit chose for the block and
+// its copy-in block together (-1 until it has).
+struct CopyInReservation {
+    std::int32_t slot{0};
+    std::int32_t bucket{-1};
+};
+
 struct AdmissionPlan {
     CacheCoordinator::PrefixProbe prefix;
     std::vector<VictimSet> victims;
-    // Per group, the bucket of each copy-in block the admission reserves, one
-    // per slot of CopyInSlots(i, next_copy_in_tokens) in slot order: the
-    // bucket of the block the slot holds once the prefix is in place, or for
-    // a slot the dense growth fills, the bucket the fit chose for that block
-    // and its copy-in block together. Empty without next_copy_in_tokens.
-    std::vector<std::vector<std::int32_t>> copy_in_buckets;
+    // Per group, the copy-in blocks the admission reserves, in slot order
+    // (AdmissionPlanner::reserveCopyIns). Empty without a copy-in point.
+    std::vector<std::vector<CopyInReservation>> copy_ins;
 };
 
 // The table shape a restore rebuilds before its dense demand is placed: how
-// many blocks each bucket must receive and the tail capacity the rebuilt
-// table then has. An admission plans against the live table instead and
-// passes none.
+// many blocks each bucket must receive, the block count and the tail capacity
+// the rebuilt table then has, and the rebuilt slots among the copy-in slots
+// with the buckets they are rebuilt in. An admission plans against the live
+// table instead and passes none.
 struct PlannedShape {
     std::vector<std::int64_t> blocks_by_bucket;
+    std::int32_t num_blocks{0};
     std::int32_t available_tokens{0};
+    std::vector<CopyInReservation> rebuilt_copy_ins;
 };
 
 // The table slots a tail ending at `tokens` occupies in a token-spanned
@@ -101,11 +110,11 @@ public:
     AdmissionPlanner(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
                      std::span<const GroupGeometry> geometry, std::int32_t prefix_granularity, const BlockPool& pool,
                      const BlockPool* host_pool, std::span<const GroupDemand> demands,
-                     std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> next_copy_in_tokens,
+                     std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> copy_in_point,
                      const CacheCoordinator::PrefixProbe& prefix, std::span<const PlannedShape> shapes,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
                      const BoundaryTree& boundary_tree, bool evicts_segments, bool evicts_blocks_past_segments,
-                     std::vector<VictimSet>& victims, std::vector<std::vector<std::int32_t>>& copy_in_buckets)
+                     std::vector<VictimSet>& victims, std::vector<std::vector<CopyInReservation>>& copy_ins)
         : coordinator_{coordinator},
           groups_{groups},
           geometry_{geometry},
@@ -114,7 +123,7 @@ public:
           host_pool_{host_pool},
           demands_{demands},
           num_computed_tokens_{num_computed_tokens},
-          next_copy_in_tokens_{next_copy_in_tokens},
+          copy_in_point_{copy_in_point},
           prefix_{prefix},
           shapes_{shapes},
           claimed_{claimed},
@@ -122,12 +131,14 @@ public:
           evicts_segments_{evicts_segments},
           evicts_blocks_past_segments_{evicts_blocks_past_segments},
           victims_{victims},
-          copy_in_buckets_{copy_in_buckets},
+          copy_ins_{copy_ins},
           eviction_plan_{pool, groups},
           shape_need_(groups.size()),
           blocks_needed_(groups.size()),
           pair_need_(groups.size(), 0),
-          prefix_tail_buckets_(groups.size()) {}
+          prefix_tail_buckets_(groups.size()) {
+        copy_ins_.assign(copy_in_point ? groups.size() : 0, {});
+    }
 
     bool Plan() {
         victims_.clear();
@@ -145,9 +156,9 @@ public:
             const std::vector<std::int32_t> pair_buckets =
                 AssignPairBuckets(shape_need_[i], eviction_plan_.HolesByBucket(i), pair_need_[i]);
             auto next_pair = pair_buckets.begin();
-            for (std::int32_t& bucket : copy_in_buckets_[i]) {
-                if (bucket < 0) {
-                    bucket = *next_pair++;
+            for (CopyInReservation& copy_in : copy_ins_[i]) {
+                if (copy_in.bucket < 0) {
+                    copy_in.bucket = *next_pair++;
                 }
             }
             _assert(next_pair == pair_buckets.end(), "every pair of the fit has a copy-in slot");
@@ -511,6 +522,13 @@ private:
     void initializeCapacity() {
         _assert(demands_.size() == groups_.size(), "demands/groups size mismatch");
         _assert(shapes_.empty() || shapes_.size() == groups_.size(), "shapes/groups size mismatch");
+        pair_need_.assign(groups_.size(), 0);
+        for (std::vector<CopyInReservation>& known : prefix_tail_buckets_) {
+            known.clear();
+        }
+        for (std::vector<CopyInReservation>& copy_ins : copy_ins_) {
+            copy_ins.clear();
+        }
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const GroupDemand& demand = demands_[i];
             _assert(demand.table != nullptr, "group demand requires a block table");
@@ -529,10 +547,7 @@ private:
                 blocks_needed_[i] -= reserveCopyIns(i, shape_need_[i]);
             } else {
                 // A restore rebuilds the recorded shape, bucket for bucket,
-                // and grows the rebuilt table from its recorded tail. Its
-                // copy-in blocks are in the shape: each rebuilt slot's bucket
-                // is known (Restore).
-                _assert(!next_copy_in_tokens_, "a restore counts its copy-in blocks in its shape");
+                // and grows the rebuilt table from its recorded tail.
                 _assert(demand.table->NumBlocks() == 0, "a restore rebuilds into an empty table");
                 _assert(shapes_[i].blocks_by_bucket.size() == buckets,
                         "restore shape buckets must match the shard count");
@@ -546,6 +561,7 @@ private:
                                                                         dense->num_tokens + demand.reserve_tokens);
                 }
                 shape_need_[i] = shapes_[i].blocks_by_bucket;
+                blocks_needed_[i] -= reserveCopyIns(i, shape_need_[i]);
             }
         }
     }
@@ -583,7 +599,8 @@ private:
                 }
                 const std::int32_t bucket = allocator.BucketOf(*source++);
                 ++need[static_cast<std::size_t>(bucket)];
-                prefix_tail_buckets_[i].emplace_back(first_slot + static_cast<std::int32_t>(j), bucket);
+                prefix_tail_buckets_[i].push_back(
+                    CopyInReservation{.slot = first_slot + static_cast<std::int32_t>(j), .bucket = bucket});
             }
             blocks += static_cast<std::int64_t>(tail->group_keys[i].size()) - static_cast<std::int64_t>(copied.size()) -
                       FirstTailBlockNeeded(groups_[i].Spec(), block_granularity, tail->tail_tokens);
@@ -603,53 +620,71 @@ private:
     }
 
     // Charges the copy-in blocks this admission reserves for the request's
-    // next publication point (next_copy_in_tokens_), one per slot of
-    // CopyInSlots: each must share the bucket of the block its slot holds
-    // when the point is reached, so its copy's two ends have one owner under
-    // page-cyclic sharding. A slot the table holds already keeps its block's
-    // bucket (a copy-in at this admission's own publication point moves it to
-    // a block in the same bucket), and so does one the prefix's tail fills (a
-    // hitter's copy, a Host load: prefix_tail_buckets_); those copy-in blocks
-    // are counted in `need`. A slot this admission's dense growth fills takes
-    // its block and its copy-in block in one bucket the fit chooses, as a pair
-    // (pair_need_), so the growth counts that block no more. Records each
-    // slot's bucket, -1 for a pair's until the fit chooses it, and returns the
-    // number of pairs.
+    // copy-in point (copy_in_point_): one for each slot of CopyInSlots whose
+    // block this admission allocates, fills from the prefix or rebuilds. A
+    // copy-in block is reserved with the block it serves, so a request whose
+    // first admission prepaid its prompt holds them from that admission on.
+    // Each shares its slot's bucket, so its copy's two ends have one owner
+    // under page-cyclic sharding: a slot the prefix fills (a hitter's copy, a
+    // Host load: prefix_tail_buckets_) or a restore rebuilds has its block's
+    // bucket, counted in `need`; a slot the dense growth fills takes its
+    // block and its copy-in block in one bucket the fit chooses, as a pair
+    // (pair_need_), so the growth counts that block no more. A slot an
+    // earlier admission allocated holds its copy-in block already; one past
+    // the growth gets it with its block. Records the reservations
+    // (copy_ins_) and returns the number of pairs.
     std::int64_t reserveCopyIns(std::size_t i, std::vector<std::int64_t>& need) {
-        if (!next_copy_in_tokens_) {
+        if (!copy_in_point_) {
             return 0;
         }
-        const CacheCoordinator::BlockRange slots = coordinator_.CopyInSlots(i, *next_copy_in_tokens_);
-        const BlockTable& table = *demands_[i].table;
-        const GroupAllocator& allocator = groups_[i].Allocator();
-        // The slots a first admission's prefix fills: its claimed hits, a
-        // Device tail's copies, a Host extension.
-        const std::int32_t prefix_slots =
-            table.NumBlocks() == 0 && geometry_[i].HasTokenSpan()
-                ? tailSlots(geometry_[i], prefix_granularity_,
-                            std::max(prefix_.device.num_common_tokens, prefix_.host.num_common_tokens))
-                      .past_end
-                : 0;
-        std::vector<std::int32_t>& buckets = copy_in_buckets_[i];
-        buckets.clear();
-        for (std::int32_t slot = slots.first; slot < slots.past_end; ++slot) {
+        const CacheCoordinator::BlockRange slots = coordinator_.CopyInSlots(i, *copy_in_point_);
+        if (slots.first == slots.past_end) {
+            return 0;
+        }
+        const GroupDemand& demand = demands_[i];
+        const auto* dense = std::get_if<DenseGrowth>(&demand.extent);
+        _assert(dense != nullptr, "the slots of a copy-in point grow densely");
+        const BlockTable& table = *demand.table;
+        // The slots before the dense growth -- the rebuilt shape, the live
+        // table, or a first admission's prefix -- and the capacity the last
+        // of them leaves.
+        std::int32_t base = 0;
+        std::int32_t available = 0;
+        if (!shapes_.empty()) {
+            base = shapes_[i].num_blocks;
+            available = shapes_[i].available_tokens;
+        } else if (table.NumBlocks() > 0) {
+            base = table.NumBlocks();
+            available = table.AvailableTokens();
+        } else {
+            const TailSlots prefix =
+                tailSlots(geometry_[i], prefix_granularity_,
+                          std::max(prefix_.device.num_common_tokens, prefix_.host.num_common_tokens));
+            base = prefix.past_end;
+            available = prefix.available_tokens;
+        }
+        const std::int32_t growth_end =
+            base + geometry_[i].BlocksNeededBeyond(available, dense->num_tokens + demand.reserve_tokens);
+        const auto known_bucket = [](std::span<const CopyInReservation> known, std::int32_t slot) {
+            const auto it = std::ranges::find(known, slot, &CopyInReservation::slot);
+            _assert(it != known.end(), "a copy-in slot below the growth holds a block in a known bucket");
+            return it->bucket;
+        };
+        for (std::int32_t slot = slots.first; slot < std::min(slots.past_end, growth_end); ++slot) {
             std::int32_t bucket = -1;
-            if (slot < table.NumBlocks()) {
-                const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(slot)];
-                _assert(static_cast<bool>(block), "a copy-in slot the table holds is not a hole");
-                bucket = allocator.BucketOf(block->Location());
-            } else if (const auto it = std::ranges::find(prefix_tail_buckets_[i], slot,
-                                                         &std::pair<std::int32_t, std::int32_t>::first);
-                       it != prefix_tail_buckets_[i].end()) {
-                bucket = it->second;
-            } else {
-                _assert(slot >= prefix_slots, "a copy-in slot the prefix fills holds a copied or loaded block");
+            if (slot >= base) {
                 ++pair_need_[i];
+            } else if (!shapes_.empty()) {
+                bucket = known_bucket(shapes_[i].rebuilt_copy_ins, slot);
+            } else if (table.NumBlocks() > 0) {
+                continue;  // allocated, with its copy-in block, by an earlier admission
+            } else {
+                bucket = known_bucket(prefix_tail_buckets_[i], slot);
             }
             if (bucket >= 0) {
                 ++need[static_cast<std::size_t>(bucket)];
             }
-            buckets.push_back(bucket);
+            copy_ins_[i].push_back(CopyInReservation{.slot = slot, .bucket = bucket});
         }
         return pair_need_[i];
     }
@@ -730,7 +765,8 @@ private:
                 }
                 const std::int32_t bucket = count_hit(tail->group_keys[group_index][j]);
                 if (geometry_[group_index].HasTokenSpan()) {
-                    prefix_tail_buckets_[group_index].emplace_back(first_slot + static_cast<std::int32_t>(j), bucket);
+                    prefix_tail_buckets_[group_index].push_back(
+                        CopyInReservation{.slot = first_slot + static_cast<std::int32_t>(j), .bucket = bucket});
                 }
             }
         }
@@ -882,8 +918,8 @@ private:
     const BlockPool* host_pool_;
     std::span<const GroupDemand> demands_;
     std::optional<std::int32_t> num_computed_tokens_;
-    // The point the request's next admission copies in at (Admit).
-    std::optional<std::int32_t> next_copy_in_tokens_;
+    // The point whose copy-in blocks this admission reserves (Admit).
+    std::optional<std::int32_t> copy_in_point_;
     const CacheCoordinator::PrefixProbe& prefix_;
     std::span<const PlannedShape> shapes_;
     // Device-cached blocks a restore claims instead of copying: protected
@@ -897,27 +933,27 @@ private:
     // leaves block by block (Admit's evict_blocks_past_segments).
     bool evicts_blocks_past_segments_;
     std::vector<VictimSet>& victims_;
-    // The plan's copy-in bucket per slot (AdmissionPlan::copy_in_buckets).
-    std::vector<std::vector<std::int32_t>>& copy_in_buckets_;
+    // The plan's copy-in reservations (AdmissionPlan::copy_ins).
+    std::vector<std::vector<CopyInReservation>>& copy_ins_;
     // Lookup nodes live for this plan; returned victim vectors own their
     // storage independently. One arena avoids allocating each hash node from
     // the general heap while trying and rejecting candidate sets.
     std::pmr::monotonic_buffer_resource scratch_;
     // The pool as the tentative victims would leave it.
     CacheEvictionPlan eviction_plan_;
-    // Per group: the bucket-constrained blocks (a restore's rebuilt slots and
-    // copy-in blocks; an admission's Host-hit destinations, tail copies and
-    // the copy-in blocks of slots it holds), and the dense blocks wanted in
-    // any bucket.
+    // Per group: the bucket-constrained blocks (a restore's rebuilt slots; an
+    // admission's Host-hit destinations and tail copies; the copy-in blocks
+    // of slots whose blocks are in a known bucket), and the dense blocks
+    // wanted in any bucket.
     std::vector<std::vector<std::int64_t>> shape_need_;
     std::vector<std::int64_t> blocks_needed_;
     // Per group, the block pairs whose shared bucket the fit chooses: a tail
     // block the dense growth fills and its copy-in block (reserveCopyIns).
     std::vector<std::int64_t> pair_need_;
     // Per group, the slots a first admission's prefix tail fills with a block
-    // in a known bucket -- a Device tail's copies, a Host tail's loads -- and
-    // that bucket, for a copy-in slot among them (reserveCopyIns).
-    std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> prefix_tail_buckets_;
+    // in a known bucket -- a Device tail's copies, a Host tail's loads --
+    // with that bucket, for a copy-in slot among them (reserveCopyIns).
+    std::vector<std::vector<CopyInReservation>> prefix_tail_buckets_;
     std::vector<VictimCandidate> request_reclaim_candidates_;
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations_{&scratch_};
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> request_reclaim_locations_{&scratch_};
@@ -951,13 +987,13 @@ std::optional<AdmissionPlan> planAdmission(
     const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
     std::int32_t prefix_granularity, const BlockPool& pool, const BlockPool* host_pool,
     CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-    std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> next_copy_in_tokens,
+    std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> copy_in_point,
     std::span<const PlannedShape> shapes, std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
     const BoundaryTree& boundary_tree, bool evicts_segments, bool evicts_blocks_past_segments) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<VictimSet> victims;
-    std::vector<std::vector<std::int32_t>> copy_in_buckets(next_copy_in_tokens ? groups.size() : 0);
+    std::vector<std::vector<CopyInReservation>> copy_ins;
     AdmissionPlanner planner{coordinator,
                              groups,
                              geometry,
@@ -966,7 +1002,7 @@ std::optional<AdmissionPlan> planAdmission(
                              host_pool,
                              demands,
                              num_computed_tokens,
-                             next_copy_in_tokens,
+                             copy_in_point,
                              prefix,
                              shapes,
                              claimed,
@@ -974,12 +1010,58 @@ std::optional<AdmissionPlan> planAdmission(
                              evicts_segments,
                              evicts_blocks_past_segments,
                              victims,
-                             copy_in_buckets};
+                             copy_ins};
     if (!planner.Plan()) {
         return std::nullopt;
     }
-    return AdmissionPlan{
-        .prefix = std::move(prefix), .victims = std::move(victims), .copy_in_buckets = std::move(copy_in_buckets)};
+    return AdmissionPlan{.prefix = std::move(prefix), .victims = std::move(victims), .copy_ins = std::move(copy_ins)};
+}
+
+// Acquires the copy-in blocks an admission reserves in group `group_id`
+// (copy_ins, slot order) into `reserved`, aligned to the copy-in point's slots
+// [first_slot, ...): each in its slot's bucket. A slot `table` holds already
+// (a prefix's tail block, a rebuilt slot) has its block's bucket; a slot the
+// dense growth fills takes its own block in its copy-in block's bucket,
+// acquired in the same call ahead of the copy-in blocks, and returned for
+// GroupAllocator::Acquire to place. So every bucket-exact block of the group
+// is acquired before the growth's other blocks, the order the planner's fit
+// assumes.
+struct PairedBlocks {
+    std::int32_t first_slot{0};
+    std::vector<CacheBlockRef> blocks;
+};
+
+PairedBlocks acquireCopyIns(BlockPool& pool, std::uint32_t group_id, const GroupAllocator& allocator,
+                            const BlockTable& table, std::span<const CopyInReservation> copy_ins,
+                            std::int32_t first_slot, std::vector<CacheBlockRef>& reserved) {
+    PairedBlocks paired{.first_slot = table.NumBlocks()};
+    std::vector<std::int32_t> buckets;
+    for (const CopyInReservation& copy_in : copy_ins) {
+        _assert(copy_in.bucket >= 0, "the plan buckets every copy-in block");
+        if (copy_in.slot < table.NumBlocks()) {
+            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(copy_in.slot)];
+            _assert(block && allocator.BucketOf(block->Location()) == copy_in.bucket,
+                    "a copy-in block shares its slot's bucket");
+            continue;
+        }
+        if (buckets.empty()) {
+            paired.first_slot = copy_in.slot;
+        }
+        buckets.push_back(copy_in.bucket);
+    }
+    const std::size_t num_paired = buckets.size();
+    for (const CopyInReservation& copy_in : copy_ins) {
+        buckets.push_back(copy_in.bucket);
+    }
+    std::vector<CacheBlockRef> acquired = pool.AcquireBlocksInBuckets(group_id, buckets);
+    FatalCheck(acquired.size() == buckets.size(), "admission plan no longer fits the block pool");
+    auto next = std::make_move_iterator(acquired.begin());
+    paired.blocks.assign(next, next + static_cast<std::ptrdiff_t>(num_paired));
+    next += static_cast<std::ptrdiff_t>(num_paired);
+    for (const CopyInReservation& copy_in : copy_ins) {
+        reserved[static_cast<std::size_t>(copy_in.slot - first_slot)] = *next++;
+    }
+    return paired;
 }
 
 }  // namespace
@@ -1009,8 +1091,8 @@ void CacheCoordinator::ReleaseStateInputs(std::span<BlockTable> tables) {
 
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
-    std::optional<std::int32_t> next_copy_in_tokens, std::optional<std::uint64_t> request_access_epoch,
-    bool evict_blocks_past_segments, const std::string& session_id) {
+    std::span<std::vector<CacheBlockRef>> copy_in_blocks, std::optional<CopyInPoint> copy_in_point,
+    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments, const std::string& session_id) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].table != nullptr, "group demand requires a block table");
@@ -1018,8 +1100,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 "a State group takes a StateStep; a token-spanned group a dense or sparse extent");
     }
     validateProgress(progress);
-    _assert(!next_copy_in_tokens || *next_copy_in_tokens > progress.num_computed_tokens.value_or(0),
-            "the next copy-in point lies past the computed frontier");
+    validateCopyInBlocks(progress, copy_in_blocks);
+    _assert(!copy_in_point || copy_in_point->tokens > progress.num_computed_tokens.value_or(0),
+            "a copy-in point lies past the computed frontier");
 
     // A replayable group claims no hit pages, so before a hit its table is
     // empty: materialize it as a sparse private suffix from the replay
@@ -1050,12 +1133,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
 
     // The publication this admission carries needs no block beyond the plan's:
-    // an owner that keeps writing past a tail copies into the blocks reserved
-    // for it (CompletedPages::copy_in_blocks).
+    // an owner that keeps writing past a tail copies into the blocks it holds
+    // for it (copy_in_blocks).
     std::optional<AdmissionPlan> candidate =
         planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix), demands,
-                      progress.num_computed_tokens, next_copy_in_tokens, /*shapes=*/{}, /*claimed=*/{}, boundary_tree_,
-                      write_back_evictions_, evict_blocks_past_segments);
+                      progress.num_computed_tokens,
+                      copy_in_point ? std::optional<std::int32_t>{copy_in_point->tokens} : std::nullopt, /*shapes=*/{},
+                      /*claimed=*/{}, boundary_tree_, write_back_evictions_, evict_blocks_past_segments);
     if (!candidate) {
         return std::nullopt;
     }
@@ -1093,7 +1177,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
         .state_checkpoint_blocks = std::vector<CacheBlockRef>(groups_.size()),
-        .copy_in_blocks = std::vector<std::vector<CacheBlockRef>>(next_copy_in_tokens ? groups_.size() : 0),
+        .copy_in_blocks = std::vector<std::vector<CacheBlockRef>>(copy_in_point ? groups_.size() : 0),
         .session_access = std::move(session_access),
     };
     for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -1232,29 +1316,29 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         // its dense growth, which is what the planner's fit assumes.
         const GroupDemand& demand = demands[i];
         BlockTable& table = *demand.table;
-        const CompletedPages* completed = progress.completed_pages ? &*progress.completed_pages : nullptr;
-        // An owner that keeps writing past the publication point moves off
-        // every block it just registered into the copy-in block it reserved
-        // for the slot, in that block's bucket: a published block is never
+        // An owner that keeps writing past its published prompt end moves off
+        // every block it just registered into the copy-in block it holds for
+        // the slot, in that block's bucket: a published block is never
         // written again and never carries a second key. A slot whose key
         // another request published first was not registered and stays the
         // owner's to write; its copy-in block goes back unused. (A State
         // group's published slot 1 moves to slot 0 by rotation instead.)
-        if (completed != nullptr && completed->owner_continues && completed->tail) {
+        if (!copy_in_blocks.empty()) {
             const BlockRange slots = CopyInSlots(i, *progress.num_computed_tokens);
-            std::vector<CacheBlockRef>& reserved = completed->copy_in_blocks[i];
+            _assert(slots.past_end <= table.NumBlocks(), "the table holds every copy-in slot of its frontier");
+            std::vector<CacheBlockRef>& held = copy_in_blocks[i];
             GroupAllocator& allocator = groups_[i].Allocator();
             for (std::int32_t slot = slots.first; slot < slots.past_end; ++slot) {
                 if (!groups_[i].Index().Contains(table.Blocks()[static_cast<std::size_t>(slot)])) {
                     continue;
                 }
-                CacheBlockRef& copy_in = reserved[static_cast<std::size_t>(slot - slots.first)];
-                _assert(static_cast<bool>(copy_in), "a copy-in block is spent once");
-                const CacheBlockRef published = allocator.SwapInBlock(table, slot, std::move(copy_in));
+                const CacheBlockRef published =
+                    allocator.SwapInBlock(table, slot, std::move(held[static_cast<std::size_t>(slot - slots.first)]));
                 result.pages_to_copy[i].emplace_back(
                     allocator.ResolveCacheBlockId(*published),
                     allocator.ResolveCacheBlockId(*table.Blocks()[static_cast<std::size_t>(slot)]));
             }
+            held.clear();  // the unused ones go back
         }
         // A first admission's table ends in the tail's blocks: shared full
         // pages, then this request's own copies.
@@ -1329,45 +1413,19 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             groups_[i].Allocator().AppendHostExtension(
                 pool_, table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs, available);
         }
-        // The copy-in blocks for the request's next publication point, each in
-        // the bucket the plan gave its slot: a slot the table holds now keeps
-        // its block's bucket; a slot the growth below fills takes its own
-        // block in that bucket too, acquired with the copy-in blocks and
-        // ahead of them, before the growth's other blocks.
-        std::int32_t first_paired_slot = demand.table->NumBlocks();
-        std::vector<CacheBlockRef> paired;
-        if (next_copy_in_tokens) {
-            const BlockRange slots = CopyInSlots(i, *next_copy_in_tokens);
-            const std::vector<std::int32_t>& copy_in_buckets = plan.copy_in_buckets[i];
-            _assert(copy_in_buckets.size() == static_cast<std::size_t>(slots.past_end - slots.first),
-                    "the plan buckets every copy-in slot");
-            std::vector<std::int32_t> buckets;
-            for (std::int32_t slot = slots.first; slot < slots.past_end; ++slot) {
-                const std::int32_t bucket = copy_in_buckets[static_cast<std::size_t>(slot - slots.first)];
-                if (slot < demand.table->NumBlocks()) {
-                    const CacheBlockRef& block = demand.table->Blocks()[static_cast<std::size_t>(slot)];
-                    _assert(block && groups_[i].Allocator().BucketOf(block->Location()) == bucket,
-                            "a copy-in block shares its slot's bucket");
-                    continue;
-                }
-                if (buckets.empty()) {
-                    first_paired_slot = slot;
-                }
-                buckets.push_back(bucket);
-            }
-            const std::size_t num_paired = buckets.size();
-            buckets.insert(buckets.end(), copy_in_buckets.begin(), copy_in_buckets.end());
-            std::vector<CacheBlockRef> acquired = pool_.AcquireBlocksInBuckets(groups_[i].Id(), buckets);
-            FatalCheck(acquired.size() == buckets.size(), "admission plan no longer fits the block pool");
-            const auto paired_end = acquired.begin() + static_cast<std::ptrdiff_t>(num_paired);
-            paired.assign(std::make_move_iterator(acquired.begin()), std::make_move_iterator(paired_end));
-            result.copy_in_blocks[i].assign(std::make_move_iterator(paired_end),
-                                            std::make_move_iterator(acquired.end()));
+        // The copy-in blocks this admission reserves, each with the block it
+        // serves (acquireCopyIns), the paired ones placed by the growth.
+        PairedBlocks paired{.first_slot = demand.table->NumBlocks()};
+        if (copy_in_point) {
+            const BlockRange slots = CopyInSlots(i, copy_in_point->tokens);
+            result.copy_in_blocks[i].resize(static_cast<std::size_t>(slots.past_end - slots.first));
+            paired = acquireCopyIns(pool_, groups_[i].Id(), groups_[i].Allocator(), *demand.table, plan.copy_ins[i],
+                                    slots.first, result.copy_in_blocks[i]);
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired =
             groups_[i].Allocator().Acquire(pool_, *demand.table, geometry_[i].PlanAcquire(*demand.table, demand),
-                                           first_paired_slot, std::move(paired));
+                                           paired.first_slot, std::move(paired.blocks));
         FatalCheck(acquired, "admission plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = demand.table->Blocks();
         for (std::int32_t block = first_new_block; block < demand.table->NumBlocks(); ++block) {
@@ -1381,30 +1439,32 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     return result;
 }
 
-std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(
-    const RetractionImage& image, std::span<const GroupDemand> demands, std::optional<std::int32_t> next_copy_in_tokens,
-    std::uint64_t request_access_epoch) {
+std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const RetractionImage& image,
+                                                                           std::span<const GroupDemand> demands,
+                                                                           std::optional<CopyInPoint> copy_in_point,
+                                                                           std::uint64_t request_access_epoch) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     _assert(image.tables.size() == groups_.size(), "image/groups size mismatch");
     _assert(request_access_epoch > 0 && request_access_epoch <= next_access_epoch_,
             "request access epoch was not issued by this coordinator");
-    // The rebuilt slot each copy-in block shares a bucket with: the partial
-    // page at the image's frontier, which the restore always copies (never
-    // claims), so its bucket is the imaged block's.
-    const auto copy_in_slots = [&](std::size_t i) {
-        std::vector<const ImageSlot*> slots;
-        if (!next_copy_in_tokens) {
-            return slots;
+    // The rebuilt slots among the copy-in slots, each in its imaged block's
+    // bucket: the partial page at the image's frontier, which the restore
+    // always copies (never claims).
+    const auto rebuilt_copy_ins = [&](std::size_t i) {
+        std::vector<CopyInReservation> rebuilt;
+        if (!copy_in_point) {
+            return rebuilt;
         }
-        const BlockRange range = CopyInSlots(i, *next_copy_in_tokens);
+        const BlockRange range = CopyInSlots(i, copy_in_point->tokens);
         const ImageTable& shape = image.tables[i];
-        for (std::int32_t slot = range.first; slot < range.past_end; ++slot) {
+        for (std::int32_t slot = range.first; slot < std::min(range.past_end, shape.num_blocks); ++slot) {
             const auto it = std::ranges::find(shape.slots, slot, &ImageSlot::slot_index);
             _assert(it != shape.slots.end() && writableImageSlot(i, shape, slot),
-                    "a copy-in slot is a rebuilt slot of the partial page at the image's frontier");
-            slots.push_back(&*it);
+                    "a rebuilt copy-in slot is a slot of the partial page at the image's frontier");
+            rebuilt.push_back(
+                CopyInReservation{.slot = slot, .bucket = groups_[i].Allocator().BucketOf(it->block->Location())});
         }
-        return slots;
+        return rebuilt;
     };
     // A Host L2 slot whose key still has a Device-cached canonical block is
     // claimed instead of copied: the same bytes by construction (the victim's
@@ -1435,7 +1495,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(
             const GroupAllocator& allocator = groups_[i].Allocator();
             const ImageTable& shape = image.tables[i];
             shapes[i].blocks_by_bucket.assign(static_cast<std::size_t>(allocator.ShardCount()), 0);
+            shapes[i].num_blocks = shape.num_blocks;
             shapes[i].available_tokens = shape.available_tokens;
+            shapes[i].rebuilt_copy_ins = rebuilt_copy_ins(i);
             for (const ImageSlot& slot : shape.slots) {
                 _assert(static_cast<bool>(slot.block), "image slot lost its block");
                 const CacheBlockRef canonical =
@@ -1446,14 +1508,12 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(
                 }
                 ++shapes[i].blocks_by_bucket[static_cast<std::size_t>(allocator.BucketOf(slot.block->Location()))];
             }
-            for (const ImageSlot* slot : copy_in_slots(i)) {
-                ++shapes[i].blocks_by_bucket[static_cast<std::size_t>(allocator.BucketOf(slot->block->Location()))];
-            }
         }
-        candidate = planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, ProbePrefix({}),
-                                  demands, /*num_computed_tokens=*/std::nullopt, /*next_copy_in_tokens=*/std::nullopt,
-                                  shapes, protected_locations, boundary_tree_, write_back_evictions_,
-                                  /*evicts_blocks_past_segments=*/false);
+        candidate = planAdmission(
+            *this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, ProbePrefix({}), demands,
+            /*num_computed_tokens=*/std::nullopt,
+            copy_in_point ? std::optional<std::int32_t>{copy_in_point->tokens} : std::nullopt, shapes,
+            protected_locations, boundary_tree_, write_back_evictions_, /*evicts_blocks_past_segments=*/false);
         if (candidate || protected_locations.empty() || !write_back_evictions_) {
             break;
         }
@@ -1504,7 +1564,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(
         .access_epoch = request_access_epoch,
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
-        .copy_in_blocks = std::vector<std::vector<CacheBlockRef>>(next_copy_in_tokens ? groups_.size() : 0),
+        .copy_in_blocks = std::vector<std::vector<CacheBlockRef>>(copy_in_point ? groups_.size() : 0),
     };
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         GroupAllocator& allocator = groups_[i].Allocator();
@@ -1541,22 +1601,20 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(
         if (GroupIsState(i)) {
             continue;  // the imaged two slots are the whole table
         }
-        // The copy-in blocks, each in the bucket of the rebuilt slot it serves,
-        // before the reserve's dense growth.
-        if (next_copy_in_tokens) {
-            std::vector<std::int32_t> buckets;
-            for (const ImageSlot* slot : copy_in_slots(i)) {
-                buckets.push_back(
-                    allocator.BucketOf(table.Blocks()[static_cast<std::size_t>(slot->slot_index)]->Location()));
-            }
-            result.copy_in_blocks[i] = pool_.AcquireBlocksInBuckets(groups_[i].Id(), buckets);
-            FatalCheck(result.copy_in_blocks[i].size() == buckets.size(), "restore plan no longer fits the block pool");
+        // The copy-in blocks, each with the rebuilt or grown block it serves
+        // (acquireCopyIns), before the reserve's other blocks.
+        PairedBlocks paired{.first_slot = table.NumBlocks()};
+        if (copy_in_point) {
+            const BlockRange slots = CopyInSlots(i, copy_in_point->tokens);
+            result.copy_in_blocks[i].resize(static_cast<std::size_t>(slots.past_end - slots.first));
+            paired = acquireCopyIns(pool_, groups_[i].Id(), allocator, table, candidate->copy_ins[i], slots.first,
+                                    result.copy_in_blocks[i]);
         }
         // Only the reserve appended beyond the imaged shape is fresh, unfilled
         // Device memory for the plan to zero.
         const std::int32_t first_new_block = table.NumBlocks();
-        FatalCheck(allocator.Acquire(pool_, table, geometry_[i].PlanAcquire(table, demands[i]),
-                                     /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{}),
+        FatalCheck(allocator.Acquire(pool_, table, geometry_[i].PlanAcquire(table, demands[i]), paired.first_slot,
+                                     std::move(paired.blocks)),
                    "restore plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = table.Blocks();
         for (std::int32_t block = first_new_block; block < table.NumBlocks(); ++block) {

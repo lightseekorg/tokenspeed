@@ -138,7 +138,14 @@ public:
         const std::int32_t num_others = plan.num_blocks - static_cast<std::int32_t>(placed.size());
         std::vector<CacheBlockRef> block_refs;
         if (num_others > 0) {
-            block_refs = pool.AcquireBlocks(group_id_, num_others, BucketLoads(table));
+            // The placed blocks count toward the request's bucket loads too.
+            std::vector<std::int32_t> loads = BucketLoads(table);
+            for (const CacheBlockRef& block : placed) {
+                if (!loads.empty()) {
+                    ++loads[static_cast<std::size_t>(block->Location().slot_index % shard_count_)];
+                }
+            }
+            block_refs = pool.AcquireBlocks(group_id_, num_others, loads);
             if (static_cast<std::int32_t>(block_refs.size()) < num_others) {
                 return false;
             }

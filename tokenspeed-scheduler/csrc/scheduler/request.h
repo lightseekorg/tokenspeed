@@ -278,6 +278,12 @@ public:
 
     std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
 
+    // The copy-in blocks the request holds for its prompt end
+    // (fsm::ForwardResources::copy_in_blocks).
+    std::vector<std::vector<CacheBlockRef>>& CopyInBlocksRef() {
+        return forwardResources("CopyInBlocksRef").copy_in_blocks;
+    }
+
     fsm::CacheProgress CacheProgress() const { return forwardResources("CacheProgress").cache_progress; }
     // Written by the scheduler when an admission succeeds, like the block
     // tables the same admission fills: resources and progress land at

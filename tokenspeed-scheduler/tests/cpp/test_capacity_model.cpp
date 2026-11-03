@@ -197,9 +197,9 @@ TEST(CapacityModelTest, ConcurrentDemandByKind) {
     // can span behind an unaligned boundary and 8192 / 64 rows.
     EXPECT_EQ(pages[2], 16 * (4 + 1 + 1) + 3 + 128);
 
-    // The prefill role protects no in-flight decode step: the full group's
-    // protected spill disappears; the State group gives it junctions, and
-    // with them copy-in blocks; the State group's two slots hold on every
+    // The prefill role protects no in-flight decode step and keeps writing
+    // past no published tail block: the full group's protected spill and its
+    // copy-in block disappear; the State group's two slots hold on every
     // role.
     SchedulerConfig prefill = cfg;
     prefill.role = Role::kP;
@@ -208,7 +208,7 @@ TEST(CapacityModelTest, ConcurrentDemandByKind) {
             group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
     }
     const std::vector<std::int64_t> prefill_pages = CapacityModel{prefill}.ConcurrentGroupPages(65536, 4096);
-    EXPECT_EQ(prefill_pages[0], 1024 + 16 * (1 + 1 + 1));
+    EXPECT_EQ(prefill_pages[0], 1024 + 16 * (1 + 1));
     EXPECT_EQ(prefill_pages[1], 16 * 2);
     SchedulerConfig decode = prefill;
     decode.role = Role::kD;
@@ -216,10 +216,10 @@ TEST(CapacityModelTest, ConcurrentDemandByKind) {
 }
 
 // A request holds copy-in blocks beside the copy sources a tail handover
-// pins only on a role that reaches a publication point it keeps writing
-// past: the fused role's prompt end, and a junction, which only a State group
-// gives a prefill role. One 64-token-page full group and a 128-token limit:
-// two pages of history.
+// pins only on the role whose first decode publishes its prompt end and keeps
+// writing past it: the fused role. A junction publishes no KV tail, so a
+// prefill role holds none even with a State group. One 64-token-page full
+// group and a 128-token limit: two pages of history.
 TEST(CapacityModelTest, CopyInBlocksAreChargedWhereARoleReservesThem) {
     const auto full_pages = [](Role role, bool with_state, bool disable_prefix_cache) {
         std::vector<CacheGroupConfig> groups{Full("full", 64, 1)};
@@ -232,10 +232,10 @@ TEST(CapacityModelTest, CopyInBlocksAreChargedWhereARoleReservesThem) {
     };
     EXPECT_EQ(full_pages(Role::kFused, /*with_state=*/false, /*disable_prefix_cache=*/false), 2 + 1 + 1)
         << "a tail handover and the copy-in block of the prompt end";
-    EXPECT_EQ(full_pages(Role::kP, /*with_state=*/true, /*disable_prefix_cache=*/false), 2 + 1 + 1)
-        << "a junction's copy-in block";
-    EXPECT_EQ(full_pages(Role::kP, /*with_state=*/false, /*disable_prefix_cache=*/false), 2 + 1)
-        << "no junction without a State group";
+    EXPECT_EQ(full_pages(Role::kFused, /*with_state=*/true, /*disable_prefix_cache=*/false), 2 + 1 + 1)
+        << "a junction adds none";
+    EXPECT_EQ(full_pages(Role::kP, /*with_state=*/true, /*disable_prefix_cache=*/false), 2 + 1)
+        << "a tail handover only";
     EXPECT_EQ(full_pages(Role::kD, /*with_state=*/true, /*disable_prefix_cache=*/false), 2)
         << "the D role lands its partial block fresh and keeps writing past no publication";
     EXPECT_EQ(full_pages(Role::kFused, /*with_state=*/false, /*disable_prefix_cache=*/true), 2);

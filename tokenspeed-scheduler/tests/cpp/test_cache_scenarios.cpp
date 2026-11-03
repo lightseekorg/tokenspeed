@@ -3660,6 +3660,7 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{},
                                                       /*awaits_result=*/true});
     ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
@@ -3698,6 +3699,7 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{},
                                                       /*awaits_result=*/true});
     request.TrackScheduledForward();
@@ -3745,6 +3747,7 @@ TEST(SnapshotRetractEvent, StampsResumePriorityAndKeepsTheResumePoint) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     request.TrackScheduledForward();
@@ -3815,6 +3818,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
@@ -3839,7 +3843,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     ASSERT_TRUE(coordinator.Restore(request.GetIf<fsm::Retracted>()->image, demands,
-                                    /*next_copy_in_tokens=*/std::nullopt, /*request_access_epoch=*/1));
+                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/1));
     request.Apply(
         fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*copy_in_blocks=*/{}, /*restore_op=*/7});
     ASSERT_TRUE(request.Is<fsm::Restoring>());
@@ -3878,6 +3882,7 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
@@ -4218,8 +4223,6 @@ TEST_P(DecodesFillingTheBatchSuite, ABlockedDecodeDoesNotGiveWayToAPrefillTheFul
         AckRestores(plan);
     };
 
-    // Every prompt prefills, p by its first chunk; then d1 and e1-e3 decode
-    // three times, e4 and p left out of the full batch.
     // Every prompt prefills, p by its first chunk; then d1 and e1-e3 decode,
     // e4 and p left out of the full batch, until d1's next page does not fit.
     ExecutionPlan blocked = PlanOnce();
@@ -4579,6 +4582,7 @@ TEST(CacheProgressTest, JunctionSurvivesPrefillRounds) {
                                                           .access_epoch = admission->access_epoch,
                                                           .junction_tokens = 8,
                                                       },
+                                                      /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().junction_tokens, 8);
@@ -4868,6 +4872,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
                                                       fsm::PrefillSource::kRemote, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{.access_epoch = admission->access_epoch},
+                                                      /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::RemotePrefilling>());
 
@@ -4905,6 +4910,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
         std::move(tables),
         /*hit_tokens=*/0,
         fsm::CacheProgress{.access_epoch = admission->access_epoch},
+        /*copy_in_blocks=*/{},
         /*load_pairs=*/{},
         /*awaits_result=*/false,
     });
@@ -4931,7 +4937,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     const auto restore =
-        coordinator.Restore(retracted->image, demands, /*next_copy_in_tokens=*/std::nullopt, admission->access_epoch);
+        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch);
     ASSERT_TRUE(restore);
     ASSERT_EQ(restore->snapshot_pairs.size(), 2u) << "the 4 computed prompt tokens; the decode input has no KV yet";
     request.Apply(
@@ -4988,6 +4994,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{.access_epoch = admission->access_epoch},
+                                                      /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.CacheProgress().access_epoch, admission->access_epoch);
@@ -5015,7 +5022,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
         GroupDemand{.table = &restored[1], .extent = DenseGrowth{0}, .reserve_tokens = 1},
     };
     ASSERT_TRUE(
-        coordinator.Restore(retracted->image, demands, /*next_copy_in_tokens=*/std::nullopt, admission->access_epoch));
+        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch));
     request.Apply(
         fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*copy_in_blocks=*/{}, /*restore_op=*/1});
     request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate()});
@@ -5093,6 +5100,7 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
                                                           fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                           /*hit_tokens=*/0,
                                                           /*cache_progress=*/{},
+                                                          /*copy_in_blocks=*/{},
                                                           /*load_pairs=*/{}, /*awaits_result=*/false}),
         std::runtime_error);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 31) << "a failed req-pool Allocate must not leak block-pool pages";

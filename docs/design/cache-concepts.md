@@ -929,28 +929,40 @@ Its responsibilities:
   hitter's table and never zeroed) or a fresh block where the probe left a
   hole -- and a Host tail is loaded into fresh private pages like any Host
   hit and never republished on the Device. The owner's side of the same
-  rule is **copy-in**: an admission whose publication point the owner
-  keeps writing past (`CompletedPages::owner_continues`: the fused role's
-  prompt end, or a junction a chunk was cut at) registers the owner's tail
-  blocks under `hash@T` and swaps into the table, for each block it
-  registered, a copy in the copy-in block reserved for that slot, so the
-  published bytes are exactly what the prefill forward wrote and nothing
-  writes them again. The owner never takes another request's canonical
-  block into its table: where the key is published already it keeps
-  writing its own block, unregistered, and needs no copy. The copy-in
-  blocks are reserved by the admission whose forward reaches the point
-  (`Admit`'s `next_copy_in_tokens`; the request holds them in
-  `fsm::CacheProgress::copy_in_blocks` and the next admission spends them
-  or lets them go), one per slot the point publishes under the tail's hash
-  (`CacheCoordinator::CopyInSlots`), each in the bucket of the block the
-  slot holds then: a block the table holds already, or the hitter's copy or
-  Host load the prefix puts there. A slot that admission's growth fills
+  rule is **copy-in**: the fused role's first decode, which publishes the
+  prompt end and keeps writing past it (`OwnerTail::kCopiedIn`), registers
+  the owner's tail blocks under `hash@T` and swaps into the table, for each
+  block it registered, a copy in the copy-in block the request holds for
+  that slot, so the published bytes are exactly what the prefill forward
+  wrote and nothing writes them again. The owner never takes another
+  request's canonical block into its table: where the key is published
+  already it keeps writing its own block, unregistered, and needs no copy.
+  There is one copy-in block per slot the prompt end publishes under the
+  tail's hash (`CacheCoordinator::CopyInSlots`), and each is reserved with
+  the block it serves: every admission of the prompt -- each chunk, and a
+  restore before the first decode -- passes the prompt end as its
+  `copy_in_point` and reserves the copy-in blocks of the slots whose blocks
+  it allocates, fills from the prefix or rebuilds, each in that block's
+  bucket. A slot the prefix fills (the hitter's copy, a Host load) or a
+  restore rebuilds has a known bucket; a slot the admission's growth fills
   takes its block and its copy-in block together, in the one bucket the fit
-  chooses for the pair (below). The publication point therefore needs no
-  block it did not reserve -- a pool full of requests whose reserve covers
-  their generation never wedges at their first decodes -- and every such
-  point is published whatever the pool's pressure. A restore of a request
-  suspended at such a point reserves its copy-in blocks again. Copies are
+  chooses for the pair (below). The request holds them beside its tables
+  (`fsm::ForwardResources::copy_in_blocks`), so a retraction releases them
+  and the restore reserves them again, and the first decode spends them.
+  The first admission prepays the whole prompt in full-history groups, so
+  it holds their copy-in blocks from then on: neither the prompt's later
+  chunks nor its first decode need a block that admission did not reserve
+  there (a sliding-window group allocates the tail's blocks with the chunk
+  that reaches them, like the rest of its window growth), and every prompt
+  end is published whatever the pool's pressure. A chunk end cut at a
+  junction keeps writing past its point too, but needs no copy: the
+  junction's KV is cached already, so it publishes the state there, under
+  the tail's hash, and its KV blocks stay its own, unpublished
+  (`OwnerTail::kKept`). On the Device the owner would keep its own block
+  anyway; a Host tail pairs with the Device checkpoint in the probe's Host
+  suffix. Should that tail leave both tiers before the publication, the
+  checkpoint has no KV to resume with: no probe matches it, and it occupies
+  its blocks until it is evicted like any cache. Copies are
   fire-and-forget: the runtime orders them on the forward thread's default
   stream after the execution stream's in-flight forwards and before the
   plan's zeroing, so a source another admission of the same round evicts
@@ -1140,7 +1152,8 @@ Its responsibilities:
   without guaranteeing that KV and every required state checkpoint
   remain resident together. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
-  admission, or a junction cut) queues its tail and state checkpoint too;
+  admission) queues its tail and state checkpoint too, a junction cut its
+  state checkpoint;
   the candidates are merged into a batched writeback. Ordinary decode
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the
