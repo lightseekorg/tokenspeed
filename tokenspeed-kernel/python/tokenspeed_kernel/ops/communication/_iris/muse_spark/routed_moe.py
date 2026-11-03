@@ -440,6 +440,133 @@ def _iris_column_routes_offsets():
 
 
 @gluon.jit
+def iris_column_routes_push_words(
+    words,
+    rows,
+    slice_words,
+    owner,
+    stage,
+    mask,
+    regions,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+    STAGE_WORDS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Push this rank's partial route words into column owner ``owner``'s mailbox.
+
+    ``words`` holds BF16 column pairs (low half the even column) of route
+    rows ``rows`` (token * 8 + pick) at 32-bit words ``slice_words`` of the
+    owner's 512-column slice; ``rows``, ``slice_words`` and ``mask``
+    broadcast against ``words``. ``owner`` (uniform, not RANK) keeps one
+    slot per other rank, indexed by distance - 1. ``stage`` (broadcasting
+    like ``rows``) is the memory stage word of (token, owner) modulo 3,
+    which only that owner's finisher advances.
+    Producers call this from their epilogue; the column-route kernel's
+    senders call it on the routes buffer.
+    """
+    PEERS: gl.constexpr = WORLD_SIZE - 1
+    delta = (owner - RANK + WORLD_SIZE) % WORLD_SIZE
+    offsets = (
+        (stage * STAGE_WORDS).to(gl.int32)
+        + (PEERS - delta) * (MAX_ROWS * _ROUTE_WORDS)
+        + rows * _SLICE_WORDS
+        + slice_words
+    )
+    target = gl.multiple_of(
+        _iris_group_heap_base(owner, regions).to(gl.pointer_type(gl.uint32)), 16
+    )
+    gl.amd.cdna4.buffer_store(
+        _iris_sanitize_lamport_bf16x2(words),
+        target,
+        offsets,
+        mask=mask,
+        cache=PEER_SIGNAL_STORE_CACHE,
+    )
+
+
+@gluon.jit
+def iris_column_routes_dn_sink(
+    values,
+    rows,
+    columns,
+    valid,
+    SINK_ARGS,
+    SINK_CONSTS: gl.constexpr,
+):
+    """Store a producer's partial-route tile the way the column-route kernel needs it.
+
+    ``values`` BF16 [R, C] (any layout) are this rank's partials of route
+    rows ``rows`` ([R] or [R, 1]; token * 8 + pick, masked by ``valid``) at
+    feature columns ``columns`` ([C] or [1, C]), a contiguous block starting at a multiple of 64
+    columns inside one owner's 512-column slice. This rank's own slice goes to the
+    routes buffer (read by the completer after the kernel boundary); another
+    owner's slice is pushed into its mailbox (iris_column_routes_push_words).
+    SINK_ARGS = (routes_ptr, routes_stride, epochs, regions); SINK_CONSTS =
+    (RANK, WORLD_SIZE, MAX_ROWS, STAGE_WORDS, PEER_SIGNAL_STORE_CACHE).
+    """
+    routes_ptr, routes_stride, epochs, regions = SINK_ARGS
+    RANK: gl.constexpr = SINK_CONSTS[0]
+    WORLD_SIZE: gl.constexpr = SINK_CONSTS[1]
+    MAX_ROWS: gl.constexpr = SINK_CONSTS[2]
+    STAGE_WORDS: gl.constexpr = SINK_CONSTS[3]
+    CACHE: gl.constexpr = SINK_CONSTS[4]
+    R: gl.constexpr = values.shape[0]
+    C: gl.constexpr = values.shape[1]
+    # Rows, valid ([R] or [R, 1]) and columns ([C] or [1, C]) may come
+    # broadcast against the tile.
+    if len(rows.shape) == 2:
+        rows = gl.reshape(rows, [R])
+    if len(valid.shape) == 2:
+        valid = gl.reshape(valid, [R])
+    if len(columns.shape) == 2:
+        columns = gl.reshape(columns, [C])
+    gl.static_assert(C % 16 == 0)
+    # Eight adjacent columns per lane: each 32-bit word pairs a column with
+    # its neighbour, and a 64-column block is one 128-byte line per row.
+    LANES_C: gl.constexpr = C // 8 if C // 8 <= 64 else 64
+    pair_l: gl.constexpr = gl.BlockedLayout(
+        [1, 8], [64 // LANES_C, LANES_C], [gl.num_warps(), 1], [1, 0]
+    )
+    values = gl.convert_layout(values, pair_l)
+    r = gl.convert_layout(rows, gl.SliceLayout(1, pair_l))
+    v = gl.convert_layout(valid, gl.SliceLayout(1, pair_l))
+    # Rebuild the columns from the block start so their alignment (and the
+    # stores' width) is known.
+    start = gl.multiple_of(gl.min(columns, axis=0), 64)
+    owner = start // _SLICE_FEATURES
+    c = start + gl.arange(0, C, gl.SliceLayout(0, pair_l))
+    if owner == RANK:
+        gl.amd.cdna4.buffer_store(
+            values,
+            routes_ptr,
+            r[:, None] * routes_stride + c[None, :],
+            mask=v[:, None] & (c >= 0)[None, :],
+        )
+    else:
+        halves = gl.reshape(values.to(gl.uint16, bitcast=True), [R, C // 2, 2])
+        low, high = gl.split(halves)
+        words = low.to(gl.uint32) | (high.to(gl.uint32) << 16)
+        words_l: gl.constexpr = words.type.layout
+        w_rows = gl.convert_layout(r, gl.SliceLayout(1, words_l))
+        w_valid = gl.convert_layout(v, gl.SliceLayout(1, words_l))
+        first = gl.multiple_of(start % _SLICE_FEATURES // 2, 32)
+        slice_words = first + gl.arange(0, C // 2, gl.SliceLayout(0, words_l))
+        stage = (
+            gl.load(
+                epochs + w_rows // 8 * WORLD_SIZE + owner, mask=w_valid, other=0
+            ).to(gl.uint32)
+            % 3
+        )
+        iris_column_routes_push_words(
+            words, w_rows[:, None], slice_words[None, :], owner, stage[:, None],
+            w_valid[:, None] & (slice_words >= 0)[None, :], regions, RANK,
+            WORLD_SIZE, MAX_ROWS, STAGE_WORDS, CACHE
+        )  # fmt: skip
+
+
+@gluon.jit
 def _iris_column_routes_send(
     routes,
     epochs,
@@ -455,27 +582,17 @@ def _iris_column_routes_send(
     PEERS: gl.constexpr = WORLD_SIZE - 1
     delta = program % PEERS + 1
     row = program // PEERS
-    token = row // 8
     owner = (RANK + delta) % WORLD_SIZE
     words = _iris_column_routes_offsets()
-    partial = _iris_sanitize_lamport_bf16x2(
-        gl.amd.cdna4.buffer_load(
-            routes.to(gl.pointer_type(gl.uint32), bitcast=True),
-            row * _ROUTE_WORDS + owner * _SLICE_WORDS + words,
-        )
+    partial = gl.amd.cdna4.buffer_load(
+        routes.to(gl.pointer_type(gl.uint32), bitcast=True),
+        row * _ROUTE_WORDS + owner * _SLICE_WORDS + words,
     )
-    stage = gl.load(epochs + token * WORLD_SIZE + owner).to(gl.uint32) % 3
-    # The owner keeps one slot per other rank, indexed by distance - 1.
-    offsets = (
-        (stage * STAGE_WORDS).to(gl.int32)
-        + (PEERS - delta) * (MAX_ROWS * _ROUTE_WORDS)
-        + row * _SLICE_WORDS
-        + words
-    )
-    target = gl.multiple_of(
-        _iris_group_heap_base(owner, regions).to(gl.pointer_type(gl.uint32)), 16
-    )
-    gl.amd.cdna4.buffer_store(partial, target, offsets, cache=PEER_SIGNAL_STORE_CACHE)
+    stage = gl.load(epochs + row // 8 * WORLD_SIZE + owner).to(gl.uint32) % 3
+    iris_column_routes_push_words(
+        partial, row, words, owner, stage, words >= 0, regions, RANK, WORLD_SIZE,
+        MAX_ROWS, STAGE_WORDS, PEER_SIGNAL_STORE_CACHE
+    )  # fmt: skip
 
 
 @gluon.jit
@@ -741,6 +858,7 @@ def iris_fused_lamport_column_routed_rmsnorm_sum(
     EPS: gl.constexpr,
     WEIGHT_OFFSET: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    PUSHED: gl.constexpr,
 ):
     """Sum expert TP8 partial routes, apply the routed RMSNorm and weighted sum.
 
@@ -761,6 +879,9 @@ def iris_fused_lamport_column_routed_rmsnorm_sum(
        contracts that multiply-add only in some specializations, so the
        sums agree with it within one BF16 ULP.
     Every rank writes every column, so ranks agree bit for bit.
+    With ``PUSHED`` the producer already pushed every row's partials
+    (iris_column_routes_push_words from its epilogue), so there are no
+    senders: grid (16 * rows,).
     region holds [stage][slices from peers, completed slices from every rank,
     sums of squares] of 32-bit words for MAX_ROWS tokens. epochs[t, q] is the
     stage of token t's mailboxes for owner q's columns; only finisher (t, q)
@@ -774,7 +895,7 @@ def iris_fused_lamport_column_routed_rmsnorm_sum(
         (2 * WORLD_SIZE - 1) * _ROUTE_WORDS + WORLD_SIZE * WORLD_SIZE * 8
     )
     program = gl.program_id(0)
-    senders = rows * 8 * (WORLD_SIZE - 1)
+    senders = 0 if PUSHED else rows * 8 * (WORLD_SIZE - 1)
     # Waiting programs follow the programs they wait on, so every sender and
     # completer dispatches before a program that depends on it spins.
     if program < senders:

@@ -31,6 +31,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from utils import polling_cycles, votes_with_subgroup_mask
 
@@ -1337,6 +1338,7 @@ def test_column_routes_lamport_codegen():
             "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
+            "PUSHED": False,
         },
         num_warps=1,
         unspecialized=("rows",),
@@ -2845,6 +2847,25 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
         dist.barrier()
 
 
+@gluon.jit
+def _pushing_route_producer(
+    src, rows_count, SINK_ARGS, sink: gl.constexpr, SINK_CONSTS: gl.constexpr
+):
+    """A stand-in for an expert down-projection epilogue: [16, 128] tiles of
+    partial routes handed to ``sink`` (4 waves, 128-column blocks) with rows,
+    columns and valid broadcast against the tile, as the MoE kernels pass."""
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [8, 8], [4, 1], [1, 0])
+    rows = gl.program_id(0) * 16 + gl.arange(0, 16, gl.SliceLayout(1, layout))
+    columns = gl.program_id(1) * 128 + gl.arange(0, 128, gl.SliceLayout(0, layout))
+    valid = rows < rows_count * 8
+    tile = gl.load(
+        src + rows[:, None] * 4096 + columns[None, :],
+        mask=valid[:, None] & (columns >= 0)[None, :],
+        other=0.0,
+    )
+    sink(tile, rows[:, None], columns[None, :], valid[:, None], SINK_ARGS, SINK_CONSTS)
+
+
 def _muse_tp_column_routes_worker(rank, world_size, device):
     """Expert TP8 decode tokens complete their routes column-owned in one launch.
 
@@ -2854,7 +2875,12 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
     at each of 1, 8, 9 and 43 tokens, interleaved with the generic Lamport
     one-shot and two-shot reductions; a zero route and negative zeros travel
     as data, one rank is delayed in each replay, and the stage counters start
-    at the last stage so the replays wrap them.
+    at the last stage so the replays wrap them. The first layer's partials
+    arrive producer-direct (a producer epilogue pushes the other owners'
+    columns and writes only its own into a NaN-filled routes buffer, and the
+    reduction runs without senders) and must equal the sender path bit for
+    bit; the second uses the senders, so both share the mailboxes and stage
+    words.
     """
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_arch_policy,
@@ -2864,6 +2890,7 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
         prepare_muse_communication,
     )
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_column_routes_dn_sink,
         iris_fused_lamport_column_routed_rmsnorm_sum,
     )
     from tokenspeed_kernel.ops.moe import routed_input_scale_rmsnorm_sum
@@ -2956,16 +2983,47 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
         one_shot_input.fill_((rank + 1) * (phase + 1) / 16)
         two_shot.fill_((rank + 1) * (phase + 1) / 64)
 
+    pushed_routes = {
+        key: torch.empty_like(value) for key, value in routes.items() if key[1] == 0
+    }
+
     def run(run_counts):
         outputs = {}
         for rows in run_counts:
             for layer in range(layers):
+                if layer == 0:
+                    # Producer-direct: only this rank's columns reach the
+                    # routes buffer; the rest go straight to their owners.
+                    target = pushed_routes[rows, layer]
+                    target.fill_(float("nan"))
+                    sink_args, sink_consts = state.column_routes_push_args(target)
+                    _pushing_route_producer[(-(-rows * 8 // 16), 32)](
+                        routes[rows, layer],
+                        rows,
+                        sink_args,
+                        iris_column_routes_dn_sink,
+                        sink_consts,
+                        num_warps=4,
+                    )
+                    outputs[rows, layer] = state.reduce_column_routed_rmsnorm_sum(
+                        target, weights[rows, layer], norms[layer], 1e-6, 1.0, True
+                    )
+                    outputs[rows, "senders"] = state.reduce_column_routed_rmsnorm_sum(
+                        routes[rows, layer],
+                        weights[rows, layer],
+                        norms[layer],
+                        1e-6,
+                        1.0,
+                        False,
+                    )
+                    continue
                 outputs[rows, layer] = state.reduce_column_routed_rmsnorm_sum(
                     routes[rows, layer],
                     weights[rows, layer],
                     norms[layer],
                     1e-6,
                     1.0,
+                    False,
                 )
             iris_lamport_bf16_allreduce[(one_shot_input.numel() // 512,)](
                 one_shot_input,
@@ -2985,7 +3043,11 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
         return outputs
 
     def check(outputs, phase):
+        for rows in {key[0] for key in outputs}:
+            assert torch.equal(outputs[rows, 0], outputs[rows, "senders"]), rows
         for (rows, layer), output in outputs.items():
+            if layer == "senders":
+                continue
             # Every rank writes every column the same way.
             gathered = [torch.empty_like(output) for _ in range(world_size)]
             dist.all_gather(gathered, output)
