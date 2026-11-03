@@ -539,6 +539,13 @@ class MuseSparkFusedDecoderLayer:
     def _launch(self, key, q, gate, residual, positions, cache, prologue, normed_out):
         state, t, moe = self.state, self.tensors, self.moe
         rows = q.shape[0]
+        # 8 rows are one request's verify step, not 8 one-row requests: the
+        # kernel reads request r's pages for rows 8r .. 8r + 7.
+        if cache.seq_lens.shape[0] != key.requests:
+            raise ValueError(
+                f"fused Muse layer: {rows} rows need {key.requests} requests, "
+                f"got {cache.seq_lens.shape[0]}"
+            )
         if key.layer_kind == "full" and cache.split_schedule is None:
             raise ValueError("a full layer's decode view carries no split schedule")
         if (
