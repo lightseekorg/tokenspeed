@@ -72,6 +72,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
     poll_tags16,
     poll_until,
     poll_until_all,
+    record_failure,
     store_pairs,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import (
@@ -118,6 +119,7 @@ __all__ = [
     "poll_until",
     "poll_until_all",
     "realtime_ticks",
+    "record_failure",
     "release_drain",
     "scalar_load_glc",
     "scalar_load_glc_i64",
