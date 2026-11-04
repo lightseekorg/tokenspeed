@@ -830,7 +830,7 @@ if current_platform().is_amd:
         k-th score is used: the selection is redone from it deterministically,
         as every KVP rank must select the same tied candidates."""
         from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
-            rank_major_scores,
+            rank_major_scores_with_bounds,
             select_through_threshold,
             select_through_threshold_by_source,
         )
@@ -839,14 +839,9 @@ if current_platform().is_amd:
             gluon_dsa_logical_topk_gfx950,
         )
 
-        scores = rank_major_scores(records)
-        rows, columns = scores.shape
-        order, _ = gluon_dsa_logical_topk_gfx950(
-            scores,
-            torch.zeros((rows,), device=scores.device, dtype=torch.int32),
-            torch.full((rows,), columns, device=scores.device, dtype=torch.int32),
-            topk=topk,
-        )
+        scores, starts, ends = rank_major_scores_with_bounds(records)
+        rows = scores.shape[0]
+        order, _ = gluon_dsa_logical_topk_gfx950(scores, starts, ends, topk=topk)
         # Measured on MI350X: the per-source programs halve the selection up
         # to about four waves of them and lose beyond eight.
         degree = records.shape[0]
