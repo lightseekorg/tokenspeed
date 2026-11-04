@@ -1497,16 +1497,12 @@ class TestPrefillRoleGraphsTest:
         *,
         world_size: int,
         peer=None,
-        levers: str = "merge,qlayout,owned",
         max_logits_mb: int = 512,
-        probe_all_entries: bool = False,
     ):
         """Run the boot check with emulated peers holding ``peer(local)``
-        (this rank's own tuple by default), on a launch with ``levers`` as
-        ``--dsa-kvp-prefill-levers``, ``max_logits_mb`` as
-        ``--deepseek-v4-indexer-prefill-max-logits-mb`` and
-        ``probe_all_entries`` as ``--cudagraph-memory-probe-all-entries`` (the
-        launch defaults unless given); returns the groups it asked for."""
+        (this rank's own tuple by default), on a launch with ``max_logits_mb``
+        as ``--deepseek-v4-indexer-prefill-max-logits-mb``; returns the groups
+        it asked for."""
         import torch
 
         from tokenspeed.runtime.distributed.process_group_manager import (
@@ -1534,24 +1530,14 @@ class TestPrefillRoleGraphsTest:
             mapping=SimpleNamespace(
                 world_size=world_size, world_group=tuple(range(world_size))
             ),
-            dsa_kvp_prefill_levers=levers,
             deepseek_v4_indexer_prefill_max_logits_mb=max_logits_mb,
-            cudagraph_memory_probe_all_entries=probe_all_entries,
         )
         self.prefill_graph.check_rank_uniform_prefill_plan(owner, server_args)
         return groups
 
-    def _agreed_tuple(
-        self,
-        monkeypatch,
-        owner,
-        *,
-        levers: str,
-        max_logits_mb: int,
-        probe_all_entries: bool = False,
-    ):
-        """The tuple a rank launched with these KVP sparse prefill and
-        probe arguments brings to the boot check, as its peers see it."""
+    def _agreed_tuple(self, monkeypatch, owner, *, max_logits_mb: int):
+        """The tuple a rank launched with this indexer prefill logits budget
+        brings to the boot check, as its peers see it."""
         seen = []
 
         def record(local):
@@ -1563,9 +1549,7 @@ class TestPrefillRoleGraphsTest:
             owner,
             world_size=2,
             peer=record,
-            levers=levers,
             max_logits_mb=max_logits_mb,
-            probe_all_entries=probe_all_entries,
         )
         return seen[0]
 
@@ -1597,75 +1581,29 @@ class TestPrefillRoleGraphsTest:
             with pytest.raises(RuntimeError, match="differs across ranks"):
                 self._check_plan(monkeypatch, owner, world_size=2, peer=peer)
 
-    def test_a_rank_with_another_kvp_sparse_prefill_fails_the_boot(self, monkeypatch):
-        """A DSA break's KVP collectives follow --dsa-kvp-prefill-levers and
-        the indexer's prefill logits budget, replayed or eager: a rank
-        launched with another lever set or budget fails the boot although
-        it plans the same prefill graphs. Another spelling of the same lever
-        set is the same launch."""
+    def test_a_rank_with_another_indexer_logits_budget_fails_the_boot(
+        self, monkeypatch
+    ):
+        """The indexer's prefill logits budget sets how many KVP exchanges a
+        DSA break makes, replayed or eager: a rank launched with another
+        budget fails the boot although it plans the same prefill graphs."""
         import torch
 
         monkeypatch.delenv("NCCL_GRAPH_MIXING_SUPPORT", raising=False)
         for enforce_eager in (False, True):
             owner = self._planning_owner(enforce_eager=enforce_eager)
-            launch = self._agreed_tuple(
-                monkeypatch, owner, levers="merge,qlayout,owned", max_logits_mb=512
-            )
-            for levers in ("owned, merge,qlayout", "qlayout,owned,merge,"):
-                same = self._agreed_tuple(
-                    monkeypatch, owner, levers=levers, max_logits_mb=512
-                )
-                assert torch.equal(same, launch)
-            for levers, max_logits_mb in (
-                ("merge,owned", 512),
-                ("", 512),
-                ("merge,qlayout,owned", 2048),
-            ):
-                other = self._agreed_tuple(
-                    monkeypatch, owner, levers=levers, max_logits_mb=max_logits_mb
-                )
-                # Only the digest tells the launches apart.
-                assert torch.equal(other[[0, 1, 3]], launch[[0, 1, 3]])
-                with pytest.raises(RuntimeError, match="differs across ranks"):
-                    self._check_plan(
-                        monkeypatch,
-                        owner,
-                        world_size=2,
-                        peer=lambda local, other=other: other.clone(),
-                    )
-
-    def test_a_rank_with_another_probe_entry_choice_fails_the_boot(self, monkeypatch):
-        """The startup memory probe captures every entry or a sample of
-        each ladder by --cudagraph-memory-probe-all-entries, and its warmups
-        and breaks run collectives: a rank launched with the other choice
-        fails the boot before the probe, graphs on or off."""
-        import torch
-
-        monkeypatch.delenv("NCCL_GRAPH_MIXING_SUPPORT", raising=False)
-        for enforce_eager in (False, True):
-            owner = self._planning_owner(enforce_eager=enforce_eager)
-            sampled = self._agreed_tuple(
-                monkeypatch, owner, levers="merge,qlayout,owned", max_logits_mb=512
-            )
-            every = self._agreed_tuple(
-                monkeypatch,
-                owner,
-                levers="merge,qlayout,owned",
-                max_logits_mb=512,
-                probe_all_entries=True,
-            )
+            launch = self._agreed_tuple(monkeypatch, owner, max_logits_mb=512)
+            other = self._agreed_tuple(monkeypatch, owner, max_logits_mb=2048)
             # Only the digest tells the launches apart.
-            assert torch.equal(every[[0, 1, 3]], sampled[[0, 1, 3]])
-            assert every[2] != sampled[2]
+            assert torch.equal(other[[0, 1, 3]], launch[[0, 1, 3]])
+            assert other[2] != launch[2]
             with pytest.raises(RuntimeError, match="differs across ranks"):
                 self._check_plan(
                     monkeypatch,
                     owner,
                     world_size=2,
-                    peer=lambda local, every=every: every.clone(),
+                    peer=lambda local, other=other: other.clone(),
                 )
-            # Ranks that agree on it boot.
-            self._check_plan(monkeypatch, owner, world_size=2, probe_all_entries=True)
 
     def test_prefill_graphs_refuse_nccl_graph_mixing_off(self, monkeypatch):
         monkeypatch.setenv("NCCL_GRAPH_MIXING_SUPPORT", "0")

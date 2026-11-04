@@ -32,7 +32,6 @@ from typing import Literal
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.dsa_kvp_prefill import canonical_dsa_kvp_prefill_levers
 from tokenspeed.runtime.configs.numerics import (
     DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
@@ -379,6 +378,8 @@ class ServerArgs:
     max_num_seqs: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
+    # PD prefill role: tokens of each round kept for prompts that finish in it (0 = off).
+    prefill_short_first_tokens: int = 0
     max_prefill_tokens: int = 8192
     # Optional bound on summed per-request KV pages in a local prefill batch.
     chunk_prefill_kv_size: int | None = None
@@ -574,10 +575,6 @@ class ServerArgs:
     # forward's rows over the attention TP group (1 = off; equals
     # kv_parallel_size when on).
     query_context_parallel_size: int = 1
-    # Faster forms of the KVP sparse (DSA) prefill
-    # (configs/dsa_kvp_prefill.py): a comma-separated subset of
-    # DSA_KVP_PREFILL_LEVERS, resolved to that order; empty for none.
-    dsa_kvp_prefill_levers: str = "merge,qlayout,owned"
     deepseek_v41_attention_query_swa_min_tokens: int = 4096
     deepseek_v41_attention_query_min_tokens: int = 1024
     deepseek_v41_attention_query_parallel_size: int = 1
@@ -701,10 +698,6 @@ class ServerArgs:
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
     disable_kda_prefill_graph: bool = False
-    # Keep Kimi-K3.1 prefill forwards eager; on the prefill role, and on the
-    # aggregated role when the launch names its prefill buckets, it otherwise
-    # replays prefill graphs around its DSA attention breaks.
-    disable_dsa_prefill_graph: bool = False
     # Breakable prefill graph bucket cap: None = auto min(8192, chunk); 0 disables.
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
@@ -719,9 +712,6 @@ class ServerArgs:
     enable_memory_saver: bool = False
     weight_memory_policy: Literal["cpu_backup", "discard"] | None = None
     disable_cudagraph_memory_reserve: bool = False
-    # The startup memory probe captures every graph entry and projects none
-    # (cudagraph_memory.probe_cudagraph_memory); off samples a few per ladder.
-    cudagraph_memory_probe_all_entries: bool = False
     mla_disable_ragged: bool = False
 
     # parallel strategy
@@ -1066,11 +1056,6 @@ class ServerArgs:
             ("--dsa-slot-order", self.dsa_slot_order, DSA_SLOT_ORDERS),
         ):
             _require_choice(flag, value, choices)
-        # One spelling per lever set, whatever the order or spacing given, so
-        # every rank (and any digest of the arguments) sees the same value.
-        self.dsa_kvp_prefill_levers = canonical_dsa_kvp_prefill_levers(
-            self.dsa_kvp_prefill_levers
-        )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -2715,6 +2700,15 @@ class ServerArgs:
             help="Maximum number of tokens the scheduler may issue in a single iteration. Setting this to -1 disables chunked prefill.",
         )
         parser.add_argument(
+            "--prefill-short-first-tokens",
+            type=int,
+            default=ServerArgs.prefill_short_first_tokens,
+            help="PD prefill role only: a round whose chunked prefill cannot finish "
+            "keeps up to this many of its --chunked-prefill-size tokens for waiting "
+            "prompts whose uncached rest completes in that round. At most half of "
+            "--chunked-prefill-size; 0 (the default) turns it off.",
+        )
+        parser.add_argument(
             "--enable-mixed-batch",
             action="store_true",
             dest="enable_mixed_batch",
@@ -3801,16 +3795,6 @@ class ServerArgs:
             "attention is included in prefill graphs by default.",
         )
         parser.add_argument(
-            "--disable-dsa-prefill-graph",
-            action="store_true",
-            help="Keep Kimi-K3.1 prefill forwards eager. Without pipeline "
-            "parallelism it otherwise replays breakable prefill graphs with its "
-            "DSA attention at eager breaks on --disaggregation-mode prefill with "
-            "--disaggregation-layerwise-interval 0, and on --disaggregation-mode "
-            "null when --prefill-graph-capture-token-sizes names the buckets and "
-            "--enable-mixed-batch is off. Other models are unaffected.",
-        )
-        parser.add_argument(
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
@@ -3910,16 +3894,6 @@ class ServerArgs:
             action="store_true",
             help="Do not reserve the projected CUDA-graph pool memory, nor what startup "
             "keeps resident on CUDA, in the KV cache budget.",
-        )
-        parser.add_argument(
-            "--cudagraph-memory-probe-all-entries",
-            action="store_true",
-            help="Let the startup CUDA-graph memory probe capture every graph entry "
-            "and reserve what the captures took, instead of sampling a few entries "
-            "per ladder and projecting the rest. Startup is longer by the captures "
-            "of the entries otherwise skipped. Meant for a ladder the projection "
-            "may reserve above its cost, such as many prefill buckets with inline "
-            "variants sharing one pool. Every rank must pass the same value.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -4068,22 +4042,6 @@ class ServerArgs:
             "keeps its attention weights head-replicated; this model-wide layout "
             "is separate from its operator-level "
             "--deepseek-v41-*-query-parallel-size options.",
-        )
-        parser.add_argument(
-            "--dsa-kvp-prefill-levers",
-            type=str,
-            default=ServerArgs.dsa_kvp_prefill_levers,
-            help="Comma-separated faster forms of the sparse (DSA) prefill "
-            "over --kv-parallel-size pages, each keeping its step's result: "
-            "'merge' merges each query row's index candidates on one rank "
-            "(all-to-all, then an all-gather of the selection) instead of on "
-            "every rank; 'qlayout' gathers the query heads rank-major and has "
-            "the sparse core write its partials in the exchange's layout; "
-            "'owned' sizes the index candidate tiles to the pages a rank "
-            "owns. An empty value or 'none' runs without them. 'qlayout' "
-            "applies to an FP8 KV cache only, and is off where the sparse "
-            "prefill runs a pinned kernel plan (--numerics rl-bitwise). "
-            "Default: merge,qlayout,owned.",
         )
         parser.add_argument(
             "--dense-tp-size",

@@ -1183,14 +1183,9 @@ class CacheGroupRouter(AttentionBackend):
         )
 
     # ------------------------------------------------------------------
-    # DSA KVP prefill surface: the model's top-k over KVP pages applies the
-    # --dsa-kvp-prefill-levers its DSA leaf applies, and tiles by the owned
-    # width the leaf planned for the forward.
+    # DSA KVP prefill surface: the model's top-k over KVP pages tiles by the
+    # owned width the leaf planned for the forward.
     # ------------------------------------------------------------------
-
-    @property
-    def kvp_prefill_levers(self) -> frozenset[str]:
-        return self._sole_leaf("kvp_prefill_levers").kvp_prefill_levers
 
     def prefill_index_columns(self) -> int | None:
         return self._sole_leaf("prefill_index_columns").prefill_index_columns()

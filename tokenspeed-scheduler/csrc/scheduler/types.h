@@ -95,10 +95,7 @@ struct SchedulerConfig {
     // cold prompt waits for all of its chunks. On, the resident still
     // advances by at least max_scheduled_tokens minus this every round and
     // keeps capacity priority (Scheduler::scheduleShortFirst). The fused and
-    // D roles ignore it. The environment variable
-    // TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS sets it when it is left 0
-    // (Scheduler construction), so a deployment can turn it on without a
-    // server arg; an explicit value wins.
+    // D roles ignore it (--prefill-short-first-tokens).
     std::int32_t prefill_short_first_tokens{0};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};

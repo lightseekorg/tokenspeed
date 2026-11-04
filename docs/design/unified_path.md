@@ -68,7 +68,7 @@ pure extend; `None` otherwise). The one leaf that attends a shard — GPU DSA
 prefix-chunk gathers by page owner the same way. On a pure KVP extend the
 GPU DSA leaf also bounds the index pages any rank owns from it
 (`max_owned_index_pages`), so its indexer tiles span that owned width
-(`--dsa-kvp-prefill-levers owned`) with the same plan on every rank. No
+with the same plan on every rank. No
 default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
 idle replay passes the empty `[:0]` slices), so a node that reads a field
@@ -291,16 +291,9 @@ from one first bound to that pool:
   way, whatever shape its cost takes down the ladder: flat, falling with the
   entry's width, or lumpy. That is not a bound: a cost that drops between
   two anchors is priced short over that stretch. Nor is it known to be
-  tight. One observation: Kimi-K3.1 on the PD prefill role, with a 20-bucket
-  256..4096 ladder at request counts 1 and 4 (60 entries sharing one pool),
-  was reserved 11.64 GB (4.73 GB measured over 15 sampled entries, 6.91 GB
-  projected) and booted with 6.64 GB more device memory free than the
-  same launch without the ladder. The suspected cause, unconfirmed, is that
-  the readings of a pool captured widest first carry its one-time growth,
-  which the projection then prices into every skipped entry.
-  `--cudagraph-memory-probe-all-entries` captures every entry instead and
-  projects none, at the cost of the skipped captures' startup time; the
-  probe logs every reading either way, which is the data to settle it.
+  tight: Kimi-K3.1 on the PD prefill role, with 60 prefill entries sharing
+  one pool, was reserved 11.64 GB and booted with 6.64 GB more device memory
+  free than the same launch without the ladder.
   The result is reduced across ranks with MAX. The orchestrator
   releases the probe's graphs and collects the cycles they sit in, then
   rebuilds on the memory profile the probe build took -- where a boot without
@@ -650,9 +643,10 @@ capture/refresh signatures are pinned by
 
 ### Graded CUDA-graph support
 
-A backend's static graph capability is a class attribute,
-`cuda_graph_support: CudaGraphSupport(decode_graph, prefill_graph)`, never a
-scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
+A backend's graph capability is a class attribute,
+`cuda_graph_support: CudaGraphSupport(decode_graph, prefill_graph)`, which an
+instance may only narrow or widen from its construction arguments (the DSA
+leaf below), never a scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
 over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
@@ -661,14 +655,13 @@ consumer narrows a padded replay to the live rows in an eager break: a KPool
 instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, opted in
 by an explicit `--prefill-graph-capture-token-sizes` without
 `--enable-mixed-batch`, on the aggregated role
-(`DSAConfig.padded_prefill_replay`, off with `--disable-dsa-prefill-graph`).
+(`DSAConfig.padded_prefill_replay`).
 That instance declaration follows launch arguments, so the prefill role and
 Kimi-K3.1's aggregated role check at boot that every rank plans the same
 prefill graphs (`check_rank_uniform_prefill_plan`; keyed on the role and
 the checkpoint's `ModelConfig.dsa_padded_prefill_replay`, never on a rank's
-graph decision), and that every rank runs the same KVP
-sparse prefill in those breaks: `--dsa-kvp-prefill-levers` and the indexer's
-prefill logits budget choose its collectives. Qwen4-Exp's
+graph decision) under the same indexer prefill logits budget, which sets how
+many KVP exchanges those breaks make. Qwen4-Exp's
 PLE and QSA indexer support the breakable graph: their model methods are eager
 break points, where live request metadata controls cache writes and padded
 token rows are sliced before state updates. The root composes its actual

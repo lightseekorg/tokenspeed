@@ -25,11 +25,8 @@ from typing import Any
 
 from tokenspeed_kernel.platform import pdl_enabled
 
-from tokenspeed.runtime.configs.dsa_kvp_prefill import parse_dsa_kvp_prefill_levers
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
-# "dsa_kvp_prefill_levers" holds the parsed frozenset of the argument; each DSA
-# leaf narrows it to the levers it applies (DSABackend.kvp_prefill_levers).
 global_server_args_dict: dict = {
     "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
@@ -54,9 +51,6 @@ global_server_args_dict: dict = {
     "logprob_order": ServerArgs.logprob_order,
     "moe_combine_order": ServerArgs.moe_combine_order,
     "dsa_slot_order": ServerArgs.dsa_slot_order,
-    "dsa_kvp_prefill_levers": parse_dsa_kvp_prefill_levers(
-        ServerArgs.dsa_kvp_prefill_levers
-    ),
     "tp_batch_invariant": ServerArgs.tp_batch_invariant,
     "head_tp_exchange_max_rows": ServerArgs.head_tp_exchange_max_rows,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
@@ -121,9 +115,6 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "logprob_order": server_args.logprob_order,
             "moe_combine_order": server_args.moe_combine_order,
             "dsa_slot_order": server_args.dsa_slot_order,
-            "dsa_kvp_prefill_levers": parse_dsa_kvp_prefill_levers(
-                server_args.dsa_kvp_prefill_levers
-            ),
             "tp_batch_invariant": server_args.tp_batch_invariant,
             "head_tp_exchange_max_rows": server_args.head_tp_exchange_max_rows,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
@@ -391,16 +382,6 @@ class Envs:
     # Qwen4-Exp QSA
     TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH = EnvStr("auto")
     TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB = EnvInt(256)
-
-    # DSA under KVP/DCP: FP32 logits budget of one decode/verify top-k tile.
-    # 0 scores all rows in one tile, as the unsharded decode top-k does; its
-    # logits span the whole page-table width (about 2 GiB at bs 64 x 8 rows
-    # with a 1M-token table), held in the decode graph pool. Tiles never
-    # exceed 2**31 logits elements (2047 rows at 1M). A positive value
-    # (e.g. 2560) bounds that buffer at the cost of more tiles per layer,
-    # and bounds each candidate exchange the same way (kvp * topk * 12
-    # bytes per row, never less than one tile).
-    TOKENSPEED_DSA_DCP_DECODE_MAX_LOGITS_MB = EnvInt(0)
 
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)

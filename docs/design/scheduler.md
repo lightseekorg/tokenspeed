@@ -233,14 +233,15 @@ get the round only when no prefill scheduled — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
 
 **The one exception is opt-in and P-only: the short-first bypass.** With
-`SchedulerConfig::prefill_short_first_tokens = S > 0` (the environment variable
-`TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS` fills it when it is left 0), a P round
+`SchedulerConfig::prefill_short_first_tokens = S > 0`
+(`--prefill-short-first-tokens`), a P round
 whose resident prefill cannot finish keeps up to `S` tokens of its budget for
 waiting prompts whose whole uncached rest — with the replay window, and not
 cut at a junction or an in-forward checkpoint — fits one final chunk. The
 resident's chunk is admitted first, on the budget minus what they reserve, so
-it keeps capacity priority and advances by at least `max_scheduled_tokens - S`
-every round; if it fails, no bypass prompt runs. A bypass prompt is admitted
+it keeps capacity priority and, in every round it is admitted, advances by at
+least `max_scheduled_tokens - S` (less only where chunk alignment or a
+checkpoint cuts it); if it fails, no bypass prompt runs. A bypass prompt is admitted
 only as a completing chunk, so it never becomes an incomplete prefill: on the
 P role its pages leave through the PD transfer alone, and the set of
 incomplete prefills is still the one this section allows. A headroom guard

@@ -149,35 +149,12 @@ def dsa_padded_prefill_replay(
     token bucket) with its DSA attention at eager breaks.
 
     The model declares the contract (``dsa_padded_prefill_replay``: every DSA
-    operation sits in one eager break that narrows a padded replay to its
-    live rows). It is admitted for the target on the roles that run prefill
-    forwards: the PD prefill role and the aggregated (``null``) role, never
-    the PD decode role, whose extend forwards are not prompt prefills. On the
-    prefill role it further needs layerwise KV transfer off
-    (``--disaggregation-layerwise-interval 0``): the transfer step counter it
-    arms there turns the inline KDA route off. The aggregated role transfers
-    nothing and arms no counter, so the interval, which defaults to 1, does
-    not apply to it. Both roles need no pipeline stages (whose DSpark context
-    producer the captured segments would bake in) and no
-    ``--disable-dsa-prefill-graph``.
-
-    The aggregated role is opt-in, and admits it only under the conditions
-    it has been checked in. The launch must name its bucket ladder
-    (``--prefill-graph-capture-token-sizes``): the automatic ladder (up to
-    ``min(8192, chunk)`` tokens in steps of at most 12.5 % from a 16-token
-    floor, an inline variant per bucket) has not been measured beside the
-    decode ladder, and an aggregated launch that names none keeps its
-    prefill eager, as before the role was admitted. And it must leave
-    ``--enable-mixed-batch`` off (aggregated DCP refuses it anyway): a MIXED
-    round may replay a padded bucket on the ordinary route with decode rows
-    inside the narrowed DSA break, which no test covers. Every replayed
-    round is then a pure extend and may take the inline KDA variants.
-
-    On the aggregated role the prefill graphs live beside the decode graphs:
-    the decode ladder is captured first into its own private pool, then the
-    prefill buckets into theirs on the same capture stream. With a drafter,
-    both record the FULL hidden-state capture it reads (no context producer
-    without pipeline stages).
+    operation sits in one eager break that narrows a padded replay to its live
+    rows). The target admits it without pipeline stages, on the PD prefill role
+    with layerwise KV transfer off (its step counter turns the inline KDA route
+    off), and on the aggregated role when the launch names its bucket ladder
+    (``--prefill-graph-capture-token-sizes``) and leaves
+    ``--enable-mixed-batch`` off, so every replayed round is a pure extend.
     """
     if server_args.disaggregation_mode == "prefill":
         role_admits = server_args.disaggregation_layerwise_interval <= 0
@@ -193,7 +170,7 @@ def dsa_padded_prefill_replay(
         and not is_draft
         and role_admits
         and server_args.pipeline_parallel_size == 1
-        and not server_args.disable_dsa_prefill_graph
+        and not server_args.disable_prefill_graph
     )
 
 

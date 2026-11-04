@@ -36,7 +36,6 @@ from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.selection import NoKernelFoundError
 from tokenspeed_kernel.signature import format_signatures
 
-from tokenspeed.runtime.configs.dsa_kvp_prefill import DSA_KVP_PREFILL_LEVERS
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -197,29 +196,17 @@ def test_sparse_plans_decide_decode_graph_capture(registry, graph):
     assert not support.prefill_graph
 
 
-def test_pinned_prefill_plan_keeps_its_core_under_kvp_prefill_levers(
-    registry, monkeypatch
-):
-    monkeypatch.setitem(
-        global_server_args_dict,
-        "dsa_kvp_prefill_levers",
-        frozenset(DSA_KVP_PREFILL_LEVERS),
-    )
+def test_pinned_prefill_plan_keeps_its_core_for_kvp_prefill(registry):
     _register(registry, True, graph=False)
     backend = _backend()
     assert backend.prefill_kernel_plan is not None
-    # The rank-major core would replace the pinned plan's; the row-owner
-    # merge and owned-width tiles keep every row's selection.
-    assert backend.kvp_prefill_levers == {"merge", "owned"}
+    # The rank-major query layout would replace the pinned plan's sparse core.
+    assert backend.kvp_prefill_query_layout is False
 
 
-@pytest.mark.parametrize("levers", [frozenset(DSA_KVP_PREFILL_LEVERS), frozenset()])
-def test_unplanned_leaf_applies_the_requested_kvp_prefill_levers(
-    registry, monkeypatch, levers
-):
+def test_unplanned_leaf_takes_the_kvp_prefill_query_layout(registry, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
     monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "selection")
-    monkeypatch.setitem(global_server_args_dict, "dsa_kvp_prefill_levers", levers)
     backend = _backend()
     assert backend.prefill_kernel_plan is None
-    assert backend.kvp_prefill_levers == levers
+    assert backend.kvp_prefill_query_layout is True

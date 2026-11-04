@@ -147,31 +147,6 @@ const IDLE_WAIT: Duration = Duration::from_millis(10);
 /// forward runs.
 const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
-/// The P role's transfer polls, for A/B runs: the head poll
-/// (`TOKENSPEED_PD_HEAD_POLL=0` turns it off) and the interval of the poll
-/// while a forward runs (`TOKENSPEED_PD_POLL_DURING_FORWARD_MS`, 0 turns it
-/// off). Both decide collectives, whose tags pair by kind, group and
-/// sequence, so they must be the same on every rank.
-fn pd_round_options() -> (bool, Option<Duration>) {
-    let head_poll = std::env::var("TOKENSPEED_PD_HEAD_POLL")
-        .ok()
-        .is_none_or(|on| on.trim() != "0");
-    let interval = match std::env::var("TOKENSPEED_PD_POLL_DURING_FORWARD_MS") {
-        Err(_) => Some(TRANSFER_POLL_INTERVAL),
-        Ok(ms) => match ms.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(ms) => Some(Duration::from_millis(ms)),
-            Err(_) => {
-                tracing::warn!(
-                    "TOKENSPEED_PD_POLL_DURING_FORWARD_MS={ms:?} is not a count of ms; using 2 ms"
-                );
-                Some(TRANSFER_POLL_INTERVAL)
-            }
-        },
-    };
-    (head_poll, interval)
-}
-
 /// How long the scheduler's active page count is reused before it is taken
 /// again.
 const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
@@ -576,11 +551,6 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// the plan and pruned by the mirrored output states, so the same on
     /// every rank.
     handed_over: HashSet<String>,
-    /// P role: poll the transfers at the round head (A/B switch).
-    head_poll: bool,
-    /// P role: how often to poll the handed-over transfers while a forward
-    /// runs; `None` turns that off (A/B switch).
-    transfer_poll_interval: Option<Duration>,
     /// The scheduler's active page count, reused across rounds.
     active_pages: ActivePages,
 }
@@ -610,17 +580,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         ranks: Ranks,
         subsystems: Subsystems,
     ) -> Self {
-        let (head_poll, transfer_poll_interval) = pd_round_options();
-        if outputs.role() == Role::Prefill {
-            // Every P rank logs them: a mismatch would pair collectives
-            // wrongly.
-            let every_ms = transfer_poll_interval.map_or(0, |every| every.as_millis() as u64);
-            tracing::info!(
-                head_poll,
-                poll_during_forward_ms = every_ms,
-                "PD prefill round options"
-            );
-        }
         Self {
             controls: Controls::new(config.controls.clone()),
             batch_logger: BatchLogger::new(config.batch_log.clone()),
@@ -649,8 +608,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             last_load_report: None,
             reported_load: None,
             handed_over: HashSet::new(),
-            head_poll,
-            transfer_poll_interval,
             active_pages: ActivePages::default(),
         }
     }
@@ -770,7 +727,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.note_forward(forwarded);
             std::thread::sleep(PAUSED_IDLE_SLEEP);
         } else {
-            if self.head_poll && self.outputs.role() == Role::Prefill {
+            if self.outputs.role() == Role::Prefill {
                 // Advance point 3 (Principle 3): the P role's bootstrap gate.
                 // A request admitted at this head whose decode node already
                 // pre-allocated is planned in this round, not after this
@@ -2215,9 +2172,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         events: &mut Vec<ForwardEvent>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
-        let Some(interval) = self.transfer_poll_interval else {
-            return Ok(());
-        };
+        let interval = TRANSFER_POLL_INTERVAL;
         if self.config.in_flight_depth != 0
             || self.in_flight.len() != 1
             || self.outputs.role() != Role::Prefill

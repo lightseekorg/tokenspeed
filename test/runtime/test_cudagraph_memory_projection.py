@@ -46,7 +46,6 @@ from tokenspeed.runtime.execution.cudagraph_memory import (  # noqa: E402
     _ladders,
     estimate_cudagraph_memory,
     probe_cudagraph_memory,
-    probe_positions,
     reserve_and_rebind,
 )
 from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
@@ -319,16 +318,7 @@ def test_the_projection_refuses_samples_the_capture_cannot_produce(
         estimate_cudagraph_memory(samples, ladders)
 
 
-def _probe(
-    samples,
-    ladders,
-    *,
-    world_size=1,
-    gpu_id=0,
-    hungriest=None,
-    startup=0,
-    all_entries=False,
-):
+def _probe(samples, ladders, *, world_size=1, gpu_id=0, hungriest=None, startup=0):
     """Run the probe with a fabricated observer; returns (reserve, seen)."""
     seen = {"gpu_ids": []}
 
@@ -342,32 +332,24 @@ def _probe(
             self.samples.setdefault(series, []).append(0)
             yield
 
-    def ladder(value, entries):
-        # A ladder given as plain widths samples the positions the probe asked
-        # for, as the real capture_ladders does; a CapturedLadder pins them.
-        if isinstance(value, CapturedLadder):
-            return value
-        return CapturedLadder(list(value), probe_positions(len(value), entries))
-
     executor = SimpleNamespace(
         capture_graphs=lambda entries, observer: seen.update(entries=entries),
         drafter=None,
         captures_drafter_prefill_graph=False,
         forward_step=SimpleNamespace(
             capture_ladders=lambda entries: {
-                k: ladder(v, entries) for k, v in ladders.items() if "decode" in k
+                k: v for k, v in ladders.items() if "decode" in k
             }
         ),
         prefill_graph=SimpleNamespace(
             capture_ladders=lambda entries: {
-                k: ladder(v, entries) for k, v in ladders.items() if "decode" not in k
+                k: v for k, v in ladders.items() if "decode" not in k
             }
         ),
     )
     server_args = SimpleNamespace(
         device="cuda",
         mapping=SimpleNamespace(world_size=world_size, world_group="world"),
-        cudagraph_memory_probe_all_entries=all_entries,
     )
     with contextlib.ExitStack() as stack:
         stack.enter_context(
@@ -397,42 +379,6 @@ def test_the_probe_samples_its_own_device_and_reserves_every_ladder() -> None:
     assert seen["gpu_ids"] == [3]
     assert seen["entries"] == PROBE_ENTRIES_PER_LADDER
     assert reserve == MIB * (730 + 318) + 4 * _rate(18, 3)
-
-
-def test_the_probe_can_capture_every_entry_and_project_none() -> None:
-    """--cudagraph-memory-probe-all-entries: every entry captured, the reserve
-    is what the captures took, and the readings are logged in capture order."""
-    # A shared prefill pool: the first capture and the first inline variant
-    # pay it, every later entry a few MiB.
-    prefill = (900, 600, 4, 6, 4, 2, 4, 4)
-    decode = (300, 6, 6, 6, 6, 6)
-    samples = {
-        "prefill": [MIB * s for s in prefill],
-        "decode:default": [MIB * s for s in decode],
-    }
-    # Plain widths: the ladders sample what the probe asks for, so a probe
-    # that captured every entry but described its ladders as sampled would
-    # hand the projection more readings than positions and fail here.
-    widths = [64, 64, 48, 48, 32, 32, 16, 16]
-    ladders = {"prefill": widths, "decode:default": [6, 5, 4, 3, 2, 1]}
-    with mock.patch.object(cudagraph_memory.logger, "info") as info:
-        reserve, seen = _probe(samples, ladders, all_entries=True)
-
-    assert seen["entries"] is None
-    assert reserve == MIB * (sum(prefill) + sum(decode))
-    lines = [str(call.args[0]) for call in info.call_args_list]
-    (readings,) = [line for line in lines if "probe readings" in line]
-    assert "decode:default [300, 6, 6, 6, 6, 6]" in readings
-    assert "prefill [900, 600, 4, 6, 4, 2, 4, 4]" in readings
-    assert "unsampled entries 0;" in lines[-1]
-
-    # The default probe samples the same ladder at its positions and projects
-    # the entries it skipped (the estimator's own tests pin that pricing).
-    positions = probe_positions(len(widths), PROBE_ENTRIES_PER_LADDER)
-    sampled = {"prefill": [MIB * prefill[position] for position in positions]}
-    projected, seen = _probe(sampled, {"prefill": widths})
-    assert seen["entries"] == PROBE_ENTRIES_PER_LADDER
-    assert projected > MIB * sum(prefill[position] for position in positions)
 
 
 def test_the_probe_reserves_what_the_reduction_returned() -> None:
@@ -516,9 +462,7 @@ def test_memory_taken_between_captures_is_not_reserved() -> None:
         capture_graphs=capture,
     )
     server_args = SimpleNamespace(
-        device="cuda",
-        mapping=SimpleNamespace(world_size=1, world_group=None),
-        cudagraph_memory_probe_all_entries=False,
+        device="cuda", mapping=SimpleNamespace(world_size=1, world_group=None)
     )
     with mock.patch.object(torch, "get_device_module", lambda _d: device):
         reserve = probe_cudagraph_memory(

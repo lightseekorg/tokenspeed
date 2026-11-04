@@ -559,7 +559,7 @@ def _records_cache(degree, rank, device):
     return cache.to(torch.float8_e4m3fn)
 
 
-def _records_leaf(dsa, group, rank, levers):
+def _records_leaf(dsa, group, rank, query_layout):
     """The DSA leaf's head-sharded KVP prefill state on an FP8 cache."""
     leaf = object.__new__(dsa.DSABackend)
     leaf.kernel_page_size = 64
@@ -580,7 +580,7 @@ def _records_leaf(dsa, group, rank, levers):
     leaf.step_counter = None
     leaf.num_attention_heads = _RECORDS_HEADS * len(group)
     leaf.num_local_heads = _RECORDS_HEADS
-    leaf.kvp_prefill_levers = levers
+    leaf.kvp_prefill_query_layout = query_layout
     # configure_runtime's probe on an FP8 cache: the Triton core
     # (test_dcp_records_core_on_the_real_k31_selection).
     leaf._dcp_records_core = True
@@ -636,7 +636,7 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
             if use_pynccl
             else nullcontext()
         )
-        # The qlayout arm must run, not only agree: count its core's launches.
+        # The query-layout arm must run, not only agree: count its core's launches.
         records_core = dsa.dsa_prefill_dcp_records
         launches = []
 
@@ -657,16 +657,16 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
         )
         with context:
             # 1037 rows reach the records core; the Triton launch of 5 rows
-            # splits its keys, so qlayout falls back to the packed partials.
+            # splits its keys, so the query layout falls back to the packed partials.
             for tokens, records_arm in ((1037, True), (5, False)):
                 slots, lengths = _records_selection(degree, tokens, device)
                 generator = torch.Generator().manual_seed(900 + rank)
                 q = torch.randn((tokens, _RECORDS_HEADS, 576), generator=generator)
                 q = q.to(device=device, dtype=torch.bfloat16)
                 outputs = []
-                for levers in (frozenset(), frozenset({"qlayout"})):
+                for query_layout in (False, True):
                     launches.clear()
-                    leaf = _records_leaf(dsa, group, rank, levers)
+                    leaf = _records_leaf(dsa, group, rank, query_layout)
                     outputs.append(
                         leaf.forward_sparse_prefill(
                             q=q,
@@ -678,7 +678,7 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
                             max_seq_len=cache.shape[0] * degree,
                         )
                     )
-                    ran = bool(levers) and records_arm
+                    ran = query_layout and records_arm
                     shape = (degree, tokens, _RECORDS_HEADS, 576)
                     assert launches == ([shape] if ran else [])
                 off, on = outputs
@@ -709,7 +709,7 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
             assert torch.equal(padded[:, :gathered], token_major)
             assert not padded[:, gathered:].any()
             if current_platform().is_blackwell:
-                # Where the trtllm-gen core runs them, the qlayout lever's
+                # Where the trtllm-gen core runs them, the query layout's
                 # padded query gives the leaf's own padding's partials, so
                 # the same output bit for bit.
                 wide = SimpleNamespace(**{**vars(layer), "tp_q_head_num": wide_heads})
@@ -717,8 +717,8 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
                 q = torch.randn((1037, wide_heads, 576), generator=generator)
                 q = q.to(device=device, dtype=torch.bfloat16)
                 outputs = []
-                for levers in (frozenset(), frozenset({"qlayout"})):
-                    leaf = _records_leaf(dsa, group, rank, levers)
+                for query_layout in (False, True):
+                    leaf = _records_leaf(dsa, group, rank, query_layout)
                     leaf.kernel_solution = None
                     leaf.num_attention_heads = gathered
                     leaf.num_local_heads = wide_heads

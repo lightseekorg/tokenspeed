@@ -237,7 +237,7 @@ _NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
         ({"disaggregation_mode": "prefill"}, False, True),
         ({"disaggregation_mode": "prefill"}, True, False),
         (
-            {"disaggregation_mode": "prefill", "disable_dsa_prefill_graph": True},
+            {"disaggregation_mode": "prefill", "disable_prefill_graph": True},
             False,
             False,
         ),
@@ -294,7 +294,7 @@ _NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
         (
             {
                 "disaggregation_mode": "null",
-                "disable_dsa_prefill_graph": True,
+                "disable_prefill_graph": True,
                 **_NAMED_BUCKETS,
             },
             False,
@@ -348,10 +348,10 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
     server_args.prefill_graph_capture_sizes = [256, 4096]
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
-    server_args.disable_dsa_prefill_graph = True
+    server_args.disable_prefill_graph = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
-    server_args.disable_dsa_prefill_graph = False
+    server_args.disable_prefill_graph = False
     server_args.enable_mixed_batch = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False

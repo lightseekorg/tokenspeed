@@ -170,18 +170,17 @@ void SchedulerConfig::Validate() const {
     }
     if (prefill_short_first_tokens < 0) {
         throw std::invalid_argument(
-            "Scheduler: prefill_short_first_tokens (TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS) must be >= 0");
+            "Scheduler: prefill_short_first_tokens (--prefill-short-first-tokens) must be >= 0");
     }
     // Only the P role spends it, so only there must it leave the resident
     // prefill a chunk: at most half the round, and never less than the
     // smallest chunk a replayable model can advance by (the minimum
     // ValidateCapacityInputs holds the whole budget to). The fused and D
-    // roles accept any non-negative value and ignore it, because a PD
-    // deployment may export the variable to both servers.
+    // roles accept any non-negative value and ignore it.
     if (role == Role::kP && prefill_short_first_tokens > 0) {
         if (prefill_short_first_tokens > max_scheduled_tokens / 2) {
             throw std::invalid_argument(
-                "Scheduler: prefill_short_first_tokens (TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS) must be at most half "
+                "Scheduler: prefill_short_first_tokens (--prefill-short-first-tokens) must be at most half "
                 "of max_scheduled_tokens (--chunked-prefill-size), so the resident prefill keeps the larger share");
         }
         std::int32_t replay_window_tokens = 0;

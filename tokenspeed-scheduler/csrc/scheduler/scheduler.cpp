@@ -22,7 +22,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -30,8 +29,6 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <string_view>
-#include <system_error>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -73,37 +70,9 @@ std::vector<std::int32_t> slotsPerParentByGroup(const SchedulerConfig& config) {
     return slots_per_group;
 }
 
-constexpr const char* kPrefillShortFirstTokensEnv = "TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS";
-
-// The short-first bypass (SchedulerConfig::prefill_short_first_tokens) is a
-// deployment experiment, so it can be switched on from the environment
-// without a server arg: the variable fills the field when the config leaves
-// it 0 (an explicit value wins; the C++ and Python test suites clear the
-// variable at startup, so a shell that exports it does not turn the bypass
-// on under them). Unset or empty means off. Anything but a whole
-// non-negative decimal number is rejected rather than read as 0: a typo must
-// not quietly run the baseline. Every mirrored rank must inherit the same
-// environment; nothing at startup compares it across ranks besides the line
-// each rank logs.
-void applyPrefillShortFirstEnv(SchedulerConfig& config) {
-    const char* value = std::getenv(kPrefillShortFirstTokensEnv);
-    if (value == nullptr || *value == '\0' || config.prefill_short_first_tokens != 0) {
-        return;
-    }
-    const std::string_view text{value};
-    std::int32_t tokens = 0;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), tokens);
-    if (error != std::errc{} || end != text.data() + text.size() || tokens < 0) {
-        throw std::invalid_argument(std::string{"Scheduler: "} + kPrefillShortFirstTokensEnv + "='" +
-                                    std::string{text} + "' is not a non-negative token count");
-    }
-    config.prefill_short_first_tokens = tokens;
-}
-
 // config_ is the first member, so routing it through this helper validates the
 // configuration before any pool or the coordinator is built off it.
 SchedulerConfig validated(SchedulerConfig config) {
-    applyPrefillShortFirstEnv(config);
     config.Validate();
     return config;
 }

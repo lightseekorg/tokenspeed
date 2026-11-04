@@ -23,11 +23,10 @@
 The first indexer layer of a forward builds the local page table, the row
 geometry and the compact owned pages; later layers of the same forward reuse
 them through the shared decode top-k record. Drafts, other tables, other
-verify widths and other row counts rebuild. The decode logits budget comes
-from ``TOKENSPEED_DSA_DCP_DECODE_MAX_LOGITS_MB`` (0: one tile).
+verify widths and other row counts rebuild. The decode top-k scores in one
+tile.
 
-A KVP prefill under ``--dsa-kvp-prefill-levers owned`` does the same through
-the shared prefill record, at the owned width the DSA leaf plans from the
+A KVP prefill does the same through the shared prefill record, at the owned width the DSA leaf plans from the
 host page table; the owned-width pages are planned once per forward only
 within the memory cap (otherwise every tile plans its own).
 """
@@ -97,7 +96,6 @@ def recorded(monkeypatch):
     monkeypatch.setattr(glm5, "build_dcp_index_metadata", build)
     monkeypatch.setattr(glm5, "select_dsa_topk", select)
     monkeypatch.setattr(glm5, "local_topk_to_global_slots", lambda **kw: None)
-    monkeypatch.delenv("TOKENSPEED_DSA_DCP_DECODE_MAX_LOGITS_MB", raising=False)
     return builds, selects
 
 
@@ -242,21 +240,13 @@ def test_other_forward_inputs_rebuild(recorded, change):
     assert second.dcp_index is builds[1]
 
 
-@pytest.mark.parametrize(
-    "env,budget",
-    [(None, None), ("0", None), ("-3", None), ("64", 64 << 20), ("2560", 2560 << 20)],
-)
-def test_decode_logits_budget_comes_from_the_environment(
-    recorded, monkeypatch, env, budget
-):
+def test_decode_scores_every_row_in_one_tile(recorded):
     _, selects = recorded
-    if env is not None:
-        monkeypatch.setenv("TOKENSPEED_DSA_DCP_DECODE_MAX_LOGITS_MB", env)
     seq_lens, page_table, q_len = _batch(requests=1, q_len=1)
     _decode_layer(_layer(), _ctx(seq_lens, q_len), page_table, seq_lens, q_len)
 
     [(_, max_logits_bytes)] = selects
-    assert max_logits_bytes == budget
+    assert max_logits_bytes is None
 
 
 def test_unsharded_decode_keeps_no_dcp_record(monkeypatch):
@@ -316,12 +306,11 @@ def owned_prefill(monkeypatch):
     return plans, selects
 
 
-def _prefill_ctx(columns, *, levers=frozenset({"owned"})):
+def _prefill_ctx(columns):
     """The router surface the KVP prefill top-k reads, for one forward."""
     backend = SimpleNamespace(
         cache_placement=lambda layer: _PLACEMENT,
         sparse_topk=SimpleNamespace(prefill=None, decode=None),
-        kvp_prefill_levers=levers,
         prefill_index_columns=lambda: columns,
     )
     pool = SimpleNamespace(
@@ -426,16 +415,10 @@ def test_prefill_owned_width_cache_respects_memory_cap(owned_prefill, columns, p
     assert selected is metadata
 
 
-@pytest.mark.parametrize(
-    "levers,columns",
-    [(frozenset({"merge", "qlayout"}), 32), (frozenset({"owned"}), None)],
-)
-def test_prefill_keeps_the_table_width_without_owned_columns(
-    owned_prefill, levers, columns
-):
+def test_prefill_keeps_the_table_width_without_owned_columns(owned_prefill):
     plans, selects = owned_prefill
     rows = 28
-    ctx = _prefill_ctx(columns, levers=levers)
+    ctx = _prefill_ctx(None)
     _, _, record = _first_prefill_layer(ctx, _prefill_table(64), rows)
 
     assert record.dcp_index is None and not plans
@@ -450,7 +433,7 @@ def test_prefill_keeps_the_table_width_without_owned_columns(
 # --- the DSA leaf's owned width ----------------------------------------------
 
 
-def _kvp_leaf(rank, *, degree=4, levers=frozenset({"owned"})):
+def _kvp_leaf(rank, *, degree=4):
     """A GPU DSA leaf over KVP pages, as far as its extend metadata reads."""
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = 64
@@ -460,7 +443,6 @@ def _kvp_leaf(rank, *, degree=4, levers=frozenset({"owned"})):
     backend.kvp_rank = rank
     backend.kvp_block_granularity = 128
     backend.kvp_virtual_block_count = 1 + 64 * degree
-    backend.kvp_prefill_levers = levers
     backend.query_shard_metadata = None
     backend._prefill_page_table = None
     backend._prefill_index_columns = None
@@ -537,14 +519,10 @@ def test_owned_index_columns_follow_the_host_table(rank):
     assert backend.prefill_index_columns() is None
 
 
-@pytest.mark.parametrize("case", ["no_lever", "no_host_table", "unsharded"])
-def test_owned_index_columns_need_the_lever_kvp_and_the_host_table(case):
+@pytest.mark.parametrize("case", ["no_host_table", "unsharded"])
+def test_owned_index_columns_need_kvp_and_the_host_table(case):
     table, prefix, extend = _owned_width_table()
-    backend = _kvp_leaf(
-        0,
-        degree=1 if case == "unsharded" else 4,
-        levers=frozenset({"merge"}) if case == "no_lever" else frozenset({"owned"}),
-    )
+    backend = _kvp_leaf(0, degree=1 if case == "unsharded" else 4)
     _init_extend(
         backend,
         table,

@@ -40,8 +40,7 @@ the budget's tiles), must match eager after the lengths and the table change
 in place.
 
 A prefill (a long cached prefix with a chunk, and a cold chunk) selects at
-the owned width the host table bounds (``--dsa-kvp-prefill-levers owned``)
-what it selects at the table's width, with the pages planned once per
+the owned width the host table bounds what it selects at the table's width, with the pages planned once per
 forward or per tile, merged on every rank or on the row owner, under skewed
 ownership and with every page on rank 0 (a prefill-graph capture's dummy,
 whose owned width is the table's).
@@ -54,11 +53,11 @@ exchanges whose last one does not split evenly over the ranks, and in one
 exchange.
 
 Two DSA layers' eager breaks (the model's ``forward_dsa_core``: the narrowing
-of a padded replay, the index-K write and the KVP prefill top-k with its
-lever gates) captured in a breakable prefill graph from that capture batch
-and replayed padded for live prefills above and below the "merge" lever's
-row gate must select, with the levers and without them, what the same
-layers select eagerly over the live rows.
+of a padded replay, the index-K write and the KVP prefill top-k) captured in
+a breakable prefill graph from that capture batch and replayed padded for
+live prefills above and below the row-owner merge's row gate must select,
+at the owned width and at the table's, what the same layers select eagerly
+over the live rows.
 """
 
 import dataclasses
@@ -435,8 +434,7 @@ def _worker(rank, degree, columns, rendezvous):
                 metadata=metadata,
                 **kwargs,
             )
-            # The planned pages, row-sliced across the budget's tiles, as a
-            # positive TOKENSPEED_DSA_DCP_DECODE_MAX_LOGITS_MB selects.
+            # The planned pages, row-sliced across a logits budget's tiles.
             planned_tiled = select_dsa_topk(
                 q,
                 weights,
@@ -779,13 +777,13 @@ def test_k31_dcp_decode_topk_matches_unsharded(tmp_path, degree, columns):
 
 # KVP prefill requests as (prefix, new rows): a long prefix whose blocks are
 # skewed onto rank 0, a cold request whose rows see fewer than topk tokens,
-# and a short one. The 1153 rows cross the "merge" lever's 1024-row gate.
+# and a short one. The 1153 rows cross the row-owner merge's 1024-row gate.
 _PREFILL = ((6000, 800), (0, 300), (2500, 53))
 # On the 512-column table this scores 128 rows per tile, and a row-owner
 # exchange (topk * 24 bytes per row) joins two tiles: five exchanges, the
 # last of 129 rows, two tiles padded to whole rows per rank.
 _PREFILL_BUDGET = 16 << 20
-# The prefill graph's capture batch (lever 1): one request of a bucket's rows
+# The prefill graph's capture batch: one request of a bucket's rows
 # without a prefix, every page column on one block.
 _CAPTURE_ROWS = 2048
 
@@ -1022,9 +1020,8 @@ class _IndexKPool:
 
 class _KvpPrefillBackend:
     """The attention backend as a DSA break reads it on a pure KVP extend:
-    the forward's chunked-prefill metadata, write span and owned index width,
-    the cache placement, the shared top-k, and the DSA leaf's
-    ``--dsa-kvp-prefill-levers``.
+    the forward's chunked-prefill metadata, write span and owned index width
+    (planned when ``owned_width``), the cache placement and the shared top-k.
 
     :meth:`begin` stands in for ``init_forward_metadata``: it plans the owned
     width from the host table as ``DSABackend._plan_prefill_index_columns``
@@ -1032,11 +1029,11 @@ class _KvpPrefillBackend:
     or a live one) starts from its own metadata.
     """
 
-    def __init__(self, placement, levers: frozenset[str]):
+    def __init__(self, placement, owned_width: bool):
         from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 
         self.placement = placement
-        self.kvp_prefill_levers = levers
+        self.owned_width = owned_width
         self.sparse_topk = SparseTopKShare()
         self.forward_decode_metadata = None
         self.chunked_prefill_metadata: _ChunkedPrefillMetadata | None = None
@@ -1057,7 +1054,7 @@ class _KvpPrefillBackend:
         )
         self._write_slots = _extend_slots(table, prefill).to(device)
         self._index_columns = None
-        if "owned" in self.kvp_prefill_levers:
+        if self.owned_width:
             bound = max_owned_index_pages(
                 table, prefix_lens + new_lens, page_size=_PAGE, placement=self.placement
             )
@@ -1089,7 +1086,7 @@ class _IdentityAttnComm:
 def _k31_dsa_layer(records: list):
     """``GlmDsaSparseAttentionMixin`` as a Kimi-K3.1 DSA layer runs it in its
     eager break: the mixin's own ``forward_dsa_core`` (the narrowing of a
-    padded replay, the index-K write, the prefill top-k with its KVP lever
+    padded replay, the index-K write, the prefill top-k with its KVP
     gates and collectives), around an indexer that reads the index query from
     ``q_norm`` and the index key and head weights from ``hidden_states``. The
     sparse core appends each forward's top-k to ``records`` and outputs the
@@ -1213,7 +1210,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
         visible = torch.arange(_TOPK, dtype=torch.int32, device=device)
         every_token = torch.where(visible < capture_causal.unsqueeze(1), visible, -1)
         # Live prefills (prefill, host table, first row of q): above the
-        # "merge" lever's row gate, then below it (merged on every rank).
+        # row-owner merge's row gate, then below it (merged on every rank).
         batches = (
             (_PREFILL, table, 0),
             (_PREFILL[1:], table[1:], _PREFILL[0][1]),
@@ -1257,11 +1254,10 @@ def _padded_replay_worker(rank, degree, rendezvous):
                 output_layout=ForwardOutputLayout(bs, bs, 0, 1),
             )
 
-        # "qlayout" acts in the DSA leaf's sparse core, which this layer
-        # replaces; the indexer reads "merge" and "owned".
+        # The query layout acts in the DSA leaf's sparse core, which this layer replaces.
         selections = {}
-        for levers in (frozenset({"merge", "owned"}), frozenset()):
-            backend = _KvpPrefillBackend(placement, levers)
+        for owned_width in (True, False):
+            backend = _KvpPrefillBackend(placement, owned_width)
             pool = _IndexKPool(_plane(keys, virtual_blocks, placement, device))
             # The bucket's static inputs, holding the capture batch's rows.
             static_positions = torch.arange(_CAPTURE_ROWS, device=device)
@@ -1322,7 +1318,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
                     rtol=0,
                     atol=0,
                 )
-                if "owned" in levers:
+                if owned_width:
                     owned = record.dcp_index.local_page_table >= 0
                     assert bool(owned.all()) if rank == 0 else not bool(owned.any())
                     assert record.dcp_index.columns == _CAPTURE_ROWS // _PAGE
@@ -1332,7 +1328,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
             # The capture batch's index-K writes went to block 1's pages.
             pool.plane = _plane(keys, virtual_blocks, placement, device)
 
-            selections[levers] = []
+            selections[owned_width] = []
             for prefill, batch_table, first_row in batches:
                 live_rows = sum(new for _, new in prefill)
                 rows_of_q = slice(first_row, first_row + live_rows)
@@ -1388,7 +1384,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
                     replayed_output[:live_rows], eager_output, rtol=0, atol=0
                 )
                 assert not bool(replayed_output[live_rows:].any())
-                if "owned" in levers:
+                if owned_width:
                     # Planned once per forward, at the leaf's owned width
                     # within the forward's table, and reused by the next
                     # layer; no row's owned pages overflow it.
@@ -1399,14 +1395,14 @@ def _padded_replay_worker(rank, degree, rendezvous):
                     assert not bool(index.pages.overflow.any())
                 else:
                     assert replayed[0].dcp_index is None
-                selections[levers].append((replayed, causal))
+                selections[owned_width].append((replayed, causal))
             print(
-                f"rank {rank}/{degree}: levers {sorted(levers)} padded replays "
+                f"rank {rank}/{degree}: owned_width={owned_width} padded replays "
                 "matched eager",
                 flush=True,
             )
 
-        # The levers keep every row's selection.
+        # The owned width keeps every row's selection.
         on, off = selections.values()
         for (on_layers, causal), (off_layers, _) in zip(on, off, strict=True):
             for got, expected in zip(on_layers, off_layers, strict=True):
@@ -1423,13 +1419,12 @@ def _padded_replay_worker(rank, degree, rendezvous):
 
 @pytest.mark.parametrize("degree", [2, 4])
 def test_k31_kvp_prefill_padded_replay_matches_eager(tmp_path, degree):
-    """Lever 1 with lever 3: two Kimi-K3.1 DSA layers' breaks captured in a
-    breakable prefill graph over a 2048-row bucket from the capture batch,
-    whose pages all sit on rank 0's block, then replayed padded for live
-    prefills above and below the "merge" lever's row gate. With the merge
-    and owned levers and without them, the capture batch selects every
-    visible token at the table's owned width, and each replay selects what
-    the same layers select eagerly over the live rows."""
+    """Two Kimi-K3.1 DSA layers' breaks captured in a breakable prefill graph
+    over a 2048-row bucket from the capture batch, whose pages all sit on
+    rank 0's block, then replayed padded for live prefills above and below
+    the row-owner merge's row gate. At the owned width and at the table's,
+    the capture batch selects every visible token, and each replay selects
+    what the same layers select eagerly over the live rows."""
     if (
         torch.version.cuda is None
         or not torch.cuda.is_available()

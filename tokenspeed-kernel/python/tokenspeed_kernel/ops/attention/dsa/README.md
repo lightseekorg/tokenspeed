@@ -372,7 +372,7 @@ and merge scores, `degree * topk * 12` bytes per row, fit it, so a long
 prefill chunk never exchanges every row at once. Without a budget (DCP
 decode by default) every row joins one exchange.
 
-A KVP prefill of at least 1024 rows under `--dsa-kvp-prefill-levers merge`
+A KVP prefill of at least 1024 rows
 merges each row on one rank instead of on every rank. An exchange's rows are
 padded with invalid candidates to equal slices, one per rank; an all-to-all
 sends each slice's candidates to its owner, which runs the same merge on

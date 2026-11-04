@@ -122,22 +122,10 @@ def test_kda_prefill_graph_routes_to_engine():
     assert r.gateway == []
 
 
-def test_dsa_prefill_graph_routes_to_engine():
-    r = _split(["--disable-dsa-prefill-graph"])
-    assert r.engine == ["--disable-dsa-prefill-graph"]
+def test_prefill_short_first_tokens_routes_to_engine():
+    r = _split(["--prefill-short-first-tokens", "2048"])
+    assert r.engine == ["--prefill-short-first-tokens", "2048"]
     assert r.gateway == []
-
-
-def test_dsa_kvp_prefill_levers_route_to_engine():
-    """An empty lever list is the flag's value, not a bare flag."""
-    for argv, value in (
-        (["--dsa-kvp-prefill-levers", "merge,owned"], "merge,owned"),
-        (["--dsa-kvp-prefill-levers", ""], ""),
-        (["--dsa-kvp-prefill-levers="], ""),
-    ):
-        r = _split([*argv, "--dp-sampling"])
-        assert r.engine == ["--dsa-kvp-prefill-levers", value, "--dp-sampling"]
-        assert r.gateway == []
 
 
 def test_multi_value_capture_sizes_route_to_engine():

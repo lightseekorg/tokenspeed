@@ -86,7 +86,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
 # Prefill chunks with fewer rows keep every rank selecting every row: there the
@@ -94,10 +94,7 @@ _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
 # 320 rows 314 us whole vs 340 us split, 384 rows 387 vs 342).
 _PREFILL_TOPK_TP_SPLIT_MIN_ROWS = 384
 _PREFILL_TOPK_ROW_ALIGN = 16
-# KVP prefill chunks with fewer rows merge every row's index candidates on
-# every rank even under the "merge" lever (--dsa-kvp-prefill-levers): there
-# the row-owner merge's two extra collectives per exchange cost more than the
-# merging and gathered bytes they save.
+# Below this many rows every rank merges every KVP prefill row: the row-owner merge's two extra collectives cost more.
 _KVP_PREFILL_ROW_OWNER_MIN_ROWS = 1024
 
 
@@ -688,7 +685,6 @@ class GlmDsaSparseAttentionMixin:
                     placement=placement,
                     page_size=page_size,
                 )
-            max_logits_mb = max(0, envs.TOKENSPEED_DSA_DCP_DECODE_MAX_LOGITS_MB.get())
             offsets, _ = select_dsa_topk(
                 q,
                 weights,
@@ -702,7 +698,7 @@ class GlmDsaSparseAttentionMixin:
                 softmax_scale=self.indexer.weights_softmax_scale,
                 initial_tokens=0,
                 local_tokens=0,
-                max_logits_bytes=(max_logits_mb << 20) or None,
+                max_logits_bytes=None,
                 metadata=dcp_index,
             )
             local_topk_to_global_slots(
@@ -1040,30 +1036,21 @@ class GlmDsaSparseAttentionMixin:
         if placement is not None:
             if indexer_output.query_proj is not None:
                 q = indexer_output.query_proj(q)
-            # The --dsa-kvp-prefill-levers the DSA leaf applies. Every gate
-            # below reads host values equal on every rank of the KVP group,
-            # so the ranks issue the same collectives: the live rows (a
-            # padded prefill-graph replay is narrowed in forward_dsa_core
-            # before the indexer) and the owned width the leaf planned from
-            # the forward's host page table.
-            levers = ctx.attn_backend.kvp_prefill_levers
-            row_owner = (
-                "merge" in levers and q.shape[0] >= _KVP_PREFILL_ROW_OWNER_MIN_ROWS
-            )
+            # Both gates read host values equal on every KVP rank, so the ranks issue the same collectives.
+            row_owner = q.shape[0] >= _KVP_PREFILL_ROW_OWNER_MIN_ROWS
             global_starts, global_ends = row_starts, row_ends
-            if "owned" in levers:
-                owned_index = self._owned_width_dcp_index(
-                    ctx,
-                    dcp_index,
-                    q,
-                    weights,
-                    index_k_cache,
-                    page_table,
-                    seq_lens,
-                    row_starts,
-                    row_ends,
-                    placement=placement,
-                )
+            owned_index = self._owned_width_dcp_index(
+                ctx,
+                dcp_index,
+                q,
+                weights,
+                index_k_cache,
+                page_table,
+                seq_lens,
+                row_starts,
+                row_ends,
+                placement=placement,
+            )
             offsets, topk_lens = select_dsa_topk(
                 q,
                 weights,
@@ -1134,9 +1121,8 @@ class GlmDsaSparseAttentionMixin:
         *,
         placement: CachePlacement,
     ) -> DCPIndexMetadata | None:
-        """This forward's DCP index metadata at the leaf's owned width
-        (``--dsa-kvp-prefill-levers owned``), or ``None`` to keep the page
-        table's width.
+        """This forward's DCP index metadata at the leaf's owned width, or
+        ``None`` to keep the page table's width.
 
         The leaf plans the width per forward from the host page table, the
         same on every rank (``prefill_index_columns``). Every indexer layer

@@ -213,9 +213,8 @@ def estimate_cudagraph_memory(
     )
 
 
-def _ladders(executor: ModelExecutor, entries: int | None) -> dict[str, CapturedLadder]:
-    """Every ladder a full capture records, and the positions the probe sampled
-    (all of them when ``entries`` is None)."""
+def _ladders(executor: ModelExecutor, entries: int) -> dict[str, CapturedLadder]:
+    """Every ladder a full capture records, and the positions the probe sampled."""
     drafter = CapturedLadder((1,), (0,))
     return {
         **executor.prefill_graph.capture_ladders(entries),
@@ -299,41 +298,12 @@ def probe_cudagraph_memory(
     One-time bytes outside every capture (warmups, workspaces) are left to
     the utilization headroom, which funds them on a boot without a reserve
     too.
-
-    ``--cudagraph-memory-probe-all-entries`` captures every entry of every
-    ladder instead of ``PROBE_ENTRIES_PER_LADDER`` positions, so nothing is
-    projected and the reserve is the bytes the captures took, at the cost of
-    the skipped entries' warmups and captures at startup. It is for a ladder
-    the projection may price above its cost. The suspected case, a
-    hypothesis the per-reading log line below is there to confirm or refute,
-    is a ladder whose entries share one private pool captured widest first
-    (prefill buckets and their inline variants): it may pay most of that
-    pool in its first captures, while the projection prices every skipped
-    entry at the sampled window's rate.
     """
     device_module = torch.get_device_module(server_args.device)
     observer = DriverMemoryDeltaObserver(device_module, gpu_id)
-    # The entries every rank captures: a rank capturing others runs other
-    # collectives in the warmups and breaks, so the flag must match across
-    # ranks. check_rank_uniform_prefill_plan compares it where it runs (the
-    # prefill role, and the aggregated role of a model with the DSA
-    # padded-replay contract); nothing compares it on the other roles, the
-    # PD decode role among them, where ranks launched with different values
-    # hang in this probe instead of failing with a message.
-    entries = (
-        None
-        if server_args.cudagraph_memory_probe_all_entries
-        else PROBE_ENTRIES_PER_LADDER
-    )
-    executor.capture_graphs(entries=entries, observer=observer)
+    executor.capture_graphs(entries=PROBE_ENTRIES_PER_LADDER, observer=observer)
 
-    ladders = _ladders(executor, entries)
-    # The raw readings, in capture order: what a projection change is checked against.
-    readings = "; ".join(
-        f"{name} [{', '.join(f'{sample / 2**20:.0f}' for sample in samples)}]"
-        for name, samples in sorted(observer.samples.items())
-    )
-    logger.info(f"CUDA-graph memory probe readings (MiB, capture order): {readings}")
+    ladders = _ladders(executor, PROBE_ENTRIES_PER_LADDER)
     estimate = estimate_cudagraph_memory(observer.samples, ladders)
     # A net release over startup never lowers the reserve below the graphs' projection.
     startup = max(startup_resident_bytes, 0)

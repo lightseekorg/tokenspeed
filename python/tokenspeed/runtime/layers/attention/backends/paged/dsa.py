@@ -42,7 +42,6 @@ from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-from tokenspeed.runtime.configs.dsa_kvp_prefill import effective_dsa_kvp_prefill_levers
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -101,8 +100,7 @@ logger = logging.getLogger(__name__)
 # per leaf, view or cache rebind.
 _LOGGED_SPARSE_LEAVES: set[tuple] = set()
 
-# Owned-width KVP index tiles (--dsa-kvp-prefill-levers owned) span whole
-# groups of this many pages, so a forward's tile widths take few values.
+# Owned-width KVP index tiles span whole groups of this many pages, so tile widths take few values.
 _OWNED_INDEX_COLUMN_ALIGN = 16
 
 
@@ -314,13 +312,8 @@ class DSABackend(PagedAttentionBackend):
                 ),
                 ignore_layout=False,
             )
-        # The --dsa-kvp-prefill-levers this leaf's KVP prefill applies; the
-        # model's KVP top-k reads the same set through the router.
-        self.kvp_prefill_levers: frozenset[str] = effective_dsa_kvp_prefill_levers(
-            global_server_args_dict["dsa_kvp_prefill_levers"],
-            batch_invariant=self.batch_invariant,
-            prefill_kernel_plan_pinned=self.prefill_kernel_plan is not None,
-        )
+        # Rank-major query gather with partials in the exchange layout; a pinned prefill plan keeps its own core.
+        self.kvp_prefill_query_layout: bool = self.prefill_kernel_plan is None
         # Whether the KVP prefill's ordinary selection runs the Triton core on
         # an FP8 cache, which the qlayout lever replaces by its DCP records
         # form; probed in configure_runtime, once a router's solution pin has
@@ -1094,7 +1087,6 @@ class DSABackend(PagedAttentionBackend):
             and num_extends > 0
             and self.query_shard_metadata is None
             and page_table_cpu is not None
-            and "owned" in self.kvp_prefill_levers
         ):
             self._prefill_index_columns = self._plan_prefill_index_columns(
                 page_table_cpu[:num_extends],
@@ -1133,7 +1125,7 @@ class DSABackend(PagedAttentionBackend):
         """The owned width, in kernel pages, of this forward's KVP index tiles.
 
         Set by :meth:`init_forward_metadata` for a pure extend over KVP pages
-        under ``--dsa-kvp-prefill-levers owned`` (and not query-sharded): the
+        (and not query-sharded): the
         model's KVP top-k plans each query row's owned index pages that wide
         instead of the page table's width, so a logits budget fits more rows
         per tile. ``None`` keeps the page table's width.
@@ -1573,7 +1565,7 @@ class DSABackend(PagedAttentionBackend):
             # narrows before this call).
             if (
                 not keep_all_heads
-                and "qlayout" in self.kvp_prefill_levers
+                and self.kvp_prefill_query_layout
                 and self._dcp_records_core
                 and dsa_prefill_dcp_records_supported(
                     tokens=q_view.shape[0],
@@ -1595,7 +1587,7 @@ class DSABackend(PagedAttentionBackend):
             core_heads = trtllm_sparse_mla_query_heads(gathered_heads)
             if (
                 not keep_all_heads
-                and "qlayout" in self.kvp_prefill_levers
+                and self.kvp_prefill_query_layout
                 and self._dcp_padded_query
                 and core_heads != gathered_heads
             ):

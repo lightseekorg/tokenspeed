@@ -939,14 +939,14 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
 @pytest.mark.parametrize(
     "arm",
     [
-        # --dsa-kvp-prefill-levers without qlayout.
-        "levers_off",
-        # qlayout requested, but the leaf's prefill selection is not the
+        # Query layout off, as under a pinned prefill plan.
+        "query_layout_off",
+        # Query layout on, but the leaf's prefill selection is not the
         # Triton core the records core stands in for.
         "unprobed",
-        # qlayout on a prefill whose Triton launch would split its keys.
+        # Query layout on a prefill whose Triton launch would split its keys.
         "split_size",
-        # qlayout: rank-major gather, records core, records exchange.
+        # Query layout: rank-major gather, records core, records exchange.
         "records",
     ],
 )
@@ -974,9 +974,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
     backend.kvp_virtual_block_count = 5
     backend.query_shard_metadata = None
     backend.step_counter = None
-    backend.kvp_prefill_levers = (
-        frozenset() if arm == "levers_off" else frozenset({"qlayout"})
-    )
+    backend.kvp_prefill_query_layout = arm != "query_layout_off"
     # configure_runtime's probe verdict, set directly: the probe admits only
     # an FP8 cache (test_dcp_records_core_follows_the_ordinary_prefill_selection),
     # and the forward reads only this flag, whatever the query dtype.

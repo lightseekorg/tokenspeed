@@ -23,7 +23,6 @@
 // writeback and recovery.
 
 #include <algorithm>
-#include <cstdlib>
 #include <map>
 #include <memory>
 #include <optional>
@@ -7602,42 +7601,6 @@ TEST_F(BoundedReplayDecodeRoleSuite, RemoteAdmissionLandsTheRetainedTailAndRepla
 // 12-page (24-token) prompt whose first 8-token chunk has landed, so two
 // whole rounds of it are left when the short prompts arrive.
 // ---------------------------------------------------------------------------
-namespace {
-
-constexpr const char* kShortFirstEnv = "TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS";
-
-// Sets an environment variable for one scope and restores what was there.
-class ScopedEnv {
-public:
-    ScopedEnv(const char* name, const char* value) : name_{name} {
-        if (const char* previous = std::getenv(name)) {
-            previous_ = std::string{previous};
-        }
-        ::setenv(name, value, /*overwrite=*/1);
-    }
-    ~ScopedEnv() {
-        if (previous_) {
-            ::setenv(name_, previous_->c_str(), /*overwrite=*/1);
-        } else {
-            ::unsetenv(name_);
-        }
-    }
-    ScopedEnv(const ScopedEnv&) = delete;
-    ScopedEnv& operator=(const ScopedEnv&) = delete;
-
-private:
-    const char* name_;
-    std::optional<std::string> previous_;
-};
-
-// Every suite in this binary builds schedulers with the field left 0, which
-// the variable fills: clear it once, before any test runs, so a shell that
-// exports it (as a P server's does) cannot turn the bypass on under them.
-// ScopedEnv sets it where a test needs it.
-[[maybe_unused]] const bool kShortFirstEnvCleared = (::unsetenv(kShortFirstEnv), true);
-
-}  // namespace
-
 class ShortFirstPrefillRoleSuite : public SchedulerTestSuite {
 protected:
     virtual Role RoleUnderTest() const { return Role::kP; }
@@ -8153,37 +8116,6 @@ TEST_F(ShortFirstPrefillRoleSuite, ValidationBoundsTheShareOnThePrefillRoleOnly)
     EXPECT_NO_THROW(fused.Validate());
     fused.prefill_short_first_tokens = -1;
     EXPECT_THROW(fused.Validate(), std::invalid_argument);
-}
-
-// TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS fills the field when the config
-// leaves it 0. It is read once, when the scheduler is built; empty means
-// unset, and anything but a whole non-negative number is refused.
-TEST_F(ShortFirstOffPrefillRoleSuite, TheEnvironmentTurnsItOnWhenTheConfigLeavesItZero) {
-    for (const char* malformed : {"abc", "-4", "4x", " 4"}) {
-        SCOPED_TRACE(malformed);
-        ScopedEnv env{kShortFirstEnv, malformed};
-        EXPECT_THROW(Scheduler{Config()}, std::invalid_argument);
-    }
-    {
-        ScopedEnv env{kShortFirstEnv, ""};
-        EXPECT_NO_THROW(Scheduler{Config()});
-    }
-    {
-        ScopedEnv env{kShortFirstEnv, "4"};
-        scheduler_ = std::make_unique<Scheduler>(Config());
-    }
-    ASSERT_NO_FATAL_FAILURE(StartLongPrefill());
-    Arrive(MakeRequestSpec("short", /*num_pages=*/1, /*start=*/2001));
-    const ExecutionPlan plan = PlanOnce();
-    const ForwardBatch* batch = FindForwardBatch(plan);
-    ASSERT_NE(batch, nullptr);
-    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"short", "long"}));
-    EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{2, 6}));
-}
-
-TEST_F(ShortFirstPrefillRoleSuite, AnExplicitValueWinsOverTheEnvironment) {
-    ScopedEnv env{kShortFirstEnv, "abc"};
-    EXPECT_NO_THROW(Scheduler{Config()}) << "the variable is not read when the config sets the field";
 }
 
 // Bounded replay: a continuation's hit re-feeds the 16-token window, so its

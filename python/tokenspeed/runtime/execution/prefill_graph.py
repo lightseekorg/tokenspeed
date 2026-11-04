@@ -68,7 +68,6 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
 import torch
 import tqdm
 
-from tokenspeed.runtime.configs.dsa_kvp_prefill import canonical_dsa_kvp_prefill_levers
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
     HandoffSlot,
@@ -1583,55 +1582,28 @@ class PrefillGraph:
 def check_rank_uniform_prefill_plan(
     prefill_graph: PrefillGraph, server_args: ServerArgs
 ) -> None:
-    """Fail the boot unless every rank will capture the same prefill graphs
-    and run the same KVP sparse prefill in their DSA breaks.
+    """Fail the boot unless every rank captures the same prefill graphs.
 
-    The ranks of an instance must take the same graph-or-eager decision,
-    bucket and variant for every forward: captured segments and the eager
-    breaks between them run collectives (a DSA break's KVP all-gathers and
-    all-to-all among them), so a rank running eager where its peers replay
-    hangs them. That decision follows per-process server arguments (such as
-    ``--disable-dsa-prefill-graph``), so the ranks compare whether prefill
-    graphs are on, how many graphs the capture plan holds and a digest of
-    that plan over the world's gloo group, before any capture runs.
-
-    The digest also covers the two arguments that choose the collectives of
-    a DSA break's KVP sparse prefill, replayed or eager: the
-    ``--dsa-kvp-prefill-levers`` set, in its one spelling, which picks how
-    the index candidates and the attention partials are exchanged, and
-    ``--deepseek-v4-indexer-prefill-max-logits-mb``, which sizes the index
-    tiles and so how many exchanges a forward makes. Ranks that differ in
-    either issue different collectives and hang each other.
-
-    And it covers ``--cudagraph-memory-probe-all-entries``: the startup
-    memory probe that follows captures every entry or a sample of each
-    ladder by it, and the warmups and breaks of a capture run collectives,
-    so ranks that differ in it hang each other in the probe.
-
-    It runs on the prefill role, and on the aggregated role of a model that
-    declares the DSA padded-replay contract (``build_device_side``), on
-    every rank whatever its graph decision.
-
-    It also refuses ``NCCL_GRAPH_MIXING_SUPPORT=0`` with prefill graphs on:
-    the eager breaks issue NCCL collectives on communicators whose
-    collectives the captured segments also record.
+    Captured segments and the eager breaks between them run collectives (a DSA
+    break's KVP exchanges among them), so a rank running eager where its peers
+    replay hangs them. The ranks compare, over the world's gloo group, whether
+    prefill graphs are on, the capture plan's size and a digest of the plan and
+    of ``--deepseek-v4-indexer-prefill-max-logits-mb``, which sets how many KVP
+    index exchanges a forward makes. It also refuses
+    ``NCCL_GRAPH_MIXING_SUPPORT=0`` with prefill graphs on: the eager breaks
+    issue NCCL collectives on communicators the captured segments also use.
 
     Args:
         prefill_graph: This rank's prefill graph owner, before capture.
-        server_args: The launch; supplies the world size and group, the
-            KVP sparse prefill arguments and the probe's entry choice.
+        server_args: The launch; supplies the world size and group.
 
     Raises:
         RuntimeError: The ranks' plans differ, or graph mixing is off.
     """
     enabled = not prefill_graph.disable
     plan = prefill_graph.capture_plan
-    kvp_prefill = (
-        canonical_dsa_kvp_prefill_levers(server_args.dsa_kvp_prefill_levers),
-        server_args.deepseek_v4_indexer_prefill_max_logits_mb,
-    )
-    probe_all_entries = bool(server_args.cudagraph_memory_probe_all_entries)
-    key = repr((sorted(plan.items()), kvp_prefill, probe_all_entries)).encode()
+    max_logits_mb = server_args.deepseek_v4_indexer_prefill_max_logits_mb
+    key = repr((sorted(plan.items()), max_logits_mb)).encode()
     digest = zlib.crc32(key) & 0x7FFFFFFF
     mixing_off = os.environ.get("NCCL_GRAPH_MIXING_SUPPORT", "1") == "0"
     entries = sum(len(graphs) for graphs in plan.values())
@@ -1640,9 +1612,7 @@ def check_rank_uniform_prefill_plan(
     )
     logger.info(
         f"prefill graph plan: enabled={enabled!s} entries={entries:d} "
-        f"digest={digest:08x} dsa_kvp_prefill_levers={kvp_prefill[0]!r} "
-        f"indexer_prefill_max_logits_mb={kvp_prefill[1]:d} "
-        f"probe_all_entries={probe_all_entries!s}"
+        f"digest={digest:08x} indexer_prefill_max_logits_mb={max_logits_mb:d}"
     )
     if server_args.mapping.world_size > 1:
         from tokenspeed.runtime.distributed.process_group_manager import (
