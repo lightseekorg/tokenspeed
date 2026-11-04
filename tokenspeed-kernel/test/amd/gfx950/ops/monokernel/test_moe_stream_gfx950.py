@@ -30,8 +30,8 @@ import os
 
 import pytest
 import torch
-from native_moe_helpers import make_experts
-from test_native_moe_plan import RECORDED_ROUTINGS
+from moe_stream_helpers import make_experts
+from test_moe_stream_plan import RECORDED_ROUTINGS
 from utils import is_cdna4
 
 if not is_cdna4():

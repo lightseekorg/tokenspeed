@@ -27,7 +27,7 @@ test compiles the stream for.
 
 import pytest
 import torch
-from native_moe_helpers import DIVISIBLE, PHYS, make_experts
+from moe_stream_helpers import DIVISIBLE, PHYS, make_experts
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
     _extract_gluon_raw_s,
     _extract_gluon_raw_w,

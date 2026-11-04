@@ -36,7 +36,7 @@ import pytest
 pytest.importorskip("tokenspeed_kernel_amd")
 
 from asm_checks import instruction_lines  # noqa: E402
-from native_body_helpers import (  # noqa: E402
+from monokernel_body_helpers import (  # noqa: E402
     column_relay_kernel,
     compile_gfx950,
     full_records_kernel,

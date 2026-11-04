@@ -29,11 +29,10 @@ this layer's FP8 cache view, and the next layer's prologue target or input
 norm).
 """
 
-import sys
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 import torch
+from moe_stream_helpers import make_experts
 from tokenspeed_kernel.ops.attention.mha import mha_decode_schedule
 from tokenspeed_kernel.ops.attention.prologue import (
     HeadKVCache,
@@ -42,11 +41,6 @@ from tokenspeed_kernel.ops.attention.prologue import (
     Rotary,
 )
 from tokenspeed_kernel.ops.monokernel import PlanKey
-
-# make_experts lives with the native MoE tests.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "moe"))
-
-from native_moe_helpers import make_experts  # noqa: E402
 
 # Muse Spark per rank at TP 8 / EP1.
 WORLD = 8

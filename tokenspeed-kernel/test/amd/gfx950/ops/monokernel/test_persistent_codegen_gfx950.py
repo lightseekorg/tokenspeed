@@ -478,7 +478,7 @@ def test_per_wave_scalars_are_compiler_visible_lane_reads():
 # Inline asm the fused layer may inline, by file and function: every other
 # site is a failure. Sites in the files marked True also need a "# asm:"
 # comment in their function saying why no compiler-visible op serves.
-_REPO = Path(__file__).resolve().parents[4]
+_REPO = Path(__file__).resolve().parents[6]
 _KA = "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/"
 _KT = "tokenspeed-kernel/python/tokenspeed_kernel/ops/"
 _ASM_SITES = {

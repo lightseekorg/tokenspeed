@@ -35,7 +35,7 @@ import pytest
 
 pytest.importorskip("tokenspeed_kernel_amd")
 
-from native_moe_helpers import DIVISIBLE, PHYS  # noqa: E402
+from moe_stream_helpers import DIVISIBLE, PHYS  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon, triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import moe_stream  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402

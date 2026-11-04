@@ -20,7 +20,7 @@
 
 """Numerics of the native decoder layer's front bodies on gfx950: the o_proj
 sender and the router / pooler K-part consumers, each as a test kernel
-(native_body_helpers.py) against an FP32 reference."""
+(monokernel_body_helpers.py) against an FP32 reference."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
-from native_body_helpers import (  # noqa: E402
+from monokernel_body_helpers import (  # noqa: E402
     kpart_pooler_kernel,
     kpart_pooler_steps_kernel,
     kpart_router_kernel,

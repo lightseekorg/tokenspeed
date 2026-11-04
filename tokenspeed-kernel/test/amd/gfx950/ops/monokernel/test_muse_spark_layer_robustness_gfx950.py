@@ -306,7 +306,7 @@ _WITHHELD_CHILD = textwrap.dedent("""
     sys.path.insert(0, sys.argv[1])
     rank, port, record_dir, withheld = int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5])
     import torch, torch.distributed as dist
-    import test_muse_spark_fused_layer_robustness_gfx950 as t
+    import test_muse_spark_layer_robustness_gfx950 as t
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl", init_method=f"tcp://localhost:{port}", rank=rank, world_size=t.WORLD

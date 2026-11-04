@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """Numerics of the native decoder layer's tail bodies on gfx950, each as a
-test kernel (native_body_helpers.py) against today's kernels or FP32."""
+test kernel (monokernel_body_helpers.py) against today's kernels or FP32."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
-from native_body_helpers import (  # noqa: E402
+from monokernel_body_helpers import (  # noqa: E402
     column_relay_kernel,
     sender_sums_kernel,
 )
