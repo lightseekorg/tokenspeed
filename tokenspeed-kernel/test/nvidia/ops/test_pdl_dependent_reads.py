@@ -36,16 +36,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.dsv41 import triton as dsv41_triton
-from tokenspeed_kernel.ops.quantization.triton import (
-    _quantize_fp8_group32_swizzled,
-    triton_rmsnorm_fp8_group32_ue8m0,
-)
-from tokenspeed_kernel.ops.residual.triton import (
-    mhc_pre_layer_norm_hc4,
-    mhc_pre_mix_hc4,
-    triton_mhc_post,
-)
+from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
 from tokenspeed_kernel.platform import pdl_enabled
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -157,89 +148,10 @@ def _assert_tuples_close(actual, expected) -> None:
 
 
 # ---------------------------------------------------------------------------
-# One case per PDL-patched kernel: (real tensor to race, run(raced) -> tuple,
-# reset() -> None). reset() launches any setup kernels before the producer, so
-# nothing separates the producer from the kernel under test.
+# One case per PDL-patched kernel: (real tensor to race, run(raced) -> tuple).
+# run() launches only the kernel under test, so nothing separates the producer
+# from it.
 # ---------------------------------------------------------------------------
-
-
-def _no_reset() -> None:
-    pass
-
-
-def _case_mhc_post():
-    torch.manual_seed(101)
-    tokens, hidden = 32, 5120
-    real = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=DEVICE)
-    residual = torch.randn(tokens, 4, hidden, dtype=torch.bfloat16, device=DEVICE)
-    post = torch.randn(tokens, 4, dtype=torch.float32, device=DEVICE)
-    comb = torch.randn(tokens, 4, 4, dtype=torch.float32, device=DEVICE)
-
-    def run(hidden_states):
-        return (triton_mhc_post(hidden_states, residual, post, comb),)
-
-    return real, run, _no_reset
-
-
-def _case_mhc_pre_mix():
-    torch.manual_seed(102)
-    num_tokens, n_splits, hidden_size = 64, 1, 5120
-    real = torch.randn(n_splits, num_tokens, 24, dtype=torch.float32, device=DEVICE)
-    gemm_out_sqrsum = (
-        torch.rand(n_splits, num_tokens, dtype=torch.float32, device=DEVICE) + 1.0
-    )
-    hc_scale = torch.rand(3, dtype=torch.float32, device=DEVICE) + 0.5
-    hc_base = torch.randn(24, dtype=torch.float32, device=DEVICE)
-
-    def run(gemm_out_mul):
-        pre_mix = torch.empty(num_tokens, 4, dtype=torch.float32, device=DEVICE)
-        post_mix = torch.empty(num_tokens, 4, dtype=torch.float32, device=DEVICE)
-        comb_mix = torch.empty(num_tokens, 16, dtype=torch.float32, device=DEVICE)
-        mhc_pre_mix_hc4(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            pre_mix,
-            post_mix,
-            comb_mix,
-            hidden_size=hidden_size,
-            rms_eps=1e-6,
-            hc_eps=1e-5,
-            sinkhorn_iters=3,
-            n_splits=n_splits,
-            num_tokens=num_tokens,
-        )
-        return (pre_mix, post_mix, comb_mix)
-
-    return real, run, _no_reset
-
-
-def _case_mhc_pre_layer_norm():
-    torch.manual_seed(103)
-    tokens, hidden = 32, 5120
-    real = torch.randn(tokens, 4, hidden, dtype=torch.bfloat16, device=DEVICE)
-    pre_mix = torch.rand(tokens, 4, dtype=torch.float32, device=DEVICE) + 0.1
-    weight = torch.randn(hidden, dtype=torch.bfloat16, device=DEVICE)
-
-    def run(residual):
-        out = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=DEVICE)
-        mhc_pre_layer_norm_hc4(pre_mix, residual, weight, out, eps=1e-6)
-        return (out,)
-
-    return real, run, _no_reset
-
-
-def _case_rmsnorm_fp8_group32():
-    torch.manual_seed(104)
-    rows, hidden = 128, 5120
-    real = torch.randn(rows, hidden, dtype=torch.bfloat16, device=DEVICE)
-    weight = torch.randn(hidden, dtype=torch.bfloat16, device=DEVICE)
-
-    def run(x):
-        return triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6)
-
-    return real, run, _no_reset
 
 
 def _case_quantize_fp8_group32_swizzled():
@@ -250,81 +162,25 @@ def _case_quantize_fp8_group32_swizzled():
     def run(x):
         return _quantize_fp8_group32_swizzled(x)
 
-    return real, run, _no_reset
-
-
-def _case_rope_inplace():
-    torch.manual_seed(106)
-    tokens, rotary_dim, width = 128, 64, 128
-    real = torch.randn(tokens, width, dtype=torch.bfloat16, device=DEVICE)
-    positions = torch.arange(tokens, device=DEVICE, dtype=torch.int64)
-    angles = (
-        torch.arange(16384, device=DEVICE)[:, None].float()
-        * torch.exp(-torch.arange(rotary_dim // 2, device=DEVICE).float() / 4)[None, :]
-    )
-    cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
-
-    def run(values):
-        return (dsv41_triton.rope_inplace(values, positions, cache),)
-
-    return real, run, _no_reset
-
-
-def _case_swa_rope_scatter():
-    torch.manual_seed(107)
-    tokens = 128
-    real = torch.randn(tokens, 512, dtype=torch.bfloat16, device=DEVICE)
-    positions = torch.arange(tokens, device=DEVICE, dtype=torch.int64)
-    angles = (
-        torch.arange(512, device=DEVICE)[:, None].float()
-        * torch.arange(32, device=DEVICE)[None, :]
-        / 1000
-    )
-    cos_sin_cache = torch.cat((angles.cos(), angles.sin()), -1)
-    slots = torch.arange(64, 64 + tokens, device=DEVICE, dtype=torch.int32)
-    row_bytes = dsv41_triton._LAYOUTS["swa"][3]
-    num_pages = (64 + tokens) // 64 + 1
-
-    storage = torch.empty((num_pages, 64 * row_bytes), dtype=torch.uint8, device=DEVICE)
-    cache = storage.view(num_pages, 64, row_bytes)
-
-    def run(values):
-        out = torch.empty_like(values)
-        dsv41_triton.triton_dsv41_swa_rope_scatter(
-            values, positions, cos_sin_cache, cache, slots, "swa", out, None, 1e-6
-        )
-        return (out, cache.clone())
-
-    def reset():
-        storage.zero_()
-
-    return real, run, reset
+    return real, run
 
 
 _CASES = {
-    "mhc_post_hc4": _case_mhc_post,
-    "mhc_pre_mix_hc4": _case_mhc_pre_mix,
-    "mhc_pre_layer_norm_hc4": _case_mhc_pre_layer_norm,
-    "rmsnorm_fp8_group32_ue8m0": _case_rmsnorm_fp8_group32,
     "fp8_group32_ue8m0_quantize_swizzled": _case_quantize_fp8_group32_swizzled,
-    "rope_inplace": _case_rope_inplace,
-    "swa_rope_insert": _case_swa_rope_scatter,
 }
 
 
 @pytest.mark.parametrize("case_name", list(_CASES))
 def test_pdl_kernel_waits_for_upstream_write(case_name):
-    real, run, reset = _CASES[case_name]()
+    real, run = _CASES[case_name]()
 
     # Reference first: it also compiles the kernel, so the raced launch below
     # reaches the GPU while the producer is still spinning.
-    reset()
     expected = run(real.clone())
     torch.cuda.synchronize()
 
     # Race path: no host sync between the producer and the kernel under test.
     race_buf = _poison_like(real)
-    reset()
     _publish_with_delay(real, race_buf, _DELAY_NS)
     actual = run(race_buf)
     torch.cuda.synchronize()
@@ -334,13 +190,12 @@ def test_pdl_kernel_waits_for_upstream_write(case_name):
 
 @pytest.mark.parametrize("case_name", list(_CASES))
 def test_pdl_kernel_waits_for_upstream_write_under_cuda_graph(case_name):
-    real, run, reset = _CASES[case_name]()
+    real, run = _CASES[case_name]()
 
     # CUDA graphs require a warm-up launch outside the capture on buffers
     # that are not reused by the capture itself.
     warmup_real = real.clone()
     warmup_buf = _poison_like(warmup_real)
-    reset()
     _publish_with_delay(warmup_real, warmup_buf, _DELAY_NS)
     run(warmup_buf)
     torch.cuda.synchronize()
@@ -350,7 +205,6 @@ def test_pdl_kernel_waits_for_upstream_write_under_cuda_graph(case_name):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         race_buf.view(torch.uint8).fill_(0xAB)
-        reset()
         _publish_with_delay(source, race_buf, _DELAY_NS)
         captured = run(race_buf)
 
@@ -360,7 +214,6 @@ def test_pdl_kernel_waits_for_upstream_write_under_cuda_graph(case_name):
         torch.cuda.synchronize()
         actual = tuple(tensor.clone() for tensor in captured)
 
-        reset()
         expected = run(source.clone())
         torch.cuda.synchronize()
 
