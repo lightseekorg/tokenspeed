@@ -143,6 +143,96 @@ def current_op_metadata() -> dict[str, Any] | None:
     return _recording_op.get()
 
 
+def profile_session_active() -> bool:
+    """Whether this thread/context is inside a collected iteration window."""
+    return _current.get() is not None
+
+
+@dataclass(frozen=True)
+class _ImplementationEngineContract:
+    implementation: Callable
+    compute_type: str
+    contract_id: str
+
+
+def profile_engine_contract(*, compute_type: str, contract_id: str) -> Callable:
+    """Declare an implementation-owned compute contract without wrapping it.
+
+    This is a source assertion about the declared implementation, not engine
+    detection. A replacement must supply its own reviewed declaration; copying
+    function attributes with functools.wraps does not transfer the contract.
+    """
+    if (
+        not isinstance(compute_type, str)
+        or not compute_type.endswith(("_simt", "_tensor"))
+        or not isinstance(contract_id, str)
+        or not contract_id
+    ):
+        raise ValueError("Invalid implementation engine contract")
+
+    def declare(implementation: Callable) -> Callable:
+        implementation._tokenspeed_profile_engine_contract = (
+            _ImplementationEngineContract(implementation, compute_type, contract_id)
+        )
+        return implementation
+
+    return declare
+
+
+def _implementation_engine_contract(implementation: Callable) -> tuple[str, str] | None:
+    """Resolve a declaration only when it belongs to this exact callable."""
+    contract = getattr(implementation, "_tokenspeed_profile_engine_contract", None)
+    if (
+        not isinstance(contract, _ImplementationEngineContract)
+        or contract.implementation is not implementation
+        or not isinstance(contract.compute_type, str)
+        or not contract.compute_type.endswith(("_simt", "_tensor"))
+        or not isinstance(contract.contract_id, str)
+        or not contract.contract_id
+    ):
+        return None
+    return contract.compute_type, contract.contract_id
+
+
+def record_selected_kernel(
+    name: str, solution: str, *, implementation: Callable
+) -> None:
+    """Attach the actual leaf and its implementation-owned proof to this op.
+
+    Ordered tuples retain every dispatch, including repeated leaves. A single
+    engine summary is available only for one leaf with a reviewed declaration;
+    multiple leaves need a separate FLOP partition and remain unnormalized.
+    Reserved selected_* fields never replace a caller's compute_type argument.
+    Outside collection this does nothing and never changes execution selection.
+    """
+    metadata = current_op_metadata()
+    if metadata is None:
+        return
+    if (
+        not isinstance(name, str)
+        or not name
+        or not isinstance(solution, str)
+        or not solution
+    ):
+        raise ValueError("Selected kernel identity requires name and solution")
+    contract = _implementation_engine_contract(implementation)
+    compute_type, engine_contract_id = (
+        contract if contract is not None else (None, None)
+    )
+    for key, value in (
+        ("selected_kernel_names", name),
+        ("selected_solutions", solution),
+        ("selected_compute_types", compute_type),
+        ("selected_engine_contract_ids", engine_contract_id),
+    ):
+        metadata[key] = (*metadata.get(key, ()), value)
+    single = len(metadata["selected_kernel_names"]) == 1
+    metadata["selected_kernel_name"] = name if single else None
+    metadata["selected_solution"] = solution if single else None
+    metadata["selected_compute_type"] = compute_type if single else None
+    metadata["selected_engine_contract_id"] = engine_contract_id if single else None
+
+
 class ProfileSession:
     """Collect host metadata within explicit, synchronous iteration windows.
 

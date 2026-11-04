@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.profiling import (
@@ -47,7 +48,6 @@ from tokenspeed_kernel.profiling import (
     start_profiling,
     stop_profiling,
 )
-from viztracer import VizTracer
 
 from tokenspeed.runtime.engine.io_struct import (
     ProfileReq,
@@ -60,6 +60,9 @@ from tokenspeed.runtime.moe.expert_location import (
     expert_load_recording_enabled,
 )
 from tokenspeed.runtime.utils.env import envs
+
+if TYPE_CHECKING:
+    from viztracer import VizTracer
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +314,8 @@ class Profiler:
                 )
 
         if "VIZTRACER" in activities:
+            from viztracer import VizTracer
+
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
             self.viztracer = VizTracer(
                 output_file=os.path.join(

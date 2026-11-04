@@ -117,9 +117,10 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        ignored_layers = cls.get_from_keys_or(
-            config, ["ignored_layers", "modules_to_not_convert"], None
-        )
+        ignored_layers = list(dict.fromkeys(
+            (config.get("ignored_layers") or [])
+            + (config.get("modules_to_not_convert") or [])
+        ))
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
         return cls(

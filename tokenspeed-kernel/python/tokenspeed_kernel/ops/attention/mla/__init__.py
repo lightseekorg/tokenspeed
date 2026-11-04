@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.op_profile import current_op_metadata, record_selected_kernel
 from tokenspeed_kernel.ops.gemm.flashinfer import autotune_bf16_gemm
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -41,6 +42,16 @@ from tokenspeed_kernel.signature import (
 )
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
+
+
+def _record_selected_mla_leaf(kernel) -> None:
+    if current_op_metadata() is None:
+        return
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name(kernel.name)
+    bound = spec is not None and registry.get_impl(kernel.name) is kernel.impl
+    solution = spec.solution if bound else "unregistered"
+    record_selected_kernel(kernel.name, solution, implementation=kernel.impl)
 
 
 def mla_prolog_available() -> bool:
@@ -294,6 +305,7 @@ def mla_project_value(
             kernel = candidate
 
     if kernel is not None:
+        _record_selected_mla_leaf(kernel)
         shape_params = {
             "batch_size": batch,
             "num_heads": heads,
@@ -317,6 +329,7 @@ def mla_project_value(
         ):
             return kernel(attention=attention, weight=weight, gate=gate, out=out)
 
+    record_selected_kernel("torch.bmm", "torch", implementation=torch.bmm)
     output_view = out.view(batch, heads, value_dim)
     if current_platform().is_nvidia:
         torch.bmm(
@@ -1332,6 +1345,7 @@ def mla_decode_with_kvcache(
                 override=override,
             )
 
+    _record_selected_mla_leaf(kernel)
     shape_params = {
         "batch_size": q.shape[0],
         "q_len": q.shape[1],

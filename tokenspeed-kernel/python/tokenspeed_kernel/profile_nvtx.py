@@ -153,7 +153,11 @@ class NvtxTimeline:
             raise ValueError("max_metadata_bytes must be a positive integer")
         self.session = session
         self.costs = costs
-        self.hardware = hardware
+        self.hardware = (
+            hardware.validate_cuda_device(stream.device)
+            if hardware.schema_version == 2
+            else hardware
+        )
         self.stream = stream
         self.max_scopes = max_scopes
         self.library = library
@@ -271,7 +275,12 @@ class NvtxTimeline:
             snapshot.target[snapshot.name] = tuple(snapshot.host.tolist())
         self._snapshots.clear()
         report = self.session.report(costs=self.costs)
-        report["hardware"] = asdict(self.hardware)
+        hardware = self.hardware
+        if hardware.schema_version == 1 and hardware.selection is None:
+            hardware = hardware.validate_device(
+                {"name": torch.cuda.get_device_name(self.stream.device)}
+            )
+        report["hardware"] = asdict(hardware)
         report["device_analysis"] = {
             "timing_kind": "pending_nsight",
             "process_id": os.getpid(),

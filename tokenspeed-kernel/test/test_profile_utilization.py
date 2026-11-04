@@ -984,6 +984,8 @@ def test_layer_normalizes_only_nonzero_compute_types(fixture, other_flops):
             {"synthetic": 0.24, "other": 0.12}
         )
         assert "mixed compute types" in row["mfu_missing_reason"]
+        assert row["mfu_total"] == pytest.approx(0.36)
+        assert row["mfu_total_missing_reason"] is None
     else:
         assert row["mfu"] == pytest.approx(0.24)
         assert row["mfu_by_compute_type"] == pytest.approx({"synthetic": 0.24})

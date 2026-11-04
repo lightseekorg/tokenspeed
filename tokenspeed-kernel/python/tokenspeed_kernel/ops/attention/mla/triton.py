@@ -20,6 +20,7 @@
 
 
 import torch
+from tokenspeed_kernel.op_profile import profile_engine_contract
 from tokenspeed_kernel.ops.attention.mla._triton.decode import (
     _triton_mla_decode_with_kvcache_impl,
 )
@@ -102,6 +103,9 @@ def triton_mla_prefill(
         "return_lse": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
     },
+)
+@profile_engine_contract(
+    compute_type="fp32_simt", contract_id="mla.triton_decode.fp32_simt.v1"
 )
 def triton_mla_decode_with_kvcache(
     q: torch.Tensor,

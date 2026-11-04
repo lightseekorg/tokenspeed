@@ -1,0 +1,68 @@
+# Theoretical product peaks; explicit per-device profile, not measured limits.
+schema_version: 2
+name: "NVIDIA H200 SXM 141GB (up to 700W, one full GPU)"
+device:
+  vendor: "NVIDIA"
+  sku: "H200"
+  form_factor: "SXM"
+  memory_gb: 141
+  power_watts: 700
+  partition: "full_device"
+  mig_profile: null
+  match_names:
+    - "NVIDIA H200"
+units:
+  compute: "FLOP/s"
+  hbm: "byte/s"
+compute_flops_per_second:
+  bf16_tensor: 989500000000000
+  fp16_tensor: 989500000000000
+  fp8_e4m3_tensor: 1979000000000000
+  fp32_simt: 67000000000000
+compute_metadata:
+  bf16_tensor:
+    precision: "bf16"
+    engine: "tensor"
+    sparsity: "dense"
+    source_id: "nvidia-spec"
+    published_value: 1979
+    published_unit: "TFLOP/s"
+    published_sparsity: "sparse"
+    dense_conversion_factor: 0.5
+  fp16_tensor:
+    precision: "fp16"
+    engine: "tensor"
+    sparsity: "dense"
+    source_id: "nvidia-spec"
+    published_value: 1979
+    published_unit: "TFLOP/s"
+    published_sparsity: "sparse"
+    dense_conversion_factor: 0.5
+  fp8_e4m3_tensor:
+    precision: "fp8_e4m3"
+    engine: "tensor"
+    sparsity: "dense"
+    source_id: "nvidia-spec"
+    published_value: 3958
+    published_unit: "TFLOP/s"
+    published_sparsity: "sparse"
+    dense_conversion_factor: 0.5
+  fp32_simt:
+    precision: "fp32"
+    engine: "simt"
+    sparsity: "dense"
+    source_id: "nvidia-spec"
+    published_value: 67
+    published_unit: "TFLOP/s"
+    published_sparsity: "dense"
+    dense_conversion_factor: 1.0
+hbm_bytes_per_second: 4800000000000
+bandwidth_source_id: "nvidia-spec"
+sources:
+  -
+    id: "nvidia-spec"
+    title: "NVIDIA H200 GPU official product specifications"
+    url: "https://www.nvidia.com/en-us/data-center/h200/"
+    accessed: "2026-11-04"
+    document_version: "live product page, H200 SXM column; preliminary specifications; accessed 2026-11-04"
+source: "NVIDIA H200 GPU official product specifications; live product page, H200 SXM column; preliminary specifications; accessed 2026-11-04. SXM 141GB, one full GPU, not a multi-GPU NVLink pair or MIG slice. Dense Tensor Core peak is half the sparse published rate; FP32 SIMT and HBM bandwidth are unchanged. Decimal units. power_watts is the nominal maximum configurable TDP, not an observed power limit. Selection is explicit; device names alone do not prove form factor or TDP."

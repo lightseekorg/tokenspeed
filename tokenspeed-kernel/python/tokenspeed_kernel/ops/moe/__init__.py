@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
+from tokenspeed_kernel.op_profile import record_selected_kernel
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -2220,6 +2221,9 @@ def moe_apply(
     if routing_prepared is not None:
         quantized_kwargs["routing_prepared"] = routing_prepared
     output_kwargs = {"deferred_out": deferred_out} if deferred_out is not None else {}
+    record_selected_kernel(
+        kernel.name, plan["solution"], implementation=kernel.impl
+    )
     return kernel(
         plan=plan,
         x=x,

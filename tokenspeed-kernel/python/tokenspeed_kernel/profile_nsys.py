@@ -24,17 +24,19 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sqlite3
 import subprocess
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from tokenspeed_kernel.profile_utilization import (
-    HardwareProfile,
     ScopeTiming,
     analyze_utilization,
+    hardware_for_analysis,
 )
 
 
@@ -168,7 +170,9 @@ def analyze_nsight(
             "gpu_end_ns": None if gpu_start is None else gpu_start + duration,
             "gpu_activity_count": count,
         }
-    rows = analyze_utilization(report, timings, HardwareProfile(**report["hardware"]))
+    rows = analyze_utilization(
+        report, timings, hardware_for_analysis(report["hardware"], None)
+    )
     for row in rows:
         row.update(evidence[row["trace_label"]])
     return {
@@ -186,7 +190,12 @@ def analyze_nsight(
 
 
 def finalize_nsight(
-    *, nsys: str, trace: Path, metadata: Path, output: Path
+    *,
+    nsys: str,
+    trace: Path,
+    metadata: Path,
+    output: Path,
+    hardware: Path | None = None,
 ) -> dict[str, Any]:
     """Export a finished nsys-rep and write metrics without modifying the capture.
 
@@ -196,6 +205,8 @@ def finalize_nsight(
     """
     if output.resolve() in (metadata.resolve(), trace.resolve()):
         raise ValueError("Output must not overwrite metadata or the Nsight capture")
+    recorded = json.loads(metadata.read_text())
+    recorded["hardware"] = asdict(hardware_for_analysis(recorded["hardware"], hardware))
     with tempfile.TemporaryDirectory(prefix="tokenspeed-nsight-") as directory:
         root = Path(directory)
         database = root / "trace.sqlite"
@@ -221,11 +232,16 @@ def finalize_nsight(
             check=True,
         )
         result = analyze_nsight(
-            json.loads(metadata.read_text()),
+            recorded,
             database=database,
             projection=root / "projection_nvtx_gpu_proj_trace.csv",
         )
     result["device_analysis"]["source_report"] = str(trace.resolve())
+    with trace.open("rb") as source:
+        fingerprint = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            fingerprint.update(chunk)
+    result["device_analysis"]["source_report_sha256"] = fingerprint.hexdigest()
     result["device_analysis"]["source_metadata"] = str(metadata.resolve())
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
@@ -248,10 +264,36 @@ def main() -> None:
     parser.add_argument(
         "--output", type=Path, required=True, help="New Nsight-timed metrics JSON"
     )
-    args = parser.parse_args()
-    finalize_nsight(
-        nsys=args.nsys, trace=args.report, metadata=args.metadata, output=args.output
+    parser.add_argument(
+        "--hardware", type=Path, help="Verify the profile saved in capture metadata"
     )
+    parser.add_argument(
+        "--annotated-report",
+        type=Path,
+        help="New native report with utilization labels",
+    )
+    parser.add_argument(
+        "--import-nvtxt", type=Path, help="Matching Nsight ImportNvtxt executable"
+    )
+    args = parser.parse_args()
+    if (args.annotated_report is None) != (args.import_nvtxt is None):
+        parser.error("--annotated-report and --import-nvtxt must be supplied together")
+    finalize_nsight(
+        nsys=args.nsys,
+        trace=args.report,
+        metadata=args.metadata,
+        output=args.output,
+        hardware=args.hardware,
+    )
+    if args.annotated_report is not None:
+        from tokenspeed_kernel.profile_native_report import annotate_report
+
+        annotate_report(
+            report=args.report,
+            metrics=args.output,
+            output=args.annotated_report,
+            importer=args.import_nvtxt,
+        )
 
 
 if __name__ == "__main__":

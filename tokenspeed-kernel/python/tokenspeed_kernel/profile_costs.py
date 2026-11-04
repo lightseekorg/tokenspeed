@@ -33,22 +33,28 @@ from tokenspeed_kernel.op_profile import (
 )
 
 
-def _infer_matmul_compute_type(
-    op: OpRecord, *operands: TensorDescription
-) -> str | None:
-    """Select a peak for uncast BF16/FP16 GPU matrix products.
+def _matmul_compute_type(op: OpRecord, *operands: TensorDescription) -> str | None:
+    """Use an explicit implementation contract or captured execution decision.
 
-    This selects a normalization peak, not the kernel's actual instruction mix.
-    FP32/TF32, quantized, mixed-dtype and autocast execution need more metadata.
+    Operand storage dtype alone does not identify Tensor Core/SIMT execution.
+    Dynamic metadata takes precedence over the implementation's fixed traits.
     """
-    dtype, device = operands[0].dtype, operands[0].device
     if (
         op.autocast_enabled
-        or not device.startswith("cuda:")
-        or any(tensor.dtype != dtype or tensor.device != device for tensor in operands)
+        or not operands
+        or any(not tensor.device.startswith("cuda:") for tensor in operands)
     ):
         return None
-    return {"torch.bfloat16": "bf16_tensor", "torch.float16": "fp16_tensor"}.get(dtype)
+    compute_type = op.scalar_args.get(
+        "compute_type", op.static_traits.get("compute_type")
+    )
+    if compute_type is None:
+        return None
+    if not isinstance(compute_type, str) or not compute_type.endswith(
+        ("_tensor", "_simt")
+    ):
+        raise ValueError("Explicit compute_type must identify precision and engine")
+    return compute_type
 
 
 @dataclass(frozen=True)
@@ -91,7 +97,7 @@ class DenseMatmulCost:
                 "each operand read once; output written once",
                 "logical bytes do not measure HBM traffic",
             ),
-            compute_type=_infer_matmul_compute_type(op, lhs, rhs),
+            compute_type=_matmul_compute_type(op, lhs, rhs),
         )
 
 
@@ -150,7 +156,7 @@ class _DenseProjectionCost:
             estimated_hbm_bytes=estimated_hbm_bytes,
             rule=f"dense_projection_{self.ndim}d.v1",
             assumptions=assumptions,
-            compute_type=_infer_matmul_compute_type(op, lhs, rhs),
+            compute_type=_matmul_compute_type(op, lhs, rhs),
         )
 
 
@@ -213,7 +219,7 @@ class BlockScaledMatmulCost:
             assumptions=(
                 "useful matmul FLOPs; quantization, scale arithmetic and padding excluded",
                 "activation quantization occurs before this GEMM scope",
-                "FP8 E4M3 operands select the compute peak; BF16 output does not",
+                "registered block-scaled FP8 GEMM implementation contract uses Tensor Cores",
                 "boundary IO read/write once; temporary scale layouts and reloads excluded",
                 "logical IO does not establish physical HBM traffic",
             ),
@@ -553,7 +559,7 @@ class _FlashMLACost:
                 "HBM estimate excludes split/combine workspace, tile reloads and cross-request cache reuse",
                 "cache/table allocation capacity is not traffic; only referenced logical rows/pages counted",
             ),
-            compute_type=_infer_matmul_compute_type(op, q, cache),
+            compute_type=_matmul_compute_type(op, q, cache),
         )
 
 
@@ -667,7 +673,7 @@ class _VarlenAttentionCost:
                 "logical boundary IO counted once, including cumulative-length arguments and returned LSE",
                 "HBM estimate excludes tiling reloads, intermediate workspace and cache effects",
             ),
-            compute_type=_infer_matmul_compute_type(op, q, k, v),
+            compute_type=_matmul_compute_type(op, q, k, v),
         )
 
 
@@ -1324,7 +1330,7 @@ class AttentionMatmulCost:
                 "softmax, scale, projections, padding and recompute excluded",
                 "logical tensor IO does not establish HBM traffic or executed FLOPs",
             ),
-            compute_type=_infer_matmul_compute_type(op, q, k, v),
+            compute_type=_matmul_compute_type(op, q, k, v),
         )
 
     @staticmethod
