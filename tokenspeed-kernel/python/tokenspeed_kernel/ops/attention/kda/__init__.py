@@ -764,6 +764,7 @@ import tokenspeed_kernel.ops.attention.kda.vllm_recoverssm  # noqa: E402,F401
 if importlib.util.find_spec("flash_kda") is not None:
     import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.cudnn  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
 # isort: on

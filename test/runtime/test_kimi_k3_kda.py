@@ -1152,7 +1152,8 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
 
 @requires_cuda
 @pytest.mark.parametrize("prefix", [0, 1024])
-def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
+@pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
+def test_kda_prefill_fused_staging_matches_pytorch(prefix, backend_name, monkeypatch):
     """Native KDA outputs and persistent state match the old staging ops."""
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
@@ -1179,7 +1180,7 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
         gid: [[2 * row + 1, 2 * row + 2]] for row, gid in enumerate(_STATE_GROUPS)
     }
     for harness in harnesses:
-        harness.backend.kda_backend = "cutedsl_kda"
+        harness.backend.kda_backend = backend_name
         harness.extend_metadata(
             tables,
             seq_lens=[prefix + 868],

@@ -2140,18 +2140,21 @@ class MambaAttnBackend(AttentionBackend):
             and self._tree_node_states is None
         ):
             scan_replay, replay_inputs = replay_inputs[0], None
-        # KDA's verify consumes zero-copy strided views. When recurrent-state
-        # replay is enabled, the split kernel also saves the persistent inputs
-        # needed to reconstruct accepted state later.
+        # Scans supporting strided QKV consume views of the convolution output.
+        # Replay payloads still need the split kernel to save recovery inputs.
         if (
             (
-                self._verify_packed_qkv_views
-                or scan_replay is not None
-                or conv_replay is not None
+                is_target_verify
+                and (
+                    self._verify_packed_qkv_views
+                    or scan_replay is not None
+                    or conv_replay is not None
+                )
+                or not is_target_verify
+                and self._prefill_supports_strided_qkv()
             )
             and replay_inputs is None
             and mixed_qkv.stride(-1) == 1
-            and is_target_verify
         ):
             query, key, value = _packed_qkv_views(
                 mixed_qkv,
@@ -2477,6 +2480,9 @@ class MambaAttnBackend(AttentionBackend):
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
+
+    def _prefill_supports_strided_qkv(self) -> bool:
+        return False
 
     def _prefill_scan(
         self,
