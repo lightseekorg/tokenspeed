@@ -48,6 +48,7 @@ from tokenspeed_kernel.signature import (  # isort: skip
     format_signature,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
+    gluon_dsa_live_logical_topk_gfx950,
     gluon_dsa_logical_topk_gfx950,
     gluon_dsa_row_bounded_logical_topk_gfx950,
 )
@@ -92,6 +93,54 @@ def test_row_bounded_topk_selects_each_rows_largest_owned_scores(rows, topk):
             assert torch.equal(
                 logits[row, mine].sort().values,
                 logits[row, :length].topk(count).values.sort().values,
+            )
+
+
+@pytest.mark.parametrize("rows", [1, 64])
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_live_topk_keeps_every_live_score_of_rows_holding_at_most_topk(rows, topk):
+    # Merged candidate rows: padding rows with no live score, short
+    # histories with fewer live scores than topk, live scores scattered
+    # among -inf ones, and mandatory +inf ones.
+    width = 8 * topk
+    generator = torch.Generator(device="cuda").manual_seed(rows + topk)
+    logits = torch.rand((rows, width), device="cuda", generator=generator)
+    live_counts = torch.randint(
+        0, width, (rows,), device="cuda", generator=generator
+    ).tolist()
+    live_counts[: min(rows, 4)] = [0, topk - 5, topk, topk + 1][:rows]
+    starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
+    ends = torch.full((rows,), width, device="cuda", dtype=torch.int32)
+    live = torch.zeros((rows, width), device="cuda", dtype=torch.bool)
+    for row, count in enumerate(live_counts):
+        columns = torch.randperm(width, device="cuda", generator=generator)
+        live[row, columns[:count]] = True
+    logits[~live] = -torch.inf
+    if rows > 4:
+        logits[3, live[3].nonzero()[:3, 0]] = torch.inf
+        # A row narrower than topk.
+        starts[4], ends[4] = 100, 100 + topk // 2
+        live[4, :100] = False
+        live[4, 100 + topk // 2 :] = False
+
+    offsets, counts = gluon_dsa_live_logical_topk_gfx950(
+        logits, starts, ends, topk=topk
+    )
+
+    for row in range(rows):
+        live_columns = live[row].nonzero()[:, 0]
+        count = int(counts[row])
+        assert count == min(topk, live_columns.numel())
+        assert (offsets[row, count:] == -1).all()
+        mine = offsets[row, :count].long()
+        assert len(set(mine.tolist())) == count
+        assert bool(live[row, mine].all())
+        if live_columns.numel() <= topk:
+            assert sorted(mine.tolist()) == live_columns.tolist()
+        else:
+            assert torch.equal(
+                logits[row, mine].sort().values,
+                logits[row, live_columns].topk(topk).values.sort().values,
             )
 
 

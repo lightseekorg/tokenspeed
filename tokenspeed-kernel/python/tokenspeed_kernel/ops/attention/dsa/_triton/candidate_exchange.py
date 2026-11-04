@@ -289,9 +289,11 @@ def select_through_threshold(
     ``scores`` (:func:`rank_major_scores` of ``records``).
 
     Keeps every candidate scoring above the k-th largest score and, among the
-    candidates tied at it, the first ones in candidate order. Returns int32
-    [rows, topk] positions in candidate order with -1 after the valid ones,
-    and int32 [rows] counts of valid positions.
+    candidates tied at it, the first ones in candidate order. A row's
+    ``order`` may list fewer than ``topk`` columns when those are all its
+    candidates above -inf. Returns int32 [rows, topk] positions in candidate
+    order with -1 after the valid ones, and int32 [rows] counts of valid
+    positions.
     """
     _, rows, width, _ = records.shape
     positions = torch.empty((rows, topk), device=records.device, dtype=torch.int32)
