@@ -54,6 +54,12 @@ and the receiver polls until no marker remains, restores the markers, and
 advances a three-stage counter. Fusions sharing the one-shot mailbox keep its
 per-512-element stage counters; the TP8 two-shot owns its mailboxes and
 counters.
+The TP8 two-shot's phases are device functions taking the stage, so a fused
+kernel that produces the partials itself reuses its mailbox layout and
+reduction. Muse's sliding attention tail does: one launch of attention splits,
+o_proj senders that push straight into the reduce-scatter slots, and
+workgroups that reduce, all-gather and finish the attention boundary, on its
+own region with every workgroup's epoch as the stage.
 
 `residual_rmsnorm.py` reduces BF16 rows fused with the residual add and
 RMSNorm, for callers that prepare it per group and width (draft layers). Each

@@ -135,6 +135,8 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
 
+    from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
+
 
 # Row limit of the generic column gather and the NVLS mailbox.
 _GATHER_WORKSPACE_ROWS = 64
@@ -949,6 +951,55 @@ class MuseSparkAttention(nn.Module):
             pdl_enabled(),
         )
         return self._project(output)
+
+    def forward_sliding_tail(
+        self,
+        positions: torch.Tensor,
+        normalized: torch.Tensor,
+        ctx: ForwardContext,
+        cache: DecodeKVView,
+        stream: torch.Tensor,
+        post_norm: MuseSparkRMSNorm,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        pre_norm: MuseSparkRMSNorm,
+        iris: MuseIrisState,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sliding decode rows through attention and the attention boundary.
+
+        Projects and prepares the query (writing K/V), then one launch attends,
+        applies the gated norm and o_proj, all-reduces and runs the boundary
+        (MuseIrisState.sliding_attention_boundary). Returns the FP32 residual,
+        router input and pre-expert input. The caller checked
+        can_sliding_attention_boundary.
+        """
+        qkv_gate, _ = self.qkv_proj(normalized)
+        q, k, v, output_gate = qkv_gate.split(
+            (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
+        )
+        prepared = self.attn.prologue(q, k, v, positions, ctx)
+        return iris.sliding_attention_boundary(
+            prepared.q.view(-1, self.num_heads, self.head_dim),
+            cache.k_cache,
+            cache.v_cache,
+            cache.page_table,
+            cache.seq_lens,
+            cache.max_seqlen_k,
+            self.attn.sliding_window_size,
+            self.attn.scaling,
+            output_gate,
+            self.o_proj.weight,
+            stream,
+            post_norm.weight,
+            alpha,
+            beta,
+            pre_norm.weight,
+            self.rms_norm_eps,
+            post_norm.eps,
+            post_norm.weight_offset,
+            pre_norm.eps,
+            pre_norm.weight_offset,
+        )
 
     def _project(self, output: torch.Tensor) -> tuple[torch.Tensor, int | None, int]:
         """Project attended rows; a batch the mailbox serves publishes its partial for the boundary to reduce."""
@@ -1959,6 +2010,53 @@ class MuseSparkDecoderLayer(nn.Module):
         )
         self.iris_state: MuseIrisState | None = None
 
+    def _sliding_attention_tail(
+        self,
+        positions: torch.Tensor,
+        attention_input: torch.Tensor,
+        ctx: ForwardContext,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Run sliding decode rows through attention and its boundary in one
+        launch, or return None when that path does not apply."""
+        attn = self.self_attn
+        iris = self.iris_state
+        pre_norm = self.pre_feedforward_layernorm
+        if (
+            iris is None
+            or attn.o_proj.tp_size == 1
+            or attn.o_proj.reduce_results
+            or pre_norm.weight is None
+            or not self.comm_manager.use_all_reduce(self.comm_manager.is_moe)
+            or type(attn.o_proj.quant_method) is not UnquantizedLinearMethod
+        ):
+            return None
+        cache = attn.attn.decode_kv_view(ctx)
+        if cache is None or not iris.can_sliding_attention_boundary(
+            attention_input.shape[0],
+            cache.seq_lens.shape[0],
+            cache.k_cache,
+            cache.max_seqlen_k,
+            attn.attn.sliding_window_size,
+            attn.attn.scaling,
+            attn.o_proj.weight,
+            hidden_states,
+        ):
+            return None
+        alpha, beta = self.post_attention_residual_gate._gate_coefficients()
+        return attn.forward_sliding_tail(
+            positions,
+            attention_input,
+            ctx,
+            cache,
+            hidden_states,
+            self.post_attention_layernorm,
+            alpha,
+            beta,
+            pre_norm,
+            iris,
+        )
+
     def refresh_residual_gates(self) -> None:
         """Re-derive ``(alpha, beta)`` in place so captured graphs read reloaded gates."""
         self.post_attention_residual_gate.refresh_gate()
@@ -2003,42 +2101,51 @@ class MuseSparkDecoderLayer(nn.Module):
                 )
             else:
                 attention_input = self.comm_manager.pre_attn_comm(attention_input, ctx)
-        attention_output, attention_sentinel, attention_ranks = self.self_attn(
-            positions, attention_input, ctx, owned_global_rows if owned_qkvg else None
+        # Sliding decode rows may run attention through its boundary in one launch.
+        fused = (
+            self._sliding_attention_tail(positions, attention_input, ctx, hidden_states)
+            if owned_global_rows is None
+            else None
         )
-        fused = None
-        if owned_global_rows is not None:
-            attention_output = iris.reduce_scatter_owned_rows(attention_output)
-        elif (
-            self.self_attn.o_proj.tp_size > 1
-            and not self.self_attn.o_proj.reduce_results
-            and self.pre_feedforward_layernorm.weight is not None
-            and self.comm_manager.use_all_reduce(self.comm_manager.is_moe)
-        ):
-            iris = self.iris_state
-            pre_norm = self.pre_feedforward_layernorm
-            post_norm = self.post_attention_layernorm
-            alpha, beta = self.post_attention_residual_gate._gate_coefficients()
-            if iris is not None and iris.can_all_reduce_symmetric_boundary(
-                attention_output,
-                hidden_states,
-                post_norm.weight,
-                alpha,
-                beta,
-                pre_norm.weight,
+        if fused is None:
+            attention_output, attention_sentinel, attention_ranks = self.self_attn(
+                positions,
+                attention_input,
+                ctx,
+                owned_global_rows if owned_qkvg else None,
+            )
+            if owned_global_rows is not None:
+                attention_output = iris.reduce_scatter_owned_rows(attention_output)
+            elif (
+                self.self_attn.o_proj.tp_size > 1
+                and not self.self_attn.o_proj.reduce_results
+                and self.pre_feedforward_layernorm.weight is not None
+                and self.comm_manager.use_all_reduce(self.comm_manager.is_moe)
             ):
-                fused = iris.all_reduce_symmetric_boundary(
+                iris = self.iris_state
+                pre_norm = self.pre_feedforward_layernorm
+                post_norm = self.post_attention_layernorm
+                alpha, beta = self.post_attention_residual_gate._gate_coefficients()
+                if iris is not None and iris.can_all_reduce_symmetric_boundary(
                     attention_output,
                     hidden_states,
                     post_norm.weight,
                     alpha,
                     beta,
                     pre_norm.weight,
-                    post_norm.eps,
-                    post_norm.weight_offset,
-                    pre_norm.eps,
-                    pre_norm.weight_offset,
-                )
+                ):
+                    fused = iris.all_reduce_symmetric_boundary(
+                        attention_output,
+                        hidden_states,
+                        post_norm.weight,
+                        alpha,
+                        beta,
+                        pre_norm.weight,
+                        post_norm.eps,
+                        post_norm.weight_offset,
+                        pre_norm.eps,
+                        pre_norm.weight_offset,
+                    )
         if fused is not None:
             hidden_states, router_input, mlp_input = fused
         else:
