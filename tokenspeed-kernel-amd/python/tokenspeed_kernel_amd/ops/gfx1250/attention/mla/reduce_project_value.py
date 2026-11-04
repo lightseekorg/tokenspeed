@@ -318,11 +318,14 @@ def _mla_query_block_reduce_project_value_kernel(
     )
     NUM_D: gl.constexpr = LATENT // BLOCK_D
     row = token * HEADS + head
+    row64 = row.to(gl.int64)
     if HAS_GATE:
         # Only the row's last arrival applies the gate, but loading it here
         # keeps its latency off the end of the merge.
         gate = gl.load(
-            gate_ptr + token * GATE_STRIDE_B + (head * VALUE + offs_v) * GATE_STRIDE_N
+            gate_ptr
+            + token.to(gl.int64) * GATE_STRIDE_B
+            + (head * VALUE + offs_v) * GATE_STRIDE_N
         )
     VEC: gl.constexpr = BLOCK_D // 32
     TILE_LAYOUT: gl.constexpr = gl.BlockedLayout(
@@ -335,7 +338,7 @@ def _mla_query_block_reduce_project_value_kernel(
     seq_len = gl.load(seq_len_ptr + token // QUERIES)
     tiles_per_split = gl.cdiv(seq_len, NUM_KV_SPLITS * TILE_SIZE)
     active_splits = gl.cdiv(seq_len, tiles_per_split * TILE_SIZE)
-    stat_base = row.to(gl.int64) * NUM_KV_SPLITS
+    stat_base = row64 * NUM_KV_SPLITS
 
     offs_all = gl.arange(0, NUM_KV_SPLITS, layout=STAT_LAYOUT)
     split_max = gl.load(
@@ -382,7 +385,7 @@ def _mla_query_block_reduce_project_value_kernel(
     )
     projected = gl.sum(weight.to(gl.float32) * attention[:, None], axis=0)
 
-    partial_row = partial_ptr + row.to(gl.int64) * (NUM_D * VALUE)
+    partial_row = partial_ptr + row64 * (NUM_D * VALUE)
     gl.store(partial_row + d_block * VALUE + offs_v, projected, cache_modifier=".cg")
     # Every wave publishes its stores before one atomic announces the slice.
     # ".cg" stores and loads work at device scope, so the announcement needs
@@ -401,7 +404,7 @@ def _mla_query_block_reduce_project_value_kernel(
         if HAS_GATE:
             total *= 1.0 / (1.0 + gl.exp(-gate.to(gl.float32)))
         gl.store(
-            output_ptr + row * VALUE + offs_v,
+            output_ptr + row64 * VALUE + offs_v,
             total.to(output_ptr.dtype.element_ty),
         )
 
