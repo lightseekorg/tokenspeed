@@ -603,37 +603,6 @@ def muse_attntail_publish_attention(program, merged, gate, att_box, EPS: gl.cons
 
 
 @gluon.jit
-def muse_attntail_publish_rows(
-    program, offs_m, merged, gate, att_box, EPS: gl.constexpr
-):
-    """:func:`muse_attntail_publish_attention` for block rows ``offs_m`` only
-    (the spread merge's share): ``merged`` and ``gate`` are those rows'
-    ``[len(offs_m), head_dim]`` FP32 merge and gate logits in ``offs_m``'s
-    parent layout. Each row is one (token, head), so its norm is the row's
-    alone; the box gets whole 32-bit words (eight BF16 per lane)."""
-    cfg = program.cfg
-    rows = muse_attntail_gated_rows(merged, gate, EPS)
-    box_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [8, 8], [cfg.NUM_WARPS, 1], [1, 0]
-    )
-    rows = gl.convert_layout(rows, box_layout)
-    m = gl.convert_layout(offs_m, gl.SliceLayout(1, box_layout))
-    d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, box_layout))
-    base = gl.multiple_of(
-        program.row_tokens(m) * (cfg.NUM_Q_HEADS * cfg.HEAD_DIM)
-        + program.row_heads(m) * cfg.HEAD_DIM,
-        cfg.HEAD_DIM,
-    )
-    gl.amd.cdna4.buffer_store(
-        rows,
-        gl.multiple_of(att_box.to(gl.pointer_type(gl.bfloat16), bitcast=True), 16),
-        base[:, None] + d[None, :],
-        mask=program.row_valid(m)[:, None] & (d >= 0)[None, :],
-        cache=".wt",
-    )
-
-
-@gluon.jit
 def muse_attntail_attention(
     request,
     head_block,
