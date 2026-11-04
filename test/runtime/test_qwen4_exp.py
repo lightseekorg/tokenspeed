@@ -3859,16 +3859,24 @@ def test_hyperconnection_attention_residual_rows(
     selected = slice(start, start + counts[rank])
 
     # Emulate only the absent TP peers; HC and communication layout logic are real.
-    monkeypatch.setattr(
-        comm_module,
-        "token_reduce_scatter",
-        lambda value, **kwargs: (value * 2)[selected],
-    )
-    monkeypatch.setattr(comm_module, "all_reduce", lambda value, group: value * 2)
+    def reduce_scatter(value, *, group, scattered_num_tokens):
+        assert group == mapping.attn.tp_group
+        assert scattered_num_tokens == counts
+        return (value * 2)[selected]
 
-    def gather(value, **kwargs):
+    def reduce(value, group):
+        assert group == mapping.attn.tp_group
+        return value * 2
+
+    monkeypatch.setattr(comm_module, "token_reduce_scatter", reduce_scatter)
+    monkeypatch.setattr(comm_module, "all_reduce", reduce)
+
+    def gather(value, *, group, scattered_num_tokens):
+        assert group == mapping.attn.tp_group
+        assert scattered_num_tokens == counts
         torch.testing.assert_close(value, hyper_input[selected])
-        return hyper_input
+        # A real collective allocates new storage, requiring fresh HC normalization.
+        return hyper_input.clone()
 
     monkeypatch.setattr(comm_module, "token_all_gather", gather)
 
