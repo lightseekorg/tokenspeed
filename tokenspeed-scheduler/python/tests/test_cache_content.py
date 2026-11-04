@@ -800,17 +800,7 @@ def test_fused_forwards_read_their_own_prefixes(
             ),
             id="aborts-during-landing",
         ),
-        pytest.param(
-            False,
-            True,
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=ContentError,
-                reason="Known bug: a remote admission whose hit is a tail inside "
-                "the history table's first block exports the null block for it.",
-            ),
-            id="first-block-tails",
-        ),
+        pytest.param(False, True, id="first-block-tails"),
     ],
 )
 def test_decode_role_landings_and_forwards_read_their_own_prefixes(
@@ -957,12 +947,6 @@ def test_a_finish_behind_a_masked_first_decode_publishes_the_prompt_end_state() 
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known bug: the D role's first-block tail hole is exported as the "
-    "null block (reclaimed_prefix_blocks_ is not lowered when the slot is "
-    "filled).",
-)
 @pytest.mark.parametrize(
     "block_granularity, first_len, extra",
     [(8, 6, 1), (8, 3, 5), (4, 3, 2)],
