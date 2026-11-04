@@ -7,11 +7,13 @@ isolation and output consistency: the engine accepts token IDs through
 `WireDriver`, so an HTTP gateway, detokenizer, stop-string handling, and client
 connection timing are not part of the comparison.
 
-## First-pass RTX 4090 run
+## First-pass single-GPU run
 
-The defaults use `Qwen/Qwen2.5-1.5B-Instruct` with BF16, TP 1, a 4096-token
-context, greedy decoding, prefix caching disabled, chunked prefill disabled,
-and CUDA graphs disabled. The launch enables returned output logprobs. It does
+The defaults use `Qwen/Qwen3-0.6B` with BF16, TP 1, a 4096-token context,
+greedy decoding, prefix caching disabled, CUDA graphs disabled, and a
+4096-token scheduler budget. This leaves every prompt in one scheduled prefill
+round while satisfying the scheduler's positive `max_scheduled_tokens`
+requirement. The launch enables returned output logprobs. It does
 not request `--numerics rl-bitwise`: that envelope is verified per model and
 requires its profile to advertise the contract. This experiment still reports
 exact token and logprob differences, but a passing `auto` run is evidence for
@@ -87,8 +89,8 @@ a cache hit never substitutes for output equality.
 
 Keep one changed dimension per run:
 
-1. Set `--chunked-prefill-size` in `engine_args()` to a positive explicit value
-   and rerun the same matrix for full versus chunked-prefill comparison.
+1. Set `--chunked-prefill-size` in `engine_args()` to a smaller positive explicit
+   value and rerun the same matrix for full versus chunked-prefill comparison.
 2. Use a model whose profile has verified `rl-bitwise`, launch with
    `--numerics rl-bitwise`, and treat any reported token or logprob difference
    as a contract violation. The design contract is in

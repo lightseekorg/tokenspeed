@@ -132,7 +132,7 @@ def test_first_pass_engine_arguments_disable_interfering_features(tmp_path):
     argv = isolation.engine_args(args, prefix_caching=False)
     assert argv == [
         "--model",
-        isolation.DEFAULT_MODEL,
+        "Qwen/Qwen3-0.6B",
         "--dtype",
         "bfloat16",
         "--tensor-parallel-size",
@@ -144,7 +144,7 @@ def test_first_pass_engine_arguments_disable_interfering_features(tmp_path):
         "--max-num-seqs",
         "4",
         "--chunked-prefill-size",
-        "-1",
+        "4096",
         "--disable-prefix-caching",
         "--disable-prefill-graph",
         "--enforce-eager",

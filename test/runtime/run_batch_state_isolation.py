@@ -26,11 +26,11 @@ metadata, prefix-cache counts, first divergences, and frontend-observed load
 samples.  It uses greedy decoding and the launch's declared numerical contract;
 with ``--numerics rl-bitwise`` every comparison is exact.
 
-The default command is a first-pass RTX 4090 experiment:
-``Qwen/Qwen2.5-1.5B-Instruct``, BF16, TP 1, 4096 context, disabled prefix
-caching, chunked prefill, and CUDA graphs.  It includes independent repeats,
+The default command is a first-pass single-GPU experiment:
+``Qwen/Qwen3-0.6B``, BF16, TP 1, a 4096-token context and scheduling budget,
+disabled prefix caching and CUDA graphs. It includes independent repeats,
 equal-length and long/short two-request batches, reversed submission order,
-shared-prefix requests, and a four-request batch.  See
+shared-prefix requests, and a four-request batch. See
 ``docs/guides/batch-state-isolation.md`` for commands and interpretation.
 """
 
@@ -46,7 +46,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Protocol
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 DEFAULT_TARGET_PROMPT = """You are a careful assistant. Answer the following arithmetic question with one short sentence.
 
 Question: If a box has 17 blue marbles and 25 red marbles, how many marbles are in the box?
@@ -370,8 +370,10 @@ def engine_args(args: argparse.Namespace, *, prefix_caching: bool) -> list[str]:
         str(args.max_model_len),
         "--max-num-seqs",
         str(args.max_num_seqs),
+        # The scheduler requires a positive per-round budget. A full-context
+        # budget preserves the first pass's non-chunked behavior for this run.
         "--chunked-prefill-size",
-        "-1",
+        str(args.max_model_len),
         "--disable-prefix-caching" if not prefix_caching else "--enable-prefix-caching",
         "--disable-prefill-graph",
         "--enforce-eager",
@@ -543,7 +545,7 @@ def run(args: argparse.Namespace, *, driver: Driver | None = None) -> dict[str, 
             "tensor_parallel_size": 1,
             "max_model_len": args.max_model_len,
             "prefix_caching": False,
-            "chunked_prefill_size": -1,
+            "chunked_prefill_size": args.max_model_len,
             "cuda_graphs": False,
             "numerics": "auto",
         },
