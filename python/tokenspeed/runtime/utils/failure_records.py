@@ -51,7 +51,7 @@ def rank_record_path(kind: str, rank: int) -> str:
     """The file a rank's ``kind`` kernel mirrors its failure record into.
 
     Args:
-        kind: The writing kernel family, such as ``"decoder-layer"``.
+        kind: The writing kernel family, such as ``"monokernel"``.
         rank: The rank's global rank.
     """
     directory = _record_dir(os.getppid())

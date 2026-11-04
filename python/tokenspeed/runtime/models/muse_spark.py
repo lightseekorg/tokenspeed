@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Iterable
 from functools import partial
@@ -140,8 +139,6 @@ if TYPE_CHECKING:
 
     from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
-
-logger = logging.getLogger(__name__)
 
 # Row limit of the generic column gather and the NVLS mailbox.
 _GATHER_WORKSPACE_ROWS = 64
@@ -2161,7 +2158,7 @@ class MuseSparkDecoderLayer(nn.Module):
             else ``(residual, None, next layer's attention input)``.
         """
         cache = self.self_attn.attn.decode_kv_view(ctx)
-        assert cache is not None, "fused layers run decode forwards only"
+        assert cache is not None, "monokernel layers run decode forwards only"
         if not next_fused:
             norm = next_layer.input_layernorm
             normed, residual = fused.forward_last(

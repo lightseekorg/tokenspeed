@@ -136,7 +136,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
             group=process_group_manager.get_device_process_group(group),
             rank_in_group=rank_in_group,
             max_requests=max(FUSED_REQUESTS),
-            failure_record_path=rank_record_path("decoder-layer", dist.get_rank()),
+            failure_record_path=rank_record_path("monokernel", dist.get_rank()),
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
         if state is None:
@@ -171,7 +171,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
             prepared.append(fused)
             for shape in shapes:
                 if fused is None:
-                    reasons[shape]["no fused decoder layer kernel"] = None
+                    reasons[shape]["no monokernel"] = None
                     continue
                 for reason in fused.decline_reasons(shape[0]):
                     reasons[shape][f"layer {index}: {reason}"] = None
@@ -182,7 +182,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
             process_group_manager.get_process_group("gloo", group),
         )
         if rank_in_group == 0:
-            logger.info(served.report("fused decoder layers"))
+            logger.info(served.report("monokernel layers"))
         if served.shapes:
             self.fused_layers = prepared
             self.fused_indices = candidates

@@ -33,7 +33,7 @@ from tokenspeed.runtime.utils.failure_records import (
 
 def _rank(rank: int, words: list[int]) -> None:
     # What a kernel's host mirror leaves: a page whose record leads it.
-    with open(rank_record_path("decoder-layer", rank), "wb") as handle:
+    with open(rank_record_path("monokernel", rank), "wb") as handle:
         handle.write(struct.pack(f"<{len(words)}i", *words).ljust(4096, b"\0"))
 
 
@@ -47,7 +47,7 @@ def test_launcher_logs_only_records_that_hold_a_failure(caplog):
     with caplog.at_level(logging.ERROR, logger="launcher"):
         report_failure_records(os.getpid(), logger)
     assert [record.getMessage() for record in caplog.records] == [
-        "failure record decoder-layer-rank3.bin: [4, 17, -1, 9]"
+        "failure record monokernel-rank3.bin: [4, 17, -1, 9]"
     ]
     # Removed with the records: a second report finds nothing.
     caplog.clear()

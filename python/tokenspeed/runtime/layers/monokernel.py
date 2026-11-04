@@ -118,10 +118,10 @@ def deployment_decline_reasons(deployment: MonokernelDeployment) -> list[str]:
         if deployment.environ.get(name):
             reasons.append(f"{name} restricts the compute units a launch can use")
     if deployment.expert_load_recorder is not None:
-        reasons.append("fused layers do not record expert loads")
+        reasons.append("monokernels do not record expert loads")
     if deployment.memory_saver:
         reasons.append(
-            "the memory saver can release the fused launch state apart from "
+            "the memory saver can release the monokernel launch state apart from "
             "the communication buffers it indexes"
         )
     if deployment.forward_side_stream:
@@ -191,7 +191,7 @@ def agree_served_shapes(
         dist.all_gather_object(gathered, local, group=group)
     if any(set(other) != set(local) for other in gathered):
         raise RuntimeError(
-            f"fused decoder layers: ranks propose different shapes: "
+            f"monokernels: ranks propose different shapes: "
             f"{[sorted(other) for other in gathered]}"
         )
     declined = {}
