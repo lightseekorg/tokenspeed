@@ -2118,7 +2118,9 @@ class MuseSparkDecoderLayer(nn.Module):
             "post_feedforward_norm": norm(self.post_feedforward_layernorm),
             "post_feedforward_gate": post_feedforward,
             "next_input_norm": norm(next_layer.input_layernorm),
-            "next_qkv_proj": next_layer.self_attn.qkv_proj.weight,
+            # This rank's q | k | v | gate rows, as its attention reads them (a
+            # contiguous view when the weight is replicated for owned rows).
+            "next_qkv_proj": next_layer.self_attn.qkv_proj._local_weight(),
         }
 
     def prepare_fused_query(
