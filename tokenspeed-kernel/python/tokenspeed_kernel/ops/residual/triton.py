@@ -1885,6 +1885,179 @@ def triton_mhc_mixes(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_it
     )
 
 
+@triton.jit(do_not_specialize=["num_tokens", "n_splits", "hidden_size"])
+def _ihc_gates_kernel(
+    projection,
+    square_sum,
+    scale,
+    base,
+    gates,
+    num_tokens,
+    n_splits,
+    hidden_size,
+    rms_eps,
+    hc_eps,
+    magnitude,
+    HC: tl.constexpr,
+    GATE_SETS: tl.constexpr,
+    BLOCK_HC: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_HC)
+    mask = offsets < HC
+
+    # Sum the split partials in the same order as the mHC coefficient kernels.
+    rms_sum = tl.full((), 0.0, tl.float32)
+    for split in range(0, n_splits):
+        rms_sum += tl.load(square_sum + split * num_tokens + token)
+    inv_rms = tl.rsqrt(rms_sum / (HC * hidden_size) + rms_eps)
+
+    for gate_set in tl.static_range(GATE_SETS):
+        mix = tl.zeros((BLOCK_HC,), tl.float32)
+        for split in range(0, n_splits):
+            row = projection + (split * num_tokens + token) * (GATE_SETS * HC)
+            mix += tl.load(row + gate_set * HC + offsets, mask=mask, other=0.0)
+        logit = mix * inv_rms * tl.load(scale + gate_set) + tl.load(
+            base + gate_set * HC + offsets, mask=mask, other=0.0
+        )
+        gate = tl.sigmoid(logit)
+        if gate_set == 1:
+            gate *= magnitude
+        tl.store(
+            gates + (gate_set * num_tokens + token) * HC + offsets,
+            gate + hc_eps,
+            mask=mask,
+        )
+
+
+def _triton_ihc_gates(
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    magnitude: float = 1.0,
+) -> torch.Tensor:
+    """iHC coefficients [gate_sets,T,hc]: pre, then post scaled by ``magnitude``."""
+    tokens, hc, hidden = residual.shape
+    gate_sets = weight.shape[0] // hc
+    gates = torch.empty(
+        (gate_sets, tokens, hc), device=residual.device, dtype=torch.float32
+    )
+    if tokens == 0:
+        return gates
+    splits = compute_mhc_num_splits(
+        residual.device, 64, hc * hidden, triton.cdiv(tokens, 64)
+    )
+    projection = torch.empty(
+        (splits, tokens, weight.shape[0]), device=residual.device, dtype=torch.float32
+    )
+    square_sum = torch.empty(
+        (splits, tokens), device=residual.device, dtype=torch.float32
+    )
+    _mhc_prenorm_gemm_triton(
+        residual.view(tokens, hc * hidden), weight, projection, square_sum, splits
+    )
+    _ihc_gates_kernel[(tokens,)](
+        projection,
+        square_sum,
+        scale,
+        base,
+        gates,
+        tokens,
+        splits,
+        hidden,
+        rms_eps,
+        hc_eps,
+        magnitude,
+        HC=hc,
+        GATE_SETS=gate_sets,
+        BLOCK_HC=triton.next_power_of_2(hc),
+        num_warps=1,
+    )
+    return gates
+
+
+@register_kernel(
+    "residual",
+    "ihc_mixes",
+    name="triton_ihc_mixes",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_ihc_mixes(residual, weight, scale, base, rms_eps, hc_eps, magnitude):
+    pre, post = _triton_ihc_gates(
+        residual, weight, scale, base, rms_eps, hc_eps, magnitude
+    )
+    return pre, post
+
+
+@register_kernel(
+    "residual",
+    "ihc_head_mixes",
+    name="triton_ihc_head_mixes",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_ihc_head_mixes(residual, weight, scale, base, rms_eps, hc_eps):
+    return _triton_ihc_gates(residual, weight, scale, base, rms_eps, hc_eps)[0]
+
+
+@triton.jit
+def _ihc_post_kernel(
+    hidden_states,
+    residual,
+    post,
+    out,
+    hidden_size,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offsets < hidden_size
+    update = tl.load(
+        hidden_states + token * hidden_size + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    for stream in tl.static_range(HC):
+        row = (token * HC + stream) * hidden_size + offsets
+        stream_values = tl.load(residual + row, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(post + token * HC + stream)
+        result = tl.fma(gate, update, stream_values)
+        tl.store(out + row, result.to(out.dtype.element_ty), mask=mask)
+
+
+@register_kernel(
+    "residual",
+    "ihc_post",
+    name="triton_ihc_post",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_ihc_post(hidden_states, residual, post):
+    tokens, hc, hidden = residual.shape
+    out = torch.empty_like(residual)
+    if tokens:
+        block_h = min(1024, triton.next_power_of_2(hidden))
+        _ihc_post_kernel[(tokens, triton.cdiv(hidden, block_h))](
+            hidden_states, residual, post, out, hidden, HC=hc, BLOCK_H=block_h
+        )
+    return out
+
+
 @triton.jit(do_not_specialize=["X0", "X1"])
 def _mhc_init_kernel(
     X, Y, PRE, X0, X1, H: tl.constexpr, HC: tl.constexpr, B: tl.constexpr

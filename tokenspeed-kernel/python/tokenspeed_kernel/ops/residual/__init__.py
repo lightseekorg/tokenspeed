@@ -763,6 +763,111 @@ def mhc_mixes(
     return kernel(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters)
 
 
+def _select_ihc_mix_kernel(
+    op: str,
+    residual: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    gate_sets: int,
+):
+    if residual.ndim != 3 or residual.shape[1] < 2:
+        raise ValueError(f"{op} requires residual [T,hc,H] with hc > 1")
+    _, hc, hidden = residual.shape
+    if (
+        weight.shape != (gate_sets * hc, hc * hidden)
+        or scale.shape != (gate_sets,)
+        or base.shape != (gate_sets * hc,)
+    ):
+        raise ValueError(
+            f"{op} requires weight [{gate_sets}*hc,hc*H], scale [{gate_sets}] "
+            f"and base [{gate_sets}*hc]"
+        )
+    if residual.dtype != _torch.bfloat16 or any(
+        t.dtype != _torch.float32 for t in (weight, scale, base)
+    ):
+        raise ValueError(f"{op} requires BF16 residual and FP32 parameters")
+    if any(
+        not t.is_contiguous() or t.device != residual.device
+        for t in (residual, weight, scale, base)
+    ):
+        raise ValueError(f"{op} requires contiguous colocated tensors")
+    traits = {
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
+        "hc_mult": hc,
+        "hidden_size": hidden,
+    }
+    return select_kernel(
+        "residual",
+        op,
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=traits,
+        override=None,
+        solution=None,
+    )
+
+
+def ihc_mixes(
+    residual: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    magnitude: float,
+) -> tuple[_torch.Tensor, _torch.Tensor]:
+    """Produce independent Hyper-Connections (iHC) layer coefficients.
+
+    iHC keeps ``hc`` residual streams like mHC but has no combine matrix.
+    The projection and its inverse-RMS scale match :func:`mhc_mixes`.
+    Consume ``pre`` with :func:`mhc_apply_pre` and ``post`` with
+    :func:`ihc_post`.
+
+    Args:
+        residual: Contiguous BF16 residual streams [T,hc,H] with hc > 1.
+        weight: Contiguous FP32 mixing projection [2*hc,hc*H], pre rows first.
+        scale: FP32 pre/post scales [2].
+        base: FP32 pre/post biases [2*hc].
+        rms_eps: Epsilon for residual RMS normalization.
+        hc_eps: Epsilon added to both coefficients.
+        magnitude: Gain of the post sigmoid.
+
+    Returns:
+        Contiguous FP32 ``pre = sigmoid + hc_eps`` and
+        ``post = magnitude * sigmoid + hc_eps``, each [T,hc].
+    """
+    kernel = _select_ihc_mix_kernel("ihc_mixes", residual, weight, scale, base, 2)
+    return kernel(residual, weight, scale, base, rms_eps, hc_eps, magnitude)
+
+
+def ihc_head_mixes(
+    residual: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> _torch.Tensor:
+    """Produce the iHC pre coefficients that merge the streams before the head.
+
+    Same as the ``pre`` output of :func:`ihc_mixes`, from a projection with
+    only pre rows.
+
+    Args:
+        residual: Contiguous BF16 residual streams [T,hc,H] with hc > 1.
+        weight: Contiguous FP32 mixing projection [hc,hc*H].
+        scale: FP32 pre scale [1].
+        base: FP32 pre biases [hc].
+        rms_eps: Epsilon for residual RMS normalization.
+        hc_eps: Epsilon added to the coefficients.
+
+    Returns:
+        Contiguous FP32 ``pre = sigmoid + hc_eps`` [T,hc].
+    """
+    kernel = _select_ihc_mix_kernel("ihc_head_mixes", residual, weight, scale, base, 1)
+    return kernel(residual, weight, scale, base, rms_eps, hc_eps)
+
+
 def try_mhc_shifted_post_pre_norm(
     x: _torch.Tensor,
     residual: _torch.Tensor,
@@ -1152,6 +1257,58 @@ def mhc_post(
         return kernel(hidden_states, residual, post, comb)
 
 
+def ihc_post(
+    hidden_states: _torch.Tensor,
+    residual: _torch.Tensor,
+    post: _torch.Tensor,
+) -> _torch.Tensor:
+    """Add the post-gated layer output to every iHC residual stream.
+
+    Computes ``residual[t, i] + post[t, i] * hidden_states[t]`` as one FP32
+    fused multiply-add per element.
+
+    Args:
+        hidden_states: Contiguous BF16 layer output [T,H].
+        residual: Contiguous BF16 residual streams [T,hc,H].
+        post: Contiguous FP32 post coefficients [T,hc] from :func:`ihc_mixes`.
+
+    Returns:
+        Updated BF16 residual streams [T,hc,H].
+    """
+    if residual.ndim != 3 or hidden_states.shape != (
+        residual.shape[0],
+        residual.shape[2],
+    ):
+        raise ValueError("ihc_post requires hidden_states [T,H] and residual [T,hc,H]")
+    if post.shape != residual.shape[:2]:
+        raise ValueError("ihc_post requires post [T,hc]")
+    if (
+        hidden_states.dtype != _torch.bfloat16
+        or residual.dtype != _torch.bfloat16
+        or post.dtype != _torch.float32
+    ):
+        raise ValueError("ihc_post requires BF16 activations and FP32 post")
+    if any(
+        not t.is_contiguous() or t.device != residual.device
+        for t in (hidden_states, residual, post)
+    ):
+        raise ValueError("ihc_post requires contiguous colocated tensors")
+    traits = {
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
+        "hc_mult": int(residual.shape[1]),
+        "hidden_size": int(residual.shape[2]),
+    }
+    kernel = select_kernel(
+        "residual",
+        "ihc_post",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=traits,
+        override=None,
+        solution=None,
+    )
+    return kernel(hidden_states, residual, post)
+
+
 def mhc_fused_hc(
     x_prev: _torch.Tensor,
     residual_prev: _torch.Tensor,
@@ -1231,6 +1388,9 @@ __all__ = [
     "boundary_gathers_mailbox",
     "gated_residual_combine",
     "gated_residual_mix",
+    "ihc_head_mixes",
+    "ihc_mixes",
+    "ihc_post",
     "mhc_apply_pre",
     "mhc_apply_pre_quantize_fp8",
     "mhc_fused_hc",

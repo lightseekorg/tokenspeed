@@ -18,9 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""PyTorch references for ``tokenspeed_kernel.ops.residual``: manifold
-hyper-connections (mHC), hyper-connection mixes, attention residuals and the
-gated residual boundary."""
+"""PyTorch references for ``tokenspeed_kernel.ops.residual``: manifold and
+independent hyper-connections (mHC, iHC), hyper-connection mixes, attention
+residuals and the gated residual boundary."""
 
 from __future__ import annotations
 
@@ -97,6 +97,72 @@ def torch_mhc_mixes(
     inv_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + rms_eps)
     mixes = F.linear(flat, weight) * inv_rms
     return mhc_mix_coefficients(mixes, scale, base, hc_eps, sinkhorn_iters)
+
+
+def ihc_sigmoid_gates(
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    rms_eps: float,
+) -> torch.Tensor:
+    """iHC sigmoid gates ``[..., gate_sets, hc]`` of streams ``[..., hc, H]``.
+
+    The projection and inverse RMS match :func:`torch_mhc_mixes`; each set of
+    ``hc`` projection rows has its own scale. Math runs in ``weight``'s dtype.
+    """
+    hc = residual.shape[-2]
+    flat = residual.to(weight.dtype).flatten(-2)
+    inv_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + rms_eps)
+    mixes = (F.linear(flat, weight) * inv_rms).unflatten(-1, (-1, hc))
+    scale, base = scale.to(mixes.dtype), base.to(mixes.dtype)
+    return torch.sigmoid(mixes * scale[:, None] + base.view(-1, hc))
+
+
+@register_kernel(
+    "residual",
+    "ihc_mixes",
+    name="torch_ihc_mixes",
+    solution="torch",
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.REFERENCE,
+)
+def torch_ihc_mixes(
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    magnitude: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iHC ``pre = sigmoid + hc_eps`` and ``post = magnitude * sigmoid + hc_eps``."""
+    gates = ihc_sigmoid_gates(residual, weight, scale, base, rms_eps)
+    return gates[..., 0, :] + hc_eps, magnitude * gates[..., 1, :] + hc_eps
+
+
+@register_kernel(
+    "residual",
+    "ihc_head_mixes",
+    name="torch_ihc_head_mixes",
+    solution="torch",
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.REFERENCE,
+)
+def torch_ihc_head_mixes(
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    """iHC head ``pre = sigmoid + hc_eps`` from a pre-only projection."""
+    return ihc_sigmoid_gates(residual, weight, scale, base, rms_eps)[..., 0, :] + hc_eps
 
 
 @register_kernel(
@@ -327,3 +393,24 @@ def torch_mhc_post(
     mixed_residual = torch.einsum("tnm,tnh->tmh", comb.float(), residual.float())
     block_update = post.float() * hidden_states.float().unsqueeze(1)
     return (mixed_residual + block_update).to(hidden_states.dtype)
+
+
+@register_kernel(
+    "residual",
+    "ihc_post",
+    name="torch_ihc_post",
+    solution="torch",
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.REFERENCE,
+)
+def torch_ihc_post(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+) -> torch.Tensor:
+    """iHC post-mapping: every stream ``[T, hc, H]`` adds ``post [T, hc]`` times
+    the layer output ``[T, H]``, in FP32 before casting to the residual dtype."""
+    update = post.float().unsqueeze(-1) * hidden_states.float().unsqueeze(1)
+    return (residual.float() + update).to(residual.dtype)
