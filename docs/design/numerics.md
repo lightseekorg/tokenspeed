@@ -691,6 +691,12 @@ The final subtraction is `target - log(sum_exp)`, preserving positive zero
 for a token whose rounded probability is one. Negating the equivalent NLL
 would produce negative zero and fail a bit-pattern comparison with the trainer.
 
+`--logprob-order mora` uses the same 32768-wide fold and preserves the
+negative-cross-entropy convention instead: probability-one rows return
+`-0.0`. All nonzero FP32 results are unchanged. This is a separate explicit
+order because signed zero is part of a trainer's bitwise logprob contract;
+the existing Megatron orders continue to return `+0.0`.
+
 The pins above cover only the paths a verified model takes, so the
 verification is recorded per model and enforced at startup
 (`require_verified_numerics`): a model profile lists the envelopes its model

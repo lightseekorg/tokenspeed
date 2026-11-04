@@ -139,6 +139,9 @@ MEGATRON_VOCAB_BLOCK = 32768
 MEGATRON_LOGPROB_BLOCKS = {
     "megatron": MEGATRON_VOCAB_BLOCK,
     "megatron-16384": 16384,
+    # Mora uses the same sum-exp fold but returns negative cross-entropy,
+    # including its negative zero for a probability rounded to one.
+    "mora": MEGATRON_VOCAB_BLOCK,
 }
 LOGPROB_ORDERS = ("torch", *MEGATRON_LOGPROB_BLOCKS)
 

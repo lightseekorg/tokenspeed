@@ -93,17 +93,24 @@ def gather_token_logprobs(
         logprob_order: ``"torch"`` for ``torch.log_softmax``; ``"megatron"``
             for the trainer's vocab-parallel cross-entropy order over fixed
             32768-wide vocab blocks, or ``"megatron-16384"`` for a rank-ordered
-            fold of 16384-wide shards (validated by ServerArgs).
+            fold of 16384-wide shards (validated by ServerArgs). ``"mora"``
+            uses 32768-wide blocks and negative-cross-entropy signed zeros.
 
     Returns:
         ``[rows]`` fp32 log probabilities.
     """
     if logprob_order in MEGATRON_LOGPROB_BLOCKS:
-        return vocab_parallel_logprobs(
+        result = vocab_parallel_logprobs(
             logits,
             tokens.to(torch.int64),
             vocab_block=MEGATRON_LOGPROB_BLOCKS[logprob_order],
         )
+        if logprob_order == "mora":
+            # -(log(sum_exp) - target) and target - log(sum_exp) agree for
+            # nonzero results, but only the former preserves Mora's -0.0.
+            # Keep the existing Megatron contract and all nonzero bits.
+            result = torch.where(result == 0, -0.0, result)
+        return result
     return gather_token_logprobs_torch(logits, tokens)
 
 

@@ -87,6 +87,29 @@ def test_megatron_order_preserves_positive_zero(dtype, order, block):
     assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_mora_order_preserves_negative_cross_entropy_zero(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    logits = torch.full((4, VOCAB), -100.0, dtype=dtype, device=device)
+    targets = torch.tensor([3, VOCAB - 1, 3, 4], device=device)
+    logits[0, 3] = 0
+    logits[1].fill_(-float("inf"))
+    logits[1, VOCAB - 1] = 0
+    logits[2, 3:5] = 0
+    logits[3, 3] = 0
+    old = gather_token_logprobs(logits, targets, logprob_order="megatron")
+    got = gather_token_logprobs(logits, targets, logprob_order="mora")
+    # Probability-one rows must retain the sign from -cross_entropy;
+    # tied and unlikely target rows must preserve every existing FP32 bit.
+    expected_zero = torch.full((2,), -0.0, dtype=torch.float32, device=device)
+    assert torch.equal(got[:2].view(torch.int32), expected_zero.view(torch.int32))
+    assert not torch.signbit(old[:2]).any()
+    assert torch.equal(got[2:].view(torch.int32), old[2:].view(torch.int32))
+    assert (got[2:] < 0).all()
+
+
 @pytest.mark.parametrize(
     "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
 )
