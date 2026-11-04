@@ -169,10 +169,6 @@ def test_no_volatile_drains_on_the_main_path(key):
     assert store_loop_preheader_drains(assembly) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the MoE ring loop loads its scale dwords (_load_scale_dword) without nt",
-)
 @pytest.mark.parametrize("key", _variants())
 def test_moe_loops_keep_the_ring_and_have_no_barrier(key):
     assembly, constexprs = _compile(key)
