@@ -54,8 +54,8 @@ class IndexMetadata:
             or request_indices.numel() >= 2**31
         ):
             raise ValueError(
-                "request_indices must be contiguous int32 [queries] on the table device, "
-                "with fewer than 2**31 rows"
+                "request_indices must be contiguous int32 [queries] "
+                "on the table device, with fewer than 2**31 rows"
             )
         self.source = IndexGeometry((table, lengths, request_indices))
         self.paged = {}

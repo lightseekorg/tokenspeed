@@ -29,7 +29,6 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     block_maxima,
     clean_logits,
     clean_logits_for_selection,
-    finish_selection,
     prepare_native_block_scores,
     prepare_scores,
 )
