@@ -60,8 +60,16 @@ from tokenspeed_kernel._triton import gluon, triton  # noqa: E402
 
 # Any rank: the variants differ in their peers' order only.
 _RANK = 3
-# Functions whose code only runs on the failure path.
-_FAILURE_PATHS = {"fail_stop", "iris_fail_stop", "trap"}
+# Functions whose code only runs on the failure path. The abort-word load of
+# poll_stop_site and record_failure's own loads may be attributed to the
+# caller once inlined, so both are listed.
+_FAILURE_PATHS = {
+    "fail_stop",
+    "record_failure",
+    "poll_stop_site",
+    "iris_fail_stop",
+    "trap",
+}
 
 
 def _variant_id(key):
