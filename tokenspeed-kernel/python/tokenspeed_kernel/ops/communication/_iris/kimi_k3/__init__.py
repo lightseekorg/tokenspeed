@@ -351,6 +351,15 @@ class K3IrisState:
         )
 
         lamport = self.lamport
+        if (
+            rows < 1
+            or width % lamport.BLOCK_ELEMENTS
+            or output.numel() % lamport.BLOCK_ELEMENTS
+            or not rows * width < output.numel() <= lamport.max_numel
+        ):
+            raise ValueError(
+                "routed Lamport output must fit its mailbox in complete tiles"
+            )
         iris_k3moe_lamport_allreduce_topk[(output.numel() // lamport.BLOCK_ELEMENTS,)](
             partials,
             lamport.producer.data,

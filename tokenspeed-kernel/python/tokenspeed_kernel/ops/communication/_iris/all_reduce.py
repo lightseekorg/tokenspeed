@@ -490,6 +490,10 @@ class ProducerLamport:
         )
 
     def run(self, out: torch.Tensor) -> None:
+        if not 0 < out.numel() <= self.max_numel or out.numel() % self.BLOCK_ELEMENTS:
+            raise ValueError(
+                "Lamport output must fit its mailbox in complete 512-element tiles"
+            )
         iris_lamport_allreduce[(out.numel() // self.BLOCK_ELEMENTS,)](
             self.producer.data,
             self.mailbox,
@@ -824,7 +828,7 @@ def _iris_lamport_exchange_tile(
     mask,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    TOTAL_ELEMENTS: gl.constexpr,
+    TOTAL_ELEMENTS,
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
@@ -892,7 +896,7 @@ def _iris_lamport_exchange_tile(
     gl.store(epochs + gl.program_id(0), ((generation + 1) % NUM_STAGES).to(gl.int32))
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["TOTAL_ELEMENTS"])
 def iris_lamport_allreduce(
     input_sym_ptr,
     region_sym_ptr,
@@ -908,7 +912,7 @@ def iris_lamport_allreduce(
     region_7,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    TOTAL_ELEMENTS: gl.constexpr,
+    TOTAL_ELEMENTS,
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
@@ -921,14 +925,19 @@ def iris_lamport_allreduce(
     counter; negative zero is replaced with zero to preserve the empty marker.
     """
     gl.static_assert(WORLD_SIZE == 8)
-    gl.static_assert(TOTAL_ELEMENTS % 512 == 0)
-    gl.static_assert(TOTAL_ELEMENTS <= MAX_ELEMENTS)
+    # ProducerLamport.run validates the payload's tile alignment and bound.
+    # Its size follows the batch and must not choose another binary.
+    TOTAL_ELEMENTS = gl.multiple_of(TOTAL_ELEMENTS, 512)
     gl.static_assert(NUM_STAGES >= 3)
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
     pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
     offsets = pack[:, None] * 8 + element[None, :]
-    mask = offsets < TOTAL_ELEMENTS
+    # The host launches complete 512-element tiles. A uniform tile predicate
+    # preserves 16-byte coherent stores with a runtime payload bound.
+    mask = gl.full([64, 8], True, gl.int1, layout) & (
+        gl.program_id(0) * 512 < TOTAL_ELEMENTS
+    )
     generation = (
         gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
     )

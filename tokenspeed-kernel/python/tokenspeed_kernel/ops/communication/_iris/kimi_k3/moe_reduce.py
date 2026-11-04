@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["TOTAL_ELEMENTS", "ROUTED_ELEMENTS"])
 def iris_k3moe_lamport_allreduce_topk(
     partials_ptr,
     input_sym_ptr,
@@ -44,8 +44,8 @@ def iris_k3moe_lamport_allreduce_topk(
     regions,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    TOTAL_ELEMENTS: gl.constexpr,
-    ROUTED_ELEMENTS: gl.constexpr,
+    TOTAL_ELEMENTS,
+    ROUTED_ELEMENTS,
     ROUTED_WIDTH: gl.constexpr,
     TOPK: gl.constexpr,
     MAX_ELEMENTS: gl.constexpr,
@@ -61,15 +61,20 @@ def iris_k3moe_lamport_allreduce_topk(
     plain all-reduce does.
     """
     gl.static_assert(WORLD_SIZE == 8)
-    gl.static_assert(TOTAL_ELEMENTS % 512 == 0 and ROUTED_WIDTH % 512 == 0)
-    gl.static_assert(ROUTED_ELEMENTS % ROUTED_WIDTH == 0)
-    gl.static_assert(ROUTED_ELEMENTS < TOTAL_ELEMENTS <= MAX_ELEMENTS)
+    gl.static_assert(ROUTED_WIDTH % 512 == 0)
+    # The launcher validates the complete-tile payload and mailbox bound.
+    TOTAL_ELEMENTS = gl.multiple_of(TOTAL_ELEMENTS, 512)
+    ROUTED_ELEMENTS = gl.multiple_of(ROUTED_ELEMENTS, 512)
     gl.static_assert(NUM_STAGES >= 3)
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
     pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
     offsets = pack[:, None] * 8 + element[None, :]
-    mask = offsets < TOTAL_ELEMENTS
+    # Payload bounds are tile-aligned at the launcher; every lane in this
+    # tile has the same predicate, preserving 16-byte peer transactions.
+    mask = gl.full([64, 8], True, gl.int1, layout) & (
+        gl.program_id(0) * 512 < TOTAL_ELEMENTS
+    )
     generation = (
         gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
     )
