@@ -1551,7 +1551,6 @@ def gluon_decoder_layer_muse_spark_gfx950(
     NEXT_ROTARY: gl.constexpr,
     QKV_WINDOW: gl.constexpr,
     ATT_MERGE: gl.constexpr,
-    SCALAR_ENTRY: gl.constexpr,
     STAMPS: gl.constexpr,
     # MoE plan fields (native_stream.run_moe).
     N_PHYS1: gl.constexpr,
@@ -1593,9 +1592,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         # Full layers: every workgroup runs its attention items first (one
         # code copy for every role); each role then issues its weights and
         # publishes the pending record.
-        launch = enter_check(
-            entry, errors, arena, deadline_ticks, label, fail_stop, SCALAR_ENTRY
-        )
+        launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
         _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
         records = _launch_records(att_records, launch)
         items = _full_items(
@@ -1611,9 +1608,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             # o_proj goes out before the entry check (no attention here),
             # paced, and lands long before the box.
             o_tiles = _sender_weights_paced(o_proj_ptr, sender)
-            launch = enter_check(
-                entry, errors, arena, deadline_ticks, label, fail_stop, SCALAR_ENTRY
-            )
+            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
             _send(launch, view, sender, o_tiles, rows, RANK, PEER_CACHE)
@@ -1666,9 +1661,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         task = xcd * _POOL_TILES + tile
         if SLIDING:
             p_tiles = _pooler_weights_sliding(pooler_ptr, task)
-            launch = enter_check(
-                entry, errors, arena, deadline_ticks, label, fail_stop, SCALAR_ENTRY
-            )
+            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
         else:
@@ -1705,9 +1698,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             )  # fmt: skip
     else:
         if SLIDING:
-            launch = enter_check(
-                entry, errors, arena, deadline_ticks, label, fail_stop, SCALAR_ENTRY
-            )
+            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
             if xcd < 2 * REQUESTS:
@@ -2013,7 +2004,6 @@ def kernel_constexprs(
     next_rotary: bool,
     qkv_window: int,
     att_merge: str,
-    entry: str,
     stamps: bool,
 ) -> dict:
     """The kernel's constexprs for one plan variant on one rank."""
@@ -2046,7 +2036,6 @@ def kernel_constexprs(
         NEXT_ROTARY=next_rotary,
         QKV_WINDOW=qkv_window,
         ATT_MERGE=att_merge,
-        SCALAR_ENTRY={"vector": False, "scalar": True}[entry],
         STAMPS=stamps,
         N_PHYS1=n_phys1,
         N_PHYS2=n_phys2,
@@ -2184,7 +2173,7 @@ def offline_compile_args(key: PlanKey, rank: int):
         dn_order=0, dn_lines=0, addr_soffset=0, tag_poll=2, scale_lanes=0, tail_num=1, tail_den=2,
         n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False,
         next_rotary=key.next_kind == "sliding", qkv_window=2, att_merge="designated",
-        entry="vector", stamps=False,
+        stamps=False,
     )  # fmt: skip
     signature = offline_signature(constexprs)
     options = {"num_warps": NUM_WARPS, **persistent_compile_options()}

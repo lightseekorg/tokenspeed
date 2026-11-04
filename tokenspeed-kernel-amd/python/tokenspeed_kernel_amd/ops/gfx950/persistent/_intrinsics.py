@@ -165,26 +165,6 @@ def wave_index():
 
 
 @gluon.jit
-def scalar_add2_i64(first_ptr, second_ptr):
-    """Add 1 to the int64 at each address with returning scalar atomics
-    (``s_atomic_add_x2 … glc``) and return both old values, per wave.
-
-    Scalar atomics count in ``lgkmcnt``, so the wait for them never waits
-    for the wave's vector loads. Each atomic is its own clause (the ISA
-    requires it), hence the ``s_nop`` between them. Inline asm: LLVM never
-    selects scalar atomics."""
-    return gl.inline_asm(
-        "s_mov_b64 $0, 1\n\ts_mov_b64 $1, 1\n\t"
-        "s_atomic_add_x2 $0, $2, 0x0 glc\n\ts_nop 0\n\t"
-        "s_atomic_add_x2 $1, $3, 0x0 glc\n\ts_waitcnt lgkmcnt(0)",
-        "=&s,=&s,s,s,~{memory}",
-        [first_ptr, second_ptr],
-        (gl.int64, gl.int64),
-        is_pure=False,
-    )
-
-
-@gluon.jit
 def scalar_load_glc(word_ptr):
     """Load an int32 with a scalar load past the scalar cache (``glc``).
 

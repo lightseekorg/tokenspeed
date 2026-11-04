@@ -52,7 +52,6 @@ from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     memrealtime,
     release_drain,
-    scalar_add2_i64,
     scalar_load_glc,
     scalar_load_glc_i64,
     scalar_pair_sums8,
@@ -60,7 +59,6 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     trap,
     vote,
     wave_acquire,
-    wave_index,
     xcc_id,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
@@ -169,17 +167,15 @@ class Entry:
     xcd: gl.tensor
     slot: gl.tensor
     pid: gl.tensor
-    wave: gl.tensor
     epoch_line: gl.tensor
     claim_line: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, cta, xcd, slot, pid, wave, epoch_line, claim_line):
+    def __init__(self, cta, xcd, slot, pid, epoch_line, claim_line):
         self.cta = cta
         self.xcd = xcd
         self.slot = slot
         self.pid = pid
-        self.wave = wave
         self.epoch_line = epoch_line
         self.claim_line = claim_line
 
@@ -229,13 +225,11 @@ def enter_issue(epoch_ptr, claim_ptr):
     slot = pid // _XCDS
     epoch_line = epoch_ptr + pid * _COUNTER_STRIDE
     claim_line = claim_ptr + (xcd * _SLOTS + slot) * _COUNTER_STRIDE
-    return Entry(
-        slot * _XCDS + xcd, xcd, slot, pid, wave_index(), epoch_line, claim_line
-    )
+    return Entry(slot * _XCDS + xcd, xcd, slot, pid, epoch_line, claim_line)
 
 
 @gluon.jit
-def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry, SCALAR_COUNTERS: gl.constexpr,):  # fmt: skip
+def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry):
     """Finish the launch entry; returns this wave's :class:`Launch`.
 
     Every workgroup advances its epoch word once per launch, so all
@@ -247,20 +241,14 @@ def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry, S
     XCD runs it, so its coherence across launches rests on the kernel
     boundary.
 
-    ``SCALAR_COUNTERS`` picks how:
-
-    - ``False``: every wave reads the epoch word with a scalar ``glc`` load,
-      the waves join at a barrier (so none reads the word after the store),
-      and the epoch goes back with a relaxed atomic store, which does not
-      wait for earlier loads. The workgroup then exchanges ``(tag, pid)``
-      into its claim word and stops if the old tag is this launch's. The
-      exchange returns after the vector loads issued before it (results
-      return in order), so the check waits for the role's first weights.
-    - ``True``: each wave adds 1 to its own word of both lines with
-      returning scalar atomics (``s_atomic_add_x2 … glc``) and waits with
-      ``lgkmcnt`` only, so loads issued before stay in flight. Every counter
-      gains one increment per launch, so a wave reading
-      ``claim != epoch`` is on a duplicate role. No barrier.
+    Every wave reads the epoch word with a scalar ``glc`` load, the waves
+    join at a barrier (so none reads the word after the store), and the
+    epoch goes back with a relaxed atomic store, which does not wait for
+    earlier loads. The workgroup then exchanges ``(tag, pid)`` into its
+    claim word and stops if the old tag is this launch's. The exchange
+    returns after the vector loads issued before it (results return in
+    order), so the check waits for the role's first weights: issue only the
+    weights the role uses first before the entry.
 
     Args:
         entry: From :func:`enter_issue`.
@@ -269,37 +257,25 @@ def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry, S
         deadline_ticks: Clock ticks a wait may last before it fails.
         label: int32 recorded with a failure, such as the layer index.
         on_expiry: ``on_expiry(launch, site, detail)``; must not return.
-        SCALAR_COUNTERS: The entry form, as above.
     """
-    if SCALAR_COUNTERS:
-        epoch_old, claim_old = scalar_add2_i64(
-            entry.epoch_line + entry.wave, entry.claim_line + entry.wave
-        )
-        epoch = epoch_old + 1
-        duplicate = epoch_old != claim_old
-        detail = entry.slot
-    else:
-        epoch = scalar_load_glc_i64(entry.epoch_line) + 1
-        gl.barrier()
-        gl.atomic_store(entry.epoch_line, epoch, sem="relaxed", scope="gpu")
+    epoch = scalar_load_glc_i64(entry.epoch_line) + 1
+    gl.barrier()
+    gl.atomic_store(entry.epoch_line, epoch, sem="relaxed", scope="gpu")
     tag = launch_tag(epoch, 32).to(gl.int32)
     launch = Launch(
         entry.cta, entry.xcd, entry.slot, epoch, tag, (epoch & 1).to(gl.int32),
         gl.to_tensor(label), error_ptr, error_ptr + _ERROR_ABORT, deadline_ticks,
         arena_ptr,
     )  # fmt: skip
-    if not SCALAR_COUNTERS:
-        mark = (tag.to(gl.int64) << 32) | entry.pid.to(gl.int64)
-        old = gl.atomic_xchg(entry.claim_line, mark, sem="relaxed", scope="gpu")
-        # The exchange's result reaches the other waves through compiler
-        # scratch in LDS; the barrier keeps every wave's read of it before
-        # any wave's next LDS write (the role's buffers may start there).
-        gl.barrier()
-        duplicate = ((old >> 32) & 0xFFFFFFFF) == tag.to(gl.int64)
+    mark = (tag.to(gl.int64) << 32) | entry.pid.to(gl.int64)
+    old = gl.atomic_xchg(entry.claim_line, mark, sem="relaxed", scope="gpu")
+    # The exchange's result reaches the other waves through compiler
+    # scratch in LDS; the barrier keeps every wave's read of it before any
+    # wave's next LDS write (the role's buffers may start there).
+    gl.barrier()
+    if ((old >> 32) & 0xFFFFFFFF) == tag.to(gl.int64):
         # The other workgroup's program id.
-        detail = (old & 0xFFFFFFFF).to(gl.int32)
-    if duplicate:
-        on_expiry(launch, _SITE_CLAIM, detail)
+        on_expiry(launch, _SITE_CLAIM, (old & 0xFFFFFFFF).to(gl.int32))
     return launch
 
 
