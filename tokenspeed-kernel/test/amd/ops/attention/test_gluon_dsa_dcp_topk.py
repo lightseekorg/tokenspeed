@@ -34,7 +34,11 @@ if not is_cdna4():
 
 from tokenspeed_kernel.ops.attention.dsa import dsa_merge_candidates  # isort: skip
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (  # isort: skip
+    _select_source_through_threshold,
     _select_through_threshold,
+    rank_major_scores,
+    select_through_threshold,
+    select_through_threshold_by_source,
 )
 from tokenspeed_kernel.selection import select_kernel  # isort: skip
 from tokenspeed_kernel.signature import (  # isort: skip
@@ -180,13 +184,46 @@ def test_gluon_merge_selects_the_same_tied_candidates_every_time(degree, topk):
         )
 
 
+@pytest.mark.parametrize("degree", [2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 7, 64])
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("tied", [False, True])
+def test_per_source_selection_matches_per_row_selection(degree, rows, topk, tied):
+    records = _records(degree, rows, topk, seed=degree * 1000 + rows + topk)
+    if tied:
+        generator = torch.Generator(device="cuda").manual_seed(rows)
+        ties = torch.randint(
+            0, 8, records.shape[:3], device="cuda", generator=generator
+        )
+        records[..., 1] = ties.float().view(torch.int32)
+    scores = rank_major_scores(records)
+    order, _ = gluon_dsa_logical_topk_gfx950(
+        scores,
+        torch.zeros((rows,), device="cuda", dtype=torch.int32),
+        torch.full((rows,), scores.shape[1], device="cuda", dtype=torch.int32),
+        topk=topk,
+    )
+
+    positions, counts = select_through_threshold_by_source(
+        records, scores, order, topk=topk
+    )
+    expected, expected_counts = select_through_threshold(
+        records, scores, order, topk=topk
+    )
+
+    torch.testing.assert_close(positions, expected, atol=0, rtol=0)
+    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
+
+
 def test_gluon_merge_launches_one_specialization_across_batch_rows():
-    for rows in (1, 16):
+    # Small batches select per source, large ones per row.
+    for rows in (1, 16, 600):
         dsa_merge_candidates(
             _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
         )
     with assert_no_triton_compile(_select_through_threshold):
-        for rows in (3, 8, 37, 64):
-            dsa_merge_candidates(
-                _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
-            )
+        with assert_no_triton_compile(_select_source_through_threshold):
+            for rows in (3, 8, 37, 64, 513, 700):
+                dsa_merge_candidates(
+                    _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
+                )

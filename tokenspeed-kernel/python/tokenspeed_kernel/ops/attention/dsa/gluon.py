@@ -832,8 +832,10 @@ if current_platform().is_amd:
         from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
             rank_major_scores,
             select_through_threshold,
+            select_through_threshold_by_source,
         )
         from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+            _device_compute_units,
             gluon_dsa_logical_topk_gfx950,
         )
 
@@ -845,4 +847,9 @@ if current_platform().is_amd:
             torch.full((rows,), columns, device=scores.device, dtype=torch.int32),
             topk=topk,
         )
+        # Measured on MI350X: the per-source programs halve the selection up
+        # to about four waves of them and lose beyond eight.
+        degree = records.shape[0]
+        if rows * degree <= 4 * _device_compute_units(records.device.index):
+            return select_through_threshold_by_source(records, scores, order, topk=topk)
         return select_through_threshold(records, scores, order, topk=topk)
