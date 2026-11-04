@@ -36,6 +36,7 @@ from transformers import PretrainedConfig
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
+from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
 from tokenspeed.runtime.plugins import ensure_loaded
 from tokenspeed.runtime.plugins.registry import resolve_model_profile
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -1236,9 +1237,3 @@ def is_audio_model(model_architectures: list[str] | None):
         "MuseSparkForConditionalGeneration",
     }
     return any(arch in audio_architectures for arch in model_architectures or [])
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0

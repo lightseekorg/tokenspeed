@@ -116,7 +116,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
     should_exclude_quant_module,
 )
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import get_rope, yarn_get_mscale
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -494,14 +494,6 @@ class DeepseekV3MoE(nn.Module):
                 else routed_expert_output
             )
         return final_hidden_states
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
