@@ -168,7 +168,7 @@ def prepare_monokernel_state(
 
 
 def prepare_monokernel_layer(
-    *, recipe, plan_keys, traits, weights, state
+    *, recipe, plan_keys, traits, weights, state, deadline_seconds
 ) -> MonokernelLayer | None:
     """Prepare one monokernel layer: compile every plan variant in
     ``plan_keys`` and check it before capture.
@@ -180,6 +180,12 @@ def prepare_monokernel_layer(
             KV cache dtype).
         weights: The layer's weights, read in place (a recipe-defined dict).
         state: From :func:`prepare_monokernel_state`.
+        deadline_seconds: How long a launch's wait for another workgroup or
+            GPU may last before the launch stops with an error. Correctness
+            does not depend on it: it only turns a hand-off that never comes
+            (a GPU that died or skipped the launch) into a clean error. It
+            must outlast a peer that arrives late, such as one compiling a
+            variant for the first time or paused by its host.
 
     Returns:
         The prepared layer, or ``None`` when no leaf serves the recipe.
@@ -187,7 +193,12 @@ def prepare_monokernel_layer(
     kernel = _select(recipe, traits)
     if kernel is None or state is None:
         return None
-    return kernel.impl(plan_keys=plan_keys, weights=weights, state=state)
+    return kernel.impl(
+        plan_keys=plan_keys,
+        weights=weights,
+        state=state,
+        deadline_seconds=deadline_seconds,
+    )
 
 
 def monokernel_state_heap_bytes(*, recipe, world_size, max_requests) -> int:

@@ -33,8 +33,13 @@ memory for cross-XCD words (`arena.py`), a host copy of the failure record
   second workgroup on a role stops with `SITE_CLAIM`.
 - Every wait is an equality on the launch tag and returns whether it was
   seen, per wave; the caller then runs `on_expiry(launch, site, detail)`,
-  which must not return. A wait gives up at `deadline_ticks` (10 ns ticks)
-  or when a peer stored its abort marker in this GPU's error words.
+  which must not return. A wait gives up at `deadline_ticks` (10 ns ticks;
+  `deadline_ticks(seconds)` converts) or when a peer stored its abort marker
+  in this GPU's error words. Every launch takes the deadline explicitly:
+  correctness never depends on it, it only turns a hand-off that will never
+  come (a GPU that died or skipped the launch) into a clean error. It must
+  outlast a peer GPU that arrives late, such as one compiling a variant for
+  the first time or paused by its host.
 - Waits by hand-off class:
   - `poll_until(word, expected, launch, LOAD)`: one int32 word. `LOAD` is
     `"sc1"` (stored on this GPU), `".cv"` (stored by another GPU) or

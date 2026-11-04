@@ -77,6 +77,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.sync import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.timing import (
     REALTIME_TICK_NS,
+    deadline_ticks,
     realtime_ticks,
     trace_stamp,
 )
@@ -118,6 +119,7 @@ __all__ = [
     "poll_tags16",
     "poll_until",
     "poll_until_all",
+    "deadline_ticks",
     "realtime_ticks",
     "record_failure",
     "release_drain",

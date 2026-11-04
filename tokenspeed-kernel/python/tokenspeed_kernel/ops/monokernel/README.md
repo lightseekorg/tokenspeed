@@ -19,10 +19,12 @@ trait and shape traits such as `verify_width`, `tp_size`, `ep_size` and
   failure_record_path=, device=)`: the state every monokernel layer of a group
   shares (launch counters, communication regions, a host copy of the failure
   record), or `None` without a leaf. Every rank calls it before capture.
-- `prepare_monokernel_layer(recipe=, plan_keys=, traits=, weights=, state=)`:
-  one `MonokernelLayer` for one decoder layer, or `None` without a leaf. It
-  reads the layer's weights in place, and compiles and checks every plan
-  variant before capture.
+- `prepare_monokernel_layer(recipe=, plan_keys=, traits=, weights=, state=,
+  deadline_seconds=)`: one `MonokernelLayer` for one decoder layer, or `None`
+  without a leaf. It reads the layer's weights in place, and compiles and
+  checks every plan variant before capture. `deadline_seconds` bounds how long
+  a launch waits for another workgroup or GPU before it stops with an error;
+  the runtime derives it from the server's watchdog timeout.
 
 A `PlanKey` is `(requests, layer_kind, next_kind)`: the requests in the step
 (rows = requests x verify width), this layer's attention kind, and the next

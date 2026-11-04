@@ -403,6 +403,8 @@ class ServerArgs:
     stream_interval: int = 1
     seed: int | None = None
     distributed_timeout_seconds: int | None = None
+    # Seconds a stuck forward may stall before it is treated as hung.
+    watchdog_timeout: float = 300.0
     download_dir: str | None = None
     # Used for customizing extensible models
     ext_yaml: str | None = None
@@ -1295,6 +1297,8 @@ class ServerArgs:
         """
         if self.head_tp_exchange_max_rows < 1:
             raise ValueError("--head-tp-exchange-max-rows must be positive")
+        if not self.watchdog_timeout > 0:
+            raise ValueError("--watchdog-timeout must be positive")
         attn = self.mapping.attn
         if attn.head_tp_serves_decode_only:
             # Head TP over attention-DP ranks serves absorbed decode rows
@@ -2940,6 +2944,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.distributed_timeout_seconds,
             help="Set timeout for torch.distributed initialization.",
+        )
+        parser.add_argument(
+            "--watchdog-timeout",
+            metavar="SECONDS",
+            type=float,
+            default=ServerArgs.watchdog_timeout,
+            help="Seconds a stuck forward may stall before it is treated as "
+            "hung. Monokernel layers wait for their peer GPUs inside one "
+            "launch; such a wait gives up with an error after half of this, "
+            "kept between 5 and 60 seconds.",
         )
         parser.add_argument(
             "--download-dir",

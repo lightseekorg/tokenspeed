@@ -95,10 +95,6 @@ _LDS_RESERVE_BYTES = 96 * 1024
 _CU_LDS_BYTES = 160 * 1024
 # Registers per lane of a wave when 8 waves share a CU (2 per SIMD).
 _MAX_VGPRS = 256
-# Clock ticks (10 ns) a wait may last before the launch fail-stops: 60 s, so
-# a rank stalled between launches (a first compile, a host pause) is not taken
-# for a failure.
-DEADLINE_TICKS = 6_000_000_000
 # Plan fields of the default variant (benchmarks vary them one at a time).
 # The MoE ring is 16 chunks per wave: other phases set the kernel's register
 # maximum, so the deeper ring costs no registers, and the down units keep
@@ -371,8 +367,9 @@ class MuseSparkMonokernelLayer:
         """``plan_fields``: :data:`DEFAULT_PLAN_FIELDS`' keys (serving passes
         the defaults; benchmarks vary them); ``stamps``: store per-workgroup
         clock stamps into ``state.stamps``; ``deadline_ticks``: how long a
-        wait may last, in 10 ns clock ticks (:data:`DEADLINE_TICKS` when
-        serving; a test stops a withheld launch sooner)."""
+        wait may last before the launch stops with an error, in 10 ns clock
+        ticks (``persistent.deadline_ticks`` converts seconds). Serving
+        derives it from the server's watchdog; tests pass a short one."""
         if set(plan_fields) != set(DEFAULT_PLAN_FIELDS):
             raise ValueError(f"plan fields must be {sorted(DEFAULT_PLAN_FIELDS)}")
         if deadline_ticks <= 0:

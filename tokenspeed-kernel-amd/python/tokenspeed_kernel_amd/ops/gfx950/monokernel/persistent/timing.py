@@ -29,6 +29,20 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent._intrinsics import (
 REALTIME_TICK_NS = 10
 
 
+def deadline_ticks(seconds: float) -> int:
+    """``seconds`` as clock ticks, for the ``deadline_ticks`` a launch takes.
+
+    Args:
+        seconds: How long a wait may last; positive.
+
+    Returns:
+        The same span in :data:`REALTIME_TICK_NS` ticks.
+    """
+    if not seconds > 0:
+        raise ValueError(f"a wait deadline must be positive, got {seconds} s")
+    return round(seconds * 1e9 / REALTIME_TICK_NS)
+
+
 @gluon.jit
 def realtime_ticks():
     """Return the 64-bit constant-rate clock (10 ns ticks); uniform per wave

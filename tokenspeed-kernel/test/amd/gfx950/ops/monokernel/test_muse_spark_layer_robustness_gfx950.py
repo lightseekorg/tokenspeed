@@ -78,7 +78,10 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (  # noq
     DEFAULT_PLAN_FIELDS,
     MuseSparkMonokernelLayer,
 )
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import GRID  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
+    GRID,
+    deadline_ticks,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import (  # noqa: E402
     FailureMirror,
     _hip,
@@ -87,11 +90,11 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.sync import (  # noq
     FIRST_KERNEL_SITE,
     SITE_ABORTED,
 )
+from wait_deadline import TEST_DEADLINE_SECONDS  # noqa: E402
 
 ONE = PlanKey(1, "sliding", "sliding")
 TWO = PlanKey(2, "sliding", "sliding")
 CONTEXT = {1: (1500,), 2: (1500, 2600)}
-TICKS_PER_SECOND = 100_000_000  # the 100 MHz device clock
 # int64 words per 128 B line: one epoch or claim counter per line.
 LINE_INT64 = 16
 
@@ -111,7 +114,7 @@ def _layer(state, weights, deadline_seconds: float):
     return MuseSparkMonokernelLayer(
         plan_keys=[ONE, TWO], weights=weights, state=state,
         plan_fields=DEFAULT_PLAN_FIELDS, stamps=False,
-        deadline_ticks=int(deadline_seconds * TICKS_PER_SECOND),
+        deadline_ticks=deadline_ticks(deadline_seconds),
     )  # fmt: skip
 
 
@@ -186,7 +189,7 @@ def _alternation(rank, record_dir):
     a residual's rows 8-15 alone."""
     state = _state(rank, record_dir)
     weights, steps, references = _steps(rank)
-    fused = _layer(state, weights, 2.0)
+    fused = _layer(state, weights, TEST_DEADLINE_SECONDS)
     for key in (ONE, TWO):
         assert_matches(key, _launch(fused, key, steps[key]), references[key])
         _assert_areas_empty(state)
@@ -217,7 +220,7 @@ def _replays(rank, record_dir, replays: int):
     every Lamport area empty."""
     state = _state(rank, record_dir)
     weights, steps, _ = _steps(rank)
-    fused = _layer(state, weights, 2.0)
+    fused = _layer(state, weights, TEST_DEADLINE_SECONDS)
     eager, graphs, outputs = {}, {}, {}
     for key in (ONE, TWO):
         eager[key] = _launch(fused, key, steps[key])
@@ -245,7 +248,7 @@ def _epoch_wrap(rank, record_dir):
     for counters in (state.epochs, state.claims):
         counters.view(-1, LINE_INT64)[:GRID, 0] = (1 << 32) - 3
     weights, steps, references = _steps(rank)
-    fused = _layer(state, weights, 2.0)
+    fused = _layer(state, weights, TEST_DEADLINE_SECONDS)
     for launch in range(6):
         key = (ONE, TWO)[launch % 2]
         assert_matches(key, _launch(fused, key, steps[key]), references[key])
@@ -316,7 +319,7 @@ _WITHHELD_CHILD = textwrap.dedent("""
     )
     state = t._state(rank, record_dir)
     weights, steps, _ = t._steps(rank)
-    fused = t._layer(state, weights, 0.5)
+    fused = t._layer(state, weights, t.TEST_DEADLINE_SECONDS)
     t._launch(fused, t.ONE, steps[t.ONE])
     dist.barrier()
     if rank == withheld:
@@ -330,7 +333,7 @@ _WITHHELD_CHILD = textwrap.dedent("""
 
 
 def test_a_withheld_launch_stops_every_peer_with_the_origin(tmp_path):
-    """Rank 5 skips launch 2. Every other rank stops at its 0.5 s deadline
+    """Rank 5 skips launch 2. Every other rank stops at the test deadline
     (a queue error, not a hang); each record names its origin, a rank that
     timed out itself and its site, and the withheld rank records nothing."""
     withheld, port = 5, _free_port()

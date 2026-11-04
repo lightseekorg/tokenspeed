@@ -73,21 +73,23 @@ class GluonMonokernelMuseSparkGfx950:
             world_size=world_size, max_requests=max_requests
         )
 
-    def __init__(self, *, plan_keys, weights, state) -> None:
+    def __init__(self, *, plan_keys, weights, state, deadline_seconds) -> None:
         from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (
-            DEADLINE_TICKS,
             DEFAULT_PLAN_FIELDS,
             MuseSparkMonokernelLayer,
         )
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
+            deadline_ticks,
+        )
 
-        # Serving: the default plan fields, no stamps, the serving deadline.
+        # Serving: the default plan fields, no stamps.
         self.layer = MuseSparkMonokernelLayer(
             plan_keys=plan_keys,
             weights=weights,
             state=state,
             plan_fields=DEFAULT_PLAN_FIELDS,
             stamps=False,
-            deadline_ticks=DEADLINE_TICKS,
+            deadline_ticks=deadline_ticks(deadline_seconds),
         )
 
     def decline_reasons(self, requests: int) -> list[str]:

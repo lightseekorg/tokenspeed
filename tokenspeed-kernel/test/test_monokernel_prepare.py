@@ -57,10 +57,11 @@ def _register_leaf(recipe):
         traits={"recipe": frozenset({recipe}), "verify_width": frozenset({8})},
     )
     class Leaf:
-        def __init__(self, *, plan_keys, weights, state):
+        def __init__(self, *, plan_keys, weights, state, deadline_seconds):
             self.plan_keys = plan_keys
             self.weights = weights
             self.state = state
+            self.deadline_seconds = deadline_seconds
 
         @staticmethod
         def prepare_state(**kwargs):
@@ -81,16 +82,27 @@ def test_selected_leaf_receives_every_argument():
         traits={"verify_width": 8},
         weights={"w": 1},
         state=state,
+        deadline_seconds=12.5,
     )
     assert isinstance(layer, leaf)
-    assert (layer.plan_keys, layer.weights, layer.state) == (keys, {"w": 1}, state)
+    assert (layer.plan_keys, layer.weights, layer.state, layer.deadline_seconds) == (
+        keys,
+        {"w": 1},
+        state,
+        12.5,
+    )
 
 
 def test_unserved_recipe_or_traits_prepare_nothing():
     _register_leaf("muse_spark")
     assert prepare_monokernel_state(recipe="other", **STATE_ARGS) is None
     state = prepare_monokernel_state(recipe="muse_spark", **STATE_ARGS)
-    common = dict(plan_keys=[PlanKey(1, "full", "regular")], weights={}, state=state)
+    common = dict(
+        plan_keys=[PlanKey(1, "full", "regular")],
+        weights={},
+        state=state,
+        deadline_seconds=5.0,
+    )
     assert prepare_monokernel_layer(recipe="other", traits={}, **common) is None
     assert (
         prepare_monokernel_layer(
@@ -109,6 +121,7 @@ def test_no_state_prepares_no_layer():
             traits={"verify_width": 8},
             weights={},
             state=None,
+            deadline_seconds=5.0,
         )
         is None
     )

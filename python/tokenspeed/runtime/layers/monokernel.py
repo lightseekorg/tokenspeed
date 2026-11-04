@@ -50,6 +50,29 @@ import torch.distributed as dist
 # Variables that restrict which compute units a queue may use.
 _CU_MASK_VARIABLES = ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
 
+# The range a monokernel launch's wait deadline is kept in (seconds).
+MIN_WAIT_DEADLINE_SECONDS = 5.0
+MAX_WAIT_DEADLINE_SECONDS = 60.0
+
+
+def wait_deadline_seconds(watchdog_timeout: float) -> float:
+    """How long a monokernel launch waits for another GPU before it stops
+    with an error: half the server's watchdog timeout, kept within
+    [``MIN_WAIT_DEADLINE_SECONDS``, ``MAX_WAIT_DEADLINE_SECONDS``].
+
+    Correctness never depends on it; it only turns a hand-off that never
+    comes (a GPU that died or skipped the launch) into a clean error, before
+    the watchdog would call the server hung. The lower bound keeps it longer
+    than a peer GPU arriving late (a first compile, a host pause).
+
+    Args:
+        watchdog_timeout: ``--watchdog-timeout`` in seconds.
+    """
+    return min(
+        max(watchdog_timeout / 2, MIN_WAIT_DEADLINE_SECONDS),
+        MAX_WAIT_DEADLINE_SECONDS,
+    )
+
 
 @dataclass(frozen=True)
 class MonokernelDeployment:
