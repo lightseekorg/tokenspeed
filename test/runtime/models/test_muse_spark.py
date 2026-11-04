@@ -1315,6 +1315,39 @@ def test_packed_qkv_gate_loader_replicates_kv_heads_across_ranks() -> None:
         assert torch.equal(layer.weight.data, expected)
 
 
+def test_replicated_qkv_gate_weight_hands_out_this_ranks_rows(
+    bf16_default_dtype,
+) -> None:
+    """Replicated for owned rows, the packed weight holds every rank's rows;
+    the rank's own rows (what a fused layer is handed) are exactly the
+    sharded weight the regular path keeps on that rank."""
+    hidden, head_dim, heads, kv_heads, ranks = 32, 8, 8, 4, 4
+    shards = (("q", heads), ("k", kv_heads), ("v", kv_heads), ("g", heads))
+    full = {
+        name: torch.randn(count * head_dim, hidden).to(torch.bfloat16)
+        for name, count in shards
+    }
+
+    def build(rank, replicate):
+        layer = QKVOGateParallelLinear(
+            hidden_size=hidden, head_size=head_dim, total_num_heads=heads,
+            total_num_kv_heads=kv_heads, quant_config=None, prefix="qkv_proj",
+            tp_rank=rank, tp_size=ranks, tp_group=tuple(range(ranks)),
+            replicate_for_owned_rows=replicate,
+        )  # fmt: skip
+        for shard, weight in full.items():
+            layer.weight_loader(layer.weight, weight, shard)
+        return layer
+
+    for rank in range(ranks):
+        replicated = build(rank, True)
+        assert replicated.replicate_for_owned_rows
+        assert replicated.weight.shape[0] == ranks * replicated._local_weight().shape[0]
+        rows = replicated._local_weight()
+        assert rows.is_contiguous()
+        assert torch.equal(rows, build(rank, False).weight.data)
+
+
 def _forward_ctx(decode: bool) -> SimpleNamespace:
     return SimpleNamespace(
         forward_mode=SimpleNamespace(is_decode_or_idle=lambda: decode)
