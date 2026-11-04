@@ -476,3 +476,84 @@ def test_native_block_scores_width_changes_do_not_recompile():
     with assert_no_triton_compile(_reduce_blocks):
         for width in (1025, 32769, 65537):
             run(width)
+
+
+def test_native_block_scores_reach_rows_past_int32_offsets():
+    # The last of 2049 BF16 rows starts past 2**31 elements. Only that row is
+    # live, so the reduction reads and writes nothing but the far end.
+    rows, width, block_size, alignment = 2049, (1 << 20) + 512, 8, 256
+    logits = torch.empty((rows, width), device="cuda", dtype=torch.bfloat16)
+    assert (rows - 1) * logits.stride(0) >= 2**31
+    logits[-1].normal_()
+    lengths = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    lengths[-1] = (1 << 20) + 37
+
+    actual, ends = prepare_native_block_scores(logits, lengths, block_size, alignment)
+
+    columns = torch.arange(width, device="cuda")
+    live = logits[-1].float().masked_fill(columns >= lengths[-1], -torch.inf)
+    expected = torch_dsv41_block_maxima(live[None, :], lengths[-1:])[0]
+    count = ((1 << 20) + 37 + block_size - 1) // block_size
+    initialized = (count + alignment - 1) // alignment * alignment
+    expected_ends = torch.zeros_like(ends)
+    expected_ends[-1] = count
+    torch.testing.assert_close(ends, expected_ends, rtol=0, atol=0)
+    torch.testing.assert_close(actual[-1, :count], expected[:count], rtol=0, atol=0)
+    padding = actual[-1, count:initialized]
+    torch.testing.assert_close(
+        padding, torch.full_like(padding, -torch.inf), rtol=0, atol=0
+    )
+
+
+def test_selection_cleaner_reaches_rows_past_int32_offsets():
+    # The last of 2049 rows starts past 2**31 elements in both the native
+    # logits and the aligned output. Only that row is live.
+    rows, capacity, page_size, alignment = 2049, (1 << 20) + 64, 64, 512
+    pages = capacity // page_size
+    values = torch.empty((rows, capacity), device="cuda", dtype=torch.bfloat16)
+    values[-1].normal_()
+    lengths = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    lengths[-1] = capacity
+    table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    table[-1, 1::3] = -1
+    table[-1, 2::5] = pages + 3
+
+    actual = clean_logits_for_selection(
+        values, lengths, table, pages, capacity, page_size, alignment
+    )
+
+    assert (rows - 1) * actual.stride(0) >= 2**31
+    page = table[-1, torch.arange(capacity, device="cuda") // page_size]
+    expected = values[-1].masked_fill((page < 0) | (page >= pages), -torch.inf)
+    torch.testing.assert_close(actual[-1, :capacity], expected, rtol=0, atol=0)
+    tail = actual[-1, capacity:]
+    assert tail.numel()
+    torch.testing.assert_close(tail, torch.full_like(tail, -torch.inf), rtol=0, atol=0)
+
+
+def test_selection_cleaner_capacity_does_not_recompile():
+    from tokenspeed_kernel.ops.attention.dsv41.triton import _clean_logits
+
+    torch.manual_seed(0)
+
+    def run(rows, capacity):
+        pages = (capacity + 63) // 64
+        values = torch.randn((rows, capacity), device="cuda", dtype=torch.bfloat16)
+        lengths = torch.randint(
+            0, capacity + 1, (rows,), device="cuda", dtype=torch.int32
+        )
+        table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(rows, 1)
+        actual = clean_logits_for_selection(
+            values, lengths, table, pages, capacity, 64, 512
+        )
+        expected = clean_logits(values, lengths, table, pages, capacity, 64)
+        columns = torch.arange(capacity, device="cuda")[None, :]
+        live = columns < (lengths[:, None] + 1023) // 1024 * 1024
+        torch.testing.assert_close(
+            actual[:, :capacity][live], expected[live], rtol=0, atol=0
+        )
+
+    run(8, 1024)
+    with assert_no_triton_compile(_clean_logits):
+        for rows, capacity in ((1, 2048), (17, 2112), (3, 16448), (6, 1048640)):
+            run(rows, capacity)
