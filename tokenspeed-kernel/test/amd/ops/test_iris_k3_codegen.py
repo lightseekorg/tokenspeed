@@ -20,6 +20,8 @@
 
 """Compile the Iris K3 fusions for gfx1250 without launching them."""
 
+import importlib.util
+import itertools
 import re
 
 import pytest
@@ -79,17 +81,17 @@ _LAUNCH_FIELDS = {
 
 def _k3_cases():
     """Every row-sharded kernel at each gfx1250 launch row, plus the AttnRes push."""
-    try:
-        from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
-            _K3_LAUNCHES,
-        )
-    except ImportError:
+    # Collection runs before _require_iris skips; any other import error fails.
+    if importlib.util.find_spec("iris") is None:
         return []
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+        _K3_LAUNCHES,
+    )
+
     rows = range(len(_K3_LAUNCHES[ArchVersion(12, 5)]))
     return [
         pytest.param(kind, row, id=f"{kind}-row{row}")
-        for kind in _LAUNCH_FIELDS
-        for row in rows
+        for kind, row in itertools.product(_LAUNCH_FIELDS, rows)
     ] + [pytest.param("attnres_push_oneshot", None, id="attnres_push_oneshot")]
 
 
