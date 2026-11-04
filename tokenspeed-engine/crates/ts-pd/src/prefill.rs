@@ -265,9 +265,10 @@ impl State {
         self.take_owed_failures(room)
     }
 
-    /// The failure notices `room` owes, once no chunk of it reads.
+    /// The failure notices `room` owes, once it has ended here, so no new
+    /// chunk is queued for it, and no chunk of it reads.
     fn take_owed_failures(&mut self, room: u64) -> Vec<(String, u16)> {
-        if self.readers.contains_key(&room) {
+        if !self.ended(room) || self.readers.contains_key(&room) {
             return Vec::new();
         }
         let owed = self.owed_failures.remove(&room).unwrap_or_default();
@@ -464,6 +465,15 @@ impl Shared {
     /// Fail a room and tell every destination that pre-allocated for it
     /// (`abort_room`), once no chunk of the room still reads.
     fn abort_room(&self, room: u64, reason: &str) {
+        self.fail_room(room, reason, None);
+    }
+
+    /// `abort_room`, also owing the failure to the Decode rank of
+    /// `owed_session`, whose pre-allocation may never have arrived here (a
+    /// Cancel, a rejected pre-allocation). Its route is owed in the critical
+    /// section that fails the room: owed any earlier, a chunk returning in
+    /// between could tell that rank while new chunks were still queued.
+    fn fail_room(&self, room: u64, reason: &str, owed_session: Option<&str>) {
         let routes = {
             let mut state = self.state();
             // Once per room: a room's later chunks fail here again.
@@ -492,6 +502,31 @@ impl Shared {
                 })
                 .collect();
             state.owed_failures.entry(room).or_default().extend(routes);
+            if let Some(session_id) = owed_session {
+                match state.route_of(session_id) {
+                    Some(route) => {
+                        state.owed_failures.entry(room).or_default().insert(route);
+                    }
+                    None => tracing::error!(
+                        room,
+                        session = session_id,
+                        "cannot owe a Decode peer its failure: unregistered session"
+                    ),
+                }
+            }
+            state.take_owed_failures(room)
+        };
+        for route in routes {
+            self.notify_failed(route, room);
+        }
+    }
+
+    /// Owe the Decode rank at `route` the failure of `room`, which has ended
+    /// here, and tell it once no chunk of the room reads.
+    fn owe_failure(&self, room: u64, route: (String, u16)) {
+        let routes = {
+            let mut state = self.state();
+            state.owed_failures.entry(room).or_default().insert(route);
             state.take_owed_failures(room)
         };
         for route in routes {
@@ -509,19 +544,7 @@ impl Shared {
                 return;
             }
         };
-        let route = self.state().route_of(&session_id);
-        match route {
-            // Owed even when its pre-allocation never arrived here.
-            Some(route) => {
-                self.state()
-                    .owed_failures
-                    .entry(room)
-                    .or_default()
-                    .insert(route);
-            }
-            None => tracing::error!(room, "cannot answer a cancellation: unregistered session"),
-        }
-        self.abort_room(room, "Decode stopped receiving the room");
+        self.fail_room(room, "Decode stopped receiving the room", Some(&session_id));
     }
 
     fn handle(&self, frames: &[Bytes]) {
@@ -613,11 +636,11 @@ impl Shared {
         };
         if let Err(reason) = self.accept_preallocation(room, &session_id, frames) {
             tracing::error!(room, reason, "rejecting CachePD pre-allocation metadata");
-            self.abort_room(room, &format!("invalid pre-allocation metadata: {reason}"));
-            match self.state().route_of(&session_id) {
-                Some(route) => self.notify_failed(route, room),
-                None => tracing::error!(room, "cannot notify a malformed Decode peer"),
-            }
+            self.fail_room(
+                room,
+                &format!("invalid pre-allocation metadata: {reason}"),
+                Some(&session_id),
+            );
         }
     }
 
@@ -635,7 +658,9 @@ impl Shared {
             .ok_or("CachePD request references an unregistered Decode session")?;
         let route = (registration.endpoint.clone(), registration.port);
         if self.state().rooms.get(room) == Some(TransferPoll::Failed) {
-            self.notify_failed(route, room);
+            // A chunk of the failed room may still write this rank's pages
+            // (a repeated pre-allocation): the notice waits for its readers.
+            self.owe_failure(room, route);
             return Ok(());
         }
         let preallocation = Preallocation::from_frames(frames).map_err(|error| error.0)?;
@@ -2092,6 +2117,20 @@ mod tests {
             .insert(route);
         drop(reader);
         assert!(book.take_notified().is_empty());
+    }
+
+    #[test]
+    fn no_notice_goes_out_while_the_room_takes_chunks() {
+        let (book, route) = Book::owing(7);
+        // The failure is owed, but the room has not ended here: a new chunk
+        // could still be queued for it, so its last reader tells no one.
+        book.state().rooms.update(7, TransferPoll::Bootstrapped);
+        drop(book.claim(7));
+        assert!(book.take_notified().is_empty());
+        assert!(book.state().take_owed_failures(7).is_empty());
+        // Once the room has failed, the notice goes out.
+        book.state().rooms.update(7, TransferPoll::Failed);
+        assert_eq!(book.state().take_owed_failures(7), [route]);
     }
 
     #[test]
