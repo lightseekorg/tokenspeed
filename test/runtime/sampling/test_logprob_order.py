@@ -56,7 +56,8 @@ def _logits(rows: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize(
-    "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
+    "order, block",
+    [("megatron", 32768), ("megatron-16384", 16384), ("cross-entropy", 32768)],
 )
 def test_gather_dispatches_on_the_order(order, block):
     logits = _logits(3)
@@ -69,26 +70,30 @@ def test_gather_dispatches_on_the_order(order, block):
     )
     assert torch.equal(
         megatron,
-        vocab_parallel_logprobs(logits, tokens, vocab_block=block),
+        vocab_parallel_logprobs(
+            logits, tokens, vocab_block=block, negative_nll=order == "cross-entropy"
+        ),
     )
     torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
-    "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
+    "order, block",
+    [("megatron", 32768), ("megatron-16384", 16384), ("cross-entropy", 32768)],
 )
-def test_megatron_order_preserves_positive_zero(dtype, order, block):
+def test_trainer_order_preserves_zero_sign(dtype, order, block):
     logits = torch.full((2, VOCAB), -float("inf"), dtype=dtype)
     tokens = torch.tensor([3, block + 3], dtype=torch.int32)
     logits.scatter_(1, tokens.long()[:, None], 0)
     got = gather_token_logprobs(logits, tokens, logprob_order=order)
-    expected = torch.zeros(2, dtype=torch.float32)
+    expected = torch.full((2,), -0.0 if order == "cross-entropy" else 0.0)
     assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
 
 
 @pytest.mark.parametrize(
-    "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
+    "order, block",
+    [("megatron", 32768), ("megatron-16384", 16384), ("cross-entropy", 32768)],
 )
 def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch, order, block):
     def fake_gumbel(logits, req_pool_indices, *pools, min_p_pool=None, **_):
@@ -142,7 +147,9 @@ def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch, order, block)
     assert sampled.tolist() == [7, 60001]
     assert torch.equal(
         output.next_token_logprobs,
-        vocab_parallel_logprobs(logits, sampled, vocab_block=block),
+        vocab_parallel_logprobs(
+            logits, sampled, vocab_block=block, negative_nll=order == "cross-entropy"
+        ),
     )
 
 
@@ -169,7 +176,8 @@ def _prompt_rows(rows: list[int], targets: list[int], *, num_input_rows: int):
 
 
 @pytest.mark.parametrize(
-    "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
+    "order, block",
+    [("megatron", 32768), ("megatron-16384", 16384), ("cross-entropy", 32768)],
 )
 def test_prompt_logprobs_follow_the_order(monkeypatch, order, block):
     # Prompt rows take the sampler's gather in the launch's order, so a
@@ -199,7 +207,10 @@ def test_prompt_logprobs_follow_the_order(monkeypatch, order, block):
     assert torch.equal(torch_order, gather_token_logprobs_torch(logits, ids))
     megatron = run(order)
     assert torch.equal(
-        megatron, vocab_parallel_logprobs(logits, ids, vocab_block=block)
+        megatron,
+        vocab_parallel_logprobs(
+            logits, ids, vocab_block=block, negative_nll=order == "cross-entropy"
+        ),
     )
     torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
 

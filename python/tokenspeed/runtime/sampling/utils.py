@@ -93,7 +93,8 @@ def gather_token_logprobs(
         logprob_order: ``"torch"`` for ``torch.log_softmax``; ``"megatron"``
             for the trainer's vocab-parallel cross-entropy order over fixed
             32768-wide vocab blocks, or ``"megatron-16384"`` for a rank-ordered
-            fold of 16384-wide shards (validated by ServerArgs).
+            fold of 16384-wide shards. ``"cross-entropy"`` uses 32768-wide
+            blocks and negates the NLL, preserving negative zero.
 
     Returns:
         ``[rows]`` fp32 log probabilities.
@@ -103,6 +104,7 @@ def gather_token_logprobs(
             logits,
             tokens.to(torch.int64),
             vocab_block=MEGATRON_LOGPROB_BLOCKS[logprob_order],
+            negative_nll=logprob_order == "cross-entropy",
         )
     return gather_token_logprobs_torch(logits, tokens)
 

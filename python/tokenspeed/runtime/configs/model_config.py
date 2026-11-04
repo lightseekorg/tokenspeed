@@ -946,7 +946,13 @@ class ModelConfig:
                 )
                 if nextn_layers is not None and nextn_layers > 0:
                     self.num_attention_layers = nextn_layers
-        self.vocab_size = self.hf_text_config.vocab_size
+        # Some checkpoints include input-only embedding rows. Sampling and
+        # selected-token scores use the vocabulary represented by the head.
+        self.vocab_size = getattr(
+            self.hf_text_config, "output_vocab_size", self.hf_text_config.vocab_size
+        )
+        if type(self.vocab_size) is not int or self.vocab_size <= 0:
+            raise ValueError("The output vocabulary size must be a positive integer")
 
         # Verify quantization
         self._verify_quantization()

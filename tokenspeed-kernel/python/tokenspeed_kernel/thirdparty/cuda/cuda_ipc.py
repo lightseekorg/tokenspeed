@@ -71,7 +71,9 @@ def find_loaded_library(lib_name) -> Optional[str]:
             start = line.index("/")
             path = line[start:].strip()
             filename = path.split("/")[-1]
-            if filename.rpartition(".so")[0].startswith(lib_name):
+            # Match the SONAME base, not similarly named compiler stubs such
+            # as libcudart_stub.so, which lack the runtime IPC entry points.
+            if filename.rpartition(".so")[0] == lib_name:
                 candidates.append(path)
     if not candidates:
         # the library is not loaded in the current process

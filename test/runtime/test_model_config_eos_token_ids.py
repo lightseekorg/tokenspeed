@@ -35,7 +35,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
-def _load(tmp_path, eos_token_id, generation_eos_token_id):
+def _load(tmp_path, eos_token_id, generation_eos_token_id, output_vocab_size):
     config = dict(
         model_type="qwen3",
         architectures=["Qwen3ForCausalLM"],
@@ -51,6 +51,8 @@ def _load(tmp_path, eos_token_id, generation_eos_token_id):
         bos_token_id=1,
         eos_token_id=eos_token_id,
     )
+    if output_vocab_size is not None:
+        config["output_vocab_size"] = output_vocab_size
     (tmp_path / "config.json").write_text(json.dumps(config))
     if generation_eos_token_id is not None:
         (tmp_path / "generation_config.json").write_text(
@@ -94,5 +96,18 @@ def _load(tmp_path, eos_token_id, generation_eos_token_id):
 def test_eos_token_ids_are_merged(
     tmp_path, eos_token_id, generation_eos_token_id, expected
 ):
-    model = _load(tmp_path, eos_token_id, generation_eos_token_id)
+    model = _load(tmp_path, eos_token_id, generation_eos_token_id, None)
     assert model.hf_eos_token_id == expected
+
+
+@pytest.mark.parametrize("output_vocab_size, expected", [(None, 128), (96, 96)])
+def test_sampling_vocabulary_follows_output_head(tmp_path, output_vocab_size, expected):
+    model = _load(tmp_path, 2, None, output_vocab_size)
+    assert model.vocab_size == expected
+    assert model.hf_text_config.vocab_size == 128
+
+
+@pytest.mark.parametrize("output_vocab_size", [0, -1, True, 96.5])
+def test_invalid_output_vocabulary(tmp_path, output_vocab_size):
+    with pytest.raises(ValueError, match="output vocabulary"):
+        _load(tmp_path, 2, None, output_vocab_size)

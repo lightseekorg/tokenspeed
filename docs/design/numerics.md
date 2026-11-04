@@ -1,5 +1,12 @@
 # Numerics envelopes
 
+Models may declare an `output_vocab_size` smaller than their input embedding
+`vocab_size`. `ModelConfig.vocab_size` then exposes the positive output size to
+sampling and logprob consumers; the model's original config retains the input
+size for embedding construction. Models without that field keep their existing
+vocabulary size. The model implementation must build its head and logits
+processor for the same output size.
+
 `--numerics` names, at launch level, the numerical contract a deployment
 promises. Every capability under it exists as an individual switch; the
 envelope's whole job is to keep the set coherent, because RL rollout
@@ -191,6 +198,13 @@ two narrow shards before folding changes FP32 rounding, so one order does
 not promise alignment to both trainers. Prompt and output logprobs share
 the chosen operation; logits and sampled tokens are unchanged. The model's
 existing rl-bitwise vocabulary eligibility remains a multiple of 32768.
+
+`--logprob-order cross-entropy` uses the same 32768-wide blocks but computes
+`-(log(sum_exp) - target)`. This preserves negative zero when a selected
+token has probability one. The existing `megatron` orders retain their
+positive-zero convention. Choose the expression used by the training loss;
+bitwise comparisons must include zero's sign bit. Prompt and output logprobs
+use the same selected expression.
 
 The invariance layers make a deployment agree with itself. Trainer alignment
 makes it agree with a different program: the training framework's forward,
