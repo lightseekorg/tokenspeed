@@ -163,6 +163,67 @@ def _select_through_threshold(
     tl.store(counts + row, count)
 
 
+@triton.jit(do_not_specialize=["rows"])
+def _select_source_through_threshold(
+    records,
+    scores,
+    order,
+    positions,
+    counts,
+    rows,
+    WIDTH: tl.constexpr,
+    DEGREE: tl.constexpr,
+    TOPK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+):
+    # _select_through_threshold's selection, one program per (row, source
+    # rank): each counts the kept candidates of the sources before its own
+    # and writes its own source's at that offset.
+    row = tl.program_id(0).to(tl.int64)
+    source = tl.program_id(1)
+    COLUMNS: tl.constexpr = DEGREE * WIDTH
+    threshold = tl.full((), float("inf"), tl.float32)
+    for start in range(0, TOPK, TOPK_BLOCK):
+        col = start + tl.arange(0, TOPK_BLOCK)
+        selected = tl.load(order + row * TOPK + col, col < TOPK, other=-1)
+        score = tl.load(
+            scores + row * COLUMNS + selected,
+            (col < TOPK) & (selected >= 0),
+            other=float("inf"),
+        )
+        threshold = tl.minimum(threshold, tl.min(score, axis=0))
+    local = tl.arange(0, WIDTH)
+    above = tl.full((), 0, tl.int32)
+    above_before = tl.full((), 0, tl.int32)
+    tied_before = tl.full((), 0, tl.int32)
+    for other in tl.static_range(DEGREE):
+        score = tl.load(scores + row * COLUMNS + other * WIDTH + local)
+        source_above = tl.sum((score > threshold).to(tl.int32), axis=0)
+        above += source_above
+        if other < source:
+            above_before += source_above
+            tie = (score == threshold) & (score > -float("inf"))
+            tied_before += tl.sum(tie.to(tl.int32), axis=0)
+    quota = TOPK - above
+    score = tl.load(scores + row * COLUMNS + source * WIDTH + local)
+    live = score > -float("inf")
+    tie = (score == threshold) & live
+    tie_rank = tied_before + tl.cumsum(tie.to(tl.int32), axis=0) - 1
+    keep = ((score > threshold) | (tie & (tie_rank < quota))) & live
+    before = above_before + tl.minimum(tied_before, tl.maximum(quota, 0))
+    slot = before + tl.cumsum(keep.to(tl.int32), axis=0) - 1
+    position = tl.load(
+        records + ((source * rows + row) * WIDTH + local) * 2, keep, other=-1
+    )
+    tl.store(positions + row * TOPK + slot, position, keep)
+    if source == DEGREE - 1:
+        count = before + tl.sum(keep.to(tl.int32), axis=0)
+        for start in range(0, TOPK, TOPK_BLOCK):
+            col = start + tl.arange(0, TOPK_BLOCK)
+            tl.store(positions + row * TOPK + col, -1, (col >= count) & (col < TOPK))
+        tl.store(counts + row, count)
+
+
 def rank_major_scores(records: torch.Tensor) -> torch.Tensor:
     """FP32 [rows, shards * candidates] scores of int32 [shards, rows,
     candidates, 2] records, rank-major; invalid candidates score ``-inf``."""
@@ -211,6 +272,37 @@ def select_through_threshold(
             TOPK=topk,
             TOPK_BLOCK=triton.next_power_of_2(min(topk, _MAX_GATHER_BLOCK_SIZE)),
             BLOCK=_MAX_GATHER_BLOCK_SIZE,
+        )
+    return positions, counts
+
+
+def select_through_threshold_by_source(
+    records: torch.Tensor, scores: torch.Tensor, order: torch.Tensor, *, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`select_through_threshold`, bit for bit, with one program per
+    row and source rank instead of one per row.
+
+    Each program rereads its row's scores to count the sources before it, so
+    this pays off while ``rows * shards`` programs fit a few waves of the
+    device; the caller picks between the two."""
+    degree, rows, width, _ = records.shape
+    if width & (width - 1):
+        raise ValueError("per-source selection needs a power-of-two width")
+    positions = torch.empty((rows, topk), device=records.device, dtype=torch.int32)
+    counts = torch.empty((rows,), device=records.device, dtype=torch.int32)
+    if rows:
+        _select_source_through_threshold[(rows, degree)](
+            records,
+            scores,
+            order,
+            positions,
+            counts,
+            rows,
+            WIDTH=width,
+            DEGREE=degree,
+            TOPK=topk,
+            TOPK_BLOCK=triton.next_power_of_2(min(topk, _MAX_GATHER_BLOCK_SIZE)),
+            num_warps=4,
         )
     return positions, counts
 
