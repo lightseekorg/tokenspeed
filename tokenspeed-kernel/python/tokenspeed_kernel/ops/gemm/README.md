@@ -120,5 +120,12 @@ canonical `[groups * N, K / 32]` weight scales out once for the serving kernel
 and returns None where no kernel serves the weights, so callers keep their
 dequantized BF16 path. The DeepGEMM kernel (SM100/SM103) takes activation
 scales packed four per int32, MN-major and TMA-aligned, which is what
-`dsv41.rope_quantize_fp8_grouped` writes. DeepGEMM picks and JIT-compiles a
-tile configuration per token-count range on first use.
+`dsv41.rope_quantize_fp8_grouped` writes.
+`grouped_fp8_projection_quantize_fp8` instead writes E4M3 codes of the
+BF16-rounded result with packed scales in that same layout, which
+`fp8_projection` (a dense E4M3 GEMM, `prepare_fp8_projection` for its weight
+scales) reads directly, so no quantization kernel runs between the two.
+
+DeepGEMM picks a tile configuration from the token count (one per 16 tokens)
+and JIT-compiles each on first use. `warmup_fp8_projections` launches every
+configuration up to a token bound at startup so serving never compiles.

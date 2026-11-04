@@ -50,7 +50,12 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
-from tokenspeed_kernel.ops.gemm import grouped_fp8_projection, mm
+from tokenspeed_kernel.ops.gemm import (
+    fp8_projection,
+    grouped_fp8_projection,
+    grouped_fp8_projection_quantize_fp8,
+    mm,
+)
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
@@ -2421,8 +2426,8 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     config.num_attention_heads = config.o_groups = config.index_n_heads = 2
     config.head_dim, config.index_head_dim = 512, 128
     config.qk_rope_head_dim, config.q_lora_rank = 64, 128
-    # A 64-wide wo_a group output lets the grouped FP8 kernel serve wo_a.
-    config.o_lora_rank = 64
+    # A 128-wide wo_a group output lets FP8 kernels serve wo_a and wo_b.
+    config.o_lora_rank = 128
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     torch.manual_seed(41)
     with torch.device("cuda:0"):
@@ -2437,7 +2442,8 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     adapter.load_weights(_bind_engram_tables(adapter, weights, tmp_path).items())
     adapter.initialize_engram(_Tokenizer())
     model = adapter.model
-    # SM100/SM103 run wo_a on its FP8 codes; other GPUs dequantize it.
+    # SM100/SM103 run wo_a on its FP8 codes and feed wo_b its FP8 output;
+    # other GPUs dequantize wo_a.
     platform = current_platform()
     fp8_wo_a = (
         platform.is_nvidia
@@ -2446,14 +2452,21 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     )
     for layer in model.layers:
         assert layer.attn.wo_a_fp8 is fp8_wo_a
+        assert layer.attn.wo_b_fp8 is (True if fp8_wo_a else None)
         assert layer.attn.wo_a.weight.dtype == (
             torch.float8_e4m3fn if fp8_wo_a else torch.bfloat16
         )
     if fp8_wo_a and execution_mode == "eager":
         _assert_fp8_wo_a_matches_checkpoint(
             model.layers[0].attn,
-            weights["layers.0.attn.wo_a.weight"],
-            weights["layers.0.attn.wo_a.scale"],
+            *(
+                weights[f"layers.0.attn.{name}"]
+                for name in ("wo_a.weight", "wo_a.scale")
+            ),
+            *(
+                weights[f"layers.0.attn.{name}"]
+                for name in ("wo_b.weight", "wo_b.scale")
+            ),
         )
     for module in model.modules():
         if isinstance(module, LinearBase):
@@ -2520,30 +2533,43 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     )
 
 
-def _assert_fp8_wo_a_matches_checkpoint(attn, codes, scales):
-    """The loaded FP8 wo_a computes the checkpoint's dequantized projection of
-    the FP8-rounded, inverse-rotated attention output."""
-    groups, rank = attn.n_local_groups, attn.o_lora_rank
+def _dequantize_checkpoint(codes, scales):
     exponents = scales.view(torch.uint8).repeat_interleave(32, 0)
     exponents = exponents.repeat_interleave(32, 1).cuda().to(torch.int32)
-    weight = codes.cuda().float() * (exponents << 23).view(torch.float32)
+    return codes.cuda().float() * (exponents << 23).view(torch.float32)
+
+
+def _dequantize_packed(codes, scales):
+    exponents = torch.stack(
+        [(scales >> (8 * byte)) & 255 for byte in range(4)], dim=-1
+    ).flatten(-2)
+    values = codes.float().unflatten(-1, (-1, 32))
+    return (values * (exponents << 23).view(torch.float32)[..., None]).flatten(-2)
+
+
+def _assert_fp8_wo_a_matches_checkpoint(attn, a_codes, a_scales, b_codes, b_scales):
+    """The loaded FP8 wo_a and wo_b compute the checkpoint's dequantized
+    projections of their FP8-rounded inputs."""
+    groups, rank = attn.n_local_groups, attn.o_lora_rank
     torch.manual_seed(5)
     out = torch.randn(9, attn.n_local_heads, 512, device="cuda").bfloat16()
     x, x_scales = attn.rotary_emb.inverse_quantize_grouped(
         out, torch.arange(9, device="cuda"), groups
     )
-    actual = grouped_fp8_projection(
-        x, x_scales, attn.wo_a.weight.view(groups, rank, -1), attn.wo_a_scales, None
-    )
-    x_exponents = torch.stack(
-        [(x_scales >> (8 * byte)) & 255 for byte in range(4)], dim=-1
-    ).flatten(-2)
-    x_values = x.float().unflatten(-1, (-1, 32))
-    x_values = x_values * (x_exponents << 23).view(torch.float32)[..., None]
+    wo_a = attn.wo_a.weight.view(groups, rank, -1)
+    actual = grouped_fp8_projection(x, x_scales, wo_a, attn.wo_a_scales, None)
     expected = torch.einsum(
         "tgk,grk->tgr",
-        x_values.flatten(-2).double(),
-        weight.view(groups, rank, -1).double(),
+        _dequantize_packed(x, x_scales).double(),
+        _dequantize_checkpoint(a_codes, a_scales).view(groups, rank, -1).double(),
+    )
+    torch.testing.assert_close(actual.double(), expected, rtol=2**-8, atol=1e-3)
+    z, z_scales = grouped_fp8_projection_quantize_fp8(
+        x, x_scales, wo_a, attn.wo_a_scales
+    )
+    actual = fp8_projection(z, z_scales, attn.wo_b.weight, attn.wo_b_scales, None)
+    expected = _dequantize_packed(z, z_scales).double() @ (
+        _dequantize_checkpoint(b_codes, b_scales).double().T
     )
     torch.testing.assert_close(actual.double(), expected, rtol=2**-8, atol=1e-3)
 

@@ -88,11 +88,15 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
 )
 from tokenspeed_kernel.ops.gemm import (
     dsv4_linear_fp32,
+    fp8_projection,
     grouped_bf16_projection,
     grouped_bf16_projection_quantize_fp8,
     grouped_fp8_projection,
+    grouped_fp8_projection_quantize_fp8,
     mm,
+    prepare_fp8_projection,
     prepare_grouped_fp8_projection,
+    warmup_fp8_projections,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
@@ -678,6 +682,23 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     )
 
 
+def _max_forward_tokens() -> int:
+    """The most tokens one forward carries, as execution/device.py sizes it."""
+    args = global_server_args_dict
+    chunk = int(args["chunked_prefill_size"])
+    tokens = (
+        chunk
+        if chunk > 0
+        else int(args["max_prefill_tokens"]) + int(args["max_model_len"])
+    )
+    decode_rows = max(
+        int(args["max_cudagraph_capture_size"] or 0), int(args["max_num_seqs"] or 0)
+    )
+    if args["speculative_algorithm"]:
+        decode_rows *= int(args["speculative_num_draft_tokens"])
+    return max(tokens, decode_rows)
+
+
 def _all_reduce_output(
     shape: tuple[int, int], like: torch.Tensor, group
 ) -> torch.Tensor | None:
@@ -996,6 +1017,11 @@ class DeepseekV41Attention(nn.Module):
         # that kernel's layout; False when it holds BF16 weights.
         self.wo_a_fp8: bool | None = None
         self.register_buffer("wo_a_scales", None)
+        # Decided by the first prepare_wo_b once wo_a runs in FP8: True when
+        # wo_b reads wo_a's FP8 output through an FP8 kernel, with wo_b_scales
+        # derived from its loaded scales; False keeps wo_b's own method.
+        self.wo_b_fp8: bool | None = None
+        self.register_buffer("wo_b_scales", None, persistent=False)
         self.wo_b = RowParallelLinear(
             input_size=config.o_groups * config.o_lora_rank,
             output_size=config.hidden_size,
@@ -1036,6 +1062,42 @@ class DeepseekV41Attention(nn.Module):
         default_weight_loader(param, loaded_weight[start : start + self.n_local_heads])
         if self._padded_attn_sink is not None:
             self._padded_attn_sink[: self.n_local_heads].copy_(param)
+
+    @torch.no_grad()
+    def prepare_wo_b(self) -> None:
+        """Derive wo_b's FP8-kernel scales from its loaded ones once wo_a runs in FP8.
+
+        Call once the loaded weights are final; later calls refresh the scales
+        in place, so captured graphs keep reading the same buffer.
+        """
+        if not self.wo_a_fp8 or self.wo_b_fp8 is False:
+            return
+        prepared = None
+        # FP8 output packs four scales per 128 columns of each wo_a group.
+        if (
+            self.o_lora_rank % 128 == 0
+            and isinstance(self.wo_b.quant_method, _ReferenceFp8LinearMethod)
+            and self.wo_b.weight.dtype == torch.float8_e4m3fn
+            and self.wo_b.weight_scale_inv.dtype == torch.uint8
+        ):
+            prepared = prepare_fp8_projection(
+                self.wo_b.weight, self.wo_b.weight_scale_inv
+            )
+        if self.wo_b_fp8 is None:
+            self.wo_b_fp8 = prepared is not None
+            self.wo_b_scales = prepared
+        else:
+            self.wo_b_scales.copy_(prepared)
+
+    def warmup_output_projections(self, max_tokens: int) -> None:
+        """Compile the FP8 wo_a/wo_b kernels for every count up to max_tokens."""
+        warmup_fp8_projections(
+            self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1),
+            self.wo_a_scales,
+            self.wo_b.weight if self.wo_b_fp8 else None,
+            self.wo_b_scales if self.wo_b_fp8 else None,
+            max_tokens,
+        )
 
     def _kernel_attn_sink(self):
         if not self.attn_sink.is_cuda or self.n_kernel_heads == self.n_local_heads:
@@ -1449,8 +1511,19 @@ class DeepseekV41Attention(nn.Module):
             codes, scales = self.rotary_emb.inverse_quantize_grouped(
                 out, positions, self.n_local_groups
             )
-            out = grouped_fp8_projection(codes, scales, weight, self.wo_a_scales, None)
-            out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
+            if self.wo_b_fp8:
+                # wo_a writes wo_b's FP8 input and scales; nothing quantizes between.
+                codes, scales = grouped_fp8_projection_quantize_fp8(
+                    codes, scales, weight, self.wo_a_scales
+                )
+                out = fp8_projection(
+                    codes, scales, self.wo_b.weight, self.wo_b_scales, target
+                )
+            else:
+                out = grouped_fp8_projection(
+                    codes, scales, weight, self.wo_a_scales, None
+                )
+                out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
         else:
             if out_rope_cache is None:
                 out = self.rotary_emb.apply_owned(out, positions, True)
@@ -3199,12 +3272,19 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 # The target and DSpark share this hook. Refresh in place after
                 # a complete weight update; captured graphs retain the buffer.
                 module.quant_method.prepare_weight_scales(module)
+            elif isinstance(module, DeepseekV41Attention):
+                module.prepare_wo_b()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded
         # state loader post-processes modules before copying the saved state
         # in, so scales prepared during post-processing are stale there.
         self.post_load_weights()
+        for module in self.modules():
+            if isinstance(module, DeepseekV41Attention) and module.wo_a_fp8:
+                # Every layer shares these shapes, so one layer warms them all.
+                module.warmup_output_projections(_max_forward_tokens())
+                break
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
