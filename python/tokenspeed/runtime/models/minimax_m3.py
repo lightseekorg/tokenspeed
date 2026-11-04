@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SwigluOAI
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
+from tokenspeed.runtime.layers.dense.fp8 import prepare_fp8_linear_weight_scales
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -899,7 +900,19 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        self.post_load_weights()
         return loaded_params
+
+    def post_load_weights(self) -> None:
+        # MXFP8 linears read weight scales prepared once from the loaded ones;
+        # rebuild them in place after every complete load or weight update.
+        prepare_fp8_linear_weight_scales(self)
+
+    def post_quant_warmup(self) -> None:
+        # Every loader calls this once the loaded state is final. The sharded
+        # state loader post-processes modules before copying the saved state
+        # in, so scales prepared earlier are stale there.
+        self.post_load_weights()
 
     @classmethod
     def get_model_config_for_expert_location(
