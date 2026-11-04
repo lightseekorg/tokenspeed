@@ -18,11 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Host side of the fused Muse Spark layer on gfx950: the group's launch
+"""Host side of the Muse Spark monokernel on gfx950: the group's launch
 state, a layer's weights read in place, compile-time checks, and launches.
 
-:class:`MuseSparkMonokernelLayer` is the ``("monokernel", "prepare")``
-leaf for the ``muse_spark`` recipe (registered in ``decoder_layer/gluon.py``).
+:class:`MuseSparkMonokernelLayer` is the ``("monokernel", "prepare")`` leaf
+for the ``muse_spark`` recipe (registered in ``monokernel/gluon.py``). The
+values it names (h', the routed sum ``s_rows``, the MXFP4 pooled rows ``xq``)
+are defined in ``layer.py``.
 """
 
 from __future__ import annotations
@@ -93,14 +95,14 @@ _LDS_RESERVE_BYTES = 96 * 1024
 _CU_LDS_BYTES = 160 * 1024
 # Registers per lane of a wave when 8 waves share a CU (2 per SIMD).
 _MAX_VGPRS = 256
-# Clock ticks (10 ns) a wait may last before the launch fail-stops: 60 s,
-# so a rank stalled between launches (a first compile, a host pause) is not
-# taken for a failure.
+# Clock ticks (10 ns) a wait may last before the launch fail-stops: 60 s, so
+# a rank stalled between launches (a first compile, a host pause) is not taken
+# for a failure.
 DEADLINE_TICKS = 6_000_000_000
-# Plan fields of the default variant (benchmarks sweep them one at a time).
-# The MoE ring is 16 chunks per wave: the kernel's register maximum (set by
-# other phases) does not move, and the down units keep >= 15 loads in flight
-# per wave instead of draining to 2 at unit ends.
+# Plan fields of the default variant (benchmarks vary them one at a time).
+# The MoE ring is 16 chunks per wave: other phases set the kernel's register
+# maximum, so the deeper ring costs no registers, and the down units keep
+# their loads in flight across unit ends.
 DEFAULT_PLAN_FIELDS = dict(
     ring=16,
     quad_map=0,
@@ -115,9 +117,9 @@ DEFAULT_PLAN_FIELDS = dict(
     tail_num=1,
     tail_den=2,
     num_stages=2,
-    # Two 16 KB QKV tiles per CU in flight: the 128 workgroups streaming
-    # theirs while the tail exchanges run stay near 3.3 TB/s, below the
-    # ~4.5 TB/s where polls slow down (four tiles would be ~6).
+    # Two 16 KB QKV tiles per CU in flight: the QKV weight streams that run
+    # beside the post-MoE exchanges then leave the memory bandwidth the
+    # exchanges' polls need; deeper windows slow the polls down.
     qkv_window=2,
     # Who merges a sliding block's splits: split 0 ("designated") or every
     # split its share of the rows ("spread").
@@ -126,15 +128,15 @@ DEFAULT_PLAN_FIELDS = dict(
 
 
 class MuseSparkMonokernelState:
-    """The launch state every fused layer of one group shares.
+    """The launch state every monokernel layer of one group shares.
 
-    Holds the entry counters (epochs, role claims), the Iris areas and
-    error words (``MuseSparkIrisState``), the uncached exchange (ids, xq
-    rows and tags), the host mirror of the failure record, and the
-    launch-local scratch (attention partials and records, K-part partials,
-    the MoE mids, S rows, h'). One state serves every layer: a layer's
-    launch is the group's next epoch, and consecutive launches alternate
-    the two-copy areas. The Iris heap must already hold
+    Holds the entry counters (epochs, role claims), the Iris areas and error
+    words (``MuseSparkIrisState``), the uncached exchange (routed ids, the
+    MXFP4 pooled rows and their tags), the host copy of the failure record,
+    and the launch-local scratch (attention partials and records, K-part
+    partials, the MoE intermediates, the routed sums, h'). One state serves
+    every layer: a layer's launch is the group's next epoch, and consecutive
+    launches alternate the two-copy areas. The Iris heap must already hold
     :meth:`heap_bytes` spare (``monokernel_state_heap_bytes``).
 
     Args:
@@ -233,8 +235,8 @@ class MuseSparkMonokernelState:
 
     @staticmethod
     def heap_bytes(*, world_size: int, max_requests: int) -> int:
-        """Iris heap bytes the state allocates (the symmetric areas, sized
-        for the most rows any launch carries)."""
+        """Iris heap bytes the state allocates: the symmetric areas, sized
+        for the most rows any launch carries."""
         if world_size != WORLD_SIZE or not 1 <= max_requests <= 2:
             return 0
         return MuseSparkIrisState.heap_bytes()
@@ -388,8 +390,8 @@ class MuseSparkMonokernelLayer:
         self.checked: set[tuple] = set()
         self.page_table_stride: int | None = None
         self.tensors, self.model, problems = self._read_weights(weights, state.rank)
-        # The lane-major gate/up scales cost a 32 MiB copy per layer: off
-        # until a benchmark shows the win is worth the memory.
+        # The lane-major gate/up scales cost a 32 MiB copy per layer, so they
+        # stay off unless a benchmark shows the gain is worth the memory.
         self.moe = moe_stream_weights(weights["experts"], scale_lanes=False)
         for key in self.plan_keys:
             reasons = problems + self._compile(key)
@@ -429,10 +431,10 @@ class MuseSparkMonokernelLayer:
             o_proj=_require("o_proj", weights["o_proj"], (HIDDEN, Q_WIDTH), torch.bfloat16),
             alpha=_require("alpha", alpha, (HIDDEN,), torch.float32),
             beta=_require("beta", beta, (HIDDEN,), torch.float32),
-            # A weightless post-attention norm (Muse) passes the multiplier
-            # vector of ones and no weight to AR_OWNER.
-            # Without a weight (Muse), AR_OWNER reads none: the BF16 multiplier
-            # vector of ones stands in for the pointer.
+            # A weightless post-attention norm passes the multiplier vector
+            # of ones and no weight to the all-reduce owners.
+            # Without a weight, the all-reduce owners read none: the BF16
+            # multiplier vector of ones stands in for the pointer.
             post_attn_norm=(
                 _bf16_with_offset(None, 0.0, HIDDEN, device)
                 if post_attn_w is None

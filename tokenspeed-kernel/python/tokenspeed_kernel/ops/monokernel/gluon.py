@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""gfx950 Gluon fused decoder layer registration.
+"""gfx950 Gluon monokernel registration.
 
 The leaf's modules load on first use, so importing the op family needs no
 device (its plan checker runs on CPU).
@@ -52,8 +52,8 @@ from tokenspeed_kernel.registry import Priority, register_kernel
     priority=Priority.SPECIALIZED,
 )
 class GluonMonokernelMuseSparkGfx950:
-    """The Muse Spark fused decoder layer on gfx950 (EP1, TP 8, DFlash
-    verify width 8, FP8 KV cache); see ``_gluon/muse_spark/prepared.py``."""
+    """The Muse Spark monokernel layer on gfx950 (EP1, TP 8, DFlash verify
+    width 8, FP8 KV cache); see ``_gluon/muse_spark/prepared.py``."""
 
     @staticmethod
     def prepare_state(**kwargs):
