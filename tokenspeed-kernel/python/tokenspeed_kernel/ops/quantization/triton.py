@@ -1553,7 +1553,13 @@ def _rmsnorm_fp8_group32_ue8m0(
     BLOCK: tl.constexpr,
     SWIZZLED: tl.constexpr,
     PADDED_GROUPS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    # Padding-only programs wait too: the scale buffer may reuse memory the
+    # upstream kernel still reads.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, BLOCK)
     groups = tl.arange(0, BLOCK // 32)
@@ -1708,6 +1714,7 @@ def triton_rmsnorm_fp8_group32_ue8m0(
         rows = m
         scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
     if m:
+        enable_pdl = pdl_enabled()
         _rmsnorm_fp8_group32_ue8m0[(rows,)](
             x,
             weight,
@@ -1721,8 +1728,10 @@ def triton_rmsnorm_fp8_group32_ue8m0(
             triton.next_power_of_2(k),
             swizzled_scales,
             triton.next_power_of_2(triton.cdiv(k, 128) * 4),
+            enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return normalized, quantized, scales
 

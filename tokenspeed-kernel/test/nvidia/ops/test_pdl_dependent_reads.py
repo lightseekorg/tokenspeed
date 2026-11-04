@@ -36,7 +36,10 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
+from tokenspeed_kernel.ops.quantization.triton import (
+    _quantize_fp8_group32_swizzled,
+    triton_rmsnorm_fp8_group32_ue8m0,
+)
 from tokenspeed_kernel.ops.residual.triton import (
     mhc_pre_layer_norm_hc4,
     mhc_pre_mix_hc4,
@@ -233,11 +236,24 @@ def _case_quantize_fp8_group32_swizzled():
     return real, run
 
 
+def _case_rmsnorm_fp8_group32_swizzled():
+    torch.manual_seed(106)
+    rows, hidden = 32, 1536
+    real = torch.randn(rows, hidden, dtype=torch.bfloat16, device=DEVICE)
+    weight = torch.randn(hidden, dtype=torch.bfloat16, device=DEVICE)
+
+    def run(x):
+        return triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, swizzled_scales=True)
+
+    return real, run
+
+
 _CASES = {
     "mhc_post_hc4": _case_mhc_post,
     "mhc_pre_mix_hc4": _case_mhc_pre_mix,
     "mhc_pre_layer_norm_hc4": _case_mhc_pre_layer_norm,
     "fp8_group32_ue8m0_quantize_swizzled": _case_quantize_fp8_group32_swizzled,
+    "rmsnorm_fp8_group32_ue8m0": _case_rmsnorm_fp8_group32_swizzled,
 }
 
 
