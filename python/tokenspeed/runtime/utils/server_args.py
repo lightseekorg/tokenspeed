@@ -425,6 +425,7 @@ class ServerArgs:
     # Jaeger, Langfuse) and the share of requests it samples. 0 disables.
     otlp_traces_endpoint: str | None = None
     trace_sample_ratio: float = 0.0
+    trace_provider: str | None = None
 
     # Version identifier for the model weights: the L3 cache's namespace,
     # which a flushed weight update that names a new version replaces.
@@ -3008,6 +3009,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.trace_sample_ratio,
             help="The share of requests the OTLP endpoint traces (0..1).",
+        )
+
+        parser.add_argument(
+            "--trace-provider",
+            type=str,
+            default=ServerArgs.trace_provider,
+            help="Registered plugin provider of custom trace context; omission retains native generation.",
         )
 
         # Data parallelism

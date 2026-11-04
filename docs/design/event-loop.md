@@ -22,6 +22,25 @@ Peripheral threads stay off the round: the wire's Tokio runtime
 transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
 publisher, the expert-rebalance solver.
 
+Request traces are exported on a bounded, lossy background queue. Plugins can
+register a named context provider with `register_trace_provider`; users
+select it with `--trace-provider NAME`. The provider receives the request
+ID as input and returns `(trace_id, optional_parent_span_id)` or `None`. Generating
+IDs, recovering upstream context, and any RID encoding are plugin policies, not
+host conventions. Registration alone does not enable a provider. Async and
+generator providers are rejected during registration.
+
+The host resolves the name at startup and invokes the callable only on the trace
+export thread. Providers must be short, nonblocking functions without model or
+GPU access, I/O, or per-request retained state; Python calls use the GIL. An absent
+provider, `None`, an exception, or invalid IDs retains native hash-based generation.
+Trace IDs must be nonzero 32-character hex strings; an optional parent must be a
+nonzero 16-character hex string distinct from the current span ID. IDs are
+normalized to lowercase. The exporter
+preserves its own span ID and lifecycle data. RID sampling is unchanged and does
+not inherit upstream sampling flags. Unknown provider names fail startup. Plugin
+registration uses the usual duplicate-name and rollback rules.
+
 With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host

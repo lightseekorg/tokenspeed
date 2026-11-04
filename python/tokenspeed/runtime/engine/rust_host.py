@@ -132,6 +132,10 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
+from tokenspeed.runtime.plugins.registry import (
+    TraceProvider,
+    get_trace_provider,
+)
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
@@ -441,6 +445,7 @@ class HostConfig:
             None.
         otlp_traces_endpoint: ``--otlp-traces-endpoint``, the OTLP/HTTP
             receiver finished requests trace to.
+        trace_provider: Optional registered provider of custom span context.
         trace_sample_ratio: ``--trace-sample-ratio``, the share of requests
             it keeps.
         l3: With the L3 storage tier, what the host starts its executor
@@ -501,6 +506,7 @@ class HostConfig:
     kv_events_publisher: KVEventsConfig | None
     otlp_traces_endpoint: str | None
     trace_sample_ratio: float
+    trace_provider: TraceProvider | None
     l3: L3Settings | None
     l3_metrics: bool
     attn_tp_rank: int
@@ -1298,6 +1304,11 @@ class HostBootstrap:
                 ),
                 otlp_traces_endpoint=server_args.otlp_traces_endpoint,
                 trace_sample_ratio=server_args.trace_sample_ratio,
+                trace_provider=(
+                    get_trace_provider(server_args.trace_provider)
+                    if server_args.trace_provider is not None
+                    else None
+                ),
                 epd_receive_enabled=(
                     (
                         server_args.disaggregation_mode == "prefill"
