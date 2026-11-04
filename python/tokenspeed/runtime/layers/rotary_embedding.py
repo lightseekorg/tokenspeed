@@ -21,10 +21,11 @@
 
 """Rotary Positional Embeddings."""
 
+import dataclasses
 import itertools
 import logging
 import math
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -1185,6 +1186,82 @@ class MRotaryEmbedding(RotaryEmbedding):
             return position_ids, mrope_position_deltas
 
 
+@dataclasses.dataclass(frozen=True)
+class RopeScaling:
+    """A ``rope_scaling`` config dict parsed once into typed fields.
+
+    ``from_dict`` validates the type tag (``rope_type``, legacy ``type``) and
+    the keys the selected scaling type requires, so a malformed checkpoint
+    config fails here with the missing keys named instead of a ``KeyError``
+    deep in ``get_rope``. Keys the selected type does not consume stay
+    ignored, as before.
+    """
+
+    rope_type: str
+    factor: float | None = None
+    original_max_position_embeddings: int | None = None
+    low_freq_factor: float | None = None
+    high_freq_factor: float | None = None
+    alpha: float | None = None
+    extrapolation_factor: float = 1
+    attn_factor: float = 1
+    beta_fast: int = 32
+    beta_slow: int = 1
+    mscale: float = 1
+    mscale_all_dim: float = 0
+    short_factor: list[float] | None = None
+    long_factor: list[float] | None = None
+    short_mscale: float | None = None
+    long_mscale: float | None = None
+    mrope_section: list[int] | None = None
+    mrope_interleaved: bool = False
+
+    # Keys each scaling type must carry, beyond the type tag. "dynamic" needs
+    # "alpha" for the NTK-alpha variant and "factor" otherwise.
+    _REQUIRED_KEYS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "llama3": (
+            "factor",
+            "low_freq_factor",
+            "high_freq_factor",
+            "original_max_position_embeddings",
+        ),
+        "linear": ("factor",),
+        "yarn": ("factor", "original_max_position_embeddings"),
+        "deepseek_yarn": ("factor", "original_max_position_embeddings"),
+        "longrope": (
+            "short_factor",
+            "long_factor",
+            "original_max_position_embeddings",
+        ),
+    }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RopeScaling":
+        """Parse and validate a checkpoint's ``rope_scaling`` dict."""
+        if "rope_type" in raw:
+            rope_type = raw["rope_type"]
+        elif "type" in raw:
+            rope_type = raw["type"]
+        else:
+            raise ValueError("Unknown RoPE scaling type")
+
+        known = {f.name for f in dataclasses.fields(cls)} - {"rope_type"}
+        scaling = cls(
+            rope_type=rope_type, **{k: v for k, v in raw.items() if k in known}
+        )
+
+        required = cls._REQUIRED_KEYS.get(rope_type, ())
+        if rope_type == "dynamic":
+            required = ("alpha",) if "alpha" in raw else ("factor",)
+        missing = [k for k in required if k not in raw]
+        if missing:
+            raise ValueError(
+                f"rope_scaling type {rope_type!r} misses required "
+                f"key(s): {', '.join(missing)}"
+            )
+        return scaling
+
+
 _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 
 
@@ -1235,18 +1312,10 @@ def get_rope(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
-        if "rope_type" in rope_scaling:
-            scaling_type = rope_scaling["rope_type"]
-        elif "type" in rope_scaling:
-            scaling_type = rope_scaling["type"]
-        else:
-            raise ValueError("Unknown RoPE scaling type")
+        scaling = RopeScaling.from_dict(rope_scaling)
+        scaling_type = scaling.rope_type
 
         if scaling_type == "llama3":
-            scaling_factor = rope_scaling["factor"]
-            low_freq_factor = rope_scaling["low_freq_factor"]
-            high_freq_factor = rope_scaling["high_freq_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
             rotary_emb = Llama3RotaryEmbedding(
                 head_size,
                 rotary_dim,
@@ -1254,13 +1323,13 @@ def get_rope(
                 base,
                 is_neox_style,
                 dtype,
-                scaling_factor,
-                low_freq_factor,
-                high_freq_factor,
-                original_max_position,
+                scaling.factor,
+                scaling.low_freq_factor,
+                scaling.high_freq_factor,
+                scaling.original_max_position_embeddings,
             )
         elif scaling_type == "default":
-            if "mrope_section" in rope_scaling:
+            if scaling.mrope_section is not None:
                 rotary_emb = MRotaryEmbedding(
                     head_size,
                     rotary_dim,
@@ -1268,8 +1337,8 @@ def get_rope(
                     base,
                     is_neox_style,
                     dtype,
-                    mrope_section=rope_scaling["mrope_section"],
-                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    mrope_section=scaling.mrope_section,
+                    mrope_interleaved=scaling.mrope_interleaved,
                 )
             else:
                 rotary_emb = RotaryEmbedding(
@@ -1281,26 +1350,24 @@ def get_rope(
                     dtype,
                 )
         elif scaling_type == "linear":
-            scaling_factor = rope_scaling["factor"]
             rotary_emb = LinearScalingRotaryEmbedding(
                 head_size,
                 rotary_dim,
                 max_position,
                 base,
                 is_neox_style,
-                scaling_factor,
+                scaling.factor,
                 dtype,
             )
         elif scaling_type == "dynamic":
-            scaling_factor = rope_scaling["factor"]
-            if "alpha" in rope_scaling:
+            if scaling.alpha is not None:
                 rotary_emb = DynamicNTKAlphaRotaryEmbedding(
                     head_size,
                     rotary_dim,
                     max_position,
                     base,
                     is_neox_style,
-                    rope_scaling["alpha"],
+                    scaling.alpha,
                     dtype,
                 )
             else:
@@ -1310,76 +1377,54 @@ def get_rope(
                     max_position,
                     base,
                     is_neox_style,
-                    scaling_factor,
+                    scaling.factor,
                     dtype,
                 )
         elif scaling_type == "yarn":
-            scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k
-                in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
-            }
             rotary_emb = YaRNScalingRotaryEmbedding(
                 head_size,
                 rotary_dim,
-                original_max_position,
+                scaling.original_max_position_embeddings,
                 base,
                 is_neox_style,
-                scaling_factor,
+                scaling.factor,
                 dtype,
-                **extra_kwargs,
+                extrapolation_factor=scaling.extrapolation_factor,
+                attn_factor=scaling.attn_factor,
+                beta_fast=scaling.beta_fast,
+                beta_slow=scaling.beta_slow,
             )
         elif scaling_type == "deepseek_yarn":
-            scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k
-                in (
-                    "extrapolation_factor",
-                    "attn_factor",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                )
-            }
             rotary_emb = DeepseekScalingRotaryEmbedding(
                 head_size,
                 rotary_dim,
-                original_max_position,
+                scaling.original_max_position_embeddings,
                 base,
                 is_neox_style,
-                scaling_factor,
+                scaling.factor,
                 dtype,
                 device="npu" if current_platform().is_npu else "cuda",
                 ramp_device=yarn_ramp_mask_device,
                 frequency_device=yarn_frequency_device,
-                **extra_kwargs,
+                extrapolation_factor=scaling.extrapolation_factor,
+                attn_factor=scaling.attn_factor,
+                beta_fast=scaling.beta_fast,
+                beta_slow=scaling.beta_slow,
+                mscale=scaling.mscale,
+                mscale_all_dim=scaling.mscale_all_dim,
             )
         elif scaling_type == "longrope":
-            short_factor = rope_scaling["short_factor"]
-            long_factor = rope_scaling["long_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k in ("short_mscale", "long_mscale")
-            }
             rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(
                 head_size,
                 rotary_dim,
                 max_position,
-                original_max_position,
+                scaling.original_max_position_embeddings,
                 base,
                 is_neox_style,
-                short_factor,
-                long_factor,
-                **extra_kwargs,
+                scaling.short_factor,
+                scaling.long_factor,
+                short_mscale=scaling.short_mscale,
+                long_mscale=scaling.long_mscale,
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
