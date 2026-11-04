@@ -25,7 +25,6 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
-_LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
 _LARGEM_WIDE_N = 3072
 # From this many rows the 256 x 256 warp pipeline tile fills the device.
@@ -57,25 +56,22 @@ _WARP_BASES_M8 = ((1, 0), (2, 0), (4, 0))
 _WARP_BASES_4 = ((0, 1), (1, 0))
 _WARP_BASES_8 = ((0, 1), (1, 0), (2, 0))
 _WARP_BASES_N8 = ((0, 1), (0, 2), (0, 4))
-# Kimi K3 projections that run here from _LARGEM_MIN_M rows.
-_LARGEM_SHAPES = {
-    (512, 3072),
-    (768, 7168),
-    (1536, 7168),
-    (1536, 2304),
-    (3584, 7168),
-    (4224, 7168),
-    (7168, 1536),
-    (7168, 2112),
-    (7168, 3584),
-    (7168, 6288),
-    (7168, 8448),
-}
-# Inclusive row ranges, per (K, N) of the other BF16 serving weights, where
-# these kernels beat hipBLASLt on the ROCm stack CI pins; None leaves a range
-# open. The winner depends on hipBLASLt's own kernel choice, so re-measure
-# when that pin moves.
+# Inclusive row ranges per (K, N) where these kernels beat hipBLASLt; None
+# leaves a range open. Re-check when the pinned hipBLASLt changes.
 _LARGEM_ROWS = {
+    # Kimi K3 projections.
+    (512, 3072): ((512, None),),
+    (768, 7168): ((512, None),),
+    (1536, 7168): ((512, None),),
+    (1536, 2304): ((512, None),),
+    (3584, 7168): ((512, None),),
+    (4224, 7168): ((512, None),),
+    (7168, 1536): ((512, None),),
+    (7168, 2112): ((512, None),),
+    (7168, 3584): ((512, None),),
+    (7168, 6288): ((512, None),),
+    (7168, 8448): ((512, None),),
+    # Other BF16 serving weights.
     (128, 1536): ((512, None),),
     (128, 2048): ((512, None),),
     (512, 128): ((512, None),),
@@ -94,9 +90,9 @@ _LARGEM_ROWS = {
     (8192, 4096): ((848, 1792), (7424, None)),
     (14336, 2112): ((1024, 3584), (6144, 7168), (24576, None)),
 }
-# Columns past the last whole cluster column that push the warp pipeline grid
-# into one more CU round ran 2-25% faster on 128 x 64 large-M tiles after it,
-# unless the grid already kept this share of its rounds busy.
+# A column tail past the last whole cluster column that would cost the warp
+# pipeline grid one more CU round runs on 128 x 64 large-M tiles instead,
+# unless the grid already keeps this share of its rounds busy.
 _LARGEM_PEEL_MAX_CU_UTILIZATION = 0.9
 # Up to this width one wave of dense WMMA tiles beats the large-M tiles.
 _NARROW_MAX_N = 512
@@ -153,12 +149,9 @@ def _warp_pipeline_columns(m: int, n: int) -> int:
 
 
 def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
-    """Return whether the CDNA5 large-M projection is selected for this shape:
-    a K3 projection in ``_LARGEM_SHAPES`` with enough rows, or a serving
-    weight in ``_LARGEM_ROWS`` with M in one of its row ranges."""
+    """Return whether the CDNA5 large-M projection is selected: ``_LARGEM_ROWS``
+    lists ``(K, N)`` with a row range holding M."""
 
-    if (k, n) in _LARGEM_SHAPES:
-        return m >= _LARGEM_MIN_M
     return any(
         low <= m and (high is None or m <= high)
         for low, high in _LARGEM_ROWS.get((k, n), ())

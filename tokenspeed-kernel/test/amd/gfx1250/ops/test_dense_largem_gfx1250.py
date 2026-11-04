@@ -30,9 +30,7 @@ if not is_cdna5():
 from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
-    _LARGEM_MIN_M,
     _LARGEM_ROWS,
-    _LARGEM_SHAPES,
     _wmma_tdm_dense_kernel,
     _wmma_tdm_dense_largem_kernel,
     _wmma_tdm_dense_largem_warp_pipeline_kernel,
@@ -117,18 +115,16 @@ def test_largem_warp_pipeline_compiles_under_compile_monitor():
         (8192, 4096 + 64, 4096, False),  # K must be a multiple of 128
     ],
 )
-def test_largem_selection_follows_measured_rows(m, k, n, selected):
+def test_largem_selection_follows_row_ranges(m, k, n, selected):
     assert use_gluon_largem_gfx1250(m, k, n) is selected
 
 
-def test_largem_tables_are_well_formed():
-    # The tables are regenerated when the ROCm pin moves; the kernels need K
-    # in whole 128-wide tiles, and each weight's ranges ascend without overlap.
-    for k, _ in _LARGEM_SHAPES:
-        assert k % 128 == 0
+def test_largem_table_is_well_formed():
+    # The kernels need K in whole 128-wide tiles, and each weight's ranges
+    # ascend without overlap.
     for (k, _), ranges in _LARGEM_ROWS.items():
         assert k % 128 == 0
-        previous_high = _LARGEM_MIN_M - 1
+        previous_high = 0
         for index, (low, high) in enumerate(ranges):
             assert previous_high < low
             if high is None:
