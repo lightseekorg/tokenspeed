@@ -185,6 +185,10 @@ def _worker(rank, port, record_dir, errors):
             failure_record_path=f"{record_dir}/rank{rank}.bin",
             device=torch.device("cuda", rank),
         )
+        # A numerics mismatch on one key is recorded and the next key still
+        # runs, so one failure does not hide the others; the test fails at
+        # the end with every key's report.
+        mismatches = {}
         for key in PLAN_KEYS:
             for seed in SEEDS:
                 weights, inputs = build_layer_inputs(
@@ -215,7 +219,8 @@ def _worker(rank, port, record_dir, errors):
                 rows = inputs["residual"].shape[0]
                 phases = phase_errors(state, weights, expected, rows)
                 phases["box"] = _attention_box_error(state, inputs)
-                raise AssertionError(f"{error}; phases {phases}") from error
+                mismatches[key] = f"{error}; phases {phases}"
+                continue
 
             # Deterministic: the same launch again, at the next epoch and
             # the other copy of every two-copy area, gives the same bits.
@@ -240,6 +245,9 @@ def _worker(rank, port, record_dir, errors):
                 assert torch.equal(
                     value.view(torch.uint8), captured[name].view(torch.uint8)
                 ), (key, name)
+        assert not mismatches, "\n".join(
+            f"{key}: {report}" for key, report in mismatches.items()
+        )
     except Exception:
         errors[rank] = traceback.format_exc()
     finally:
