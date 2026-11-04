@@ -59,7 +59,7 @@ from tokenspeed.runtime.layers.attention.dcp.indexer import (
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
-    resolve_cache_slots,
+    resolve_write_slots,
 )
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
@@ -1266,8 +1266,8 @@ class GlmDsaSparseAttentionMixin:
                 indexer_output = replace(
                     indexer_output, query=index_query, query_proj=None
                 )
-            index_slots, index_mask = resolve_cache_slots(
-                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
+            index_slots, index_mask = resolve_write_slots(
+                out_cache_loc, backend.cache_placement(self.attn_mqa), shared_topk
             )
             ctx.token_to_kv_pool.set_index_k_buffer(
                 self.attn_mqa.layer_id,
