@@ -32,7 +32,7 @@ use std::{
 use bytes::Bytes;
 use tokio::{
     runtime::Handle,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, OwnedMutexGuard},
     task::JoinHandle,
     time::timeout,
 };
@@ -131,20 +131,47 @@ type StreamItem = std::result::Result<OutputChunk, StreamError>;
 struct Engine {
     info: EngineInfo,
     identity: Bytes,
-    /// This client's requests on the engine that have not finished.
-    in_flight: AtomicUsize,
+    /// This client's requests on the engine that have not finished: one
+    /// [`InFlight`] each.
+    in_flight: Arc<AtomicUsize>,
     load: Mutex<EngineLoad>,
 }
 
+/// One request counted in flight on its engine for as long as this lives.
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A request in flight. Removing it from the table, however that happens,
+/// takes it off its engine's count.
 struct Pending {
     engine: usize,
     tx: mpsc::UnboundedSender<StreamItem>,
+    _in_flight: InFlight,
 }
 
-/// A control operation awaiting every engine's reply.
+/// A control operation awaiting every engine's reply. One whose caller gave
+/// up stays to take the replies still due, holding its kind's turn, so they
+/// never reach the next operation of that kind.
 struct ControlWaiter {
     replies: Vec<ControlOutput>,
-    done: oneshot::Sender<Vec<ControlOutput>>,
+    /// The replies due: one from each engine the request reached.
+    expected: usize,
+    /// The caller; `None` once it gave up.
+    done: Option<oneshot::Sender<Vec<ControlOutput>>>,
+    /// The kind's turn, once the caller gave up.
+    turn: Option<OwnedMutexGuard<()>>,
 }
 
 struct Shared {
@@ -263,9 +290,6 @@ impl Shared {
     /// Stop tracking a request; returns its engine if it was in flight.
     fn forget(&self, rid: &str) -> Option<usize> {
         let pending = lock(&self.requests).remove(rid)?;
-        self.engines[pending.engine]
-            .in_flight
-            .fetch_sub(1, Ordering::Relaxed);
         Some(pending.engine)
     }
 
@@ -310,10 +334,7 @@ impl Shared {
             // forgets the request.
             let _ = pending.tx.send(Ok(OutputChunk::from(&row)));
             if row.finish_reason.is_some() {
-                let pending = requests.remove(row.rid).expect("present above");
-                self.engines[pending.engine]
-                    .in_flight
-                    .fetch_sub(1, Ordering::Relaxed);
+                requests.remove(row.rid);
             }
         }
     }
@@ -326,9 +347,12 @@ impl Shared {
             return;
         };
         waiter.replies.push(output);
-        if waiter.replies.len() == self.engines.len() {
+        if waiter.replies.len() >= waiter.expected {
+            // An abandoned operation's turn goes with it.
             let waiter = controls.remove(tag).expect("present above");
-            let _ = waiter.done.send(waiter.replies);
+            if let Some(done) = waiter.done {
+                let _ = done.send(waiter.replies);
+            }
         }
     }
 
@@ -339,9 +363,6 @@ impl Shared {
         lock(&self.controls).clear();
         let drained: Vec<Pending> = lock(&self.requests).drain().map(|(_, p)| p).collect();
         for pending in drained {
-            self.engines[pending.engine]
-                .in_flight
-                .fetch_sub(1, Ordering::Relaxed);
             let _ = pending.tx.send(Err(reason.clone()));
         }
     }
@@ -393,7 +414,7 @@ impl ClientListener {
             .map(|info| Engine {
                 identity: Bytes::copy_from_slice(&ts_wire::engine_identity(info.index)),
                 info,
-                in_flight: AtomicUsize::new(0),
+                in_flight: Arc::new(AtomicUsize::new(0)),
                 load: Mutex::new(EngineLoad::default()),
             })
             .collect();
@@ -487,16 +508,24 @@ impl EngineClient {
             if requests.contains_key(&rid) {
                 return Err(Error::DuplicateRequestId(rid));
             }
-            requests.insert(rid.clone(), Pending { engine, tx });
+            let in_flight = InFlight::new(&self.shared.engines[engine].in_flight);
+            requests.insert(
+                rid.clone(),
+                Pending {
+                    engine,
+                    tx,
+                    _in_flight: in_flight,
+                },
+            );
         }
-        self.shared.engines[engine]
-            .in_flight
-            .fetch_add(1, Ordering::Relaxed);
+        // A failed send, or this call dropped while sending, forgets it.
+        let unsent = Unsent {
+            shared: &self.shared,
+            rid: Some(&rid),
+        };
         let frames = EngineRequest::Add(Box::new(request)).to_frames();
-        if let Err(error) = self.shared.send(engine, frames).await {
-            self.shared.forget(&rid);
-            return Err(error);
-        }
+        self.shared.send(engine, frames).await?;
+        unsent.sent();
         Ok(RequestStream {
             shared: self.shared.clone(),
             rid,
@@ -518,28 +547,43 @@ impl EngineClient {
             .entry(tag)
             .or_default()
             .clone();
-        let _turn = turn.lock().await;
+        let turn = turn.lock_owned().await;
         if let Some(reason) = self.shared.closed() {
             return Err(Error::Unavailable(reason));
         }
+        let engines = self.shared.engines.len();
         let (done, replies) = oneshot::channel();
         lock(&self.shared.controls).insert(
             tag,
             ControlWaiter {
                 replies: Vec::new(),
-                done,
+                expected: engines,
+                done: Some(done),
+                turn: None,
             },
         );
+        // An error or this call dropped leaves the waiter to the replies
+        // still due.
+        let mut outstanding = Outstanding {
+            shared: &self.shared,
+            tag,
+            turn: Some(turn),
+            reached: 0,
+        };
         let frames = EngineRequest::Control(Box::new(request)).to_frames();
-        for engine in 0..self.shared.engines.len() {
+        for engine in 0..engines {
+            // Dropped mid-send, the request may have reached the engine.
+            outstanding.reached = engine + 1;
             if let Err(error) = self.shared.send(engine, frames.clone()).await {
-                lock(&self.shared.controls).remove(tag);
+                outstanding.reached = engine;
                 return Err(error);
             }
         }
-        replies.await.map_err(|_| {
+        let replies = replies.await.map_err(|_| {
             Error::Unavailable(self.shared.closed().unwrap_or(StreamError::ClientClosed))
-        })
+        });
+        outstanding.finish();
+        replies
     }
 
     /// Send an EPD encode server an item to embed. Nothing answers: the
@@ -575,6 +619,67 @@ impl Drop for EngineClient {
             task.abort();
         }
         self.shared.close(StreamError::ClientClosed);
+    }
+}
+
+/// A registered request whose Add has not gone out: dropped before
+/// [`Unsent::sent`] (the send failed, or the call adding it was dropped), it
+/// forgets the request. No abort follows, as the engine may never have seen
+/// it.
+struct Unsent<'a> {
+    shared: &'a Shared,
+    rid: Option<&'a str>,
+}
+
+impl Unsent<'_> {
+    /// The Add went out: the request's stream takes over.
+    fn sent(mut self) {
+        self.rid = None;
+    }
+}
+
+impl Drop for Unsent<'_> {
+    fn drop(&mut self) {
+        if let Some(rid) = self.rid {
+            self.shared.forget(rid);
+        }
+    }
+}
+
+/// A control operation its caller may abandon. Dropped before
+/// [`Outstanding::finish`], it leaves the waiter to the replies of the
+/// engines the request reached, holding the kind's turn until they all
+/// arrive; a waiter with none due goes at once.
+struct Outstanding<'a> {
+    shared: &'a Shared,
+    tag: &'static str,
+    turn: Option<OwnedMutexGuard<()>>,
+    reached: usize,
+}
+
+impl Outstanding<'_> {
+    /// Every reply arrived: the waiter is gone, and the turn goes now.
+    fn finish(mut self) {
+        self.turn = None;
+    }
+}
+
+impl Drop for Outstanding<'_> {
+    fn drop(&mut self) {
+        let Some(turn) = self.turn.take() else {
+            return;
+        };
+        let mut controls = lock(&self.shared.controls);
+        let Some(waiter) = controls.get_mut(self.tag) else {
+            return;
+        };
+        waiter.expected = self.reached;
+        waiter.done = None;
+        if waiter.replies.len() >= waiter.expected {
+            controls.remove(self.tag);
+        } else {
+            waiter.turn = Some(turn);
+        }
     }
 }
 
