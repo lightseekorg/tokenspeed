@@ -19,7 +19,10 @@ Full passes the same IDs to schedule construction and scoring, allowing the
 native kernel to reuse history across consecutive queries of one request.
 Such rows share a page table and have nondecreasing visible lengths. Empty
 rows get distinct scheduling labels so they cannot truncate an active request's
-history bound. Request IDs, tables and lengths remain unchanged while sharing
+history bound. The runtime groups canonical decode rows and ordered prefill
+spans. Free decode windows use independent rows so reordering queries cannot
+truncate the history scored for an earlier row.
+Request IDs, tables and lengths remain unchanged while sharing
 metadata; graph replay refreshes their captured producers.
 
 The paged selection cleaner writes its final aligned score layout directly.
