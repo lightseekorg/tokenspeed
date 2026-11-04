@@ -141,6 +141,12 @@ class MLAAttnBackend(PagedAttentionBackend):
         # seq_len, so every block query sees the whole block including its own
         # future. Target verify and ordinary decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
+        if config.draft_block_causal:
+            raise NotImplementedError(
+                f"{type(self).__name__} attends a draft block as a whole; a causal "
+                "block draft (Kimi-K3.1 DSpark) needs --drafter-attention-backend "
+                "tokenspeed_mla"
+            )
 
         backend_name = spec.backend_name or "mla"
         self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
