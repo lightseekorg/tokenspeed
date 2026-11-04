@@ -26,9 +26,10 @@
 //! messages and expires what waited too long; workers write each ready
 //! room's rows to every prefill rank of its block and push each a status.
 //! The scheduling loop names a room when its request arrives
-//! ([`EmbeddingSender::begin`]), hands over the item's rows once they sit in
-//! their send slot ([`EmbeddingSender::send`]), and learns which rooms
-//! concluded, whose slots it then reuses.
+//! ([`EmbeddingSender::begin`]) and hands over the item's rows once they sit
+//! in their send slot ([`EmbeddingSender::send`]). The chunk carries its
+//! slot ([`crate::SendSlot`]): the slot is back in the ring once the chunk
+//! drops, written or failed, wherever that happens.
 
 use std::{
     collections::HashMap,
@@ -208,8 +209,6 @@ struct State {
     rooms: HashMap<u64, Room>,
     /// Failed rooms and until when a late request gets the failure at once.
     tombstones: HashMap<u64, Instant>,
-    /// Rooms that concluded since the scheduling loop last asked.
-    concluded: Vec<u64>,
 }
 
 struct Shared {
@@ -232,7 +231,8 @@ impl Shared {
         );
     }
 
-    /// Conclude `room` failed, telling every prefill rank that asked.
+    /// Conclude `room` failed, telling every prefill rank that asked. A
+    /// parked chunk drops with the room, and its slot with it.
     fn fail(&self, state: &mut State, room: u64, reason: &str) {
         let entry = state.rooms.remove(&room);
         tracing::error!(room, reason, "EPD embedding send failed");
@@ -244,9 +244,6 @@ impl Shared {
         state
             .tombstones
             .insert(room, Instant::now() + self.bootstrap_timeout);
-        if entry.is_some_and(|entry| entry.begun) {
-            state.concluded.push(room);
-        }
     }
 
     /// A prefill rank's message.
@@ -320,8 +317,7 @@ impl Shared {
         });
     }
 
-    /// Write one room's rows to every prefill rank that asked, then
-    /// conclude it.
+    /// Write one room's rows to every prefill rank that asked.
     fn transfer(&self, chunk: &EmbeddingChunk, infos: &[TransferInfo]) -> Result<(), String> {
         if let Some(reason) = validate_fanout(infos, chunk) {
             return Err(reason);
@@ -382,6 +378,7 @@ impl Shared {
         Ok(())
     }
 
+    /// Write each ready room; its chunk drops after, returning its slot.
     fn run_worker(&self, queue: &mpsc::Receiver<Ready>) {
         while let Ok((chunk, infos)) = queue.recv() {
             let sent = self.transfer(&chunk, &infos);
@@ -389,7 +386,6 @@ impl Shared {
             match sent {
                 Ok(()) => {
                     state.rooms.remove(&chunk.room);
-                    state.concluded.push(chunk.room);
                 }
                 Err(reason) => self.fail(&mut state, chunk.room, &reason),
             }
@@ -526,7 +522,8 @@ impl EmbeddingSender for Sender {
     fn send(&mut self, chunk: EmbeddingChunk) {
         let mut state = self.shared.state();
         let Some(entry) = state.rooms.get_mut(&chunk.room) else {
-            // Failed while it was being encoded.
+            // Failed while it was being encoded: the chunk drops here, and
+            // its slot returns.
             return;
         };
         if entry.complete() {
@@ -542,14 +539,10 @@ impl EmbeddingSender for Sender {
     fn fail(&mut self, room: u64, reason: &str) {
         let mut state = self.shared.state();
         if state.rooms.get(&room).is_some_and(|entry| entry.sending) {
-            // A worker writes it already and concludes it either way.
+            // A worker writes it already; its chunk drops either way.
             return;
         }
         self.shared.fail(&mut state, room, reason);
-    }
-
-    fn concluded(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.shared.state().concluded)
     }
 }
 
@@ -559,6 +552,7 @@ mod tests {
 
     fn chunk(rows: i64, deepstack_width: i64) -> EmbeddingChunk {
         EmbeddingChunk {
+            slot: crate::SendRing::new(1).lease().expect("a free slot"),
             room: 7,
             source: 0x10_0000,
             rows,

@@ -33,9 +33,10 @@
 //! its item; the others wait in arrival order for a batch under the token
 //! and item budgets. Each batched item leases a slot of the send ring, which
 //! the data plane copies its rows into; once the copy finished, the rows go
-//! to the sender, and the slot returns when the room concludes. Only what is
-//! the same on every rank decides a batch: a room's conclusion, which each
-//! rank sees at its own time, only frees its slot.
+//! to the sender with the slot's lease ([`SendSlot`]), which returns the slot
+//! when the sender drops them, written or failed. Only what is the same on
+//! every rank decides a batch: a slot's return, which each rank sees at its
+//! own time, only frees it.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -45,7 +46,7 @@ use std::{
 
 use bytes::Bytes;
 use ts_collective::{Group, Mesh};
-use ts_pd::{EmbeddingChunk, EmbeddingSender};
+use ts_pd::{EmbeddingChunk, EmbeddingSender, SendRing, SendSlot};
 use ts_wire::EncodeRequest;
 
 use crate::{
@@ -185,14 +186,11 @@ pub struct EncodeLoop<D: EncodeDataPlane, S: EmbeddingSender> {
     hits: VecDeque<u64>,
     /// Admissions waiting for a forward, in arrival order.
     misses: VecDeque<u64>,
-    /// Free send slots, the lowest last.
-    free: Vec<usize>,
-    /// The slot each item in flight holds, by admission.
-    leased: HashMap<u64, usize>,
-    /// The admission whose rows a room's send reads.
-    sending: HashMap<u64, u64>,
-    /// Items handed to the data plane whose rows have not come back.
-    encoding: usize,
+    /// The send ring; a slot is free again once its lease drops.
+    ring: SendRing,
+    /// Items handed to the data plane whose rows have not come back, with
+    /// the slot each one's rows go into.
+    encoding: HashMap<u64, SendSlot>,
     /// What the first rank waits for a request before the next round.
     wait: Duration,
 }
@@ -207,7 +205,7 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         mesh: Mesh,
         group: Group,
     ) -> Self {
-        let free = (0..config.ring.slots).rev().collect();
+        let ring = SendRing::new(config.ring.slots);
         Self {
             config,
             data_plane,
@@ -219,10 +217,8 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
             requests: HashMap::new(),
             hits: VecDeque::new(),
             misses: VecDeque::new(),
-            free,
-            leased: HashMap::new(),
-            sending: HashMap::new(),
-            encoding: 0,
+            ring,
+            encoding: HashMap::new(),
             wait: IDLE_WAIT,
         }
     }
@@ -242,7 +238,6 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
             self.admit(round.messages)?;
             moved |= self.batch(round.free)?;
             moved |= self.hand_over()?;
-            moved |= self.reclaim();
             self.wait = if !round.busy && !self.busy() {
                 IDLE_WAIT
             } else if moved {
@@ -253,15 +248,18 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         }
     }
 
-    /// This rank has work in flight.
+    /// This rank has work in flight: requests to encode, rows coming back
+    /// from the data plane, or chunks the sender still holds.
     fn busy(&self) -> bool {
-        !self.requests.is_empty() || self.encoding > 0 || !self.leased.is_empty()
+        !self.requests.is_empty()
+            || !self.encoding.is_empty()
+            || self.ring.free() < self.ring.slots()
     }
 
     /// Agree on the round: the first rank's messages and stop request, the
     /// slots free everywhere and whether any rank is busy.
     fn exchange(&mut self, stop: bool, messages: Vec<Vec<Bytes>>) -> Result<Round, EncodeError> {
-        let (free, busy) = (self.free.len(), self.busy());
+        let (free, busy) = (self.ring.free(), self.busy());
         if self.group.size() == 1 {
             return Ok(Round {
                 stop,
@@ -428,18 +426,19 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         if batch.is_empty() {
             return Ok(false);
         }
+        // Slots only come back meanwhile: the agreed ones are all free.
         let leased: Vec<(u64, usize)> = batch
             .into_iter()
             .map(|admission| {
                 let slot = self
-                    .free
-                    .pop()
+                    .ring
+                    .lease()
                     .expect("every rank has the agreed slots free");
-                self.leased.insert(admission, slot);
-                (admission, slot)
+                let index = slot.index();
+                self.encoding.insert(admission, slot);
+                (admission, index)
             })
             .collect();
-        self.encoding += leased.len();
         self.data_plane.encode(&leased)?;
         Ok(true)
     }
@@ -450,10 +449,9 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         let moved = !encoded.is_empty();
         let ring = self.config.ring;
         for (admission, outcome) in encoded {
-            self.encoding = self.encoding.saturating_sub(1);
-            let (Some(request), Some(&slot)) = (
+            let (Some(request), Some(slot)) = (
                 self.requests.remove(&admission),
-                self.leased.get(&admission),
+                self.encoding.remove(&admission),
             ) else {
                 return Err(DataPlaneError(format!(
                     "the data plane encoded admission {admission}, which it was not given"
@@ -461,21 +459,22 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
                 .into());
             };
             if request.duplicate {
-                self.free_slot(admission);
+                // Embedded like any other, not sent: the slot returns.
                 continue;
             }
             match outcome {
                 Ok(rows) => {
-                    self.sending.insert(request.room, admission);
+                    let index = slot.index() as u64;
                     self.sender.send(EmbeddingChunk {
+                        slot,
                         room: request.room,
-                        source: ring.base + slot as u64 * ring.slot_bytes,
+                        source: ring.base + index * ring.slot_bytes,
                         rows: rows.rows,
                         hidden: rows.hidden,
                         dtype: rows.dtype,
                         nbytes: rows.nbytes,
                         deepstack_source: if rows.deepstack_width > 0 {
-                            ring.deepstack_base + slot as u64 * ring.deepstack_slot_bytes
+                            ring.deepstack_base + index * ring.deepstack_slot_bytes
                         } else {
                             0
                         },
@@ -484,29 +483,12 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
                     });
                 }
                 Err(reason) => {
-                    self.free_slot(admission);
+                    drop(slot);
                     self.sender.fail(request.room, &reason);
                 }
             }
         }
         Ok(moved)
-    }
-
-    /// Free the slots of the rooms that concluded.
-    fn reclaim(&mut self) -> bool {
-        let concluded = self.sender.concluded();
-        for room in &concluded {
-            if let Some(admission) = self.sending.remove(room) {
-                self.free_slot(admission);
-            }
-        }
-        !concluded.is_empty()
-    }
-
-    fn free_slot(&mut self, admission: u64) {
-        if let Some(slot) = self.leased.remove(&admission) {
-            self.free.push(slot);
-        }
     }
 }
 
@@ -620,16 +602,33 @@ mod tests {
     #[derive(Default)]
     struct Sends {
         begun: HashSet<u64>,
-        sent: Vec<EmbeddingChunk>,
+        /// Each written chunk's room and source.
+        sent: Vec<(u64, u64)>,
         failed: Vec<u64>,
-        concluded: Vec<u64>,
     }
 
-    /// Concludes a sent room `delay` calls of `concluded` later.
+    /// Writes a chunk `delay` rounds after it was sent ([`FakeSender::tick`])
+    /// and drops it then, which returns its slot. Like ts-pd's sender, it
+    /// drops a chunk for a room that failed meanwhile at once.
     struct FakeSender {
         sends: Arc<Mutex<Sends>>,
         delay: usize,
-        waiting: Vec<(u64, usize)>,
+        writing: Vec<(EmbeddingChunk, usize)>,
+    }
+
+    impl FakeSender {
+        /// A round passed.
+        fn tick(&mut self) {
+            let mut sends = self.sends.lock().unwrap();
+            self.writing.retain_mut(|(chunk, delay)| {
+                if *delay > 0 {
+                    *delay -= 1;
+                    return true;
+                }
+                sends.begun.remove(&chunk.room);
+                false
+            });
+        }
     }
 
     impl EmbeddingSender for FakeSender {
@@ -638,33 +637,19 @@ mod tests {
         }
 
         fn send(&mut self, chunk: EmbeddingChunk) {
-            self.waiting.push((chunk.room, self.delay));
-            self.sends.lock().unwrap().sent.push(chunk);
+            let mut sends = self.sends.lock().unwrap();
+            if !sends.begun.contains(&chunk.room) {
+                // Failed while it was being encoded: dropped here.
+                return;
+            }
+            sends.sent.push((chunk.room, chunk.source));
+            self.writing.push((chunk, self.delay));
         }
 
         fn fail(&mut self, room: u64, _reason: &str) {
             let mut sends = self.sends.lock().unwrap();
             sends.failed.push(room);
             sends.begun.remove(&room);
-        }
-
-        fn concluded(&mut self) -> Vec<u64> {
-            let mut done = Vec::new();
-            self.waiting.retain_mut(|(room, delay)| {
-                if *delay == 0 {
-                    done.push(*room);
-                    false
-                } else {
-                    *delay -= 1;
-                    true
-                }
-            });
-            let mut sends = self.sends.lock().unwrap();
-            for room in &done {
-                sends.begun.remove(room);
-            }
-            sends.concluded.extend(&done);
-            done
         }
     }
 
@@ -732,7 +717,7 @@ mod tests {
                         FakeSender {
                             sends: sends.clone(),
                             delay,
-                            waiting: Vec::new(),
+                            writing: Vec::new(),
                         },
                         (rank == 0).then(|| Box::new(Queue(intake)) as Box<dyn Intake + Send>),
                         mesh,
@@ -771,7 +756,7 @@ mod tests {
                         rank.encode.admit(round.messages).unwrap();
                         rank.encode.batch(round.free).unwrap();
                         rank.encode.hand_over().unwrap();
-                        rank.encode.reclaim();
+                        rank.encode.sender.tick();
                     }
                 });
             }
@@ -780,7 +765,7 @@ mod tests {
 
     #[test]
     fn ranks_batch_alike_while_their_sends_conclude_apart() {
-        // Two slots; rank 1's sends conclude three rounds after rank 0's do,
+        // Two slots; rank 1's writes finish three rounds after rank 0's do,
         // so rank 0 has slots free earlier but waits for rank 1.
         let rounds = vec![vec![
             request("a", 1, vec![vec![(0, 3)]]),
@@ -799,12 +784,12 @@ mod tests {
         assert_eq!(batches[0], [vec![1, 2], vec![3, 4]]);
         for rank in &ranks {
             let sends = rank.sends.lock().unwrap();
-            let rooms: Vec<u64> = sends.sent.iter().map(|chunk| chunk.room).collect();
+            let rooms: Vec<u64> = sends.sent.iter().map(|&(room, _)| room).collect();
             assert_eq!(rooms, [1, 2, 3, 4]);
             // Each item read from its own slot of the ring.
-            let sources: HashSet<u64> = sends.sent[..2].iter().map(|chunk| chunk.source).collect();
+            let sources: HashSet<u64> = sends.sent[..2].iter().map(|&(_, source)| source).collect();
             assert_eq!(sources.len(), 2);
-            assert_eq!(rank.encode.free.len(), 2);
+            assert_eq!(rank.encode.ring.free(), 2);
         }
     }
 
@@ -847,14 +832,29 @@ mod tests {
         let sends = ranks[0].sends.lock().unwrap();
         assert_eq!(sends.failed, [7, 13]);
         assert_eq!(
-            sends
-                .sent
-                .iter()
-                .map(|chunk| chunk.room)
-                .collect::<Vec<_>>(),
+            sends.sent.iter().map(|&(room, _)| room).collect::<Vec<_>>(),
             [21]
         );
-        assert_eq!(ranks[0].encode.free.len(), 4);
+        assert_eq!(ranks[0].encode.ring.free(), 4);
         assert!(!ranks[0].encode.busy());
+    }
+
+    #[test]
+    fn a_room_that_fails_while_its_item_encodes_returns_the_slot() {
+        let rounds = vec![vec![request("cancelled", 31, vec![vec![(0, 1)]])]];
+        let mut ranks = ranks(2, &[0], rounds);
+        let rank = &mut ranks[0];
+        let received = rank.encode.intake.as_mut().unwrap().receive(Duration::ZERO);
+        let round = rank.encode.exchange(false, received).unwrap();
+        rank.encode.admit(round.messages).unwrap();
+        assert!(rank.encode.batch(round.free).unwrap());
+        assert_eq!(rank.encode.ring.free(), 1);
+        // The prefill side fails the room before its rows come back.
+        rank.encode.sender.fail(31, "the request was aborted");
+        rank.encode.hand_over().unwrap();
+        // The sender dropped the chunk: its slot is free, nothing is busy.
+        assert!(rank.sends.lock().unwrap().sent.is_empty());
+        assert_eq!(rank.encode.ring.free(), 2);
+        assert!(!rank.encode.busy());
     }
 }
