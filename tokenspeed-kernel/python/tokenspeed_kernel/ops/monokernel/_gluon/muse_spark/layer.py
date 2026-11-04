@@ -31,7 +31,7 @@ the consumer's poll can see them.
 
 Values: h is the residual entering the layer; h' (``hprime``) the residual
 after attention; x the normed router and pooler input built from h'; the
-routed sum (``s_rows``, "S") the route-weighted sum of the experts' outputs;
+routed sum (``routed_sums``, "S") the route-weighted sum of the experts' outputs;
 h'' the residual after the FFN; x'' the next layer's normed input.
 
 Roles, by plan name, in the order a workgroup runs them:
@@ -227,7 +227,7 @@ QKV_GROUPS = 16
 QKV_PARTS = 16
 QKV_TASK_ROWS = QKV_WIDTH // QKV_GROUPS
 # PROLOGUE tasks: the q heads, the (K, V) head pairs, then the gate heads.
-HEAD_TASKS = Q_HEADS + KV_HEADS + Q_HEADS
+PROLOGUE_TASKS = Q_HEADS + KV_HEADS + Q_HEADS
 # Hidden columns per post-expert sender.
 POST_SENDER_COLUMNS = 16
 
@@ -245,11 +245,11 @@ assert RECORD_WORDS % GRID == 0
 # flow (int64, ``STAMP_STRIDE`` per workgroup, logical id order).
 STAMP_ENTRY = 0
 STAMP_CHECKED = 1
-STAMP_FRONT = 2
+STAMP_PRE_MOE = 2
 STAMP_IDS = 3
 STAMP_XQ = 4
 STAMP_MOE = 5
-STAMP_TAIL = 6
+STAMP_POST_MOE = 6
 STAMP_QKV = 7
 STAMP_END = 8
 # Post-MoE hand-offs: the workgroup's last route owner, finisher and routed
@@ -257,8 +257,8 @@ STAMP_END = 8
 # pushed, the reducer done, the QKV task's x'' ready.
 STAMP_ROUTE_OWNER = 9
 STAMP_FINISHER = 10
-STAMP_S = 11
-STAMP_POST_SENDER_S = 12
+STAMP_ROUTED_SUM = 11
+STAMP_POST_SENDER_ROUTED_SUM = 12
 STAMP_POST_AG = 13
 STAMP_REDUCER = 14
 STAMP_QKV_X = 15
@@ -275,14 +275,15 @@ EX_WEIGHTS = EX_IDS + MAX_ROWS * TOPK
 EX_IDS_TAGS = EX_WEIGHTS + MAX_ROWS * TOPK
 EX_XQ_TAGS = EX_IDS_TAGS + MAX_ROWS
 EX_HP_TAGS = EX_XQ_TAGS + MAX_ROWS
-EX_S_TAGS = EX_HP_TAGS + KPARTS * 16
+EX_ROUTED_SUM_TAGS = EX_HP_TAGS + KPARTS * 16
 # The xq scales are CDNA4-swizzled (``empty_swizzled_cdna4_mxfp4_scale``):
 # one 32-row block, stride 1 within it.
 XS_MBLOCK_STRIDE = MAX_ROWS * XS_ROW_BYTES
-EXCHANGE_WORDS = EX_S_TAGS + KPARTS * MAX_ROWS
+EXCHANGE_WORDS = EX_ROUTED_SUM_TAGS + KPARTS * MAX_ROWS
 # Every polled tag line starts on a 64 B line (16 words).
 assert all(
-    offset % 16 == 0 for offset in (EX_IDS_TAGS, EX_XQ_TAGS, EX_HP_TAGS, EX_S_TAGS)
+    offset % 16 == 0
+    for offset in (EX_IDS_TAGS, EX_XQ_TAGS, EX_HP_TAGS, EX_ROUTED_SUM_TAGS)
 )
 assert MAX_ROWS % 16 == 0
 
@@ -297,7 +298,7 @@ SITE_POOL = SITE_RECORDS + 5
 SITE_IDS = SITE_RECORDS + 6
 SITE_XQ = SITE_RECORDS + 7
 SITE_HPRIME = SITE_RECORDS + 8
-SITE_S = SITE_RECORDS + 9
+SITE_ROUTED_SUM = SITE_RECORDS + 9
 SITE_POST_AG = SITE_RECORDS + 10
 SITE_POST_AG_SUMS = SITE_RECORDS + 11
 SITE_QKV = SITE_RECORDS + 12
@@ -329,7 +330,7 @@ _EX_IDS_TAGS = gl.constexpr(EX_IDS_TAGS)
 _EX_XQ_TAGS = gl.constexpr(EX_XQ_TAGS)
 _XS_MBLOCK_STRIDE = gl.constexpr(XS_MBLOCK_STRIDE)
 _EX_HP_TAGS = gl.constexpr(EX_HP_TAGS)
-_EX_S_TAGS = gl.constexpr(EX_S_TAGS)
+_EX_ROUTED_SUM_TAGS = gl.constexpr(EX_ROUTED_SUM_TAGS)
 _POST_AG_SLOT = gl.constexpr(POST_AG_SLOT)
 _POST_AG_WORDS = gl.constexpr(POST_AG_WORDS)
 _Q_HEADS = gl.constexpr(Q_HEADS)
@@ -339,13 +340,13 @@ _QKV_WIDTH = gl.constexpr(QKV_WIDTH)
 _QKV_GROUPS = gl.constexpr(QKV_GROUPS)
 _QKV_PARTS = gl.constexpr(QKV_PARTS)
 _QKV_TASK_ROWS = gl.constexpr(QKV_TASK_ROWS)
-_HEAD_TASKS = gl.constexpr(HEAD_TASKS)
+_PROLOGUE_TASKS = gl.constexpr(PROLOGUE_TASKS)
 _POST_SENDER_COLUMNS = gl.constexpr(POST_SENDER_COLUMNS)
 _STAMP_STRIDE = gl.constexpr(STAMP_STRIDE)
 _STAMP_ROUTE_OWNER = gl.constexpr(STAMP_ROUTE_OWNER)
 _STAMP_FINISHER = gl.constexpr(STAMP_FINISHER)
-_STAMP_S = gl.constexpr(STAMP_S)
-_STAMP_POST_SENDER_S = gl.constexpr(STAMP_POST_SENDER_S)
+_STAMP_ROUTED_SUM = gl.constexpr(STAMP_ROUTED_SUM)
+_STAMP_POST_SENDER_ROUTED_SUM = gl.constexpr(STAMP_POST_SENDER_ROUTED_SUM)
 _STAMP_POST_AG = gl.constexpr(STAMP_POST_AG)
 _STAMP_REDUCER = gl.constexpr(STAMP_REDUCER)
 _STAMP_QKV_X = gl.constexpr(STAMP_QKV_X)
@@ -353,15 +354,15 @@ _PART_ROWS = gl.constexpr(PART_ROWS)
 _RECORD_WORDS = gl.constexpr(RECORD_WORDS)
 _STAMP_ENTRY = gl.constexpr(STAMP_ENTRY)
 _STAMP_CHECKED = gl.constexpr(STAMP_CHECKED)
-_STAMP_FRONT = gl.constexpr(STAMP_FRONT)
+_STAMP_PRE_MOE = gl.constexpr(STAMP_PRE_MOE)
 _STAMP_IDS = gl.constexpr(STAMP_IDS)
 _STAMP_XQ = gl.constexpr(STAMP_XQ)
 _STAMP_MOE = gl.constexpr(STAMP_MOE)
-_STAMP_TAIL = gl.constexpr(STAMP_TAIL)
+_STAMP_POST_MOE = gl.constexpr(STAMP_POST_MOE)
 _STAMP_QKV = gl.constexpr(STAMP_QKV)
 _STAMP_END = gl.constexpr(STAMP_END)
 _SITE_HPRIME = gl.constexpr(SITE_HPRIME)
-_SITE_S = gl.constexpr(SITE_S)
+_SITE_ROUTED_SUM = gl.constexpr(SITE_ROUTED_SUM)
 _SITE_POST_AG = gl.constexpr(SITE_POST_AG)
 _SITE_POST_AG_SUMS = gl.constexpr(SITE_POST_AG_SUMS)
 _SITE_QKV = gl.constexpr(SITE_QKV)
@@ -1112,10 +1113,10 @@ def _publish_hprime(launch, part, exchange_ptr):
 
 
 @gluon.jit
-def _store_s(s, token, part, s_rows_ptr):
+def _store_routed_sums(s, token, part, s_rows_ptr):
     """The finisher's routed sum of (token, part), FP32 [512], as BF16 (the
-    post-expert projection's input) to ``s_rows [MAX_ROWS, 4096]``, written
-    through. :func:`_publish_s` then publishes it."""
+    post-expert projection's input) to ``routed_sums [MAX_ROWS, 4096]``, written
+    through. :func:`_publish_routed_sums` then publishes it."""
     columns = gl.arange(0, 512, layout=s.type.layout)
     gl.amd.cdna4.buffer_store(
         s.to(gl.bfloat16), s_rows_ptr, token * _POOLED + part * 512 + columns,
@@ -1124,8 +1125,10 @@ def _store_s(s, token, part, s_rows_ptr):
 
 
 @gluon.jit
-def _publish_s(launch, first_token, ROWS: gl.constexpr, part, rows, exchange_ptr):
-    """After this workgroup's :func:`_store_s` of tokens ``first_token + 8 r``
+def _publish_routed_sums(
+    launch, first_token, ROWS: gl.constexpr, part, rows, exchange_ptr
+):
+    """After this workgroup's :func:`_store_routed_sums` of tokens ``first_token + 8 r``
     (r < ROWS): one drain for them all, then their routed-sum tags
     ``[part][row]`` (also row ``token + 8`` when the launch has at most 8
     rows: the post-expert senders poll 16-row lines)."""
@@ -1135,7 +1138,9 @@ def _publish_s(launch, first_token, ROWS: gl.constexpr, part, rows, exchange_ptr
     lane = gl.arange(0, 64 * gl.num_warps(), lanes_l)
     tag = gl.full([64 * gl.num_warps()], 0, gl.int32, lanes_l) + launch.tag
     for r in gl.static_range(ROWS):
-        tags = exchange_ptr + _EX_S_TAGS + part * _MAX_ROWS + first_token + 8 * r
+        tags = (
+            exchange_ptr + _EX_ROUTED_SUM_TAGS + part * _MAX_ROWS + first_token + 8 * r
+        )
         gl.amd.cdna4.buffer_store(tag, tags, lane * 0, mask=lane == 0)
         gl.amd.cdna4.buffer_store(
             tag, tags, lane * 0 + 8, mask=(lane == 0) & (rows <= 8)
@@ -1200,8 +1205,10 @@ def _post_sender(
     (POST_AG) and their four norm-sum partials to this XCD's reducer."""
     WAVES: gl.constexpr = gl.num_warps()
     for p in gl.static_range(_KPARTS):
-        _wait_line(launch, exchange_ptr + _EX_S_TAGS + p * _MAX_ROWS, _SITE_S)
-    _stamp(stamps_ptr, launch.cta, _STAMP_POST_SENDER_S, STAMPS)
+        _wait_line(
+            launch, exchange_ptr + _EX_ROUTED_SUM_TAGS + p * _MAX_ROWS, _SITE_ROUTED_SUM
+        )
+    _stamp(stamps_ptr, launch.cta, _STAMP_POST_SENDER_ROUTED_SUM, STAMPS)
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, 32], transposed=True,
         warps_per_cta=[WAVES, 1, 1],
@@ -1306,7 +1313,7 @@ def _ffn_state(
 
 
 @gluon.jit
-def _head_rows(launch, qkv_parts, column0, rows):
+def _prologue_rows(launch, qkv_parts, column0, rows):
     """One head's 16 x 64 rows from the 16 QKV K parts' tagged
     partials, summed in part order and rounded once to BF16 (as FP32), in
     the prologue's rows layout."""
@@ -1325,7 +1332,7 @@ def _head_rows(launch, qkv_parts, column0, rows):
 
 
 @gluon.jit
-def _head(
+def _prologue(
     launch,
     head,
     rows,
@@ -1361,19 +1368,19 @@ def _head(
     )
     slot = gl.load(slots_ptr + tokens, mask=kv_mask, other=0).to(gl.int64)
     if head < _Q_HEADS:
-        q = _head_rows(launch, qkv_parts, head * _HEAD_DIM, rows)
+        q = _prologue_rows(launch, qkv_parts, head * _HEAD_DIM, rows)
         gqa_prologue_query_gfx950(
             q, q_out_ptr + tokens * _Q_WIDTH + head * _HEAD_DIM, q_norm_ptr, cos, sin,
             row_mask, ROTARY, QK_EPS, QK_OFFSET,
         )  # fmt: skip
     elif head < _Q_HEADS + _KV_HEADS:
         kv = head - _Q_HEADS
-        k_rows = _head_rows(launch, qkv_parts, (_Q_HEADS + kv) * _HEAD_DIM, rows)
+        k_rows = _prologue_rows(launch, qkv_parts, (_Q_HEADS + kv) * _HEAD_DIM, rows)
         gqa_prologue_key_gfx950(
             k_rows, next_k_cache_ptr + (slot * _KV_HEADS + kv) * _HEAD_DIM, k_norm_ptr,
             cos, sin, kv_mask, k_inv_scale, ROTARY, QK_EPS, QK_OFFSET, KV_SCALED,
         )  # fmt: skip
-        v_rows = _head_rows(
+        v_rows = _prologue_rows(
             launch, qkv_parts, (_Q_HEADS + _KV_HEADS + kv) * _HEAD_DIM, rows
         )
         gqa_prologue_value_gfx950(
@@ -1382,7 +1389,7 @@ def _head(
         )  # fmt: skip
     else:
         g = head - _Q_HEADS - _KV_HEADS
-        gate = _head_rows(
+        gate = _prologue_rows(
             launch, qkv_parts, (_Q_HEADS + 2 * _KV_HEADS + g) * _HEAD_DIM, rows
         )
         d = gl.arange(0, _HEAD_DIM, gl.SliceLayout(0, rows_l))
@@ -1523,7 +1530,7 @@ def gluon_monokernel_muse_spark_gfx950(
     stride_s2nb,
     # Routed sum and post-expert projection.
     route_norm_ptr,
-    s_rows,
+    routed_sums,
     hprime,
     post_expert_ptr,
     # FFN boundary (gate coefficients, the post-norm and the next input norm
@@ -1723,11 +1730,11 @@ def gluon_monokernel_muse_spark_gfx950(
             _POOLED_LOCAL, ".wt",
         )  # fmt: skip
         if xcd == tile:
-            red_l: gl.constexpr = gl.BlockedLayout(
+            sum_l: gl.constexpr = gl.BlockedLayout(
                 [1, 2], [16, 4], [_NUM_WARPS, 1], [1, 0]
             )
-            t = gl.arange(0, 16, gl.SliceLayout(1, red_l))
-            c = gl.arange(0, _POOL_TILE, gl.SliceLayout(0, red_l))
+            t = gl.arange(0, 16, gl.SliceLayout(1, sum_l))
+            c = gl.arange(0, _POOL_TILE, gl.SliceLayout(0, sum_l))
             offsets = t[:, None] * _POOLED_LOCAL + tile * _POOL_TILE + c[None, :]
             live = (t < rows)[:, None] & (c >= 0)[None, :]
             reduced = gemv_a16w16_splitk_sum_gfx950(
@@ -1772,7 +1779,7 @@ def gluon_monokernel_muse_spark_gfx950(
                 xq_ptr, xs_ptr, RANK, POOLED_EPS, POOLED_OFFSET,
             )  # fmt: skip
 
-    _stamp(stamps_ptr, launch.cta, _STAMP_FRONT, STAMPS)
+    _stamp(stamps_ptr, launch.cta, _STAMP_PRE_MOE, STAMPS)
     # MoE: every workgroup, once the ids and then the xq rows land.
     if not poll_tags16(exchange + _EX_IDS_TAGS, launch.tag, launch, True, True):
         iris_fail_stop(launch, _SITE_IDS, 0)
@@ -1827,7 +1834,7 @@ def gluon_monokernel_muse_spark_gfx950(
                 QKV_WINDOW, 0, QKV_FIRST,
             )  # fmt: skip
         _post_sender(
-            launch, view, sender, rows, w, s_rows, hprime, exchange, alpha2_ptr,
+            launch, view, sender, rows, w, routed_sums, hprime, exchange, alpha2_ptr,
             beta2_ptr, post2_bf16_ptr, stamps_ptr, RANK, PEER_CACHE, STAMPS,
         )  # fmt: skip
         if slot == 16:
@@ -1866,9 +1873,9 @@ def gluon_monokernel_muse_spark_gfx950(
                 route_norm_ptr, iris_fail_stop, ROUTE_EPS, ROUTE_OFFSET,
             )  # fmt: skip
             _stamp(stamps_ptr, launch.cta, _STAMP_FINISHER, STAMPS)
-            _store_s(s, index + 8 * r, xcd, s_rows)
-        _publish_s(launch, index, REQUESTS, xcd, rows, exchange)
-        _stamp(stamps_ptr, launch.cta, _STAMP_S, STAMPS)
+            _store_routed_sums(s, index + 8 * r, xcd, routed_sums)
+        _publish_routed_sums(launch, index, REQUESTS, xcd, rows, exchange)
+        _stamp(stamps_ptr, launch.cta, _STAMP_ROUTED_SUM, STAMPS)
     else:
         if NEXT_KIND != 2:
             # The other workgroups stream their task while the post-MoE
@@ -1877,7 +1884,7 @@ def gluon_monokernel_muse_spark_gfx950(
                 qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
                 QKV_WINDOW,
             )  # fmt: skip
-    _stamp(stamps_ptr, launch.cta, _STAMP_TAIL, STAMPS)
+    _stamp(stamps_ptr, launch.cta, _STAMP_POST_MOE, STAMPS)
     if NEXT_KIND != 2:
         # QKV: x'' of K part ``part``, one K step at a time; group 0
         # stores h'' for the next layer.
@@ -1893,8 +1900,8 @@ def gluon_monokernel_muse_spark_gfx950(
         )  # fmt: skip
         _stamp(stamps_ptr, launch.cta, _STAMP_QKV, STAMPS)
         head = index * 8 + xcd
-        if is_tail & (head < _HEAD_TASKS):
-            _head(
+        if is_tail & (head < _PROLOGUE_TASKS):
+            _prologue(
                 launch, head, rows, qkv_parts, q_out_ptr, gate_out_ptr, q_norm_ptr,
                 k_norm_ptr, cos_sin_ptr, cos_sin_stride, positions_ptr,
                 next_k_cache_ptr, next_v_cache_ptr, slots_ptr, num_slots, k_inv_scale,
@@ -1972,7 +1979,7 @@ _POINTER_TYPES = dict(
     mids_s="*i32",
     moe_tags="*i32",
     route_norm_ptr="*bf16",
-    s_rows="*bf16",
+    routed_sums="*bf16",
     hprime="*fp32",
     post_expert_ptr="*bf16",
     alpha2_ptr="*fp32",

@@ -258,7 +258,7 @@ def phase_errors(state, weights, expected, rows):
     """Relative RMS error of the launch's intermediates that stay in its
     state against the reference's, to locate the first phase that differs:
     the residual after attention (``hprime``), the router logits (the sum of
-    the K parts), the pooled rows and the summed experts (``s_rows``)."""
+    the K parts), the pooled rows and the summed experts (``routed_sums``)."""
     phases = expected["phases"]
     errors = {}
     hprime = state.hprime[:rows]
@@ -269,7 +269,9 @@ def phase_errors(state, weights, expected, rows):
     errors["logits"] = _relative_rms(
         parts * weights["router_multiplier"], phases["logits"]
     )
-    errors["combined"] = _relative_rms(state.s_rows[:rows].float(), phases["combined"])
+    errors["combined"] = _relative_rms(
+        state.routed_sums[:rows].float(), phases["combined"]
+    )
     return errors
 
 

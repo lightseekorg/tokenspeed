@@ -23,7 +23,7 @@ state, a layer's weights read in place, compile-time checks, and launches.
 
 :class:`MuseSparkMonokernelLayer` is the ``("monokernel", "prepare")`` leaf
 for the ``muse_spark`` recipe (registered in ``monokernel/gluon.py``). The
-values it names (h', the routed sum ``s_rows``, the MXFP4 pooled rows ``xq``)
+values it names (h', the routed sum ``routed_sums``, the MXFP4 pooled rows ``xq``)
 are defined in ``layer.py``.
 """
 
@@ -223,7 +223,7 @@ class MuseSparkMonokernelState:
         # loads on any other, so uncached (scalar polls of cached device
         # memory are only good for words written on the same XCD).
         self.moe_tags = UncachedBuffer(TAG_WORDS, torch.int32, device)
-        self.s_rows = torch.zeros(
+        self.routed_sums = torch.zeros(
             (MAX_ROWS, POOLED), dtype=torch.bfloat16, device=device
         )
         self.hprime = torch.zeros(
@@ -627,7 +627,7 @@ class MuseSparkMonokernelLayer:
             moe.w2, moe.s2, state.mids, state.mids_scale, state.moe_tags,
             moe.stride_w13, moe.stride_s13, moe.stride_s13lin, moe.stride_s13nb,
             moe.stride_w2, moe.stride_s2, moe.stride_s2lin, moe.stride_s2nb,
-            t.route_norm, state.s_rows, state.hprime, t.post_expert, t.alpha2,
+            t.route_norm, state.routed_sums, state.hprime, t.post_expert, t.alpha2,
             t.beta2, t.post2_bf16, t.next_pre_bf16,
             *next_args,
             state.stamps,

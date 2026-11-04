@@ -942,7 +942,7 @@ def qkv_task_steps_kernel(
 
 
 @gluon.jit
-def _head_rows(
+def _prologue_rows(
     part_ptr, tag, column0, launch, M, N: gl.constexpr, HEAD_DIM: gl.constexpr
 ):
     """One head's 16 x HEAD_DIM rows from the QKV tasks' 16 K-part partials,
@@ -1004,7 +1004,7 @@ def head_task_kernel(
     )
     slot = gl.load(slots_ptr + tokens, mask=row_mask, other=0).to(gl.int64)
     if head < NUM_Q_HEADS:
-        rows = _head_rows(part_ptr, tag, head * HEAD_DIM, launch, M, N, HEAD_DIM)
+        rows = _prologue_rows(part_ptr, tag, head * HEAD_DIM, launch, M, N, HEAD_DIM)
         gqa_prologue_query_gfx950(
             rows,
             q_out_ptr + tokens * (NUM_Q_HEADS * HEAD_DIM) + head * HEAD_DIM,
@@ -1018,7 +1018,7 @@ def head_task_kernel(
         )
     else:
         kv = head - NUM_Q_HEADS
-        k_rows = _head_rows(
+        k_rows = _prologue_rows(
             part_ptr, tag, (NUM_Q_HEADS + kv) * HEAD_DIM, launch, M, N, HEAD_DIM
         )
         gqa_prologue_key_gfx950(
@@ -1034,7 +1034,7 @@ def head_task_kernel(
             0.0,
             False,
         )
-        v_rows = _head_rows(
+        v_rows = _prologue_rows(
             part_ptr,
             tag,
             (NUM_Q_HEADS + NUM_KV_HEADS + kv) * HEAD_DIM,

@@ -69,7 +69,7 @@ from tokenspeed_kernel.ops.monokernel._gluon.plan import (
 
 ROWS_PER_REQUEST = 8
 REGION_ROWS = 32
-HEAD_TASKS = 34
+PROLOGUE_TASKS = 34
 QKV_GROUPS = 16
 QKV_PARTS = 16
 UNPS = 64
@@ -86,7 +86,7 @@ _LANDED = "landed"
 # (``att_box``): re-armed by the o_proj senders at entry. Tagged words
 # (``S``: the routed sums): never cleared.
 _CLEARED = ("att_box", "AR", "POOLED_AG", "ROUTE_PUSH_own", "routes", "POST_AG")
-_TAGGED = ("att_rec", "AR_sums", "rtr", "pool", "exchange", "S", "hprime",
+_TAGGED = ("att_rec", "ar_sums", "router", "pooler", "exchange", "routed_sum", "hprime",
            "reducer_in", "POST_AG_sums", "qkv")  # fmt: skip
 REGIONS = tuple(Region(name, 2, REGION_ROWS) for name in _CLEARED) + tuple(
     Region(name, 1, REGION_ROWS) for name in _TAGGED
@@ -125,7 +125,8 @@ def expected_counts(key: PlanKey) -> dict[str, tuple[int, ...]]:
     else:
         counts["QKV"] = _per_xcd(SLOTS)
         counts["PROLOGUE"] = tuple(
-            sum(1 for i in range(8) if i * 8 + xcd < HEAD_TASKS) for xcd in range(XCDS)
+            sum(1 for i in range(8) if i * 8 + xcd < PROLOGUE_TASKS)
+            for xcd in range(XCDS)
         )
     return counts
 
@@ -174,7 +175,7 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
         steps.append(Wait("ROUTER", _ALL, ag, "vector", _IWC))
         if slot == 1:
             steps.append(Publish("ROUTER", _ALL, (f"hprime[{xcd}]",)))
-        steps.append(Publish("ROUTER", _ALL, (f"rtr[{xcd}][{slot}]",)))
+        steps.append(Publish("ROUTER", _ALL, (f"router[{xcd}][{slot}]",)))
         return steps
     if slot < 24:
         tile = slot - 16
@@ -184,10 +185,10 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
             steps.append(Load("POOLER", _ALL))
         steps += [
             Wait("POOLER", _ALL, ag, "vector", _IWC),
-            Publish("POOLER", _ALL, (f"pool[{xcd}][{tile}]",)),
+            Publish("POOLER", _ALL, (f"pooler[{xcd}][{tile}]",)),
         ]
         if xcd == tile:
-            parts = tuple(f"pool[{x}][{tile}]" for x in range(XCDS))
+            parts = tuple(f"pooler[{x}][{tile}]" for x in range(XCDS))
             steps += [
                 Wait("POOLER", _ALL, parts, "vector", ""),
                 Publish("POOLER", _ALL, (f"POOLED_AG[{tile}]",)),
@@ -216,7 +217,7 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
             ]
     if slot == 24 and xcd >= XCDS - requests:
         group = 7 - xcd
-        logits = tuple(f"rtr[{x}][{s}]" for x in range(XCDS) for s in range(16))
+        logits = tuple(f"router[{x}][{s}]" for x in range(XCDS) for s in range(16))
         steps += [
             Wait("TOPK", _ALL, logits, "vector", ""),
             Publish("TOPK", _ALL, (f"ids[{group}]",)),
@@ -275,18 +276,24 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
             route_ag = tuple(f"ROUTE_AG[{token}][{k}]" for k in range(XCDS))
             steps.append(Wait("FINISHER", _ALL, route_ag, "vector", _LANDED))
         steps.append(
-            Publish("FINISHER", _ALL, tuple(f"S[{xcd}][{token}]" for token in tokens))
+            Publish(
+                "FINISHER",
+                _ALL,
+                tuple(f"routed_sum[{xcd}][{token}]" for token in tokens),
+            )
         )
     elif post_sender:
         sender = xcd * 8 + slot - 16
-        s_lines = tuple(f"S[{p}][{t}]" for p in range(XCDS) for t in range(rows))
+        routed_sum_lines = tuple(
+            f"routed_sum[{p}][{t}]" for p in range(XCDS) for t in range(rows)
+        )
         steps.append(Load("POST_SENDER", _ALL))  # the relay's post-expert weights
         if not regular:
             # The QKV task's first window of tiles, paced; the rest follow
             # the relay's (and REDUCER's) work.
             steps.append(Load("QKV", _ALL))
         steps += [
-            Wait("POST_SENDER", _ALL, s_lines, "smem", ""),
+            Wait("POST_SENDER", _ALL, routed_sum_lines, "smem", ""),
             Publish("POST_SENDER", _ALL, (f"POST_AG[{sender}]",)),
             Wait("POST_SENDER", _ALL, ("hprime[0]",), "smem", ""),
             Publish("POST_SENDER", _ALL, (f"reducer_in[{xcd}][{slot - 16}]",)),
@@ -320,7 +327,7 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
     ]
     if tail:
         head = TAIL_SLOTS.index(slot) * 8 + xcd
-        if head < HEAD_TASKS:
+        if head < PROLOGUE_TASKS:
             # Every task's partials (the head's columns span groups).
             parts = tuple(f"qkv[{t}]" for t in range(QKV_PARTS * QKV_GROUPS))
             steps += [

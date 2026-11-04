@@ -137,7 +137,7 @@ def test_per_row_regions_hold_every_served_row():
         (composer.EX_IDS_TAGS, composer.MAX_ROWS),
         (composer.EX_XQ_TAGS, composer.MAX_ROWS),
         (composer.EX_HP_TAGS, composer.KPARTS * 16),
-        (composer.EX_S_TAGS, composer.KPARTS * composer.MAX_ROWS),
+        (composer.EX_ROUTED_SUM_TAGS, composer.KPARTS * composer.MAX_ROWS),
     ]
     for (start, size), (following, _) in zip(regions, regions[1:]):
         assert start + size <= following

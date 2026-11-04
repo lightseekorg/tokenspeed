@@ -69,7 +69,7 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (  # noqa: E402
     EX_IDS_TAGS,
-    EX_S_TAGS,
+    EX_ROUTED_SUM_TAGS,
     EX_XQ_TAGS,
     KPARTS,
     MAX_ROWS,
@@ -196,8 +196,10 @@ def _alternation(rank, record_dir):
     _write_exchange(state, EX_IDS_TAGS + WIDTH, [stale] * WIDTH)
     _write_exchange(state, EX_XQ_TAGS + WIDTH, [stale] * WIDTH)
     for part in range(KPARTS):
-        _write_exchange(state, EX_S_TAGS + part * MAX_ROWS + WIDTH, [stale] * WIDTH)
-    state.s_rows[rows.start : rows.stop] = float("nan")
+        _write_exchange(
+            state, EX_ROUTED_SUM_TAGS + part * MAX_ROWS + WIDTH, [stale] * WIDTH
+        )
+    state.routed_sums[rows.start : rows.stop] = float("nan")
     state.hprime[rows.start : rows.stop] = float("nan")
     # A 16-row residual whose first 8 rows are the step's.
     residual = torch.randn((2 * WIDTH, HIDDEN), device=f"cuda:{rank}")
