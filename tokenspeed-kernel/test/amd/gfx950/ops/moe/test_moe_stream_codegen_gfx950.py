@@ -197,6 +197,15 @@ def test_item_loops_keep_the_ring(variant):
         ]
         assert all(s.endswith(" nt") for s in wide), wide
         assert len(wide) == mfma, len(wide)
+        if mfma == 16:
+            # Intermediates may come from another XCD, whose L2 does not snoop
+            # this one's: their reads bypass every L2 (SC0 SC1).
+            mids = [
+                s
+                for s in body
+                if s.startswith("buffer_load_dwordx4") and s.endswith(" sc1")
+            ]
+            assert mids and all(s.endswith(" sc0 sc1") for s in mids), mids
         dwords = [s for s in body if s.startswith("buffer_load_dword ")]
         if mfma == 32:
             # Each wave's group tag follows a wait covering its mids stores.
