@@ -334,8 +334,8 @@ An EPD encode rank's loop is its own, with the same split. Each round the
 attention-TP group's first rank relays the frontend's requests to the
 others, in one exchange that also agrees on the send-ring slots free on
 every rank, so every rank forms the same vision-tower batches (the tower is
-TP-sharded); a room's send concludes on each rank at its own time and only
-frees its slot. The data plane admits requests on the forward thread: the
+TP-sharded); a slot returns on each rank at its own time, when the sender
+drops the chunk leasing it, and only frees it. The data plane admits requests on the forward thread: the
 ranks open every pixel-SHM segment of the round behind a CPU-group barrier
 before any consumes one, since consuming unlinks it on cache hits and misses
 alike. It embeds each batch and copies every item's rows into its send slot;

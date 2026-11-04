@@ -40,7 +40,7 @@ use super::{
 use crate::{
     bootstrap::{BootstrapServer, Registry},
     control::{EmbeddingChunk, EmbeddingItem, EmbeddingReceiver, EmbeddingSender, LandedRequest},
-    PeerConfig, Transport,
+    PeerConfig, SendRing, Transport,
 };
 
 const HIDDEN: i64 = 8;
@@ -68,6 +68,8 @@ struct Node {
     sender: Sender,
     /// The send slot the rows are read from.
     ring: Vec<u8>,
+    /// Its lease: back once the sender dropped the chunk.
+    slots: SendRing,
 }
 
 fn encode_node(library: PathBuf, bootstrap_timeout: Duration) -> Node {
@@ -85,6 +87,7 @@ fn encode_node(library: PathBuf, bootstrap_timeout: Duration) -> Node {
         server,
         sender,
         ring,
+        slots: SendRing::new(1),
     }
 }
 
@@ -126,10 +129,11 @@ fn item(port: u16, room: u64, rows: i64) -> EmbeddingItem {
     }
 }
 
-fn chunk(ring: &[u8], room: u64, rows: i64) -> EmbeddingChunk {
+fn chunk(node: &Node, room: u64, rows: i64) -> EmbeddingChunk {
     EmbeddingChunk {
+        slot: node.slots.lease().expect("the send slot is free"),
         room,
-        source: ring.as_ptr() as u64,
+        source: node.ring.as_ptr() as u64,
         rows,
         hidden: HIDDEN,
         dtype: "torch.float32".to_owned(),
@@ -165,10 +169,11 @@ fn settle(receiver: &mut Receiver) -> (i64, Vec<LandedRequest>) {
     settle_all(std::slice::from_mut(receiver)).pop().unwrap()
 }
 
-fn concluded(sender: &mut Sender, room: u64) {
+/// Wait until the sender dropped the chunk it was handed, returning its slot.
+fn slot_returned(node: &Node) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !sender.concluded().contains(&room) {
-        assert!(Instant::now() < deadline, "room {room} never concluded");
+    while node.slots.free() < node.slots.slots() {
+        assert!(Instant::now() < deadline, "the send slot never came back");
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -188,7 +193,8 @@ fn an_item_reaches_its_prefill_rank() {
     assert!(node.sender.begin(42));
     // Another request cannot take the room.
     assert!(!node.sender.begin(42));
-    node.sender.send(chunk(&node.ring, 42, rows));
+    let embedding = chunk(&node, 42, rows);
+    node.sender.send(embedding);
 
     let (code, landed) = settle(&mut prefill);
     assert_eq!(code, 2);
@@ -200,7 +206,7 @@ fn an_item_reaches_its_prefill_rank() {
     let bytes = (rows * HIDDEN * ELEMENT) as usize;
     assert_eq!(pool[..bytes], node.ring[..bytes]);
     assert!(pool[bytes..].iter().all(|&byte| byte == 0));
-    concluded(&mut node.sender, 42);
+    slot_returned(&node);
     // The data plane copied the rows out: the slot takes the next item.
     assert!(prefill.awaiting_release());
     prefill.release(&[0]);
@@ -221,7 +227,8 @@ fn sharded_prefill_ranks_each_receive_their_rows() {
         .collect();
     let rows = 7;
     assert!(node.sender.begin(9));
-    node.sender.send(chunk(&node.ring, 9, rows));
+    let embedding = chunk(&node, 9, rows);
+    node.sender.send(embedding);
     for rank in &mut ranks {
         rank.stage("r1", &[item(node.server.port(), 9, rows)]);
     }
@@ -238,7 +245,7 @@ fn sharded_prefill_ranks_each_receive_their_rows() {
         let (start, count) = (start as usize * row_bytes, count as usize * row_bytes);
         assert_eq!(pools[rank][..count], node.ring[start..start + count]);
     }
-    concluded(&mut node.sender, 9);
+    slot_returned(&node);
 }
 
 #[test]
@@ -256,7 +263,6 @@ fn a_failed_room_fails_its_prefill_ranks() {
     thread::sleep(Duration::from_millis(200));
     node.sender.fail(5, "the vision tower failed");
     assert_eq!(settle(&mut prefill).0, 0);
-    concluded(&mut node.sender, 5);
     // A prefill rank that asks only now learns it at once.
     let mut late = receiver(library, &pool, 1, 0, false);
     late.stage("r1", &[item(node.server.port(), 5, 3)]);
@@ -275,7 +281,9 @@ fn an_item_whose_fanout_never_completes_fails() {
     let mut prefill = receiver(library, &pool, 2, 0, true);
     assert!(node.sender.begin(11));
     prefill.stage("r1", &[item(node.server.port(), 11, 4)]);
-    node.sender.send(chunk(&node.ring, 11, 4));
+    let embedding = chunk(&node, 11, 4);
+    node.sender.send(embedding);
     assert_eq!(settle(&mut prefill).0, 0);
-    concluded(&mut node.sender, 11);
+    // The parked chunk dropped with its expired room.
+    slot_returned(&node);
 }
