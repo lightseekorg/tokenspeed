@@ -3,8 +3,9 @@
 A decode monokernel runs a decoder layer as one persistent launch: one
 workgroup stays resident on every CU, and workgroups hand work to each other
 through memory instead of kernel boundaries. This directory holds gfx950
-pieces such kernels share. They carry no model knowledge. The design
-invariants are in `docs/design/monokernel.md`.
+pieces such kernels share. The persistent helpers and the deferred norm carry
+no model knowledge; the MoE stream serves one MoE shape (see its Contract).
+The design invariants are in `docs/design/monokernel.md`.
 
 ### gfx950 persistent launch helpers
 
@@ -97,6 +98,9 @@ launch for tests.
 
 #### Contract
 
+- Shape: hidden 4096 (2048 packed bytes of K per row) and 512 intermediate
+  columns per expert slice. The workgroups that also run post-MoE work are
+  slots 0 and 16-30 of every XCD; they take a smaller, gate/up-only share.
 - Inputs: the routed ids `(rows, top_k)`, the MXFP4 activations and their
   swizzled scales, and `moe_stream_weights(experts, scale_lanes=...)`: the
   processed MoE layer's gdot128 weights and swizzled scales, read in place

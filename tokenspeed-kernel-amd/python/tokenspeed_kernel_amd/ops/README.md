@@ -46,10 +46,10 @@ they publish a generation and all consumer subgroups before they read the
 peer inbox. Removing either rendezvous can increase cross-rank
 skew and regress performance even when the generated kernel remains correct.
 
-## Persistent kernels (gfx950)
+## Monokernel building blocks (gfx950)
 
-The persistent launch helpers (`gfx950/monokernel/persistent/`) are
-documented in `gfx950/monokernel/README.md`.
+The persistent launch helpers, the MXFP4 MoE stream and the deferred residual
+norm are documented in `gfx950/monokernel/README.md`.
 
 ## Attention prologue
 
@@ -311,10 +311,6 @@ behind one barrier. In `gemv_a16w16_splitk_exchange_gfx950` they are stored
 rows fastest, so each thread reads its contiguous rows of every wave with
 wide LDS reads (a 64-row sender: 4 `ds_read2st64_b64`, not 32 4-byte reads)
 and adds the waves in wave order in registers.
-
-### gfx950 deferred residual norms
-
-See `gfx950/monokernel/README.md`.
 
 ### gfx950 sigmoid-bias routing top-k
 
@@ -1507,7 +1503,7 @@ and stores its partial. Two merges follow it:
 - `publish_split_record` / `merge_split_records`: each wave waits for its own
   partial stores (`release_drain`), then stores an int32 tag record; a
   designated merger waits for all `NUM_KV_SPLITS * NUM_WARPS` records through
-  a caller-supplied poll (the scalar `poll_tags16` in a persistent layer) and
+  a caller-supplied poll (for example the scalar `poll_tags16`) and
   merges with `.cg` partial loads, all splits' loads issued before the fold.
   Same split boundaries and fold order, so the rows are bitwise the
   last arriver's.
@@ -2201,10 +2197,6 @@ rounds is one wave max reduction followed by clearing the winning key. The
 selected logits come back exactly from the key bits, so no second gather is
 needed. The ids and weights collect in registers and leave with one buffer
 store each.
-
-### gfx950 MXFP4 MoE stream
-
-See `gfx950/monokernel/README.md`.
 
 ### MXFP4 sorted experts
 

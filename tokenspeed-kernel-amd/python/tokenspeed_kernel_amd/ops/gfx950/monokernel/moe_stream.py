@@ -116,8 +116,6 @@ __all__ = [
     "MoeBuffers",
     "MoeStreamState",
     "MoeStreamWeights",
-    "gluon_mxfp4_moe_stream_gfx950",
-    "launch_gluon_mxfp4_moe_stream_gfx950",
     "moe_stream_plan",
     "moe_stream_weights",
     "prefetch_moe",
@@ -243,7 +241,7 @@ def _full_units(groups, units, t, b):
     return first, end
 
 
-def moe_stream_plan(topk_ids, tail_num=1, tail_den=2):
+def moe_stream_plan(topk_ids, *, tail_num, tail_den):
     """The closed-form plan on the host.
 
     Args:
@@ -1574,8 +1572,9 @@ def gluon_mxfp4_moe_stream_gfx950(
     SINK: gl.constexpr,
 ):
     """The MoE stream as its own persistent launch of 256 workgroups x 8
-    waves; ``SINK((out,), ys, route, cols, col0)`` takes the down units' output
-    (``store_routes_sink``: ``out[route, :]`` in bf16)."""
+    waves, for tests (not registered). ``SINK((out,), ys, route, cols,
+    col0)`` takes the down units' output (``store_routes_sink``:
+    ``out[route, :]`` in bf16)."""
     # Entry counters first, then the plan and the first weights (they depend
     # only on the ids), then the entry check.
     entry = enter_issue(epochs, claims)
@@ -1733,18 +1732,18 @@ def moe_stream_weights(experts, *, scale_lanes: bool) -> MoeStreamWeights:
     experts_n = w13.shape[0]
     if w13.dtype != torch.uint8 or w13.shape[1:] != (HIDDEN // 2, GATE_UP):
         raise ValueError(
-            f"native MoE stream: gate/up weights must be (E, {HIDDEN // 2}, "
+            f"moe_stream_weights: gate/up weights must be (E, {HIDDEN // 2}, "
             f"{GATE_UP}) uint8 gdot128, got {tuple(w13.shape)} {w13.dtype}"
         )
     if w2.dtype != torch.uint8 or w2.shape != (experts_n, INTER // 2, HIDDEN):
         raise ValueError(
-            f"native MoE stream: down weights must be (E, {INTER // 2}, "
+            f"moe_stream_weights: down weights must be (E, {INTER // 2}, "
             f"{HIDDEN}) uint8 gdot128, got {tuple(w2.shape)} {w2.dtype}"
         )
     for name, scale in (("gate/up", s13), ("down", s2)):
         if scale.dtype != torch.uint8 or scale.stride(1) != 1:
             raise ValueError(
-                f"native MoE stream: {name} scales must be CDNA4-swizzled uint8 "
+                f"moe_stream_weights: {name} scales must be CDNA4-swizzled uint8 "
                 f"(stride(1) == 1), got {scale.dtype} strides {scale.stride()}"
             )
     strides = dict(
@@ -1760,7 +1759,7 @@ def moe_stream_weights(experts, *, scale_lanes: bool) -> MoeStreamWeights:
     uneven = {k: v for k, v in strides.items() if not k.endswith("lin") and v % 16}
     if uneven:
         raise ValueError(
-            f"native MoE stream: strides must be multiples of 16, got {uneven}"
+            f"moe_stream_weights: strides must be multiples of 16, got {uneven}"
         )
     lanes = None
     if scale_lanes:
@@ -1799,7 +1798,7 @@ def launch_gluon_mxfp4_moe_stream_gfx950(
     swiglu_beta: float,
     deadline_ticks: int,
 ):
-    """Run the MoE stream as its own launch.
+    """Run the MoE stream as its own launch, for tests (not registered).
 
     Args:
         xq, xs: MXFP4 activation rows ``(rows, 2048)`` and their CDNA4-swizzled
@@ -1818,12 +1817,13 @@ def launch_gluon_mxfp4_moe_stream_gfx950(
     rows, top_k = topk_ids.shape
     if xq.shape[1] != HIDDEN // 2:
         raise ValueError(
-            f"native MoE stream: activations must be (rows, {HIDDEN // 2}), "
-            f"got {tuple(xq.shape)}"
+            "launch_gluon_mxfp4_moe_stream_gfx950: activations must be "
+            f"(rows, {HIDDEN // 2}), got {tuple(xq.shape)}"
         )
     if rows > 16 or out.shape != (rows * top_k, HIDDEN):
         raise ValueError(
-            "native MoE stream: at most 16 rows, out is (rows * top_k, hidden)"
+            "launch_gluon_mxfp4_moe_stream_gfx950: at most 16 rows, "
+            "out is (rows * top_k, hidden)"
         )
     w = weights
     gluon_mxfp4_moe_stream_gfx950[(GRID,)](
