@@ -229,7 +229,8 @@ pub struct PythonDataPlane {
     shared: Arc<Shared>,
     next_forward: ForwardId,
     thread: Option<thread::JoinHandle<()>>,
-    /// The Python plane answers `landed`; an older package does not.
+    /// The loop polls `landed` (`--pd-prefill-poll-transfers`) and the Python
+    /// plane answers it; an older package does not.
     polls_landed: bool,
 }
 
@@ -238,20 +239,27 @@ impl PythonDataPlane {
     /// dispatch guard on the calling thread, the control thread, which must
     /// also drop the data plane. With PD, the forward thread stages each
     /// plan's remote stream with the transfer peer (`streams`).
-    pub fn start(plane: Py<PyAny>, streams: Option<Streams>) -> Result<Self, String> {
+    pub fn start(
+        plane: Py<PyAny>,
+        streams: Option<Streams>,
+        poll_transfers: bool,
+    ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
                 .call_method0(py, "control_thread_guard")
                 .and_then(|guard| guard.call_method0(py, "__enter__").map(|_| guard))
                 .map_err(|error| describe(py, &error))
         })?;
-        let polls_landed = Python::attach(|py| {
-            plane
-                .bind(py)
-                .getattr("landed")
-                .is_ok_and(|landed| landed.is_callable())
-        });
-        if !polls_landed {
+        // Probed only when the loop will ask: off, the control thread touches
+        // nothing it did not before.
+        let polls_landed = poll_transfers
+            && Python::attach(|py| {
+                plane
+                    .bind(py)
+                    .getattr("landed")
+                    .is_ok_and(|landed| landed.is_callable())
+            });
+        if poll_transfers && !polls_landed {
             tracing::warn!(
                 "the data plane has no `landed`: PD transfers are polled between forwards only"
             );
@@ -1096,7 +1104,7 @@ result = (Plane(), ts.Scheduler(cfg))
     }
 
     fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
+        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None, true).unwrap()
     }
 
     /// A one-row batch: the stand-in launches whatever it is handed.

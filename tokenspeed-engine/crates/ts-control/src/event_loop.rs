@@ -841,7 +841,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 tracing::debug!(rids = ?batch.request_ids, "remote decode planned");
             }
         }
-        if self.outputs.role() == Role::Prefill {
+        if self.config.pd_prefill_poll_transfers && self.outputs.role() == Role::Prefill {
             if let Some(batch) = plan.remote_decode() {
                 self.handed_over.extend(batch.request_ids);
             }
@@ -2137,7 +2137,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         }
         // This bounds the set where the forward-time poll never runs.
-        self.prune_handed_over();
+        if self.config.pd_prefill_poll_transfers {
+            self.prune_handed_over();
+        }
         Ok(())
     }
 

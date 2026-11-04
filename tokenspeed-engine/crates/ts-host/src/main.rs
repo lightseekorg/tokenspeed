@@ -470,7 +470,11 @@ impl HostConfig {
                 }
             },
             eager_grammar: config.getattr("eager_grammar")?.extract()?,
-            pd_prefill_poll_transfers: config.getattr("pd_prefill_poll_transfers")?.extract()?,
+            // Absent from an older runtime's config: off.
+            pd_prefill_poll_transfers: match config.getattr("pd_prefill_poll_transfers") {
+                Ok(value) => value.extract()?,
+                Err(_) => false,
+            },
             metrics: Metrics::from_python(config)?,
             batch_log: BatchLogConfig {
                 enabled: config.getattr("batch_log")?.extract()?,
@@ -674,8 +678,8 @@ fn serve(args: &Args) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    let data_plane =
-        PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
+    let data_plane = PythonDataPlane::start(data_plane, peers.streams, config.pd_prefill_poll_transfers)
+        .map_err(HostError::DataPlane)?;
     let trace = config
         .trace
         .as_ref()
