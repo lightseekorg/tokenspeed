@@ -63,10 +63,15 @@ struct PrefixHitStats {
 };
 
 // Host L2 counters, and the Device evictions they are read against:
-// cumulative since start and never reset. Accounting only, for tests and
-// inspection: no scheduling decision reads them and the runtime exports none.
+// cumulative since start and never reset. Accounting only: no scheduling
+// decision reads them. The runtime exports the prefix hits and L3 query
+// tokens (`PrefixHitView`); the rest stay for tests and inspection.
 struct HostCacheStats {
     PrefixHitStats prefix_hits;
+    // Tokens of keys storage queries found, cumulative. They are also part of
+    // `prefix_hits.host_hit_tokens` once loaded; subtract them to separate
+    // the Host's own cache from L3.
+    std::uint64_t storage_query_hit_tokens{0};
     TierTransferManager::WriteBackStats publication_stores;
     TierTransferManager::WriteBackStats finish_stores;
     TierTransferManager::WriteBackStats retraction_stores;

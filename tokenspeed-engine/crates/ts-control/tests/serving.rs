@@ -1275,6 +1275,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             },
         },
         kv_total_pages: 512,
+        kv_page_tokens: 16,
         ngram_context_len: setup.ngram_context_len,
         request_token_history: setup.request_token_history,
         controls: ControlConfig {

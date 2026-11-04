@@ -525,6 +525,13 @@ The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
+Only ranks with an engine metrics exporter retain per-request timing samples.
+Decode request logs and exported latency metrics use the arrival of the
+bootstrap token as the first-token timestamp.
+Decode throughput counts tokens appended to the request, including the stop
+token when present. A speculative suffix discarded at the stop boundary still
+advances the scheduler frontier but contributes no output tokens.
+
 Metric output plugins run in the node's metrics relay process
 (`metrics/relay.py`); the rank's `ts-metrics` hands them every update as an
 event and writes Prometheus' multiprocess files itself, so the loop never

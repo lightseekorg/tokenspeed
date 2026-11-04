@@ -85,6 +85,47 @@ pub enum Copy {
     },
 }
 
+impl Copy {
+    /// Bytes this descriptor moves.
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Copy::Pages(grid) => {
+                let per_page: u64 = grid
+                    .fields
+                    .iter()
+                    .map(|field| u64::try_from(field[4]).unwrap_or(0))
+                    .sum();
+                grid.src_pages.len() as u64 * per_page
+            }
+            Copy::Spans { lengths, .. } => lengths
+                .iter()
+                .map(|&length| u64::try_from(length).unwrap_or(0))
+                .sum(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_bytes_counts_pages_and_spans() {
+        let grid = Copy::Pages(PageGrid {
+            src_pages: vec![1, 2],
+            dst_pages: vec![3, 4],
+            fields: vec![[0, 0, 0, 0, 128], [0, 0, 0, 0, 64]],
+        });
+        assert_eq!(grid.bytes(), 2 * (128 + 64));
+        let spans = Copy::Spans {
+            sources: vec![0, 0],
+            destinations: vec![0, 0],
+            lengths: vec![10, 20],
+        };
+        assert_eq!(spans.bytes(), 30);
+    }
+}
+
 /// The most descriptors one WRITE batch carries.
 const DESCRIPTOR_BATCH: usize = 4096;
 
