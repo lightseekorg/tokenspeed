@@ -2132,13 +2132,18 @@ head TP: only the absorbed sparse prefill can take the exchange. The
 alternative to this fork — sharding the drafter's decode rows by a plan too,
 so every forward exchanges — needs a sharded DSA decode arm (history gathers
 for decode rows) that does not exist; the fork is the contained form until
-it does. The decode-only gates of the attention-DP
-layout (`disaggregation_mode == "decode"`, the decode-shaped autotune; a
-retracted request restores rather than recomputes, so no admission rule is
-needed) key on
-`mapping.attn.head_tp_serves_decode_only`, which is False over the query
-shards; the prefill role's own rules (`validate_qcp`) and the mapping (`head
-TP == qcp`) gate this layout.
+it does. `mapping.attn.head_tp_serves_decode_only`, which is False over the
+query shards, requires the Decode role for head TP without QCP. The prefill
+role's own rules (`validate_qcp`) and the mapping (`head TP == qcp`) gate
+the sharded Prefill layout.
+
+Startup chooses its forward from the engine role. Every disaggregated Decode
+worker warms the existing Decode path at its maximum Decode batch, including
+ordinary TP and TP1 attention DP. It reserves no Prefill graph buckets and never
+captures an extend-shaped graph, even if a Prefill graph limit was supplied.
+Remote admission and snapshot restore do not execute local Prefill. Prefill
+workers and aggregated engines retain their extend warmup; disabling autotune
+disables tactic profiling, not the role's warmup traversal.
 
 Eager only: the history gather runs in the attention break, so the GPU DSA
 backend declares `CudaGraphSupport(prefill_graph=False)` under a query shard
