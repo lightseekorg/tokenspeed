@@ -1101,6 +1101,24 @@ def test_workspace_reserves_full_paged_decode_scores(chunk, overlap_depth):
     assert recipe.workspace_bytes() >= 2 * score_bytes
 
 
+def test_workspace_reserves_windowless_paged_prefill_scores():
+    recipe = _recipe("cpu")
+    context = 1 << 20
+    config = replace(recipe.attn_config, context_len=context, max_bs=1)
+    spec = config.component(DeepseekV41Config)
+
+    def workspace(queries):
+        recipe.attn_config = replace(
+            config, components=(replace(spec, max_query_tokens=queries),)
+        )
+        return recipe.workspace_bytes()
+
+    # Both tiles exceed the dense score cap. Compare their budgets so the
+    # context-sized KV workspace cannot hide a missing paged prefill reserve.
+    extra_score_bytes = (256 - 128) * context * 2
+    assert workspace(256) - workspace(128) >= 2 * extra_score_bytes
+
+
 def test_pool_reports_the_whole_arena_as_kv_bytes():
     # The startup memory summary reads this; without it the arena is
     # misattributed to activations and the KV row prints 0.
