@@ -714,7 +714,9 @@ def _missing(words, tag, live, PARTS: gl.constexpr):
     """Per lane: whether any of its words under ``live`` lacks ``tag`` (axis 1 is in-thread)."""
     missing = gl.zeros(live.shape, gl.int32, live.type.layout)
     for p in gl.static_range(PARTS):
-        missing |= (((words[p] >> 32) & 0xFFFFFFFF) != tag).to(gl.int32)
+        # Compare as int32 like the tag: a tag with its top bit set must not
+        # be sign-extended against a zero-extended high half.
+        missing |= ((words[p] >> 32).to(gl.int32) != tag).to(gl.int32)
     return gl.max(missing & live, 1)
 
 

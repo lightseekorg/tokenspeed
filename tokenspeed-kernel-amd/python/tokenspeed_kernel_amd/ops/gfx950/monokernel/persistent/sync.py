@@ -272,7 +272,7 @@ def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry):
     # scratch in LDS; the barrier keeps every wave's read of it before any
     # wave's next LDS write (the role's buffers may start there).
     gl.barrier()
-    if ((old >> 32) & 0xFFFFFFFF) == tag.to(gl.int64):
+    if (old >> 32).to(gl.int32) == tag:
         # The other workgroup's program id.
         on_expiry(launch, _SITE_CLAIM, (old & 0xFFFFFFFF).to(gl.int32))
     return launch
