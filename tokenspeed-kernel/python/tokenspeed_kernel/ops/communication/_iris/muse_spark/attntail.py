@@ -513,6 +513,13 @@ def iris_fused_lamport_allreduce_muse_attntail(
 # An empty BF16 pair in the attention box: negative zero in both halves.
 _ATT_BOX_EMPTY = gl.constexpr(0x80008000)
 
+# The fused sliding tail's epoch words count launches modulo this period. A
+# multiple of three keeps the stage (epoch % 3) rotating across the wrap; below
+# 2**31 the tag (epoch + 1) never reaches 0, the tag of a never-written norm
+# sum. Counting modulo 2**32 instead would repeat a stage at the wrap
+# (2**32 - 1 and 0 are both 0 mod 3), and a signed count would turn negative.
+_SLIDING_TAIL_EPOCH_PERIOD = gl.constexpr(3 << 29)
+
 
 @gluon.jit
 def _muse_attntail_wait_box(box_ptr, offsets, valid, LAYOUT: gl.constexpr):
@@ -1180,10 +1187,10 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
     The two-shot region is #2568's layout ([stage][reduce-scatter,
     all-gather][source][shard]) with column shards of [rows, WIDTH /
     WORLD_SIZE]. Every workgroup reads its own epoch word at entry and stores
-    it plus one at exit, so all agree on stage = epoch % 3 and tag = epoch +
-    1. rows is at most MAX_ROWS and PARTS divides WORLD_SIZE. RESERVED_LDS
-    keeps every workgroup alone on its compute unit, so no sender shares one
-    with an attention split.
+    it plus one (modulo _SLIDING_TAIL_EPOCH_PERIOD) at exit, so all agree on
+    stage = epoch % 3 and tag = epoch + 1. rows is at most MAX_ROWS and PARTS
+    divides WORLD_SIZE. RESERVED_LDS keeps every workgroup alone on its
+    compute unit, so no sender shares one with an attention split.
     """
     gl.static_assert(WIDTH == 8192 and WORLD_SIZE == 8)
     cfg: gl.constexpr = AttentionConfig(
@@ -1213,8 +1220,10 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
     CLEARERS: gl.constexpr = 8
     K: gl.constexpr = NUM_Q_HEADS * HEAD_DIM
     program = gl.program_id(0)
-    epoch = gl.load(epochs + program)
-    stage = epoch % 3
+    # Unsigned, so a word outside [0, period) still gives a stage in [0, 3).
+    epoch = gl.load(epochs + program).to(gl.uint32)
+    stage = (epoch % 3).to(gl.int32)
+    tag = (epoch + 1).to(gl.int32)
     reserved = gl.allocate_shared_memory(
         gl.int32, [RESERVED_LDS // 4], gl.SwizzledSharedLayout(1, 1, 1, [0])
     )
@@ -1272,7 +1281,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
             region,
             rs_peers,
             sums_peers,
-            epoch + 1,
+            tag,
             stage,
             rows,
             stream_ptr,
@@ -1297,7 +1306,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
             att_box,
             region,
             sums,
-            epoch + 1,
+            tag,
             stage,
             stream_ptr,
             post_weight_ptr,
@@ -1331,4 +1340,4 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
     # A subgroup loading the epoch after this store would use the next stage;
     # each has used its stage before this barrier.
     gl.barrier()
-    gl.store(epochs + program, epoch + 1)
+    gl.store(epochs + program, ((epoch + 1) % _SLIDING_TAIL_EPOCH_PERIOD).to(gl.int32))

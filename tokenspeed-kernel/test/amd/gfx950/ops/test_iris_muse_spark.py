@@ -1459,6 +1459,20 @@ def test_sliding_attention_tail_hand_offs_bypass_every_l2():
     assert not agent_only, agent_only
 
 
+def test_sliding_attention_tail_stage_is_unsigned():
+    """The fused sliding tail takes its stage (epoch % 3) as unsigned.
+
+    A signed remainder of an epoch word past 2**31 - 1 is negative, which
+    moves the two-shot slots below the region. LLVM divides by three with a
+    multiply-high by a magic constant: 0x55555556 (s/v_mul_hi_i32) for a
+    signed remainder, 0xaaaaaaab (s/v_mul_hi_u32) for an unsigned one.
+    """
+    assembly = _sliding_tail_assembly()
+    signed = re.findall(r"_mul_hi_i32\b.*0x55555556", assembly)
+    assert not signed, signed
+    assert re.search(r"_mul_hi_u32\b.*0xaaaaaaab", assembly), "no unsigned % 3"
+
+
 @pytest.mark.parametrize("rows", [8, 16])
 def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
     """The fused sliding tail's page-index loads do not drain the KV copies.
@@ -2323,7 +2337,7 @@ def _muse_moetail_worker(rank, world_size, device):
     assert all(torch.equal(e, reduction.lamport_epochs) for e in epochs)
 
 
-def _muse_sliding_attention_tail_worker(rank, world_size, device):
+def _muse_sliding_attention_tail_worker(rank, world_size, device, first_epoch):
     """The fused sliding attention tail matches today's four kernels.
 
     Today: sliding split attention, the gated per-head norm, the o_proj GEMV
@@ -2332,8 +2346,12 @@ def _muse_sliding_attention_tail_worker(rank, world_size, device):
     expansion), so it agrees within rounding while ranks agree bit for bit.
     Row counts alternate 8 -> 16 -> 8 -> 16 eagerly and under graph replay
     with fresh inputs, one rank lags, and both post-norm forms run; afterwards
-    the next launch's mailboxes are empty.
+    the next launch's mailboxes are empty. The epoch words start at
+    first_epoch; 2**31 - 2 runs the launches across the signed 32-bit limit.
     """
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        _SLIDING_TAIL_EPOCH_PERIOD,
+    )
     from tokenspeed_kernel.ops.gemm import mv
     from tokenspeed_kernel.ops.layernorm.fused_norm import (
         weightless_rmsnorm_gated_sigmoid,
@@ -2346,6 +2364,7 @@ def _muse_sliding_attention_tail_worker(rank, world_size, device):
     if world_size != 8:
         assert state.attntail_region is None
         return
+    state.attntail_epochs.fill_(first_epoch)
     generator = torch.Generator(device=device).manual_seed(4100 + rank)
     shared = torch.Generator(device=device).manual_seed(4200)
     # 4104 cached tokens per request: a 2048-key window over 33 pages of 64.
@@ -2472,8 +2491,10 @@ def _muse_sliding_attention_tail_worker(rank, world_size, device):
     dist.barrier()
     # The next launch's stage is empty everywhere (cleared at an entry two
     # launches back and unused since), and every attention-box word is re-armed.
+    # Eight eager launches and eight replayed ones advanced every epoch word.
+    period = _SLIDING_TAIL_EPOCH_PERIOD.value
     epochs = state.attntail_epochs
-    assert bool((epochs == epochs[0]).all())
+    assert bool((epochs == (first_epoch + 16) % period).all())
     stage = int(epochs[0]) % 3
     assert bool((state.attntail_region[stage].view(torch.int32) == -(2**31)).all())
     assert bool((state.attention_box == -2147450880).all())
@@ -4271,7 +4292,14 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
         ),
         pytest.param(_muse_moetail_worker, "nccl", id="moetail"),
         pytest.param(
-            _muse_sliding_attention_tail_worker, "nccl", id="sliding_attention_tail"
+            partial(_muse_sliding_attention_tail_worker, first_epoch=0),
+            "nccl",
+            id="sliding_attention_tail",
+        ),
+        pytest.param(
+            partial(_muse_sliding_attention_tail_worker, first_epoch=2**31 - 2),
+            "nccl",
+            id="sliding_attention_tail_epoch_wrap",
         ),
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
