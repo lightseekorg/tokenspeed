@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Offline gfx950 compile of the native MoE stream: the ring contract.
+"""Offline gfx950 compile of the monokernel MoE stream: the ring contract.
 
 Compiles the standalone launch for gfx950 without a GPU and checks, in each
 plan variant, that the gate/up and down item loops keep their weight ring:
@@ -60,7 +60,7 @@ VARIANTS = [
 
 @gluon.jit
 def _pair_word_sink(args, ys, route, cols, col0):
-    """A Lamport-style sink like the layer's ROUTE_PUSH push: whole bf16 pairs as
+    """A Lamport-style sink like the layer's route push: whole bf16 pairs as
     32-bit words, one relaxed system-scope store each, all in the lane, to a
     per-wave owner slice picked by the scalar first column."""
     words_ptr = args[0].to(gl.pointer_type(gl.int32), bitcast=True) + (col0 // 512) * 8

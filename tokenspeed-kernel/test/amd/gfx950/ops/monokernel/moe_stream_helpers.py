@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared pieces of the native MoE stream tests."""
+"""Shared pieces of the monokernel MoE stream tests."""
 
 from types import SimpleNamespace
 

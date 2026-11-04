@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerics of the native decoder layer's front bodies on gfx950: the o_proj
+"""Numerics of the monokernel's pre-MoE bodies on gfx950: the o_proj
 sender and the router / pooler K-part consumers, each as a test kernel
 (monokernel_body_helpers.py) against an FP32 reference."""
 
@@ -147,8 +147,8 @@ def test_kpart_router_matches_fp32_reference(rows: int) -> None:
     # hi + lo carries ~16 bits of the weight and of x: each product of
     # |x w| ~ 0.02 is off by up to ~2**-15 relative (the dropped lo x lo
     # term and both residuals), ~6e-7. Over K = 8192 terms of random sign
-    # the sum's sigma is ~1e-5 (GPU: max 3.5e-5 over 2048 logits, ~3.5
-    # sigma), so 6e-5 is ~6 sigma. FP32 accumulation adds ~1e-6.
+    # the sum's sigma is ~1e-5, so 6e-5 is ~6 sigma. FP32 accumulation adds
+    # ~1e-6.
     expected = (inputs["x"].double() @ router.double().T).float()
     torch.testing.assert_close(actual, expected, atol=6e-5, rtol=1e-5)
 
@@ -213,8 +213,8 @@ def test_kpart_steps_are_bitwise_the_full_x_build(role: str, rows: int) -> None:
 @pytest.mark.parametrize("rows", [8, 16])
 def test_topk_keys_match_the_row_topk_bitwise(rows: int) -> None:
     """The one-wave-per-row 64-bit-key top-8 picks the same experts in the
-    same order with the same weights as the per-row top-k the layer uses
-    today, ties (equal logits) included."""
+    same order with the same weights as the regular per-row top-k, ties
+    (equal logits) included."""
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
         gluon_sigmoid_bias_topk_gfx950,
     )

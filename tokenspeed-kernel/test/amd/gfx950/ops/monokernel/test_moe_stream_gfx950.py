@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The native MoE stream is bitwise equal to today's direct decode.
+"""The monokernel MoE stream is bitwise equal to the regular direct decode.
 
 Single GPU, the recorded verify routings at 8 and 16 rows, random weights and
 random (not constant) E8M0 scales, every plan variant, repeated launches and
@@ -77,7 +77,8 @@ def experts():
 
 
 def _direct_decode(xq, xs, w13, w13_scale, w2, w2_scale, ids):
-    """Today's direct decode: stage 1 with MXFP4 mids, then stage 2 per route."""
+    """The regular direct decode: stage 1 with MXFP4 mids, then stage 2 per
+    route."""
     rows = ids.shape[0]
     mids = torch.empty((rows * TOPK, INTER // 2), dtype=torch.uint8, device="cuda")
     mids_scale = empty_swizzled_cdna4_mxfp4_scale(

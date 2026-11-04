@@ -18,8 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerics of the native decoder layer's tail bodies on gfx950, each as a
-test kernel (monokernel_body_helpers.py) against today's kernels or FP32."""
+"""Numerics of the monokernel's post-MoE bodies on gfx950, each as a test
+kernel (monokernel_body_helpers.py) against the regular kernels or FP32."""
 
 from __future__ import annotations
 
@@ -59,8 +59,9 @@ def test_column_relay_equals_the_column_shard_bitwise(rows: int) -> None:
 
 def test_sender_sums_match_the_four_norm_sums() -> None:
     """Each sender's tagged words hold, per row, the FFN boundary's four sums
-    over its 16 columns (sum b^2, B, A, C with b = BF16 POST_AG times post) and
-    its tag; the POST_AG value is the column shard GEMM's, bit for bit."""
+    over its 16 columns (sum b^2, B, A, C, with b the BF16 post-expert
+    output times the post-norm weight) and its tag; the post-expert output is
+    the column shard GEMM's, bit for bit."""
     torch.manual_seed(0)
     rows, n, k, tag = 8, 1024, 4096, 0x5A5A
     x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)

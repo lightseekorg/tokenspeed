@@ -483,8 +483,8 @@ def register_problems(
 
 
 def banned_instruction_problems(assembly: str) -> list[str]:
-    """Instructions a persistent layer must never emit: L2 write-back and
-    invalidate (microseconds each, and they drop warm lines), global wave
+    """Instructions a persistent kernel must never emit: L2 write-back and
+    invalidate (each walks the whole L2 and drops warm lines), global wave
     sync (not supported on gfx950 although the assembler accepts it) and
     ``s_sleep`` (polls do not back off)."""
     lines = instruction_lines(assembly)

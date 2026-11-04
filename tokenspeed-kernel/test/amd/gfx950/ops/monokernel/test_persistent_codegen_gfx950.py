@@ -475,7 +475,7 @@ def test_per_wave_scalars_are_compiler_visible_lane_reads():
     assert reads
 
 
-# Inline asm the fused layer may inline, by file and function: every other
+# Inline asm the monokernel may inline, by file and function: every other
 # site is a failure. Sites in the files marked True also need a "# asm:"
 # comment in their function saying why no compiler-visible op serves.
 _REPO = Path(__file__).resolve().parents[6]
@@ -509,7 +509,7 @@ _ASM_SITES = {
 
 
 def test_inline_asm_stays_at_its_listed_and_justified_sites():
-    """New inline asm in a file the fused layer inlines must be added to the
+    """New inline asm in a file the monokernel inlines must be added to the
     list on purpose, with its reason written next to it."""
     problems = []
     for path, (marked, allowed) in _ASM_SITES.items():

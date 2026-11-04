@@ -18,9 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Offline gfx950 codegen of the native fused layer's Iris hop bodies.
+"""Offline gfx950 codegen of the Muse Spark monokernel's Iris hop bodies.
 
-The hop bodies of the standalone kernels run inside the 8-wave fused-layer
+The hop bodies of the standalone kernels run inside the 8-wave monokernel
 launch. These tests compile them at 8 waves (no device needed) and check the
 ordering contract of each: pushes are whole-line system-scope stores with no
 wait, polls stay in their loop with system-scope loads, and with the entry
@@ -85,7 +85,8 @@ def _compile(fn, signature, constexprs, num_warps=8):
 def _route_owner_kernel(
     routes, norm_weight, region, regions, row, copy, RANK: gl.constexpr
 ):
-    """ROUTE_PUSH push of one route slice, then ROUTE_OWNER: complete + ROUTE_AG, as in the layer."""
+    """Push one route slice to its owner, then, as the route owner, complete
+    the route and send it to every rank, as in the layer."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
     )
@@ -105,7 +106,8 @@ def _route_owner_kernel(
 
 @gluon.jit
 def _finisher_kernel(route_weights, norm_weight, region, out, token, owner, copy):
-    """FINISHER for (token, owner): wait + routed norm + weighted sum."""
+    """The finisher for (token, owner): wait for the completed routes, then
+    the routed norm and the weighted sum."""
     loaded, squares = iris_column_routes_wait(
         region, copy, token, owner, 8, 32, _STAGE, False, None, None, 0
     )
@@ -158,7 +160,8 @@ def test_column_route_finisher_compiles_at_8_waves():
 
 @gluon.jit
 def _pooled_norm_kernel(local_input, weight, packed, scales, region, regions, row, copy,RANK: gl.constexpr):  # fmt: skip
-    """POOLED_AG push of one row's 512 reduced columns, then POOLED_NORM: wait, RMSNorm, MXFP4."""
+    """Push one row's 512 reduced pooled columns to every rank, then, as the
+    pooled-row norm, wait for all of them, RMSNorm and quantize to MXFP4."""
     STAGE_WORDS: gl.constexpr = 8 * 16384 // 2
     stages = (copy.to(gl.uint32),)
     local_words = tl.cast(local_input, gl.pointer_type(gl.uint32)) + row * 256
@@ -199,7 +202,7 @@ def test_pooled_ag_push_and_pooled_norm_compile_at_8_waves():
 
 @gluon.jit
 def _post_ag_kernel(values_ptr, regions, copy, RANK: gl.constexpr):
-    """POST_AG: one POST_SENDER sender's 16 columns of 8 rows pushed to every rank."""
+    """One post-expert sender's 16 columns of 8 rows pushed to every rank."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 16], [64, 1], [gl.num_warps(), 1], [1, 0]
     )
@@ -261,7 +264,7 @@ _VIEW = {
 
 @gluon.jit
 def _layer_hops_kernel(heaps, rank, box, ar, ar_sums, pooled_ag, route_push_own, routes, post_ag, reducer_in,post_ag_sums, errors,floats, words, copy, rows, ROLE: gl.constexpr):  # fmt: skip
-    """Each fused-layer hop end on the view, at 8 waves, by ROLE."""
+    """Each monokernel hop end on the view, at 8 waves, by ROLE."""
     view = MuseSparkIrisView(
         heaps,
         rank,
@@ -361,7 +364,7 @@ def _layer_hops_kernel(heaps, rank, box, ar, ar_sums, pooled_ag, route_push_own,
     ],
 )
 def test_fused_layer_hop_compiles_at_8_waves(role):
-    """Every hop end of the fused layer compiles at 8 waves, with no L2
+    """Every hop end of the monokernel compiles at 8 waves, with no L2
     invalidate or write-back, no scratch, and system-scope peer stores."""
     signature = dict(
         _VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32", rows="i32"

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compile gate of the fused Muse Spark decoder layer on gfx950.
+"""Compile gate of the Muse Spark monokernel on gfx950.
 
 Every plan variant is compiled without a GPU, with the argument attributes a
 launch gives it, and its assembly is checked against the rules the layer's
@@ -225,9 +225,9 @@ def test_entry_is_an_epoch_store_and_a_claim_exchange(key):
 
 @pytest.mark.parametrize("key", _variants())
 def test_router_weights_stay_in_flight_until_the_all_gather(key):
-    # The router's tiles are issued after the sender's push (slot 0: after
-    # AR_OWNER); nothing may retire them before the router's x build waits for
-    # the all-gather.
+    # The router's tiles are issued after the o_proj sender's push (on slot
+    # 0, after its all-reduce owner role); nothing may retire them before the
+    # router's x build waits for the all-gather.
     texts, chains = attributed(key)
     issued = _loads(texts, _in(chains, "_router_weights"))
     assert issued

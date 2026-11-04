@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Host-side pieces of the fused Muse Spark layer, checked without a GPU.
+"""Host-side pieces of the Muse Spark monokernel, checked without a GPU.
 
 The layer's own math runs only on gfx950 (Gluon has no interpreter), but what
-the host prepares for it and the constants it shares with today's kernels can
+the host prepares for it and the constants it shares with the regular kernels can
 be checked on CPU: the router's BF16 hi/lo copy, the norm multipliers'
 rounding, the full-attention grid against the balanced decode's schedule, the
 rows each per-row region holds, and selection and heap sizing through the
@@ -126,8 +126,8 @@ def test_full_attention_items_fit_the_layers_grid(requests):
 
 def test_per_row_regions_hold_every_served_row():
     """Every per-row region (exchange tags and ids, tagged K-part partials,
-    the xq rows and swizzled scales, the MoE mids scales) is sized for at
-    least the rows of the largest served launch."""
+    the quantized pooled rows and their swizzled scales, the MoE mids
+    scales) is sized for at least the rows of the largest served launch."""
     rows = max(PLAN_REQUESTS) * WIDTH
     assert rows <= composer.PART_ROWS <= composer.MAX_ROWS
     # Exchange regions, in order, each sized for MAX_ROWS rows.
@@ -143,7 +143,7 @@ def test_per_row_regions_hold_every_served_row():
         assert start + size <= following
     start, size = regions[-1]
     assert start + size <= composer.EXCHANGE_WORDS
-    # The xq scales: one 32-row swizzled block holds every served row.
+    # The pooled rows' scales: one 32-row swizzled block holds every served row.
     assert composer.XS_MBLOCK_STRIDE == composer.MAX_ROWS * composer.XS_ROW_BYTES
     # The MoE mids scales: the state keeps routes * INTER / 32 bytes, which
     # is the swizzled layout's size at the served route counts (no padding).

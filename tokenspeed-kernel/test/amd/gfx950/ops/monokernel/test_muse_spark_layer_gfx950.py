@@ -18,22 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""One fused Muse Spark layer launch against the regular layer's math, on 8
+"""One Muse Spark monokernel launch against the regular layer's math, on 8
 gfx950 ranks.
 
 Each rank prepares the ``muse_spark`` leaf over random weights in the
 production layouts (EP1 expert slices from ``make_experts``) and runs one
 launch per plan key. The reference composes the regular path's steps on the
-same inputs: today's decode kernel over the FP8 cache (with the forward's
+same inputs: the regular decode kernel over the FP8 cache (with the forward's
 split schedule on full layers, ~141k context), the gated o-norm, the
 o_proj all-reduce, the attention boundary, the FP32 router with sigmoid
-top-8, the pooler with its norm and MXFP4 quantization, today's direct-decode
+top-8, the pooler with its norm and MXFP4 quantization, the direct-decode
 MoE kernels per rank and their route sum, the routed norm, the post-expert
 projection, the FFN boundary, and the next layer's QKV projection and
 ``gqa_prologue``. Routing is checked untied on the reference logits, so both
 sides pick the same experts.
 
-The fused sums run in a different order (deterministic, not bitwise), and the
+The monokernel's sums run in a different order (deterministic, not bitwise), and the
 pooled rows feed an MXFP4 quantization, where an order difference can move a
 value across a rounding boundary. So outputs are compared by relative RMS
 error (one BF16 rounding per reordered step, with headroom for those rare
@@ -102,16 +102,17 @@ PLAN_KEYS = [
 
 
 def _check_attention_box(state, inputs):
-    """The launch's attention box holds the gated-normed attention rows; for
-    a full layer, the split-schedule attention followed by the gated norm
-    must equal today's decode kernel and gated-norm kernel bit for bit (the
-    box stores -0.0 as +0.0: its empty word is the -0.0 pair)."""
+    """The launch's attention output area (``box``: the gated-normed
+    attention rows the o_proj senders read) holds the right rows; for a full
+    layer, the split-schedule attention followed by the gated norm must equal
+    the regular decode kernel and gated-norm kernel bit for bit (the area
+    stores -0.0 as +0.0: its empty word is the -0.0 pair)."""
     q, gate = inputs["prepared_query"]
     rows = q.shape[0]
     expected = weightless_rmsnorm_gated_sigmoid(
         attention_reference(inputs), gate, Q_HEADS, HEAD_DIM, EPS, False
     )
-    # This launch's copy of the box (epoch & 1), as BF16 rows.
+    # This launch's copy of the area (epoch & 1), as BF16 rows.
     epoch = int(state.epochs[0])
     box = state.iris.box.view(2, BOX_WORDS)[epoch & 1]
     actual = box.view(torch.bfloat16).view(-1, Q_WIDTH)[:rows]

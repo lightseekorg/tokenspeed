@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU test of the native MoE stream's host weight contract.
+"""CPU test of the monokernel MoE stream's host weight contract.
 
 ``moe_stream_weights`` must read a processed MoE layer (built with the
 production weight prep) in place, with the shapes and strides the codegen

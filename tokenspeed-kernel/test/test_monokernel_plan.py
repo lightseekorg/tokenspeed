@@ -18,7 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The fused-layer plan checker on the Muse Spark role table (CPU only)."""
+"""The monokernel plan checker on the Muse Spark role table (CPU only).
+
+Role tags are the plan's (see ``_gluon/muse_spark/plan.py``): SENDER sends
+o_proj partials, AR_OWNER owns columns of the o_proj all-reduce (AR, a
+reduce-scatter ``AR.rs`` then an all-gather ``AR.ag``), ROUTE_OWNER and
+FINISHER run after the MoE and complete the routed rows (ROUTE_AG).
+"""
 
 import dataclasses
 
@@ -49,14 +55,15 @@ def _edit(plan, cta, edit):
 @pytest.mark.parametrize("key", plan_variants(), ids=str)
 def test_every_served_variant_is_accepted(key):
     """12 variants: 8 / 16 rows x sliding / full x next sliding / full /
-    regular; each contains the all-to-all AR hop."""
+    regular; each contains the all-to-all o_proj all-reduce."""
     assert check_plan(muse_plan(key)) > 0
 
 
 def test_a_merge_task_on_a_weight_holding_slot_is_rejected():
-    """At full layers SENDER workgroups hold their o_proj and router weights
-    after their first attention item; a merge task placed there would poll
-    the records behind those loads (poll-behind-own-loads)."""
+    """At full layers the o_proj senders hold their o_proj and router
+    weights in flight after their first attention item; a merge task placed
+    there would poll the records behind those loads, and vector memory
+    returns in issue order."""
     plan = muse_plan(PlanKey(1, "full", "sliding"))
     merge = [x for x in plan.programs[(0, 24)] if x.role == "MERGE"]
     assert merge
@@ -80,7 +87,8 @@ def test_a_merge_task_on_a_weight_holding_slot_is_rejected():
 
 
 def test_the_v01_role_map_with_56_route_owner_is_rejected():
-    """v0.1 placed ROUTE_OWNER on 7 slots per XCD; the role table needs 8."""
+    """The role table needs route owners on 8 slots per XCD; a plan with
+    only 7 per XCD (56 in all) leaves routes without an owner."""
     plan = muse_plan(_KEY)
     for xcd in range(8):
         plan = _edit(
@@ -109,8 +117,8 @@ def test_a_variant_without_ar_is_rejected():
 
 
 def test_a_vector_poll_behind_its_own_loads_is_rejected():
-    """ROUTER polls the AG words behind its router weights: allowed only as
-    issue-wait-compute."""
+    """The router polls the all-gather words behind its router weights,
+    which is allowed only when the plan states the weights land first."""
 
     def drop_flag(steps):
         return [
@@ -127,9 +135,9 @@ def test_a_vector_poll_behind_its_own_loads_is_rejected():
 
 
 def test_router_weights_at_entry_would_queue_the_owner_poll():
-    """AR_OWNER polls the reduce-scatter words with no loads in flight: the
-    router's tiles go out after it. Issued at entry (before the push), they
-    would sit in front of that poll."""
+    """The all-reduce owner polls the reduce-scatter words with no loads in
+    flight, so the router's weight tiles are issued after that poll; issued
+    at entry they would sit in front of it in the wave's vmcnt queue."""
 
     def router_at_entry(steps):
         router = next(x for x in steps if isinstance(x, Load) and x.role == "ROUTER")
@@ -143,9 +151,9 @@ def test_router_weights_at_entry_would_queue_the_owner_poll():
 
 
 def test_tail_workgroups_push_every_route_ag_before_waiting_on_one():
-    """At 16 rows a tail workgroup completes two routes: both ROUTE_AG pushes go
-    out before its first ROUTE_AG wait, so the second push does not wait for the
-    first row's whole ROUTE_AG hop."""
+    """At 16 rows a post-MoE workgroup completes two routes: it pushes both
+    completed routes to every rank before it waits on either, so the second
+    push does not wait for the first route's whole exchange."""
     plan = muse_plan(PlanKey(2, "sliding", "sliding"))
     for xcd in range(8):
         steps = plan.programs[(xcd, 24)]
@@ -165,8 +173,9 @@ def test_tail_workgroups_push_every_route_ag_before_waiting_on_one():
 
 
 def test_a_wait_cycle_is_rejected():
-    """Each owner waits for the next owner's AG words before publishing its
-    own: a ring of waits that resident workgroups cannot leave."""
+    """Each all-reduce owner waits for the next owner's all-gather words
+    before publishing its own: a ring of waits that resident workgroups
+    cannot leave."""
     plan = muse_plan(_KEY)
     for xcd in range(8):
 

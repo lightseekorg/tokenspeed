@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The fused Muse Spark layer's launch state under the conditions serving
+"""The Muse Spark monokernel's launch state under the conditions serving
 creates, on 8 gfx950 ranks.
 
 One state serves every launch of a group: launches alternate request counts
@@ -180,9 +180,10 @@ def _write_exchange(state, word_offset: int, values: list[int]) -> None:
 def _alternation(rank, record_dir):
     """1 -> 2 -> 1 requests on one state; before the second 1-request
     launch, the next launch's tag sits in the exchange's per-row tag lines
-    of rows 8-15 (ids, xq, every S part) and NaN in their S and h' rows. The
-    launch must match the reference without reading rows 8-15, and leave a
-    residual's rows 8-15 alone."""
+    of rows 8-15 (expert ids, quantized pooled rows, every part of the summed
+    experts) and NaN in their summed-expert and post-attention residual rows.
+    The launch must match the reference without reading rows 8-15, and leave
+    a residual's rows 8-15 alone."""
     state = _state(rank, record_dir)
     weights, steps, references = _steps(rank)
     fused = _layer(state, weights, 2.0)

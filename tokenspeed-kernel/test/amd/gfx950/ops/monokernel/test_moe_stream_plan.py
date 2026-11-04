@@ -18,14 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU test of the native MoE stream's closed-form plan on recorded routings.
+"""CPU test of the monokernel MoE stream's closed-form plan on recorded
+routings.
 
 Runs the host form of the plan (``moe_stream_plan``) and a fluid timeline
 model: every CU streams its list in order; the active CUs share
-``min(peak, active * 46 GB/s)`` (128 CUs alone stream ~5.9 TB/s); a down unit
-cannot finish before its expert's last gate/up group plus a hand-off. Checks
-coverage, XCD locality, byte balance, and that the tail-role workgroups
-finish early enough to be drained before the layer's tail polls.
+``min(peak, active * PER_CU_GBS)``; a down unit cannot finish before its
+expert's last gate/up group plus a hand-off. Checks coverage, XCD locality,
+byte balance, and that the workgroups that also run post-MoE roles finish
+their MoE share early enough to be drained before those roles poll.
 """
 
 from collections import Counter
@@ -167,7 +168,7 @@ RECORDED_ROUTINGS = {
 XCDS = 8
 SLOTS = 32
 TAIL_SLOTS = {0, *range(16, 31)}
-PER_CU_GBS = 5.9e3 / 128  # GB/s per CU when 128 CUs stream alone
+PER_CU_GBS = 5.9e3 / 128  # model input: GB/s per CU when 128 CUs stream alone
 HANDOFF_US = 0.7  # gate/up -> down hand-off on one XCD
 ENTRY_US = 1.2
 TAIL_US = 0.6
@@ -180,7 +181,8 @@ def _item_bytes(item):
 
 
 def _fluid(plan, peak_tbs, dt_us=0.02):
-    """Finish time (us) of each workgroup's list, entry and tail included."""
+    """Finish time (us) of each workgroup's list, its launch entry and its
+    post-MoE work included."""
     peak = peak_tbs * 1e6  # bytes per us
     cap = PER_CU_GBS * 1e3
     lists = [list(items) for items in plan]
@@ -265,7 +267,7 @@ def test_lane_major_scales_follow_the_mfma_lanes():
     scale = torch.randint(0, 256, (3, 64, 32), dtype=torch.uint8, generator=generator)
     packed = pack_cdna4_mxfp4_scale_lanes(scale)
     assert packed.shape == (3, 4, 64, 8) and packed.is_contiguous()
-    # Lane 16 q + n of strip s holds column 16 s + n, K quad q, at step t.
+    # Lane 16 q + n of strip s holds column 16 s + n, K group q, at step t.
     strip, lane, step = torch.meshgrid(
         torch.arange(4), torch.arange(64), torch.arange(8), indexing="ij"
     )

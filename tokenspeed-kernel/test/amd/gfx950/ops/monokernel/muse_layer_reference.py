@@ -18,14 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The regular Muse Spark layer's math for the fused-layer tests, and one
-fused launch on the builder's inputs (``muse_layer_builder``).
+"""The regular Muse Spark layer's math for the monokernel tests, and one
+monokernel launch on the builder's inputs (``muse_layer_builder``).
 
 ``regular_reference`` composes the regular path's steps on the same inputs:
-today's decode kernel over the FP8 cache (with the forward's split schedule
+the regular decode kernel over the FP8 cache (with the forward's split schedule
 on full layers), the gated o-norm, the o_proj all-reduce, the attention
 boundary, the FP32 router with sigmoid top-8 (checked untied), the pooler
-with its norm and MXFP4 quantization, today's direct-decode MoE kernels per
+with its norm and MXFP4 quantization, the direct-decode MoE kernels per
 rank and their route sum, the routed norm, the post-expert projection, the
 FFN boundary, and the next layer's QKV projection and ``gqa_prologue``.
 Collectives run over the default process group.
@@ -102,7 +102,7 @@ class RoutingTie(AssertionError):
 
 
 def run_fused(fused, key, inputs, residual):
-    """One fused launch that updates ``residual`` (rows of the step's
+    """One monokernel launch that updates ``residual`` (rows of the step's
     residual) in place; the next layer's caches are fresh copies, so a launch
     can be repeated."""
     common = dict(positions=inputs["positions"], cache=inputs["cache"])
@@ -255,10 +255,10 @@ _FP8_BOUND = 2**-3
 
 
 def phase_errors(state, expected, rows):
-    """Relative RMS error of the fused launch's intermediates that stay in
-    its state against the reference's, to locate the first phase that
-    differs: h' (the residual after attention), the router logits (the sum
-    of the K parts), the pooled rows and the summed experts (S)."""
+    """Relative RMS error of the launch's intermediates that stay in its
+    state against the reference's, to locate the first phase that differs:
+    the residual after attention (``hprime``), the router logits (the sum of
+    the K parts) and the summed experts (``s_rows``)."""
     phases = expected["phases"]
     errors = {}
     hprime = state.hprime[:rows]

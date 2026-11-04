@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Offline gfx950 codegen checks of the native decoder layer's device bodies.
+"""Offline gfx950 codegen checks of the monokernel's device bodies.
 
 These compile without a GPU, so they run on any host with the AMD backend;
 the test tree's conftest needs a device, so on a GPU-less host run them with
-``pytest --noconftest``.
-Each test names the instruction-level contract its body promises
-(the persistent layer's codegen rules): waits, cache bits, and what may not drain a stream.
+``pytest --noconftest``. Each test names the instruction-level contract its
+body promises: its waits, its cache bits, and which waits may not drain a
+wave's in-flight weight loads.
 """
 
 from __future__ import annotations
@@ -366,7 +366,7 @@ def test_qkv_task_paces_its_weights_and_fits(window: int, kernel, max_vgprs: int
 
 
 def test_head_task_prologue_runs_on_summed_partials():
-    """A PROLOGUE task sums its head's 16 K-part partials (tag-polled 64-bit
+    """A prologue task sums its head's 16 K-part partials (tag-polled 64-bit
     words) and runs the GQA prologue on the rows in registers: no store and
     reload of the rows, no scratch."""
     assembly = compile_gfx950(
