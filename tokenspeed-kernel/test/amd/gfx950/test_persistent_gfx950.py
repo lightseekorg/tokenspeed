@@ -318,6 +318,7 @@ _TRAP_CHILD = textwrap.dedent("""
         state.epochs, state.claims, state.joins, state.errors, 1_000_000,
         num_warps=8, **t.persistent_compile_options(),
     )
+    print("LAUNCHED", flush=True)
     torch.cuda.synchronize()
     print("NO TRAP")
     """)
@@ -327,7 +328,7 @@ _TRAP_CHILD = textwrap.dedent("""
 def _fail_stop_kernel(epochs, claims, joins, errors, deadline_ticks):
     entry = enter_issue(epochs, claims)
     # The serving entry form.
-    launch = enter_check(entry, errors, errors, deadline_ticks, 0, fail_stop, False)
+    launch = enter_check(entry, errors, errors, deadline_ticks, 0, fail_stop)
     grid_join(joins, launch, fail_stop, 0, 0)
 
 
@@ -352,6 +353,9 @@ def _run_trap_child(tmp_path, mode):
         timeout=300,
     )
     assert child.returncode != 0, child.stdout + child.stderr
+    # The kernel compiled and launched (a child that fails before its launch
+    # also exits nonzero, with only the zeroed record).
+    assert "LAUNCHED" in child.stdout, child.stderr[-4000:]
     assert "NO TRAP" not in child.stdout
     assert time.monotonic() - start < 300
     # A child that died before its kernel ran left no record.
