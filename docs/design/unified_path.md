@@ -1717,6 +1717,10 @@ builder. Decode-only refresh/capture remains unchanged and carries no
 prefill convolution schedule. Breakable prefill graphs consume the live
 metadata in the eager attention break, as ordinary eager forwards do.
 
+Prefill convolution returns `[channels, tokens]` with contiguous channels per
+token, independent of the input strides. Transposing to `[tokens, channels]`
+and splitting the packed channels can therefore remain views.
+
 Prefill state staging fuses resumed conv-window copying, recurrent-state
 gather/zero, and history flags in one kernel. It preserves scheduler-owned
 block ids and arbitrary cache strides. Fresh rows never read null or stale
