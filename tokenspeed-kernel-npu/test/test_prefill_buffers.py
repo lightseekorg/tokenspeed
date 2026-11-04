@@ -30,6 +30,12 @@ import torch.distributed as dist
 
 
 class ExecutionStream:
+    def __init__(self):
+        self.predecessors = []
+
+    def wait_stream(self, stream):
+        self.predecessors.append(stream)
+
     def synchronize(self):
         pass
 
@@ -277,4 +283,52 @@ def test_history_ensure_rejects_stale_batch_and_different_stream(
         runtime.prefetch(1, cache, None, **(options | {"batch_key": object()}))
     torch.npu.stream = ExecutionStream()
     with pytest.raises(RuntimeError, match="original execution stream"):
+        runtime.prefetch(1, cache, None, **options)
+    with pytest.raises(RuntimeError, match="original execution stream"):
         runtime.gather_current(1, cache[:1], width=576, total_rows=1)
+
+
+@pytest.mark.parametrize("has_index", [False, True])
+def test_completed_prefill_can_move_between_execution_streams(
+    transport_class, monkeypatch, has_index
+):
+    cls, _ = transport_class
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    cache = payload(256, 576, 9)
+    index = payload(256, 128, 19) if has_index else None
+    runtime = cls(
+        cache,
+        index,
+        ranks=(0,),
+        history_group=None,
+        max_current_rows=2,
+        history_null_rows=128,
+    )
+    previous = None
+    for step in range(3):
+        stream = ExecutionStream()
+        torch.npu.stream = stream
+        runtime.prefetch(
+            3,
+            cache,
+            index,
+            batch_key=object(),
+            total_rows=2,
+            has_history=True,
+            history_slots=torch.tensor([128, 129]),
+            history_counts=(2,),
+        )
+        exact(runtime.kv[128:130], cache[128:130])
+        if has_index:
+            exact(runtime.index[128:130], index[128:130])
+            current_index = payload(2, 128, 20 + step)
+            runtime.gather_current(3, current_index, width=128, total_rows=2)
+        current = payload(2, 576, 10 + step)
+        runtime.gather_current(3, current, width=576, total_rows=2)
+        exact(runtime.kv[130:132], current)
+        if has_index:
+            exact(runtime.index[130:132], current_index)
+        assert stream.predecessors == ([] if previous is None else [previous])
+        runtime.finish(3)
+        previous = stream
+    runtime.close()
