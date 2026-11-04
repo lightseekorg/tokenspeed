@@ -297,7 +297,7 @@ class DeepseekV3MLP(GatedMLP):
         super().__init__(
             gate_up_proj,
             down_proj,
-            gated_activation(hidden_act),
+            gated_activation(hidden_act, swiglu_limit=None),
             fusions=(GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT,),
         )
         self.mapping = mapping

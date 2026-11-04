@@ -70,6 +70,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
 )
 from tokenspeed.runtime.layers.linear import LinearBase, ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
@@ -722,17 +723,18 @@ def test_scale_expansion_then_tp_and_merged_sharding():
             elif isinstance(linear, v41.RowParallelLinear):
                 expected = expected.chunk(4, dim=1)[rank]
             assert torch.equal(linear.weight_scale_inv, expected)
-        # Shared experts consume the config through the unchanged V4 MLP.
-        shared = v41.DeepseekV4MLP(
-            128,
-            128,
-            "silu",
-            mapping,
-            quant,
-            "shared",
-            swiglu_limit=None,
+        # Shared experts consume the config through the gated MLP.
+        shared = GatedMLP.tensor_parallel(
+            hidden_size=128,
+            intermediate_size=128,
+            activation=gated_activation("silu", swiglu_limit=None),
+            tp_rank=mapping.dense.tp_rank,
+            tp_size=mapping.dense.tp_size,
+            tp_group=mapping.dense.tp_group,
             reduce_results=False,
-            is_shared_expert=False,
+            fusions=(),
+            quant_config=quant,
+            prefix="shared",
         )
         merged = shared.gate_up_proj
         assert isinstance(merged.quant_method, v41._ReferenceFp8LinearMethod)

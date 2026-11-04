@@ -238,7 +238,9 @@ class K3DSparkDecoderLayer(nn.Module):
         self.mlp = GatedMLP.tensor_parallel(
             hidden_size=hidden_size,
             intermediate_size=int(config.intermediate_size),
-            activation=gated_activation(getattr(config, "hidden_act", "silu")),
+            activation=gated_activation(
+                getattr(config, "hidden_act", "silu"), swiglu_limit=None
+            ),
             tp_rank=mapping.dense.tp_rank,
             tp_size=mapping.dense.tp_size,
             tp_group=mapping.dense.tp_group,
