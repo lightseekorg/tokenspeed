@@ -64,6 +64,7 @@ public:
     // gets the same guard. Boundary publication and finish drain with
     // kPinnedUntilAck; a retraction's stream-ordered L2 leg does not use the
     // queue -- StartRetractionStores builds it from the victim's tables.
+    // An empty drain returns before scanning in-flight stores for duplicates.
     // `cause` (kPublication or kFinish) only picks the counters.
     std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, HostStoreCause cause);
     // Drains the segments this plan's admissions and restores recorded under
