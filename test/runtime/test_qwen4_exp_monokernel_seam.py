@@ -28,6 +28,7 @@ import sys
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.monokernel import FusedDecodeLayer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -59,8 +60,11 @@ from tokenspeed.runtime.models.qwen4_exp_monokernel import (  # noqa: E402
     ATTENTION_TP,
     EXPERT_PARALLEL,
     NOT_MXFP4,
-    DraftVerifyLengths,
+    DeltaMonokernelLayer,
+    MonokernelState,
+    NoMonokernel,
     QSAMonokernelLayer,
+    enable_decode_monokernels,
     forward_chain,
     unserved_error,
     unserved_report,
@@ -179,11 +183,37 @@ def test_every_fused_draft_layer_reads_the_lengths_from_before_the_publish() -> 
             seq_lens.copy_(lengths)
 
     narrowing = AcceptedPrefixPublisher(_PublishingBackend(), torch.tensor([10, 11]))
-    lengths = DraftVerifyLengths()
-    first = lengths.take(seq_lens, narrowing)
+    state = MonokernelState(torch.device("cpu"), scratch_pairs=1)
+    state.begin_forward()
+    first = state.draft_lengths(seq_lens, narrowing)
     assert seq_lens.tolist() == [10, 11]
-    second = lengths.take(seq_lens, narrowing)
+    second = state.draft_lengths(seq_lens, narrowing)
     assert first.tolist() == second.tolist() == [12, 15]
+    # The next forward copies its own lengths.
+    state.begin_forward()
+    assert state.draft_lengths(seq_lens, narrowing).tolist() == [10, 11]
+
+
+def test_a_forward_ends_with_one_new_tag_when_it_launched() -> None:
+    """The step counter changes once per forward that launches: in
+    end_forward, unless the last launch ran the final mixer (and moved the
+    counter itself). A forward without launches adds no kernel."""
+    state = MonokernelState(torch.device("cpu"), scratch_pairs=1)
+
+    def forward(launched: bool, folded: bool):
+        state.begin_forward()
+        state.launched = launched
+        if folded:
+            state.lm_head_input = torch.ones(1, 2)
+        return state.end_forward()
+
+    assert forward(launched=False, folded=False) is None
+    assert state.step.tolist() == [0, 0]
+    assert forward(launched=True, folded=False) is None
+    assert state.step.tolist() == [1, 0]
+    lm_head_input = forward(launched=True, folded=True)
+    assert lm_head_input is not None and lm_head_input.tolist() == [[1.0, 1.0]]
+    assert state.step.tolist() == [1, 0]
 
 
 def test_the_report_groups_layers_by_reason() -> None:
@@ -220,6 +250,78 @@ class _RegularLayer(torch.nn.Module):
 
 class _MonokernelLayer(QSAMonokernelLayer, _RegularLayer):
     pass
+
+
+class _Packing:
+    """Packing without the checkpoint's weights: the layer packs into a
+    layer of its own, or fails with its reasons."""
+
+    def __init__(self, layer_id: int, reasons: tuple[str, ...] = ()) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.reasons = reasons
+        self.final_mixer: torch.nn.Module | None = None
+
+    def prepare_monokernel(self, final_mixer: torch.nn.Module | None) -> None:
+        if self.reasons:
+            raise NoMonokernel(*self.reasons)
+        self.final_mixer = final_mixer
+        self.fused = FusedDecodeLayer(
+            decode=None,
+            weights=None,
+            scratch_pairs=4 + self.layer_id,
+            late_weights=torch.tensor([self.layer_id]),
+        )
+
+
+class _PackingDelta(_Packing, DeltaMonokernelLayer, _RegularLayer):
+    pass
+
+
+class _PackingQSA(_Packing, QSAMonokernelLayer, _RegularLayer):
+    pass
+
+
+class _Backbone(torch.nn.Module):
+    def __init__(self, layers) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList(layers)
+        self.hyper_connection_mixer = torch.nn.Linear(1, 1)
+        self.monokernels: MonokernelState | None = None
+
+
+@pytest.mark.parametrize("last", [_PackingQSA, _PackingDelta])
+def test_packing_shares_one_state_and_folds_the_final_mixer(last) -> None:
+    """Every layer gets the shared state and the next layer's late weights
+    to warm. Only a last layer whose launch can run the final mixer (QSA)
+    gets it."""
+    layers = [_PackingDelta(0), _PackingQSA(1), _PackingDelta(2), last(3)]
+    model = _Backbone(layers)
+    enable_decode_monokernels(model)
+    state = model.monokernels
+    assert state is not None and state.scratch.numel() == 7
+    assert all(layer.monokernel_state is state for layer in layers)
+    assert [layer.warm.tolist() for layer in layers[:3]] == [[1], [2], [3]]
+    assert layers[3].warm is None
+    folds = last is _PackingQSA
+    assert [layer.final_mixer for layer in layers] == [None, None, None] + [
+        model.hyper_connection_mixer if folds else None
+    ]
+
+
+def test_packing_fails_and_names_every_unserved_layer() -> None:
+    layers = [
+        _PackingDelta(0, (ATTENTION_TP,)),
+        _PackingQSA(1),
+        _PackingQSA(2, (ATTENTION_TP, NOT_MXFP4)),
+    ]
+    model = _Backbone(layers)
+    with pytest.raises(ValueError) as error:
+        enable_decode_monokernels(model)
+    assert str(error.value) == unserved_error(
+        "_Backbone", {0: [ATTENTION_TP], 2: [ATTENTION_TP, NOT_MXFP4]}
+    )
+    assert model.monokernels is None
 
 
 def test_a_monokernel_layer_runs_other_forwards_with_its_regular_code() -> None:

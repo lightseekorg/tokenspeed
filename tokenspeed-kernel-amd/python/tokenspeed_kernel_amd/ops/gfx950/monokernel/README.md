@@ -9,7 +9,7 @@ Read these documents with this one:
 - [`docs/design/monokernel.md`](../../../../../../docs/design/monokernel.md):
   the invariants.
 - [`tokenspeed_kernel/ops/monokernel/README.md`](../../../../../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md):
-  the ops, how a model's runtime seam calls them, the steps to add a model
+  the ops, how a model's runtime seam calls them, the steps to add a model,
   and the tests.
 - `tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_monokernel_example_gfx950.py`:
   the smallest complete monokernel, of two stages. Copy its shape for a new
@@ -22,7 +22,7 @@ Read these documents with this one:
 | `plan.py` | Host side: `Stage`, `Plan`, `PlanKey`, `placement`, `launch_tag`. A plan describes one launch. |
 | `schedule.py` | Device side: the plan's sizes, and the tasks of each stage that this CTA runs. |
 | `mailbox.py` | The tagged-pair protocol: `Mailbox`, `put`, the polls, `pre_poll`. |
-| `mx.py` | The MXFP4-weight, MXFP4-activation GEMV, the MXFP4 quantizer and the puts of MXFP4 and BF16 values. |
+| `mx.py` | The MXFP4-weight, MXFP4-activation GEMV, the MXFP4 quantizer, and the puts of MXFP4 and BF16 values. |
 | `bf16.py` | The BF16-weight, BF16-activation GEMV and the BF16 row loads. |
 | `weights.py` | Host side: the weight and scale layouts that `mx.py` and `bf16.py` read. |
 | `trace.py` | Timestamps for each wave and stage inside a launch. |
@@ -36,7 +36,7 @@ Read these documents with this one:
 
 These are the gfx950 steps of "Adding a model" in the kernel boundary's
 README. The [Qwen3.8-Flash-Next kernels](qwen4_exp/README.md) are the full
-example. Their README gives the stages, the placement and the rows and verify
+example. Their README gives the stages, the placement, and the rows and verify
 design. Their module docstrings give each stage's math and task split.
 
 1. **Write one stage module per block** in `<model>/`. A module has:
@@ -56,7 +56,7 @@ design. Their module docstrings give each stage's math and task split.
      the modules' `stages()` with all stage bases in that one function.
    - The `@gluon.jit` kernel, which builds the bundles from tuple arguments
      and runs each stage's tasks in plan order.
-   - `launch_<kernel name>`, which checks shapes, strides and row counts.
+   - `launch_<kernel name>`, which checks shapes, strides, and row counts.
 3. **Pack the weights** in `<model>/weights.py`. Where the regular path's
    weights have the GEMV's tile order, read them in place. The MFMA dense
    layout and the N16 MoE banks have that order. Copy only the scales. Give
@@ -64,7 +64,7 @@ design. Their module docstrings give each stage's math and task split.
    order.
 4. **Document the model** in `<model>/README.md`, with the sections of
    `qwen4_exp/README.md`: the kernels and their contract, the stage table,
-   the placement, rows and verify, the weights and the tests. Add the
+   the placement, rows and verify, the weights, and the tests. Add the
    directory to the model table above.
 
 To test one stage, run a slice of the real plan,
@@ -88,7 +88,7 @@ read the outputs with `payloads`.
 - `trace_buf` is `None`, or int64 `[grid, trace.EVENTS, num_warps]`. When it
   is `None`, the trace points compile to nothing.
 - Values that change per step are runtime arguments: positions, sequence
-  lengths, page tables, table widths and slots. The row count and the chain
+  lengths, page tables, table widths, and slots. The row count and the chain
   length are part of the plan.
 
 ## Plans
@@ -138,13 +138,13 @@ the CTA's program id.
 A stage gives a 32-bit value to another CTA as an aligned 8-byte pair
 `(tag << 32) | payload`. One 64-bit store writes the pair. The consumer loads
 the pair again until the tag is the launch's tag. Thus the pair is its own
-ready flag. The protocol needs no flag, no fence and no clear. A pair from an
+ready flag. The protocol needs no flag, no fence, and no clear. A pair from an
 earlier launch has a different tag.
 
 The launch's tag is `launch_tag(step, layer) = step * 64 + layer + 1`, modulo 2^32
 (`plan.py`), from a device step counter. The counter moves on once per
 forward, inside the CUDA graph: the forward's last launch moves it as its
-last CTA ends, and otherwise the last layer moves it after its launch.
+last CTA ends, and otherwise the runtime seam moves it after the layers.
 
 Memory rules on gfx950 (coarse-grained VRAM):
 
@@ -194,7 +194,7 @@ flight.
   dimension adds the waves' results.
 - **Issue, then compute.** `load_weight_tiles` issues every weight and scale
   load of a task and does not wait. `gemv` multiplies the activation rows by
-  the loaded tiles and returns `[rows, N]`. `gemv_zero`, `gemv_row` and
+  the loaded tiles and returns `[rows, N]`. `gemv_zero`, `gemv_row`, and
   `gemv_result` serve a stage that reads other weights for each row (the
   routed experts).
 - **Activations.** The A operand is in LDS as `[KP, 64]` packed E2M1 bytes
@@ -205,7 +205,7 @@ flight.
   starts share an LDS bank conflict (2.7 times slower at 4 rows).
 - **Quantization.** `quantize_mxfp4` follows TokenSpeed's activation
   quantizer (Quark's "even" scale rule) on values rounded to BF16.
-- **Puts.** `put_mxfp4_rows`, `put_mxfp4`, `put_bf16_rows` and `put_bf16`
+- **Puts.** `put_mxfp4_rows`, `put_mxfp4`, `put_bf16_rows`, and `put_bf16`
   publish values. The row versions do not publish the padding rows past the
   launch's rows. `pack_bf16_pairs` and `bf16_half` pack and unpack BF16
   pairs.
@@ -230,7 +230,7 @@ Weight layouts (`weights.py` builds them on the host):
 
 A kernel profiler sees one launch. The trace shows the time inside the
 launch: when each wave of each CTA starts a stage (`START`), has its inputs
-(`READY`), finishes the computation (`COMPUTED`) and ends the stage (`END`).
+(`READY`), finishes the computation (`COMPUTED`), and ends the stage (`END`).
 
 - Stamps are `s_memrealtime` values, a 100 MHz clock (`TICK_NS` = 10) that
   all CUs share. Thus CTAs on different XCDs align on one timeline.
@@ -286,7 +286,7 @@ Rules:
 - **Two kinds of stage.**
   - A stage that streams weights serves every row in each task, so it reads
     each weight once. Keep the rows as the leading tensor dimension (indices
-    from `Mailbox.row_offset`). One poll, one reduction and one put then
+    from `Mailbox.row_offset`). One poll, one reduction, and one put then
     serve all rows.
   - A stage whose work is one request's state (a recurrence, attention, a
     conv) runs one task per row and task: `row, task, tok =
@@ -297,7 +297,7 @@ Rules:
 - **Operands go in bundles.** Each stage module has an `@aggregate` bundle
   for each operand group. The kernel takes one tuple for each bundle and
   builds the bundle at its top with `Bundle(*tuple)`.
-- **Stamp the trace points** `START`, `READY` (after the polls), `COMPUTED`
+- **Stamp the trace points** `START`, `READY` (after the polls), `COMPUTED`,
   and `END`.
 
 ## Gluon notes
@@ -368,7 +368,7 @@ Tests are in `tokenspeed-kernel/test/amd/gfx950/ops/monokernel/`:
 
 | Test | Covers |
 |---|---|
-| `test_plan.py` | The plan checks, the region offsets of each row, `Plan.only`, `Plan.key` and `placement`. |
+| `test_plan.py` | The plan checks, the region offsets of each row, `Plan.only`, `Plan.key`, and `placement`. |
 | `test_mailbox_gfx950.py` | Stage rounds, and polls that read only the current launch's pairs. |
 | `test_mx_gfx950.py` | The MXFP4 quantizer, the GEMV against a dequantized reference, rows against one-row launches, and the GEMV on TokenSpeed's MoE banks. |
 | `test_monokernel_example_gfx950.py` | The two-stage example kernel. |

@@ -77,8 +77,8 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
 )
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (
     DeltaMonokernelLayer,
+    MonokernelState,
     QSAMonokernelLayer,
-    Qwen4ExpMonokernels,
     enable_decode_monokernels,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
@@ -569,9 +569,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
-        # The packed monokernels of the monokernel layers, set after loading
-        # by enable_decode_monokernels. None with the regular layers.
-        self.monokernels: Qwen4ExpMonokernels | None = None
+        # The state that the monokernel layers share, set after loading by
+        # enable_decode_monokernels. None with the regular layers.
+        self.monokernels: MonokernelState | None = None
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
@@ -602,6 +602,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
         rows = hidden_states.shape[0]
+        if self.monokernels is not None:
+            self.monokernels.begin_forward()
         if self.layers and self.layers[0].prefetches_ple(rows, ctx):
             self._start_ple_prefetch(self.layers[0].ple, input_ids, ctx)
         residual = None
@@ -634,7 +636,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 hidden_states.add_(deepstack)
 
         if self.monokernels is not None:
-            lm_head_input = self.monokernels.take_lm_head_input()
+            lm_head_input = self.monokernels.end_forward()
             if lm_head_input is not None:
                 # The last layer's launch also ran the final mixer.
                 return lm_head_input, [hidden_states]
