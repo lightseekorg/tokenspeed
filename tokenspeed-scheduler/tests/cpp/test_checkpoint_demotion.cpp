@@ -377,6 +377,19 @@ protected:
         return coordinator_.BoundaryCheckpointKeys(hashes, /*kept_boundaries=*/{});
     }
 
+    // Demotions, drops and demoted landings leave the boundary tree in step
+    // with the indexes (CacheCoordinatorTestAccess::BoundaryTreeMismatches):
+    // checked before a round clears the cache, and when a test ends.
+    void ExpectTreeInStep() const {
+        const std::vector<std::string> mismatches = CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator_);
+        EXPECT_TRUE(mismatches.empty()) << mismatches.size() << " mismatches, first: " << mismatches.front();
+    }
+    bool ClearRound() {
+        ExpectTreeInStep();
+        return coordinator_.ClearCache();
+    }
+    void TearDown() override { ExpectTreeInStep(); }
+
     BlockPool device_{32, {4, 1}};
     BlockPool host_{32, {4, 1}};
     CacheCoordinator coordinator_ =
@@ -411,7 +424,7 @@ TEST_F(CheckpointDemotionWriteBackTest, ADemotedCheckpointIsDroppedNeverWrittenB
         EXPECT_EQ(after.admission.blocks - before.admission.blocks, demotion ? 1u : 0u);
         EXPECT_EQ(after.request_reclaim.blocks - before.request_reclaim.blocks, demotion ? 0u : 1u);
         EXPECT_EQ(coordinator_.DemotedEntriesNotWrittenBack() - dropped_before, demotion ? 1u : 0u);
-        ASSERT_TRUE(coordinator_.ClearCache());
+        ASSERT_TRUE(ClearRound());
     }
 }
 
@@ -462,7 +475,7 @@ TEST_F(CheckpointDemotionWriteBackTest, ACheckpointDemotedWhileItsCopyIsOutLands
         ASSERT_TRUE(epoch.has_value());
         EXPECT_EQ(*epoch == CacheCoordinator::kDemotedAccessEpoch, demoted_in_flight);
         EXPECT_EQ(HostEntryDemoted(Key(shorter[1], kState)), demoted_in_flight);
-        ASSERT_TRUE(coordinator_.ClearCache());
+        ASSERT_TRUE(ClearRound());
     }
 }
 
@@ -494,7 +507,7 @@ TEST_F(CheckpointDemotionWriteBackTest, AHostEntryTheCopyHoldsIsDemotedWithIt) {
         EXPECT_EQ(HostEpoch(checkpoint),
                   demoted_in_flight ? std::optional{CacheCoordinator::kDemotedAccessEpoch} : dated);
         EXPECT_EQ(HostEntryDemoted(checkpoint), demoted_in_flight) << "the settlement keeps the demotion";
-        ASSERT_TRUE(coordinator_.ClearCache());
+        ASSERT_TRUE(ClearRound());
     }
 }
 
@@ -546,7 +559,7 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
                 << "D's pages leave with its demoted checkpoint, or as Device duplicates without demotion";
             batch.blocks.clear();
             held_.clear();
-            ASSERT_TRUE(coordinator_.ClearCache());
+            ASSERT_TRUE(ClearRound());
         }
     }
 }
@@ -601,7 +614,7 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
         batch.blocks.clear();
         request.clear();
         held_.clear();
-        ASSERT_TRUE(coordinator_.ClearCache());
+        ASSERT_TRUE(ClearRound());
     }
 }
 
@@ -650,7 +663,7 @@ TEST_F(CheckpointDemotionWriteBackTest, ASessionsDemotedEntriesKeepTheirOwnRules
             EXPECT_EQ(segment.members[0].key, shorter_checkpoint);
             EXPECT_EQ(coordinator_.DemotedEntriesNotWrittenBack(), 0u);
             coordinator_.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
-            ASSERT_TRUE(coordinator_.ClearCache());
+            ASSERT_TRUE(ClearRound());
         }
     }
 }
@@ -718,7 +731,7 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementRanksASessionsDemote
             EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(d.front(), kFull)));
             batch.blocks.clear();
             held_.clear();
-            ASSERT_TRUE(coordinator_.ClearCache());
+            ASSERT_TRUE(ClearRound());
         }
     }
 }
