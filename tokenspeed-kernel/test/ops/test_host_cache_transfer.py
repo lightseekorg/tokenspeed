@@ -1005,6 +1005,57 @@ def test_block_h2d_range_factory_reads_only_referenced_group_rows():
     assert accesses == [slice(2, 3)]
 
 
+def test_dma_ranges_follow_workspace_reloads():
+    host_transfer = _load_host_transfer_contract_module()
+    geometry = _sample_geometry(host_transfer)
+    workspace = host_transfer.HostTransferWorkspace()
+
+    def ranges(offset, count):
+        return host_transfer._make_block_ranges(
+            geometry,
+            workspace,
+            num_blocks=workspace._num_loaded_blocks,
+            geometry_offset=offset,
+            num_geometry_rows=count,
+        )
+
+    transfers = [[0, 2, 1], [1, 3, 2]]
+    workspace.load_block_transfers(transfers, geometry=geometry)
+    assert ranges(0, 1) == ((0, 292, 0, 40),)
+    # The loaded batch owns its values even if the caller changes its input.
+    transfers[0] = [0, 5, 4]
+    assert ranges(1, 1) == ((0, 292, 40, 40),)
+    assert ranges(2, 1) == ((1, 6344, 1280, 1000),)
+
+    workspace.load_block_transfers(transfers, geometry=geometry)
+    assert ranges(0, 2) == ((0, 580, 240, 40), (0, 580, 280, 40))
+    assert ranges(2, 1) == ((1, 6344, 1280, 1000),)
+
+    workspace.load_block_transfers((), geometry=geometry)
+    assert ranges(0, 3) == ()
+    workspace.load_block_transfers(((1, 1, 1),), geometry=geometry)
+    assert ranges(0, 2) == ()
+    assert ranges(2, 1) == ((1, 2248, 0, 1000),)
+
+
+def test_dma_ranges_recover_after_failed_workspace_load():
+    host_transfer = _load_host_transfer_contract_module()
+    geometry = _sample_geometry(host_transfer)
+    workspace = host_transfer.HostTransferWorkspace()
+
+    def ranges():
+        return host_transfer._make_block_ranges(
+            geometry, workspace, num_blocks=1, geometry_offset=0, num_geometry_rows=1
+        )
+
+    workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
+    assert ranges() == ((0, 292, 0, 40),)
+    with pytest.raises(ValueError, match="positive"):
+        workspace.load_block_transfers(((0, 0, 1),), geometry=geometry)
+    workspace.load_block_transfers(((0, 5, 4),), geometry=geometry)
+    assert ranges() == ((0, 580, 240, 40),)
+
+
 def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
     host_transfer = _load_host_transfer_contract_module()
     geometry = _sample_geometry(host_transfer).bind(

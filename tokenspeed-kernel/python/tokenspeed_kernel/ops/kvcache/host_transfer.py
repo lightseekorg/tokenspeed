@@ -329,7 +329,11 @@ def build_host_transfer_geometry(
 
 
 class HostTransferWorkspace:
-    """Reusable address and block tables for one Host-cache transfer stream."""
+    """Reusable address and block tables for one Host-cache transfer stream.
+
+    DMA block rows are materialized lazily per group and invalidated on every
+    load attempt. Host table views are read-only; updates use load_block_transfers.
+    """
 
     def __init__(self) -> None:
         self._address_key: tuple[int, ...] | None = None
@@ -344,6 +348,7 @@ class HostTransferWorkspace:
         self._block_group_offsets_count = 0
         self._block_load_generation = 0
         self._block_commit_generation = -1
+        self._dma_block_rows: dict[int, list[list[int]]] = {}
         self._layer_ready_flags: torch.Tensor | None = None
         self._layer_cta_counts: torch.Tensor | None = None
         self._num_layer_ready = 0
@@ -405,6 +410,7 @@ class HostTransferWorkspace:
         return self._mode
 
     def _invalidate_block_commit(self) -> None:
+        self._dma_block_rows.clear()
         self._block_load_generation += 1
         self._num_committed_blocks = 0
         self._block_group_offsets_count = 0
@@ -721,7 +727,7 @@ def _make_block_ranges(
     ].tolist()
     block_rows = workspace.host_block_rows(num_blocks)
     group_offsets = workspace.block_group_offsets_host()
-    group_block_rows = {}
+    group_block_rows = workspace._dma_block_rows
     ranges = []
     for row in geometry_rows:
         (
