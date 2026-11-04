@@ -126,10 +126,13 @@ def test_empty_input(fusions) -> None:
 
 @torch.no_grad()
 def test_fused_finalize_matches_separate_kernels() -> None:
+    block = _block((MoEBlockFusion.FINALIZE_ADD_SHARED,), None)
+    if not block.experts.supports_deferred_cuda_finalize:
+        pytest.skip("the MoE backend on this GPU finalizes its own rows")
     x = _input(77)
     expected = _block((), None)(x, 77, 77)
 
-    out = _block((MoEBlockFusion.FINALIZE_ADD_SHARED,), None)(x, 77, 77)
+    out = block(x, 77, 77)
 
     # The fused epilogue rounds routed plus shared once, so only close.
     torch.testing.assert_close(out, expected, atol=2**-6, rtol=2**-7)
