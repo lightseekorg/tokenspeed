@@ -23,7 +23,8 @@
 The layer's own math runs only on gfx950 (Gluon has no interpreter), but what
 the host prepares for it and the constants it shares with the regular kernels can
 be checked on CPU: the router's BF16 hi/lo copy, the norm multipliers'
-rounding, the full-attention grid against the balanced decode's schedule, the
+rounding, the attention's softmax scale and full-attention grid against the
+regular decode's, the
 rows each per-row region holds, and selection and heap sizing through the
 registry.
 """
@@ -101,6 +102,30 @@ def test_norm_multiplier_rounds_as_the_boundary_reference(offset):
         _bf16_with_offset(None, offset, width, "cpu"),
         torch.ones(width, dtype=torch.bfloat16),
     )
+
+
+@pytest.mark.parametrize("layer_kind", LAYER_KINDS)
+def test_attention_scale_matches_the_regular_decode(layer_kind):
+    """The layer runs the regular decode's attention bodies, so it must hand
+    them the scale the regular launcher computes from the same softmax
+    scale."""
+    key = PlanKey(requests=1, layer_kind=layer_kind, next_kind="sliding")
+    _, _, constexprs, _ = composer.offline_compile_args(key, 0)
+    sliding = layer_kind == "sliding"
+    regular = decode.get_config(
+        q=torch.empty(WIDTH, composer.Q_HEADS, composer.HEAD_DIM),
+        k_cache=torch.empty(
+            1,
+            composer.MUSE_SPARK_CONSTANTS.page_size,
+            composer.KV_HEADS,
+            composer.HEAD_DIM,
+        ),
+        max_seqlen_k=4096,
+        max_seqlen_q=WIDTH,
+        window_left=composer.MUSE_SPARK_CONSTANTS.window_left if sliding else -1,
+        softmax_scale=composer.MUSE_SPARK_CONSTANTS.sm_scale,
+    )
+    assert constexprs["SM_SCALE"] == regular.sm_scale
 
 
 @pytest.mark.parametrize("requests", PLAN_REQUESTS)

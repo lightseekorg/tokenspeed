@@ -114,7 +114,10 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (
     route_owner_complete,
     route_push_sink,
 )
-from tokenspeed_kernel_amd.ops.gfx950.attention._common import InputStrides
+from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
+    _INV_LN2_VALUE,
+    InputStrides,
+)
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     AttentionConfig,
     AttentionProgram,
@@ -2094,7 +2097,9 @@ def kernel_constexprs(
         NEXT_KIND=_NEXT_KINDS[key.next_kind],
         RANK=rank,
         PEER_CACHE=peer_cache,
-        SM_SCALE=model.sm_scale,
+        # The decode bodies take exponents in base 2 (exp2), so the scale
+        # carries log2(e), as the regular launcher's (``get_config``).
+        SM_SCALE=model.sm_scale * _INV_LN2_VALUE,
         PAGE_TABLE_STRIDE=model.page_table_stride,
         PAGE_SIZE=model.page_size,
         WINDOW_LEFT=model.window_left,
