@@ -42,10 +42,10 @@ pytest.importorskip("tokenspeed_kernel_amd")
 layer = pytest.importorskip("tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer")
 
 from asm_checks import (  # noqa: E402
-    _innermost_loop_lines,
     banned_instruction_problems,
     drains_of,
     frame_functions,
+    innermost_loop_lines,
     isa_report,
     persistent_codegen_problems,
     register_problems,
@@ -182,7 +182,7 @@ def test_moe_loops_keep_the_ring_and_have_no_barrier(key):
     by_index = {line.index: line for line in source_lines(assembly)}
     moe_loops = [
         indices
-        for indices in _innermost_loop_lines(assembly).values()
+        for indices in innermost_loop_lines(assembly).values()
         if any(
             "moe_stream.py" in (name for name, _ in by_index[i].frames)
             for i in indices

@@ -61,7 +61,7 @@ def votes_with_subgroup_mask(cycle: list[str]) -> bool:
     )
 
 
-def _innermost_loop_lines(assembly: str) -> dict[str, list[int]]:
+def innermost_loop_lines(assembly: str) -> dict[str, list[int]]:
     """Map each innermost loop's header to the indices of its lines.
 
     A block starts at a label (``.LBB0_7:``) or an unlabeled block comment
@@ -110,7 +110,7 @@ def innermost_loops(assembly: str) -> list[str]:
     lines = assembly.splitlines()
     return [
         "\n".join(lines[i] for i in indices)
-        for indices in _innermost_loop_lines(assembly).values()
+        for indices in innermost_loop_lines(assembly).values()
     ]
 
 
@@ -193,7 +193,7 @@ def _load_before_barrier(lines: list[str], loop: set[int]) -> bool:
     return False
 
 
-def _clock_on_retry_path(lines: list[str], loop: set[int]) -> bool:
+def clock_on_retry_path(lines: list[str], loop: set[int]) -> bool:
     """Whether the loop reads the clock, in its blocks or on its retry path."""
     retry = _retry_lines(lines, loop, _successors(lines))
     return any("s_memrealtime" in lines[i] for i in loop | retry)
@@ -350,7 +350,7 @@ def persistent_codegen_problems(assembly: str, *, entry: str | None) -> list[str
             if "s_waitcnt vmcnt(0)" not in before or "s_barrier" not in before:
                 problems.append(f"arrival without drain and barrier: {lines[index]}")
     raw = assembly.splitlines()
-    for indices in _innermost_loop_lines(assembly).values():
+    for indices in innermost_loop_lines(assembly).values():
         loop = "\n".join(raw[i] for i in indices)
         # A poll rereads with sc1 and computes nothing; a K loop over data
         # another work-group wrote (".cv" loads) runs MFMAs.
@@ -380,7 +380,7 @@ def persistent_codegen_problems(assembly: str, *, entry: str | None) -> list[str
             loop,
         ):
             problems.append("poll loop without a lane-mask exit")
-        if not _clock_on_retry_path(raw, set(indices)):
+        if not clock_on_retry_path(raw, set(indices)):
             problems.append("poll loop without a deadline")
     return problems
 
@@ -395,7 +395,7 @@ def scalar_poll_vector_waits(assembly: str) -> list[str]:
     """
     raw = assembly.splitlines()
     waits = []
-    for indices in _innermost_loop_lines(assembly).values():
+    for indices in innermost_loop_lines(assembly).values():
         loop = set(indices)
         if not any(
             re.search(r"s_load_dword\w* .*\bglc\b|s_dcache_inv", raw[i]) for i in loop
@@ -573,7 +573,7 @@ def store_loop_preheader_drains(assembly: str) -> list[str]:
     the loop."""
     lines = assembly.splitlines()
     problems = []
-    for indices in _innermost_loop_lines(assembly).values():
+    for indices in innermost_loop_lines(assembly).values():
         body = [lines[i] for i in indices]
         if not any(re.search(r"\b(global|buffer)_store", b) for b in body) or any(
             _VMEM_LOAD.search(b) for b in body

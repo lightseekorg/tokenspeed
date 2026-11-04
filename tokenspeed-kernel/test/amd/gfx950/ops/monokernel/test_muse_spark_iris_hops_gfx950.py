@@ -375,15 +375,15 @@ def test_every_exchange_end_compiles_at_8_waves(role):
     if role in ("ar_owner", "pooled_ag", "route_owner", "finisher", "reducer"):
         # Every poll loop reads the clock (deadline) on its retry path, and
         # the failure path traps after storing the peers' abort words.
-        from asm_checks import _clock_on_retry_path, _innermost_loop_lines
+        from asm_checks import clock_on_retry_path, innermost_loop_lines
 
         raw = assembly.splitlines()
         polls = [
             set(lines)
-            for lines in _innermost_loop_lines(assembly).values()
+            for lines in innermost_loop_lines(assembly).values()
             if any(re.search(r"_load_dword\w* .*sc1", raw[i]) for i in lines)
         ]
-        assert polls and all(_clock_on_retry_path(raw, loop) for loop in polls)
+        assert polls and all(clock_on_retry_path(raw, loop) for loop in polls)
         assert "s_trap 2" in assembly
     if role in (
         "ar",
