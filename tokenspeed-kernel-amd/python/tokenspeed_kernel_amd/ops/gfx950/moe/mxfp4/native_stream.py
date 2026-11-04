@@ -1215,7 +1215,12 @@ def run_moe(
     w2d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.w2, 0x7FFFFFF0)
     s2d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.s2, 0x7FFFFFF0)
     mids_d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.mids, 0x7FFFFFF0)
+    # The mids' E8M0 bytes: stored a byte per (route, group), read back as
+    # int32 words (one per K step), so two views of the same buffer.
     mids_sd = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.mids_s, 0x7FFFFFF0)
+    mids_sb = gl.amd.cdna3.buffer.make_buffer_descriptor(
+        bufs.mids_s.to(gl.pointer_type(gl.uint8), bitcast=True), 0x7FFFFFF0
+    )
     tags_d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.tags, 0x7FFFFFF0)
     lanes = gl.arange(0, 64 * 8, layout=lane)
     # This launch's tag copy; zero this workgroup's share of the other one
@@ -1353,7 +1358,7 @@ def run_moe(
         ]
         sg = gl.arange(0, 1, layout=gl.SliceLayout(0, SLY))[None, :]
         # mids_s[route][g]: group g is K step g // 4, quad g % 4.
-        _store(mids_sd, sbyte, sroute * _MID_SCALES + group + sg, sroute >= 0, left)
+        _store(mids_sb, sbyte, sroute * _MID_SCALES + group + sg, sroute >= 0, left)
         pend_word = rank * _TAGS + group * 4 + plan.strip
         pend_left = left
         expert, rank, group, left = nexpert, nrank, ngroup, nleft
