@@ -109,25 +109,61 @@ class MuseSparkLayerStack(DecoderLayerStack):
             recipe=RECIPE, world_size=world_size, max_requests=max(FUSED_REQUESTS)
         )
 
+    @staticmethod
+    def selection_traits(server_args: dict, mapping) -> dict:
+        """The shape traits a fused layer leaf is selected by: the decode
+        rows per request (the verify width, 1 without speculation), the
+        attention TP and MoE EP sizes, and the KV cache dtype."""
+        return {
+            "verify_width": (
+                int(server_args["speculative_num_draft_tokens"])
+                if server_args["speculative_algorithm"]
+                else 1
+            ),
+            "tp_size": mapping.attn.tp_size,
+            "ep_size": mapping.moe.ep_size,
+            "kv_cache_dtype": server_args["kv_cache_dtype"],
+        }
+
+    def prepare_layers(
+        self, model: MuseSparkModel, state: object, traits: dict
+    ) -> list[MonokernelLayer | None]:
+        """One prepared fused layer per candidate layer (None where no leaf
+        serves ``traits``), each for every request count in
+        ``FUSED_REQUESTS``, reading the layer's weights and the next layer's
+        input norm and query projection in place."""
+        from tokenspeed_kernel.ops.monokernel import prepare_monokernel_layer
+
+        candidates = self._candidate_indices(model)
+        prepared = []
+        for index in candidates:
+            layer, next_layer = model.layers[index], model.layers[index + 1]
+            next_kind = next_layer.layer_kind if index + 1 in candidates else "regular"
+            prepared.append(
+                prepare_monokernel_layer(
+                    recipe=RECIPE,
+                    plan_keys=[
+                        PlanKey(requests, layer.layer_kind, next_kind)
+                        for requests in FUSED_REQUESTS
+                    ],
+                    traits=traits,
+                    weights=layer.fused_weights(next_layer),
+                    state=state,
+                )
+            )
+        return prepared
+
     def prepare(self, model: MuseSparkModel) -> None:
         """Prepare the fused layers and agree, across the attention group, on
         the decode shapes they serve; log the startup report. Runs once,
         after the Iris heap exists and before the KV cache is sized or a
         graph is captured."""
-        from tokenspeed_kernel.ops.monokernel import (
-            prepare_monokernel_layer,
-            prepare_monokernel_state,
-        )
+        from tokenspeed_kernel.ops.monokernel import prepare_monokernel_state
 
         candidates = self._candidate_indices(model)
         if self.state is not None or not candidates:
             return
         args = global_server_args_dict
-        width = (
-            int(args["speculative_num_draft_tokens"])
-            if args["speculative_algorithm"]
-            else 1
-        )
         mapping = model.mapping
         group = mapping.attn.tp_group
         rank_in_group = group.index(dist.get_rank())
@@ -143,32 +179,14 @@ class MuseSparkLayerStack(DecoderLayerStack):
             # No leaf serves this platform: nothing was allocated.
             return
         self.state = state
-        shapes = [(requests, width) for requests in FUSED_REQUESTS]
+        traits = self.selection_traits(args, mapping)
+        shapes = [(requests, traits["verify_width"]) for requests in FUSED_REQUESTS]
         deployment = deployment_decline_reasons(
             current_deployment(args, forward_side_stream=model.alt_stream is not None)
         )
         reasons = {shape: dict.fromkeys(deployment) for shape in shapes}
-        traits = {
-            "verify_width": width,
-            "tp_size": mapping.attn.tp_size,
-            "ep_size": mapping.moe.ep_size,
-            "kv_cache_dtype": args["kv_cache_dtype"],
-        }
-        prepared = []
-        for index in candidates:
-            layer, next_layer = model.layers[index], model.layers[index + 1]
-            next_kind = next_layer.layer_kind if index + 1 in candidates else "regular"
-            fused = prepare_monokernel_layer(
-                recipe=RECIPE,
-                plan_keys=[
-                    PlanKey(requests, layer.layer_kind, next_kind)
-                    for requests in FUSED_REQUESTS
-                ],
-                traits=traits,
-                weights=layer.fused_weights(next_layer),
-                state=state,
-            )
-            prepared.append(fused)
+        prepared = self.prepare_layers(model, state, traits)
+        for index, fused in zip(candidates, prepared):
             for shape in shapes:
                 if fused is None:
                     reasons[shape]["no fused decoder layer kernel"] = None
