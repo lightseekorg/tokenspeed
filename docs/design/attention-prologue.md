@@ -152,7 +152,7 @@ attention K/V either. `test/runtime/test_paged_attention_prologue.py` lists
 these writers and fails on any other model or drafter call of the step
 kernels and modules it names.
 
-A fused decoder layer ([fused-decoder-layers.md](fused-decoder-layers.md))
+A fused decoder layer ([monokernel.md](monokernel.md))
 writes the next layer's K/V inside its launch. It takes the slots, format,
 norm, rotary and query dtype from `PagedAttention.prologue_target`, and its
 writes must equal `gqa_prologue`'s byte for byte; its kernel test compares

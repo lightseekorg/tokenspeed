@@ -36,7 +36,7 @@ holds the model-independent half of that decision:
 The model chooses the fused layout per forward from the agreed set only,
 which depends on the padded batch shape and nothing rank-local, so a captured
 graph records the same choice on every rank. See
-``docs/design/fused-decoder-layers.md``.
+``docs/design/monokernel.md``.
 """
 
 from __future__ import annotations

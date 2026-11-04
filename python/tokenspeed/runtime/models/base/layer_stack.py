@@ -32,7 +32,7 @@ the KV cache is sized or a graph is captured. A stack that runs some layers
 through other kernels (a fused decoder layer, for one) prepares them there
 and decides per step, from the step's shape alone, which layers they run;
 every other step runs the default loop. See
-``docs/design/fused-decoder-layers.md``.
+``docs/design/monokernel.md``.
 """
 
 from __future__ import annotations

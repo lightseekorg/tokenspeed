@@ -7,7 +7,7 @@ projection, attention prologue and K/V write as one kernel launch per decode
 step. This directory holds the op's interface; implementations live in
 solution-named packages (`_gluon/` for gfx950). How a model chooses between a
 fused layer and its regular layers is described in
-[docs/design/fused-decoder-layers.md](../../../../../docs/design/fused-decoder-layers.md).
+[docs/design/monokernel.md](../../../../../docs/design/monokernel.md).
 
 ## Interface
 
