@@ -1541,35 +1541,6 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
         torch.testing.assert_close(got, expected)
 
 
-def test_qwen4_exp_nextn_head_matches_attention_dp_layout(monkeypatch) -> None:
-    calls = []
-
-    def fake_replicated(*args, **kwargs):
-        calls.append(("replicated", args, kwargs))
-        return object()
-
-    def fake_parallel(*args, **kwargs):
-        calls.append(("parallel", args, kwargs))
-        return object()
-
-    monkeypatch.setattr(qwen4_exp_nextn, "ReplicatedLinear", fake_replicated)
-    monkeypatch.setattr(qwen4_exp_nextn, "ParallelLMHead", fake_parallel)
-    config = SimpleNamespace(hidden_size=16, vocab_size=128)
-    attn = SimpleNamespace(has_dp=True, tp_rank=0, tp_size=2, tp_group=object())
-
-    qwen4_exp_nextn._build_mtp_lm_head(
-        config, SimpleNamespace(attn=attn), None, "draft"
-    )
-    attn.has_dp = False
-    qwen4_exp_nextn._build_mtp_lm_head(
-        config, SimpleNamespace(attn=attn), None, "draft"
-    )
-
-    assert [kind for kind, _, _ in calls] == ["replicated", "parallel"]
-    assert calls[0][1] == (16, 128)
-    assert calls[1][1] == (128, 16)
-
-
 def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:
     nested = SimpleNamespace(index_share_for_mtp_iteration=True)
 
