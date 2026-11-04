@@ -1675,7 +1675,7 @@ class ServerArgs:
                     "--enable-block-rejection requires a DSPARK or EAGLE3 chain "
                     "(--speculative-eagle-topk 1), --enable-speculative-sampling, "
                     "the flashinfer sampling backend, and aggregate TP without attention DP, "
-                    "DP sampling, or pipeline parallelism"
+                    "DP sampling, pipeline parallelism, or PD disaggregation"
                 )
             if self.synthetic_acceptance_length is not None:
                 # vLLM's draft_sample_method=probabilistic with
@@ -1786,6 +1786,11 @@ class ServerArgs:
                 "--enable-speculative-sampling needs a chain drafter that samples "
                 "one token per step from its own distribution; "
                 f"{self.speculative_algorithm} proposes a whole block greedily"
+                + (
+                    "; pass --enable-block-rejection for sampled DSPARK drafting"
+                    if self.speculative_algorithm == "DSPARK"
+                    else ""
+                )
             )
         # EAGLE-Harness samples its trees (validate_eagle_harness_args).
         if self.speculative_eagle_topk != 1 and not self.eagle_harness:
@@ -3611,7 +3616,8 @@ class ServerArgs:
             help="Opt in to block rejection verification of sampled DSPARK or EAGLE3 "
             "chain drafts (--speculative-eagle-topk 1). Requires "
             "--enable-speculative-sampling and --sampling-backend flashinfer. "
-            "Supports aggregate TP (including DCP), without DP or PP. "
+            "Supports aggregate TP (including DCP), without DP, PP or PD "
+            "disaggregation. "
             "With --synthetic-acceptance-length, drafts stay sampled but the "
             "accepted length is forced (benchmark only); greedy requests remain greedy.",
         )

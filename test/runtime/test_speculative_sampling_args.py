@@ -83,8 +83,10 @@ def test_refuses_without_speculative_decoding():
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "DSPARK"])
 def test_refuses_block_drafters(algorithm):
-    with pytest.raises(ValueError, match="whole block greedily"):
+    with pytest.raises(ValueError, match="whole block greedily") as error:
         _args(speculative_algorithm=algorithm)
+    hinted = "pass --enable-block-rejection" in str(error.value)
+    assert hinted == (algorithm == "DSPARK")
 
 
 @pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3"])

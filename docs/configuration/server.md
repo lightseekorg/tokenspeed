@@ -1388,8 +1388,8 @@ chain, so draft trees are refused. EAGLE3 already samples its chain under
 vocabulary with zeros outside the draft vocabulary. The feature is disabled by
 default; without it, the greedy DSpark path and the token-wise EAGLE3 verifier
 are unchanged. The initial support scope is aggregate TP, including DCP, without
-attention DP, DP sampling or pipeline parallelism. Other combinations fail at
-startup.
+attention DP, DP sampling, pipeline parallelism or PD disaggregation. Other
+combinations fail at startup.
 
 Draft probabilities follow the request temperature; greedy requests retain
 one-hot proposals. Target filtering and grammar masks still apply before
