@@ -288,6 +288,13 @@ offload keeps its pinned Host history mapped across a release and zeroes it on
 resume. Other device memory (input buffers, communication workspaces such as
 symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
 
+With attention DP, every rank must stop admissions and drain before any rank
+releases memory. Send the release to every DP engine concurrently; a release
+itself stops admissions, so a separate pause is unnecessary. A peer explicitly
+paused with `wait` or `abort` may also satisfy the drain. An idle engine that
+has not paused prevents release. After a partial or staggered resume, no DP
+rank forwards until every region released on every rank has been restored.
+
 Queued weight operations finish before a release frees memory. If a PD engine
 is paused with buffered requests, release is refused: resume and drain those
 requests first. While any region is released, a pause is refused; resume the

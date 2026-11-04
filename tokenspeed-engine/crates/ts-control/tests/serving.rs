@@ -1628,6 +1628,8 @@ struct ScriptedRank {
     released: Vec<(String, i32)>,
     cache_ops: Vec<CacheOpKind>,
     idle_forwards: usize,
+    forwards: usize,
+    device_ops: Vec<String>,
 }
 
 /// Run `layout`'s ranks, one script per engine (its first rank's frontend
@@ -1654,6 +1656,7 @@ fn run_scripted(
         .map(|(rank, mesh_listener)| {
             let device = fake_device(layout, rank, &setup);
             let (plans, idle_forwards) = (device.plans.clone(), device.idle_forwards.clone());
+            let device_ops = device.device_ops.clone();
             let replies = Arc::new(Mutex::new(Vec::new()));
             let finished = Arc::new(Mutex::new(Vec::new()));
             let outputs = Arc::new(Mutex::new(Vec::new()));
@@ -1690,6 +1693,7 @@ fn run_scripted(
                 released,
                 plans,
                 idle_forwards,
+                device_ops,
             )
         })
         .collect();
@@ -1702,19 +1706,23 @@ fn run_scripted(
     ranks
         .into_iter()
         .map(
-            |(thread, replies, finished, outputs, released, plans, idle_forwards)| ScriptedRank {
-                outcome: thread.join().unwrap(),
-                replies: replies.lock().unwrap().clone(),
-                finished: finished.lock().unwrap().clone(),
-                outputs: outputs.lock().unwrap().clone(),
-                released: released.lock().unwrap().clone(),
-                cache_ops: plans
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
-                    .collect(),
-                idle_forwards: *idle_forwards.lock().unwrap(),
+            |(thread, replies, finished, outputs, released, plans, idle_forwards, device_ops)| {
+                let outcome = thread.join().unwrap();
+                let plans = plans.lock().unwrap();
+                ScriptedRank {
+                    outcome,
+                    replies: replies.lock().unwrap().clone(),
+                    finished: finished.lock().unwrap().clone(),
+                    outputs: outputs.lock().unwrap().clone(),
+                    released: released.lock().unwrap().clone(),
+                    cache_ops: plans
+                        .iter()
+                        .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
+                        .collect(),
+                    idle_forwards: *idle_forwards.lock().unwrap(),
+                    forwards: plans.iter().filter(|(_, rids, _)| !rids.is_empty()).count(),
+                    device_ops: device_ops.lock().unwrap().clone(),
+                }
             },
         )
         .collect()
@@ -4429,6 +4437,166 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     assert_eq!(tokens(&chunks), [1000, 1001]);
 }
 
+#[test]
+fn dp_memory_release_waits_for_every_rank_to_pause_and_drain() {
+    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        tags: None,
+    });
+    for peer_pause in [pause("wait"), release.clone()] {
+        let peer_releases = matches!(&peer_pause, ControlRequest::ReleaseMemoryOccupation(_));
+        let mut busy = vec![Vec::new(); 340];
+        busy[0].push(EngineRequest::Add(Box::new(request(
+            "busy",
+            3,
+            budget(300),
+        ))));
+        busy[10].push(EngineRequest::Control(Box::new(peer_pause)));
+        let mut idle = vec![Vec::new(); 340];
+        idle[2].push(EngineRequest::Control(Box::new(release.clone())));
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            0,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![busy, idle],
+            no_reaction,
+        );
+        for rank in &ranks {
+            assert!(rank.outcome.is_ok(), "{:?}", rank.outcome);
+            assert!(outcome(rank.replies.clone()).iter().all(|(_, ok)| *ok));
+        }
+        assert_eq!(
+            ranks[0].finished,
+            [("busy".to_owned(), "length".to_owned())]
+        );
+        assert!(ranks[0].forwards >= 300);
+        // Every real forward still has its peer's device participation,
+        // including the rounds after the idle rank requested its release.
+        assert_eq!(ranks[1].idle_forwards, ranks[0].forwards);
+        assert_eq!(ranks[1].device_ops, ["release kv_cache,weights"]);
+        assert_eq!(
+            outcome(ranks[0].replies.clone()),
+            [(
+                if peer_releases {
+                    "ReleaseMemoryOccupationReqOutput"
+                } else {
+                    "PauseSchedulerReqOutput"
+                },
+                true
+            )]
+        );
+        assert_eq!(
+            outcome(ranks[1].replies.clone()),
+            [("ReleaseMemoryOccupationReqOutput", true)]
+        );
+    }
+}
+
+#[test]
+fn dp_memory_release_waits_for_an_idle_peer_to_pause() {
+    let mut peer = vec![Vec::new(); 60];
+    peer[12].push(EngineRequest::Add(Box::new(request(
+        "later",
+        3,
+        budget(20),
+    ))));
+    let mut releasing = vec![Vec::new(); 60];
+    releasing[2].push(EngineRequest::Control(Box::new(
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            tags: None,
+        }),
+    )));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![peer, releasing],
+        no_reaction,
+    );
+    for rank in &ranks {
+        assert!(rank.outcome.is_ok(), "{:?}", rank.outcome);
+        assert!(
+            rank.device_ops.is_empty(),
+            "an unpaused peer prevents release"
+        );
+        assert!(rank.replies.is_empty());
+    }
+    assert_eq!(
+        ranks[0].finished,
+        [("later".to_owned(), "length".to_owned())]
+    );
+    assert_eq!(ranks[1].idle_forwards, ranks[0].forwards);
+}
+
+#[test]
+fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
+    for wake_peer in [false, true] {
+        let mut scripts = vec![vec![Vec::new(); 90]; 2];
+        for (rank, script) in scripts.iter_mut().enumerate() {
+            script[0].push(EngineRequest::Control(Box::new(
+                ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: None,
+                }),
+            )));
+            for (round, tag) in [(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")] {
+                if rank == 1 && tag == "kv_cache" && !wake_peer {
+                    continue;
+                }
+                script[round].push(EngineRequest::Control(Box::new(
+                    ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        tags: Some(vec![tag.to_owned()]),
+                    }),
+                )));
+            }
+        }
+        scripts[0][5].push(EngineRequest::Add(Box::new(request(
+            "awake",
+            3,
+            budget(40),
+        ))));
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            0,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            scripts,
+            no_reaction,
+        );
+        for rank in &ranks {
+            assert!(rank.outcome.is_ok(), "{:?}", rank.outcome);
+            assert!(outcome(rank.replies.clone()).iter().all(|(_, ok)| *ok));
+        }
+        assert_eq!(
+            ranks[0].device_ops,
+            [
+                "release kv_cache,weights",
+                "resume weights",
+                "resume kv_cache"
+            ]
+        );
+        assert_eq!(ranks[1].idle_forwards, ranks[0].forwards);
+        if wake_peer {
+            assert_eq!(
+                ranks[0].finished,
+                [("awake".to_owned(), "length".to_owned())]
+            );
+            assert!(ranks[0].forwards >= 40);
+        } else {
+            assert!(ranks[0].finished.is_empty());
+            assert_eq!(ranks[0].forwards, 0);
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_release_waits_for_the_host_stores_in_flight() {
     // The devices hold every cache acknowledgment until the test opens their
@@ -4437,7 +4605,12 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
     // Host; under write-back, what the third of three 3000-token prompts
     // evicts of the first one. Either way the KV cache cannot be cleared, nor
     // released, until the stores land.
-    for layout in [Layout::Single, Layout::Tp(2), Layout::TpKvp(2, 2)] {
+    for layout in [
+        Layout::Single,
+        Layout::Tp(2),
+        Layout::TpKvp(2, 2),
+        Layout::Dp(2),
+    ] {
         for (tiers, prompts) in [
             (Tiers::HostL2, &[("r1", 0, 65)][..]),
             (
@@ -4447,6 +4620,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
         ] {
             let write_back = matches!(tiers, Tiers::HostL2WriteBack);
             let case = format!("{layout:?}, write-back {write_back}");
+            let num_engines = layout.sizes().2;
             let engine = start_ranks_with(
                 layout,
                 1,
@@ -4463,6 +4637,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
                     &engine.client,
                     TokenizedGenerateReqInput {
                         input_ids: Some((first + 1..=first + len).collect()),
+                        data_parallel_rank: Some(0),
                         ..request(rid, 1, budget(2))
                     },
                 )
@@ -4502,7 +4677,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
                 .unwrap();
             assert_eq!(
                 outcome(released),
-                [("ReleaseMemoryOccupationReqOutput", true)],
+                vec![("ReleaseMemoryOccupationReqOutput", true); num_engines],
                 "{case}"
             );
             let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
@@ -4512,7 +4687,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
             });
             assert_eq!(
                 control(&engine, wake).await,
-                [("ResumeMemoryOccupationReqOutput", true)],
+                vec![("ResumeMemoryOccupationReqOutput", true); num_engines],
                 "{case}"
             );
             // The first prompt is served exactly after the wake. Under
@@ -4525,6 +4700,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
                 &engine.client,
                 TokenizedGenerateReqInput {
                     input_ids: Some((first + 1..=first + len).collect()),
+                    data_parallel_rank: Some(0),
                     ..request("again", 1, budget(2))
                 },
             )
