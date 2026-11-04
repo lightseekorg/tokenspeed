@@ -203,10 +203,16 @@ def build_layer_inputs(plan_key: PlanKey, rank: int, seed: int, device, context)
     )
     flat = (-1, KV_HEADS, HEAD_DIM)
     inputs["next_prologue"] = PrologueTarget(
-        HeadKVCache(next_cache.view(flat), next_cache.clone().view(flat), None, slots),
+        # The runtime's types: FP32 norm weights, int32 write slots.
+        HeadKVCache(
+            next_cache.view(flat),
+            next_cache.clone().view(flat),
+            None,
+            slots.to(torch.int32),
+        ),
         HeadNorm(
-            _randn(norm_generator, device, HEAD_DIM, scale=0.1),
-            _randn(norm_generator, device, HEAD_DIM, scale=0.1),
+            _randn(norm_generator, device, HEAD_DIM, scale=0.1, dtype=torch.float32),
+            _randn(norm_generator, device, HEAD_DIM, scale=0.1, dtype=torch.float32),
             1.0,
             EPS,
         ),

@@ -210,6 +210,7 @@ class MuseSparkMonokernelState:
                 ("fp8", torch.float8_e4m3fn),
                 ("fp32", torch.float32),
                 ("i64", torch.int64),
+                ("i32", torch.int32),
             )
         }
         routes = rows * 8
@@ -605,8 +606,8 @@ class MuseSparkMonokernelLayer:
             # unused stand-ins of their types.
             d = state.dummies
             next_args = (
-                d["bf16"], state.qkv_parts, d["fp8"], d["bf16"], d["bf16"], d["bf16"],
-                d["fp32"], 64, positions, d["fp8"], d["fp8"], d["i64"], 0, 1.0, 1.0,
+                d["bf16"], state.qkv_parts, d["fp8"], d["bf16"], d["fp32"], d["fp32"],
+                d["fp32"], 64, positions, d["fp8"], d["fp8"], d["i32"], 0, 1.0, 1.0,
                 normed_out,
             )  # fmt: skip
         args = (
