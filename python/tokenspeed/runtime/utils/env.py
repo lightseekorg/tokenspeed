@@ -86,7 +86,7 @@ global_server_args_dict: dict = {
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
     "all2all_backend": ServerArgs.all2all_backend,
     "deepep_mode": ServerArgs.deepep_mode,
-    # Settings that decide whether fused decoder layers may run (side-stream
+    # Settings that decide whether decode monokernels may run (side-stream
     # kernels, expert-load recording, released memory).
     "enable_kvstore": ServerArgs.enable_kvstore,
     "kvstore_io_backend": ServerArgs.kvstore_io_backend,

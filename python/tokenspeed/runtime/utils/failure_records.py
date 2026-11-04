@@ -20,10 +20,10 @@
 
 """Failure records that outlive the rank that wrote them.
 
-A kernel that stops its process on a device-side failure (a fused decoder
-layer's fail-stop) cannot report through the host: once it traps, its queue
-is gone and the process aborts. Before trapping, it copies its record into a
-file-backed host page. The rank names that file with ``rank_record_path``,
+A kernel that stops its process on a device-side failure (a decode
+monokernel's fail-stop) cannot report through the host: once it traps, its
+queue is gone and the process aborts. Before trapping, it copies its record
+into a file-backed host page. The rank names that file with ``rank_record_path``,
 under a directory owned by its launcher (the rank's parent process). When the
 ranks are gone, the launcher logs every record that holds a failure and
 removes the directory (``report_failure_records``); it discards a directory

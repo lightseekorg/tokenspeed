@@ -29,7 +29,7 @@ stack its forward calls, with the boundary values its layers pass.
 
 ``prepare`` runs once at startup, after the weights are loaded and before
 the KV cache is sized or a graph is captured. A stack that runs some layers
-through other kernels (a fused decoder layer, for one) prepares them there
+through other kernels (a decode monokernel, for one) prepares them there
 and decides per step, from the step's shape alone, which layers they run;
 every other step runs the default loop. See
 ``docs/design/monokernel.md``.

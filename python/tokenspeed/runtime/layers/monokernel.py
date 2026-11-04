@@ -18,22 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Decide where a fused decoder-layer kernel may serve a model's decode steps.
+"""Decide where a decode monokernel may serve a model's decode steps.
 
-A fused decoder layer runs a whole decoder layer, its cross-GPU exchanges
-included, in one launch that keeps one workgroup resident on every compute
-unit while its workgroups wait on each other. That launch is correct only
-when nothing else takes a compute unit while it is dispatched, and only when
-every rank of the group runs the same sequence of fused launches. This module
-holds the model-independent half of that decision:
+A monokernel runs a whole decoder layer, its cross-GPU exchanges included, in
+one launch that keeps one workgroup resident on every compute unit while its
+workgroups wait on each other. That launch is correct only when nothing else
+takes a compute unit while it is dispatched, and only when every rank of the
+group runs the same sequence of monokernel launches. This module holds the
+model-independent half of that decision:
 
 * ``deployment_decline_reasons`` lists the server settings under which some
-  other kernel can run beside a fused launch;
+  other kernel can run beside a monokernel launch;
 * ``agree_served_shapes`` turns each rank's row shapes and local refusals into
   one served set that every rank of the group holds, so a decline on one rank
   declines the shape everywhere.
 
-The model chooses the fused layout per forward from the agreed set only,
+The model chooses its monokernel layers per forward from the agreed set only,
 which depends on the padded batch shape and nothing rank-local, so a captured
 graph records the same choice on every rank. See
 ``docs/design/monokernel.md``.
@@ -53,7 +53,8 @@ _CU_MASK_VARIABLES = ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
 
 @dataclass(frozen=True)
 class MonokernelDeployment:
-    """The server settings that decide whether a fused launch can be resident.
+    """The server settings that decide whether a monokernel launch can be
+    resident.
 
     Attributes:
         host_kv_store: Whether the host KV store (Host L2) is on.
@@ -61,7 +62,7 @@ class MonokernelDeployment:
         expert_load_recorder: ``--expert-distribution-recorder-mode``.
         memory_saver: Whether the memory saver may release device memory.
         forward_side_stream: Whether the model forks a side stream inside its
-            forward (a captured fork can run beside a fused launch).
+            forward (a captured fork can run beside a monokernel launch).
         environ: The process environment.
     """
 
@@ -96,12 +97,12 @@ def current_deployment(
 
 
 def deployment_decline_reasons(deployment: MonokernelDeployment) -> list[str]:
-    """Why fused decoder layers cannot run under ``deployment``; empty if they
+    """Why monokernel layers cannot run under ``deployment``; empty if they
     can.
 
     Every reason names a source of kernels that may run concurrently with a
-    fused launch (which then waits on a workgroup that never becomes resident
-    and fail-stops the group), or state the fused path cannot keep.
+    monokernel launch (which then waits on a workgroup that never becomes
+    resident and fail-stops the group), or state the monokernel cannot keep.
     """
     reasons = []
     if deployment.host_kv_store and deployment.kvstore_io_backend == "kernel":
@@ -130,13 +131,13 @@ def deployment_decline_reasons(deployment: MonokernelDeployment) -> list[str]:
 
 # A decode forward's row shape: (requests, tokens per request). Plain decode of
 # 8 requests and a verify of one request with 8 tokens both carry 8 rows, but
-# they are different shapes to a fused layer.
+# they are different shapes to a monokernel.
 Shape = tuple[int, int]
 
 
 @dataclass(frozen=True)
 class ServedShapes:
-    """The decode row shapes every rank of a group serves with a fused layer.
+    """The decode row shapes every rank of a group serves with monokernels.
 
     Attributes:
         shapes: ``(requests, tokens per request)`` shapes served on every rank.
@@ -166,15 +167,15 @@ def agree_served_shapes(
     local_reasons: Mapping[Shape, Sequence[str]],
     group: dist.ProcessGroup | None,
 ) -> ServedShapes:
-    """Agree on the decode row shapes a group serves with a fused layer.
+    """Agree on the decode row shapes a group serves with monokernels.
 
     Args:
-        candidates: ``(requests, tokens per request)`` shapes the model can run
-            fused, the same on every rank.
+        candidates: ``(requests, tokens per request)`` shapes the model can
+            run with monokernels, the same on every rank.
         local_reasons: This rank's reasons to decline a shape (missing or
             empty: this rank can serve it).
-        group: The CPU (gloo) group of the ranks that run each fused launch
-            together, or None for a single process.
+        group: The CPU (gloo) group of the ranks that run each monokernel
+            launch together, or None for a single process.
 
     Returns:
         The shapes no rank declined, and the reasons for the others.

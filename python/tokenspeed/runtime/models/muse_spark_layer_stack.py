@@ -19,14 +19,14 @@
 # SOFTWARE.
 
 """Muse Spark's decoder-layer stack: every layer regular, or the MXFP4-expert
-layers as fused launches on the decode shapes the group serves.
+layers as monokernel launches on the decode shapes the group serves.
 
 ``MuseSparkModel.layer_stack_cls``. The model's forward embeds the tokens,
 picks the row layout and runs the final norm; the stack runs the layers in
-between (``models/base/layer_stack.py`` describes the hook). Fused layers
-are an implementation of the same layers chosen per step, not a second
-model: the regular layers before and after them run as written, and every
-step the stack does not serve runs the regular loop.
+between (``models/base/layer_stack.py`` describes the hook). Monokernel
+layers are another implementation of the same layers, chosen per step: the
+regular layers before and after them run as written, and every step the stack
+does not serve runs the regular loop.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Requests per decode step that fused layers are prepared for: most
+# Requests per decode step that the monokernel layers are prepared for: most
 # speculative decode steps carry one or two requests.
 FUSED_REQUESTS = (1, 2)
 RECIPE = "muse_spark"
@@ -63,21 +63,21 @@ RECIPE = "muse_spark"
 class MuseSparkLayerStack(DecoderLayerStack):
     """Muse Spark's decoder layers for one forward.
 
-    Fused layers cover the contiguous layers with MXFP4 experts; the layers
-    before and after them stay regular, and the hand-offs at both ends use
-    the regular layers' own boundary: the first fused layer's query comes
-    from its attention's regular prologue, and the last fused launch ends
-    with the next layer's input norm.
+    Monokernels cover the contiguous layers with MXFP4 experts (the fused
+    range); the layers before and after them stay regular, and the hand-offs
+    at both ends use the regular layers' own boundary: the first monokernel
+    layer's query comes from its attention's regular prologue, and the last
+    launch ends with the next layer's input norm.
     """
 
     def __init__(self) -> None:
-        # The prepared fused layers and the layer indices they run, set by
+        # The prepared monokernel layers and the layer indices they run, set by
         # ``prepare`` when the group serves any shape; empty otherwise.
         self.fused_layers: list[MonokernelLayer] = []
         self.fused_indices = range(0)
         # (requests, tokens per request) decode shapes every rank serves.
         self.served_shapes: frozenset[tuple[int, int]] = frozenset()
-        # The launch state every fused layer of the group shares.
+        # The launch state every monokernel layer of the group shares.
         self.state: object | None = None
 
     @staticmethod
@@ -97,8 +97,8 @@ class MuseSparkLayerStack(DecoderLayerStack):
         return range(indices[0], indices[-1] + 1)
 
     def heap_bytes(self, model: MuseSparkModel, world_size: int) -> int:
-        """Symmetric heap bytes the fused layers' state takes (0 when no
-        layer can run fused); the Iris heap is created with them."""
+        """Symmetric heap bytes the monokernel state takes (0 when no layer
+        can run as a monokernel); the Iris heap is created with them."""
         from tokenspeed_kernel.ops.monokernel import (
             monokernel_state_heap_bytes,
         )
@@ -110,9 +110,9 @@ class MuseSparkLayerStack(DecoderLayerStack):
         )
 
     def prepare(self, model: MuseSparkModel) -> None:
-        """Prepare the fused layers and agree, across the attention group, on
-        the decode shapes they serve; log the startup report. Runs once,
-        after the Iris heap exists and before the KV cache is sized or a
+        """Prepare the monokernel layers and agree, across the attention
+        group, on the decode shapes they serve; log the startup report. Runs
+        once, after the Iris heap exists and before the KV cache is sized or a
         graph is captured."""
         from tokenspeed_kernel.ops.monokernel import (
             prepare_monokernel_layer,
@@ -195,10 +195,10 @@ class MuseSparkLayerStack(DecoderLayerStack):
         ctx: ForwardContext,
         owned_global_rows: int | None,
     ) -> range:
-        """The layers this step runs fused, or an empty range: the regular
-        loop runs every layer.
+        """The layers this step runs as monokernels, or an empty range: the
+        regular loop runs every layer.
 
-        A step runs fused only as a decode forward (it carries decode
+        A step runs monokernels only as a decode forward (it carries decode
         metadata: an extend of the same shape does not) on replicated rows
         whose padded (requests, tokens per request) shape every rank agreed
         to serve. Nothing rank-local enters, so a captured graph records the
