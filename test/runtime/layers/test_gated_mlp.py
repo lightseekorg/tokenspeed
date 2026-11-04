@@ -26,10 +26,11 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.activation import torch_swiglu_oai
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.activation import SiluAndMul, SwigluOAI
 from tokenspeed.runtime.layers.mlp import GatedMLP, GatedMLPFusion
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 
@@ -62,26 +63,43 @@ def _mlp(fusions, quant_config, activation, device) -> GatedMLP:
         )
 
 
-@torch.no_grad()
-@pytest.mark.parametrize("rows", [0, 1, 77])
-def test_bf16_matches_swiglu_reference(rows: int) -> None:
-    torch.manual_seed(0)
-    # A listed fusion the bf16 projections cannot run leaves the separate kernels.
-    mlp = _mlp((_NVFP4,), None, SiluAndMul(), "cuda").to(torch.bfloat16)
+def _bf16_mlp(fusions, activation):
+    mlp = _mlp(fusions, None, activation, "cuda").to(torch.bfloat16)
     gate, up = (torch.randn(_INTERMEDIATE, _HIDDEN) * 0.05 for _ in range(2))
     down = torch.randn(_HIDDEN, _INTERMEDIATE) * 0.05
     mlp.gate_up_proj.weight_loader(mlp.gate_up_proj.weight, gate, 0)
     mlp.gate_up_proj.weight_loader(mlp.gate_up_proj.weight, up, 1)
     mlp.down_proj.weight_loader(mlp.down_proj.weight, down)
+    return mlp, *(w.to("cuda", torch.bfloat16) for w in (gate, up, down))
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("rows", [0, 1, 77])
+def test_bf16_matches_swiglu_reference(rows: int) -> None:
+    torch.manual_seed(0)
+    # A listed fusion the bf16 projections cannot run leaves the separate kernels.
+    mlp, gate, up, down = _bf16_mlp((_NVFP4,), SiluAndMul())
     x = torch.randn(rows, _HIDDEN, device="cuda", dtype=torch.bfloat16)
 
     out = mlp(x)
 
-    gate, up, down = (w.to("cuda", torch.bfloat16) for w in (gate, up, down))
     # SwiGLU in FP32 over the BF16 GEMM outputs, rounded once, as the kernel does.
     act = F.silu(F.linear(x, gate).float()) * F.linear(x, up).float()
     expected = F.linear(act.to(torch.bfloat16), down)
     assert out.shape == (rows, _HIDDEN)
+    torch.testing.assert_close(out, expected, atol=1e-3, rtol=2**-7)
+
+
+@torch.no_grad()
+def test_swiglu_oai_matches_reference() -> None:
+    torch.manual_seed(0)
+    mlp, gate, up, down = _bf16_mlp((), SwigluOAI(alpha=1.702, limit=2.0))
+    x = torch.randn(77, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+    out = mlp(x)
+
+    gate_up = torch.cat([F.linear(x, gate), F.linear(x, up)], dim=-1)
+    expected = F.linear(torch_swiglu_oai(gate_up, alpha=1.702, limit=2.0), down)
     torch.testing.assert_close(out, expected, atol=1e-3, rtol=2**-7)
 
 

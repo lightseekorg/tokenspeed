@@ -1320,7 +1320,7 @@ class BeamDecoderLayer(BaseDecoderLayer):
             return BeamMLP.tensor_parallel(
                 hidden_size=self.config.hidden_size,
                 intermediate_size=self.config.intermediate_size,
-                activation=gated_activation(self.config.hidden_act),
+                activation=gated_activation(self.config.hidden_act, swiglu_limit=None),
                 tp_rank=self.mapping.dense.tp_rank,
                 tp_size=self.mapping.dense.tp_size,
                 tp_group=self.mapping.dense.tp_group,

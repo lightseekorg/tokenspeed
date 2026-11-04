@@ -27,7 +27,6 @@ import math
 from collections.abc import Iterable, Sequence
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import swiglu_oai
 from tokenspeed_kernel.ops.attention.prologue import qk_norm_rope
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
@@ -44,17 +43,18 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
+from tokenspeed.runtime.layers.activation import SwigluOAI
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+from tokenspeed.runtime.layers.mlp import GatedMLP
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
@@ -91,67 +91,6 @@ from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 logger = logging.getLogger(__name__)
-
-
-class MiniMaxM3MLP(nn.Module):
-    """Dense MiniMax-M3 MLP using the SwiGLU-OAI activation."""
-
-    def __init__(
-        self,
-        config: MiniMaxM3VLTextConfig,
-        intermediate_size: int,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        is_shared_expert: bool = False,
-    ) -> None:
-        super().__init__()
-        if is_shared_expert:
-            # The MoE block's combined routed+shared output is reduced once
-            # over the MoE tp_ep group, so shard the shared expert over that
-            # same group (mapping.dense may differ under DP/EP layouts).
-            tp_rank = mapping.moe.tp_ep_rank
-            tp_size = mapping.moe.tp_ep_size
-            tp_group = mapping.moe.tp_ep_group
-        else:
-            tp_rank = mapping.dense.tp_rank
-            tp_size = mapping.dense.tp_size
-            tp_group = mapping.dense.tp_group
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [intermediate_size, intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.swiglu_alpha = config.swiglu_alpha
-        self.swiglu_limit = config.swiglu_limit
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        gate_up, _ = self.gate_up_proj(hidden_states)
-        activated = swiglu_oai(
-            gate_up,
-            alpha=self.swiglu_alpha,
-            limit=self.swiglu_limit,
-        )
-        output, _ = self.down_proj(activated)
-        return output
 
 
 class MiniMaxM3SparseMoeBlock(nn.Module):
@@ -229,13 +168,18 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             routed_scaling_factor=config.routed_scaling_factor,
             output_format=self.experts.topk_output_format,
         )
-        self.shared_experts = MiniMaxM3MLP(
-            config=config,
+        # The routed+shared sum is reduced once over the MoE tp_ep group.
+        self.shared_experts = GatedMLP.tensor_parallel(
+            hidden_size=config.hidden_size,
             intermediate_size=config.shared_intermediate_size,
-            mapping=mapping,
+            activation=SwigluOAI(config.swiglu_alpha, config.swiglu_limit),
+            tp_rank=mapping.moe.tp_ep_rank,
+            tp_size=mapping.moe.tp_ep_size,
+            tp_group=mapping.moe.tp_ep_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
-            is_shared_expert=True,
         )
 
     def forward(
@@ -711,10 +655,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            self.mlp = MiniMaxM3MLP(
-                config=config,
+            self.mlp = GatedMLP.tensor_parallel(
+                hidden_size=config.hidden_size,
                 intermediate_size=config.dense_intermediate_size,
-                mapping=mapping,
+                activation=SwigluOAI(config.swiglu_alpha, config.swiglu_limit),
+                tp_rank=mapping.dense.tp_rank,
+                tp_size=mapping.dense.tp_size,
+                tp_group=mapping.dense.tp_group,
+                reduce_results=False,
+                fusions=(),
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
