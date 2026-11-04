@@ -699,8 +699,6 @@ if current_platform().is_amd:
         kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
-    # This experimental leaf is selected only by an explicit solution. The
-    # portable candidate implementation keeps automatic/default selection.
     from tokenspeed_kernel.ops.attention.dsa import (
         INDEX_CANDIDATE_PAGES_FEATURE,
         DSAIndexCandidatePages,
@@ -730,7 +728,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
-        priority=Priority.REFERENCE,
+        priority=Priority.SPECIALIZED,
     )
     def gluon_dsa_index_candidates_gfx950(
         q,
