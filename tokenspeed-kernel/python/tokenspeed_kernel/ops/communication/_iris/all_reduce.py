@@ -562,6 +562,8 @@ def _iris_subgroup_any(flags):
     Args:
         flags: Exactly one int32 per lane (the instruction takes one VGPR).
     """
+    # asm: a wave vote; Gluon has no ballot op, and Iris kernels link no
+    # extern library for llvm.amdgcn.ballot.
     mask = gl.inline_asm(
         "v_cmp_ne_u32_e64 $0, 0, $1",
         "=s,v,~{memory}",

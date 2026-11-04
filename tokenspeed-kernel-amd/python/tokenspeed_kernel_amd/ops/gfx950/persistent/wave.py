@@ -65,6 +65,8 @@ def wave_scalar(x):
 @gluon.jit
 def opaque_zero():
     """Return 0 in an SGPR the compiler cannot constant-fold."""
+    # asm: a value the compiler can neither fold nor hoist; no intrinsic
+    # gives one.
     return gl.inline_asm("s_mov_b32 $0, 0", "=s", [], gl.int32, is_pure=False)
 
 
@@ -80,6 +82,8 @@ def after(x, dep):
     memory operations complete in issue order. That covers this wave's
     stores only; a tag for other waves' stores needs a barrier.
     """
+    # asm: a dependence on ``dep``'s load that uses no arithmetic; no
+    # intrinsic expresses "after this value" without consuming it.
     return gl.inline_asm_elementwise(
         "v_mov_b32 $0, $1 ; after $2",
         "=v,v,v",
@@ -101,6 +105,8 @@ def issue_order():
     Returns an int32 0 the compiler cannot fold: arithmetic that adds it
     stays after the point too (the point orders memory operations only).
     """
+    # asm: a compiler memory barrier that also yields an unfoldable 0 (a
+    # singlethread fence orders memory but returns nothing to chain on).
     return gl.inline_asm("s_mov_b32 $0, 0", "=s,~{memory}", [], gl.int32, is_pure=False)
 
 
@@ -130,7 +136,15 @@ def lds_store_count(data, offsets, values, count, counters):
     at least two elements per lane.
 
     Returns the counter before this lane's add, shaped like ``offsets``.
+
+    Wave independence: no barrier joins the writer and its readers. A
+    reader that sees the count also sees the stores, because one wave's LDS
+    operations complete in issue order (stores, then the add); the readers
+    are other waves of this workgroup in :func:`lds_spin_until` /
+    :func:`lds_spin_bounded`.
     """
+    # asm: Gluon has no LDS atomic on a shared-memory descriptor (the
+    # ds_add_rtn), and the stores must precede it in this wave's LDS order.
     return gl.inline_asm(
         _store_count_asm,
         ("=&v", "s", "v", "v", "s", "v"),
@@ -154,6 +168,8 @@ def lds_spin_until(count, counter, target):
     that never wait on this one before their increment. Do not use it for a
     wait on another workgroup or another GPU.
     """
+    # asm: a shared-memory load in a loop is hoisted (the compiler assumes
+    # no other writer); the spin rereads LDS each round.
     gl.inline_asm(
         "v_add_u32 $0, $2, $3\n1:\n\tds_read_b32 $1, $0\n\ts_waitcnt lgkmcnt(0)\n\t"
         "v_cmp_lt_u32 vcc, $1, $4\n\ts_cbranch_vccnz 1b",
@@ -183,6 +199,7 @@ def lds_spin_bounded(count, counter, target):
     (``poll_check``), so a writer that never arrives fails the launch instead
     of hanging it.
     """
+    # asm: as lds_spin_until.
     old, _addr, _left = gl.inline_asm(
         _SPIN_BOUNDED_ASM,
         "=&v,=&v,=&s,s,v,v,~{vcc},~{scc},~{memory}",

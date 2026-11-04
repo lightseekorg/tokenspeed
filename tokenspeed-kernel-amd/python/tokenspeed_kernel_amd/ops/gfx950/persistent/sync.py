@@ -54,7 +54,6 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     release_drain,
     scalar_load_glc,
     scalar_load_glc_i64,
-    scalar_pair_sums8,
     scalar_tags16_differ,
     trap,
     vote,
@@ -399,6 +398,12 @@ def poll_until(word_ptr, expected, launch, LOAD: gl.constexpr):
       weights in flight. Only for words written on this XCD or in uncached
       memory.
 
+    Wave independence: the waves that poll (lane 0's wave, or every wave
+    with ``"smem"``) loop on their own reads with no barrier or LDS in the
+    loop, so they need not agree on a trip count; the closing workgroup
+    barrier is the one point that joins them, and loads after it see the
+    word for the whole workgroup.
+
     Returns:
         Whether the word was seen; ``False`` only in the wave that stopped
         (every wave with ``"smem"``). After one workgroup barrier.
@@ -464,31 +469,6 @@ def store_pairs(pair_ptrs, values, launch, mask, SCOPE: gl.constexpr):
 
 
 @gluon.jit
-def poll_pair_sums8(first_ptr, launch, STRIDE: gl.constexpr):
-    """Wait, in this wave, for eight lines of four (value, tag) pairs at
-    ``first_ptr + k * STRIDE`` bytes (k = 0..7, 32 B aligned, stored on this
-    XCD) to carry this launch's tag, with scalar loads only: the wait never
-    queues behind the wave's vector loads, so a wave may poll with weights
-    in flight. The values ride in the polled words, so nothing else is read.
-
-    Returns:
-        ``((sum_0, sum_1, sum_2, sum_3), seen)``, per wave: ``sum_i`` the FP32
-        sum of the lines' pair-i values in line order 0..7, and whether the
-        tags were seen.
-    """
-    s0, s1, s2, s3, differ = scalar_pair_sums8(first_ptr, launch.tag, STRIDE)
-    start = gl.to_tensor(0).to(gl.int64)
-    retries = 0
-    stop = retries < 0
-    while (differ != 0) & (not stop):
-        retries += 1
-        s0, s1, s2, s3, differ = scalar_pair_sums8(first_ptr, launch.tag, STRIDE)
-        if retries % _CHECK_RETRIES == 0:
-            stop, start = poll_check(launch, start, retries, True)
-    return (s0, s1, s2, s3), not stop
-
-
-@gluon.jit
 def poll_pairs(pair_ptrs, valid, launch, SCOPE: gl.constexpr):
     """Wait for this launch's (value, tag) pairs; one pair per lane.
 
@@ -531,6 +511,12 @@ def poll_tags16(word_ptr, tag, launch, GLC: gl.constexpr, BARRIER: gl.constexpr)
     (other waves use what the tags guard), or only with a per-wave acquire
     (this wave alone polls and reads, as in per-wave work loops). Returns
     whether the tags were seen, per wave.
+
+    Wave independence (``BARRIER`` False): each wave polls with its own
+    scalar loads and goes on alone, so per-wave loops with different trip
+    counts may call it. That is safe only when the waiting wave itself reads
+    what the tags guard; its ``wave_acquire`` keeps those reads after the
+    poll. Data shared across waves needs ``BARRIER`` True.
     """
     start = gl.to_tensor(0).to(gl.int64)
     retries = 0

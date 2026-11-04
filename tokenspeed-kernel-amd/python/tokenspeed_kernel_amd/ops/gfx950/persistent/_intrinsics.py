@@ -39,7 +39,7 @@ Kernels calling the intrinsics launch with :func:`persistent_compile_options`.
 
 from pathlib import Path
 
-from tokenspeed_kernel_amd._scheduling import sched_compile_options
+from tokenspeed_kernel_amd._scheduling import sched_compile_options, wave_uniform_i32
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 _LIBRARY_NAME = "tokenspeed_persistent"
@@ -117,26 +117,6 @@ def wait_vmcnt(n, _semantic=None):
 
 
 @gluon.jit
-def vote(flags):
-    """Whether any lane of this wave holds a nonzero int32 flag, as a per-wave
-    scalar. One ``v_cmp`` writes the lane mask to an SGPR pair; Gluon has no
-    wave-level vote with a scalar result (an elementwise ballot stays a tensor,
-    and reducing it crosses waves). ``flags``: exactly one int32 per lane."""
-    mask = gl.inline_asm(
-        "v_cmp_ne_u32_e64 $0, 0, $1", "=s,v,~{memory}", [flags], gl.int64,
-        is_pure=False,
-    )  # fmt: skip
-    return mask != 0
-
-
-@tl.core.extern
-def _first_lane(x, _semantic=None):
-    """``llvm.amdgcn.readfirstlane`` of every element of the int32 tensor
-    ``x`` (uniform per wave, still a tensor)."""
-    return _call("readfirstlane", tl.int32, [x], (tl.int32,), _semantic)
-
-
-@gluon.jit
 def first_lane_scalar(x):
     """This wave's first lane of the int32 tensor ``x`` (one element per
     lane, uniform within each wave) as a per-wave scalar in an SGPR.
@@ -144,8 +124,11 @@ def first_lane_scalar(x):
     The read is the LLVM intrinsic, so the compiler sees a VALU write of the
     SGPR and inserts the wait states its memory consumers need; the asm
     only moves the (already scalar) value into Gluon's scalar type."""
+    # asm: Gluon has no op that turns a wave-uniform tensor into a scalar.
+    # The value is already in an SGPR (the readfirstlane intrinsic); the asm
+    # only moves it into Gluon's scalar type.
     return gl.inline_asm(
-        _scalar_move_asm, ("=s", "s"), [_first_lane(x)], gl.int32, is_pure=True
+        _scalar_move_asm, ("=s", "s"), [wave_uniform_i32(x)], gl.int32, is_pure=True
     )
 
 
@@ -154,6 +137,24 @@ def _scalar_move_asm(outputs, inputs):
     # A thread may hold several (equal) elements; the first one is moved.
     ((out,),), (values,) = outputs, inputs
     return f"s_mov_b32 {out}, {values[0]}"
+
+
+@tl.core.extern
+def _wave_any(flags, _semantic=None):
+    """``llvm.amdgcn.ballot`` of ``flags != 0``, tested against zero: 1 in
+    every lane of a wave where any lane's flag is set (a tensor)."""
+    return _call("wave_any", tl.int32, [flags], (tl.int32,), _semantic)
+
+
+@gluon.jit
+def vote(flags):
+    """Whether any lane of this wave holds a nonzero int32 flag, as a per-wave
+    scalar: a ballot (``llvm.amdgcn.ballot``, one compare into a lane mask)
+    the compiler sees. ``flags``: exactly one int32 per lane. Gluon has no
+    wave-level vote with a scalar result (an elementwise ballot stays a
+    tensor, and reducing it crosses waves), so the wave-uniform result is
+    moved into Gluon's scalar type by :func:`first_lane_scalar`."""
+    return first_lane_scalar(_wave_any(flags)) != 0
 
 
 @gluon.jit
@@ -173,6 +174,10 @@ def scalar_load_glc(word_ptr):
     written on another XCD to coarse memory are unmeasured. The result never
     shares registers with the address (early clobber), so the load cannot
     overwrite its own base while it is in flight."""
+    # asm: no scalar load with glc and memory semantics exists: a volatile
+    # constant-space load is an s_load without glc (it reads the scalar
+    # cache), and llvm.amdgcn.s.buffer.load is readnone (hoisted out of a
+    # poll loop). The wait is the load's own result.
     return gl.inline_asm(
         "s_load_dword $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=&s,s,~{memory}",
         [word_ptr], gl.int32, is_pure=False,
@@ -185,56 +190,10 @@ def scalar_load_glc_i64(word_ptr):
 
     Counts in ``lgkmcnt``, like :func:`scalar_load_glc` (and likewise never
     shares registers with its address)."""
+    # asm: as scalar_load_glc.
     return gl.inline_asm(
         "s_load_dwordx2 $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=&s,s,~{memory}",
         [word_ptr], gl.int64, is_pure=False,
-    )  # fmt: skip
-
-
-# Eight lines of four tagged pairs (value low, tag high): loads into s16..s79,
-# the OR of (tag ^ $5) into $4 (s80 scratch), and the four sums in line order
-# into $0..$3. Line k holds pair i's value in s(16 + 8k + 2i), its tag in the
-# next register.
-@gluon.constexpr_function
-def _pair_sums8_text(stride):
-    loads = "\n\t".join(
-        f"s_load_dwordx8 s[{16 + 8 * k}:{23 + 8 * k}], $6, {hex(k * stride)} glc"
-        for k in range(8)
-    )
-    tags = ["s_xor_b32 $4, s17, $5"]
-    for k in range(8):
-        for i in range(4):
-            if k or i:
-                reg = 16 + 8 * k + 2 * i + 1
-                tags += [f"s_xor_b32 s80, s{reg}, $5", "s_or_b32 $4, $4, s80"]
-    sums = []
-    for i in range(4):
-        sums.append(f"v_mov_b32 ${i}, s{16 + 2 * i}")
-        sums += [f"v_add_f32 ${i}, s{16 + 8 * k + 2 * i}, ${i}" for k in range(1, 8)]
-    return "\n\t".join([loads, "s_waitcnt lgkmcnt(0)"] + tags + sums)
-
-
-_PAIR_SUMS8_CONSTRAINTS = gl.constexpr(
-    "=&v,=&v,=&v,=&v,=&s,s,s,~{memory},~{scc},~{s[16:79]},~{s80}"
-)
-
-
-@gluon.jit
-def scalar_pair_sums8(first_ptr, tag, STRIDE: gl.constexpr):
-    """Read eight lines of four tagged int64 pairs (``tag << 32 | value``)
-    at ``first_ptr + k * STRIDE`` bytes (k = 0..7, each line 32 B aligned)
-    with scalar loads past the scalar cache (``glc``: same-XCD words), so the
-    read never waits behind the wave's vector loads.
-
-    Returns ``(sum_0, sum_1, sum_2, sum_3, differ)``, per wave: ``sum_i`` the
-    FP32 sum of the lines' pair-i values added in line order 0..7
-    (``((v_0 + v_1) + v_2) + ...``), ``differ`` the OR of ``tag_ik ^ tag``
-    (0: all 32 tags match, and the sums are of current values).
-    Clobbers s[16:80]."""
-    TEXT: gl.constexpr = _pair_sums8_text(STRIDE)
-    return gl.inline_asm(
-        TEXT, _PAIR_SUMS8_CONSTRAINTS, [tag, first_ptr],
-        [gl.float32, gl.float32, gl.float32, gl.float32, gl.int32], is_pure=False,
     )  # fmt: skip
 
 
@@ -256,6 +215,8 @@ def scalar_tags16_differ(word_ptr, tag, GLC: gl.constexpr):
     so it never straddles a line); returns the OR of ``tag_i ^ tag`` (0: all
     16 match). ``GLC``: past the scalar cache (``glc``), or through it after
     ``s_dcache_inv``. Clobbers s[64:80]."""
+    # asm: as scalar_load_glc, for 16 tags in one s_load_dwordx16 compared
+    # in scalar registers.
     if GLC:
         return gl.inline_asm(
             _TAGS16_GLC, _TAGS16_CONSTRAINTS, [word_ptr, tag], gl.int32, is_pure=False

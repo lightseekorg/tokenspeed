@@ -25,7 +25,9 @@ instruction-level contract of each hand-off primitive: which waits, barriers
 and cache bits it emits, and which it must not.
 """
 
+import ast
 import re
+from pathlib import Path
 
 import pytest
 from asm_checks import (
@@ -469,3 +471,63 @@ def test_per_wave_scalars_are_compiler_visible_lane_reads():
             reads += 1
             assert not inside, line
     assert reads
+
+
+# Inline asm the fused layer may inline, by file and function: every other
+# site is a failure. Sites in the files marked True also need a "# asm:"
+# comment in their function saying why no compiler-visible op serves.
+_REPO = Path(__file__).resolve().parents[4]
+_KA = "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/"
+_KT = "tokenspeed-kernel/python/tokenspeed_kernel/ops/"
+_ASM_SITES = {
+    _KA + "persistent/_intrinsics.py": (
+        True,
+        {"first_lane_scalar", "scalar_load_glc", "scalar_load_glc_i64",
+         "scalar_tags16_differ"},
+    ),
+    _KA + "persistent/wave.py": (
+        True,
+        {"opaque_zero", "after", "issue_order", "lds_store_count",
+         "lds_spin_until", "lds_spin_bounded"},
+    ),
+    _KA + "persistent/sync.py": (True, set()),
+    _KA + "persistent/timing.py": (True, set()),
+    _KT + "communication/_iris/all_reduce.py": (True, {"_iris_subgroup_any"}),
+    _KT + "communication/_iris/synchronization.py": (
+        False,
+        {"wait_vmem", "wait_loads", "wait_stores", "wait_loads_stores"},
+    ),
+    _KA + "gemm/fp16/gemv_splitk.py": (False, set()),
+    _KA + "gemm/fp16/mm.py": (False, {"gluon_mm_a16w16_medium_gfx950"}),
+    _KA + "attention/mha/decode.py": (False, {"_opaque_f32", "arrive"}),
+    _KA + "moe/mxfp4/native_stream.py": (False, set()),
+    _KT + "communication/_iris/muse_spark/fused_layer.py": (True, set()),
+    _KT + "decoder_layer/_gluon/muse_spark/layer.py": (True, set()),
+}  # fmt: skip
+
+
+def test_inline_asm_stays_at_its_listed_and_justified_sites():
+    """New inline asm in a file the fused layer inlines must be added to the
+    list on purpose, with its reason written next to it."""
+    problems = []
+    for path, (marked, allowed) in _ASM_SITES.items():
+        source = (_REPO / path).read_text()
+        lines = source.splitlines()
+        for function in ast.walk(ast.parse(source)):
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            calls = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and getattr(node.func, "attr", "")
+                in ("inline_asm", "inline_asm_elementwise")
+            ]
+            if not calls:
+                continue
+            if function.name not in allowed:
+                problems.append(f"{path}:{function.name}: unlisted inline asm")
+            body = lines[function.lineno - 1 : function.end_lineno]
+            if marked and not any(l.strip().startswith("# asm:") for l in body):
+                problems.append(f"{path}:{function.name}: no '# asm:' reason")
+    assert problems == []

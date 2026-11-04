@@ -47,6 +47,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     poll_expired,
     poll_stop_site,
     release_drain,
+    vote,
     wait_vmcnt,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
@@ -709,15 +710,6 @@ def gemv_a16w16_splitk_publish_gfx950(
 
 
 @gluon.jit
-def _wave_any(flags):
-    """Whether any lane of this wave holds a nonzero int32 (one lane-mask vote)."""
-    mask = gl.inline_asm(
-        "v_cmp_ne_u32_e64 $0, 0, $1", "=s,v,~{memory}", [flags], gl.int64, is_pure=False
-    )
-    return mask != 0
-
-
-@gluon.jit
 def _missing(words, tag, live, PARTS: gl.constexpr):
     """Per lane: whether any of its words under ``live`` lacks ``tag`` (axis 1 is in-thread)."""
     missing = gl.zeros(live.shape, gl.int32, live.type.layout)
@@ -766,7 +758,7 @@ def gemv_a16w16_splitk_sum_gfx950(
     start = realtime_ticks()
     retries = 0
     stop = retries < 0
-    while _wave_any(missing) & (not stop):
+    while vote(missing) & (not stop):
         retries += 1
         words = ()
         for p in gl.static_range(PARTS):

@@ -173,13 +173,15 @@ entry:
   ret i32 0
 }
 
-declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
+declare i64 @llvm.amdgcn.ballot.i64(i1)
 
-; The wave's first active lane of %x through the LLVM intrinsic, so the
-; compiler sees the VALU write of the SGPR and places the wait states its
-; consumers need (an inline-asm v_readfirstlane hides that write).
-define i32 @__tokenspeed_persistent_readfirstlane(i32 %x) alwaysinline {
+; Whether any active lane of the wave holds a nonzero %flag (1 or 0, the
+; same in every lane): one compare into a lane mask, tested as a scalar.
+define i32 @__tokenspeed_persistent_wave_any(i32 %flag) alwaysinline {
 entry:
-  %r = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %x)
+  %set = icmp ne i32 %flag, 0
+  %mask = call i64 @llvm.amdgcn.ballot.i64(i1 %set)
+  %any = icmp ne i64 %mask, 0
+  %r = zext i1 %any to i32
   ret i32 %r
 }
