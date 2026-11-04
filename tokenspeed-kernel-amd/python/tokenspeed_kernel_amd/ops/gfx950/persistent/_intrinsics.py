@@ -129,34 +129,39 @@ def vote(flags):
     return mask != 0
 
 
+@tl.core.extern
+def _first_lane(x, _semantic=None):
+    """``llvm.amdgcn.readfirstlane`` of every element of the int32 tensor
+    ``x`` (uniform per wave, still a tensor)."""
+    return _call("readfirstlane", tl.int32, [x], (tl.int32,), _semantic)
+
+
+@gluon.jit
+def first_lane_scalar(x):
+    """This wave's first lane of the int32 tensor ``x`` (one element per
+    lane, uniform within each wave) as a per-wave scalar in an SGPR.
+
+    The read is the LLVM intrinsic, so the compiler sees a VALU write of the
+    SGPR and inserts the wait states its memory consumers need; the asm
+    only moves the (already scalar) value into Gluon's scalar type."""
+    return gl.inline_asm(
+        _scalar_move_asm, ("=s", "s"), [_first_lane(x)], gl.int32, is_pure=True
+    )
+
+
+@gluon.constexpr_function
+def _scalar_move_asm(outputs, inputs):
+    # A thread may hold several (equal) elements; the first one is moved.
+    ((out,),), (values,) = outputs, inputs
+    return f"s_mov_b32 {out}, {values[0]}"
+
+
 @gluon.jit
 def wave_index():
     """This wave's index in the workgroup, as a per-wave scalar (SGPR)."""
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     lane = gl.arange(0, 64 * gl.num_warps(), layout)
-    return gl.inline_asm(
-        "v_readfirstlane_b32 $0, $1", "=s,v", [lane // 64], gl.int32, is_pure=True
-    )
-
-
-@gluon.jit
-def scalar_add2_i64(first_ptr, second_ptr):
-    """Add 1 to the int64 at each address with returning scalar atomics
-    (``s_atomic_add_x2 … glc``) and return both old values, per wave.
-
-    Scalar atomics count in ``lgkmcnt``, so the wait for them never waits
-    for the wave's vector loads. Each atomic is its own clause (the ISA
-    requires it), hence the ``s_nop`` between them. Inline asm: LLVM never
-    selects scalar atomics."""
-    return gl.inline_asm(
-        "s_mov_b64 $0, 1\n\ts_mov_b64 $1, 1\n\t"
-        "s_atomic_add_x2 $0, $2, 0x0 glc\n\ts_nop 0\n\t"
-        "s_atomic_add_x2 $1, $3, 0x0 glc\n\ts_waitcnt lgkmcnt(0)",
-        "=&s,=&s,s,s,~{memory}",
-        [first_ptr, second_ptr],
-        (gl.int64, gl.int64),
-        is_pure=False,
-    )
+    return first_lane_scalar(lane // 64)
 
 
 @gluon.jit

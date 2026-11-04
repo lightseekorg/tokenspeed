@@ -1609,7 +1609,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
         SCALE_LANES,
     )
     # The serving entry form (vector counters).
-    ctx = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop, False)
+    ctx = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
     run_moe(
         ctx,
         handles,

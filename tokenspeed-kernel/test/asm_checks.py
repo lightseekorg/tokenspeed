@@ -284,11 +284,9 @@ def persistent_codegen_problems(assembly: str, *, entry: str | None) -> list[str
 
     - Nothing invalidates or writes back L2.
     - With ``entry`` (a kernel that runs the launch entry, in the form
-      ``enter_check`` was given; None for a kernel without it), one check
-      per inlined copy of the entry, and nothing waits for the role's
-      loads issued before the entry until the form's first access:
-      - ``"scalar"``: the two counters are returning scalar atomics waited
-        for with lgkmcnt, and no store or vector atomic precedes them;
+      ``enter_check`` takes; None for a kernel without it), one check per
+      inlined copy of the entry, and nothing waits for the role's loads
+      issued before the entry until the claim:
       - ``"vector"``: the epoch store (``global_store_dwordx2``) is the
         first store, and the returning claim exchange the next one.
     - A store to the address of an earlier global load with a scalar base
@@ -318,33 +316,7 @@ def persistent_codegen_problems(assembly: str, *, entry: str | None) -> list[str
         for index, line in enumerate(lines)
         if re.search(r"\b(global|buffer)_(store|atomic)\w*", line)
     ]
-    if entry == "scalar":
-        # The entry: two returning scalar atomics (the counters) with an
-        # lgkmcnt wait, before any vector store or atomic; no vmcnt wait
-        # from the kernel start to the counters, so loads issued before the
-        # entry stay in flight through it.
-        counters = [
-            i
-            for i, line in enumerate(lines)
-            if re.match(r"\s*s_atomic_add_x2 s\[\d+:\d+\], s\[\d+:\d+\], 0x0 glc", line)
-        ]
-        # One pair per inlined entry (a kernel whose roles issue different
-        # weights before their check inlines the entry once per role).
-        if not counters or len(counters) % 2:
-            problems.append(
-                "the entry counters are not pairs of returning scalar atomics"
-            )
-        else:
-            first = counters[1]
-            if any(i < first for i in writes):
-                problems.append("a store or atomic precedes the entry counters")
-            if any("vmcnt" in line for line in lines[:first]):
-                problems.append("a vmcnt wait precedes the entry counters")
-            for second in counters[1::2]:
-                after = "\n".join(lines[second : second + 3])
-                if "s_waitcnt lgkmcnt(0)" not in after:
-                    problems.append("the entry does not wait for its counters")
-    elif entry == "vector":
+    if entry == "vector":
         # The entry: the epoch store, then the returning claim exchange, as
         # the first two writes of each inlined copy; no vmcnt wait before
         # the first epoch store (the exchange's own wait is the first).

@@ -172,3 +172,14 @@ entry:
   fence syncscope("wavefront") acquire
   ret i32 0
 }
+
+declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
+
+; The wave's first active lane of %x through the LLVM intrinsic, so the
+; compiler sees the VALU write of the SGPR and places the wait states its
+; consumers need (an inline-asm v_readfirstlane hides that write).
+define i32 @__tokenspeed_persistent_readfirstlane(i32 %x) alwaysinline {
+entry:
+  %r = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %x)
+  ret i32 %r
+}

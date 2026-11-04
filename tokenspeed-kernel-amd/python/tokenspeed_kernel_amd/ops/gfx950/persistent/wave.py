@@ -23,11 +23,11 @@
 
 A persistent stream runs independent work per wave inside one workgroup,
 while Gluon models a workgroup as one program. The helpers here state the
-per-wave facts Gluon cannot express, each with inline asm, until Gluon can
-state them itself.
+per-wave facts Gluon cannot express, until Gluon can state them itself.
 
 - :func:`wave_scalar`: a value uniform within a wave but different across
-  waves, in an SGPR. Use it for addresses, trip counts and branches whose
+  waves, in an SGPR (``llvm.amdgcn.readfirstlane``, visible to the
+  compiler's hazard checks). Use it for addresses, trip counts and branches whose
   bodies hold no workgroup-wide operation (reduction across waves, layout
   conversion through LDS, barrier).
 - :func:`opaque_zero`: an SGPR zero the compiler cannot fold. Indexing a
@@ -46,12 +46,7 @@ state them itself.
 """
 
 from tokenspeed_kernel_amd._triton import gl, gluon
-
-
-@gluon.constexpr_function
-def _first_lane_asm(outputs, inputs):
-    ((out,),), (values,) = outputs, inputs
-    return f"v_readfirstlane_b32 {out}, {values[0]}"
+from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import first_lane_scalar
 
 
 @gluon.jit
@@ -59,9 +54,12 @@ def wave_scalar(x):
     """Return this wave's first lane of the int32 tensor ``x`` as a scalar.
 
     ``x`` must be uniform within each wave. Every wave gets its own value,
-    while Gluon treats the result as one value for the workgroup.
+    while Gluon treats the result as one value for the workgroup. The read
+    is ``llvm.amdgcn.readfirstlane`` (:func:`first_lane_scalar`), so the
+    compiler places the wait states between it and memory instructions
+    that use the result.
     """
-    return gl.inline_asm(_first_lane_asm, ("=s", "v"), [x], gl.int32, is_pure=False)
+    return first_lane_scalar(x)
 
 
 @gluon.jit
