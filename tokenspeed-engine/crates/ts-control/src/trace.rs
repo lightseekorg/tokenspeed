@@ -61,7 +61,7 @@ pub struct TraceRecord {
     pub rid: String,
     /// The continual-prompting session, when the request named one.
     pub session: Option<String>,
-    /// Received: the span's start.
+    /// Request creation supplied by the frontend: the span's start.
     pub created: f64,
     /// First dispatched into a forward batch.
     pub scheduled: f64,
@@ -331,6 +331,38 @@ fn span(record: &TraceRecord) -> Value {
         int_attribute("tokenspeed.preempt_count", record.preempt_count),
         double_attribute("tokenspeed.preempt_seconds", record.preempt_seconds),
     ];
+    attributes.push(string_attribute(
+        "tokenspeed.timing_scope",
+        "request_created_to_engine_release",
+    ));
+    // These are host-observed lifecycle intervals, not GPU execution times.
+    for (name, start, end) in [
+        ("tokenspeed.ttft_ms", record.created, record.first_token),
+        ("tokenspeed.total_ms", record.created, record.finish),
+        ("tokenspeed.queue_ms", record.created, record.scheduled),
+        (
+            "tokenspeed.prefill_process_ms",
+            record.scheduled,
+            record.prefill_done,
+        ),
+        (
+            "tokenspeed.decode_process_ms",
+            record.first_token,
+            record.finish,
+        ),
+    ] {
+        if let Some(ms) = elapsed_ms(start, end) {
+            attributes.push(double_attribute(name, ms));
+        }
+    }
+    if record.output_tokens > 1 {
+        if let Some(ms) = elapsed_ms(record.first_token, record.finish) {
+            attributes.push(double_attribute(
+                "tokenspeed.tpot_ms",
+                ms / (record.output_tokens - 1) as f64,
+            ));
+        }
+    }
     if let Some(session) = &record.session {
         // The GenAI session convention: same id, one conversation in the
         // tracing UI, each request its own trace.
@@ -354,6 +386,13 @@ fn span(record: &TraceRecord) -> Value {
             json!({})
         },
     })
+}
+
+/// Zero marks an unreached boundary; clock reversals must not become zero latency.
+fn elapsed_ms(start: f64, end: f64) -> Option<f64> {
+    let ms = (end - start) * 1000.0;
+    (start.is_finite() && end.is_finite() && start > 0.0 && end >= start && ms.is_finite())
+        .then_some(ms)
 }
 
 fn string_attribute(key: &str, value: &str) -> Value {
@@ -517,6 +556,90 @@ mod tests {
         assert_eq!(events[0]["timeUnixNano"], "1700000000500000000");
     }
 
+    fn timing(value: &Value, name: &str) -> Option<f64> {
+        value["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|attribute| attribute["key"] == format!("tokenspeed.{name}_ms"))
+            .and_then(|attribute| attribute["value"]["doubleValue"].as_f64())
+    }
+
+    #[test]
+    fn span_reports_host_lifecycle_durations() {
+        let value = span(&record());
+        for (name, expected) in [
+            ("ttft", 1250.0),
+            ("total", 2000.0),
+            ("queue", 500.0),
+            ("prefill_process", 500.0),
+            ("decode_process", 750.0),
+            ("tpot", 750.0 / 7.0),
+        ] {
+            assert_eq!(timing(&value, name), Some(expected), "{name}");
+        }
+        assert!(value["attributes"]
+            .as_array()
+            .unwrap()
+            .contains(&string_attribute(
+                "tokenspeed.timing_scope",
+                "request_created_to_engine_release",
+            )));
+    }
+
+    #[test]
+    fn abort_before_dispatch_reports_only_total_duration() {
+        let mut record = record();
+        record.scheduled = 0.0;
+        record.prefill_done = 0.0;
+        record.first_token = 0.0;
+        record.output_tokens = 0;
+        record.finish_reason = "abort";
+        let value = span(&record);
+        assert_eq!(timing(&value, "total"), Some(2000.0));
+        for name in ["ttft", "queue", "prefill_process", "decode_process", "tpot"] {
+            assert_eq!(timing(&value, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn tpot_requires_more_than_one_output_token() {
+        for count in [0, 1] {
+            let mut record = record();
+            record.output_tokens = count;
+            assert_eq!(timing(&span(&record), "tpot"), None);
+        }
+        let mut record = record();
+        record.finish = record.first_token;
+        assert_eq!(timing(&span(&record), "tpot"), Some(0.0));
+    }
+
+    #[test]
+    fn invalid_boundaries_omit_only_affected_durations() {
+        for invalid in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1_700_000_003.0,
+        ] {
+            let mut record = record();
+            record.created = invalid;
+            let value = span(&record);
+            for name in ["ttft", "total", "queue"] {
+                assert_eq!(timing(&value, name), None, "{name}: {invalid}");
+            }
+            assert_eq!(timing(&value, "decode_process"), Some(750.0));
+        }
+        let mut record = record();
+        record.finish = record.first_token - 0.25;
+        let value = span(&record);
+        assert_eq!(timing(&value, "decode_process"), None);
+        assert_eq!(timing(&value, "tpot"), None);
+        assert_eq!(timing(&value, "ttft"), Some(1250.0));
+    }
+
     #[test]
     fn a_request_without_a_session_carries_no_session_attribute() {
         let mut record = record();
@@ -645,6 +768,12 @@ mod tests {
         let batch: Value = serde_json::from_slice(&body).expect("the OTLP body");
         let spans = &batch["resourceSpans"][0]["scopeSpans"][0]["spans"];
         let span = &spans[0];
+        assert_eq!(timing(span, "ttft"), Some(1250.0));
+        assert_eq!(timing(span, "total"), Some(2000.0));
+        assert_eq!(timing(span, "tpot"), Some(750.0 / 7.0));
+        assert_eq!(timing(span, "queue"), Some(500.0));
+        assert_eq!(timing(span, "prefill_process"), Some(500.0));
+        assert_eq!(timing(span, "decode_process"), Some(750.0));
         assert_eq!(span["name"], "tokenspeed.request");
         assert_eq!(span["kind"], 2);
         assert_eq!(span["status"], serde_json::json!({}));
