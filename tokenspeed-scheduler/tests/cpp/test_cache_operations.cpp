@@ -1040,6 +1040,18 @@ TEST_F(AsyncStorageTailTest, RetiredGetPublishesTailForOrdinaryMatching) {
     EXPECT_EQ(storage.NumHeldBlocks(), 0u);
 }
 
+TEST_F(AsyncStorageTailTest, QueryHitTokensCountEachGroupsActualTailSpan) {
+    auto missing = coordinator.MissingStorageKeys(prompt(3, true), 64);
+    ASSERT_EQ(missing.keys.size(), 5u);
+    auto query = storage.StartQuery(std::move(missing.keys), std::move(missing.key_tokens));
+    ASSERT_TRUE(query);
+    storage.TakeCommands();
+    storage.Complete(cache::StorageDone{query.OperationId(), {1, 1, 1, 1, 1}, true, {0, 0, 0, 0, 0}});
+    EXPECT_EQ(storage.QueryHits(query.OperationId()).size(), 5u);
+    // Full history and SWA each cover 2 + 1 tokens; the state covers all three.
+    EXPECT_EQ(storage.QueryHitTokens(), 9u);
+}
+
 TEST_F(AsyncStorageTailTest, FirstPageTailNeedsNoFullPageHash) {
     const auto prefix = prompt(3, true);
     const auto query = coordinator.MissingStorageKeys(prefix, 64);
@@ -1664,10 +1676,14 @@ TEST_F(AsyncStorageTransactionTest, RejectedReadDoesNotPoisonObjectsAndCanRetry)
     EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 0);
     read.reset();
     EXPECT_EQ(storage.NumHeldBlocks(), 0u);
-    StorageLease query = storage.StartQuery(coordinator.ExpandPrefixKeys(hashes), {2, 2, 2});
+    auto missing = coordinator.MissingStorageKeys(StoragePrompt(hashes, 2), 3);
+    StorageLease query = storage.StartQuery(std::move(missing.keys), std::move(missing.key_tokens));
+    ASSERT_TRUE(query);
     storage.TakeCommands();
     storage.Complete(cache::StorageDone{query.OperationId(), {1, 1, 1}, true, {0, 0, 0}});
     const auto hits = storage.QueryHits(query.OperationId());
+    EXPECT_EQ(storage.QueryHitTokens(), 6u);
+    EXPECT_EQ(storage.QueryHits(query.OperationId()), hits);
     EXPECT_EQ(storage.QueryHitTokens(), 6u);
     EXPECT_EQ(hits.size(), 3u);
     query.reset();

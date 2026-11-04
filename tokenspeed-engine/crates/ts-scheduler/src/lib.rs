@@ -336,8 +336,7 @@ mod ffi {
         device_hit_tokens: u64,
         /// Tokens the Host loads (L2 including anything L3 supplied).
         host_hit_tokens: u64,
-        /// Tokens of keys storage queries found (L3); a subset of
-        /// `host_hit_tokens` once loaded.
+        /// Token spans of successful storage keys (L3), counted per cache group.
         l3_hit_tokens: u64,
     }
 

@@ -127,6 +127,7 @@ void StorageLease::reset() noexcept {
 }
 
 StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens) {
+    if (keys.size() != key_tokens.size()) throw std::invalid_argument("Each storage query key needs a token span");
     if (keys.empty() || !CanStart() || availableHostCredits() == 0 ||
         keys.size() > static_cast<std::size_t>(config_.max_keys_per_operation)) {
         return {};
@@ -154,7 +155,7 @@ std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
         if (!ticket.success[i] || IsNegative(ticket.keys[i])) continue;
         keys.push_back(ticket.keys[i]);
-        if (i < ticket.key_tokens.size()) query_hit_tokens_ += ticket.key_tokens[i];
+        query_hit_tokens_ += std::exchange(ticket.key_tokens[i], 0);
     }
     return keys;
 }

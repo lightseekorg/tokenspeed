@@ -3101,7 +3101,7 @@ CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const Prompt
         std::unordered_set<CacheKey, CacheKeyHash> distinct;
         bool fits = true;
         forEachStorageDependency(
-            probe, *local.group_keys, device.full_page_tokens, [&](const CacheKey& key, std::int32_t tokens) {
+            probe, *local.group_keys, device.full_page_tokens, [&](const CacheKey& key, std::int32_t logical_block) {
                 if (!fits || ContainsHostCachedBlock(key) || selected.contains(key) || !distinct.insert(key).second)
                     return;
                 if (additional.size() == max_keys - query.keys.size()) {
@@ -3109,7 +3109,9 @@ CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const Prompt
                     return;
                 }
                 additional.push_back(key);
-                additional_tokens.push_back(tokens);
+                const auto grain =
+                    GroupIsState(key.group_id) ? prefix_granularity_ : geometry_[key.group_id].BlockGranularity();
+                additional_tokens.push_back(std::min(grain, candidate.max_tokens - logical_block * grain));
             });
         if (!fits) continue;
         query.max_tokens = std::max(query.max_tokens, candidate.max_tokens);

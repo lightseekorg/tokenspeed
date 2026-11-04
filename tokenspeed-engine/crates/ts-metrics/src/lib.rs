@@ -690,7 +690,7 @@ impl EngineMetrics {
             prefix_l3_hit_tokens: Metric::counter(
                 exporter,
                 "tokenspeed:prefix_l3_hit_tokens",
-                "Tokens of keys storage queries found (L3).",
+                "Token spans of successful storage keys (L3), counted per cache group.",
                 names,
             ),
             exported_compiles: 0,
@@ -793,9 +793,9 @@ impl EngineMetrics {
         used_pages: i64,
         active_pages: i64,
         total_pages: i64,
-        page_tokens: i64,
+        token_capacity: i64,
     ) {
-        if total_pages <= 0 || page_tokens <= 0 {
+        if total_pages <= 0 || token_capacity < 0 {
             return;
         }
         let labels = self.labels();
@@ -803,10 +803,12 @@ impl EngineMetrics {
         let active = active_pages.clamp(0, total_pages);
         self.kv_token_usage
             .set(&labels, used as f64 / total_pages as f64);
-        self.num_used_tokens
-            .set(&labels, (used * page_tokens) as f64);
+        let tokens = |pages: i64| {
+            (i128::from(pages) * i128::from(token_capacity) / i128::from(total_pages)) as f64
+        };
+        self.num_used_tokens.set(&labels, tokens(used));
         self.num_free_tokens
-            .set(&labels, ((total_pages - active) * page_tokens) as f64);
+            .set(&labels, tokens(total_pages - active));
     }
 
     /// The prefill role's PD queues: waiting for a decode peer, transfer in

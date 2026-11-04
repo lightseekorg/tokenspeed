@@ -26,7 +26,7 @@
 # HELP tokenspeed:num_used_tokens KV tokens held by resident pages (active plus reclaimable).
 # HELP tokenspeed:prefix_device_hit_tokens_total Admitted prompt tokens served from the Device prefix cache (L1).
 # HELP tokenspeed:prefix_host_hit_tokens_total Admitted prompt tokens loaded from the Host cache (L2, including L3-supplied).
-# HELP tokenspeed:prefix_l3_hit_tokens_total Tokens of keys storage queries found (L3).
+# HELP tokenspeed:prefix_l3_hit_tokens_total Token spans of successful storage keys (L3), counted per cache group.
 # HELP tokenspeed:prefix_prompt_tokens_total Prompt tokens of admitted requests.
 # HELP tokenspeed:prompt_tokens_total Prompt tokens of requests that finished.
 # HELP tokenspeed:request_queue_time_seconds Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. Grammar-compile, pause-hold, and EPD embedding waits precede submission and are excluded, as are frontend and IPC wait.
@@ -143,7 +143,7 @@ tokenspeed:kv_transfer_timeouts_total{app_key="",model_name="m",stage="waiting_f
 tokenspeed:num_capacity_aborted_requests_total{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_decode_prealloc_queue_reqs{app_key="",dp_rank="0",model_name="m"} 3.0
 tokenspeed:num_decode_transfer_queue_reqs{app_key="",dp_rank="0",model_name="m"} 4.0
-tokenspeed:num_free_tokens{app_key="",dp_rank="0",model_name="m"} 512.0
+tokenspeed:num_free_tokens{app_key="",dp_rank="0",model_name="m"} 517.0
 tokenspeed:num_nan_aborted_requests_total{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_preemptions_total{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:num_prefill_inflight_queue_reqs{app_key="",dp_rank="0",model_name="m"} 2.0
@@ -151,7 +151,7 @@ tokenspeed:num_prefill_prealloc_queue_reqs{app_key="",dp_rank="0",model_name="m"
 tokenspeed:num_requests_running{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_requests_waiting{app_key="",dp_rank="0",model_name="m"} 0.0
 tokenspeed:num_retracted_queue_reqs{app_key="",dp_rank="0",model_name="m"} 1.0
-tokenspeed:num_used_tokens{app_key="",dp_rank="0",model_name="m"} 192.0
+tokenspeed:num_used_tokens{app_key="",dp_rank="0",model_name="m"} 194.0
 tokenspeed:prefix_device_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 40.0
 tokenspeed:prefix_host_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 30.0
 tokenspeed:prefix_l3_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 10.0

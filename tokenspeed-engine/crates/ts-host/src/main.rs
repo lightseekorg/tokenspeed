@@ -186,8 +186,8 @@ struct HostConfig {
     request_token_history: bool,
     physical_context_len: i64,
     kv_total_pages: i64,
-    /// Tokens one usable KV page holds.
-    kv_page_tokens: i64,
+    /// Effective token capacity of the usable KV pool.
+    kv_token_capacity: i64,
     rank: usize,
     replica_ranks: Vec<usize>,
     pp_ranks: Option<Vec<usize>>,
@@ -403,7 +403,7 @@ impl HostConfig {
             request_token_history: config.getattr("request_token_history")?.extract()?,
             physical_context_len: config.getattr("physical_context_len")?.extract()?,
             kv_total_pages: config.getattr("kv_total_pages")?.extract()?,
-            kv_page_tokens: config.getattr("kv_page_tokens")?.extract()?,
+            kv_token_capacity: config.getattr("kv_token_capacity")?.extract()?,
             rank: config.getattr("rank")?.extract()?,
             replica_ranks: config.getattr("replica_ranks")?.extract()?,
             pp_ranks: config.getattr("pp_ranks")?.extract()?,
@@ -628,18 +628,23 @@ fn serve(args: &Args) -> Result<(), HostError> {
     }
     let data_plane =
         PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
+    let metrics = exporter
+        .as_ref()
+        .filter(|_| config.metrics.engine)
+        .map(|exporter| EngineMetrics::new(exporter, &config.metrics.labels));
     let outputs = OutputProcessor::new(
         config.spec_num_tokens,
         config.stream_interval,
         Some(config.physical_context_len),
         role,
         config.finish_log,
+        metrics.is_some(),
     );
     let loop_config = LoopConfig {
         in_flight_depth: config.in_flight_depth,
         limits: config.limits,
         kv_total_pages: config.kv_total_pages,
-        kv_page_tokens: config.kv_page_tokens,
+        kv_token_capacity: config.kv_token_capacity,
         ngram_context_len: config.ngram_context_len,
         request_token_history: config.request_token_history,
         controls: config.controls.clone(),
@@ -657,10 +662,6 @@ fn serve(args: &Args) -> Result<(), HostError> {
         in_flight_depth = config.in_flight_depth,
         "serving"
     );
-    let metrics = exporter
-        .as_ref()
-        .filter(|_| config.metrics.engine)
-        .map(|exporter| EngineMetrics::new(exporter, &config.metrics.labels));
     // The L3 tier's executor connects its store before serving starts.
     let l3 = config.l3.as_ref().map(ts_l3::Settings::start).transpose()?;
     let grammars = config

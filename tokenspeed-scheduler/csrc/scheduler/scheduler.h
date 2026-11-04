@@ -68,9 +68,7 @@ struct PrefixHitStats {
 // tokens (`PrefixHitView`); the rest stay for tests and inspection.
 struct HostCacheStats {
     PrefixHitStats prefix_hits;
-    // Tokens of keys storage queries found, cumulative. They are also part of
-    // `prefix_hits.host_hit_tokens` once loaded; subtract them to separate
-    // the Host's own cache from L3.
+    // Cumulative token spans of successful storage keys, counted per cache group.
     std::uint64_t storage_query_hit_tokens{0};
     TierTransferManager::WriteBackStats publication_stores;
     TierTransferManager::WriteBackStats finish_stores;

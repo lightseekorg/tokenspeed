@@ -193,7 +193,7 @@ void Scheduler::prepareStorage(Request& request) {
     auto keys = std::move(query.keys);
     auto key_tokens = std::move(query.key_tokens);
     if (bound - local < limits.min_prefetch_tokens || keys.empty()) return;
-    if (key_tokens.size() != keys.size()) key_tokens.assign(keys.size(), 0);
+    _assert(key_tokens.size() == keys.size(), "Each storage query key needs a token span");
     // A known failed immutable object remains unavailable for this attempt.
     std::size_t kept = 0;
     for (std::size_t i = 0; i < keys.size(); ++i) {

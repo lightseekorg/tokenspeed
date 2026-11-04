@@ -56,13 +56,14 @@ public:
     std::size_t NumNegativeKeys() const { return negative_.size(); }
     std::size_t NumBackupCandidates() const { return backup_candidates_.size(); }
     bool IsNegative(const CacheKey& key) const { return negative_.contains(key); }
+    // Returns an empty lease when nothing was started.
     StorageLease StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens);
     bool Completed(std::uint64_t id) const;
     bool IsQuery(std::uint64_t id) const;
-    // Successful query hits, and the cumulative tokens they cover. Reading
-    // the hits is what counts them: each operation is detached right after.
+    // Successful query hits, and the cumulative tokens they cover. Each hit counts once per operation.
     std::vector<CacheKey> QueryHits(std::uint64_t id);
     std::uint64_t QueryHitTokens() const { return query_hit_tokens_; }
+    // Returns an empty lease when nothing was started.
     StorageLease StartRead(const CacheCoordinator::PromptPrefix& prompt, std::span<const CacheKey> hits);
     void Complete(const cache::StorageDone& event);
     void QueueBackups(std::span<const CacheKey> keys);

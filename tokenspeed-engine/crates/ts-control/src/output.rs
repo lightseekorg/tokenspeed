@@ -504,6 +504,7 @@ impl OutputProcessor {
         physical_context_len: Option<i64>,
         role: Role,
         finish_log: FinishLog,
+        metrics_enabled: bool,
     ) -> Self {
         Self {
             states: HashMap::new(),
@@ -515,7 +516,7 @@ impl OutputProcessor {
             finish_log,
             last_commit_at: 0.0,
             admissions: 0,
-            metrics_enabled: true,
+            metrics_enabled,
             generated_tokens: 0,
             prompt_tokens: 0,
             cache_hit_tokens: 0,
@@ -525,11 +526,6 @@ impl OutputProcessor {
             tpot_seconds: Vec::new(),
             completion_tokens: 0,
         }
-    }
-
-    pub(crate) fn with_metrics_enabled(mut self, enabled: bool) -> Self {
-        self.metrics_enabled = enabled;
-        self
     }
 
     /// Per-request latency samples and token totals since the last drain.
@@ -1574,7 +1570,14 @@ mod tests {
     };
 
     fn processor(spec_num_tokens: Option<usize>) -> OutputProcessor {
-        OutputProcessor::new(spec_num_tokens, 1, Some(4096), Role::Plain, NO_FINISH_LOG)
+        OutputProcessor::new(
+            spec_num_tokens,
+            1,
+            Some(4096),
+            Role::Plain,
+            NO_FINISH_LOG,
+            true,
+        )
     }
 
     fn register(p: &mut OutputProcessor, rid: &str, prompt: i64, max_new: i64, stop: &[i32]) {
@@ -1674,7 +1677,7 @@ mod tests {
 
     #[test]
     fn request_latency_samples_use_the_prefill_boundaries() {
-        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Prefill, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Prefill, NO_FINISH_LOG, true);
         register(&mut p, "a", 4, 8, &[]);
         let mut state = p.states.remove("a").expect("registered above");
         state.created_time = 100.0;
@@ -1693,7 +1696,7 @@ mod tests {
 
     #[test]
     fn a_decode_landing_sets_the_first_token_boundary() {
-        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true);
         register(&mut p, "a", 4, 8, &[]);
         p.remote_prefill_done("a", 7, 0, None);
         let state = p.state("a").expect("still registered");
@@ -1712,8 +1715,8 @@ mod tests {
                 enabled: true,
                 request_stats: true,
             },
-        )
-        .with_metrics_enabled(false);
+            false,
+        );
         register(&mut p, "r", 3, 8, &[]);
         p.remote_prefill_done("r", 9, 0, None);
         let first = p.state("r").unwrap().first_token_time;
@@ -1734,7 +1737,7 @@ mod tests {
 
     #[test]
     fn disabled_metrics_do_not_retain_finished_requests() {
-        let mut p = processor(None).with_metrics_enabled(false);
+        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Plain, NO_FINISH_LOG, false);
         let mut state = RequestState::new(vec![1], 4, BTreeSet::new(), true, None, false);
         state.created_time = 100.0;
         state.first_token_time = 101.0;
@@ -1954,7 +1957,7 @@ mod tests {
 
     #[test]
     fn the_decode_role_ships_no_prompt_logprobs() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         assert!(!p.state("r").unwrap().wants_input_logprobs());
         p.remote_prefill_done("r", 9, 0, Some(-0.25));
@@ -1974,7 +1977,7 @@ mod tests {
 
     #[test]
     fn a_bootstrap_token_without_a_cumulative_probability_keeps_the_column_aligned() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         // The prefill node sends the first token's logprob, but no cumulative
         // probability.
@@ -2013,7 +2016,7 @@ mod tests {
 
     #[test]
     fn the_prefill_role_ships_its_prompt_logprobs_with_its_final_output() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, true);
         let prompt = batch(&[("r", 3, 0, 3)], 1);
         let plan = p.logprob_plan(&prompt).input.unwrap();
@@ -2031,7 +2034,7 @@ mod tests {
 
     #[test]
     fn ngram_windows_follow_the_committed_tokens() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true);
         p.register(
             "r".to_owned(),
             RequestState::new(vec![10, 11, 12, 13], 8, BTreeSet::new(), true, None, false),
@@ -2319,7 +2322,7 @@ mod tests {
     fn a_verify_step_past_the_physical_extent_is_an_engine_error() {
         // A 4-token verify window over buffers holding 8 tokens: a request
         // at 4 committed tokens fits one more window exactly, not two.
-        let mut p = OutputProcessor::new(Some(4), 1, Some(8), Role::Plain, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(Some(4), 1, Some(8), Role::Plain, NO_FINISH_LOG, true);
         register(&mut p, "r", 3, 100, &[]);
         p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[1], &[1]))
             .unwrap();

@@ -97,32 +97,8 @@ impl Copy {
                     .sum();
                 grid.src_pages.len() as u64 * per_page
             }
-            Copy::Spans { lengths, .. } => lengths
-                .iter()
-                .map(|&length| u64::try_from(length).unwrap_or(0))
-                .sum(),
+            Copy::Spans { lengths, .. } => lengths.iter().sum(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn copy_bytes_counts_pages_and_spans() {
-        let grid = Copy::Pages(PageGrid {
-            src_pages: vec![1, 2],
-            dst_pages: vec![3, 4],
-            fields: vec![[0, 0, 0, 0, 128], [0, 0, 0, 0, 64]],
-        });
-        assert_eq!(grid.bytes(), 2 * (128 + 64));
-        let spans = Copy::Spans {
-            sources: vec![0, 0],
-            destinations: vec![0, 0],
-            lengths: vec![10, 20],
-        };
-        assert_eq!(spans.bytes(), 30);
     }
 }
 
@@ -307,4 +283,25 @@ fn sleep_or_stop(stop: &std::sync::mpsc::Receiver<()>, duration: Duration) -> bo
         stop.recv_timeout(duration),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_bytes_counts_pages_and_spans() {
+        let grid = Copy::Pages(PageGrid {
+            src_pages: vec![1, 2],
+            dst_pages: vec![3, 4],
+            fields: vec![[0, 0, 0, 0, 128], [0, 0, 0, 0, 64]],
+        });
+        assert_eq!(grid.bytes(), 2 * (128 + 64));
+        let spans = Copy::Spans {
+            sources: vec![0, 0],
+            destinations: vec![0, 0],
+            lengths: vec![10, 20],
+        };
+        assert_eq!(spans.bytes(), 30);
+    }
 }
