@@ -26,6 +26,8 @@ import dataclasses
 import os
 import re
 import socket
+import subprocess
+import sys
 
 import psutil
 
@@ -42,6 +44,39 @@ DIST_INIT_DEFAULT_PORT = 23456
 
 _BRACKET_RE = re.compile(r"\[([^\]]*)\]")
 _EPHEMERAL_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
+
+
+def _supports_allocator_setting(setting: str) -> bool:
+    """Check the native parser without changing the launcher's allocator state."""
+    # Even reading a snapshot initializes allocator settings, so keep capability
+    # detection in a child without visible GPUs before worker processes fork.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import torch; torch.cuda.memory._set_allocator_settings({setting!r})",
+        ],
+        env=dict(
+            os.environ,
+            CUDA_VISIBLE_DEVICES="",
+            HIP_VISIBLE_DEVICES="",
+            ROCR_VISIBLE_DEVICES="",
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode == 0:
+        return True
+    name = setting.split(":", 1)[0]
+    if (
+        f"Unrecognized CachingAllocator option: {name}" in result.stderr
+        or f"Unrecognized key '{name}'" in result.stderr
+    ):
+        return False
+    raise RuntimeError(
+        f"Cannot probe pinned allocator setting: {result.stderr.strip()}"
+    )
 
 
 def set_pinned_allocator_default() -> None:
@@ -62,7 +97,8 @@ def set_pinned_allocator_default() -> None:
     config = os.environ.get(key, "").strip().rstrip(",")
     if "pinned_max_round_threshold_mb" not in config:
         default = "pinned_max_round_threshold_mb:1024"
-        os.environ[key] = f"{config},{default}" if config else default
+        if _supports_allocator_setting(default):
+            os.environ[key] = f"{config},{default}" if config else default
 
 
 def set_rocm_tool_registration_default() -> None:
