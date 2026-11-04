@@ -295,6 +295,16 @@ def fail_stop(launch, site, detail):
             ``SITE_ABORTED`` (a peer stopped this wait) the record holds the
             abort word instead, the marker that names the origin.
     """
+    record_failure(launch, site, detail)
+    trap()
+
+
+@gluon.jit
+def record_failure(launch, site, detail):
+    """:func:`fail_stop`'s record without the trap: claim the error record
+    (the first claim on this GPU wins), write it and its host copy, and
+    drain. A caller that must publish something after its record, such as a
+    peer abort marker, calls this first and then traps itself."""
     lane = _lanes()
     # One load, on the failure path only.
     abort = gl.load(launch.abort_ptr + lane * 0, cache_modifier=".cv")
@@ -329,7 +339,6 @@ def fail_stop(launch, site, detail):
     to_host = wave_owns & (word < _RECORD_FIELDS) & (mirror != 0)
     gl.store(host + word, field_of, mask=to_host, cache_modifier=".wt")
     release_drain()
-    trap()
 
 
 @gluon.jit
