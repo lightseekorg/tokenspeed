@@ -85,7 +85,7 @@ def triton_hadamard_transform_128(
             f"triton_hadamard_transform_128 requires last dim 128, got {x.shape[-1]}"
         )
     if not x.is_cuda:
-        raise RuntimeError("triton_hadamard_transform_128 requires a CUDA tensor")
+        raise RuntimeError("triton_hadamard_transform_128 requires a CUDA or ROCm tensor")
     if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError(
             f"triton_hadamard_transform_128 does not support dtype {x.dtype}"
