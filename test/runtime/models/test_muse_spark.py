@@ -1319,7 +1319,7 @@ def test_replicated_qkv_gate_weight_hands_out_this_ranks_rows(
     bf16_default_dtype,
 ) -> None:
     """Replicated for owned rows, the packed weight holds every rank's rows;
-    the rank's own rows (what a fused layer is handed) are exactly the
+    the rank's own rows (what a monokernel layer is handed) are exactly the
     sharded weight the regular path keeps on that rank."""
     hidden, head_dim, heads, kv_heads, ranks = 32, 8, 8, 4, 4
     shards = (("q", heads), ("k", kv_heads), ("v", kv_heads), ("g", heads))
