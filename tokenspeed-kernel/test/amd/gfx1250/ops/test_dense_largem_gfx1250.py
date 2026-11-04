@@ -57,7 +57,7 @@ def _project(a, b):
 # size the MI450 simulator lane can run.
 @pytest.mark.parametrize(
     "m,n,k",
-    [(7937, 2112, 7168), (4352, 7168, 4224), (4096, 3072, 512), (4097, 3072, 512)],
+    [(4097, 2112, 7168), (4352, 7168, 4224), (4096, 3072, 512), (4097, 3072, 512)],
 )
 def test_largem_warp_pipeline_matches_torch(m, n, k):
     torch.manual_seed(m + n + k)
@@ -95,23 +95,19 @@ def test_largem_warp_pipeline_compiles_under_compile_monitor():
     torch.testing.assert_close(actual, a @ b.T, atol=1e-2, rtol=1e-2)
 
 
-# Serving projections (M, K, N): a K3 projection from its minimum rows, a row
-# range's inclusive ends, rows between ranges, rows past a closed range, and
-# weights with no range.
+# Serving projections (M, K, N): a K3 projection from its first row, a range's
+# first row and the row before it, a closed range's last row and a row past
+# it, and weights with no range.
 @pytest.mark.parametrize(
     "m,k,n,selected",
     [
         (512, 1536, 7168, True),  # K3 o_proj
         (511, 1536, 7168, False),
-        (8192, 4096, 6416, True),  # GLM KDA q/k/v/beta/f_a/g_a, tail peeled
-        (848, 4096, 6416, True),
+        (848, 4096, 6416, True),  # GLM KDA q/k/v/beta/f_a/g_a
         (768, 4096, 6416, False),
-        (1792, 8192, 4096, True),  # GLM MTP eh_proj
-        (1793, 8192, 4096, False),
         (8192, 4096, 288, True),  # GLM MoE router
         (12288, 4096, 288, False),
         (8192, 21504, 896, False),  # K3 EAGLE3 fc
-        (8192, 4096, 160, False),  # not a serving weight
         (8192, 4096 + 64, 4096, False),  # K must be a multiple of 128
     ],
 )

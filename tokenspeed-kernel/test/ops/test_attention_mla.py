@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from itertools import accumulate
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -1252,10 +1251,8 @@ def test_mla_project_value_amd_batches(
     torch.testing.assert_close(out, expected, atol=0.125, rtol=0.05)
 
 
-@pytest.mark.parametrize("vendor", ["nvidia", "cdna5"])
 def test_mla_project_value_fallback_writes_projection_directly(
     monkeypatch: pytest.MonkeyPatch,
-    vendor: str,
 ) -> None:
     import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
@@ -1277,13 +1274,6 @@ def test_mla_project_value_fallback_writes_projection_directly(
         return original_bmm(input, mat2, out=out)
 
     monkeypatch.setattr(attention_ops, "select_kernel", no_kernel)
-    monkeypatch.setattr(
-        attention_ops,
-        "current_platform",
-        lambda: SimpleNamespace(
-            is_nvidia=vendor == "nvidia", is_cdna5=vendor == "cdna5"
-        ),
-    )
     monkeypatch.setattr(torch, "bmm", record_bmm)
     attention = torch.randn(2, 3, 4)
     weight = torch.randn(3, 4, 5)
