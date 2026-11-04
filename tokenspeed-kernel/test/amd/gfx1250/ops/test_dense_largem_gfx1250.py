@@ -117,6 +117,7 @@ def test_largem_selection_follows_measured_rows(m, k, n, selected):
     assert use_gluon_largem_gfx1250(m, k, n) is selected
 
 
+
 def _cold_kernel(kernel):
     kernel.device_caches.clear()
     return kernel
@@ -177,6 +178,8 @@ def test_largem_row_strided_a_matches_torch():
     assert _try_gluon_largem_gfx1250(projected[:, 6287:6415], b) is None
     odd = torch.empty(m, k + 4, device="cuda", dtype=torch.bfloat16)[:, :k]
     assert _try_gluon_largem_gfx1250(odd, b) is None
+    with pytest.raises(ValueError, match="16-byte"):
+        gluon_mm_a16w16_largem_gfx1250(odd, b)
 
 
 def test_largem_warp_pipeline_fp32_output_row_strided_a():

@@ -1827,6 +1827,11 @@ def gluon_mm_a16w16_largem_gfx1250(
             "gfx1250 large-M projection requires GPU BF16 A with unit column "
             "stride and contiguous B"
         )
+    if not A.is_contiguous() and (A.stride(0) % 8 or A.data_ptr() % 16):
+        raise ValueError(
+            "gfx1250 large-M projection requires a strided A's rows to start "
+            "on 16-byte boundaries"
+        )
     if k % 128 != 0:
         raise ValueError(
             f"gfx1250 large-M projection requires K divisible by 128, got K={k}"

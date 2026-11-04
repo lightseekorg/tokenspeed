@@ -569,8 +569,8 @@ projections with many rows.
 #### Contract
 
 - The operation computes `A @ B.T` from BF16 `[M, K]` with a unit column
-  stride and contiguous BF16 `[N, K]`, with K a multiple of 128, producing a
-  contiguous BF16 `[M, N]`.
+  stride and rows starting on 16-byte boundaries, and contiguous BF16
+  `[N, K]`, with K a multiple of 128, producing a contiguous BF16 `[M, N]`.
 - `use_gluon_largem_gfx1250` selects the Kimi K3 projections in
   `_LARGEM_SHAPES` from 512 rows. Other BF16 serving weights are selected
   when `_LARGEM_ROWS` lists their `(K, N)` and a row range holding M, where
