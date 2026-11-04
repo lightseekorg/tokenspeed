@@ -20,11 +20,22 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
-from tokenspeed_kernel.thirdparty.deepgemm import block_fp8_mm
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    block_fp8_mm,
+    grouped_fp8_mm,
+    grouped_fp8_weight_scales,
+)
 
 
 @register_kernel(
@@ -123,3 +134,42 @@ def deepgemm_mm_fp8_blockscale(
             "DeepGEMM out must be contiguous BF16 [M,N] on the operand device"
         )
     return block_fp8_mm(A, B, A_scales, B_scales, out)
+
+
+if importlib.util.find_spec("deep_gemm") is not None:
+
+    @register_kernel(
+        "gemm",
+        "grouped_fp8_projection",
+        name="deepgemm_grouped_fp8_projection",
+        solution="deepgemm",
+        # SM100's MMA takes the per-32 UE8M0 scales natively.
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.float8_e4m3fn),
+                    weight=dense_tensor_format(torch.float8_e4m3fn),
+                )
+            }
+        ),
+        traits={
+            "aligned": frozenset({True}),
+            "is_cuda": frozenset({True}),
+        },
+        priority=Priority.PERFORMANT,
+        weight_preprocessor=grouped_fp8_weight_scales,
+    )
+    def deepgemm_grouped_fp8_projection(
+        x: torch.Tensor,
+        x_scales: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """DeepGEMM grouped E4M3 projection; see ``grouped_fp8_projection``."""
+        return grouped_fp8_mm(x, x_scales, weight, weight_scales, out)

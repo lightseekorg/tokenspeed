@@ -25,7 +25,8 @@ duplicate and missing local text tensors, and reports explicit vision/draft skip
 Dense FP8 codes stay unchanged: 32x32 E8M0 scale rows expand losslessly to 1x32.
 On Hopper the dense projections load as BF16 weights instead -- codes widened on
 copy, scales folded in after loading, both exact -- and run the BF16 GEMM.
-Only grouped wo_a is dequantized to BF16, after selecting this TP rank's rows.
+Grouped wo_a keeps its FP8 codes where a grouped FP8 kernel serves them, and is
+dequantized to BF16 otherwise, after selecting this TP rank's rows.
 Engram tables load local FP8/E8M0 rows in bounded chunks without table conversion.
 The unquantized LM head follows the model loading dtype, including its logits.
 Packed routed experts use the V4 MoE loader, with zero-padded intermediate lanes
@@ -82,13 +83,16 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     index_query_rope_weights,
     rope_inplace,
     rope_pad_query,
+    rope_quantize_fp8_grouped,
     rope_weights_inplace,
 )
 from tokenspeed_kernel.ops.gemm import (
     dsv4_linear_fp32,
     grouped_bf16_projection,
     grouped_bf16_projection_quantize_fp8,
+    grouped_fp8_projection,
     mm,
+    prepare_grouped_fp8_projection,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
@@ -602,6 +606,15 @@ class DeepseekV41RotaryEmbedding(nn.Module):
         cache = self.inverse_cos_sin_cache if inverse else self.cos_sin_cache
         return rope_inplace(x, positions, cache, None)
 
+    def inverse_quantize_grouped(
+        self, x: torch.Tensor, positions: torch.Tensor, groups: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Undo RoPE on CUDA [T,H,512] heads and cast each group to FP8; see rope_quantize_fp8_grouped."""
+        self._prepare_cache(x.device)
+        return rope_quantize_fp8_grouped(
+            x, positions, self.inverse_cos_sin_cache, groups
+        )
+
 
 def v41_hc_mixes(
     x: torch.Tensor,
@@ -978,6 +991,11 @@ class DeepseekV41Attention(nn.Module):
             add_prefix("wo_a", prefix),
             mapping,
         )
+        # Decided by the first wo_a load: True when wo_a.weight keeps the
+        # checkpoint's FP8 codes for a grouped FP8 kernel, with wo_a_scales in
+        # that kernel's layout; False when it holds BF16 weights.
+        self.wo_a_fp8: bool | None = None
+        self.register_buffer("wo_a_scales", None)
         self.wo_b = RowParallelLinear(
             input_size=config.o_groups * config.o_lora_rank,
             output_size=config.hidden_size,
@@ -1415,30 +1433,40 @@ class DeepseekV41Attention(nn.Module):
         if out.shape[0] == 0 and query_gather is not None:
             return hidden_states.new_empty((0, self.wo_b.output_size))
         out = out[:, : self.n_local_heads]
-        if out_rope_cache is None:
-            out = self.rotary_emb.apply_owned(out, positions, True)
-        grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
         weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
         target = None
         if self.mapping.attn.head_tp_size > 1:
             target = _all_reduce_output(
-                (grouped.shape[0], self.wo_b.output_size),
-                grouped,
+                (out.shape[0], self.wo_b.output_size),
+                out,
                 self.mapping.attn.head_tp_group,
             )
         method = self.wo_b.quant_method
-        if (
-            grouped.is_cuda
-            and (current_platform().is_cdna4 or current_platform().is_cdna5)
-            and isinstance(method, _ReferenceFp8LinearMethod)
-            and method.prepared_weight_scales is None
-        ):
-            # wo_b's group-32 activation quantization runs in wo_a's epilogue.
-            codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
-            out, _ = self.wo_b(codes, scale=scales, out=target)
+        if self.wo_a_fp8:
+            # One kernel undoes RoPE and casts every 32 channels to FP8, as the
+            # reference rounds o before wo_a. Only CDNA attention rotates back
+            # itself, and no grouped FP8 kernel serves CDNA.
+            codes, scales = self.rotary_emb.inverse_quantize_grouped(
+                out, positions, self.n_local_groups
+            )
+            out = grouped_fp8_projection(codes, scales, weight, self.wo_a_scales, None)
+            out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
         else:
-            out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
-            out, _ = self.wo_b(out, scale=None, out=target)
+            if out_rope_cache is None:
+                out = self.rotary_emb.apply_owned(out, positions, True)
+            grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
+            if (
+                grouped.is_cuda
+                and (current_platform().is_cdna4 or current_platform().is_cdna5)
+                and isinstance(method, _ReferenceFp8LinearMethod)
+                and method.prepared_weight_scales is None
+            ):
+                # wo_b's group-32 activation quantization runs in wo_a's epilogue.
+                codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
+                out, _ = self.wo_b(codes, scale=scales, out=target)
+            else:
+                out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+                out, _ = self.wo_b(out, scale=None, out=target)
         if self.mapping.attn.head_tp_size > 1 and reduce_output:
             out = all_reduce(
                 out,
@@ -2865,7 +2893,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def _load_wo_a(self, name, tensor, pending) -> None:
         layer_id = int(name.split(".")[1])
-        linear = self.model.layers[layer_id].attn.wo_a
+        attn = self.model.layers[layer_id].attn
+        linear = attn.wo_a
         field = name.rsplit(".", 1)[1]
         expected = (linear.output_size, linear.input_size)
         if field == "scale":
@@ -2897,17 +2926,43 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         if weight.dtype == torch.bfloat16:
             if scale is not None:
                 raise ValueError(f"{key}: BF16 wo_a must not have a quantization scale")
+            if attn.wo_a_fp8:
+                raise ValueError(f"{key}: BF16 wo_a cannot replace loaded FP8 codes")
             default_weight_loader(linear.weight, weight)
+            attn.wo_a_fp8 = False
             # Keep the dtype marker to reject a scale arriving after BF16 weights.
             pair["weight"] = weight.new_empty(0)
         elif scale is not None:
-            scale = scale.to(linear.weight.device).view(torch.float8_e8m0fnu).float()
-            scale = scale.repeat_interleave(32, dim=0)[start % 32 : start % 32 + rows]
-            weight = weight.to(linear.weight.device).float().unflatten(-1, (-1, 32))
-            default_weight_loader(
-                linear.weight,
-                (weight * scale.unsqueeze(-1)).flatten(-2).to(torch.bfloat16),
-            )
+            device = linear.weight.device
+            # 32x32 blocks expand losslessly to one scale per 32 input channels.
+            scale = scale.to(device).repeat_interleave(32, dim=0)
+            scale = scale[start % 32 : start % 32 + rows]
+            weight = weight.to(device)
+            prepared = None
+            # The fused inverse-RoPE quantizer takes 512-wide heads, 64 rotated.
+            if attn.wo_a_fp8 is not False and (
+                attn.head_dim,
+                attn.rotary_emb.dim,
+            ) == (512, 64):
+                prepared = prepare_grouped_fp8_projection(
+                    weight, scale, attn.n_local_groups
+                )
+            if attn.wo_a_fp8 is None:
+                attn.wo_a_fp8 = prepared is not None
+                if prepared is not None:
+                    linear.weight.data = weight
+                    attn.wo_a_scales = prepared
+            elif attn.wo_a_fp8:
+                # Refresh in place: captured graphs keep reading these buffers.
+                linear.weight.copy_(weight)
+                attn.wo_a_scales.copy_(prepared)
+            if not attn.wo_a_fp8:
+                scale = scale.view(torch.float8_e8m0fnu).float()
+                weight = weight.float().unflatten(-1, (-1, 32))
+                default_weight_loader(
+                    linear.weight,
+                    (weight * scale.unsqueeze(-1)).flatten(-2).to(torch.bfloat16),
+                )
             del pending[key]
 
     @torch.no_grad()

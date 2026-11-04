@@ -89,6 +89,8 @@ __all__ = [
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
     "grouped_bf16_projection_quantize_fp8",
+    "grouped_fp8_projection",
+    "prepare_grouped_fp8_projection",
     # MV: small-M dense projection
     "mv",
     "mv_weightless_rmsnorm_gated_sigmoid",
@@ -1281,6 +1283,112 @@ def grouped_bf16_projection_quantize_fp8(
             solution=None,
         )
     return kernel(x, weight)
+
+
+def _grouped_fp8_projection_kernel(
+    device: torch.device, output_dim: int, input_dim: int
+) -> SelectedKernel:
+    return select_kernel(
+        "gemm",
+        "grouped_fp8_projection",
+        format_signature(
+            x=dense_tensor_format(_fp8_dtype),
+            weight=dense_tensor_format(_fp8_dtype),
+        ),
+        traits={
+            "aligned": output_dim % 64 == 0 and input_dim % 128 == 0,
+            "is_cuda": device.type == "cuda",
+        },
+    )
+
+
+def prepare_grouped_fp8_projection(
+    weight: torch.Tensor, weight_scales: torch.Tensor, groups: int
+) -> torch.Tensor | None:
+    """Prepare E4M3 grouped projection scales once for ``grouped_fp8_projection``.
+
+    Args:
+        weight: E4M3 ``[groups * output_dim, input_dim]`` codes; group ``g``
+            owns rows ``[g * output_dim, (g + 1) * output_dim)``.
+        weight_scales: Canonical uint8 UE8M0 scales
+            ``[groups * output_dim, input_dim // 32]``; left unchanged.
+        groups: Number of groups.
+
+    Returns:
+        New scales in the serving kernel's layout, or None when no registered
+        kernel serves these weights on their device; callers then keep their
+        dequantized path.
+    """
+    if (
+        weight.ndim != 2
+        or weight.dtype != _fp8_dtype
+        or not weight.is_contiguous()
+        or groups <= 0
+        or weight.shape[0] % groups
+        or weight.shape[1] % 32
+    ):
+        raise ValueError(
+            "grouped FP8 weights must be contiguous E4M3 [groups * N, K], K % 32 == 0"
+        )
+    if (
+        weight_scales.dtype != torch.uint8
+        or tuple(weight_scales.shape) != (weight.shape[0], weight.shape[1] // 32)
+        or weight_scales.device != weight.device
+    ):
+        raise ValueError("grouped FP8 weights require canonical UE8M0 [N, K/32] scales")
+    output_dim = weight.shape[0] // groups
+    try:
+        kernel = _grouped_fp8_projection_kernel(
+            weight.device, output_dim, weight.shape[1]
+        )
+    except NoKernelFoundError:
+        return None
+    preprocess = KernelRegistry.get().get_by_name(kernel.name).weight_preprocessor
+    return preprocess(weight_scales, groups)
+
+
+def grouped_fp8_projection(
+    x: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute ``einsum('tgk,gnk->tgn')`` of E4M3 operands with 1x32 UE8M0 scales.
+
+    Args:
+        x: E4M3 ``[tokens, groups, input_dim]`` codes with unit inner stride,
+            as ``rope_quantize_fp8_grouped`` returns them.
+        x_scales: Int32 ``[tokens, groups, input_dim // 128]`` packed UE8M0
+            scales in DeepGEMM's SM100 MN-major, TMA-aligned layout, as
+            ``rope_quantize_fp8_grouped`` returns them.
+        weight: E4M3 ``[groups, output_dim, input_dim]`` codes, the weight
+            given to ``prepare_grouped_fp8_projection`` viewed per group.
+        weight_scales: Scales from ``prepare_grouped_fp8_projection``.
+        out: Optional contiguous BF16 ``[tokens, groups, output_dim]`` result.
+            None allocates a fresh result.
+
+    Returns:
+        BF16 ``[tokens, groups, output_dim]``; ``out`` when provided.
+    """
+    if x.ndim != 3 or weight.ndim != 3 or x.dtype != _fp8_dtype:
+        raise ValueError("grouped FP8 projection takes E4M3 [tokens, groups, K] input")
+    if weight.dtype != _fp8_dtype or x.shape[1:] != (weight.shape[0], weight.shape[2]):
+        raise ValueError("grouped FP8 projection operands must share groups and K")
+    expected = (x.shape[0], weight.shape[0], weight.shape[1])
+    if out is None:
+        out = torch.empty(expected, dtype=torch.bfloat16, device=x.device)
+    elif (
+        tuple(out.shape) != expected
+        or out.dtype != torch.bfloat16
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("grouped FP8 projection out must be contiguous BF16")
+    if x.shape[0] == 0:
+        return out
+    kernel = _grouped_fp8_projection_kernel(x.device, weight.shape[1], weight.shape[2])
+    return kernel(x, x_scales, weight, weight_scales, out)
 
 
 def dsv4_linear_fp32(

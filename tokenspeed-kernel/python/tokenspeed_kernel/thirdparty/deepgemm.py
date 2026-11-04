@@ -49,3 +49,39 @@ def block_fp8_mm(
         disable_ue8m0_cast=True,
     )
     return out
+
+
+def grouped_fp8_weight_scales(scales: torch.Tensor, groups: int) -> torch.Tensor:
+    """Pack 1x32 UE8M0 weight scales ``[groups * n, k / 32]`` for ``grouped_fp8_mm``."""
+    import deep_gemm
+
+    rows, blocks = scales.shape
+    exponents = scales.to(torch.int32) << 23
+    return deep_gemm.transform_sf_into_required_layout(
+        exponents.view(torch.float32).view(groups, rows // groups, blocks),
+        rows // groups,
+        blocks * 32,
+        (1, 1, 32),
+        num_groups=groups,
+        is_sfa=False,
+    )
+
+
+def grouped_fp8_mm(
+    x: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """``einsum('tgk,gnk->tgn')`` of E4M3 operands with 1x32 UE8M0 scales."""
+    import deep_gemm
+
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd",
+        (x, x_scales),
+        (weight, weight_scales),
+        out,
+        recipe=(1, 1, 32),
+    )
+    return out

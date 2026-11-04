@@ -36,6 +36,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsv41 import rope_quantize_fp8_grouped
 from tokenspeed_kernel.ops.quantization.triton import (
     _quantize_fp8_group32_swizzled,
     triton_rmsnorm_fp8_group32_ue8m0,
@@ -248,12 +249,32 @@ def _case_rmsnorm_fp8_group32_swizzled():
     return real, run
 
 
+def _case_rope_quantize_fp8_grouped():
+    torch.manual_seed(107)
+    # 37 tokens: programs past T (aligned to 4) only zero padding scale rows,
+    # and they must wait too.
+    tokens, heads = 37, 64
+    real = torch.randn(tokens, heads, 512, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE) * 3
+    angles = torch.arange(4096, device=DEVICE)[:, None].float() * torch.exp(
+        -torch.arange(32, device=DEVICE).float() / 4
+    )
+    cache = torch.cat((angles.cos(), -angles.sin()), dim=-1)
+
+    def run(values):
+        codes, scales = rope_quantize_fp8_grouped(values, positions, cache, 8)
+        return (codes, scales.contiguous())
+
+    return real, run
+
+
 _CASES = {
     "mhc_post_hc4": _case_mhc_post,
     "mhc_pre_mix_hc4": _case_mhc_pre_mix,
     "mhc_pre_layer_norm_hc4": _case_mhc_pre_layer_norm,
     "fp8_group32_ue8m0_quantize_swizzled": _case_quantize_fp8_group32_swizzled,
     "rmsnorm_fp8_group32_ue8m0": _case_rmsnorm_fp8_group32_swizzled,
+    "dsv41_rope_quantize_fp8_grouped": _case_rope_quantize_fp8_grouped,
 }
 
 
