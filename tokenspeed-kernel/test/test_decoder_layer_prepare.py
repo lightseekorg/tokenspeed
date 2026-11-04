@@ -21,7 +21,7 @@
 """Selection of fused decoder layers through the kernel registry."""
 
 import pytest
-from tokenspeed_kernel.ops.decoder_layer import (
+from tokenspeed_kernel.ops.monokernel import (
     DECODER_LAYER_SIGNATURE,
     PlanKey,
     prepare_decoder_layer,

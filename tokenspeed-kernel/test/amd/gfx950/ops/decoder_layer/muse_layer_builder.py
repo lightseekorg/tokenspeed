@@ -41,7 +41,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     RopeStyle,
     Rotary,
 )
-from tokenspeed_kernel.ops.decoder_layer import PlanKey
+from tokenspeed_kernel.ops.monokernel import PlanKey
 
 # make_experts lives with the native MoE tests.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "moe"))

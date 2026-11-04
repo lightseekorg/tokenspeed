@@ -63,18 +63,18 @@ from muse_layer_reference import (  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
     CLEARED_AREAS,
 )
-from tokenspeed_kernel.ops.decoder_layer import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
     PlanKey,
     prepare_decoder_layer_state,
 )
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (  # noqa: E402
     EX_IDS_TAGS,
     EX_S_TAGS,
     EX_XQ_TAGS,
     KPARTS,
     MAX_ROWS,
 )
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.prepared import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (  # noqa: E402
     DEFAULT_PLAN_FIELDS,
     MuseSparkFusedDecoderLayer,
 )

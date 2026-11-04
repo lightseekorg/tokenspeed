@@ -88,8 +88,8 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
     unp_sums_publish,
     xn_wait,
 )
-from tokenspeed_kernel.ops.decoder_layer import PlanKey
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark import plan_variants
+from tokenspeed_kernel.ops.monokernel import PlanKey
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import plan_variants
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import InputStrides
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     AttentionConfig,

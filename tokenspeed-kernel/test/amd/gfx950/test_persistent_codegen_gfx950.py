@@ -502,7 +502,7 @@ _ASM_SITES = {
     _KA + "attention/mha/decode.py": (False, {"_opaque_f32", "arrive"}),
     _KA + "moe/mxfp4/native_stream.py": (False, set()),
     _KT + "communication/_iris/muse_spark/fused_layer.py": (True, set()),
-    _KT + "decoder_layer/_gluon/muse_spark/layer.py": (True, set()),
+    _KT + "monokernel/_gluon/muse_spark/layer.py": (True, set()),
 }  # fmt: skip
 
 

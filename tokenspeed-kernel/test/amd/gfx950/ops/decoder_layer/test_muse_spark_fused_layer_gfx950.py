@@ -79,13 +79,13 @@ from muse_layer_reference import (  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
     BOX_WORDS,
 )
-from tokenspeed_kernel.ops.decoder_layer import (  # noqa: E402
+from tokenspeed_kernel.ops.layernorm.fused_norm import (  # noqa: E402
+    weightless_rmsnorm_gated_sigmoid,
+)
+from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
     PlanKey,
     prepare_decoder_layer,
     prepare_decoder_layer_state,
-)
-from tokenspeed_kernel.ops.layernorm.fused_norm import (  # noqa: E402
-    weightless_rmsnorm_gated_sigmoid,
 )
 
 # Cached tokens per request before the verify rows. Full layers read the

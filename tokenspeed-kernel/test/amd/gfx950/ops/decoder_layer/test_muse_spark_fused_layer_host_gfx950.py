@@ -36,22 +36,22 @@ pytest.importorskip("tokenspeed_kernel_amd")
 from tokenspeed_kernel.numerics.torch.residual import (  # noqa: E402
     torch_post_norm_residual_pre_norm,
 )
-from tokenspeed_kernel.ops.decoder_layer import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
     LAYER_KINDS,
     PlanKey,
     decoder_layer_state_heap_bytes,
     prepare_decoder_layer,
 )
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import (  # noqa: E402
     PLAN_REQUESTS,
 )
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import (  # noqa: E402
     layer as composer,
 )
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import (  # noqa: E402
     plan_variants,
 )
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.prepared import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (  # noqa: E402
     _bf16_with_offset,
     _router_hi_lo,
 )

@@ -39,9 +39,7 @@ import pytest
 import torch
 
 pytest.importorskip("tokenspeed_kernel_amd")
-layer = pytest.importorskip(
-    "tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer"
-)
+layer = pytest.importorskip("tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer")
 
 from asm_checks import (  # noqa: E402
     _innermost_loop_lines,

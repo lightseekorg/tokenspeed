@@ -5,9 +5,9 @@ where one kernel launch runs a whole decoder layer, its cross-GPU exchanges
 included, with one workgroup resident on every compute unit. A deviation from
 the rules here is a bug unless this document is updated in the same change.
 The kernel op's interface is in
-[decoder_layer/README.md](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/decoder_layer/README.md);
+[monokernel/README.md](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md);
 the gfx950 implementation (roles, hand-offs, plan fields) in
-[decoder_layer/_gluon/README.md](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/decoder_layer/_gluon/README.md).
+[monokernel/_gluon/README.md](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/_gluon/README.md).
 
 ## The problem this solves
 

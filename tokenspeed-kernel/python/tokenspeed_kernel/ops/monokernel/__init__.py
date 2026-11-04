@@ -195,4 +195,4 @@ def decoder_layer_state_heap_bytes(*, recipe, world_size, max_requests) -> int:
 
 
 # Backend registration (side-effect import).
-import tokenspeed_kernel.ops.decoder_layer.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.monokernel.gluon  # noqa: E402,F401

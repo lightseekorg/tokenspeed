@@ -52,8 +52,8 @@ Per XCD, in launch order:
 
 from __future__ import annotations
 
-from tokenspeed_kernel.ops.decoder_layer import PlanKey
-from tokenspeed_kernel.ops.decoder_layer._gluon.plan import (
+from tokenspeed_kernel.ops.monokernel import PlanKey
+from tokenspeed_kernel.ops.monokernel._gluon.plan import (
     GRID,
     SLOTS,
     XCDS,

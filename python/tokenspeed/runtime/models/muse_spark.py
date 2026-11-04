@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.decoder_layer import FusedDecoderLayer
 from tokenspeed_kernel.ops.gemm import (
     _use_mv,
     fp32_router_gemv_counters,
@@ -66,6 +65,7 @@ from tokenspeed_kernel.ops.moe import (
     warmup_moe_sorted_prefill,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.monokernel import FusedDecoderLayer
 from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant, rmsnorm_nvfp4_quant
 from tokenspeed_kernel.ops.residual import (
     boundary_gathers_mailbox,

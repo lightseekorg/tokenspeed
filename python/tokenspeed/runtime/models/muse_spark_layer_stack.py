@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.decoder_layer import FusedDecoderLayer, PlanKey
+from tokenspeed_kernel.ops.monokernel import FusedDecoderLayer, PlanKey
 
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -99,7 +99,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
     def heap_bytes(self, model: MuseSparkModel, world_size: int) -> int:
         """Symmetric heap bytes the fused layers' state takes (0 when no
         layer can run fused); the Iris heap is created with them."""
-        from tokenspeed_kernel.ops.decoder_layer import (
+        from tokenspeed_kernel.ops.monokernel import (
             decoder_layer_state_heap_bytes,
         )
 
@@ -114,7 +114,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
         the decode shapes they serve; log the startup report. Runs once,
         after the Iris heap exists and before the KV cache is sized or a
         graph is captured."""
-        from tokenspeed_kernel.ops.decoder_layer import (
+        from tokenspeed_kernel.ops.monokernel import (
             prepare_decoder_layer,
             prepare_decoder_layer_state,
         )

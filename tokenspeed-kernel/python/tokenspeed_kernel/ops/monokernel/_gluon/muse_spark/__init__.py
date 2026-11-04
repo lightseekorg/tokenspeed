@@ -24,7 +24,7 @@ PLAN_REQUESTS = (1, 2)
 
 def plan_variants():
     """Every plan key this leaf compiles: requests x layer kind x next kind."""
-    from tokenspeed_kernel.ops.decoder_layer import LAYER_KINDS, PlanKey
+    from tokenspeed_kernel.ops.monokernel import LAYER_KINDS, PlanKey
 
     return tuple(
         PlanKey(requests, kind, nxt)

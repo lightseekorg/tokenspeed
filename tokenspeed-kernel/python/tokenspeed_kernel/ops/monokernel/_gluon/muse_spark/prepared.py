@@ -44,8 +44,8 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
     MAX_ROWS,
     MuseNativeIrisState,
 )
-from tokenspeed_kernel.ops.decoder_layer import PlanKey
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer import (
+from tokenspeed_kernel.ops.monokernel import PlanKey
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (
     ATT_BLOCK_M,
     EXCHANGE_WORDS,
     FULL_PROGRAMS,

@@ -23,10 +23,10 @@
 import dataclasses
 
 import pytest
-from tokenspeed_kernel.ops.decoder_layer import PlanKey
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark import plan_variants
-from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.plan import muse_plan
-from tokenspeed_kernel.ops.decoder_layer._gluon.plan import (
+from tokenspeed_kernel.ops.monokernel import PlanKey
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import plan_variants
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.plan import muse_plan
+from tokenspeed_kernel.ops.monokernel._gluon.plan import (
     Clear,
     Load,
     PlanError,

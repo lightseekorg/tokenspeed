@@ -26,7 +26,7 @@ device (its plan checker runs on CPU).
 
 from __future__ import annotations
 
-from tokenspeed_kernel.ops.decoder_layer import DECODER_LAYER_SIGNATURE
+from tokenspeed_kernel.ops.monokernel import DECODER_LAYER_SIGNATURE
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 
@@ -57,7 +57,7 @@ class GluonDecoderLayerMuseSparkGfx950:
 
     @staticmethod
     def prepare_state(**kwargs):
-        from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.prepared import (
+        from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (
             MuseSparkDecoderLayerState,
         )
 
@@ -65,7 +65,7 @@ class GluonDecoderLayerMuseSparkGfx950:
 
     @staticmethod
     def heap_bytes(*, world_size: int, max_requests: int) -> int:
-        from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.prepared import (
+        from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (
             MuseSparkDecoderLayerState,
         )
 
@@ -74,7 +74,7 @@ class GluonDecoderLayerMuseSparkGfx950:
         )
 
     def __init__(self, *, plan_keys, weights, state) -> None:
-        from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.prepared import (
+        from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (
             DEADLINE_TICKS,
             DEFAULT_PLAN_FIELDS,
             MuseSparkFusedDecoderLayer,
