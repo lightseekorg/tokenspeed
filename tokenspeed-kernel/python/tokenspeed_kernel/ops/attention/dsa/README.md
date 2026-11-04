@@ -39,9 +39,8 @@ Install a FlashInfer build containing PR #7984 (tested source revision
 libraries. Select `solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
 and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`
-for serving. TRTLLM keeps its higher default priority, but it returns no LSE,
-so decode context parallelism selects Prims-TS for FP8 queries. The solution
-registers only when the installed FlashInfer provides the Prims-TS sparse MLA
+for serving. TRTLLM keeps its higher default priority, and also returns the
+LSE that decode context parallelism merges. The solution registers only when the installed FlashInfer provides the Prims-TS sparse MLA
 wrapper; otherwise such calls fall back to Triton. The indexer is unchanged.
 
 The upstream plan owns PDL scheduling. This adapter requires PDL enabled and
@@ -72,7 +71,8 @@ and host planning are excluded. These are kernel times, not serving throughput.
 
 ## Speculative verify width
 
-The FP8 index-K decode path supports one through eight query rows per request.
+On NVIDIA the FP8 index-K decode path supports one through eight query rows
+per request; the gfx950 Gluon scorers and sparse MLA decode stop at six.
 Eight rows cover DSpark's seven draft tokens plus the bonus token. DeepGEMM
 scores each row separately. The row at offset `j` can select only the first
 `seq_lens[request] - q_len_per_req + 1 + j` cache positions. The FlashInfer
@@ -210,14 +210,15 @@ never convert a plane:
 | `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
 
 An index-K plane can be a view into a shared cache arena. Both its key view
-and its scale view must preserve the plane's storage offset. In the packed
-FP8 format, each page stores all key bytes before that page's FP32 scales.
+and its scale view must preserve the plane's storage offset. The packed FP8
+row above is the plane's tensor shape; in memory each page stores the key
+bytes of all its slots first, then their FP32 scales.
 
-The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes; a
-leaf scoring the checkpoint's bf16 keys (an indexer in the RL trainer's
-order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}`, and
-the `batch_invariant` and `forced_initial_local` features, so a bf16 plane
-selects it and nothing else. A plane of any other dtype is a `TypeError`.
+The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes. A
+leaf scoring the checkpoint's bf16 keys registers `index_k_format={"bf16"}`
+and `index_k_layout={"packed"}`, so a bf16 plane selects it and nothing else;
+the one in the RL trainer's order also declares the `batch_invariant` and
+`forced_initial_local` features, the gfx950 ones below do not. A plane of any other dtype is a `TypeError`.
 
 On gfx950, `gluon_dsa_decode_topk_bf16_gfx950` and
 `gluon_dsa_prefill_topk_bf16_gfx950` score a bf16 plane with BF16 queries

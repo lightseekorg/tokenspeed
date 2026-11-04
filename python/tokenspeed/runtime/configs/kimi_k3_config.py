@@ -481,3 +481,9 @@ class KimiK3Config(PretrainedConfig):
     @property
     def vocab_size(self) -> int:
         return self.text_config.vocab_size
+
+
+class KimiK31Config(KimiK3Config):
+    """Kimi-K3.1: the Kimi-K3 config whose text config carries ``dsa_config``."""
+
+    model_type = "kimi_k31"

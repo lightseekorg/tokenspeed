@@ -77,14 +77,15 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3IrisState
+
     from tokenspeed.runtime.execution.context import ForwardContext
 
 # The q_a + kv_a + RoPE-key width the Iris MoE tail can project ahead
 # (``allreduce_sharded.MLA_QKV_A_WIDTH``).
 _PRECOMPUTED_QKV_A_WIDTH = 2112
 
-# No K3/K3.1 reference code defines this norm's epsilon; GLM-5's indexer
-# LayerNorm uses 1e-6, and so does this one.
+# The checkpoint names no epsilon for the index-key LayerNorm; 1e-6 is DeepSeek-V3.2's.
 _INDEX_K_NORM_EPS = 1e-6
 
 
@@ -289,7 +290,7 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
         # The attention group's K3 Iris state, once communication is prepared.
-        self.topk_iris_state = None
+        self.topk_iris_state: K3IrisState | None = None
 
     def _gather_prefill_topk_rows(
         self, local: torch.Tensor, local_lens: torch.Tensor, gather_dtype: torch.dtype
@@ -454,25 +455,12 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
     ) -> torch.Tensor:
         """The eager break: index-K write, top-k, and the sparse cores.
 
-        Like GLM-DSA's attention break, the cache writes and the
-        data-dependent top-k read the live ``ctx``, so they never run inside
-        a captured prefill segment; the a-projection and the gated ``o_proj``
-        around it stay token-shaped. The DSA leaf is the hybrid wrapper's
-        full-attention child: the shared top-k and the decode metadata are
-        the leaf's.
-
-        Every DSA operation stays in this break, and ``forward_dsa_core``
-        narrows a padded prefill-graph replay to its live rows: that is the
-        contract ``ModelConfig.dsa_padded_prefill_replay`` declares, under
-        which the DSA leaf admits breakable prefill graphs on the roles that
-        run prefill forwards, the PD prefill role and the aggregated role
-        (``configs/dsa.py`` ``dsa_padded_prefill_replay``). On the aggregated
-        role the replayed prefill rounds alternate with decode graph replays,
-        and the role admits the graphs only without ``--enable-mixed-batch``
-        (which aggregated DCP refuses anyway), so a replayed round is a pure
-        extend and the narrowed rows are all prefill rows, as on the prefill
-        role. Anything moved out of the break must be token-shaped and read no
-        backend metadata.
+        The cache writes and the data-dependent top-k read the live ``ctx``,
+        so every DSA operation stays here, and ``forward_dsa_core`` narrows a
+        padded prefill-graph replay to its live rows: the contract
+        ``ModelConfig.dsa_padded_prefill_replay`` declares. Anything moved out
+        of the break must be token-shaped and read no backend metadata. The
+        DSA leaf is the hybrid wrapper's full-attention child.
         """
         backend = ctx.attn_backend
         if isinstance(backend, HybridLinearAttnBackend):
@@ -510,18 +498,16 @@ class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
         prepared = super().prepare_communication_runtime(max_num_tokens)
         if self.language_model is not None:
             for layer in self.language_model.model.layers:
-                self_attn = getattr(layer, "self_attn", None)
-                if isinstance(self_attn, KimiK31SparseMLAAttention):
-                    self_attn.topk_iris_state = layer.k3_comm.iris_state
+                if isinstance(layer.self_attn, KimiK31SparseMLAAttention):
+                    layer.self_attn.topk_iris_state = layer.k3_comm.iris_state
         return prepared
 
     def _fuse_indexer_projections(self) -> None:
         if self.language_model is None:
             return
         for layer in self.language_model.model.layers:
-            self_attn = getattr(layer, "self_attn", None)
-            if isinstance(self_attn, KimiK31SparseMLAAttention):
-                self_attn.indexer.fuse_key_weight_projections()
+            if isinstance(layer.self_attn, KimiK31SparseMLAAttention):
+                layer.self_attn.indexer.fuse_key_weight_projections()
 
 
 EntryClass = [KimiK31ForConditionalGeneration]

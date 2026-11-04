@@ -48,7 +48,7 @@ def _compact(
     length = tl.load(Causal + row)
     col = tl.arange(0, BLOCK)
     page = tl.load(
-        Table + req * STRIDE + col,
+        Table + req.to(tl.int64) * STRIDE + col,
         mask=(req >= 0) & (req < ROWS) & (col < COLS),
         other=-1,
     )
