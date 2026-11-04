@@ -946,7 +946,11 @@ class ModelConfig:
                 )
                 if nextn_layers is not None and nextn_layers > 0:
                     self.num_attention_layers = nextn_layers
-        self.vocab_size = self.hf_text_config.vocab_size
+        # Sampling follows the output head; embeddings retain the HF input vocabulary.
+        self.vocab_size = (
+            getattr(self.hf_text_config, "output_vocab_size", None)
+            or self.hf_text_config.vocab_size
+        )
 
         # Verify quantization
         self._verify_quantization()
