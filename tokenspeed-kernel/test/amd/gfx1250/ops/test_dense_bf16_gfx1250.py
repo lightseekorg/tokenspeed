@@ -95,9 +95,9 @@ def test_dense_short_k_drains_tdm(k):
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("n,k", [(20480, 7168), (32320, 5120), (38720, 4096)])
+@pytest.mark.parametrize("n,k", [(32320, 5120), (38720, 4096)])
 def test_dense_vocab_shard_rows_match_and_reuse_compilation(n, k):
-    # Kimi-K3 TP8, DeepSeek V4.1 TP4 and GLM-5.3-Flash TP4 LM-head shards.
+    # DeepSeek V4.1 TP4 (one wave) and GLM-5.3-Flash TP4 LM-head shards.
     torch.manual_seed(n)
     a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)

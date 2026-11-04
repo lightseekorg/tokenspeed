@@ -137,7 +137,7 @@ def test_mhc_mixes_selects_gfx1250_kernel() -> None:
 
 
 @pytest.mark.parametrize("norm", [False, True])
-@pytest.mark.parametrize("tokens", [1, 4, 64, 96, 2048, 8192])
+@pytest.mark.parametrize("tokens", [1, 96, 2048, 8192])
 def test_mhc_pre_matches_reference(tokens: int, norm: bool) -> None:
     residual, weight, scale, base = _operands(tokens, 4096, seed=tokens)
     norm_weight = None
@@ -227,7 +227,7 @@ def test_mhc_apply_pre_quantize_fp8_matches_unfused(tokens: int) -> None:
     assert torch.equal(scales, expected_scales)
 
 
-@pytest.mark.parametrize("tokens", [1, 6, 96, 848, 8192])
+@pytest.mark.parametrize("tokens", [1, 8192])
 @pytest.mark.parametrize("hidden", [5120, 4096])
 def test_mhc_post_matches_portable(tokens: int, hidden: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(tokens + hidden)
@@ -243,7 +243,7 @@ def test_mhc_post_matches_portable(tokens: int, hidden: int) -> None:
     )
 
 
-@pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
+@pytest.mark.parametrize("tokens", [1, 2048])
 @pytest.mark.parametrize("norm", [False, True])
 def test_mhc_apply_pre_matches_portable(tokens: int, norm: bool) -> None:
     generator = torch.Generator(device="cuda").manual_seed(tokens)

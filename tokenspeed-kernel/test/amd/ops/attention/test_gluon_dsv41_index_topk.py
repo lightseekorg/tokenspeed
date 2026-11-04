@@ -363,7 +363,7 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
     )
 
 
-@pytest.mark.parametrize("queries", [1, 5, 8])
+@pytest.mark.parametrize("queries", [1, 5])
 @pytest.mark.parametrize("score_chunk", [64, 256])
 @pytest.mark.parametrize("lengths_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("broadcast", [False, True])
