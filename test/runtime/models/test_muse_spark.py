@@ -1989,6 +1989,7 @@ def test_bound_stream_runs_the_selected_decode_rows(rows) -> None:
     "rows,bound,quantized,destination",
     [
         (4, True, True, True),  # a row count the stream does not serve
+        (16, True, True, True),  # two verify blocks: the route-tile decode
         (8, False, True, True),  # no stream bound (EP8, other GPUs, BF16)
         (8, True, False, True),  # BF16 input the planned kernel quantizes
         (8, True, True, False),  # no borrowed route destination

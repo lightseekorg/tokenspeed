@@ -153,8 +153,9 @@ _GATHER_MXFP4_MAX_ROWS = 172
 # Decode row counts at which expert TP8 (EP1) on gfx950 runs the experts as
 # one stream launch instead of the two-stage direct decode. The launch
 # compiles once per row count, so keep this set small. Measured on MI355X
-# (one GPU, graph replay, cold weights, recorded routings).
-_MOE_STREAM_ROWS = frozenset({8, 16})
+# (one GPU, graph replay, cold weights, recorded routings): faster at 8 rows;
+# at 16 rows the route-tile decode is as fast, so it keeps that path.
+_MOE_STREAM_ROWS = frozenset({8})
 _gather_workspaces: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
 
 
