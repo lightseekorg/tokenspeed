@@ -2224,6 +2224,103 @@ def test_sharded_state_load_prepares_fp8_scales_from_loaded_state(
     not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
     reason="requires Blackwell MXFP8",
 )
+@pytest.mark.parametrize("layer_id", [0, 20, 24])
+@pytest.mark.parametrize("rows", ["all", "narrowed", "partitioned"])
+@torch.inference_mode()
+def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows):
+    """wq_b and the indexer's wq_b read the fused norm's F8_128x4 scales as
+    written. A narrowed batch keeps the canonical scales it selects rows of; an
+    indexer partition quantizes its local BF16 rows into the same codes."""
+    from tokenspeed.runtime.layers.attention.query_partition import (
+        InterleavedQueryPlan,
+    )
+
+    class Partitioned(_Backend):
+        def __init__(self, positions, requests, view):
+            super().__init__(positions, requests, view)
+            self.selections = []
+
+        def plan_indexer_queries(self, *args):
+            return InterleavedQueryPlan(total_rows=6, rank=1, size=2)
+
+        def prepare_global_selection(
+            self, layer_id, index_q, index_weights, *args, **kwargs
+        ):
+            assert kwargs["projected_partition"] is not None
+            self.selections.append((index_q.clone(), index_weights.clone()))
+            return None
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    previous_pdl = pdl_enabled()
+    pdl_enabled(True)
+    try:
+        config = _config()
+        config.q_lora_rank = 128
+        torch.manual_seed(23)
+        with torch.device("cuda:0"):
+            attn = DeepseekV41Attention(
+                config,
+                _mapping(0, 1, 1),
+                layer_id,
+                layer_id if rows == "narrowed" else v41._ced_decoder_start(config),
+                v41_mxfp8_config(_quant()),
+                f"layers.{layer_id}.attn",
+                aux_stream=None,
+            )
+        _initialize(attn)
+        for module in attn.modules():
+            if isinstance(module, LinearBase):
+                module.quant_method.process_weights_after_loading(module)
+        assert v41._reads_swizzled_scales(attn.wq_b)
+        positions = torch.arange(6, device="cuda:0")
+        requests = torch.zeros(6, dtype=torch.int64, device="cuda:0")
+        x = torch.randn(6, 128, dtype=torch.bfloat16, device="cuda:0")
+        layouts = []
+        quantize = v41.rmsnorm_quantize_fp8_group32
+
+        def recording(*args, **kwargs):
+            layouts.append(kwargs["swizzled_scales"])
+            return quantize(*args, **kwargs)
+
+        monkeypatch.setattr(v41, "rmsnorm_quantize_fp8_group32", recording)
+
+        def run():
+            view = None
+            if rows == "narrowed":
+                keep = torch.tensor([1, 3, 5], device="cuda:0")
+                query = SimpleNamespace(
+                    positions=positions[keep], request_indices=requests[keep]
+                )
+                view = V41DecoderView(query, None, (), keep, None)
+            backend = (Partitioned if rows == "partitioned" else _Backend)(
+                positions, requests, view
+            )
+            out = attn(
+                positions, x, _ctx(backend, 6, ForwardMode.EXTEND), reduce_output=True
+            )
+            selections = backend.selections if rows == "partitioned" else []
+            return out, [*backend.calls[-1][1:5], *sum(selections, ())]
+
+        actual, actual_inputs = run()
+        monkeypatch.setattr(v41, "_reads_swizzled_scales", lambda layer: False)
+        expected, expected_inputs = run()
+        assert layouts == [rows != "narrowed", False]
+        if rows == "partitioned" and attn.indexer is not None:
+            assert len(actual_inputs) == 6
+        assert torch.equal(actual, expected)
+        assert len(actual_inputs) == len(expected_inputs)
+        for got, want in zip(actual_inputs, expected_inputs):
+            assert (got is None) == (want is None)
+            if got is not None:
+                assert torch.equal(got, want)
+    finally:
+        pdl_enabled(previous_pdl)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
+    reason="requires Blackwell MXFP8",
+)
 @torch.inference_mode()
 def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")

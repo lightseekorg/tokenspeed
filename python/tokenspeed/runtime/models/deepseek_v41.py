@@ -340,8 +340,13 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         if block_scale is not None:
-            # x holds E4M3 codes with canonical group-32 UE8M0 scales, shared by
-            # every projection of one quantized activation.
+            # x holds E4M3 codes with group-32 UE8M0 scales, shared by every
+            # projection of one quantized activation: canonical [M, K/32], or
+            # 1-D F8_128x4 bytes that only the prepacked GEMM reads.
+            if block_scale.ndim == 1 and self.prepared_weight_scales is None:
+                raise ValueError(
+                    "F8_128x4 activation scales require prepared weight scales"
+                )
             if x.shape[0] == 0:
                 return x.new_empty(
                     (*x.shape[:-1], layer.weight.shape[0]), dtype=output_dtype
@@ -404,6 +409,15 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         # Other fused activation quantizers do not implement the reference
         # amax floor.
         return self.apply(layer, activation(x), bias)
+
+
+def _reads_swizzled_scales(layer: nn.Module) -> bool:
+    """Whether the layer's GEMM reads F8_128x4 activation scales as given."""
+    method = layer.quant_method
+    return (
+        isinstance(method, _ReferenceFp8LinearMethod)
+        and method.prepared_weight_scales is not None
+    )
 
 
 def _replicated(input_size, output_size, dtype, quant_config, prefix):
@@ -1165,10 +1179,21 @@ class DeepseekV41Attention(nn.Module):
             )
             and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
+            # Write the scales in the layout wq_b's GEMM reads as given, when
+            # every projection sharing them does and no narrowing selects
+            # their rows (only the canonical layout selects by row).
+            index_shares_scales = self.indexer is not None and isinstance(
+                self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod
+            )
             qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
                 qr,
                 self.q_norm.weight,
                 self.q_norm.variance_epsilon,
+                swizzled_scales=rows.keep_rows is None
+                and _reads_swizzled_scales(self.wq_b)
+                and (
+                    not index_shares_scales or _reads_swizzled_scales(self.indexer.wq_b)
+                ),
                 override=None,
                 solution="triton",
             )
@@ -1273,13 +1298,18 @@ class DeepseekV41Attention(nn.Module):
                             positions,
                         )
                         if partition is not None:
+                            if index_scale is not None and index_scale.ndim == 1:
+                                # F8_128x4 scales do not slice by row; the
+                                # projection quantizes the local BF16 rows into
+                                # the same codes and scales.
+                                index_input, index_scale = qr, None
                             # Only indexer projections consume the local query rows.
                             index_x, index_input, index_positions = (
                                 t[partition.local_slice].contiguous()
-                                for t in (hidden_states, index_q_input, positions)
+                                for t in (hidden_states, index_input, positions)
                             )
-                            if index_q_scale is not None:
-                                index_scale = index_q_scale[
+                            if index_scale is not None:
+                                index_scale = index_scale[
                                     partition.local_slice
                                 ].contiguous()
                         if index_x.shape[0]:

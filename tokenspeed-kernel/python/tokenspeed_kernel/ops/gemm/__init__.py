@@ -432,11 +432,17 @@ def _mm_mxfp8_prepacked(
             "unit inner stride"
         )
     if quantized and (
-        A_scales.dtype != torch.uint8 or tuple(A_scales.shape) != (A.shape[0], k // 32)
+        A_scales.dtype != torch.uint8
+        or tuple(A_scales.shape)
+        not in (
+            (A.shape[0], k // 32),
+            (_mxfp8_swizzled_scale_count(A.shape[0], k),),
+        )
+        or (A_scales.ndim == 1 and A_scales.stride(0) != 1)
     ):
         raise ValueError(
-            "mm(prepacked_scales=True) requires canonical [M, K/32] UE8M0 "
-            "activation scales with E4M3 codes"
+            "mm(prepacked_scales=True) requires canonical [M, K/32] or dense "
+            "F8_128x4 UE8M0 activation scales with E4M3 codes"
         )
     if (
         B_scales is None
@@ -454,8 +460,7 @@ def _mm_mxfp8_prepacked(
     if A.shape[0] == 0:
         return out if out is not None else A.new_empty((0, n), dtype=out_dtype)
     if quantized:
-        # Pre-quantized codes keep their canonical scales; the native kernel
-        # swizzles these per call, which is small next to the weight scales.
+        # Canonical scales are swizzled per call; F8_128x4 ones pass through.
         values, activation_scales = A, A_scales
     else:
         # Same codes and scales as the reference 1x32 quantizer, written
@@ -565,7 +570,9 @@ def mm(
             ``[128, 128]`` they come from
             ``prepare_flashinfer_fp8_blockscale_weight_scales``; with
             ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
-            also be E4M3 codes with canonical ``[M, K/32]`` UE8M0 ``A_scales``.
+            also be E4M3 codes with UE8M0 ``A_scales``, canonical
+            ``[M, K/32]`` or already in the 1-D F8_128x4 layout (such as
+            ``rmsnorm_quantize_fp8_group32(swizzled_scales=True)`` writes).
     """
     if plan is not None and prepacked_scales:
         raise ValueError("A GEMM plan cannot use prepacked online quantization")
