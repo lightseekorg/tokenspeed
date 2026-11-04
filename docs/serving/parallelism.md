@@ -689,7 +689,7 @@ each request's owned pages `w` times instead of once. The full rule set is in
 `docs/configuration/server.md`.
 
 The chunked prefill of an MLA model reads each prefix chunk's history from its
-page owners, a window of chunks per all-gather. On GB300 a KVP group of 2, 4
+page owners, a window of chunks per all-gather. On GB300 a KVP group of 2, 4,
 or 8 ranks (on one host, or across hosts over an NVLink fabric) gathers these
 windows with a fused all-gather kernel instead of a pack copy plus an NCCL
 all-gather: each owner stores its rows straight from its cache into every
@@ -701,8 +701,8 @@ DeepSeek V4.1 (which gathers its own history), on a PD decode engine, with
 `--kv-cache-quant-method per_token_head` (an FP8 `--kv-cache-dtype` cache is
 gathered fused), and when a configured kernel waits on other ranks inside a
 kernel that needs the whole GPU (MegaMoE, DeepEP or any other all-to-all
-backend, fused DP projections, an MoE backend or solution the runtime does not
-list as safe). A window whose rows on some rank exceed the 13.5 MiB receive
+backend, fused DP projections, or any MoE backend or solution the runtime does
+not list as safe). A window whose rows on some rank exceed the 13.5 MiB receive
 slot (24576 rows of an FP8 MLA cache, 12288 of a BF16 one) also uses NCCL. The
 fused kernel's waits end 30 s before `--distributed-timeout-seconds` (at half
 of it when it is under 90 s). The

@@ -69,7 +69,7 @@ from test.runtime.test_kvp_prefix_chunk_gather import (  # noqa: E402
     _Work,
 )
 
-# A MLA latent row: 512 latent and 64 RoPE elements (fp8: 576 bytes).
+# An MLA latent row: 512 latent and 64 RoPE elements (fp8: 576 bytes).
 ROW = 576
 FP8 = torch.float8_e4m3fn
 PAGE_SIZE = 64
