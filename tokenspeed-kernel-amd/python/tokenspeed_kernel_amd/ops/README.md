@@ -2434,6 +2434,14 @@ does not require native FP8 matrix arithmetic.
 
 ## Residual
 
+### gfx950 Kimi K3 AttnRes
+
+The operation mixes the current BF16 residual with up to 11 stored block
+snapshots and applies the following RMSNorm. Startup prepares both the
+prefill and small-batch launch configurations without performing additional
+residual updates. This covers eager tails even when graph capture fuses the
+corresponding layer into a collective.
+
 ### gfx1250 Kimi K3 AttnRes
 
 `attention/kda/attn_res.py` mixes the current residual with up to 11 stored

@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.residual.triton import (
     _mhc_pre_layer_triton_kernel,
     _mhc_prenorm_gemm_triton,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -113,6 +114,7 @@ if _attn_res_rmsnorm_gfx950_impl is not None:
             output_eps=out_norm_eps,
             delta=delta,
             num_valid_blocks=num_valid_blocks,
+            warmup=is_warming_up(),
             block_write_idx=block_write_idx,
         )
 
