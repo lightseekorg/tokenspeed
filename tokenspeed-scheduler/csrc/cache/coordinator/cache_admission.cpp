@@ -332,7 +332,7 @@ private:
                     const std::vector<NodeEntry> candidate_entries = coordinator_.NodeEntries(pool_, *candidate_node);
                     std::vector<std::pair<const BoundaryTree::Node*, std::vector<NodeEntry>>> climbed;
                     if (!blocks_alone && num_staying_checkpoint_boundaries(*candidate_node) == 1) {
-                        while (top->parent != nullptr && top->parent->on_device &&
+                        while (top->parent != nullptr && top->parent->OnDevice() &&
                                num_staying_checkpoint_boundaries(*top->parent) == 1) {
                             std::vector<NodeEntry> entries = coordinator_.NodeEntries(pool_, *top->parent);
                             if (!std::ranges::all_of(entries, is_evictable)) {
@@ -372,7 +372,7 @@ private:
                             frame.next_child = child->next_sibling;
                             if (segment_at_.contains(child)) {
                                 spliced.emplace_back(set.members.size(), child);
-                            } else if (child->on_device) {
+                            } else if (child->OnDevice()) {
                                 const bool in_stranded_suffix =
                                     frame.in_stranded_suffix || frame.node == candidate_node;
                                 stack.push_back(Frame{.node = child,
@@ -1216,7 +1216,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             input = std::move(acquired_prefix.state_at_prompt_end[i]);
         }
         if (const std::optional<CacheKey> key = groups_[i].Index().KeyOf(pool_, input);
-            key && tails_.Contains(key->content_hash)) {
+            key && boundary_tree_.Tails().Contains(key->content_hash)) {
             result.resumed_tail_hash = key->content_hash;
         }
         groups_[i].Allocator().ShapeStateTable(*demands[i].table, std::move(input));
@@ -1256,8 +1256,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             }
         }
     }
+    // Held while the groups register under the publication's nodes.
+    BoundaryTree::Hold publication;
     if (progress.completed_pages) {
-        linkPublication(*progress.completed_pages);
+        publication = boundary_tree_.LinkPublication(*progress.completed_pages);
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         BlockTable& table = *demands[i].table;
@@ -1296,8 +1298,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     if (progress.completed_pages) {
         const CompletedPages& completed = *progress.completed_pages;
         // A model without a prefix-closed group may register nothing under
-        // the deepest boundary linked (a chunk end of State groups alone).
-        syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
+        // the deepest boundary linked (a chunk end of State groups alone): it
+        // leaves now.
+        publication.reset();
         recordCheckpoints(completed, access_epoch);
         recordPublishedTail(completed);
     }
