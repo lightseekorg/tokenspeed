@@ -1722,8 +1722,10 @@ token, independent of the input strides. Transposing to `[tokens, channels]`
 and splitting the packed channels can therefore remain views.
 
 Prefill state staging fuses resumed conv-window copying, recurrent-state
-gather/zero, and history flags in one kernel. It preserves scheduler-owned
-block ids and arbitrary cache strides. Fresh rows never read null or stale
+gather/zero, and history flags in one kernel. KDA gathers directly into FP32
+scan state, including from BF16 cache storage; final writeback casts to the
+cache dtype. It preserves scheduler-owned block ids and arbitrary cache strides.
+Fresh rows never read null or stale
 recurrent state; their conv working windows remain unchanged. Shared input
 snapshots are read-only, output blocks are unique, and a private in-place
 source/destination is legal. This changes neither scan arithmetic nor cache

@@ -2078,6 +2078,7 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_states,
                 state_in_blocks,
                 state_out_blocks,
+                dtype=self._prefill_state_dtype(ssm_states.dtype),
             )
             conv_cache_indices = state_out_blocks
             extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
@@ -2480,6 +2481,9 @@ class MambaAttnBackend(AttentionBackend):
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
+
+    def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:
+        return cache_dtype
 
     def _prefill_supports_strided_qkv(self) -> bool:
         return False

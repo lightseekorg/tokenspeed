@@ -187,6 +187,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         )
 
     @override
+    def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:
+        return torch.float32
+
+    @override
     def _prefill_supports_strided_qkv(self) -> bool:
         return self.kda_backend == "cudnn"
 
