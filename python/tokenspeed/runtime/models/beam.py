@@ -77,6 +77,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
@@ -110,7 +111,6 @@ from tokenspeed.runtime.models.beam_quant import (
     beam_quant_policy,
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MoE
-from tokenspeed.runtime.models.llama import LlamaMLP
 from tokenspeed.runtime.models.qwen3 import Qwen3Attention
 from tokenspeed.runtime.utils import add_prefix, make_layers, set_weight_attrs
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -1112,7 +1112,7 @@ def beam_moe_agreement(mapping: Any, decision: tuple) -> None:
         raise RuntimeError(f"Beam's MoE differs across ranks: {decisions}")
 
 
-class BeamMLP(LlamaMLP):
+class BeamMLP(GatedMLP):
     """A dense MLP layer; FP8 W8A8 decode rows run gate/up unscaled.
 
     Where gate/up and down are compressed-tensors FP8 W8A8 linears with
@@ -1123,7 +1123,7 @@ class BeamMLP(LlamaMLP):
     GEMM with unit scales (``fp8_unscaled_linear``), one launch that applies
     its scales, the SwiGLU and the down projection's per-token quantization
     (``silu_and_mul_quantize_fp8``), and the scaled FP8 down GEMM. Everything
-    else (BF16 checkpoints, other rows) runs ``LlamaMLP.forward``.
+    else (BF16 checkpoints, other rows) runs ``GatedMLP.forward``.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -1317,11 +1317,15 @@ class BeamDecoderLayer(BaseDecoderLayer):
 
     def resolve_mlp(self, prefix: str):
         if not self.is_moe_layer:
-            return BeamMLP(
+            return BeamMLP.tensor_parallel(
                 hidden_size=self.config.hidden_size,
                 intermediate_size=self.config.intermediate_size,
-                hidden_act=self.config.hidden_act,
-                mapping=self.mapping,
+                activation=gated_activation(self.config.hidden_act, swiglu_limit=None),
+                tp_rank=self.mapping.dense.tp_rank,
+                tp_size=self.mapping.dense.tp_size,
+                tp_group=self.mapping.dense.tp_group,
+                reduce_results=False,
+                fusions=(),
                 quant_config=self.quant_config,
                 prefix=add_prefix("mlp", prefix),
             )

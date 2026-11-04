@@ -36,8 +36,10 @@ from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.activation import SwigluOAI
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import QKVParallelLinear, RowParallelLinear
+from tokenspeed.runtime.layers.mlp import GatedMLP
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -47,7 +49,6 @@ from tokenspeed.runtime.models.dflash import (
     _get_dflash_layer_sliding_window,
 )
 from tokenspeed.runtime.models.dspark import DSparkDraftModel
-from tokenspeed.runtime.models.minimax_m3 import MiniMaxM3MLP
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 
@@ -146,10 +147,15 @@ class MiniMaxM3DSparkDecoderLayer(DFlashDecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = MiniMaxM3MLP(
-            config=config,
+        self.mlp = GatedMLP.tensor_parallel(
+            hidden_size=config.hidden_size,
             intermediate_size=config.dense_intermediate_size,
-            mapping=mapping,
+            activation=SwigluOAI(config.swiglu_alpha, config.swiglu_limit),
+            tp_rank=mapping.dense.tp_rank,
+            tp_size=mapping.dense.tp_size,
+            tp_group=mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )

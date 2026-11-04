@@ -36,6 +36,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
+#include "cache/prefix/boundary_tree.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -138,6 +139,27 @@ public:
         }
     }
 
+    // Every entry of these tiers holds the boundary-tree node of its hash
+    // (BoundaryTree::Hold) for as long as it is indexed, so the node follows
+    // the entries: present on a tier while some group indexes the hash there,
+    // a checkpoint there while a State group does. `state` and `closed` give
+    // this group's kind. The coordinator binds each index once, before
+    // anything is registered; an index never bound holds nothing.
+    void TrackBoundaries(BoundaryTree& tree, const BlockPool& device_pool, const BlockPool* host_pool, bool state,
+                         bool closed) {
+        const auto bind = [&](const BlockPool& pool, CacheTier tier) {
+            CacheEntries& cache_index = cacheEntries(pool);
+            _assert(cache_index.boundary_tree == nullptr && cache_index.entries.empty(),
+                    "an index tier binds its boundary tree once, before anything is registered");
+            cache_index.boundary_tree = &tree;
+            cache_index.boundary_kind = BoundaryTree::EntryKind{.tier = tier, .state = state, .closed = closed};
+        };
+        bind(device_pool, CacheTier::kDevice);
+        if (host_pool != nullptr) {
+            bind(*host_pool, CacheTier::kHost);
+        }
+    }
+
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
@@ -182,6 +204,11 @@ public:
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
         cache_index.available_order.emplace(evictionOrder(*entry_it), entry_it);
+        if (cache_index.boundary_tree != nullptr) {
+            // The tree keys its nodes by content hash alone.
+            _assert(key.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
+            entry_it->boundary = cache_index.boundary_tree->HoldEntry(key.content_hash, cache_index.boundary_kind);
+        }
         linkCommonEntry(cache_index, entry_it);
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
@@ -449,6 +476,20 @@ public:
         return changed;
     }
 
+    // The key of the entry at `location` when Evict would take it: the index
+    // is its block's only owner.
+    std::optional<CacheKey> UnpinnedKeyAt(const BlockPool& pool, CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        const ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
+            return std::nullopt;
+        }
+        return entry_it->key;
+    }
+
     std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {
         CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
@@ -571,6 +612,9 @@ private:
         CacheBlockUniqueObserver unique_observer;
         CacheEntry* common_peer{nullptr};
         SessionCacheOwner session;
+        // The entry's claim on the boundary-tree node of its hash, in a bound
+        // index (TrackBoundaries): dropped with the entry.
+        BoundaryTree::Hold boundary;
     };
 
     static void mergeSession(CacheEntry& entry, const SessionCacheOwner& session) {
@@ -593,6 +637,10 @@ private:
         CacheEntries* common_peer{nullptr};
         bool common_source{false};
         EvictionOrderMap common_order;
+        // TrackBoundaries: the tree each entry holds a node of, and what an
+        // entry of this tier stands for there.
+        BoundaryTree* boundary_tree{nullptr};
+        BoundaryTree::EntryKind boundary_kind{};
     };
 
     void linkCommonEntry(CacheEntries& cache_index, CacheEntryIterator entry) {
@@ -609,6 +657,8 @@ private:
         CacheEntries& source = cache_index.common_source ? cache_index : peer;
         const auto source_entry = cache_index.common_source ? entry : other;
         source.common_order.emplace(evictionOrder(*source_entry), source_entry);
+        // The source side counts the pair in the node.
+        source_entry->boundary.SetPaired(true);
     }
 
     static void restoreAvailable(void* context) noexcept {
@@ -698,7 +748,9 @@ private:
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
         if (CacheEntry* peer = entry_it->common_peer) {
             CacheEntries& source = cache_index.common_source ? cache_index : *cache_index.common_peer;
-            source.common_order.erase(evictionOrder(cache_index.common_source ? *entry_it : *peer));
+            CacheEntry& source_entry = cache_index.common_source ? *entry_it : *peer;
+            source.common_order.erase(evictionOrder(source_entry));
+            source_entry.boundary.SetPaired(false);
             peer->common_peer = nullptr;
         }
         entry_it->unique_observer.Reset();

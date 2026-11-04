@@ -114,6 +114,35 @@ def rmsnorm(
     return _rmsnorm(x, weight, eps, out=out)
 
 
+def gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Apply Gemma RMSNorm (multiplier ``1 + weight``) over the last dimension
+    through kernel selection.
+
+    Args:
+        x: GPU input shaped ``[..., hidden_size]``.
+        weight: Gemma checkpoint weight offset shaped ``[hidden_size]``.
+        eps: Epsilon added to the mean of squares.
+        residual: Optional ``x``-shaped residual stream. When given, the FP32
+            sum ``x + residual`` is normalized and its rounded copy becomes the
+            new residual; both results are written in place where the layouts
+            allow (dense rows), as FlashInfer's ``gemma_fused_add_rmsnorm`` does.
+
+    Returns:
+        The normalized tensor, or ``(normalized, new_residual)`` with ``residual``.
+    """
+    kernel = select_kernel(
+        "layernorm",
+        "gemma_rmsnorm",
+        format_signature(x=dense_tensor_format(x.dtype)),
+    )
+    return kernel(x, weight, eps, residual)
+
+
 def qk_rmsnorm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -293,6 +322,7 @@ __all__ = [
     "affine_rmsnorm",
     "gated_residual_combine_norm",
     "gated_rmsnorm",
+    "gemma_rmsnorm",
     "grouped_gemma_rmsnorm",
     "grouped_rmsnorm",
     "nvfp4_copy_supported",

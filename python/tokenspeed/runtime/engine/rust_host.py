@@ -132,6 +132,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
+from tokenspeed.runtime.sampling.registry import get_sampling_backend_class
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
@@ -382,6 +383,8 @@ class HostConfig:
         in_flight_depth: Dispatched forwards that may await commit.
         vocab_size: Token ids in the vocabulary.
         eos_token_ids: The model's EOS ids.
+        top_k_exclusive_max: The selected sampler's admission bound; None
+            when the backend normalizes every positive finite top_k.
         max_model_len: The longest request, prompt and output.
         max_req_input_len: The longest prompt.
         logprob_servability: Which logprobs the engine returns; its
@@ -465,6 +468,7 @@ class HostConfig:
     in_flight_depth: int
     vocab_size: int
     eos_token_ids: tuple[int, ...]
+    top_k_exclusive_max: int | None
     max_model_len: int
     max_req_input_len: int
     logprob_servability: LogprobServability
@@ -1229,6 +1233,9 @@ class HostBootstrap:
                 ),
                 vocab_size=model_config.vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
+                top_k_exclusive_max=get_sampling_backend_class(
+                    server_args
+                ).top_k_exclusive_max,
                 max_model_len=max_model_len,
                 max_req_input_len=max_req_input_len,
                 logprob_servability=LogprobServability.of(

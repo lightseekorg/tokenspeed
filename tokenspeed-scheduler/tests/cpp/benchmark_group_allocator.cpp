@@ -88,7 +88,8 @@ Sample Advance(GroupAllocator& allocator, BlockPool& pool, std::vector<BlockTabl
     const auto cpu_start = ThreadCpuNs();
     const auto start = Clock::now();
     for (auto& table : tables) {
-        success &= allocator.Acquire(pool, table, AcquirePlan{.num_blocks = append});
+        success &= allocator.Acquire(pool, table, AcquirePlan{.num_blocks = append},
+                                     /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{});
         allocator.ReclaimExpired(pool, table, table.NumBlocks() - kRetained);
     }
     const auto end = Clock::now();
@@ -137,7 +138,8 @@ Result Measure(int batch, int initial_slots, int append, int shards) {
         Require(allocator.Acquire(pool, table,
                                   AcquirePlan{.num_blocks = kRetained,
                                               .suffix_start = initial_slots - kRetained,
-                                              .table_blocks_after = initial_slots}),
+                                              .table_blocks_after = initial_slots},
+                                  /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{}),
                 "sparse setup failed");
     }
     Verify(allocator, pool, tables, initial_slots);

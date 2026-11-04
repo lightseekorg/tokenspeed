@@ -175,6 +175,21 @@ Follow this sequence:
    project's `tokenspeed-scheduler` dependency requirement in
    `python/pyproject.toml` through a follow-up PR targeting `main`.
 
+## tokenspeed-engine
+
+Inside the root `tokenspeed-engine/` directory:
+
+* Prefer RAII to manual bookkeeping in Rust code too. Tie each resource,
+  registration or in-flight count that a request, a queued job or a thread
+  holds to a guard whose `Drop` releases it, and move that guard with the
+  work it covers, such as inside the job a channel carries, so a panic, an
+  early return or a dropped channel releases it as well. Avoid paired
+  increment/decrement or insert/remove calls and cleanup code spread across
+  call sites. A `Drop` that may run while a thread unwinds must not panic,
+  since a second panic aborts the process: take the locks it needs even if
+  poisoned. `ExitNotice` (`ts-host`) and `RequestStream` (`ts-client`) are
+  the models to follow.
+
 ## tokenspeed-kernel
 
 Inside the root `tokenspeed-kernel/` directory:

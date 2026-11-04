@@ -57,7 +57,7 @@ class AscendMLAAttention(KimiLinearMLAAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fused_decode: FusedMLADecode | None = None
-        self.optimized_prefill = (
+        self.prefill_supported = (
             not self.use_output_gate
             and self.rotary_emb is None
             and self.q_lora_rank is not None
@@ -153,8 +153,9 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         else:
             qnorm = hidden.new_empty((0, self.q_lora_rank))
             latent = hidden.new_empty((0, self.kv_lora_rank + self.qk_rope_head_dim))
-        # Only the normalized Q latent uses the ordinary TP gather. Current
-        # KV gathers directly into its final receive plane on the AICPU stream.
+        # Retain Q-latent gathering and local-head projections. KV uses the
+        # same execution stream with early history gathering when available.
+        backend.prefetch_prefill_layer(self.layer_id)
         backend.start_prefill_kv(self.layer_id, latent)
         qnorm = comm_manager.pre_attn_comm(qnorm, ctx)
         query = self.q_b_proj(qnorm)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -183,15 +184,13 @@ class AscendMLAAttention(KimiLinearMLAAttention):
                 )
             )
         backend.finish_prefill_layer(self.layer_id)
-        # This is the ordinary local-head partial. CommManager owns the same
-        # output ReduceScatter as before; no complete weight copies are needed.
         return self.o_proj(attended.flatten(1))[0]
 
     def forward(self, positions, hidden_states, ctx, comm_manager, *, projection_out):
         if (
             ctx.forward_mode.is_extend_or_mixed()
-            and self.optimized_prefill
-            and ascend_mla_prefill_backend(ctx.attn_backend).native_prefill_enabled
+            and self.prefill_supported
+            and ascend_mla_prefill_backend(ctx.attn_backend).prefill_enabled
         ):
             if projection_out is not None:
                 raise ValueError("MLA Prefill output reduction belongs to CommManager")
@@ -326,7 +325,6 @@ class FusedMLADecode:
             producer=producer,
             maximum=maximum,
             total=total,
-            peers=self.owner.tables[rows],
             group=self.owner.group,
         )
         output = torch.empty(
@@ -371,7 +369,6 @@ class AscendMLARuntime:
         )
         self.window = self.resources.window
         self.outputs = self.resources.outputs
-        self.tables = self.resources.tables
         torch.npu.synchronize()
         dist.barrier(group=cpu_group)
         self.runtimes = []
@@ -400,6 +397,5 @@ class AscendMLARuntime:
         self.resources = None
         self.window = None
         self.outputs.clear()
-        self.tables.clear()
         self.runtimes.clear()
         self.closed = True

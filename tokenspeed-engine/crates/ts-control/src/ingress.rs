@@ -44,6 +44,9 @@ pub struct IngressLimits {
     pub vocab_size: i64,
     /// The model's EOS ids, which end every request not ignoring EOS.
     pub eos_token_ids: Vec<i32>,
+    /// The selected sampler's exclusive finite top-k bound; `None` when
+    /// that backend normalizes all positive finite values on admission.
+    pub top_k_exclusive_max: Option<i64>,
     /// The longest request the engine admits, prompt and output.
     pub max_model_len: i64,
     /// The longest prompt.
@@ -541,7 +544,7 @@ fn refusal(
                 .to_owned(),
         );
     }
-    sampling::verify(params, limits.vocab_size).err()
+    sampling::verify_with_top_k_limit(params, limits.vocab_size, limits.top_k_exclusive_max).err()
 }
 
 /// More stop tokens than the sampler's stop table holds.
@@ -575,6 +578,7 @@ mod tests {
         IngressLimits {
             vocab_size: 1000,
             eos_token_ids: vec![2],
+            top_k_exclusive_max: Some(sampling::TOP_K_FUSED_MAX),
             max_model_len: 100,
             max_req_input_len: 90,
             enable_output_logprobs: false,
@@ -620,6 +624,49 @@ mod tests {
                 other => panic!("expected an abort, got {other:?}"),
             },
             Admitted::Run(admission) => panic!("expected a refusal, admitted {}", admission.rid),
+        }
+    }
+
+    #[test]
+    fn finite_top_k_admission_uses_the_selected_sampler_bound() {
+        let backend_normalizes = IngressLimits {
+            top_k_exclusive_max: None,
+            ..limits()
+        };
+        for top_k in [1, 127, 128, 4095, 4096, 4097, 163840, 1_i64 << 40, -1] {
+            let params = SamplingParams {
+                temperature: 1.0,
+                top_k,
+                ..Default::default()
+            };
+            let Some(Admitted::Run(admission)) =
+                admit(request("npu", vec![1], params.clone()), &backend_normalizes)
+            else {
+                panic!("backend must receive top_k={top_k}");
+            };
+            // Only the selected sampling backend clamps its device pool.
+            assert_eq!(
+                admission.sampling_params.top_k,
+                if top_k == -1 {
+                    sampling::TOP_K_DISABLED
+                } else {
+                    top_k
+                }
+            );
+            let gpu = admit(request("gpu", vec![1], params), &limits()).unwrap();
+            if top_k != -1 && top_k >= sampling::TOP_K_FUSED_MAX {
+                assert!(refused_message(gpu).contains("top_k must be < 128"));
+            } else {
+                assert!(matches!(gpu, Admitted::Run(_)));
+            }
+        }
+        for top_k in [0, -2] {
+            let params = SamplingParams {
+                top_k,
+                ..Default::default()
+            };
+            let refusal = admit(request("invalid", vec![1], params), &backend_normalizes).unwrap();
+            assert!(refused_message(refusal).contains("top_k must be -1 (disable), or at least 1"));
         }
     }
 

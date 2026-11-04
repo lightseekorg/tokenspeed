@@ -144,20 +144,16 @@ plan also skips epochs whose entries are all known to be pinned. Temporary
 lookups do not update this secondary index. The notification
 belongs to block-reference ownership; the pool still tracks placement alone.
 
-Host duplicate reclamation checks pending stores on a candidate's ancestor
-chain once per scan and reuses that answer for other candidates sharing it.
-The memo and traversal buffers belong to the scan: the next scan rechecks
-store completions and new tree links. This changes traversal cost without
-changing candidate eligibility or eviction order.
+Host duplicate reclamation needs a complete Device prefix with no pending
+store at or above the candidate. A page is complete on the Device when its tree
+node counts every prefix-closed block of it there, so the scan checks a
+candidate's ancestor chain once and reuses the answer for other candidates
+sharing it; the memo belongs to the scan, and the next scan rechecks.
 Before opening the ordered duplicate scan, placement walks from the tree's
 roots and prunes whole subtrees covered by a pending store or an incomplete
 Device prefix. It stops at the first possible duplicate. When none is reachable,
-placement skips the ordered scan. Roots share the ordinary sibling links and
-need constant-time maintenance on insertion, linking and removal; publishing or
-settling a page adds no ancestor-count updates. A reachable duplicate still
-needs the ordinary ownership and checkpoint-window checks before reclamation.
-Collection also keeps each candidate's Device ownership and access epoch for
-ranking in the same call, avoiding a second set of key and tree lookups.
+placement skips the ordered scan. A reachable duplicate still needs the
+ordinary ownership and checkpoint-window checks before reclamation.
 Closed-group indexes maintain a non-owning Device access order for keys
 present in both Device and Host pools. Publishing or evicting either copy
 updates membership; a Device access updates the order. Host duplicate selection
@@ -380,6 +376,11 @@ Publication also registers every non-replayable sliding window at that
 checkpoint's boundary before the request reclaims expired table blocks. The
 forward's final window may start later and cannot replace this earlier window,
 even when the forward ends on a full page.
+Conversely, `--enable-state-checkpoint-in-forward` also skips the natural
+checkpoints that a next turn re-rendering the end of the previous prompt
+cannot resume at, with their KV tails: a prompt end inside the page whose start
+holds the pre-tail checkpoint, and a fused finish past the prompt end (same
+section).
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
@@ -776,14 +777,14 @@ Perception rules per directory:
   argument (`nullptr` when storage is unset) so Host-only matching cannot be
   selected by omitting it. A matcher only *reads* the group's index; it never
   touches allocation or physical placement.
-* **`TailTable`** (`tail_table.h`) — the coordinator's index of published
+* **`TailTable`** (`tail_table.h`) — the boundary tree's index of published
   tails: under the chain hash of the last full page (the *prior*), the
   `(T mod P, hash@T)` pairs published so far in least-recently-used order
   — a publication or a hit moves a tail to the back — capped at
   `kMaxTailsPerPrior` (8) with a counter of the drops
   (`Scheduler.tail_cap_evictions`). The probe enumerates it to find the
-  candidate boundaries inside a page; eviction of a tail's block removes its
-  entry.
+  candidate boundaries inside a page; a tail's entry leaves with the tail's
+  tree node.
 * **`BoundaryTree`** (`boundary_tree.h`) — the coordinator's tree of the
   boundaries it indexes, shared by both tiers: one node per content
   hash either tier holds, linked to the chain hash of the page before it (a
@@ -797,8 +798,15 @@ Perception rules per directory:
   write-back is bringing it to the Host, or a child hangs under it, and goes
   with its tail hint once none of these holds. An entry registered with no
   node yet (an L3 GET, a store whose Device entry left before its ACK, a
-  restore's republication) starts one without a parent. It is kept in step
-  with the indexes: no match reads it, evicting by segments selects along it
+  restore's republication) starts one without a parent. Its holders keep it
+  in step with the indexes: every entry of either tier, every eviction
+  write-back on its way to the Host (`PendingHostStore`) and every
+  publication in progress holds the node of its hash (`BoundaryTree::Hold`),
+  the node counts them and derives its presence and checkpoint marks from the
+  counts, and the last holder to leave takes the node away, with its tail
+  hint, and queues the node the removal stops at for the dead-entry
+  collection. Each change of a State checkpoint's residency reaches
+  `CheckpointTree` the same way. No match reads it, evicting by segments selects along it
   (`AdmissionPlanner`, and the Host's segment plan, `AcquireHostSegments`),
   the collection of dead prefix entries finds them through it, and its walks
   follow parent pointers and insertion-ordered lists, never the map, so
@@ -929,21 +937,45 @@ Its responsibilities:
   hitter's table and never zeroed) or a fresh block where the probe left a
   hole -- and a Host tail is loaded into fresh private pages like any Host
   hit and never republished on the Device. The owner's side of the same
-  rule is **copy-in**: an admission whose publication point the owner
-  keeps writing past (`CompletedPages::owner_continues`, the fused role's
-  prompt end) registers the owner's tail blocks under `hash@T` and swaps a
-  fresh copy of each into the table, so the published bytes are exactly
-  what the prefill forward wrote and nothing writes them again. The copies
-  are the one thing such an admission may need beyond what the completing
-  chunk reserved, so they are best effort: when the plan does not fit with
-  them (under page-cyclic sharding a copy may need a parent while other
-  buckets still have holes), `Admit` replans without the tail -- the owner
-  keeps its partial block private and publishes neither the tail nor the
-  state checkpoint keyed by it at that point (its full pages still publish;
-  its finish publishes the frontier later). A request whose reserve covers
-  its generation therefore never waits on a block it did not reserve, which
-  is what keeps a pool full of such requests from wedging at their first
-  decodes. Copies are
+  rule is **copy-in**: the fused role's first decode, which publishes the
+  prompt end and keeps writing past it (`OwnerTail::kCopiedIn`), registers
+  the owner's tail blocks under `hash@T` and swaps into the table, for each
+  block it registered, a copy in the copy-in block the request holds for
+  that slot, so the published bytes are exactly what the prefill forward
+  wrote and nothing writes them again. The owner never takes another
+  request's canonical block into its table: where the key is published
+  already it keeps writing its own block, unregistered, and needs no copy.
+  There is one copy-in block per slot the prompt end publishes under the
+  tail's hash (`CacheCoordinator::CopyInSlots`), and each is reserved with
+  the block it serves: every admission of the prompt -- each chunk, and a
+  restore before the first decode -- passes the prompt end as its
+  `copy_in_point` and reserves the copy-in blocks of the slots whose blocks
+  it allocates, fills from the prefix or rebuilds, each in that block's
+  bucket. A prompt end the in-forward State checkpoint makes dead
+  ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints))
+  has no copy-in point: its first decode publishes no tail, and its
+  admissions decide that as the first decode does, from the prompt and where
+  the request resumed.
+  A slot the prefix fills (the hitter's copy, a Host load) or a
+  restore rebuilds has a known bucket; a slot the admission's growth fills
+  takes its block and its copy-in block together, in the one bucket the fit
+  chooses for the pair (below). The request holds them beside its tables
+  (`fsm::ForwardResources::copy_in_blocks`), so a retraction releases them
+  and the restore reserves them again, and the first decode spends them.
+  The first admission prepays the whole prompt in full-history groups, so
+  it holds their copy-in blocks from then on: neither the prompt's later
+  chunks nor its first decode need a block that admission did not reserve
+  there (a sliding-window group allocates the tail's blocks with the chunk
+  that reaches them, like the rest of its window growth), and every prompt
+  end that is not dead is published whatever the pool's pressure. A chunk
+  end cut at a junction keeps writing past its point too, but needs no
+  copy: the junction's KV is cached already, so it publishes the state
+  there, under the tail's hash, and its KV blocks stay its own, unpublished
+  (`OwnerTail::kKept`). On the Device the owner would keep its own block
+  anyway; a Host tail pairs with the Device checkpoint in the probe's Host
+  suffix. Should that tail leave both tiers before the publication, the
+  checkpoint has no KV to resume with: no probe matches it, and it occupies
+  its blocks until it is evicted like any cache. Copies are
   fire-and-forget: the runtime orders them on the forward thread's default
   stream after the execution stream's in-flight forwards and before the
   plan's zeroing, so a source another admission of the same round evicts
@@ -1066,6 +1098,31 @@ Its responsibilities:
   model regenerates from re-fed tokens, not a function of the prefix alone.
   Retention (`ExpiredBlocksAt`/`ReclaimExpired`) still slides their
   request-private pages out.
+* **Checkpoint retention.** A request resumes from the newest checkpoint on
+  its path, so a State checkpoint a later request's checkpoint extends
+  serves only a retry or a new fork. `CheckpointTree` orders the checkpoints
+  every State group holds on either tier by token prefix, including
+  checkpoints inside a page, and keeps each one's distance to the nearest
+  leaf below it. Distance counts the later requests whose checkpoints lie
+  on the way, capped at 5: the checkpoints one request publishes (its
+  in-forward checkpoint, prompt end and end state) are no step apart, so
+  they rank level until a later turn extends them. A checkpoint more than
+  K = `SchedulerConfig::checkpoint_retention_leaf_distance` (default 0; 1
+  also keeps the previous turn's checkpoints) from that leaf is aged. With N =
+  `SchedulerConfig::checkpoint_retention_requests` (default 16 ×
+  `--max-num-seqs` per attention-DP rank, the scheduler's `max_batch_size`; 0
+  is plain LRU), an aged checkpoint used within the last N
+  new-request admissions ranks as if last used at the oldest of them, the
+  larger distance first: it leaves before every entry used since, while
+  entries unused for longer, such as an abandoned session, leave first. N
+  counts admissions, not epochs, because Host publication advances the access
+  epoch too. A junction, with checkpoints on two or more branches below it,
+  has been resumed from more than once (a shared prompt) and keeps its own
+  rank, as does a checkpoint the plan's own victims bring within K of a leaf.
+  Ranks change no checkpoint's
+  validity and reserve no capacity. `CheckpointResumeGaps` counts the
+  admissions between a resumed checkpoint's last use and its resume, from
+  which N is chosen.
 * **Two tiers (Device/Host).** What feeds the Host tier from ordinary
   Device prefix entries is an explicit cache policy,
   `SchedulerConfig::host_write_policy`: `Validate` requires it with a Host
@@ -1079,7 +1136,8 @@ Its responsibilities:
   Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
   alongside Host-side acquire/contains/pin queries. Host L2 uses free
   capacity first, then the same `CacheEvictionPlan` as Device admission:
-  access epoch first, then boundary tier and logical position, followed by
+  access epoch first (an aged checkpoint at its retention rank, above),
+  then boundary tier and logical position, followed by
   group and physical location. Equal-age prefix pages leave from the suffix;
   unproven chunk boundaries leave before established boundaries and prefix
   pages. The plan tries victims against shadow occupancy until the accepted
@@ -1107,7 +1165,8 @@ Its responsibilities:
   without guaranteeing that KV and every required state checkpoint
   remain resident together. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
-  admission, or a junction cut) queues its tail and state checkpoint too;
+  admission) queues the tail and state it publishes too, a junction cut its
+  state checkpoint;
   the candidates are merged into a batched writeback. Ordinary decode
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the
@@ -1146,8 +1205,9 @@ Its responsibilities:
   by the request itself. Releasing an input does not invalidate its checkpoint
   for other requests; a deeper checkpoint cannot restore an earlier boundary.
   Unpublished slots are dropped, and so is a block no probe could resume from on the Host
-  (`DeadEntriesNotWrittenBack`). A record holds its tree node, tail hint and
-  Host presence until its segment settles, and a block the Host holds already
+  (`DeadEntriesNotWrittenBack`). A record's `PendingHostStore` holds its
+  tree node, tail hint and Host presence until its segment settles, or until
+  a segment dropped unsettled goes, and a block the Host holds already
   rides as that entry, never copied again. The invariants: eviction keeps the
   Device's coverage closed from the root (a restore can open it, below) and a
   segment is never split; the plan that evicts drains its segments right
@@ -1188,12 +1248,14 @@ Its responsibilities:
   including when the Device KV is no longer held by a request. Held Device
   copies go first, then unheld copies; within each class newer Device copies
   go first to reduce repeated write-back. Host-only State retains its own LRU
-  order once the usable duplicate capacity is exhausted.
+  order, with the retention rank, once the usable duplicate capacity is
+  exhausted.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
-  The boundary tree maintains the nodes with settled closed-group duplicates
-  as entries arrive and leave. It also propagates complete Device-prefix
-  coverage when a page changes, including gaps opened or filled by restores.
+  The boundary tree counts each node's closed-group duplicates as entries
+  arrive and leave; whether a page completes the Device prefix is read off
+  the counts along its ancestors when a scan needs it, including gaps opened
+  or filled by restores.
   Placement follows the indexes' Device access order, merging one epoch
   across closed groups and sorting equal-epoch boundary/location ties.
   It checks duplicate membership, prefix coverage and the bounded sliding
@@ -1428,8 +1490,8 @@ request reclaim. The groups' unread epochs are merged by access time before
 inspecting block owners: a newer epoch, even if every entry is pinned, is not
 scanned to select an older candidate from another group. Complete equal epochs
 still participate in every policy tie-break. Selection compares the next candidate from each group with
-the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
+the next request-reclaimable candidate using one policy: LRU access epoch (a
+aged State checkpoint at its retention rank), then tier (uncached request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Each candidate expands into a
 *victim set* that is selected, restored and evicted whole. Finally, walk the
 selected sets in reverse and restore every set that is not strictly required,
@@ -1453,7 +1515,9 @@ L2: the segment plan (`AcquireHostSegments`) and the boundary plan
 capacity, selection until demand fits, and reverse minimization between
 Device admission and both Host block-placement entry points. Its
 `CacheEvictionCandidates` cursor reads only the access epochs needed, with
-the same boundary-tier/position ordering on both tiers. The caller defines
+the same boundary-tier/position ordering on both tiers; the aged
+checkpoints at the retention cutoff come from `CheckpointTree`, one distance
+at a time. The caller defines
 which blocks leave together: Device segments and request releases, or Host
 State cascades. Host segment write-back retains its copy-aware ordering and
 cross-tier checkpoint dependencies; its fallback boundary placement uses the
@@ -1519,9 +1583,9 @@ released slot of the request) and everything the Device holds under it,
 climbing nowhere, so the coverage stays closed (a boundary that keeps a block
 that cannot leave stays on the Device). Each such set is recorded and written
 back like a segment, a block no probe could resume from dropped. Only the
-last variant of an admission evicts so: what it may drop — the owner's
-copy-in (above), an in-forward State checkpoint's block (`scheduler.md` §1.2)
-— is dropped first and never pays for such an eviction. Waiting would never
+last variant of an admission evicts so: what it may drop — an in-forward
+State checkpoint's block (`scheduler.md` §1.2) — is dropped first and never
+pays for such an eviction. Waiting would never
 fund such an admission: the blocks in use are its own, as when it resumed
 from a checkpoint whose segment holds the pages under it (`scheduler.md`
 §1.4). The pass does not always fund it either: a prefix hit the admission
@@ -1895,7 +1959,14 @@ backend base reads a local cache in place and rebuilds one dealt over owners
 by all-gathering each owner's rows as raw cache-dtype bytes, bitwise the
 unsharded read; a leaf declaring `supports_mla_dcp` only hands it each
 prefill's prefix loops and host page table (`_prepare_prefix_history`), so
-planning the gathers never waits on the device. The gathers run on a named
+planning the gathers never waits on the device. Chunk planning shares the fixed
+history-expansion capacity among requests with remaining prefix rows. Finished
+requests release their share to the others; the total expansion never exceeds
+the existing buffer capacity. Both local slot reads and owner-count planning
+consume the same host per-request boundaries, including partial pages. Small
+partitions (an initial share below 1024 rows) retain equal-width chunks to avoid
+amplifying FP8 attention rounding when changing the softmax partitioning.
+The gathers run on a named
 copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse
@@ -2087,8 +2158,8 @@ available. A failed acquire leaves both placement and request tables unchanged.
 
 Beside that balanced path, `BlockPool::AcquireBlocksInBuckets(group, buckets)`
 acquires blocks in **given** buckets — one per requested block — for the
-transfers above, for tail copies (a hitter's copy of a claimed tail block, an
-owner's copy-in; each in its source's bucket) and for
+transfers above, for tail copies (a hitter's copy of a claimed tail block in
+its source's bucket; an owner's copy-in block, in its slot's bucket) and for
 `GroupAllocator::AcquireShape`, which rebuilds a retracted request's table
 from its recorded shape (claimed blocks in place, fresh ones in the imaged
 buckets). Its exact check is per bucket with one shared empty-parent budget:
@@ -2098,9 +2169,17 @@ the parents needed are
 (`ParentsNeededForBuckets`, the formula the pool, the coordinator's image
 probe and the admission planner's shadow occupancy share). The planner counts
 every block an admission places in a given bucket — a Host hit's destination,
-a tail copy — as that bucket's demand, and only growth and a hole's fresh
-block as dense demand; a group's bucket-exact acquisitions precede its dense
-ones. `D = 1` passes bucket 0 everywhere and is the same path. No mutation on
+a tail copy, a copy-in block whose slot's block is known — as that bucket's
+demand, and only growth and a hole's fresh block as dense demand. A copy-in
+slot the admission's growth fills is a pair whose bucket is free: each pair
+takes the bucket with the most holes the demand leaves, one pair at a time
+(`AssignPairBuckets`), which needs no more parents than any other choice --
+the pairs add the same blocks whatever their buckets, and filling the least
+short bucket first keeps the largest shortfall smallest. The fit chooses the
+buckets again against every shadow it tries, and the plan keeps the choice
+the shadow of its victims gives. A group's bucket-exact acquisitions -- the
+pairs' blocks before the copy-in blocks -- precede its dense ones. `D = 1`
+passes bucket 0 everywhere and is the same path. No mutation on
 a failed check, and the choice is deterministic on every mirrored rank.
 
 `BlockPool` maintains the free-slot count of each group per bucket and an
@@ -2156,15 +2235,23 @@ including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
 Side-stream allocations retain their own workspace owner through execution,
 separate from scratch that main-stream operations can overwrite.
-Ascend native Prefill keeps receive, send, packed history, and commit slots in
-disjoint views of a backend-owned `WorkspacePool`, allocated on first Prefill
-use and reused thereafter. Cache binding carries only the bounded configuration;
-cache capacity planning does not reserve this runtime allocation. Without
-native pool options, the backend retains its ordinary collective path and
-creates no native transport.
-Native Prefill requires an explicit `chunk_prefill_kv_size`: its page limit is
-the scheduler's rounded batch budget, and exceeding it raises before transport.
-The null page and alignment are physical overhead, not additional batch capacity.
+Ascend DSA/MLA Prefill gathers only the batch's referenced cache pages into
+compact temporary buffers. History and current rows have separate readiness;
+DSA packs KV and Indexer-K together in each phase. Persistent cache planes stay
+separate. The batch page table defines receive addresses and owner writeback.
+`chunk_prefill_kv_size` is only the scheduler's admission budget: omitting it
+never selects a different Prefill implementation.
+
+A model may submit history gathering at the first preceding KDA layer. The
+attention entry ensures the same batch/layer history exists before consumption.
+An active gather owns its tensors through the final queued read; another batch
+or layer cannot reuse those tensors. Gather, copies, commit, and consumers use
+one fixed execution stream. Synchronous HCCL submissions join their internal
+stream onto it; allocator stream tracking protects temporary storage through
+queued consumers. Finish releases references, and shutdown drains execution
+before destroying the communicator. Only one layer's receive buffers are live;
+allocation follows actual referenced pages and current rows, not cache capacity.
+The null page and receive alignment are physical overhead.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 

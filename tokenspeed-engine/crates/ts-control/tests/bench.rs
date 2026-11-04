@@ -392,6 +392,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
         limits: IngressLimits {
             vocab_size: 1 << 17,
             eos_token_ids: vec![2],
+            top_k_exclusive_max: Some(ts_control::sampling::TOP_K_FUSED_MAX),
             max_model_len: 1 << 24,
             max_req_input_len: 1 << 20,
             enable_output_logprobs: false,

@@ -41,13 +41,9 @@ from tokenspeed_kernel.ops.attention.mla import (
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
 from tokenspeed_kernel.ops.gemm import bmm, mm, plan_dense_gemm
-from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
-    nvfp4_gemm_swiglu_nvfp4_quant,
-)
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
@@ -60,7 +56,6 @@ from tokenspeed.runtime.layers.moe import (
 )
 
 _platform = current_platform()
-_is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
 _FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to 64
@@ -92,9 +87,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
-from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
-from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -103,6 +96,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.mlp import GatedMLP, GatedMLPFusion, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
@@ -141,7 +135,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
 logger = get_colorful_logger(__name__)
@@ -219,7 +213,7 @@ def _reject_query_shard(ctx: ForwardContext, where: str) -> None:
         )
 
 
-class DeepseekV3MLP(nn.Module):
+class DeepseekV3MLP(GatedMLP):
     """Dense SwiGLU MLP sharded over the dense (or shared-expert) TP group.
 
     ``batch_invariant`` selects the TP-batch-invariant layout: ``down_proj``
@@ -242,18 +236,14 @@ class DeepseekV3MLP(nn.Module):
         *,
         batch_invariant: bool,
     ) -> None:
-        super().__init__()
-        self.mapping = mapping
         if is_shared_expert:
-            tp_rank = self.mapping.moe.tp_ep_rank
-            tp_size = self.mapping.moe.tp_ep_size
-            tp_group = self.mapping.moe.tp_ep_group
+            tp_rank = mapping.moe.tp_ep_rank
+            tp_size = mapping.moe.tp_ep_size
+            tp_group = mapping.moe.tp_ep_group
         else:
-            tp_rank = self.mapping.dense.tp_rank
-            tp_size = self.mapping.dense.tp_size
-            tp_group = self.mapping.dense.tp_group
-        self.batch_invariant = batch_invariant
-        self.tp_group = tp_group
+            tp_rank = mapping.dense.tp_rank
+            tp_size = mapping.dense.tp_size
+            tp_group = mapping.dense.tp_group
         if batch_invariant:
             if is_shared_expert:
                 raise ValueError(
@@ -269,7 +259,7 @@ class DeepseekV3MLP(nn.Module):
                     "the batch-invariant dense layout needs an unquantized down_proj"
                 )
 
-        self.gate_up_proj = MergedColumnParallelLinear(
+        gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
@@ -282,7 +272,7 @@ class DeepseekV3MLP(nn.Module):
         if batch_invariant:
             # Full K (the whole intermediate dim) on every rank; the output
             # is this rank's hidden shard of every gathered token.
-            self.down_proj = ColumnParallelLinear(
+            down_proj = ColumnParallelLinear(
                 intermediate_size,
                 hidden_size,
                 bias=False,
@@ -293,7 +283,7 @@ class DeepseekV3MLP(nn.Module):
                 prefix=add_prefix("down_proj", prefix),
             )
         else:
-            self.down_proj = RowParallelLinear(
+            down_proj = RowParallelLinear(
                 intermediate_size,
                 hidden_size,
                 bias=False,
@@ -304,20 +294,15 @@ class DeepseekV3MLP(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("down_proj", prefix),
             )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-        self._use_nvfp4_gemm_swiglu_nvfp4_quant = (
-            envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
-            and _is_blackwell
-            and isinstance(self.gate_up_proj.quant_method, Nvfp4LinearMethod)
-            and isinstance(self.down_proj.quant_method, Nvfp4LinearMethod)
+        super().__init__(
+            gate_up_proj,
+            down_proj,
+            gated_activation(hidden_act, swiglu_limit=None),
+            fusions=(GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT,),
         )
-        self.gate_up_proj.interleave_linear_and_gate = (
-            self._use_nvfp4_gemm_swiglu_nvfp4_quant
-        )
+        self.mapping = mapping
+        self.batch_invariant = batch_invariant
+        self.tp_group = tp_group
 
     def forward(self, x):
         if self.batch_invariant:
@@ -331,30 +316,7 @@ class DeepseekV3MLP(nn.Module):
             x = all_gather(x, self.tp_group, dim=-1)
             x, _ = self.down_proj(x)
             return x
-
-        if x.size(0) == 0:
-            return x
-
-        if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
-            x_fc1_fp4, x_fc1_scale = fp4_quantize(
-                x,
-                self.gate_up_proj.input_scale_inv,
-            )
-            x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-                x_fc1_fp4,
-                x_fc1_scale,
-                self.gate_up_proj.weight_swiglu_interleaved,
-                self.gate_up_proj.weight_scale_swiglu_interleaved,
-                self.gate_up_proj.alpha,
-                self.down_proj.input_scale_inv,
-            )
-            x, _ = self.down_proj((x_fp4, x_scale))
-            return x
-
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        return super().forward(x)
 
 
 class MoEGate(nn.Module):
