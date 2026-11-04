@@ -2166,6 +2166,13 @@ if platform.is_amd:
         situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
         if situ_linear_beta is None:
             raise ValueError("gfx1250 A8W4 SiTU MoE requires linear_beta")
+        if getattr(w, "_gluon_w2_is_kplane", False) and not getattr(
+            w.w2_weight_triton_tensor, "kplane_rows", 0
+        ):
+            raise ValueError(
+                "gfx1250 A8W4 SiTU MoE down weight lost its K-plane layout "
+                "attributes after preprocessing"
+            )
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
         decode = _use_gfx1250_moe_decode(

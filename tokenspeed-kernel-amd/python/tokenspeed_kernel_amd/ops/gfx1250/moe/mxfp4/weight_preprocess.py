@@ -245,6 +245,8 @@ def kplane_mxfp4_weight_gfx1250(weight: torch.Tensor, plane_bytes: int) -> torch
         planes, (experts, k_packed, n), (k_packed * n, 1, plane_bytes)
     )
     view.act_scale = getattr(weight, "act_scale", None)
+    # Kernels read the K-plane layout only from these attributes, which any
+    # copy of this view (.to(), .contiguous(), a reload) drops.
     view.kplane_rows = n
     view.kplane_bytes = plane_bytes
     return view
@@ -274,6 +276,7 @@ def preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(
         and k // block_k > 1
     ):
         w.w2_weight_triton_tensor = kplane_mxfp4_weight_gfx1250(w2, block_k // 2)
+        w._gluon_w2_is_kplane = True
         torch.cuda.empty_cache()
 
 

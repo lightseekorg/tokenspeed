@@ -332,8 +332,9 @@ def test_kimi_k3_tp_situ_stores_down_weight_in_k_planes_gfx1250() -> None:
         preprocess_gluon_mxfp4_gfx1250_moe_weights,
     )
 
-    module, raw, *_ = _make_case(1)
-    kernel_moe_process_weights(_make_plan(), module)
+    module, raw, hidden_states, topk_weights, topk_ids, router_logits = _make_case(1)
+    plan = _make_plan()
+    kernel_moe_process_weights(plan, module)
     planes = module.w2_weight_triton_tensor
     assert (planes.kplane_rows, planes.kplane_bytes) == (3584, 64)
 
@@ -355,6 +356,17 @@ def test_kimi_k3_tp_situ_stores_down_weight_in_k_planes_gfx1250() -> None:
     torch.testing.assert_close(
         storage, rows.reshape(16, 3584, 3, 64).permute(0, 2, 1, 3), atol=0, rtol=0
     )
+
+    module.w2_weight_triton_tensor = planes.clone()
+    with pytest.raises(ValueError, match="K-plane"):
+        kernel_moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4])
