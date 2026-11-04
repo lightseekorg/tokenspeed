@@ -126,10 +126,16 @@ def _check_attention_box(state, inputs):
     )
 
 
+def _relative_rms(actual, expected, dims):
+    error = (actual - expected).square().mean(dims)
+    return (error / expected.square().mean(dims)).sqrt()
+
+
 def _attention_box_error(state, inputs):
-    """Relative RMS error of the launch's attention box (the gated-normed
-    attention rows, before o_proj) against the reference: in total, per head
-    and per row."""
+    """The launch's attention box (the gated-normed attention rows, before
+    o_proj) against the reference: the relative RMS error overall, per head
+    and per row, and for each wrong (row, head) the reference (row, head) it
+    is closest to, which shows misplaced rows or heads."""
     q, gate = inputs["prepared_query"]
     rows = q.shape[0]
     expected = weightless_rmsnorm_gated_sigmoid(
@@ -138,17 +144,26 @@ def _attention_box_error(state, inputs):
     epoch = int(state.epochs[0])
     box = state.iris.box.view(2, BOX_WORDS)[epoch & 1]
     actual = box.view(torch.bfloat16).view(-1, Q_WIDTH)[:rows].double()
-    expected = expected.double()
-
-    def rms(dims):
-        error = (actual - expected).square().mean(dims) / expected.square().mean(dims)
-        return [round(v, 3) for v in error.sqrt().flatten().tolist()]
-
-    # Per head (64 channels each) and per row, so a pattern (one head, one
-    # split's rows, every other row) shows which piece of attention is off.
     actual = actual.view(rows, Q_HEADS, HEAD_DIM)
-    expected = expected.view(rows, Q_HEADS, HEAD_DIM)
-    return dict(total=rms((0, 1, 2))[0], per_head=rms((0, 2)), per_row=rms((1, 2)))
+    expected = expected.double().view(rows, Q_HEADS, HEAD_DIM)
+    cells = _relative_rms(actual, expected, (2,))
+    closest = {}
+    flat = expected.reshape(-1, HEAD_DIM)
+    for row, head in (cells > 0.05).nonzero().tolist()[:16]:
+        distance = (flat - actual[row, head]).square().sum(1)
+        match = int(distance.argmin())
+        closest[(row, head)] = (
+            match // Q_HEADS,
+            match % Q_HEADS,
+            round(_relative_rms(actual[row, head], flat[match], (0,)).item(), 4),
+        )
+    return {
+        "total": round(_relative_rms(actual, expected, (0, 1, 2)).item(), 4),
+        "per_head": [round(v, 3) for v in _relative_rms(actual, expected, (0, 2)).tolist()],
+        "per_row": [round(v, 3) for v in _relative_rms(actual, expected, (1, 2)).tolist()],
+        "wrong_cells": int((cells > 0.05).sum()),
+        "closest": closest,
+    }
 
 
 def _worker(rank, port, record_dir, errors):
