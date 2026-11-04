@@ -127,11 +127,11 @@ void StorageLease::reset() noexcept {
 }
 
 StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens) {
-    if (keys.size() != key_tokens.size()) throw std::invalid_argument("Each storage query key needs a token span");
     if (keys.empty() || !CanStart() || availableHostCredits() == 0 ||
         keys.size() > static_cast<std::size_t>(config_.max_keys_per_operation)) {
         return {};
     }
+    _assert(keys.size() == key_tokens.size(), "Each storage query key needs a token span");
     StorageQueryOperation op{nextId(), std::move(keys)};
     const auto id = op.op_id;
     operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, std::move(key_tokens), {}, {}});

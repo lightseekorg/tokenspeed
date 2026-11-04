@@ -28,7 +28,7 @@
 # HELP tokenspeed:prefix_host_hit_tokens_total Admitted prompt tokens loaded from the Host cache (L2, including L3-supplied).
 # HELP tokenspeed:prefix_l3_hit_tokens_total Token spans of successful storage keys (L3), counted per cache group.
 # HELP tokenspeed:prefix_prompt_tokens_total Prompt tokens of admitted requests.
-# HELP tokenspeed:prompt_tokens_total Prompt tokens of requests that finished.
+# HELP tokenspeed:prompt_tokens_total Prompt tokens of requests that ended, including aborted requests.
 # HELP tokenspeed:request_queue_time_seconds Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. Grammar-compile, pause-hold, and EPD embedding waits precede submission and are excluded, as are frontend and IPC wait.
 # HELP tokenspeed:request_time_seconds Wall time from request creation to its end on this role (prefill: KV transfer done; decode: generation done).
 # HELP tokenspeed:spec_decode_num_accepted_tokens_total Accepted speculative draft tokens (excludes the bonus token sampled after verify).

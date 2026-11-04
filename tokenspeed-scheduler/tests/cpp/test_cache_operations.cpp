@@ -1225,6 +1225,13 @@ TEST_F(AsyncStorageTransactionTest, CancellationBeforeDispatchReleasesReservatio
     EXPECT_EQ(host.NumEmptyLcmBlocks(), 4);
 }
 
+TEST_F(AsyncStorageTransactionTest, ValidatesTokenSpansOnlyForQueriesThatCanStart) {
+    EXPECT_FALSE(storage.StartQuery({}, {2}));
+    EXPECT_THROW(storage.StartQuery({key("h0")}, {}), std::runtime_error);
+    EXPECT_TRUE(storage.TakeCommands().empty());
+    EXPECT_FALSE(storage.HasPending());
+}
+
 // Whoever holds the lease holds the operation: a move hands it on without
 // detaching, and assigning over a live lease detaches the operation it held.
 TEST_F(AsyncStorageTransactionTest, MovingALeaseHandsTheOperationOn) {

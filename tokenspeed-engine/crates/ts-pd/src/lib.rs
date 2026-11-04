@@ -93,7 +93,10 @@ impl Copy {
                 let per_page: u64 = grid
                     .fields
                     .iter()
-                    .map(|field| u64::try_from(field[4]).unwrap_or(0))
+                    .map(|field| {
+                        debug_assert!(field[4] >= 0, "negative per-page byte length");
+                        u64::try_from(field[4]).unwrap_or(0)
+                    })
                     .sum();
                 grid.src_pages.len() as u64 * per_page
             }
@@ -288,6 +291,18 @@ fn sleep_or_stop(stop: &std::sync::mpsc::Receiver<()>, duration: Duration) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "negative per-page byte length")]
+    fn negative_per_page_length_triggers_debug_assertion() {
+        Copy::Pages(PageGrid {
+            src_pages: vec![1],
+            dst_pages: vec![2],
+            fields: vec![[0, 0, 0, 0, -1]],
+        })
+        .bytes();
+    }
 
     #[test]
     fn copy_bytes_counts_pages_and_spans() {

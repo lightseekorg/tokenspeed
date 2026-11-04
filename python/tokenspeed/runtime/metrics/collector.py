@@ -229,7 +229,7 @@ class EngineMetrics:
         )
         self.prompt_tokens = factory.counter(
             name="tokenspeed:prompt_tokens",
-            documentation="Prompt tokens of requests that finished.",
+            documentation="Prompt tokens of requests that ended, including aborted requests.",
             labelnames=labelnames,
         )
         self.cache_hit_tokens = factory.counter(

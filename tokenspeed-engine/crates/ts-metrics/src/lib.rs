@@ -607,7 +607,7 @@ impl EngineMetrics {
             prompt_tokens: Metric::counter(
                 exporter,
                 "tokenspeed:prompt_tokens",
-                "Prompt tokens of requests that finished.",
+                "Prompt tokens of requests that ended, including aborted requests.",
                 names,
             ),
             cache_hit_tokens: Metric::counter(
@@ -842,7 +842,7 @@ impl EngineMetrics {
         }
     }
 
-    /// Prompt and prefix-cache tokens of requests that finished.
+    /// Prompt and prefix-cache tokens of requests that ended, including aborted requests.
     pub fn record_request_tokens(&self, prompt_tokens: u64, cache_hit_tokens: u64) {
         let labels = self.labels();
         if prompt_tokens > 0 {

@@ -2328,6 +2328,8 @@ fn prefix_hit_delta(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn first_prefix_sample_includes_admissions_and_unchanged_counters_add_nothing() {
         let mut previous = ts_scheduler::PrefixHitView::default();
@@ -2337,14 +2339,9 @@ mod tests {
             host_hit_tokens: 8,
             l3_hit_tokens: 4,
         };
-        assert_eq!(super::prefix_hit_delta(&mut previous, hits), hits);
-        assert_eq!(
-            super::prefix_hit_delta(&mut previous, hits),
-            Default::default()
-        );
+        assert_eq!(prefix_hit_delta(&mut previous, hits), hits);
+        assert_eq!(prefix_hit_delta(&mut previous, hits), Default::default());
     }
-
-    use super::*;
 
     #[test]
     fn the_active_page_count_is_reused_while_fresh_and_requests_run() {
