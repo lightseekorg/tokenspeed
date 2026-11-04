@@ -93,7 +93,10 @@ inspecting each captured graph).
 
 * Every wait inside a launch has a deadline on the device clock, set above
   the longest legal stall of one rank between two graph launches, which the
-  regular path tolerates.
+  regular path tolerates. The kernel package has no default: serving derives
+  it from `--watchdog-timeout` (half of it, clamped), tests pass a short one.
+  Correctness never depends on it; it only turns a lost hand-off into a
+  clean error.
 * On expiry the waiting workgroup writes a failure record, copies it to a
   host-mapped page that outlives the process, sets a sticky abort word in
   every peer, and traps. A wait that sees an abort word stops the same way

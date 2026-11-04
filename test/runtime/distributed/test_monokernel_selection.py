@@ -20,6 +20,7 @@
 
 """Which decode row shapes a group serves with monokernels."""
 
+import argparse
 import dataclasses
 from datetime import timedelta
 
@@ -28,9 +29,12 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tokenspeed.runtime.layers.monokernel import (
+    MAX_WAIT_DEADLINE_SECONDS,
+    MIN_WAIT_DEADLINE_SECONDS,
     MonokernelDeployment,
     agree_served_shapes,
     deployment_decline_reasons,
+    wait_deadline_seconds,
 )
 
 # The validated recipe: no host KV store, nothing that adds kernels on the side.
@@ -42,6 +46,28 @@ _RECIPE = MonokernelDeployment(
     forward_side_stream=False,
     environ={},
 )
+
+
+@pytest.mark.parametrize(
+    "flags, deadline",
+    [
+        ([], MAX_WAIT_DEADLINE_SECONDS),  # the default watchdog, clamped
+        (["--watchdog-timeout", "90"], 45.0),
+        (["--watchdog-timeout", "4"], MIN_WAIT_DEADLINE_SECONDS),
+        (["--watchdog-timeout", "1000"], MAX_WAIT_DEADLINE_SECONDS),
+    ],
+)
+def test_the_wait_deadline_is_half_the_watchdog_within_its_bounds(flags, deadline):
+    """The monokernel wait deadline follows ``--watchdog-timeout``: half of
+    it, clamped to the bounds, so a lost hand-off fails before the watchdog
+    would call the server hung, and never sooner than a late GPU may take."""
+    # Imported here: the spawned ranks of the other tests import this module.
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    watchdog = parser.parse_args(["--model-path", "m", *flags]).watchdog_timeout
+    assert wait_deadline_seconds(watchdog) == deadline
 
 
 @pytest.mark.parametrize(

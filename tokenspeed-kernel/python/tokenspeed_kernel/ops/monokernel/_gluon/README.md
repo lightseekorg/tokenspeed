@@ -17,8 +17,11 @@ below.
   `offline_attrs`) and accepts a variant only with no scratch, at most 256
   VGPRs + AGPRs and no calls. The first launch of each variant checks its
   own binary again.
-- Every wait checks the deadline (60 s by default) and the abort word every
-  64 retries. On expiry the workgroup records the failure (also in a host
+- Every wait checks the deadline and the abort word every 64 retries. The
+  deadline is a required prepare argument (serving derives it from the
+  server's watchdog timeout). Correctness never depends on it: it only turns
+  a hand-off that never comes into a clean error, and it must outlast a peer
+  GPU that arrives late (a first compile, a host pause). On expiry the workgroup records the failure (also in a host
   page), sets every rank's abort word and traps.
 
 #### Algorithm

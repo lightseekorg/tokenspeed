@@ -88,6 +88,7 @@ from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E402
     BOX_WORDS,
 )
+from wait_deadline import TEST_DEADLINE_SECONDS  # noqa: E402
 
 # Cached tokens per request before the verify rows. Full layers read the
 # whole context: one request at ~141k (the served context), and two, whose
@@ -159,8 +160,12 @@ def _attention_box_error(state, inputs):
         )
     return {
         "total": round(_relative_rms(actual, expected, (0, 1, 2)).item(), 4),
-        "per_head": [round(v, 3) for v in _relative_rms(actual, expected, (0, 2)).tolist()],
-        "per_row": [round(v, 3) for v in _relative_rms(actual, expected, (1, 2)).tolist()],
+        "per_head": [
+            round(v, 3) for v in _relative_rms(actual, expected, (0, 2)).tolist()
+        ],
+        "per_row": [
+            round(v, 3) for v in _relative_rms(actual, expected, (1, 2)).tolist()
+        ],
         "wrong_cells": int((cells > 0.05).sum()),
         "closest": closest,
     }
@@ -196,6 +201,7 @@ def _worker(rank, port, record_dir, errors):
             fused = prepare_monokernel_layer(
                 recipe="muse_spark", plan_keys=[key], traits=TRAITS,
                 weights=weights, state=state,
+                deadline_seconds=TEST_DEADLINE_SECONDS,
             )  # fmt: skip
             assert fused is not None
             assert fused.decline_reasons(key.requests) == [], key

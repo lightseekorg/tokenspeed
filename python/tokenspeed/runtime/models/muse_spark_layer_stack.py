@@ -41,9 +41,12 @@ from tokenspeed_kernel.ops.monokernel import MonokernelLayer, PlanKey
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.monokernel import (
+    MAX_WAIT_DEADLINE_SECONDS,
+    MIN_WAIT_DEADLINE_SECONDS,
     agree_served_shapes,
     current_deployment,
     deployment_decline_reasons,
+    wait_deadline_seconds,
 )
 from tokenspeed.runtime.models.base.layer_stack import DecoderLayerStack
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -126,12 +129,17 @@ class MuseSparkLayerStack(DecoderLayerStack):
         }
 
     def prepare_layers(
-        self, model: MuseSparkModel, state: object, traits: dict
+        self,
+        model: MuseSparkModel,
+        state: object,
+        traits: dict,
+        deadline_seconds: float,
     ) -> list[MonokernelLayer | None]:
         """One prepared fused layer per candidate layer (None where no leaf
         serves ``traits``), each for every request count in
         ``FUSED_REQUESTS``, reading the layer's weights and the next layer's
-        input norm and query projection in place."""
+        input norm and query projection in place; its waits for other GPUs
+        give up after ``deadline_seconds``."""
         from tokenspeed_kernel.ops.monokernel import prepare_monokernel_layer
 
         candidates = self._candidate_indices(model)
@@ -149,6 +157,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
                     traits=traits,
                     weights=layer.fused_weights(next_layer),
                     state=state,
+                    deadline_seconds=deadline_seconds,
                 )
             )
         return prepared
@@ -185,7 +194,8 @@ class MuseSparkLayerStack(DecoderLayerStack):
             current_deployment(args, forward_side_stream=model.alt_stream is not None)
         )
         reasons = {shape: dict.fromkeys(deployment) for shape in shapes}
-        prepared = self.prepare_layers(model, state, traits)
+        deadline = wait_deadline_seconds(float(args["watchdog_timeout"]))
+        prepared = self.prepare_layers(model, state, traits, deadline)
         for index, fused in zip(candidates, prepared):
             for shape in shapes:
                 if fused is None:
@@ -201,6 +211,12 @@ class MuseSparkLayerStack(DecoderLayerStack):
         )
         if rank_in_group == 0:
             logger.info(served.report("monokernel layers"))
+            logger.info(
+                f"monokernel layers: a wait for another GPU gives up after "
+                f"{deadline:g} s (half of --watchdog-timeout "
+                f"{args['watchdog_timeout']:g} s, kept within "
+                f"{MIN_WAIT_DEADLINE_SECONDS:g}-{MAX_WAIT_DEADLINE_SECONDS:g} s)"
+            )
         if served.shapes:
             self.fused_layers = prepared
             self.fused_indices = candidates

@@ -51,8 +51,8 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E4
     grid_join,
     persistent_compile_options,
 )
+from wait_deadline import TEST_DEADLINE_TICKS  # noqa: E402
 
-_DEADLINE_TICKS = 200_000_000  # 2 s
 _GRID = gl.constexpr(GRID)
 _WORDS = LINE_WORDS // 2
 
@@ -141,7 +141,7 @@ def _launch_rounds(state, values, seen, placement, rounds, grid=GRID, deadline=N
         seen,
         placement,
         tags,
-        _DEADLINE_TICKS if deadline is None else deadline,
+        TEST_DEADLINE_TICKS if deadline is None else deadline,
         ROUNDS=rounds,
         LAUNCHES=placement.shape[0],
         num_warps=8,
@@ -277,7 +277,7 @@ def test_every_wave_enters_with_the_same_epoch_advancing_by_one():
 
     def launch():
         _wave_epochs_kernel[(GRID,)](
-            state.epochs, state.claims, state.errors, seen, _DEADLINE_TICKS,
+            state.epochs, state.claims, state.errors, seen, TEST_DEADLINE_TICKS,
             LAUNCHES=launches, num_warps=8,
             **persistent_compile_options(),
         )  # fmt: skip
