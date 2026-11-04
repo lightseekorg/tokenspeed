@@ -34,9 +34,11 @@ if not is_cdna4():
 
 from tokenspeed_kernel.ops.attention.dsa import dsa_merge_candidates  # isort: skip
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (  # isort: skip
+    _extract_rank_major_scores,
     _select_source_through_threshold,
     _select_through_threshold,
     rank_major_scores,
+    rank_major_scores_with_bounds,
     select_through_threshold,
     select_through_threshold_by_source,
 )
@@ -215,15 +217,30 @@ def test_per_source_selection_matches_per_row_selection(degree, rows, topk, tied
     torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("degree", [2, 8])
+@pytest.mark.parametrize("rows", [1, 64])
+def test_rank_major_scores_with_bounds_cover_every_candidate(degree, rows):
+    records = _records(degree, rows, 1024, seed=degree + rows)
+
+    scores, starts, ends = rank_major_scores_with_bounds(records)
+
+    torch.testing.assert_close(scores, rank_major_scores(records), atol=0, rtol=0)
+    assert (starts == 0).all()
+    assert (ends == degree * 1024).all()
+
+
 def test_gluon_merge_launches_one_specialization_across_batch_rows():
     # Small batches select per source, large ones per row.
     for rows in (1, 16, 600):
         dsa_merge_candidates(
             _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
         )
-    with assert_no_triton_compile(_select_through_threshold):
-        with assert_no_triton_compile(_select_source_through_threshold):
-            for rows in (3, 8, 37, 64, 513, 700):
-                dsa_merge_candidates(
-                    _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
-                )
+    with assert_no_triton_compile(
+        _extract_rank_major_scores,
+        _select_through_threshold,
+        _select_source_through_threshold,
+    ):
+        for rows in (3, 8, 37, 64, 513, 700):
+            dsa_merge_candidates(
+                _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
+            )

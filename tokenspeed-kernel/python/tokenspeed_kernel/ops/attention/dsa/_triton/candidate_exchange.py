@@ -50,12 +50,19 @@ def pack_index_candidates(offsets: torch.Tensor, scores: torch.Tensor) -> torch.
 def _extract_rank_major_scores(
     records,
     scores,
+    starts,
+    ends,
     rows,
     WIDTH: tl.constexpr,
     DEGREE: tl.constexpr,
     BLOCK: tl.constexpr,
+    WRITE_BOUNDS: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
+    if WRITE_BOUNDS:
+        if tl.program_id(1) == 0:
+            tl.store(starts + row, 0)
+            tl.store(ends + row, DEGREE * WIDTH)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     source, local = col // WIDTH, col % WIDTH
     address = ((source * rows + row) * WIDTH + local) * 2
@@ -237,12 +244,42 @@ def rank_major_scores(records: torch.Tensor) -> torch.Tensor:
         ](
             records,
             scores,
+            scores,
+            scores,
             rows,
             WIDTH=width,
             DEGREE=degree,
             BLOCK=_SCORE_BLOCK_SIZE,
         )
     return scores
+
+
+def rank_major_scores_with_bounds(
+    records: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`rank_major_scores` and int32 [rows] row bounds over all of
+    them (zero starts, full-width ends), written by the same launch."""
+    degree, rows, width, _ = records.shape
+    scores = torch.empty(
+        (rows, degree * width), device=records.device, dtype=torch.float32
+    )
+    starts = torch.empty((rows,), device=records.device, dtype=torch.int32)
+    ends = torch.empty((rows,), device=records.device, dtype=torch.int32)
+    if rows:
+        _extract_rank_major_scores[
+            (rows, triton.cdiv(degree * width, _SCORE_BLOCK_SIZE))
+        ](
+            records,
+            scores,
+            starts,
+            ends,
+            rows,
+            WIDTH=width,
+            DEGREE=degree,
+            BLOCK=_SCORE_BLOCK_SIZE,
+            WRITE_BOUNDS=True,
+        )
+    return scores, starts, ends
 
 
 def select_through_threshold(
