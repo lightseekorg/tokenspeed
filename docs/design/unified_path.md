@@ -2316,12 +2316,37 @@ Rank zero selects the bucket and agrees it over a named host group managed by
 the existing process-group manager. Its forward-thread broadcasts cannot share
 the event loop's request-broadcast sequence.
 Online feedback is bounded and asynchronous: only completed CUDA events are
-read, and the budget uses an older confidence generation. The latest device
+read. A budget for draft generation N uses generation N-2, tagged by request
+lifetime and checked against a device counter published beside the scores.
+Feedback copies the newly published scores; host selection defers their use by
+generation. Copying only the previous scores would unnecessarily wait for one
+additional forward to complete. Previous scores travel in the same sample only
+to compare the just-verified candidates with their actual acceptance.
+The counter is reset and imaged with the candidate state. A restored request
+can rebase the host's expendable counter against its first completed sample.
+Scores survive rounds that omit a request; reusing its slot evicts them, and
+prefill invalidates pending samples from before recomputation. Missing or
+wrong-generation scores use measured per-position conditional acceptance,
+with a Beta(1, 1) cold-start prior, rather than assuming perfect acceptance.
+The latest device
 confidence allocates contiguous prefixes inside that budget. Ties use request
 then position order. A fresh request verifies only its anchor.
 The drafter broadcasts rank zero's scores on the device group before publishing
 them. Local floating-point differences must not change per-request prefixes
 across ranks: different acceptance lengths would split their scheduler state.
+
+All captured Q values in the feasible request range compete on expected output
+per time, including graphs captured for another request capacity. Startup costs
+are baselines, separate from completed live timings. The last 5,000 live samples
+estimate a nonnegative per-query correction to the full startup curve: each Q
+with at least ten samples contributes its median, and their median is applied
+to every Q. This prevents unvisited large graphs from retaining empty-cache
+costs. Each graph also retains its last nine live samples. Completed feedback
+reports allocated and effective queries, padding, predicted and accepted lengths
+for the same requests, and conditional confidence error. Acceptance is copied
+before stop truncation, and positions after the first mismatch are censored.
+The SpecForge DSpark head consumes the draft's final-normalized hidden state
+and the previous-token Markov latent; target-layer taps are a separate input.
 
 `VerifyQueryLayout` owns persistent prefix lengths, offsets, request/column
 indices and bidirectional row maps. A target graph's request capacity is

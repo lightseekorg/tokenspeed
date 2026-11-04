@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -37,14 +38,21 @@ public:
         if (width < 2) throw std::invalid_argument("confidence requires a draft window");
     }
 
+    void SetBaseline(int batch, int queries, double milliseconds) {
+        ValidateTiming(batch, queries, milliseconds);
+        baselines_[{batch, queries}] = milliseconds;
+    }
+
     void Observe(int batch, int queries, double milliseconds) {
-        if (batch < 1 || queries < batch || queries > batch * width_ || !std::isfinite(milliseconds) ||
-            milliseconds <= 0) {
-            throw std::invalid_argument("invalid confidence timing sample");
-        }
+        ValidateTiming(batch, queries, milliseconds);
         auto& samples = timings_[{batch, queries}];
         samples.push_back(milliseconds);
         if (samples.size() > 9) samples.erase(samples.begin());
+        auto baseline = baselines_.find({batch, queries});
+        if (baseline != baselines_.end()) {
+            corrections_.push_back({queries, (milliseconds - baseline->second) / queries});
+            if (corrections_.size() > 5000) corrections_.pop_front();
+        }
     }
 
     int Select(int batch, const std::vector<std::vector<float>>& rates) const {
@@ -63,22 +71,28 @@ public:
             }
         }
         std::stable_sort(scores.begin(), scores.end(), std::greater<float>());
-        int best_queries = batch * width_;
+        std::vector<double> expected(scores.size() + 1, static_cast<double>(rates.size()));
+        for (size_t i = 0; i < scores.size(); ++i) expected[i + 1] = expected[i] + scores[i];
+        const double correction = CorrectionPerQuery();
+        int best_queries = batch;
         double best_throughput = -1;
-        for (int multiplier = 1; multiplier <= width_; ++multiplier) {
-            const int queries = batch * multiplier;
-            auto found = timings_.find({batch, queries});
-            if (found == timings_.end()) continue;
-            auto sorted = found->second;
-            std::sort(sorted.begin(), sorted.end());
-            const double latency = sorted[sorted.size() / 2];
-            // The graph includes padding requests; only live requests earn
-            // base output tokens. Remaining graph capacity can go to any live
-            // request, bounded by its number of draft positions.
-            double expected = static_cast<double>(rates.size());
+        // Target graphs are keyed by Q alone. Every captured Q in range is
+        // usable, including those captured for a different request capacity.
+        for (int queries = batch; queries <= batch * width_; ++queries) {
+            const auto key = std::make_pair(batch, queries);
+            const auto baseline = baselines_.find(key);
+            const auto online = timings_.find(key);
+            if (baseline == baselines_.end() && online == timings_.end()) continue;
+            double latency = 0;
+            if (baseline != baselines_.end()) {
+                // Empty-cache capture underestimates live attention. Apply
+                // completed measurements to the entire curve, so unvisited
+                // large graphs cannot retain their optimistic startup cost.
+                latency = baseline->second + correction * queries;
+            }
+            if (online != timings_.end()) latency = std::max(latency, Median(online->second));
             const size_t extras = std::min(scores.size(), static_cast<size_t>(queries - rates.size()));
-            for (size_t i = 0; i < extras; ++i) expected += scores[i];
-            const double throughput = expected / latency;
+            const double throughput = expected[extras] / latency;
             if (throughput > best_throughput) {
                 best_throughput = throughput;
                 best_queries = queries;
@@ -88,8 +102,32 @@ public:
     }
 
 private:
+    void ValidateTiming(int batch, int queries, double milliseconds) const {
+        if (batch < 1 || queries < batch || queries > batch * width_ || !std::isfinite(milliseconds) ||
+            milliseconds <= 0) {
+            throw std::invalid_argument("invalid confidence timing sample");
+        }
+    }
+
+    static double Median(std::vector<double> samples) {
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2];
+    }
+
+    double CorrectionPerQuery() const {
+        std::map<int, std::vector<double>> by_queries;
+        for (const auto& [queries, correction] : corrections_) by_queries[queries].push_back(correction);
+        std::vector<double> medians;
+        for (auto& [queries, samples] : by_queries) {
+            if (samples.size() >= 10) medians.push_back(Median(samples));
+        }
+        return medians.empty() ? 0.0 : std::max(0.0, Median(medians));
+    }
+
     int width_;
+    std::map<std::pair<int, int>, double> baselines_;
     std::map<std::pair<int, int>, std::vector<double>> timings_;
+    std::deque<std::pair<int, double>> corrections_;
 };
 
 }  // namespace tokenspeed

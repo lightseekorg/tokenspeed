@@ -101,6 +101,7 @@ class RuntimeStates:
         self.draft_probs: torch.Tensor | None = None
         self.draft_confidence: torch.Tensor | None = None
         self.previous_draft_confidence: torch.Tensor | None = None
+        self.draft_confidence_generation: torch.Tensor | None = None
         self.draft_probs_sentinel: float = 0.0
         # Draft trees (init_draft_trees): next round's parents next to its tokens.
         self.chain_parents: torch.Tensor | None = None
@@ -138,6 +139,9 @@ class RuntimeStates:
             shape, dtype=torch.float32, device=self.device
         )
         self.previous_draft_confidence = torch.zeros_like(self.draft_confidence)
+        self.draft_confidence_generation = torch.zeros(
+            shape[0], dtype=torch.int64, device=self.device
+        )
 
     def publish_draft_confidence(
         self,
@@ -158,6 +162,7 @@ class RuntimeStates:
             dist.broadcast(rates, src=0, group=group)
         self.previous_draft_confidence[slots] = self.draft_confidence[slots]
         self.draft_confidence[slots] = rates
+        self.draft_confidence_generation[slots] += 1
 
     def init_draft_probs(
         self, *, spec_num_tokens: int, reject_threshold: float
@@ -425,7 +430,11 @@ class RuntimeStates:
             rows.append(self.draft_probs[slot])
         if self.draft_confidence is not None:
             rows.extend(
-                (self.draft_confidence[slot], self.previous_draft_confidence[slot])
+                (
+                    self.draft_confidence[slot],
+                    self.previous_draft_confidence[slot],
+                    self.draft_confidence_generation[slot],
+                )
             )
         if self.future_parent_map is not None:
             rows.append(self.future_parent_map[slot])
@@ -474,6 +483,9 @@ class RuntimeStates:
         if self.draft_confidence is not None:
             self.draft_confidence.index_fill_(0, extend_request_pool_indices, 0)
             self.previous_draft_confidence.index_fill_(
+                0, extend_request_pool_indices, 0
+            )
+            self.draft_confidence_generation.index_fill_(
                 0, extend_request_pool_indices, 0
             )
         if self.ngram_accepted_tokens is not None:

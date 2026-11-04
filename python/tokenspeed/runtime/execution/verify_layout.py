@@ -27,8 +27,15 @@ They are refreshed on the execution stream; no tensor value reaches Python.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import torch
 from tokenspeed_kernel.ops.metadata import gather_query_rows
+
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.utils import get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 
 class VerifyQueryLayout:
@@ -55,6 +62,7 @@ class VerifyQueryLayout:
         self.query_offsets = torch.zeros(
             batch_size + 1, dtype=torch.int32, device=device
         )
+        self.accept_lengths = torch.zeros(batch_size, dtype=torch.int32, device=device)
         self.packed_rows = torch.zeros(query_capacity, dtype=torch.int64, device=device)
         self.packed_valid = torch.zeros(query_capacity, dtype=torch.bool, device=device)
         self.request_indices = torch.zeros(
@@ -174,8 +182,35 @@ class VerifyQueryLayout:
         return pages, lengths
 
 
+@dataclass
+class _ConfidenceRequest:
+    slot: int
+    epoch: int
+    generation: int
+    device_generation_offset: int | None
+    rates: dict[int, list[float]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _ConfidenceSample:
+    # A tag names a request lifetime and this round's published generation.
+    tags: tuple[tuple[str, int, int] | None, ...]
+    values: torch.Tensor
+    generations: torch.Tensor
+    start: torch.cuda.Event | None
+    end: torch.cuda.Event
+    batch: int | None
+    queries: int | None
+
+
 class ConfidenceFeedback:
-    """Bounded asynchronous timing and older-score feedback for graph selection."""
+    """Asynchronous, generation-checked scores and live graph cost feedback.
+
+    A budget for draft generation N uses generation N-2. Missing feedback
+    uses observed conditional acceptance, with a Beta(1, 1) cold-start prior.
+    Request scores survive batches that do not schedule the request. Slot
+    reuse bounds this expendable host cache without changing device state.
+    """
 
     def __init__(self, width: int, max_pending: int, max_batch_size: int):
         from tokenspeed_scheduler import ConfidenceBudgetPlanner
@@ -184,51 +219,213 @@ class ConfidenceFeedback:
         self.width = width
         self.max_pending = max_pending
         self._free_buffers = [
-            torch.empty(
-                (max_batch_size, width - 1), dtype=torch.float32, pin_memory=True
+            (
+                torch.empty(
+                    (max_batch_size, 2 * width),
+                    dtype=torch.float32,
+                    pin_memory=True,
+                ),
+                torch.empty(max_batch_size, dtype=torch.int64, pin_memory=True),
             )
             for _ in range(max_pending)
         ]
-        self.pending: list[
-            tuple[
-                tuple[str, ...],
-                torch.Tensor,
-                torch.cuda.Event,
-                torch.cuda.Event,
-                int,
-                int,
-            ]
-        ] = []
-        self.rates: dict[str, list[float]] = {}
+        self.pending: list[_ConfidenceSample] = []
+        self._requests: dict[str, _ConfidenceRequest] = {}
+        self._slot_owners: dict[int, str] = {}
+        self._next_epoch = 0
+        self._round_tags: tuple[tuple[str, int, int] | None, ...] | None = None
+        self._successes = [1] * (width - 1)
+        self._trials = [2] * (width - 1)
+        self.selections = 0
+        self.selected_requests = 0
+        self.fallback_requests = 0
+        self.rejected_generations = 0
+        self.completed_rounds = 0
+        self.allocated_queries = 0
+        self.effective_queries = 0
+        self.verified_requests = 0
+        self.calibration_requests = 0
+        self.predicted_tokens = 0.0
+        self.accepted_tokens = 0
+        self.confidence_error = 0.0
+        self.confidence_observations = 0
 
-    def poll(self, request_ids: list[str]) -> None:
-        while self.pending and self.pending[0][3].query():
-            ids, rates, start, end, batch, queries = self.pending.pop(0)
-            self.rates.update(zip(ids, rates[: len(ids)].tolist(), strict=True))
-            self.planner.observe(batch, queries, start.elapsed_time(end))
-            self._free_buffers.append(rates)
-        # Bound host state to the requests in this round. A returning request
-        # can use the startup curve until its next completed feedback arrives.
-        active = set(request_ids)
-        self.rates = {key: value for key, value in self.rates.items() if key in active}
+    def prepare(
+        self,
+        request_ids: list[str],
+        slots: list[int],
+        output_layout: ForwardOutputLayout,
+    ) -> None:
+        self.poll()
+        if len(request_ids) != len(slots) or len(slots) != (
+            output_layout.num_extends + output_layout.num_decodes
+        ):
+            raise ValueError("confidence requests must match the forward layout")
+        tags = []
+        for row, (key, slot) in enumerate(zip(request_ids, slots, strict=True)):
+            owner = self._slot_owners.get(slot)
+            if owner is not None and owner != key:
+                self._requests.pop(owner, None)
+            state = self._requests.get(key)
+            if state is not None and state.slot != slot:
+                self._slot_owners.pop(state.slot, None)
+            if state is None or row < output_layout.num_extends:
+                self._next_epoch += 1
+                state = _ConfidenceRequest(
+                    slot,
+                    self._next_epoch,
+                    0,
+                    0 if row < output_layout.num_extends else None,
+                )
+                self._requests[key] = state
+            elif state.slot != slot:
+                state.slot = slot
+            self._slot_owners[slot] = key
+            if output_layout.output_width(row):
+                state.generation += 1
+                tags.append((key, state.epoch, state.generation))
+            else:
+                tags.append(None)
+        self._round_tags = tuple(tags)
+
+    def poll(self) -> None:
+        while self.pending and self.pending[0].end.query():
+            sample = self.pending.pop(0)
+            values = sample.values[: len(sample.tags)].tolist()
+            generations = sample.generations[: len(sample.tags)].tolist()
+            if sample.start is not None:
+                self.planner.observe(
+                    sample.batch, sample.queries, sample.start.elapsed_time(sample.end)
+                )
+                self.completed_rounds += 1
+                self.allocated_queries += sample.queries
+                self.effective_queries += sum(int(row[-2]) for row in values)
+                self.verified_requests += sum(row[-2] > 0 for row in values)
+            for tag, row, generation in zip(
+                sample.tags, values, generations, strict=True
+            ):
+                if tag is None:
+                    continue
+                key, epoch, expected = tag
+                state = self._requests.get(key)
+                if state is None or state.epoch != epoch:
+                    continue
+                if sample.start is not None and row[-2] == 0:
+                    # A submitted lookahead can outlive the request. Its null
+                    # state destination intentionally publishes no generation.
+                    continue
+                if state.device_generation_offset is None:
+                    # A restored slot may carry an absolute device counter
+                    # from before this host cache acquired the request.
+                    state.device_generation_offset = generation - expected
+                if generation != expected + state.device_generation_offset:
+                    self.rejected_generations += 1
+                    continue
+                rates = row[: self.width - 1]
+                state.rates[expected] = rates
+                state.rates = {
+                    age: scores
+                    for age, scores in state.rates.items()
+                    if age >= state.generation - 3
+                }
+                queries, accepted = int(row[-2]), int(row[-1])
+                if queries <= 0 or expected < 2:
+                    continue
+                # These scores accompanied the candidates just verified;
+                # newly published scores above are for a later budget.
+                rates = row[self.width - 1 : 2 * (self.width - 1)]
+                self.calibration_requests += 1
+                self.accepted_tokens += accepted
+                prefix = 1.0
+                self.predicted_tokens += 1.0
+                for position in range(queries - 1):
+                    probability = rates[position]
+                    prefix *= probability
+                    self.predicted_tokens += prefix
+                    # After the first mismatch, later positions are censored.
+                    # Acceptance is recorded before EOS/length truncation.
+                    if accepted >= position + 1:
+                        success = int(accepted > position + 1)
+                        self._successes[position] += success
+                        self._trials[position] += 1
+                        self.confidence_error += abs(probability - success)
+                        self.confidence_observations += 1
+            self._free_buffers.append((sample.values, sample.generations))
 
     def select(self, batch: int, request_ids: list[str]) -> int:
-        rates = [self.rates.get(key, [1.0] * (self.width - 1)) for key in request_ids]
-        return self.planner.select(batch, rates)
+        prior = [
+            successes / trials
+            for successes, trials in zip(self._successes, self._trials, strict=True)
+        ]
+        rates = []
+        for key in request_ids:
+            state = self._requests.get(key)
+            scores = (
+                state.rates.get(state.generation - 2) if state is not None else None
+            )
+            if scores is None:
+                self.fallback_requests += 1
+                scores = prior
+            rates.append(scores)
+        self.selections += 1
+        self.selected_requests += len(request_ids)
+        queries = self.planner.select(batch, rates)
+        if self.selections % 256 == 0:
+            logger.info(f"Confidence verification: {self.summary()}")
+        return queries
+
+    def summary(self) -> dict[str, float | int]:
+        """Return completed, same-round budget and confidence diagnostics."""
+        return {
+            "rounds": self.completed_rounds,
+            "mean_q": self.allocated_queries / max(1, self.completed_rounds),
+            "queries_per_request": self.effective_queries
+            / max(1, self.verified_requests),
+            "padding_fraction": 1
+            - self.effective_queries / max(1, self.allocated_queries),
+            "predicted_length": self.predicted_tokens
+            / max(1, self.calibration_requests),
+            "accepted_length": self.accepted_tokens / max(1, self.calibration_requests),
+            "confidence_mae": self.confidence_error
+            / max(1, self.confidence_observations),
+            "fallback_fraction": self.fallback_requests
+            / max(1, self.selected_requests),
+            "rejected_generations": self.rejected_generations,
+        }
 
     def can_record(self) -> bool:
         return len(self.pending) < self.max_pending
 
     def record(
         self,
-        request_ids: list[str],
+        current_rates: torch.Tensor,
+        current_generations: torch.Tensor,
         older_rates: torch.Tensor,
-        start: torch.cuda.Event,
-        batch: int,
-        queries: int,
+        query_lengths: torch.Tensor,
+        accept_lengths: torch.Tensor,
+        start: torch.cuda.Event | None,
+        batch: int | None,
+        queries: int | None,
     ) -> None:
-        host = self._free_buffers.pop()
-        host[: older_rates.shape[0]].copy_(older_rates, non_blocking=True)
-        end = torch.cuda.Event(enable_timing=True)
+        tags = self._round_tags
+        self._round_tags = None
+        if tags is None or not self.can_record():
+            return
+        host, generations = self._free_buffers.pop()
+        count = len(tags)
+        values = torch.cat(
+            (
+                current_rates,
+                older_rates,
+                query_lengths[:, None].to(torch.float32),
+                accept_lengths[:, None].to(torch.float32),
+            ),
+            dim=-1,
+        )
+        host[:count].copy_(values, non_blocking=True)
+        generations[:count].copy_(current_generations, non_blocking=True)
+        end = torch.cuda.Event(enable_timing=start is not None)
         end.record()
-        self.pending.append((tuple(request_ids), host, start, end, batch, queries))
+        self.pending.append(
+            _ConfidenceSample(tags, host, generations, start, end, batch, queries)
+        )
