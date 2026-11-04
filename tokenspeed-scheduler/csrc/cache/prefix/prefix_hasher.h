@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -98,8 +100,25 @@ inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const st
     }
 
     Sha256UpdateU32LE(ctx, static_cast<uint32_t>(tokens.size()));
-    for (std::int32_t t : tokens) {
-        Sha256UpdateU32LE(ctx, static_cast<uint32_t>(t));
+    if (!tokens.empty()) {
+        if constexpr (std::endian::native == std::endian::little) {
+            SHA256_Update(&ctx, tokens.data(), tokens.size_bytes());
+        } else {
+            // Batch the same little-endian token bytes without allocating.
+            uint8_t buffer[64 * sizeof(std::uint32_t)];
+            for (std::size_t start = 0; start < tokens.size();) {
+                const std::size_t count = std::min<std::size_t>(64, tokens.size() - start);
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto token = static_cast<std::uint32_t>(tokens[start + i]);
+                    buffer[4 * i] = static_cast<uint8_t>(token);
+                    buffer[4 * i + 1] = static_cast<uint8_t>(token >> 8);
+                    buffer[4 * i + 2] = static_cast<uint8_t>(token >> 16);
+                    buffer[4 * i + 3] = static_cast<uint8_t>(token >> 24);
+                }
+                SHA256_Update(&ctx, buffer, count * sizeof(std::uint32_t));
+                start += count;
+            }
+        }
     }
 
     // extra_keys is the terminal block, so an empty list can be skipped without
