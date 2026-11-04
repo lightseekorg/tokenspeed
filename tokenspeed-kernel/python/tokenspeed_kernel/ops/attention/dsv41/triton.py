@@ -2737,7 +2737,9 @@ def _reduce_blocks(
             (position < end) & (lane[None, :] < BLOCK_SIZE),
             other=-float("inf"),
         )
-        scores = tl.max(value, axis=1)
+        # torch.amax propagates NaNs, including in the pinned newest block.
+        has_nan = tl.sum((value != value).to(tl.int32), axis=1) != 0
+        scores = tl.where(has_nan, float("nan"), tl.max(value, axis=1))
         if PIN_NEWEST:
             scores = tl.where(
                 (end > 0)
