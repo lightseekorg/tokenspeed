@@ -1367,23 +1367,30 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
 
 
 @requires_gpu
-@pytest.mark.parametrize("prefix_len, extend_len", [(0, 300), (200, 100), (0, 2100)])
+@pytest.mark.parametrize(
+    "prefix_len, extend_len",
+    [(0, 300), (200, 100), (0, 2100), (2100, 64), (4736, 115), (4000, 900)],
+)
 def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> None:
     from tokenspeed.runtime.models.glm5 import workspace_topk_to_global_slots
 
     torch.manual_seed(2)
     topk = 2048
     attention = _indexer_attention(index_topk=topk)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
     seq_len = prefix_len + extend_len
-    block_ids = list(range(2, 2 + (seq_len + 127) // 128))[::-1]
+    num_blocks = (seq_len + 127) // 128
+    # Twelve 128-token blocks per LCM block; blocks 0 and 1 stay unused.
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=max(2, (num_blocks + 2 + 11) // 12))
+    block_ids = list(range(2, 2 + num_blocks))[::-1]
     slots = _slots(block_ids, seq_len, "cuda")
     # Bad keys only in the first positions: a row whose history exceeds topk
     # by exactly the bad count selects exactly the good keys.
     bad = torch.arange(max(seq_len - topk, 0), device="cuda")
     u, keys = _separable_keys(seq_len, bad, "cuda")
     pool.set_index_k_buffer(3, slots, keys, write_mask=None)
-    page_table = torch.zeros(1, 64, dtype=torch.int32, device="cuda")
+    page_table = torch.zeros(
+        1, max(64, 2 * num_blocks), dtype=torch.int32, device="cuda"
+    )
     kernel_pages = _kernel_page_table(block_ids, "cuda")
     page_table[:, : kernel_pages.shape[1]] = kernel_pages
     chunk_meta = SimpleNamespace(
@@ -1787,6 +1794,8 @@ def _k31_attention_stack(
     index_topk: int,
     kvp_size: int,
     kvp_rank: int,
+    full_blocks: int = 0,
+    context_len: int = 4096,
 ):
     """A real K3.1 sparse MLA layer (id 3) over the K3.1 pool and the DSA
     router, at TP8's 12 local heads and K3's latent geometry.
@@ -1834,13 +1843,16 @@ def _k31_attention_stack(
         components=(dsa, *recipe.attn_config.components[1:]),
     )
     groups, layout = kimi_layout(recipe)
-    # Two LCM blocks: twelve full-attention blocks even in a BF16 cache.
+    # At least two LCM blocks: twelve full-attention blocks even in a BF16
+    # cache, and more for ``full_blocks`` past block 0.
+    packing = dict(layout.group_packing)[FULL_ATTENTION]
+    num_lcm_blocks = max(2, -(-(full_blocks + 1) // packing))
     spec = CachePoolSpec(
         family="kimi_k3",
-        memory_plan=layout.bind(2),
+        memory_plan=layout.bind(num_lcm_blocks),
         layer_types=recipe.layer_types,
         cache_group_specs=tuple(group for group, _ in groups),
-        token_capacity=2 * dict(layout.group_packing)[FULL_ATTENTION] * 128,
+        token_capacity=num_lcm_blocks * packing * 128,
     )
     arena = create_cache_arena(spec, device="cuda", enable_memory_saver=False)
     pool = create_cache_pool(
@@ -1881,7 +1893,7 @@ def _k31_attention_stack(
                 v_head_dim=128,
                 q_lora_rank=128,
                 kv_lora_rank=512,
-                max_position_embeddings=4096,
+                max_position_embeddings=context_len,
                 quant_config=None,
                 layer_id=3,
                 prefix="model.layers.3.self_attn",
@@ -1920,7 +1932,7 @@ def _k31_attention_stack(
             kv_cache_dtype=kv_cache_dtype,
             kv_cache_quant_method=None,
             max_bs=4,
-            context_len=4096,
+            context_len=context_len,
             speculative_num_draft_tokens=spec_width,
             kvp_size=kvp_size,
             kvp_rank=kvp_rank,
@@ -2238,14 +2250,14 @@ def test_the_decode_chain_entry_attends_like_forward(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def _extend_over_a_cached_prefix(stack, twin, hidden, *, blocks):
-    """Rows ``[640, len(hidden))`` extending over a cached ``[0, 640)`` on
-    ``stack``, and the same rows of a one-shot prefill on ``twin``."""
+def _extend_over_a_cached_prefix(stack, twin, hidden, *, prefix, blocks):
+    """Rows ``[prefix, len(hidden))`` extending over a cached ``[0, prefix)``
+    on ``stack``, and the same rows of a one-shot prefill on ``twin``."""
     end = hidden.shape[0]
-    _extend_forward(*stack, hidden, prefix=0, end=640, blocks=blocks)
-    resumed = _extend_forward(*stack, hidden, prefix=640, end=end, blocks=blocks)
+    _extend_forward(*stack, hidden, prefix=0, end=prefix, blocks=blocks)
+    resumed = _extend_forward(*stack, hidden, prefix=prefix, end=end, blocks=blocks)
     whole = _extend_forward(*twin, hidden, prefix=0, end=end, blocks=blocks)
-    return resumed, whole[640:]
+    return resumed, whole[prefix:]
 
 
 @requires_gpu
@@ -2255,14 +2267,26 @@ def _extend_over_a_cached_prefix(stack, twin, hidden, *, blocks):
     # (and move some FP8 rows a step); an unwritten prefix errs by ~80%.
     [(torch.bfloat16, 1e-2), (torch.float8_e4m3fn, 3e-2)],
 )
+@pytest.mark.parametrize(
+    "history, prefix, index_topk",
+    [
+        # Below the 1200-row history: the extend's rows choose among the
+        # cached keys.
+        pytest.param(1200, 640, 512, id="short"),
+        # A 4851-token prompt resumed after its 4736-token checkpoint, at
+        # Kimi-K3.1's index_topk: the extend selects among far more keys.
+        pytest.param(4851, 4736, 2048, id="served"),
+    ],
+)
 def test_k31_extend_over_a_cached_prefix_matches_one_prefill(
-    monkeypatch, kv_cache_dtype, fraction
+    monkeypatch, kv_cache_dtype, fraction, history, prefix, index_topk
 ) -> None:
     """Prefix caching: the extend selects over the index keys and attends the
     latent rows an earlier forward cached, as a one-shot prefill does."""
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 8192)
+    num_blocks = -(-history // 128)
     stacks = []
     for _ in range(2):
         torch.manual_seed(5)
@@ -2271,16 +2295,18 @@ def test_k31_extend_over_a_cached_prefix_matches_one_prefill(
                 kv_cache_dtype=kv_cache_dtype,
                 spec_width=1,
                 heads=12,
-                # Below the 1200-row history: the extend's rows choose among
-                # the cached keys.
-                index_topk=512,
+                index_topk=index_topk,
                 kvp_size=1,
                 kvp_rank=0,
+                full_blocks=num_blocks,
+                context_len=max(4096, 2 * history),
             )
         )
-    hidden = torch.randn(1200, 256, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(history, 256, device="cuda", dtype=torch.bfloat16)
+    # Scattered blocks: the history's order is the table's, not the pool's.
+    blocks = torch.randperm(num_blocks, generator=torch.Generator().manual_seed(3)) + 1
     resumed, expected = _extend_over_a_cached_prefix(
-        *stacks, hidden, blocks=[9, 2, 7, 4, 11, 6, 1, 8, 3, 10]
+        *stacks, hidden, prefix=prefix, blocks=blocks.tolist()
     )
     _assert_close_to_reference(resumed, expected.float(), fraction)
 
