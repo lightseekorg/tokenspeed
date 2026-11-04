@@ -24,7 +24,7 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
@@ -1506,7 +1506,11 @@ def _swa_rope_insert(
     VALUES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     HAS_OUT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     token = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 512)
     position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
@@ -1630,6 +1634,7 @@ def triton_dsv41_swa_rope_scatter(
     )
     if values.shape[0] == 0:
         return
+    enable_pdl = pdl_enabled()
     _swa_rope_insert[(values.shape[0],)](
         values,
         norm_weight,
@@ -1655,9 +1660,11 @@ def triton_dsv41_swa_rope_scatter(
         value_bytes,
         _scale_bytes(cache_format),
         out is not None,
+        enable_pdl,
         num_warps=4,
         enable_fp_fusion=False,
         debug=True,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -1696,7 +1703,11 @@ def _rope_inplace_kernel(
     W1,
     WEIGHT_SCALE,
     SCALE_WEIGHTS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1) * HB + tl.arange(0, HB)
     live = head < H
@@ -1745,6 +1756,7 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
     fused_weights = None if scale_separately else weights
     # A program per token and 8 heads: one head's tail is too little work for a program.
     heads_per_program = min(triton.next_power_of_2(heads), 8)
+    enable_pdl = pdl_enabled()
     _rope_inplace_kernel[(values.shape[0], triton.cdiv(heads, heads_per_program))](
         values[..., -rotary_dim:],
         positions,
@@ -1763,9 +1775,11 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
         0 if fused_weights is None else fused_weights.stride(1),
         weight_scale,
         fused_weights is not None,
+        enable_pdl,
         num_warps=4,
         enable_fp_fusion=False,
         debug=True,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     if scale_separately:
         weights.mul_(weight_scale)
