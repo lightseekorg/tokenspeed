@@ -57,6 +57,8 @@ public:
         bool pending_host_store{false};
         // Some State entry or pending store still holds it.
         bool held{false};
+
+        bool operator==(const Residency&) const = default;
     };
 
     CheckpointTree(std::int32_t prefix_granularity, std::int32_t leaf_distance)
@@ -437,7 +439,9 @@ private:
 
     void releasePrefix(PrefixSegment* segment) {
         while (segment != nullptr) {
-            _assert(segment->references > 0, "checkpoint prefix reference underflow");
+            // Fatal rather than thrown: Update gets here from a boundary-tree
+            // hold's release, which runs in destructors.
+            FatalCheck(segment->references > 0, "checkpoint prefix reference underflow");
             if (--segment->references != 0) {
                 return;
             }

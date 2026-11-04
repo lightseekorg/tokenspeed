@@ -130,6 +130,31 @@ std::vector<CacheCoordinator::StoreCandidate> CacheCoordinator::TakePendingStore
     return pending;
 }
 
+namespace {
+
+BoundaryTree::Config boundaryTreeConfig(const std::vector<CacheGroup>& groups, std::int32_t prefix_granularity,
+                                        bool write_back_evictions, bool has_host_tier) {
+    BoundaryTree::Config config{
+        .prefix_granularity = prefix_granularity,
+        .closed_blocks_per_page = 0,
+        .num_state_groups = 0,
+        .has_prefix_closed_groups = false,
+        .has_host_tier = has_host_tier,
+        .queue_dead_candidates = write_back_evictions,
+    };
+    for (const CacheGroup& group : groups) {
+        config.num_state_groups += group.Spec().attn_kind == AttnKind::kState ? 1 : 0;
+        if (group.Matcher().IsPrefixClosed()) {
+            _assert(group.Spec().block_granularity > 0, "a prefix-closed group spans tokens");
+            config.has_prefix_closed_groups = true;
+            config.closed_blocks_per_page += prefix_granularity / group.Spec().block_granularity;
+        }
+    }
+    return config;
+}
+
+}  // namespace
+
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                                    bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
                                    bool stream_device_cache_to_host, bool write_back_evictions,
@@ -144,6 +169,8 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
       enable_l3_storage_{enable_l3_storage && host_pool != nullptr},
       prefix_granularity_{prefix_granularity},
       checkpoints_{prefix_granularity, checkpoint_retention_leaf_distance},
+      boundary_tree_{boundaryTreeConfig(groups_, prefix_granularity, write_back_evictions, host_pool != nullptr),
+                     &checkpoints_},
       checkpoint_retention_requests_{checkpoint_retention_requests} {
     _assert(prefix_granularity_ > 0, "coordinator needs positive prefix_granularity");
     _assert(checkpoint_retention_requests_ >= 0 && checkpoint_retention_requests_ <= kMaxCheckpointRetentionRequests,
@@ -202,12 +229,21 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
                 groups_[i].Index().TrackCommonEntries(pool_, *host_pool_);
             }
         }
+        groups_[i].Index().TrackBoundaries(boundary_tree_, pool_, host_pool_, GroupIsState(i),
+                                           groups_[i].Matcher().IsPrefixClosed());
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         if (!groups_[i].Matcher().IsPrefixClosed() && !GroupIsReplayable(static_cast<std::int32_t>(i))) {
             match_order_.push_back(i);
         }
     }
+}
+
+CacheCoordinator::~CacheCoordinator() {
+    // The recorded write-backs and the index entries point at boundary_tree_
+    // and at pending_eviction_keys_: drop them while both still exist.
+    evicted_segments_.clear();
+    groups_.clear();
 }
 
 bool CacheCoordinator::GroupIsState(std::size_t i) const {
@@ -275,7 +311,7 @@ bool CacheCoordinator::ClearDeviceCache() {
     }
     // A Device-only clear leaves Host L2 untouched: the Host pages under a
     // Device prefix it emptied are not collected for it.
-    dead_candidates_.clear();
+    boundary_tree_.ClearDeadCandidates();
     return true;
 }
 
@@ -306,12 +342,10 @@ bool CacheCoordinator::ClearCache() {
                 "clearable Host cache entry disappeared");
         ++host_evictions_.flush.blocks;
     }
-    // The Host entries left without syncing their tree nodes (so nothing was
-    // queued for collection since the Device clear emptied the queue); with
-    // both tiers empty, the tail hints and the tree go whole. No eviction store
-    // holds a node: the scheduler refuses a clear while a store is in flight.
-    tails_.Clear();
-    boundary_tree_.Clear();
+    // With both tiers empty no node is left: no eviction store holds one, as
+    // the scheduler refuses a clear while a store is in flight. What the Host
+    // evictions queued for collection goes, and so do the tail hints.
+    boundary_tree_.ClearAfterCacheClear();
     checkpoints_.Clear();
     return true;
 }
@@ -357,16 +391,16 @@ CacheCoordinator::BlockRange CacheCoordinator::CopyInSlots(std::size_t i, std::i
 
 CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary,
                                                                               std::int32_t tail_tokens) const {
-    std::int32_t cached = 0;
-    std::int32_t total = 0;
-    // A replayable group has no key here, so it never keeps a boundary partial.
-    ForEachBoundaryKey(boundary, tail_tokens, [&](std::size_t group_index, const CacheKey& key) {
-        cached += groups_[group_index].Index().Contains(pool_, key) ? 1 : 0;
-        ++total;
-    });
+    // Every Device entry under the hash is one of the boundary's keys, and
+    // holds its node.
+    _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
+    const BoundaryTree::Node* node = boundary_tree_.Find(boundary.content_hash);
+    const std::int32_t cached = node == nullptr ? 0 : node->Entries(BoundaryTree::kDevice);
     if (cached == 0) {
         return BoundaryResidency::kNone;
     }
+    const std::int32_t total = numBoundaryKeys(tail_tokens);
+    _assert(cached <= total, "a boundary's Device entries lie among its keys");
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
 }
 
@@ -388,6 +422,22 @@ bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) con
     return any_state_group;
 }
 
+std::int32_t CacheCoordinator::numBoundaryKeys(std::int32_t tail_tokens) const {
+    _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
+    std::int32_t total = 0;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const auto group = static_cast<std::int32_t>(i);
+        // A replayable group has no key here, so it never keeps a boundary
+        // partial.
+        if (GroupIsReplayable(group)) {
+            continue;
+        }
+        total += tail_tokens > 0 ? TailBlocksFor(group, tail_tokens) - FirstTailBlockNeeded(group, tail_tokens)
+                                 : BlocksPerBoundary(group);
+    }
+    return total;
+}
+
 std::vector<CacheCoordinator::NodeEntry> CacheCoordinator::NodeEntries(const BlockPool& pool,
                                                                        const BoundaryTree::Node& node) const {
     std::vector<NodeEntry> entries;
@@ -405,7 +455,7 @@ std::vector<CacheCoordinator::NodeEntry> CacheCoordinator::NodeEntries(const Blo
     for (const bool state : {true, false}) {
         // Partial checkpoints and pending Host stores keep the mark set;
         // only its absence proves that every State lookup would miss.
-        if (state && !node.has_checkpoint[tier]) {
+        if (state && !node.HasCheckpoint(tier)) {
             continue;
         }
         for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -753,7 +803,7 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
         if (static_cast<std::size_t>(page) <= prompt.prefix_hashes.size() && !prompt.tokens.empty()) {
             const ContentHash prior =
                 page == 0 ? ContentHash{} : prompt.prefix_hashes[static_cast<std::size_t>(page) - 1];
-            const std::span<const TailTable::Tail> published = tails_.Tails(prior);
+            const std::span<const TailTable::Tail> published = boundary_tree_.Tails().Tails(prior);
             std::vector<TailTable::Tail> candidates(published.begin(), published.end());
             if (prompt.tail && page == prompt.max_tokens / prefix_granularity_) {
                 const auto& tail = *prompt.tail;
@@ -1294,7 +1344,7 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
     // A hit keeps its tail young under the per-prior cap.
     for (const PrefixProbe::Tier* tier : {&probe.device, &probe.host}) {
         if (tier->tail && tier->tail->tail_tokens > 0) {
-            tails_.Touch(tier->tail->hash);
+            boundary_tree_.TouchTail(tier->tail->hash);
         }
     }
     out.device = acquireTierWithKeys<CacheTier::kDevice>(*probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
@@ -1514,44 +1564,16 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
             "a publication outside an admission publishes a final frontier");
     validateProgress(progress);
     const CompletedPages& completed = *progress.completed_pages;
-    linkPublication(completed);
+    BoundaryTree::Hold publication = boundary_tree_.LinkPublication(completed);
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         cacheDeviceCompletedBlocksForGroup(i, tables[i], completed, access_epoch);
     }
     // A model without a prefix-closed group may register nothing under the
-    // deepest boundary linked (a chunk end of State groups alone).
-    syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
+    // deepest boundary linked (a chunk end of State groups alone): it leaves
+    // now.
+    publication.reset();
     recordCheckpoints(completed, access_epoch);
     recordPublishedTail(completed);
-}
-
-void CacheCoordinator::linkPublication(const CompletedPages& completed) {
-    const std::span<const std::string> page_hashes = completed.prefix_hashes;
-    // The publisher's table holds the pages below the new ones, so a
-    // prefix-closed group keeps their nodes and the first lookup finds the
-    // parent. A node an index entry started without a parent (any page but
-    // page 0's) is not taken as the anchor: the search goes on upward, and the
-    // loop below links it under the page before it.
-    BoundaryTree::Node* parent = nullptr;
-    auto first_page_to_link = static_cast<std::size_t>(completed.first_new_prefix_page);
-    for (; first_page_to_link > 0; --first_page_to_link) {
-        parent = boundary_tree_.Find(page_hashes[first_page_to_link - 1]);
-        if (parent != nullptr && (parent->parent != nullptr || first_page_to_link == 1)) {
-            break;
-        }
-    }
-    for (std::size_t page = first_page_to_link; page < page_hashes.size(); ++page) {
-        parent = &boundary_tree_.FindOrAdd(page_hashes[page], parent,
-                                           static_cast<std::int32_t>(page + 1) * prefix_granularity_,
-                                           /*tail_tokens=*/0);
-        syncKvCoverage(*parent);
-    }
-    if (completed.tail) {
-        boundary_tree_.FindOrAdd(
-            completed.tail->hash, parent,
-            static_cast<std::int32_t>(page_hashes.size()) * prefix_granularity_ + completed.tail->tail_tokens,
-            completed.tail->tail_tokens);
-    }
 }
 
 template <CacheTier Tier>
@@ -1580,6 +1602,8 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
     const bool automatically_streams_to_host =
         stream_device_cache_to_host_ &&
         (groups_[group_index].Spec().attn_kind == AttnKind::kSlidingWindow || stream_completed_to_host);
+    // Each entry it registers holds the tree node of its hash, which a
+    // publication linked before registering.
     groups_[group_index].Index().RegisterFullBlocks(tierPool<Tier>(), blocks, keys, access_epoch, first_logical_block,
                                                     boundary_kind, Tier == CacheTier::kDevice ? &newly_cached : nullptr,
                                                     session);
@@ -1590,19 +1614,6 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
         groups_[group_index].Index().TouchExisting(*host_pool_, keys, blocks, access_epoch, session);
     }
     for (auto& [key, block_ref] : newly_cached) {
-        // Every hash an index holds has a tree node: a publication linked its
-        // own before registering; any other entry with no node yet starts one
-        // without a parent, until a publication through its hash gives it its
-        // boundary (and, past page 0, links it).
-        BoundaryTree::Node& node =
-            boundary_tree_.FindOrAdd(key.content_hash, /*parent=*/nullptr, /*boundary_tokens=*/0, /*tail_tokens=*/0);
-        node.on_device = true;
-        if (groups_[group_index].Matcher().IsPrefixClosed()) {
-            syncKvCoverage(node);
-        }
-        if (GroupIsState(group_index)) {
-            boundary_tree_.SetCheckpoint(node, CacheTier::kDevice, true);
-        }
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
         }
@@ -1864,9 +1875,9 @@ CacheBlockRef CacheCoordinator::FindHostCachedBlock(const CacheKey& key) const {
 std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
                                                                 DeviceEvictionCounts DeviceEvictionStats::*reason,
                                                                 EvictedSegment* write_back_segment) {
+    PrefixCacheIndex& index = groups_[group_id].Index();
     // Read while the entry is still there: the Host entry inherits it.
-    const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
-        groups_[group_id].Index().MetadataFor(pool_, location);
+    const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata = index.MetadataFor(pool_, location);
     // A superseded input an admission, rotation or restore evicts leaves as the
     // reclaim of the request that superseded it, under either write policy,
     // and is never written back. It is never a stranded suffix: a tail at
@@ -1877,70 +1888,106 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
         reason = &DeviceEvictionStats::request_reclaim;
         write_back_segment = nullptr;
     }
-    std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
-    if (!removed) {
-        return removed;  // pinned or gone: nothing to record
-    }
-    if (cache_mutation_sink_) {
-        cache_mutation_sink_(*removed, CacheMutation::kRemoved);
-    }
-    DeviceEvictionCounts& evicted = device_evictions_.*reason;
-    ++evicted.blocks;
-    // Contains takes no reference, so it pins nothing on the Host tier.
-    if (host_pool_ != nullptr && groups_[group_id].Index().Contains(*host_pool_, *removed)) {
-        ++evicted.host_resident;
+    const std::optional<CacheKey> key = index.UnpinnedKeyAt(pool_, location);
+    if (!key) {
+        return key;  // pinned or gone: nothing to record
     }
     if (write_back_segment != nullptr) {
         if (reason == &DeviceEvictionStats::request_reclaim) {
             ++device_evictions_.request_reclaim_for_write_back;
         }
-        BoundaryTree::Node* node = boundary_tree_.Find(removed->content_hash);
+        BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash);
         _assert(node != nullptr, "an indexed entry has a tree node");
-        // Judged before this entry's own checkpoint flag drops (syncTreeNode
-        // below), so the checkpoints of a checkpoint boundary are recorded and
-        // hold it on the Host before the pages above it are judged: no probe
-        // could resume from a tail whose hint the cap dropped, nor, with State
-        // groups, from a boundary with no checkpoint boundary at or under it on
-        // either tier and none on its way there.
+        // Judged and recorded while the entry still holds the node, so the
+        // checkpoints of a checkpoint boundary are recorded and hold it on the
+        // Host before the pages above it are judged: no probe could resume
+        // from a tail whose hint the cap dropped, nor, with State groups, from
+        // a boundary with no checkpoint boundary at or under it on either tier
+        // and none on its way there.
         const bool dead =
-            (node->tail_tokens > 0 && !tails_.Contains(removed->content_hash)) ||
-            (num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree() && node->pending_host_stores == 0);
+            (node->tail_tokens > 0 && !boundary_tree_.Tails().Contains(key->content_hash)) ||
+            (num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree() && node->PendingHostStores() == 0);
         if (dead) {
             ++dead_entries_not_written_back_;
         } else {
             write_back_segment->members.push_back(
-                EvictedBlock{.key = *removed,
+                EvictedBlock{.key = *key,
                              .device_location = location,
                              .metadata = *metadata,
-                             .host_block = FindHostCachedBlock(*removed),
-                             .written_back_before = (node->written_back_group_bits >> removed->group_id & 1U) != 0});
+                             .host_block = FindHostCachedBlock(*key),
+                             .written_back_before = (node->written_back_group_bits >> key->group_id & 1U) != 0,
+                             .pending = holdPendingStore(*node, *key, GroupIsState(group_id))});
             write_back_segment->newest_access_epoch =
                 std::max(write_back_segment->newest_access_epoch, metadata->last_access_epoch);
-            if (!pending_eviction_keys_.insert(*removed).second) {
-                ++pending_eviction_extra_refs_[*removed];
-            }
-            // Held until the segment settles: the node, its tail hint and its
-            // Host presence stay (syncTreeNode below sees the hold).
-            ++node->pending_host_stores;
-            if (GroupIsState(group_id)) {
-                ++node->pending_host_checkpoint_stores;
-            }
         }
     }
-    syncTreeNode(removed->content_hash);
-    return removed;
+    // The entry's hold on its node goes with it.
+    FatalCheck(index.Evict(pool_, location).has_value(), "an unpinned cache entry stays evictable");
+    if (cache_mutation_sink_) {
+        cache_mutation_sink_(*key, CacheMutation::kRemoved);
+    }
+    DeviceEvictionCounts& evicted = device_evictions_.*reason;
+    ++evicted.blocks;
+    // Contains takes no reference, so it pins nothing on the Host tier.
+    if (host_pool_ != nullptr && index.Contains(*host_pool_, *key)) {
+        ++evicted.host_resident;
+    }
+    return key;
+}
+
+CacheCoordinator::PendingHostStore CacheCoordinator::holdPendingStore(BoundaryTree::Node& node, const CacheKey& key,
+                                                                      bool checkpoint) {
+    const auto [key_it, inserted] = pending_eviction_keys_.insert(key);
+    if (!inserted) {
+        ++pending_eviction_extra_refs_[key];
+    }
+    return PendingHostStore{*this, boundary_tree_.HoldPendingStore(node, checkpoint), *key_it};
+}
+
+void CacheCoordinator::releasePendingEvictionKey(const CacheKey& key) noexcept {
+    // `key` may be the set's own element: find before erasing.
+    const auto extra = pending_eviction_extra_refs_.find(key);
+    if (extra == pending_eviction_extra_refs_.end()) {
+        pending_eviction_keys_.erase(pending_eviction_keys_.find(key));
+    } else if (--extra->second == 0) {
+        pending_eviction_extra_refs_.erase(extra);
+    }
+}
+
+CacheCoordinator::PendingHostStore::PendingHostStore(PendingHostStore&& other) noexcept
+    : coordinator_{std::exchange(other.coordinator_, nullptr)},
+      node_{std::move(other.node_)},
+      key_{std::exchange(other.key_, nullptr)} {}
+
+CacheCoordinator::PendingHostStore& CacheCoordinator::PendingHostStore::operator=(PendingHostStore&& other) noexcept {
+    if (this != &other) {
+        reset();
+        coordinator_ = std::exchange(other.coordinator_, nullptr);
+        node_ = std::move(other.node_);
+        key_ = std::exchange(other.key_, nullptr);
+    }
+    return *this;
+}
+
+void CacheCoordinator::PendingHostStore::reset() noexcept {
+    if (coordinator_ != nullptr) {
+        coordinator_->releasePendingEvictionKey(*key_);
+        coordinator_ = nullptr;
+        key_ = nullptr;
+    }
+    node_.reset();
 }
 
 bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                                         DeviceEvictionCounts DeviceEvictionStats::*reason,
                                         EvictedSegment* write_back_segment) {
-    // Its own entry first: when that was the hash's last entry on either tier
-    // syncTreeNode drops the tail hint too, and the cascade finds nothing.
+    // Its own entry first: when that was the last holder of the hash's node,
+    // the node leaves with its tail hint, and the cascade finds nothing.
     const std::optional<CacheKey> removed = evictCachedBlockAlone(group_id, location, reason, write_back_segment);
     if (!removed) {
         return false;
     }
-    if (const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(removed->content_hash)) {
+    if (const std::optional<std::int32_t> tail_tokens = boundary_tree_.Tails().TailTokensOf(removed->content_hash)) {
         evictTailEntries(removed->content_hash, *tail_tokens, reason, write_back_segment);
     } else {
         // A state checkpoint is matched only with the KV below it and with
@@ -1993,7 +2040,6 @@ bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLo
             }
         });
     }
-    syncTreeNode(removed->content_hash);
     return true;
 }
 
@@ -2017,115 +2063,6 @@ void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t ta
     });
 }
 
-void CacheCoordinator::syncKvCoverage(BoundaryTree::Node& node) {
-    bool complete = has_prefix_closed_groups_ && node.tail_tokens == 0;
-    bool duplicate = false;
-    ForEachBoundaryKey(CacheKey{.content_hash = *node.hash}, node.tail_tokens, [&](std::size_t i, const CacheKey& key) {
-        if (!groups_[i].Matcher().IsPrefixClosed()) {
-            return;
-        }
-        const PrefixCacheIndex& index = groups_[i].Index();
-        const bool device = index.Contains(pool_, key);
-        complete = complete && device;
-        duplicate = duplicate || (device && host_pool_ != nullptr && index.Contains(*host_pool_, key));
-    });
-    boundary_tree_.SetDeviceKvCoverage(node, complete, prefix_granularity_);
-    boundary_tree_.SetHostKvDuplicate(node, duplicate);
-}
-
-void CacheCoordinator::syncTreeNode(const ContentHash& hash) {
-    syncCheckpoint(hash);
-    // Every registration starts a node, and the last entry to leave takes it
-    // and its tail hint along: a hash without a node has nothing left.
-    BoundaryTree::Node* node = boundary_tree_.Find(hash);
-    if (node == nullptr) {
-        return;
-    }
-    // The node whose entries changed is judged from the two indexes, by
-    // CacheTier: some group holds the hash there, some State group does,
-    // some prefix-closed group does. A node started without a known parent
-    // has tail_tokens 0 even for a tail hash; its keys then span the whole
-    // page, a superset of the tail's, of which only the tail's are ever
-    // published.
-    std::array<bool, 2> held{};
-    std::array<bool, 2> state_held{};
-    std::array<bool, 2> closed_held{};
-    bool device_kv_page_complete = has_prefix_closed_groups_ && node->tail_tokens == 0;
-    bool has_host_kv_duplicate = false;
-    ForEachBoundaryKey(
-        CacheKey{.content_hash = *node->hash}, node->tail_tokens, [&](std::size_t i, const CacheKey& key) {
-            const bool closed = groups_[i].Matcher().IsPrefixClosed();
-            const std::array<bool, 2> entry{
-                groups_[i].Index().Contains(pool_, key),
-                host_pool_ != nullptr && groups_[i].Index().Contains(*host_pool_, key),
-            };
-            if (closed) {
-                device_kv_page_complete = device_kv_page_complete && entry[BoundaryTree::kDevice];
-                has_host_kv_duplicate =
-                    has_host_kv_duplicate || (entry[BoundaryTree::kDevice] && entry[BoundaryTree::kHost]);
-            }
-            for (std::size_t tier = 0; tier < entry.size(); ++tier) {
-                held[tier] = held[tier] || entry[tier];
-                state_held[tier] = state_held[tier] || (entry[tier] && GroupIsState(i));
-                closed_held[tier] = closed_held[tier] || (entry[tier] && closed);
-            }
-        });
-    boundary_tree_.SetDeviceKvCoverage(*node, device_kv_page_complete, prefix_granularity_);
-    boundary_tree_.SetHostKvDuplicate(*node, has_host_kv_duplicate);
-    // A store on its way to the Host counts there: a checkpoint's as a
-    // checkpoint there, any as Host presence.
-    state_held[BoundaryTree::kHost] = state_held[BoundaryTree::kHost] || node->pending_host_checkpoint_stores > 0;
-    held[BoundaryTree::kHost] = held[BoundaryTree::kHost] || node->pending_host_stores > 0;
-    // Whether a checkpoint mark changed or the walk took a node away: either
-    // can leave the node it stops at with no checkpoint boundary under it.
-    bool checkpoint_changed_or_node_removed = false;
-    for (const CacheTier tier : {CacheTier::kDevice, CacheTier::kHost}) {
-        checkpoint_changed_or_node_removed =
-            boundary_tree_.SetCheckpoint(*node, tier, state_held[static_cast<std::size_t>(tier)]) ||
-            checkpoint_changed_or_node_removed;
-    }
-    boundary_tree_.SetOnHost(*node, held[BoundaryTree::kHost]);
-    node->on_device = held[BoundaryTree::kDevice];
-    // A page no prefix-closed group holds on either tier and no store is
-    // bringing to the Host (a gap), at and under which nothing resumes,
-    // whatever State entries or successors it keeps.
-    bool is_gap = has_prefix_closed_groups_ && !closed_held[BoundaryTree::kDevice] &&
-                  !closed_held[BoundaryTree::kHost] && node->pending_host_stores == 0;
-    // A node no tier holds and nothing hangs under goes, then each parent it
-    // leaves so. A parent's entries did not change, so it is judged on its
-    // own flags without reading an index; one that is a gap was queued when
-    // it became one.
-    while (!node->on_device && !node->on_host && node->first_child == nullptr) {
-        // Nothing hangs under a tail, so a tail hash leaves the tail table
-        // exactly when no tier holds an entry for it.
-        tails_.Remove(*node->hash);
-        // A candidate the last eviction queued for this node leaves with it
-        // (the walk queues what is left above), so taking a chain from below
-        // queues one node, not one per page.
-        if (!dead_candidates_.empty() && dead_candidates_.back() == *node->hash) {
-            dead_candidates_.pop_back();
-        }
-        BoundaryTree::Node* parent = node->parent;
-        boundary_tree_.Remove(*node);
-        if (parent == nullptr) {
-            return;
-        }
-        node = parent;
-        checkpoint_changed_or_node_removed = true;
-        is_gap = false;
-    }
-    // Queued for collection, where it is judged again: the node the walk stops
-    // at once no checkpoint boundary is left under it -- the deepest one left,
-    // since the checkpoint boundary's own node and the pages between often go
-    // first; the collection climbs from it and stops below a checkpoint
-    // boundary published above meanwhile -- and a gap.
-    const bool no_checkpoint_boundary_in_subtree = num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree();
-    if (write_back_evictions_ &&
-        ((checkpoint_changed_or_node_removed && no_checkpoint_boundary_in_subtree) || is_gap)) {
-        dead_candidates_.push_back(*node->hash);
-    }
-}
-
 void CacheCoordinator::CollectDeadEntries() {
     // A node's entries, the Device's before the Host's.
     const auto entries_of = [&](const BoundaryTree::Node& node) {
@@ -2140,9 +2077,9 @@ void CacheCoordinator::CollectDeadEntries() {
     // entries or children it keeps. Nothing is dead while a store is
     // bringing it to the Host: its settlement queues it again.
     const auto dead = [&](const BoundaryTree::Node& node) {
-        return node.pending_host_stores == 0 &&
+        return node.PendingHostStores() == 0 &&
                ((num_state_groups_ > 0 && !node.HasCheckpointBoundaryInSubtree()) ||
-                (node.tail_tokens > 0 && !tails_.Contains(*node.hash)) ||
+                (node.tail_tokens > 0 && !boundary_tree_.Tails().Contains(*node.hash)) ||
                 (has_prefix_closed_groups_ && std::ranges::none_of(entries_of(node), [&](const NodeEntry& entry) {
                      return groups_[entry.group_id].Matcher().IsPrefixClosed();
                  })));
@@ -2150,9 +2087,9 @@ void CacheCoordinator::CollectDeadEntries() {
     // The roots left with an entry in use, each once, for the next call.
     std::vector<ContentHash> waiting;
     std::unordered_set<ContentHash> waiting_roots;
-    while (!dead_candidates_.empty()) {
-        const BoundaryTree::Node* top = boundary_tree_.Find(dead_candidates_.front());
-        dead_candidates_.pop_front();
+    // The evictions below may queue more; they are collected in this call too.
+    while (const std::optional<ContentHash> candidate = boundary_tree_.PopDeadCandidate()) {
+        const BoundaryTree::Node* top = boundary_tree_.Find(*candidate);
         if (top == nullptr || !dead(*top)) {
             continue;
         }
@@ -2202,7 +2139,7 @@ void CacheCoordinator::CollectDeadEntries() {
             // A store still on its way lands here at its ACK, published when
             // its checkpoint boundary is held: the root waits for it like for a
             // pinned entry.
-            in_use = in_use || frame.node->pending_host_stores > 0;
+            in_use = in_use || frame.node->PendingHostStores() > 0;
             stack.pop_back();
         }
         // The evictions below may take the node away.
@@ -2225,7 +2162,9 @@ void CacheCoordinator::CollectDeadEntries() {
             waiting.push_back(std::move(root));
         }
     }
-    dead_candidates_.assign(std::make_move_iterator(waiting.begin()), std::make_move_iterator(waiting.end()));
+    for (const ContentHash& root : waiting) {
+        boundary_tree_.QueueDeadCandidate(root);
+    }
 }
 
 std::vector<CacheCoordinator::EvictedSegment> CacheCoordinator::TakeEvictedSegments() {
@@ -2302,19 +2241,18 @@ std::vector<HostPublication> CacheCoordinator::SettleEvictedSegment(EvictedSegme
     // Host.
     for (EvictedBlock& member : segment.members) {
         const ContentHash& hash = member.key.content_hash;
-        BoundaryTree::Node* node = boundary_tree_.Find(hash);
-        _assert(node != nullptr && node->pending_host_stores > 0,
-                "a recorded store holds its tree node until it settles");
+        _assert(static_cast<bool>(member.pending), "a recorded store holds its tree node until it settles");
+        BoundaryTree::Node& node = member.pending.node();
         // The cap dropped the tail's hint while the copy was out, or no
         // checkpoint boundary at or under the boundary is left on either tier:
         // no probe could resume from it on the Host.
-        const bool cancelled = (node->tail_tokens > 0 && !tails_.Contains(hash)) ||
-                               (num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree());
+        const bool cancelled = (node.tail_tokens > 0 && !boundary_tree_.Tails().Contains(hash)) ||
+                               (num_state_groups_ > 0 && !node.HasCheckpointBoundaryInSubtree());
         const bool publishes = placed_on_host && !cancelled;
         if (publishes) {
             _assert(static_cast<bool>(member.host_block), "a placed segment carries a Host block for every member");
             CacheHostBlock(member.host_block, member.key, member.metadata);
-            node->written_back_group_bits |= std::uint64_t{1} << member.key.group_id;
+            node.written_back_group_bits |= std::uint64_t{1} << member.key.group_id;
             published.push_back(HostPublication{.key = member.key, .block = member.host_block});
         } else if (placed_on_host && member.host_block &&
                    groups_[member.key.group_id].Index().Contains(*host_pool_, member.host_block->Location())) {
@@ -2324,29 +2262,18 @@ std::vector<HostPublication> CacheCoordinator::SettleEvictedSegment(EvictedSegme
             member.host_block.reset();
             evictHostCachedBlock(member.key.group_id, location, &HostEvictionStats::dead_entry);
         }
-        --node->pending_host_stores;
-        if (GroupIsState(member.key.group_id)) {
-            --node->pending_host_checkpoint_stores;
-        }
-        const auto extra = pending_eviction_extra_refs_.find(member.key);
-        if (extra == pending_eviction_extra_refs_.end()) {
-            const std::size_t erased = pending_eviction_keys_.erase(member.key);
-            _assert(erased == 1, "every recorded eviction key stays pending until settlement");
-        } else if (--extra->second == 0) {
-            pending_eviction_extra_refs_.erase(extra);
-        }
-        syncTreeNode(hash);
+        // The node may leave here; it is not read below.
+        member.pending.reset();
         // What was not published is judged again by the next collection.
-        if (!publishes && boundary_tree_.Find(hash) != nullptr &&
-            (dead_candidates_.empty() || dead_candidates_.back() != hash)) {
-            dead_candidates_.push_back(hash);
+        if (!publishes) {
+            boundary_tree_.QueueDeadCandidate(hash);
         }
     }
     return published;
 }
 
 void CacheCoordinator::MarkSupersededStateInput(const ContentHash& resumed_tail_hash, std::uint64_t access_epoch) {
-    const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(resumed_tail_hash);
+    const std::optional<std::int32_t> tail_tokens = boundary_tree_.Tails().TailTokensOf(resumed_tail_hash);
     if (!tail_tokens) {
         return;
     }
@@ -2400,24 +2327,10 @@ void CacheCoordinator::syncCheckpoint(const ContentHash& hash) {
     if (checkpoints_.Size() == 0 || !checkpoints_.Contains(hash)) {
         return;
     }
-    CheckpointTree::Residency residency{.complete = {true, host_pool_ != nullptr}};
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        if (!GroupIsState(i)) {
-            continue;
-        }
-        const CacheKey key{.group_id = groups_[i].Id(), .content_hash = hash};
-        const bool on_device = groups_[i].Index().Contains(pool_, key);
-        const bool on_host = host_pool_ != nullptr && groups_[i].Index().Contains(*host_pool_, key);
-        residency.complete[BoundaryTree::kDevice] = residency.complete[BoundaryTree::kDevice] && on_device;
-        residency.complete[BoundaryTree::kHost] = residency.complete[BoundaryTree::kHost] && on_host;
-        residency.held = residency.held || on_device || on_host;
-    }
-    if (const BoundaryTree::Node* node = boundary_tree_.Find(hash);
-        node != nullptr && node->pending_host_checkpoint_stores > 0) {
-        residency.pending_host_store = true;
-        residency.held = true;
-    }
-    checkpoints_.Update(hash, residency);
+    // A checkpoint nothing holds any more leaves at once.
+    const BoundaryTree::Node* node = boundary_tree_.Find(hash);
+    checkpoints_.Update(hash,
+                        node == nullptr ? CheckpointTree::Residency{} : boundary_tree_.CheckpointResidency(*node));
 }
 
 CheckpointAging CacheCoordinator::CheckpointAgingFor(CacheTier tier) const {
@@ -2466,7 +2379,7 @@ void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
 }
 
 void CacheCoordinator::recordTail(const ContentHash& prior, const TailPublication& tail) {
-    const std::optional<TailTable::Tail> dropped = tails_.Add(prior, tail.tail_tokens, tail.hash);
+    const std::optional<TailTable::Tail> dropped = boundary_tree_.RecordTail(prior, tail.tail_tokens, tail.hash);
     if (!dropped) {
         return;
     }
@@ -2489,9 +2402,7 @@ void CacheCoordinator::recordTail(const ContentHash& prior, const TailPublicatio
                            }
                        });
     // What stayed in use on either tier goes once released.
-    if (write_back_evictions_ && boundary_tree_.Find(dropped->hash) != nullptr) {
-        dead_candidates_.push_back(dropped->hash);
-    }
+    boundary_tree_.QueueDeadCandidate(dropped->hash);
 }
 
 CacheKey CacheCoordinator::historyBlockKey(std::size_t group_index, const CompletedPages& completed,
@@ -3010,24 +2921,18 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
     } else {
         metadata.last_access_epoch = ++next_access_epoch_;
     }
+    // The entry holds the node of its hash: a store's the node its Device
+    // publication linked, while either tier holds the hash; an L3 GET's, or a
+    // store's whose Device entry left before the ACK, one it starts without a
+    // parent, until a publication through its hash gives it its boundary (and,
+    // past page 0, links it).
     index.Register(*host_pool_, block_ref, key, metadata.last_access_epoch, metadata.logical_block_index,
                    metadata.boundary_kind, /*newly_cached=*/nullptr, metadata.session);
-    // A store's entry keeps the node its Device publication linked while
-    // either tier holds the hash; an L3 GET's, or a store's whose Device
-    // entry left before the ACK, starts one without a parent, until a
-    // publication through its hash gives it its boundary (and, past page 0,
-    // links it).
-    BoundaryTree::Node& node =
-        boundary_tree_.FindOrAdd(key.content_hash, /*parent=*/nullptr, /*boundary_tokens=*/0, /*tail_tokens=*/0);
-    boundary_tree_.SetOnHost(node, true);
-    if (groups_[key.group_id].Matcher().IsPrefixClosed()) {
-        syncKvCoverage(node);
-    }
     if (GroupIsState(key.group_id)) {
-        boundary_tree_.SetCheckpoint(node, CacheTier::kHost, true);
-        node.latest_state_access_epoch =
-            std::max({node.latest_state_access_epoch, metadata.last_access_epoch, metadata.max_access_epoch});
-        syncCheckpoint(key.content_hash);
+        BoundaryTree::Node* node = boundary_tree_.Find(key.content_hash);
+        _assert(node != nullptr, "an indexed checkpoint has a tree node");
+        node->latest_state_access_epoch =
+            std::max({node->latest_state_access_epoch, metadata.last_access_epoch, metadata.max_access_epoch});
     }
 }
 
@@ -3048,22 +2953,16 @@ void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey
     _assert(static_cast<bool>(block_ref), "CacheDeviceBlock requires a destination block");
     _assert(key.group_id < groups_.size(), "CacheDeviceBlock group id out of range");
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
+    // The entry holds the node of its hash. The node the restored entry was
+    // published under is gone when no tier held the hash meanwhile; then the
+    // entry starts one without a parent, until a publication through its hash
+    // gives it its boundary (and, past page 0, links it).
     groups_[key.group_id].Index().Register(pool_, block_ref, key, access_epoch, logical_block_index, boundary_kind,
                                            &newly_cached, SessionForAccess(access_epoch));
-    // The node the restored entry was published under is gone when no tier
-    // held the hash meanwhile; then it starts one without a parent, until a
-    // publication through its hash gives it its boundary (and, past page 0,
-    // links it).
-    BoundaryTree::Node& node =
-        boundary_tree_.FindOrAdd(key.content_hash, /*parent=*/nullptr, /*boundary_tokens=*/0, /*tail_tokens=*/0);
-    node.on_device = true;
-    if (groups_[key.group_id].Matcher().IsPrefixClosed()) {
-        syncKvCoverage(node);
-    }
     if (GroupIsState(key.group_id)) {
-        boundary_tree_.SetCheckpoint(node, CacheTier::kDevice, true);
-        node.latest_state_access_epoch = std::max(node.latest_state_access_epoch, access_epoch);
-        syncCheckpoint(key.content_hash);
+        BoundaryTree::Node* node = boundary_tree_.Find(key.content_hash);
+        _assert(node != nullptr, "an indexed checkpoint has a tree node");
+        node->latest_state_access_epoch = std::max(node->latest_state_access_epoch, access_epoch);
     }
     if (!cache_mutation_sink_) {
         return;
