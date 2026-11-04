@@ -247,7 +247,7 @@ def test_fp8_channel_moe_matches_fp64(
     "hidden,ispp", [(256, 32), (256, 64), (2048, 768), (5120, 320), (5120, 2560)]
 )
 @pytest.mark.parametrize("num_tokens", [1, 16, 512, 513, 1024, 1025, 8192])
-def test_fp8_channel_sm90_tiles_stay_on_mma_sync(
+def test_fp8_channel_sm90_tiles_fit_and_stay_at_32_rows(
     hidden: int, ispp: int, num_tokens: int
 ) -> None:
     from tokenspeed_kernel.ops.moe._triton import fp8_channel
