@@ -37,6 +37,11 @@ import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
+from tokenspeed_kernel.ops.residual.triton import (
+    mhc_pre_layer_norm_hc4,
+    mhc_pre_mix_hc4,
+    triton_mhc_post,
+)
 from tokenspeed_kernel.platform import pdl_enabled
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -154,6 +159,69 @@ def _assert_tuples_close(actual, expected) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _case_mhc_post():
+    torch.manual_seed(101)
+    tokens, hidden = 32, 5120
+    real = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=DEVICE)
+    residual = torch.randn(tokens, 4, hidden, dtype=torch.bfloat16, device=DEVICE)
+    post = torch.randn(tokens, 4, dtype=torch.float32, device=DEVICE)
+    comb = torch.randn(tokens, 4, 4, dtype=torch.float32, device=DEVICE)
+
+    def run(hidden_states):
+        return (triton_mhc_post(hidden_states, residual, post, comb),)
+
+    return real, run
+
+
+def _case_mhc_pre_mix():
+    torch.manual_seed(102)
+    num_tokens, n_splits, hidden_size = 64, 1, 5120
+    real = torch.randn(n_splits, num_tokens, 24, dtype=torch.float32, device=DEVICE)
+    gemm_out_sqrsum = (
+        torch.rand(n_splits, num_tokens, dtype=torch.float32, device=DEVICE) + 1.0
+    )
+    hc_scale = torch.rand(3, dtype=torch.float32, device=DEVICE) + 0.5
+    hc_base = torch.randn(24, dtype=torch.float32, device=DEVICE)
+
+    def run(gemm_out_mul):
+        pre_mix = torch.empty(num_tokens, 4, dtype=torch.float32, device=DEVICE)
+        post_mix = torch.empty(num_tokens, 4, dtype=torch.float32, device=DEVICE)
+        comb_mix = torch.empty(num_tokens, 16, dtype=torch.float32, device=DEVICE)
+        mhc_pre_mix_hc4(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            pre_mix,
+            post_mix,
+            comb_mix,
+            hidden_size=hidden_size,
+            rms_eps=1e-6,
+            hc_eps=1e-5,
+            sinkhorn_iters=3,
+            n_splits=n_splits,
+            num_tokens=num_tokens,
+        )
+        return (pre_mix, post_mix, comb_mix)
+
+    return real, run
+
+
+def _case_mhc_pre_layer_norm():
+    torch.manual_seed(103)
+    tokens, hidden = 32, 5120
+    real = torch.randn(tokens, 4, hidden, dtype=torch.bfloat16, device=DEVICE)
+    pre_mix = torch.rand(tokens, 4, dtype=torch.float32, device=DEVICE) + 0.1
+    weight = torch.randn(hidden, dtype=torch.bfloat16, device=DEVICE)
+
+    def run(residual):
+        out = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=DEVICE)
+        mhc_pre_layer_norm_hc4(pre_mix, residual, weight, out, eps=1e-6)
+        return (out,)
+
+    return real, run
+
+
 def _case_quantize_fp8_group32_swizzled():
     torch.manual_seed(105)
     rows, hidden = 128, 5120
@@ -166,6 +234,9 @@ def _case_quantize_fp8_group32_swizzled():
 
 
 _CASES = {
+    "mhc_post_hc4": _case_mhc_post,
+    "mhc_pre_mix_hc4": _case_mhc_pre_mix,
+    "mhc_pre_layer_norm_hc4": _case_mhc_pre_layer_norm,
     "fp8_group32_ue8m0_quantize_swizzled": _case_quantize_fp8_group32_swizzled,
 }
 
