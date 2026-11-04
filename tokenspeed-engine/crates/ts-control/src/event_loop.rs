@@ -838,7 +838,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let total_pages = self.config.kv_total_pages;
             metrics.record_cache_occupancy(
                 total_pages - i64::from(sizes.empty_lcm_blocks),
-                i64::from(sizes.active_lcm_blocks),
+                i64::from(active_pages),
                 total_pages,
                 self.config.kv_page_tokens,
             );
