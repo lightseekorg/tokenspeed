@@ -478,7 +478,12 @@ def _mha_extend_warp_pipelined():
         RAGGED=False, NUM_STAGES=extend._EXTEND_STAGES,
     )  # fmt: skip
     return _compile_gfx950(
-        extend.gluon_mha_extend_gfx950, types, constexprs, num_warps, ("num_seqs",)
+        extend.gluon_mha_extend_gfx950,
+        types,
+        constexprs,
+        num_warps,
+        ("num_seqs",),
+        _sched_options(),
     )
 
 
@@ -515,7 +520,7 @@ def _mla_prefill_8wave():
         constexprs,
         config.num_warps,
         ("batch_size", "max_seqlen_q"),
-        dict(llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),)),
+        dict(_sched_options(), llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),)),
     )
 
 
@@ -672,11 +677,6 @@ INLINE_ASM_ON_MAIN = {
         _AMD + "attention._common:_keep_in_cluster",
         "keeps the ops producing a value in its warp-pipeline cluster",
         "a Gluon op that pins a value to a program point",
-    ),
-    "_wave_maxima_unchanged": (
-        _AMD + "attention._common:_wave_maxima_unchanged",
-        "a wave vote with a scalar result",
-        "a Gluon ballot (wave vote) op",
     ),
     "gluon_fp32_router_gemv_gfx950": (
         _AMD + "gemm.fp32.router_gemv:gluon_fp32_router_gemv_gfx950",
