@@ -83,7 +83,7 @@ def clean_logits_and_block_max(
 ):
     """Return fully cleaned logits, aligned eight-row maxima and block ends.
 
-    FP32 values and integer lengths follow the internal clean_logits contract;
+    FP32/BF16 values and integer lengths follow the internal clean_logits contract;
     table is the original logical page table (None for unpaged input). Invalid
     pages and future positions are -inf. Both output matrices, including their
     alignment tails, are completely initialized. The newest visible block is
@@ -98,13 +98,13 @@ def clean_logits_and_block_max(
         or values.shape[0] != lengths.numel()
         or values.shape[1] < capacity
         or values.stride(1) != 1
-        or values.dtype != torch.float32
+        or values.dtype not in (torch.float32, torch.bfloat16)
     ):
-        raise RuntimeError("DeepGEMM returned incompatible FP32 score geometry")
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
     alignment = input_alignment // 4
     stride = triton.cdiv(triton.cdiv(capacity, 8), alignment) * alignment
     cleaned = torch.empty(
-        (values.shape[0], capacity), device=values.device, dtype=torch.float32
+        (values.shape[0], capacity), device=values.device, dtype=values.dtype
     )
     blocks = torch.empty(
         (values.shape[0], stride), device=values.device, dtype=torch.float32

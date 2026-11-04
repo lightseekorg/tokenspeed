@@ -355,12 +355,16 @@ class MLAAttnBackend(PagedAttentionBackend):
             cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
             torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
+        # The host chunk boundaries only feed the distributed prefix-history
+        # gather (KVP), which this backend does not support: it reads every
+        # history row from its own pool, so the boundaries are not needed here.
         (
             chunked_loop_num,
             chunk_kv_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
+            _chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,

@@ -288,6 +288,13 @@ offload keeps its pinned Host history mapped across a release and zeroes it on
 resume. Other device memory (input buffers, communication workspaces such as
 symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
 
+With attention DP, every rank must stop admissions and drain before any rank
+releases memory. Send the release to every DP engine concurrently; a release
+itself stops admissions, so a separate pause is unnecessary. A peer explicitly
+paused with `wait` or `abort` may also satisfy the drain. An idle engine that
+has not paused prevents release. After a partial or staggered resume, no DP
+rank forwards until every region released on every rank has been restored.
+
 Queued weight operations finish before a release frees memory. If a PD engine
 is paused with buffered requests, release is refused: resume and drain those
 requests first. While any region is released, a pause is refused; resume the
@@ -1221,11 +1228,14 @@ Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
 headroom per rank. Each buffer counts at the size its configured pinned
-allocator reserves. On CUDA/ROCm, the launcher defaults
-`pinned_max_round_threshold_mb:1024` before starting the ranks: allocations
-up to 1 GiB round to a power of two; larger buffers use their requested size.
-This avoids reserving 274.88 GB for a 140 GB L2 buffer. Explicit thresholds
-and other allocator options are preserved. To override the default, set
+allocator reserves. When the CUDA/ROCm allocator supports it, the launcher sets
+`pinned_max_round_threshold_mb:1024` as the default before starting the ranks.
+Allocations up to 1 GiB round to a power of two; larger buffers use their
+requested size.
+This avoids reserving 274.88 GB for a 140 GB L2 buffer. Allocators without this
+option keep their native defaults. The capability probe has a 60-second timeout.
+Probe failures stop startup. Explicit thresholds and other allocator options
+are preserved. To override the default, set
 `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:<MiB>` before launch;
 the legacy `PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_HIP_ALLOC_CONF` variables
 take precedence, in that order. The check reads the effective allocator
@@ -1382,11 +1392,3 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
-
-### Pinned allocator compatibility
-
-The launcher defaults large pinned allocations to exact sizes when the installed
-PyTorch allocator supports `pinned_max_round_threshold_mb`. It probes the parser
-in a separate process so the check does not change the caller's allocator state.
-Older builds retain their existing allocation policy; explicitly supplied
-allocator options are preserved. Unexpected probe failures stop startup.

@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import dataclasses
-import logging
 import os
 import re
 import socket
@@ -47,6 +46,39 @@ _BRACKET_RE = re.compile(r"\[([^\]]*)\]")
 _EPHEMERAL_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
 
 
+def _supports_allocator_setting(setting: str) -> bool:
+    """Check the native parser without changing the launcher's allocator state."""
+    # Even reading a snapshot initializes allocator settings, so keep capability
+    # detection in a child without visible GPUs before worker processes fork.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import torch; torch.cuda.memory._set_allocator_settings({setting!r})",
+        ],
+        env=dict(
+            os.environ,
+            CUDA_VISIBLE_DEVICES="",
+            HIP_VISIBLE_DEVICES="",
+            ROCR_VISIBLE_DEVICES="",
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode == 0:
+        return True
+    name = setting.split(":", 1)[0]
+    if (
+        f"Unrecognized CachingAllocator option: {name}" in result.stderr
+        or f"Unrecognized key '{name}'" in result.stderr
+    ):
+        return False
+    raise RuntimeError(
+        f"Cannot probe pinned allocator setting: {result.stderr.strip()}"
+    )
+
+
 def set_pinned_allocator_default() -> None:
     """Default large pinned buffers to exact sizes in fresh worker processes."""
     # PyTorch reads the first defined variable in this order.
@@ -65,44 +97,8 @@ def set_pinned_allocator_default() -> None:
     config = os.environ.get(key, "").strip().rstrip(",")
     if "pinned_max_round_threshold_mb" not in config:
         default = "pinned_max_round_threshold_mb:1024"
-        # Probe the installed allocator parser in isolation: older PyTorch
-        # builds reject this optional optimization. Parsing in this process
-        # would reset the caller's allocator settings, even without CUDA init.
-        probe_env = dict(os.environ)
-        for name in (
-            "PYTORCH_CUDA_ALLOC_CONF",
-            "PYTORCH_HIP_ALLOC_CONF",
-            "PYTORCH_ALLOC_CONF",
-        ):
-            probe_env.pop(name, None)
-        probe = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "import torch; torch.cuda.memory._set_allocator_settings("
-                + repr(default)
-                + ")",
-            ],
-            env=probe_env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        if probe.returncode:
-            if (
-                "Unrecognized CachingAllocator option: pinned_max_round_threshold_mb"
-                not in probe.stderr
-            ):
-                raise RuntimeError(
-                    f"Pinned allocator capability probe failed: {probe.stderr}"
-                )
-            logging.getLogger(__name__).warning(
-                "Installed PyTorch does not support pinned_max_round_threshold_mb; "
-                "keeping its existing pinned allocation policy"
-            )
-            return
-        os.environ[key] = f"{config},{default}" if config else default
+        if _supports_allocator_setting(default):
+            os.environ[key] = f"{config},{default}" if config else default
 
 
 def set_rocm_tool_registration_default() -> None:

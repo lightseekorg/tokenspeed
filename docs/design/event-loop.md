@@ -71,6 +71,32 @@ set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
 
+## Request identity and submission failures
+
+The wire identifies a request and its output stream by `rid` alone. A new
+request, including a retry after abort, should use a fresh id. Before ingress
+can publish a refusal or register data-plane state, the loop discards repeated
+ids in the same received round and ids still owned by the output processor.
+The original request keeps its state and stream; a warning records the
+duplicate. Sending a final error for that duplicate would end the original
+stream, since the wire cannot distinguish the two submissions.
+
+Output completion and scheduler retirement are separate fences. After the
+output processor forgets a request, the scheduler may still hold it while
+forward results drain or until the next plan removes its finished entry.
+An id in that interval receives a 409 refusal before data-plane admission.
+The check uses the scheduler's existing request lookup; it does not reclaim
+an id ahead of its in-flight work. Once both owners have released an id, this
+admission guard allows it again.
+
+The Rust/C++ submission bridge returns `Result`: native validation exceptions
+must never escape a `noexcept` bridge. The scheduler validates a complete
+submission batch before inserting requests. If it rejects the batch, the
+loop finishes and releases those unscheduled requests with a client error
+and continues serving; it starts PD transfers only after submission succeeds.
+Already running requests remain intact. Other requests in a rejected batch
+also receive its error and can be retried with fresh ids.
+
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
 The event loop is the **control plane**. The forward thread is the **data
@@ -608,6 +634,22 @@ registration is deferred until resume admits them, and aborted buffered
 requests never register one. An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
+
+With attention DP, memory release waits for every rank to stop admissions
+and drain its requests, forwards, cancelled embedding receives, cache copies,
+transfers and queued weight operations. A locally drained rank keeps joining
+idle forwards while a peer drains. An idle but unpaused peer prevents release:
+it could admit a request in the next round. Release intent rides the head
+gate, so every rank joins the tail's readiness agreement when any release is
+pending, including ranks without a release of their own. Ordinary rounds add
+no collective. Readiness is MIN-reduced over the replica and then attention DP
+before any release runs on the forward thread.
+
+The head gate also agrees whether any DP rank still has released regions.
+Until all regions are restored on every rank, it withholds forward permission
+through the scheduler's storage tick and suppresses idle forwards. This covers
+staggered and partial resumes without building a batch that cannot execute;
+control operations and cache acknowledgments continue to progress.
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
 Weight-update `flush_cache` and a standalone flush first MAX-reduce
