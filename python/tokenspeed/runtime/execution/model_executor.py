@@ -1583,6 +1583,9 @@ class ModelExecutor:
                     ctx.verify_queries.query_lengths[: accept_lengths.shape[0]],
                 )
             )
+            ctx.verify_queries.accept_lengths[: accept_lengths.shape[0]].copy_(
+                accept_lengths
+            )
         ib = self.input_buffers
         self.runtime_states.apply_stop_conditions(
             ib.state_write_req_pool_indices_buf[: ctx.bs],
@@ -2683,7 +2686,9 @@ class ModelExecutor:
                     color="blue",
                 ):
                     self.forward_step.prepare_confidence_feedback(
-                        forward_op.request_ids
+                        forward_op.request_ids,
+                        forward_op.request_pool_indices,
+                        ctx.output_layout,
                     )
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0

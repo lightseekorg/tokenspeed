@@ -89,6 +89,7 @@ void BindForwardCommonFields(Cls& cls) {
 NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::ConfidenceBudgetPlanner>(m, "ConfidenceBudgetPlanner")
         .def(nb::init<int>())
+        .def("set_baseline", &tokenspeed::ConfidenceBudgetPlanner::SetBaseline)
         .def("observe", &tokenspeed::ConfidenceBudgetPlanner::Observe)
         .def("select", &tokenspeed::ConfidenceBudgetPlanner::Select);
 

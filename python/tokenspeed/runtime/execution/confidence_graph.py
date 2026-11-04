@@ -488,11 +488,9 @@ class ConfidenceDecodeGraphs:
         # The startup curve composes both captured stages. Completed whole-round
         # feedback additionally includes metadata refresh and graph submission.
         for batch, draft in self.drafts.items():
-            for multiple in range(1, self.width + 1):
-                queries = batch * multiple
-                target = self.targets.get(queries)
-                if target is not None:
-                    runner.confidence_feedback.planner.observe(
+            for queries, target in self.targets.items():
+                if batch <= queries <= batch * self.width:
+                    runner.confidence_feedback.planner.set_baseline(
                         batch, queries, target.milliseconds + draft.milliseconds
                     )
 

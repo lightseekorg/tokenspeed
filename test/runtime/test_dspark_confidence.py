@@ -364,14 +364,17 @@ def test_slot_confidence_generations_are_reset_and_restored():
     states.publish_draft_confidence(slots, second, group=None)
     torch.testing.assert_close(states.previous_draft_confidence[slots], first)
     torch.testing.assert_close(states.draft_confidence[slots], second)
+    assert states.draft_confidence_generation[1].item() == 2
     image = torch.empty(states.slot_state_bytes(), dtype=torch.uint8)
     states.export_slot_state(1, image, None, request_id="request")
     states.import_slot_state(2, image, None, request_id="request")
     torch.testing.assert_close(states.draft_confidence[2], second[0])
     torch.testing.assert_close(states.previous_draft_confidence[2], first[0])
+    assert states.draft_confidence_generation[2].item() == 2
     states.reset_states(torch.tensor([2]), torch.tensor([0], dtype=torch.int32))
     assert not states.draft_confidence[2].any()
     assert not states.previous_draft_confidence[2].any()
+    assert states.draft_confidence_generation[2].item() == 0
     torch.testing.assert_close(states.draft_confidence[1], second[0])
 
 
@@ -388,6 +391,46 @@ def test_planner_accounts_for_full_round_cost_and_prefers_smaller_ties():
         planner.observe(2, 4, float("nan"))
     with pytest.raises(ValueError):
         planner.select(2, [[1.0]])
+
+
+def test_planner_uses_shared_query_graphs_and_anchor_only_without_timings():
+    from tokenspeed_scheduler import ConfidenceBudgetPlanner
+
+    planner = ConfidenceBudgetPlanner(4)
+    rates = [[0.8] * 3 for _ in range(4)]
+    assert planner.select(4, rates) == 4
+    planner.set_baseline(4, 4, 1.0)
+    planner.set_baseline(4, 6, 1.05)
+    planner.set_baseline(4, 8, 2.0)
+    assert planner.select(4, rates) == 6
+
+
+def test_live_cost_corrects_unvisited_large_query_graphs():
+    from tokenspeed_scheduler import ConfidenceBudgetPlanner
+
+    planner = ConfidenceBudgetPlanner(4)
+    for queries in (4, 6, 8, 12, 16):
+        planner.set_baseline(4, queries, 1.0)
+    rates = [[0.6] * 3 for _ in range(4)]
+    assert planner.select(4, rates) == 16
+    for _ in range(10):
+        planner.observe(4, 16, 9.0)
+    # Live attention costs 0.5 ms/query above startup. The unvisited graphs
+    # must inherit it instead of attracting the next round at 1 ms each.
+    assert planner.select(4, rates) == 4
+
+
+def test_graph_cost_correction_ignores_isolated_slow_samples():
+    from tokenspeed_scheduler import ConfidenceBudgetPlanner
+
+    planner = ConfidenceBudgetPlanner(4)
+    for queries in (4, 8, 12, 16):
+        planner.set_baseline(4, queries, 1.0)
+    rates = [[0.9] * 3 for _ in range(4)]
+    for _ in range(10):
+        planner.observe(4, 16, 1.0)
+    planner.observe(4, 4, 1000.0)
+    assert planner.select(4, rates) == 16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

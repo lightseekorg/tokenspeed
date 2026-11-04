@@ -334,6 +334,7 @@ class ForwardStepRunner:
         self.confidence_request_ids: list[str] = []
         self.confidence_queries: int | None = None
         self.confidence_batch: int | None = None
+        self.confidence_round_prepared = False
         self._confidence_host_group = None
         if drafter is not None and drafter.verify_policy == "confidence":
             self.confidence_feedback = ConfidenceFeedback(
@@ -587,10 +588,18 @@ class ForwardStepRunner:
             )
         return self.verify_query_layouts[key]
 
-    def prepare_confidence_feedback(self, request_ids: list[str]) -> None:
+    def prepare_confidence_feedback(
+        self,
+        request_ids: list[str],
+        request_pool_indices: list[int],
+        output_layout: ForwardOutputLayout,
+    ) -> None:
         self.confidence_request_ids = request_ids
-        if self.confidence_feedback is not None:
-            self.confidence_feedback.poll(request_ids)
+        if self.confidence_feedback is not None and self.global_rank == 0:
+            self.confidence_feedback.prepare(
+                request_ids, request_pool_indices, output_layout
+            )
+            self.confidence_round_prepared = True
 
     def _cuda_graph_replay_variant(self) -> str:
         if self.sampling_backend is None:
@@ -1407,15 +1416,30 @@ class ForwardStepRunner:
         if not (self.segmented_decode is not None and ctx.verify_queries is not None):
             self.commit_forward(ctx, result)
 
-        if confidence_start is not None:
+        if self.confidence_feedback is not None and self.confidence_round_prepared:
             slots = self.input_buffers.req_pool_indices_buf[:bs]
-            self.confidence_feedback.record(
-                self.confidence_request_ids,
-                self.runtime_states.previous_draft_confidence.index_select(0, slots),
-                confidence_start,
-                self.confidence_batch,
-                self.confidence_queries,
+            layout = ctx.verify_queries
+            query_lengths = (
+                layout.query_lengths[:bs]
+                if layout is not None
+                else torch.zeros_like(slots, dtype=torch.int32)
             )
+            accept_lengths = (
+                layout.accept_lengths[:bs]
+                if layout is not None
+                else torch.zeros_like(slots, dtype=torch.int32)
+            )
+            self.confidence_feedback.record(
+                self.runtime_states.draft_confidence.index_select(0, slots),
+                self.runtime_states.draft_confidence_generation.index_select(0, slots),
+                self.runtime_states.previous_draft_confidence.index_select(0, slots),
+                query_lengths,
+                accept_lengths,
+                confidence_start,
+                self.confidence_batch if confidence_start is not None else None,
+                self.confidence_queries if confidence_start is not None else None,
+            )
+            self.confidence_round_prepared = False
 
         self.last_graph_bs = padded_bs if use_graph else None
         return result

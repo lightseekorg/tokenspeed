@@ -378,6 +378,22 @@ def _inputs(executor, runner, slots, *, queries, step, graph):
     return ctx, info
 
 
+@pytest.mark.parametrize("graph", [False, True])
+def test_confidence_feedback_keeps_acceptance_before_token_limit(process_group, graph):
+    executor = _Executor(logprobs=False, grammar=False)
+    runner = _Runner(executor, grammar=False)
+    if graph:
+        runner.capture(entries=None, observer=_Observer())
+    states = executor.runtime_states
+    states.spec_candidates_ready[1] = True
+    # The uncached anchor already consumes one position of the token limit.
+    states.token_limits[1] = states.valid_cache_lengths[1] + 2
+    ctx, info = _inputs(executor, runner, [1], queries=4, step=0, graph=graph)
+    result = runner.segmented_decode.run_round(ctx, info)
+    assert result[1].tolist() == [1]
+    assert ctx.verify_queries.accept_lengths[:1].tolist() == [4]
+
+
 @pytest.mark.parametrize(
     "logprobs,grammar", [(False, False), (True, False), (True, True)]
 )
@@ -446,6 +462,10 @@ def test_captured_round_preserves_outputs_and_state_when_b_and_q_change(
             (
                 captured.runtime_states.previous_draft_confidence[1:9],
                 eager.runtime_states.previous_draft_confidence[1:9],
+            ),
+            (
+                captured.runtime_states.draft_confidence_generation[1:9],
+                eager.runtime_states.draft_confidence_generation[1:9],
             ),
             (captured.runtime_states.stopped, eager.runtime_states.stopped),
             (captured.attn_backend.committed, eager.attn_backend.committed),

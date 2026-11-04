@@ -28,6 +28,8 @@ before sampling.
 
 The confidence head predicts conditional acceptance at each block position;
 its sigmoid outputs, rather than its logits, are multiplied into prefix scores.
+SpecForge's DSpark objective feeds it the backbone's final-normalized hidden
+state, also used by the LM head, together with the previous-token Markov latent.
 """
 
 from __future__ import annotations
