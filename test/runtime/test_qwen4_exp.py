@@ -33,10 +33,12 @@ from tokenspeed_kernel.ops.ple import (
     ple_page_gather_pair,
     prepare_ngram_reciprocals,
 )
+from transformers import PretrainedConfig
 
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
 import tokenspeed.runtime.layers.attention.qsa.metadata as qsa_metadata_module
+import tokenspeed.runtime.layers.logits_processor as logits_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_qwen4_exp
 from tokenspeed.runtime.configs.qwen4_exp_config import (
@@ -45,6 +47,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.factory import _check_shared_head_layout
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention import registry as attention_registry
@@ -100,6 +103,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
@@ -115,6 +119,7 @@ from tokenspeed.runtime.layers.qwen4_exp_ple import (
     qwen4_exp_ple_conv_field,
 )
 from tokenspeed.runtime.models import qwen4_exp_nextn
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     _qwen4_exp_uses_sigmoid_output_gate,
@@ -1541,33 +1546,134 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
         torch.testing.assert_close(got, expected)
 
 
-def test_qwen4_exp_nextn_head_matches_attention_dp_layout(monkeypatch) -> None:
-    calls = []
+class _EmbeddingOnlyDraft(torch.nn.Module):
+    """CPU stand-in for transformer weights; real heads handle the logits."""
 
-    def fake_replicated(*args, **kwargs):
-        calls.append(("replicated", args, kwargs))
-        return object()
+    def __init__(self, config, mapping, quant_config, prefix):
+        super().__init__()
+        self.qsa_indexers = []
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
 
-    def fake_parallel(*args, **kwargs):
-        calls.append(("parallel", args, kwargs))
-        return object()
 
-    monkeypatch.setattr(qwen4_exp_nextn, "ReplicatedLinear", fake_replicated)
-    monkeypatch.setattr(qwen4_exp_nextn, "ParallelLMHead", fake_parallel)
-    config = SimpleNamespace(hidden_size=16, vocab_size=128)
-    attn = SimpleNamespace(has_dp=True, tp_rank=0, tp_size=2, tp_group=object())
+class _HeadOnlyTarget(BaseCausalLM):
+    model_cls = _EmbeddingOnlyDraft
 
-    qwen4_exp_nextn._build_mtp_lm_head(
-        config, SimpleNamespace(attn=attn), None, "draft"
+
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("attn_tp", [1, 2, 4])
+def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
+    mapping = Mapping(
+        rank=rank, world_size=8, attn_tp_size=attn_tp, attn_dp_size=8 // attn_tp
     )
-    attn.has_dp = False
-    qwen4_exp_nextn._build_mtp_lm_head(
-        config, SimpleNamespace(attn=attn), None, "draft"
+    config = PretrainedConfig(
+        hc_count=4,
+        hidden_size=4,
+        vocab_size=8,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
     )
+    # The GPU transformer and CUDA cache management are outside this test;
+    # the head, logits processors and factory layout check are real classes.
+    monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = _HeadOnlyTarget(config, mapping)
+    with torch.no_grad():
+        target.lm_head.weight.copy_(
+            torch.arange(target.lm_head.weight.numel()).reshape_as(
+                target.lm_head.weight
+            )
+            / 100
+            - 0.16
+        )
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping)
+    _check_shared_head_layout(target, draft)
+    draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
 
-    assert [kind for kind, _, _ in calls] == ["replicated", "parallel"]
-    assert calls[0][1] == (16, 128)
-    assert calls[1][1] == (128, 16)
+    hidden = (
+        torch.arange(3 * config.hidden_size, dtype=torch.float32).reshape(3, -1) / 7
+    )
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    actual = draft.logits_processor._get_logits(
+        hidden, draft.lm_head, metadata, require_full_vocab=False
+    )
+    expected = torch.nn.functional.linear(hidden, target.lm_head.weight)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
+    mapping = Mapping(
+        rank=rank, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=2
+    )
+    config = PretrainedConfig(
+        hc_count=4,
+        hidden_size=4,
+        vocab_size=128,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = _HeadOnlyTarget(config, mapping)
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping)
+    _check_shared_head_layout(target, draft)
+    full_weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4) / 100
+    width = target.lm_head.weight.shape[0]
+    start = mapping.lm_head.tp_rank * width
+    with torch.no_grad():
+        target.lm_head.weight.copy_(full_weight[start : start + width])
+    draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
+    rows = [1 + r % 3 for r in range(8)]
+    hidden = [
+        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r
+        for r, n in enumerate(rows)
+    ]
+
+    # Only the distributed transport is simulated on CPU. The real target and
+    # draft heads, layout validation, and logits GEMM handle distinct DP rows
+    # and vocabulary shards; the peer contributes its independently computed shard.
+    def gather(local, group, counts):
+        return torch.cat(
+            [
+                (local if r == rank else hidden[r])[:count]
+                for r, count in zip(group, counts)
+            ]
+        )
+
+    def transpose(local_logits, group, *, input_split_sizes):
+        offset = sum(input_split_sizes[: group.index(rank)])
+        return torch.cat(
+            [
+                (
+                    local_logits[offset : offset + rows[rank]]
+                    if r == rank
+                    else torch.nn.functional.linear(
+                        hidden[rank], full_weight[i * width : (i + 1) * width]
+                    )
+                )
+                for i, r in enumerate(group)
+            ],
+            dim=1,
+        )
+
+    monkeypatch.setattr(logits_module, "token_all_gather", gather)
+    monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.DECODE,
+        query_shard=None,
+        global_num_tokens=rows,
+        all_decode_or_idle=True,
+    )
+    actual = draft.logits_processor._get_logits(
+        hidden[rank], draft.lm_head, metadata, require_full_vocab=False
+    )
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(hidden[rank], full_weight)
+    )
 
 
 def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:

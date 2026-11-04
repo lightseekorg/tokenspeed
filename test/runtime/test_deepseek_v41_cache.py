@@ -2906,6 +2906,7 @@ def test_one_index_graph_crosses_coverage_limits_with_padding(
 def test_reordered_decode_index_topk_across_kv_split():
     from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
 
+    pytest.importorskip("deep_gemm")
     if not is_deep_select_available():
         pytest.skip("requires DeepSelect")
     config = replace(_config("cuda"), context_len=4160, speculative_num_draft_tokens=2)
