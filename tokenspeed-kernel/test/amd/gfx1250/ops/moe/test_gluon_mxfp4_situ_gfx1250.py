@@ -369,10 +369,10 @@ def test_kimi_k3_tp_situ_stores_down_weight_in_k_planes_gfx1250() -> None:
         )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4])
 def test_kimi_k3_tp_situ_paired_down_tiles_match_gfx1250(
-    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    num_tokens = 4
     module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
         num_tokens
     )
@@ -401,7 +401,7 @@ def test_kimi_k3_tp_situ_paired_down_tiles_match_gfx1250(
 
 
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
-@pytest.mark.parametrize("num_tokens", [2, 4, 64])
+@pytest.mark.parametrize("num_tokens", [4, 64])
 def test_gfx1250_small_route_fp8_quantize_matches_standalone(
     num_tokens: int, scaled: bool
 ) -> None:

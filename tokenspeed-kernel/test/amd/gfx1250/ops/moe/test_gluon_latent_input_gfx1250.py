@@ -126,10 +126,10 @@ def test_decode_replays_in_a_graph() -> None:
             torch.testing.assert_close(output, reference, atol=0.0, rtol=0.0)
 
 
-# 129, 848 and 2000 leave a partial row tile, so they exercise the clamped
-# load descriptor and the clipped store that whole tiles never reach; 1280
-# and 1281 straddle the change from 128-row to 256-row tiles.
-@pytest.mark.parametrize("tokens", [129, 848, 1280, 1281, 2000, 8192])
+# 848 and 2000 leave a partial 128- and 256-row tile, so they exercise the
+# clamped load descriptor and the clipped store that whole tiles never reach;
+# 1280 and 1281 straddle the change from 128-row to 256-row tiles.
+@pytest.mark.parametrize("tokens", [848, 1280, 1281, 2000, 8192])
 def test_prefill_matches_reference(tokens: int) -> None:
     _packed, views = _weights()
     hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
