@@ -1023,11 +1023,14 @@ def muse_attntail_finish(
     owner = gl.arange(0, OWNERS, gl.SliceLayout(1, sums_layout))
     which = gl.arange(0, 4, gl.SliceLayout(0, sums_layout))
     index = (owner[:, None] * MAX_ROWS + row) * 4 + which[None, :]
+    # System scope (SC0 SC1): the sums arrive from other GPUs and from other
+    # XCDs of this one, and each XCD's L2 may hold an older copy of the line;
+    # an SC0 SC1 load bypasses every L2 coherently (CDNA4 ISA 9.1.10.2).
     gl.atomic_poll(
         sums.to(gl.pointer_type(gl.int32), bitcast=True) + index * 2 + 1,
         tag,
         sem="relaxed",
-        scope="gpu",
+        scope="sys",
     )
     # The poll is relaxed: the barrier orders the word loads after it.
     gl.barrier()

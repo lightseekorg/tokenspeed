@@ -1340,12 +1340,8 @@ def test_attntail_stage_store_follows_a_barrier():
     assert "s_barrier" in lines[index], "the stage store does not follow a barrier"
 
 
-def test_sliding_attention_tail_epoch_store_follows_a_barrier():
-    """Every subgroup of a fused sliding-tail workgroup loads its epoch; one
-    lane stores the next. A subgroup that loaded after that store would push
-    with the next stage and tag (or clear the current stage's all-gather
-    slots), so a workgroup barrier must precede the store on every path: it
-    sits in the block that ends in the store."""
+def _sliding_tail_assembly() -> str:
+    """gfx950 assembly of the fused sliding tail at 8 rows, TP8."""
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
         iris_fused_sliding_attention_twoshot_muse_attntail as fn,
     )
@@ -1420,7 +1416,16 @@ def test_sliding_attention_tail_epoch_store_follows_a_barrier():
         num_warps=4,
         options=sched_compile_options(),
     )
-    lines = kernel.asm["amdgcn"].splitlines()
+    return kernel.asm["amdgcn"]
+
+
+def test_sliding_attention_tail_epoch_store_follows_a_barrier():
+    """Every subgroup of a fused sliding-tail workgroup loads its epoch; one
+    lane stores the next. A subgroup that loaded after that store would push
+    with the next stage and tag (or clear the current stage's all-gather
+    slots), so a workgroup barrier must precede the store on every path: it
+    sits in the block that ends in the store."""
+    lines = _sliding_tail_assembly().splitlines()
     stores = [i for i, line in enumerate(lines) if "global_store_dword " in line]
     assert stores, "expected the epoch's global store"
     index = stores[-1]
@@ -1431,6 +1436,25 @@ def test_sliding_attention_tail_epoch_store_follows_a_barrier():
             break
         index -= 1
     assert "s_barrier" in lines[index], "the epoch store does not follow a barrier"
+
+
+def test_sliding_attention_tail_hand_offs_bypass_every_l2():
+    """No load or store of the fused sliding tail uses agent scope alone.
+
+    Its hand-offs cross XCDs (and GPUs), and each XCD has its own L2 that
+    does not snoop the others: a hand-off word read or written with SC1 but
+    not SC0 may hit a stale line in the reader's L2. Hand-offs use SC0 SC1,
+    which bypasses every L2 coherently (CDNA4 ISA 9.1.10.2); everything else
+    uses neither bit.
+    """
+    agent_only = [
+        line.strip()
+        for line in _sliding_tail_assembly().splitlines()
+        if re.match(r"\s*(global|buffer)_(load|store)", line)
+        and re.search(r"\bsc1\b", line)
+        and not re.search(r"\bsc0\b", line)
+    ]
+    assert not agent_only, agent_only
 
 
 @pytest.mark.parametrize("rows", [8, 16])
