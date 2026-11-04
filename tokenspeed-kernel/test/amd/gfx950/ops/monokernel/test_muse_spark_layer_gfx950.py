@@ -127,7 +127,8 @@ def _check_attention_box(state, inputs):
 
 def _attention_box_error(state, inputs):
     """Relative RMS error of the launch's attention box (the gated-normed
-    attention rows, before o_proj) against the reference."""
+    attention rows, before o_proj) against the reference: in total, per head
+    and per row."""
     q, gate = inputs["prepared_query"]
     rows = q.shape[0]
     expected = weightless_rmsnorm_gated_sigmoid(
@@ -137,9 +138,16 @@ def _attention_box_error(state, inputs):
     box = state.iris.box.view(2, BOX_WORDS)[epoch & 1]
     actual = box.view(torch.bfloat16).view(-1, Q_WIDTH)[:rows].double()
     expected = expected.double()
-    return (
-        ((actual - expected).square().mean() / expected.square().mean()).sqrt().item()
-    )
+
+    def rms(dims):
+        error = (actual - expected).square().mean(dims) / expected.square().mean(dims)
+        return [round(v, 3) for v in error.sqrt().flatten().tolist()]
+
+    # Per head (64 channels each) and per row, so a pattern (one head, one
+    # split's rows, every other row) shows which piece of attention is off.
+    actual = actual.view(rows, Q_HEADS, HEAD_DIM)
+    expected = expected.view(rows, Q_HEADS, HEAD_DIM)
+    return dict(total=rms((0, 1, 2))[0], per_head=rms((0, 2)), per_row=rms((1, 2)))
 
 
 def _worker(rank, port, record_dir, errors):
