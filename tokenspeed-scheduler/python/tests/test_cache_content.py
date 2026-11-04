@@ -79,8 +79,10 @@ ZERO_STATE = _state_after(())
 
 
 def _copied(group: str, value):
-    """A block's contents as a copy leaves them in another block: a History
-    block's rows by offset, or a State."""
+    """A block's contents as a copy leaves them in another block.
+
+    A History block's rows by offset, or a State.
+    """
     return dict(value or {}) if group == HISTORY else value
 
 
@@ -89,9 +91,9 @@ class _Request:
     prompt: list[int]
     # Every token it samples, drawn at submission.
     outputs: list[int]
-    # Tokens the scheduler was told of.
     # Whether the PD peer bootstrapped it (a fused request needs none).
     bootstrapped: bool
+    # Tokens the scheduler was told of.
     landed: int = 0
     finished: bool = False
 
@@ -214,7 +216,7 @@ class _Device:
             )
         return block
 
-    def check_kv(self, request_id: str, table, position: int, want) -> None:
+    def check_kv(self, request_id: str, table, position: int, want) -> int:
         bg = self.history_block
         block = int(table[position // bg])
         got = self.device[HISTORY].get(block, {}).get(position % bg)
@@ -224,6 +226,7 @@ class _Device:
                 f"{request_id} reads the KV of position {position} from block "
                 f"{block}: {_describe(got)}; it wants {_describe(want)}"
             )
+        return block
 
 
 def _describe(value) -> str:
@@ -296,8 +299,10 @@ def _event(kind: str, request_id: str, **fields):
 
 
 class _Loop:
-    """The event loop's calls, a client and a PD peer around one scheduler,
-    with every plan replayed on the device model."""
+    """The event loop's calls, a client and a PD peer around one scheduler.
+
+    Every plan is replayed on the device model.
+    """
 
     def __init__(
         self,
@@ -418,6 +423,7 @@ class _Loop:
         state_writes: dict[tuple[str, int], str] = {}
         kv_writes: dict[tuple[int, int], str] = {}
         state_reads: list[tuple[str, int, str]] = []
+        kv_reads: list[tuple[int, int, str]] = []
         pending_writes = []
         for i, request_id in enumerate(batch.request_ids):
             request = self.requests[request_id]
@@ -460,9 +466,10 @@ class _Loop:
                 )
             table = tables[HISTORY][i]
             for position in range(before):
-                self.device.check_kv(
+                block = self.device.check_kv(
                     request_id, table, position, _kv_of(request.tokens(position + 1))
                 )
+                kv_reads.append((block, position % bg, request_id))
             for position in range(before, before + window):
                 slot = position // bg
                 block = int(table[slot]) if slot < table.shape[0] else 0
@@ -499,6 +506,13 @@ class _Loop:
                 raise ContentError(
                     f"{request_id} reads {group} block {block} as {owner} writes it"
                 )
+        for block, offset, request_id in kv_reads:
+            owner = kv_writes.get((block, offset))
+            if owner is not None and owner != request_id:
+                raise ContentError(
+                    f"{request_id} reads block {block} row {offset} as {owner} "
+                    f"writes it"
+                )
         for kind, group, where, value, request_id in pending_writes:
             if kind == "state":
                 self.device.put_state(group, where, value, request_id)
@@ -508,8 +522,11 @@ class _Loop:
     def export_chunk(
         self, request_id: str, tables, i: int, before: int, count: int
     ) -> None:
-        """P role: the transfer reads each chunk's KV once its forward wrote
-        it (layerwise), and the State at the prompt end."""
+        """P role: adds the pages the transfer reads to it.
+
+        The transfer reads each chunk's KV once its forward wrote it
+        (layerwise), and the State at the prompt end.
+        """
         transfer = self.device.transfers.setdefault(request_id, _Transfer())
         bg = self.device.history_block
         table = tables[HISTORY][i]
@@ -521,8 +538,10 @@ class _Loop:
 
     # ---- the PD peer ----
     def start_landings(self, batch) -> None:
-        """D role: the peer starts writing a remote prefill's pages; it lands
-        zero to two rounds later."""
+        """D role: the peer starts writing a remote prefill's pages.
+
+        It lands zero to two rounds later.
+        """
         tables = batch.block_tables_arrays()
         cached = list(batch.state_prefix_cached) or [False] * len(batch.request_ids)
         bg = self.device.history_block
@@ -677,8 +696,10 @@ class _Loop:
             self.scheduler.advance(events)
 
     def end(self, request_id: str) -> None:
-        """A request was aborted: its PD transfer, if any, learns of it and
-        stops a little later."""
+        """Drops a request that was aborted.
+
+        Its PD transfer, if any, learns of the abort and stops a little later.
+        """
         self.live.discard(request_id)
         self.transferring.discard(request_id)
         self.landing.pop(request_id, None)
@@ -895,11 +916,14 @@ def _submit(scheduler, request_id: str, tokens: list[int], max_new: int) -> None
 
 
 def test_a_finish_behind_a_masked_first_decode_publishes_the_prompt_end_state() -> None:
-    """Two requests prefill the same prompt; B stops on its first token, so its
+    """B's finish behind its padded first decode publishes the prompt-end state.
+
+    Two requests prefill the same prompt; B stops on its first token, so its
     first decode, already dispatched behind the prefill, runs as padding and
     writes nothing. The prompt-end checkpoint B publishes at its finish must
     hold the prompt-end state even after A's copy of it was evicted, as C
-    resumes from it."""
+    resumes from it.
+    """
     scheduler = _scripted("Fused", [STATES[1], HISTORY, STATES[0]], P)
     prompt = [8, 245, 288, 266, 420, 388, 449, 50, 287, 25, 80, 185]
     holds = {group: {} for group in STATES}
@@ -970,9 +994,12 @@ def test_a_finish_behind_a_masked_first_decode_publishes_the_prompt_end_state() 
 def test_a_tail_hit_in_the_first_block_lands_in_a_real_block(
     block_granularity: int, first_len: int, extra: int
 ) -> None:
-    """A D request continues a sequence whose earlier turn finished inside the
+    """A landing whose hit is a tail inside the first block names that block.
+
+    A D request continues a sequence whose earlier turn finished inside the
     history table's first block: the peer writes the block holding the hit
-    whole, so the landing table must name a real block for it."""
+    whole, so the landing table must name a real block for it.
+    """
     scheduler = _scripted("D", [HISTORY, STATES[0]], block_granularity)
     prompt = list(range(100, 100 + first_len))
 
