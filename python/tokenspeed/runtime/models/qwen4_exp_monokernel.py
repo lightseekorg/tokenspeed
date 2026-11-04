@@ -48,7 +48,7 @@ follow each other freely.
 The launches tag their mailbox writes with the layer index and a device step
 counter, which changes once per forward that launches, inside the CUDA graph:
 the last layer's launch moves it when it also runs the final mixer, else
-``MonokernelState.end_forward`` does.
+``MonokernelState.finish_step`` does.
 
 A target's MTP verify (``k + 1`` tokens per request, request-major rows) runs
 the same launches with ``chain = k + 1``:
@@ -130,12 +130,12 @@ class Qwen4ExpMonokernelState(MonokernelState):
             for bs in range(1, MAX_ROWS + 1)
             for chain in range(2, MAX_ROWS // bs + 1)
         }
-        # The verified rows' lengths of the current forward's draft first
-        # step. begin_forward resets it.
+        # The verified rows' lengths of the current step, when it is a
+        # draft's first step. start_step resets it.
         self._draft_lengths: torch.Tensor | None = None
 
-    def begin_forward(self) -> None:
-        super().begin_forward()
+    def start_step(self) -> None:
+        super().start_step()
         self._draft_lengths = None
 
     def draft_lengths(
@@ -144,7 +144,7 @@ class Qwen4ExpMonokernelState(MonokernelState):
         """The verified rows' lengths in a draft's first step.
 
         The step publishes the accepted lengths into ``seq_lens``, the buffer
-        that the rows' lengths come from. So the forward's first call copies
+        that the rows' lengths come from. So the step's first call copies
         ``seq_lens`` and then publishes through ``narrowing``, and every later
         layer reuses that copy.
         """
@@ -699,7 +699,7 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
 
     ``model`` builds its layers from the monokernel classes with
     ``--decode-monokernel``. Then every layer is packed, and all of them and
-    ``model.monokernels`` get one :class:`Qwen4ExpMonokernelState`. Without
+    ``model.monokernel_state`` get one :class:`Qwen4ExpMonokernelState`. Without
     monokernel layers this does nothing.
 
     The last layer's launch also runs the final mixer when its type can
@@ -735,7 +735,7 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
         if index < last:
             layer.warm = layers[index + 1].fused.late_weights
         layer.monokernel_state = state
-    model.monokernels = state
+    model.monokernel_state = state
     logger.info(f"Decode monokernel: all {len(layers)} {type(model).__name__} layers")
 
 

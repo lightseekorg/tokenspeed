@@ -183,13 +183,13 @@ def test_every_fused_draft_layer_reads_the_lengths_from_before_the_publish() -> 
 
     narrowing = AcceptedPrefixPublisher(_PublishingBackend(), torch.tensor([10, 11]))
     state = Qwen4ExpMonokernelState(torch.device("cpu"), scratch_pairs=1)
-    state.begin_forward()
+    state.start_step()
     first = state.draft_lengths(seq_lens, narrowing)
     assert seq_lens.tolist() == [10, 11]
     second = state.draft_lengths(seq_lens, narrowing)
     assert first.tolist() == second.tolist() == [12, 15]
     # The next forward copies its own lengths.
-    state.begin_forward()
+    state.start_step()
     assert state.draft_lengths(seq_lens, narrowing).tolist() == [10, 11]
 
 
@@ -246,7 +246,7 @@ class _Backbone(torch.nn.Module):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
         self.hyper_connection_mixer = torch.nn.Linear(1, 1)
-        self.monokernels: Qwen4ExpMonokernelState | None = None
+        self.monokernel_state: Qwen4ExpMonokernelState | None = None
 
 
 @pytest.mark.parametrize("last", [_PackingQSA, _PackingDelta])
@@ -257,7 +257,7 @@ def test_packing_shares_one_state_and_folds_the_final_mixer(last) -> None:
     layers = [_PackingDelta(0), _PackingQSA(1), _PackingDelta(2), last(3)]
     model = _Backbone(layers)
     enable_decode_monokernels(model)
-    state = model.monokernels
+    state = model.monokernel_state
     assert state is not None and state.scratch.numel() == 7
     assert all(layer.monokernel_state is state for layer in layers)
     assert [layer.warm.tolist() for layer in layers[:3]] == [[1], [2], [3]]
@@ -280,7 +280,7 @@ def test_packing_fails_and_names_every_unserved_layer() -> None:
     assert str(error.value) == unserved_error(
         "_Backbone", {0: [ATTENTION_TP], 2: [ATTENTION_TP, NOT_MXFP4]}
     )
-    assert model.monokernels is None
+    assert model.monokernel_state is None
 
 
 def test_a_monokernel_layer_runs_other_forwards_with_its_regular_code() -> None:

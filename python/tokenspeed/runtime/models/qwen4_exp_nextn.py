@@ -265,7 +265,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         # The draft layer is a monokernel layer unless the draft steps reuse
         # the first step's top-k (Qwen4ExpDraftModel._decode_monokernel).
         enable_decode_monokernels(self.model)
-        if self.model.monokernels is not None and self._front_fusable():
+        if self.model.monokernel_state is not None and self._front_fusable():
             self.front_kernel = select_qwen4_exp_mtp_front(MTP_FRONT_ROWS)
 
     def _front_fusable(self) -> bool:

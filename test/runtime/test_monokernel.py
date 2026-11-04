@@ -44,16 +44,16 @@ from tokenspeed.runtime.models.monokernel import (  # noqa: E402
 
 def test_a_forward_ends_with_one_new_tag_when_it_launched() -> None:
     """The step counter changes once per forward that launches: in
-    end_forward, unless the last launch gave the LM head's input (and moved
+    finish_step, unless the last launch gave the LM head's input (and moved
     the counter itself). A forward without launches adds no kernel."""
     state = MonokernelState(torch.device("cpu"), scratch_pairs=1)
 
     def forward(launched: bool, folded: bool):
-        state.begin_forward()
+        state.start_step()
         state.launched = launched
         if folded:
             state.lm_head_input = torch.ones(1, 2)
-        return state.end_forward()
+        return state.finish_step()
 
     assert forward(launched=False, folded=False) is None
     assert state.step.tolist() == [0, 0]
@@ -119,10 +119,10 @@ def test_a_monokernel_layer_refuses_a_decode_step_before_packing() -> None:
 
 def test_a_packed_monokernel_layer_launches() -> None:
     """A packed layer returns its launch's outputs and records the launch for
-    end_forward."""
+    finish_step."""
     layer = _Layer()
     layer.monokernel_state = MonokernelState(torch.device("cpu"), scratch_pairs=1)
-    layer.monokernel_state.begin_forward()
+    layer.monokernel_state.start_step()
     out = layer(hidden_states=torch.zeros(1, 2), residual=None, ctx=None)
     assert out[0].tolist() == [[1.0, 1.0]] and out[1] is None
     assert layer.monokernel_state.launched and layer.forwards == 0

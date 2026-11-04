@@ -586,7 +586,7 @@ def _tail_fusion_model(
     model.hyper_connection_mixer = GatedResidualSimple(
         config, use_mix=True, use_combine=False
     )
-    model.monokernels = None
+    model.monokernel_state = None
     model = model.to(device="cuda", dtype=dtype)
     with torch.no_grad():
         for module in model.modules():

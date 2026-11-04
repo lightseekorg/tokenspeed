@@ -27,9 +27,9 @@ monokernel class: a subclass of the regular layer class with a
 kernels serve as one launch, and every other forward with the regular
 layer's code. After loading, the model's seam packs every layer, raising
 :class:`NoMonokernel` for a layer that it cannot pack, and gives all layers
-one :class:`MonokernelState`. The model calls
-:meth:`MonokernelState.begin_forward` before its layers and
-:meth:`MonokernelState.end_forward` after them.
+one :class:`MonokernelState`, which the model holds as ``monokernel_state``.
+The model calls :meth:`MonokernelState.start_step` before its layers and
+:meth:`MonokernelState.finish_step` after them.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ from tokenspeed.runtime.execution.context import ForwardContext
 
 class MonokernelState:
     """The state that all monokernel launches of one backbone share: the
-    mailbox scratch, the step counter, and the values of the current
-    forward.
+    mailbox scratch, the step counter, and the values that one step's
+    launches pass on. One step is one forward of the model.
 
     Args:
         device: The device of the launches.
@@ -55,25 +55,26 @@ class MonokernelState:
         # The launches' tag and a count of a launch's finished CTAs (0
         # between launches).
         self.step = torch.zeros(2, dtype=torch.int32, device=device)
-        # The current forward's values. begin_forward resets them.
+        # The current step's values. start_step resets them.
         # Whether a layer launched.
         self.launched = False
-        # The input of the LM head, when the forward's last launch also ran
-        # the model's final norm or mixer and moved the step counter.
+        # The input of the LM head, when the step's last launch also ran the
+        # model's final norm or mixer and moved the step counter.
         self.lm_head_input: torch.Tensor | None = None
 
-    def begin_forward(self) -> None:
-        """Start a forward, before its first layer."""
+    def start_step(self) -> None:
+        """Reset the values that this step's monokernel launches share. The
+        model calls it before its first layer. It does no GPU work."""
         self.launched = False
         self.lm_head_input = None
 
-    def end_forward(self) -> torch.Tensor | None:
-        """End a forward, after its last layer. Returns ``lm_head_input``.
+    def finish_step(self) -> torch.Tensor | None:
+        """Give the next step's launches a new tag, and return
+        ``lm_head_input``. The model calls it after its last layer.
 
-        The next forward's launches need a new tag. A launch that sets
-        ``lm_head_input`` moves the step counter as it ends. After other
-        launches, this moves it (graph safe). A forward without launches adds
-        no kernel.
+        A launch that sets ``lm_head_input`` moves the step counter as it
+        ends. After other launches, this moves it (graph safe). A step without
+        launches adds no kernel.
         """
         if self.launched and self.lm_head_input is None:
             self.step[:1].add_(1)

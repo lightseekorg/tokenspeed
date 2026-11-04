@@ -73,15 +73,16 @@ A model calls the ops from its runtime seam,
 - **After loading.** The seam packs every layer once the weights load and
   the quantization post-processing gives their final layout (the model's
   `post_quant_warmup` hook, which the model loader calls once). Then it gives
-  all layers and the model one `MonokernelState`, which holds the scratch
-  buffer and the step counter. Startup fails when a layer cannot be packed,
+  all layers and the model one `MonokernelState` (`monokernel_state`), which
+  holds the scratch buffer and the step counter. Startup fails when a layer cannot be packed,
   and the error (`unserved_error`) names each such layer with its reasons.
-- **Each forward.** The model calls `MonokernelState.begin_forward()` before
-  its layers and `end_forward()` after them. A launch that also runs the
-  model's final norm or mixer sets `lm_head_input` and moves the step
-  counter as it ends (`advance_step=True`). Then `end_forward()` returns that
-  output for the LM head. After other launches, `end_forward()` moves the
-  step counter. A forward without launches adds no kernel.
+- **Each step** (one forward). The model calls
+  `monokernel_state.start_step()` before its layers and `finish_step()` after
+  them. A launch that also runs the model's final norm or mixer sets
+  `lm_head_input` and moves the step counter as it ends
+  (`advance_step=True`). Then `finish_step()` returns that output for the LM
+  head. After other launches, `finish_step()` moves the step counter. A step
+  without launches adds no kernel.
 
 ## Adding a model
 
