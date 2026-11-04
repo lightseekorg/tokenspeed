@@ -21,12 +21,12 @@
 """The wait deadline persistent-kernel tests and benchmarks launch with.
 
 Serving derives its deadline from the server's watchdog; tests and
-benchmarks pass this short one instead, so a hand-off that never comes stops
-a test quickly, while every rank of a test group still reaches its launch in
-time.
+benchmarks pass this one instead. It must still outlast a rank that reaches
+its first launch late (its first compile, or loading the binary), because the
+tests do not line the ranks up before that launch.
 """
 
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import deadline_ticks
 
-TEST_DEADLINE_SECONDS = 2.0
+TEST_DEADLINE_SECONDS = 30.0
 TEST_DEADLINE_TICKS = deadline_ticks(TEST_DEADLINE_SECONDS)
