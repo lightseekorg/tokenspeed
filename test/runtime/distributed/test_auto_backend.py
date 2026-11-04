@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.distributed.comm_backend import auto as auto_module
 from tokenspeed.runtime.distributed.comm_backend import iris as iris_module
@@ -23,6 +24,8 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def test_runtime_import_without_iris():

@@ -24,6 +24,7 @@ from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
 
+import tokenspeed.runtime.engine.rank_setup as rank_setup
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
     DistributedInitializer,
@@ -199,7 +200,6 @@ def test_ranks_keep_cross_host_fusion_only_in_a_mapped_world(
     import tokenspeed_kernel.ops.communication.iris as kernel_iris
     from tokenspeed_kernel.platform import ArchVersion
 
-    import tokenspeed.runtime.engine.rank_setup as rank_setup
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     _amd_platform(monkeypatch, ArchVersion(12, 5))
