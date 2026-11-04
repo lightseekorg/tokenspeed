@@ -126,6 +126,7 @@ __all__ = [
     "gluon_dsa_kpool_prefill_logits_gfx950",
     "gluon_dsa_kpool_prefill_plan_logits_gfx950",
     "gluon_dsa_logical_topk_gfx950",
+    "gluon_dsa_row_bounded_logical_topk_gfx950",
     "launch_gluon_dsa_prefill_topk_bf16_gfx950",
     "launch_gluon_dsa_prefill_topk_fp8_gfx950",
     "launch_gluon_dsa_prefill_topk_fp8_rows_gfx950",
@@ -3310,6 +3311,83 @@ def gluon_dsa_logical_topk_gfx950(
         Logical column indices padded with ``-1`` and valid counts per row.
     """
     topk = int(topk)
+    out, lens_out = _check_logical_topk_args(
+        logits, row_starts, row_ends, topk=topk, out=out, lens_out=lens_out
+    )
+    if logits.shape[0] == 0:
+        return out, lens_out
+    return _dsa_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def gluon_dsa_row_bounded_logical_topk_gfx950(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`gluon_dsa_logical_topk_gfx950` for rows whose ranges are far
+    narrower than ``logits``, such as KVP ranks' owned candidates in a
+    max-model-len-wide buffer.
+
+    One workgroup selects each row over its own range, so the cost follows
+    the rows' lengths, not the buffer's width; the width-planned kernels
+    scan the whole width (MI350X, 64 rows over 1M columns: 25 us at 6K-token
+    rows against 86 us, 78 against 99 at 128K). Past about 200K-token rows
+    the persistent kernel's split rows are faster.
+
+    Args and returns as :func:`gluon_dsa_logical_topk_gfx950`.
+    """
+    topk = int(topk)
+    out, lens_out = _check_logical_topk_args(
+        logits, row_starts, row_ends, topk=topk, out=out, lens_out=lens_out
+    )
+    rows, cols = logits.shape
+    if rows == 0:
+        return out, lens_out
+    if cols <= topk:
+        return _dsa_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+    return _dsa_oneblock_topk_indices(
+        logits,
+        row_starts,
+        row_starts,
+        row_ends,
+        block_table_cols=0,
+        page_size=1,
+        topk=topk,
+        q_len_per_req=1,
+        is_decode=False,
+        plan=_oneblock_launch_plan(cols, is_decode=False),
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _check_logical_topk_args(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor | None,
+    lens_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     _check_topk_contract(topk)
     if logits.dim() != 2:
         raise ValueError(f"logits must be 2-D, got shape={tuple(logits.shape)}")
@@ -3365,17 +3443,7 @@ def gluon_dsa_logical_topk_gfx950(
             raise ValueError("lens_out must be on the same device as logits")
         if not lens_out.is_contiguous():
             raise ValueError("lens_out must be contiguous")
-
-    if rows == 0:
-        return out, lens_out
-    return _dsa_topk_indices(
-        logits,
-        row_starts,
-        row_ends,
-        topk=topk,
-        out=out,
-        lens_out=lens_out,
-    )
+    return out, lens_out
 
 
 def gluon_dsa_kpool_prefill_logits_gfx950(
