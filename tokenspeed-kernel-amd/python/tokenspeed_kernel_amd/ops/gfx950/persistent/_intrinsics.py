@@ -39,7 +39,7 @@ Kernels calling the intrinsics launch with :func:`persistent_compile_options`.
 
 from pathlib import Path
 
-from tokenspeed_kernel_amd._scheduling import sched_compile_options
+from tokenspeed_kernel_amd._scheduling import sched_compile_options, wave_uniform_i32
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 _LIBRARY_NAME = "tokenspeed_persistent"
@@ -117,26 +117,6 @@ def wait_vmcnt(n, _semantic=None):
 
 
 @gluon.jit
-def vote(flags):
-    """Whether any lane of this wave holds a nonzero int32 flag, as a per-wave
-    scalar. One ``v_cmp`` writes the lane mask to an SGPR pair; Gluon has no
-    wave-level vote with a scalar result (an elementwise ballot stays a tensor,
-    and reducing it crosses waves). ``flags``: exactly one int32 per lane."""
-    mask = gl.inline_asm(
-        "v_cmp_ne_u32_e64 $0, 0, $1", "=s,v,~{memory}", [flags], gl.int64,
-        is_pure=False,
-    )  # fmt: skip
-    return mask != 0
-
-
-@tl.core.extern
-def _first_lane(x, _semantic=None):
-    """``llvm.amdgcn.readfirstlane`` of every element of the int32 tensor
-    ``x`` (uniform per wave, still a tensor)."""
-    return _call("readfirstlane", tl.int32, [x], (tl.int32,), _semantic)
-
-
-@gluon.jit
 def first_lane_scalar(x):
     """This wave's first lane of the int32 tensor ``x`` (one element per
     lane, uniform within each wave) as a per-wave scalar in an SGPR.
@@ -145,7 +125,7 @@ def first_lane_scalar(x):
     SGPR and inserts the wait states its memory consumers need; the asm
     only moves the (already scalar) value into Gluon's scalar type."""
     return gl.inline_asm(
-        _scalar_move_asm, ("=s", "s"), [_first_lane(x)], gl.int32, is_pure=True
+        _scalar_move_asm, ("=s", "s"), [wave_uniform_i32(x)], gl.int32, is_pure=True
     )
 
 
@@ -154,6 +134,24 @@ def _scalar_move_asm(outputs, inputs):
     # A thread may hold several (equal) elements; the first one is moved.
     ((out,),), (values,) = outputs, inputs
     return f"s_mov_b32 {out}, {values[0]}"
+
+
+@tl.core.extern
+def _wave_any(flags, _semantic=None):
+    """``llvm.amdgcn.ballot`` of ``flags != 0``, tested against zero: 1 in
+    every lane of a wave where any lane's flag is set (a tensor)."""
+    return _call("wave_any", tl.int32, [flags], (tl.int32,), _semantic)
+
+
+@gluon.jit
+def vote(flags):
+    """Whether any lane of this wave holds a nonzero int32 flag, as a per-wave
+    scalar: a ballot (``llvm.amdgcn.ballot``, one compare into a lane mask)
+    the compiler sees. ``flags``: exactly one int32 per lane. Gluon has no
+    wave-level vote with a scalar result (an elementwise ballot stays a
+    tensor, and reducing it crosses waves), so the wave-uniform result is
+    moved into Gluon's scalar type by :func:`first_lane_scalar`."""
+    return first_lane_scalar(_wave_any(flags)) != 0
 
 
 @gluon.jit

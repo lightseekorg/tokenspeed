@@ -21,6 +21,7 @@
 """Clock and stage-stamp helpers for persistent gfx950 kernels."""
 
 from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import memrealtime
 
 # s_memrealtime counts a constant 100 MHz clock on gfx950: 10 ns per tick.
 REALTIME_TICK_NS = 10
@@ -28,17 +29,12 @@ REALTIME_TICK_NS = 10
 
 @gluon.jit
 def realtime_ticks():
-    """Return the 64-bit constant-rate clock (10 ns ticks); uniform per wave.
+    """Return the 64-bit constant-rate clock (10 ns ticks); uniform per wave
+    (``llvm.amdgcn.s.memrealtime``; launch with ``persistent_compile_options``).
 
     The clock is per GPU: stamps from different GPUs are not comparable.
     """
-    return gl.inline_asm(
-        "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)",
-        "=s,~{memory}",
-        [],
-        gl.int64,
-        is_pure=False,
-    )
+    return memrealtime()
 
 
 @gluon.jit
