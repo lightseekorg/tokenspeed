@@ -465,6 +465,7 @@ class HostConfig:
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
+        pd_prefill_poll_transfers: ``--pd-prefill-poll-transfers``.
     """
 
     handshake_address: str
@@ -519,6 +520,7 @@ class HostConfig:
     epd_receive_enabled: bool
     grammar: GrammarSettings | None
     eager_grammar: bool
+    pd_prefill_poll_transfers: bool
 
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
@@ -1354,6 +1356,7 @@ class HostBootstrap:
                     else None
                 ),
                 eager_grammar=specs.uses_eager_grammar,
+                pd_prefill_poll_transfers=server_args.pd_prefill_poll_transfers,
                 eplb=(
                     EplbSettings(
                         specs=specs.expert_rebalance,

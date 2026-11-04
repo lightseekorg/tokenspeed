@@ -1312,6 +1312,9 @@ struct Setup {
     fails_at: Option<(u64, usize)>,
     /// The `landed` queries each forward answers false on each rank.
     unlanded: Option<fn(usize) -> usize>,
+    /// PD prefill: also poll the transfers at the round head and during
+    /// forwards (`--pd-prefill-poll-transfers`).
+    pd_poll_transfers: bool,
 }
 
 impl Layout {
@@ -1373,6 +1376,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         // The fake device fills bitmasks from the committed matcher state,
         // as the eager path does.
         eager_grammar: setup.grammar,
+        pd_prefill_poll_transfers: setup.pd_poll_transfers,
     }
 }
 
@@ -4830,13 +4834,15 @@ fn a_flush_under_a_keep_pause_runs_once_the_cache_work_did() {
 }
 
 /// A prefill engine whose decode node already admitted the pages of each
-/// `(room, slot)`, so its requests bootstrap at their first transfer poll.
+/// `(room, slot)`, so its requests bootstrap at their first transfer poll,
+/// polling at the round head and during forwards too.
 fn prefill_setup(rooms: &[(u64, i32)]) -> Setup {
     Setup {
         pd: Some(Pd {
             role: Role::Prefill,
             wire: prefill_wire(rooms),
         }),
+        pd_poll_transfers: true,
         ..Setup::default()
     }
 }
@@ -4915,6 +4921,39 @@ fn a_prefill_engine_plans_a_bootstrapped_request_in_the_round_it_arrives() {
         let trace = &ranks[0].trace;
         let after_arrival = forwards(&trace[find(trace, 0, "round 1")..]);
         assert_eq!(after_arrival[0], ["r0", "s0"], "{layout:?}: {trace:?}");
+        let done = finished(&ranks[0]);
+        assert_eq!(done, ["r0 length", "s0 length"], "{layout:?}");
+    }
+}
+
+#[test]
+fn a_prefill_engine_without_extra_polls_plans_a_bootstrap_a_round_later() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        // The default polls only at the round tail: nothing runs in round 0,
+        // and round 1's forward is `s0`'s first chunk alone.
+        let mut script: Script = vec![Vec::new(); 22];
+        script[0].push(add("s0", 80, 300));
+        script[1].push(add("r0", 81, 20));
+        let ranks = run_scripted(
+            layout,
+            0,
+            Tiers::DeviceOnly,
+            Setup {
+                pd_poll_transfers: false,
+                ..prefill_setup(&[(80, 0), (81, 1)])
+            },
+            vec![script],
+            no_reaction,
+        );
+        let expected = forwards(&ranks[0].trace);
+        for (index, rank) in ranks.iter().enumerate() {
+            assert_eq!(rank.outcome, Ok(()), "{layout:?} rank {index}");
+            assert_eq!(forwards(&rank.trace), expected, "{layout:?} rank {index}");
+        }
+        let trace = &ranks[0].trace;
+        assert!(forwards(&trace[..find(trace, 0, "round 1")]).is_empty(), "{layout:?}: {trace:?}");
+        let after_arrival = forwards(&trace[find(trace, 0, "round 1")..]);
+        assert_eq!(after_arrival[0], ["s0"], "{layout:?}: {trace:?}");
         let done = finished(&ranks[0]);
         assert_eq!(done, ["r0 length", "s0 length"], "{layout:?}");
     }

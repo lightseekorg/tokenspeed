@@ -825,6 +825,15 @@ Both Prefill and Decode engines select their transport from the detected
 platform. Startup settings pass this protocol to the Rust transfer peer,
 which keeps it when recreating a session after a memory resume.
 
+By default the prefill role polls its KV transfers once per round, after the
+forward. `--pd-prefill-poll-transfers` adds two polls: one before planning a
+round, so a request whose decode node allocated its pages during the last
+forward is planned in this round instead of the next, and one every 2 ms
+while a forward runs, so a request whose transfer concluded streams its
+output without waiting for the forward to finish. Every poll is a cross-rank
+agreement; the forward-time poll needs `--disaggregation-mode prefill`
+without pipeline stages, attention DP or overlap scheduling. Off by default.
+
 ## Observability
 
 | Parameter | Purpose |

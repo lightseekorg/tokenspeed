@@ -745,6 +745,8 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
+    # PD prefill role: also poll KV transfers at the round head and during forwards.
+    pd_prefill_poll_transfers: bool = False
     pdlb_url: str | None = None
 
     # For communication + norm fusion
@@ -4317,6 +4319,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_layerwise_interval,
             help="The interval of layerwise transfer for disaggregation. Default is 1.",
+        )
+        parser.add_argument(
+            "--pd-prefill-poll-transfers",
+            action="store_true",
+            help="PD prefill role: besides the round tail, poll the KV transfers "
+            "before planning a round, so a request whose decode node allocated "
+            "during the last forward runs in this round, and every 2 ms while a "
+            "forward runs, so a finished request streams without waiting for the "
+            "forward. Each poll is a cross-rank agreement. Off by default.",
         )
         parser.add_argument(
             "--pdlb-url",

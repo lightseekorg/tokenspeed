@@ -478,6 +478,9 @@ pub struct LoopConfig {
     /// matchers' state, which only a commit advances: a grammar batch
     /// cannot overlap a pending forward (`uses_eager_grammar`).
     pub eager_grammar: bool,
+    /// P role: also poll the PD transfers at the round head and while a
+    /// forward runs (`--pd-prefill-poll-transfers`); off polls at the tail only.
+    pub pd_prefill_poll_transfers: bool,
 }
 
 /// The optional subsystems a loop coordinates; each is `None` on an engine
@@ -727,7 +730,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.note_forward(forwarded);
             std::thread::sleep(PAUSED_IDLE_SLEEP);
         } else {
-            if self.outputs.role() == Role::Prefill {
+            if self.config.pd_prefill_poll_transfers && self.outputs.role() == Role::Prefill {
                 // Advance point 3 (Principle 3): the P role's bootstrap gate.
                 // A request admitted at this head whose decode node already
                 // pre-allocated is planned in this round, not after this
@@ -2173,7 +2176,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
         let interval = TRANSFER_POLL_INTERVAL;
-        if self.config.in_flight_depth != 0
+        if !self.config.pd_prefill_poll_transfers
+            || self.config.in_flight_depth != 0
             || self.in_flight.len() != 1
             || self.outputs.role() != Role::Prefill
             || self.ranks.pp.is_some()

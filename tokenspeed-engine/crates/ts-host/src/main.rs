@@ -247,6 +247,8 @@ struct HostConfig {
     grammar: Option<GrammarConfig>,
     /// The data plane fills bitmasks from the matchers' committed state.
     eager_grammar: bool,
+    /// `--pd-prefill-poll-transfers`.
+    pd_prefill_poll_transfers: bool,
 }
 
 /// `rust_host.HostConfig.eplb`.
@@ -468,6 +470,7 @@ impl HostConfig {
                 }
             },
             eager_grammar: config.getattr("eager_grammar")?.extract()?,
+            pd_prefill_poll_transfers: config.getattr("pd_prefill_poll_transfers")?.extract()?,
             metrics: Metrics::from_python(config)?,
             batch_log: BatchLogConfig {
                 enabled: config.getattr("batch_log")?.extract()?,
@@ -716,6 +719,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
         kv_events: config.kv_events,
         epd_receive_enabled: config.epd_receive_enabled,
         eager_grammar: config.eager_grammar,
+        pd_prefill_poll_transfers: config.pd_prefill_poll_transfers,
     };
     tracing::info!(
         rank = config.rank,
