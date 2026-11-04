@@ -159,8 +159,12 @@ def _attention_box_error(state, inputs):
         )
     return {
         "total": round(_relative_rms(actual, expected, (0, 1, 2)).item(), 4),
-        "per_head": [round(v, 3) for v in _relative_rms(actual, expected, (0, 2)).tolist()],
-        "per_row": [round(v, 3) for v in _relative_rms(actual, expected, (1, 2)).tolist()],
+        "per_head": [
+            round(v, 3) for v in _relative_rms(actual, expected, (0, 2)).tolist()
+        ],
+        "per_row": [
+            round(v, 3) for v in _relative_rms(actual, expected, (1, 2)).tolist()
+        ],
         "wrong_cells": int((cells > 0.05).sum()),
         "closest": closest,
     }

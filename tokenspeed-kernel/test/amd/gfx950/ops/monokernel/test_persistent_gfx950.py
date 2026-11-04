@@ -59,8 +59,10 @@ _WORDS = LINE_WORDS // 2
 
 def _claim_mark(epoch, pid):
     """The vector entry's claim word for ``pid`` in launch ``epoch``: its
-    tag (``launch_tag(epoch, 32)``) high, the program id low."""
-    return ((epoch % (2**32 - 1) + 1) << 32) | pid
+    tag (``launch_tag(epoch, 32)``) high, the program id low, as a signed
+    64-bit value."""
+    mark = ((epoch % (2**32 - 1) + 1) << 32) | pid
+    return mark - 2**64 if mark >= 2**63 else mark
 
 
 def _check_counters(state, launches):
@@ -214,15 +216,18 @@ def test_join_waits_for_a_missing_workgroup_until_its_deadline():
     assert state.errors[3].item() == 1  # epoch of the failing launch
 
 
-def test_duplicate_claim_is_reported():
+# From zero, and past 2**31 launches, where the tag's top bit is set.
+@pytest.mark.parametrize("start", [0, 2**32 - 3])
+def test_duplicate_claim_is_reported(start):
     state = _State()
+    state.epochs.view(GRID, _WORDS)[:, 0] = start
     values = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     seen = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     placement = torch.zeros((2, GRID), dtype=torch.int32, device="cuda")
-    # Claim role (xcd 3, slot 5) for launch 1 as a second workgroup taking
-    # it would have: its counter advanced once, or program id 77's mark.
+    # Claim role (xcd 3, slot 5) for the next launch as a second workgroup
+    # taking it would have: its counter advanced once, or program id 77's mark.
     claims = state.claims.view(GRID, _WORDS)
-    claims[3 * 32 + 5, 0] = _claim_mark(1, 77)
+    claims[3 * 32 + 5, 0] = _claim_mark(start + 1, 77)
     _launch_rounds(state, values, seen, placement, 1)
     torch.cuda.synchronize()
     assert state.errors[0].item() == SITE_CLAIM

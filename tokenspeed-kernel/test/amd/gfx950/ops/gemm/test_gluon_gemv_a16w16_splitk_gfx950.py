@@ -165,13 +165,18 @@ def test_row_count_and_tag_do_not_recompile() -> None:
             _run(x[:rows].contiguous(), w, 100 + rows)
 
 
-def test_in_launch_reader_sums_like_the_reduce_and_expires_on_stale_tags() -> None:
+# A small tag, and one with its top bit set (a launch tag past 2**31).
+@pytest.mark.parametrize("tag", [41, -2])
+def test_in_launch_reader_sums_like_the_reduce_and_expires_on_stale_tags(
+    tag: int,
+) -> None:
     x, w = _problem(8, 2304, 8192, 17)
     partials = torch.zeros(16 * 8 * 2304, dtype=torch.int64, device="cuda")
-    expected = _run(x, w, 41, partials)
-    got, site = _read(partials, 8, 2304, 41, 200_000_000)
+    expected = _run(x, w, tag, partials)
+    got, site = _read(partials, 8, 2304, tag, 200_000_000)
     assert site == 0
     assert torch.equal(got, expected)
-    # Every word carries tag 41; waiting for 42 must stop at the deadline.
-    _, site = _read(partials, 8, 2304, 42, 100_000)
+    # Every word carries this tag; waiting for the next must stop at the
+    # deadline.
+    _, site = _read(partials, 8, 2304, tag + 1, 100_000)
     assert site == _SITE
