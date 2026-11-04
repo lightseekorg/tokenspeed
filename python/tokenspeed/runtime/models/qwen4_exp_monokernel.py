@@ -456,7 +456,7 @@ class DeltaMonokernelLayer(_Qwen4ExpMonokernelLayer):
         del positions
         state = self.monokernel_state
         rows = hidden_states.shape[0]
-        hidden_states = _streams(self, hidden_states, residual)
+        hidden_states = _streams(hidden_states, residual)
         gdn = ctx.attn_backend.linear_attn_backend
         state_in, state_out, conv_state, ssm_state = gdn.layer_state(self.layer_id)
         ple = None
@@ -582,7 +582,7 @@ class QSAMonokernelLayer(_Qwen4ExpMonokernelLayer):
         del input_ids
         state = self.monokernel_state
         rows = hidden_states.shape[0]
-        hidden_states = _streams(self, hidden_states, residual)
+        hidden_states = _streams(hidden_states, residual)
         backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
         metadata = backend.metadata_for(ctx.forward_mode)
         full = backend.full_attn_backend.group_view(FULL_ATTENTION, ctx.bs)
@@ -675,14 +675,19 @@ class QSAMonokernelLayer(_Qwen4ExpMonokernelLayer):
         return out, None
 
 
-def _streams(
-    layer: torch.nn.Module, hidden_states: torch.Tensor, residual
-) -> torch.Tensor:
+def _streams(hidden_states: torch.Tensor, residual) -> torch.Tensor:
     """The layer's input hyper-connection streams, or the one row (the
     embedding) that stands for all of them. The kernel reads this row as
-    streams that are all that row, without a copy."""
+    streams that are all that row, without a copy.
+
+    Every layer of a forward launches or none does, so a launch gets the
+    previous launch's complete streams, never a pending residual.
+    """
     if residual is not None:
-        hidden_states = layer.attn_hyper_connection.combine(hidden_states, residual)
+        raise RuntimeError(
+            "a monokernel launch got a pending residual: every layer of a "
+            "forward must launch, or none"
+        )
     return hidden_states.contiguous()
 
 

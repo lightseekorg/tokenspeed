@@ -18,12 +18,15 @@ while earlier stages still compute.
 
 ## Invariants
 
-**The layer boundary is the regular layer's boundary.** A fused layer takes
-and returns the same tensors as the regular decoder layer in the model's layer
-loop, with no pending state between layers. So fused and regular layers mix
-freely. A layer that the monokernel does not serve keeps the regular path, and
-the step still gives the right result. Each model's kernel README gives its
-boundary tensors.
+**A forward launches every layer or none.** A monokernel layer takes the
+regular decoder layer's arguments and returns the layer's output with no
+pending state. Startup packs every layer, and whether a layer launches depends
+only on the forward (its mode and its rows), not on the layer. So within one
+forward every layer launches or none does, and a launch gets the previous
+launch's complete output, never a regular layer's pending state. Across
+forwards, launches and regular forwards follow each other freely through the
+shared caches (next rule). Each model's kernel README gives its boundary
+tensors.
 
 **Same caches, same layouts.** A monokernel reads and writes the KV cache,
 the recurrent state pages and the other per-request caches exactly as the
@@ -66,6 +69,17 @@ step counter is a device tensor that changes once per forward, inside the
 CUDA graph, after the forward's last fused layer. So no write from an earlier
 layer or step can satisfy a poll. All layers share the scratch buffer, and
 nothing clears it.
+
+**A step starts and ends in the model.** One step is one forward. The model
+calls `start_step()` on its monokernel state before its layers and
+`finish_step()` after them. The values that cross layers within a step live in
+that state, not in the layers: whether a layer launched, the LM head input
+when the last launch also runs the model's final norm or mixer, and a model's
+own values (such as the verified lengths of a draft's first step).
+`finish_step()` moves the step counter when a layer launched and no launch
+moved it, so a step without launches adds no kernel. The regular path needs
+none of this: its layers pass values in their return values and through
+kernel boundaries.
 
 **Polls throttle their loads.** Many threads spinning on poll loads can starve
 the producers' stores. A poll issues all its loads, waits once and retries

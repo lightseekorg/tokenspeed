@@ -298,6 +298,25 @@ def test_a_monokernel_layer_runs_other_forwards_with_its_regular_code() -> None:
     assert out[0] is rows and layer.forwards == 1
 
 
+def test_a_launch_refuses_a_pending_residual() -> None:
+    """Every layer of a forward launches or none does, so a launch never
+    gets a pending residual. If one does, it fails instead of combining it."""
+    layer = _MonokernelLayer()
+    layer.monokernel_state = Qwen4ExpMonokernelState(
+        torch.device("cpu"), scratch_pairs=1
+    )
+    rows = torch.zeros(1, 2)
+    with pytest.raises(RuntimeError, match="pending residual"):
+        layer(
+            positions=None,
+            hidden_states=rows,
+            residual=(rows, rows, rows),
+            ctx=_decode_ctx(1, 1, None),
+            input_ids=None,
+        )
+    assert layer.forwards == 0
+
+
 def test_the_switch_refuses_a_model_without_monokernels() -> None:
     for architecture in DECODE_MONOKERNEL_ARCHITECTURES:
         assert decode_monokernel_refusal([architecture]) is None
