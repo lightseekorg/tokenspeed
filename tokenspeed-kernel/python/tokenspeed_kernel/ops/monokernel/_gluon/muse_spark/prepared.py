@@ -158,7 +158,7 @@ class MuseSparkMonokernelState:
     ) -> None:
         if not 1 <= max_requests <= 2:
             raise ValueError(
-                f"fused Muse layers serve 1-2 requests, not {max_requests}"
+                f"the Muse Spark monokernel serves 1-2 requests, not {max_requests}"
             )
         rows = max_requests * 8
         self.device = device
@@ -173,7 +173,7 @@ class MuseSparkMonokernelState:
         )
         peers = IrisGroup(ctx, group, rank_in_group, device)
         if peers.world_size != WORLD_SIZE:
-            raise ValueError(f"fused Muse layers need {WORLD_SIZE} ranks")
+            raise ValueError(f"the Muse Spark monokernel needs {WORLD_SIZE} ranks")
         self.iris = MuseSparkIrisState(peers)
         self.epochs = torch.zeros(ENTRY_WORDS, dtype=torch.int64, device=device)
         self.claims = torch.zeros(ENTRY_WORDS, dtype=torch.int64, device=device)
@@ -262,7 +262,7 @@ def _bf16_with_offset(weight: torch.Tensor | None, offset: float, width: int, de
 def _require(name: str, tensor: torch.Tensor, shape: tuple, dtype: torch.dtype):
     if tuple(tensor.shape) != shape or tensor.dtype != dtype or tensor.stride(-1) != 1:
         raise ValueError(
-            f"fused Muse layer: {name} must be {dtype} {list(shape)} with unit inner "
+            f"Muse Spark monokernel: {name} must be {dtype} {list(shape)} with unit inner "
             f"stride, got {tensor.dtype} {list(tensor.shape)}"
         )
     return tensor
@@ -382,7 +382,9 @@ class MuseSparkMonokernelLayer:
         self.plan_keys = tuple(plan_keys)
         kinds = {(key.layer_kind, key.next_kind) for key in self.plan_keys}
         if len(kinds) != 1:
-            raise ValueError("a fused layer's plan keys share its layer and next kinds")
+            raise ValueError(
+                "a monokernel layer's plan keys share its layer and next kinds"
+            )
         self.layer_kind, self.next_kind = kinds.pop()
         self.declines: dict[int, list[str]] = {}
         # Variants whose launched binary passed the residency check, and the
@@ -511,7 +513,7 @@ class MuseSparkMonokernelLayer:
         properties = torch.cuda.get_device_properties(self.state.device)
         if properties.multi_processor_count != GRID:
             return [
-                f"the device has {properties.multi_processor_count} CUs; a fused "
+                f"the device has {properties.multi_processor_count} CUs; a monokernel "
                 f"launch needs exactly {GRID}"
             ]
         # An early check with the usual page geometry, which the first
@@ -532,10 +534,12 @@ class MuseSparkMonokernelLayer:
 
     def _key(self, rows: int) -> PlanKey:
         if rows % 8:
-            raise ValueError(f"fused Muse layer: {rows} rows is not whole requests")
+            raise ValueError(
+                f"Muse Spark monokernel: {rows} rows is not whole requests"
+            )
         key = PlanKey(rows // 8, self.layer_kind, self.next_kind)
         if key not in self.plan_keys:
-            raise ValueError(f"fused Muse layer: {key} was not prepared")
+            raise ValueError(f"Muse Spark monokernel: {key} was not prepared")
         return key
 
     def _launch(self, key, q, gate, residual, positions, cache, prologue, normed_out):
@@ -545,7 +549,7 @@ class MuseSparkMonokernelLayer:
         # kernel reads request r's pages for rows 8r .. 8r + 7.
         if cache.seq_lens.shape[0] != key.requests:
             raise ValueError(
-                f"fused Muse layer: {rows} rows need {key.requests} requests, "
+                f"Muse Spark monokernel: {rows} rows need {key.requests} requests, "
                 f"got {cache.seq_lens.shape[0]}"
             )
         if key.layer_kind == "full" and cache.split_schedule is None:
@@ -559,7 +563,7 @@ class MuseSparkMonokernelLayer:
             )
         ):
             raise ValueError(
-                "the fused prologue rotates interleaved (GPT-J) pairs only, without mrope"
+                "the monokernel prologue rotates interleaved (GPT-J) pairs only, without mrope"
             )
         scales = None if prologue is None else prologue.cache.scales
         # The page-table width is fixed once the decode metadata exists (the
@@ -638,7 +642,7 @@ class MuseSparkMonokernelLayer:
             # a launch whose argument types differ compiles another one.
             problems = signature_problems(args, constexprs)
             if problems:
-                raise ValueError(f"fused Muse layer {key}: {'; '.join(problems)}")
+                raise ValueError(f"Muse Spark monokernel {key}: {'; '.join(problems)}")
         compiled = gluon_monokernel_muse_spark_gfx950[(GRID,)](
             *args,
             **constexprs,
@@ -650,7 +654,9 @@ class MuseSparkMonokernelLayer:
             # capture's warm-up, before serving): check that one too.
             problems = check_compiled(compiled)
             if problems:
-                raise RuntimeError(f"fused Muse layer {key}: {'; '.join(problems)}")
+                raise RuntimeError(
+                    f"Muse Spark monokernel {key}: {'; '.join(problems)}"
+                )
             self.checked.add(variant)
         return next_q, next_gate
 
@@ -668,7 +674,9 @@ class MuseSparkMonokernelLayer:
         q, gate = prepared_query
         key = self._key(q.shape[0])
         if key.next_kind != "regular":
-            raise ValueError("this layer's next layer is fused: use forward")
+            raise ValueError(
+                "this layer's next layer runs in a monokernel: use forward"
+            )
         weight, eps, offset = next_norm
         if float(eps) != self.model["pre2_eps"] or not torch.equal(
             _bf16_with_offset(weight, float(offset), HIDDEN, q.device),

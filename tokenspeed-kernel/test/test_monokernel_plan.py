@@ -112,7 +112,7 @@ def test_a_variant_without_ar_is_rejected():
                 if not (isinstance(x, Publish) and x.keys[0].startswith("AR.rs"))
             ],
         )
-    with pytest.raises(PlanError, match="no all-to-all hop"):
+    with pytest.raises(PlanError, match="no all-to-all exchange"):
         check_plan(plan)
 
 

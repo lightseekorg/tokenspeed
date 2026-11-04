@@ -252,7 +252,7 @@ def check_plan(plan: LayerPlan) -> int:
                 for region in step.regions:
                     clears[region].append(node)
     if not all_to_all_publishers:
-        raise PlanError(f"{plan.name}: no all-to-all hop ({plan.all_to_all})")
+        raise PlanError(f"{plan.name}: no all-to-all exchange ({plan.all_to_all})")
     names = {region.name for region in plan.regions}
     for region in plan.regions:
         if region.copies != 2:
