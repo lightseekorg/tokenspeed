@@ -1398,9 +1398,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         Decode graph Full sources use the refresh's full query window; consumers
         may reorder/subset it. A subset Reindex and its Reuse consumers share the
         same window tensors. Other source windows retain eager coverage validation.
-        Full scans device-visible history in fixed partitions; Reindex scans
-        shape-bounded candidates. TP gathers small Q/weight tiles once, not
-        scores per history tile. No full-history query/score matrix is materialized.
+        Full scans device-visible history; Reindex scans shape-bounded candidates.
+        Replicated-cache decode scores the caller's complete query batch;
+        owner-local history retains per-request windows. Prefill bounds query
+        tiles and score scratch. TP gathers Q/weight tiles once, not scores per
+        history tile.
         """
         from tokenspeed_kernel.ops.attention import dsv41
 
@@ -1585,6 +1587,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # not index_select the table for the entire prefill (T * context pages).
         canonical_prefill = window is not None
         query_tile = 1024 if canonical_prefill else 256
+        if forward_mode.is_decode():
+            query_tile = max(1, n)
         windows = (
             [
                 (span.offset, span.offset + span.count, span)
