@@ -117,6 +117,8 @@ class MHAAttnBackend(PagedAttentionBackend):
     # Every kernel call site forwards layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
 
+    supports_compact_verify = True
+
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # Map the selected backend to the corresponding kernel solution string.
@@ -337,15 +339,20 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         metadata = self.forward_decode_metadata
-        max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
-
-        tree = self._tree_lane_rows(bs) or self._tree_verify_rows(
-            bs, max_seqlen_q, metadata.page_table, metadata.seq_lens
-        )
-        if tree is not None:
-            return self._tree_cascade(
-                q, layer, token_to_kv_pool, tree, sinks=kwargs.get("sinks")
+        ctx = kwargs.get("ctx")
+        verify = None if ctx is None else ctx.verify_queries
+        page_table, seq_lens = metadata.page_table, metadata.seq_lens
+        if verify is not None:
+            page_table, seq_lens = verify.causal_metadata(seq_lens, page_table)
+        max_seqlen_q = q.shape[0] // seq_lens.shape[0]
+        if verify is None:
+            tree = self._tree_lane_rows(bs) or self._tree_verify_rows(
+                bs, max_seqlen_q, metadata.page_table, metadata.seq_lens
             )
+            if tree is not None:
+                return self._tree_cascade(
+                    q, layer, token_to_kv_pool, tree, sinks=kwargs.get("sinks")
+                )
 
         scale_kwargs = {}
         if self.is_mxfp8:
@@ -361,8 +368,8 @@ class MHAAttnBackend(PagedAttentionBackend):
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
-            cache_seqlens=metadata.seq_lens,
+            page_table=page_table,
+            cache_seqlens=seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=kwargs.get("sinks"),

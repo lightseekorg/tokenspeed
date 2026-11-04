@@ -662,6 +662,8 @@ class SamplingBackend(ABC):
 
     # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
     supports_tree_verify: bool = False
+    # A compact verifier reads device prefix offsets instead of B * width scores.
+    supports_compact_verify: bool = False
 
     @abstractmethod
     def sample(

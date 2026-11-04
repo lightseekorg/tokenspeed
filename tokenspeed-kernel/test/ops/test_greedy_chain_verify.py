@@ -29,6 +29,111 @@ from tokenspeed_kernel.ops.sampling.triton.verify import (
 from utils import assert_no_triton_compile
 
 
+def _compact_reference(candidates, compact_target, lengths):
+    batch, width = candidates.shape
+    tokens = torch.zeros(batch * width, dtype=torch.int32, device=candidates.device)
+    indices = torch.full_like(candidates, -1)
+    counts = torch.full((batch,), -1, dtype=torch.int32, device=candidates.device)
+    start = 0
+    for request, length in enumerate(lengths):
+        if length:
+            target = compact_target[start : start + length].to(torch.int32)
+            tokens[request * width : request * width + length] = target
+            accepted = 0
+            while (
+                accepted + 1 < length
+                and candidates[request, accepted + 1] == target[accepted]
+            ):
+                accepted += 1
+            counts[request] = accepted
+            indices[request, : accepted + 1] = torch.arange(
+                request * width,
+                request * width + accepted + 1,
+                device=candidates.device,
+            )
+        start += length
+    return tokens, indices, counts
+
+
+@pytest.mark.parametrize("width", [1, 4, 9])
+@pytest.mark.parametrize("pattern", ["none", "all", "partial", "cast_wrap"])
+def test_compact_greedy_chain_replay_reads_only_selected_prefixes(
+    device, width, pattern
+):
+    batch = 4
+    candidates, target = _inputs(batch, width, pattern, device)
+    compact = torch.empty_like(target).flatten()
+    offsets = torch.zeros(batch + 1, dtype=torch.int32, device=device)
+    actual = _outputs(batch, width, device)
+
+    def load(lengths):
+        prefix = [0]
+        for length in lengths:
+            prefix.append(prefix[-1] + length)
+        compact.fill_(-555)
+        if prefix[-1]:
+            compact[: prefix[-1]].copy_(
+                torch.cat([target[i, :n] for i, n in enumerate(lengths)])
+            )
+        offsets.copy_(torch.tensor(prefix, dtype=torch.int32, device=device))
+
+    def run():
+        verify_chain_target_sampled(
+            *actual,
+            candidates,
+            compact,
+            query_start_loc=offsets,
+            write_rejected_targets=True,
+            enable_pdl=False,
+        )
+
+    load([width] * batch)
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    with assert_no_triton_compile(_verify_chain_target_sampled_kernel):
+        for lengths in (
+            [width, 1, 0, width],
+            [0, width, 1, 0],
+            [0] * batch,
+            [width] * batch,
+        ):
+            load(lengths)
+            graph.replay()
+            for got, want in zip(
+                actual, _compact_reference(candidates, compact, lengths)
+            ):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_compact_greedy_chain_large_prediction_offsets(device):
+    first = 2**31 + 1
+    entries = first + 2
+    if torch.cuda.mem_get_info(device)[0] < entries * 4 + 256 * 1024**2:
+        pytest.skip("not enough memory for the sparse high-offset allocation")
+    # Leave the allocation uninitialized and touch only its last two entries.
+    target = torch.empty(entries, dtype=torch.int32, device=device)
+    target[-2:].copy_(torch.tensor([17, 23], dtype=torch.int32, device=device))
+    offsets = torch.tensor(
+        [first, first + 1, first + 2], dtype=torch.int64, device=device
+    )
+    candidates = torch.zeros(2, 1, dtype=torch.int32, device=device)
+    actual = _outputs(2, 1, device)
+    verify_chain_target_sampled(
+        *actual,
+        candidates,
+        target,
+        query_start_loc=offsets,
+        write_rejected_targets=True,
+        enable_pdl=False,
+    )
+    torch.testing.assert_close(
+        actual[0], torch.tensor([17, 23], dtype=torch.int32, device=device)
+    )
+    assert actual[2].tolist() == [0, 0]
+
+
 def _inputs(bs, width, pattern, device):
     target = (
         torch.arange(bs * width, device=device, dtype=torch.int64).view(bs, width) + 100

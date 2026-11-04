@@ -32,6 +32,10 @@ import torch.distributed as dist
 import tqdm
 from tokenspeed_kernel.workspace import capture_session
 
+from tokenspeed.runtime.execution.confidence_graph import (
+    ConfidenceDecodeGraphs,
+    DecodeStages,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
@@ -50,6 +54,10 @@ from tokenspeed.runtime.execution.memory_delta import (
     MemoryDeltaObserver,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.verify_layout import (
+    ConfidenceFeedback,
+    VerifyQueryLayout,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
 )
@@ -88,6 +96,18 @@ def get_is_capture_mode() -> bool:
 
 def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
+
+
+@contextmanager
+def decode_graph_capture():
+    """Expose the same capture-only stream forks for either graph layout."""
+    global _is_capture_mode
+    previous = _is_capture_mode
+    _is_capture_mode = True
+    try:
+        yield
+    finally:
+        _is_capture_mode = previous
 
 
 @contextmanager
@@ -147,6 +167,7 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
 
 
 global_graph_memory_pool = None
+DecodeGraphKey = tuple[str, int]
 
 
 class DeepEPCudaGraphRunnerAdapter:
@@ -258,6 +279,9 @@ class ForwardStepRunner:
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
         decode_graph_supported: bool = True,
+        *,
+        decode_stages: DecodeStages | None,
+        update_runtime_state: Callable | None,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -270,6 +294,8 @@ class ForwardStepRunner:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
+        self.decode_stages = decode_stages
+        self.update_runtime_state = update_runtime_state
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
@@ -303,6 +329,33 @@ class ForwardStepRunner:
         self.overlap_schedule_depth = config.overlap_schedule_depth
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
+        self.confidence_feedback: ConfidenceFeedback | None = None
+        self.verify_query_layouts: dict[tuple[int, int], VerifyQueryLayout] = {}
+        self.confidence_request_ids: list[str] = []
+        self.confidence_queries: int | None = None
+        self.confidence_batch: int | None = None
+        self.confidence_round_prepared = False
+        self._confidence_host_group = None
+        if drafter is not None and drafter.verify_policy == "confidence":
+            self.confidence_feedback = ConfidenceFeedback(
+                self.max_tokens_per_req,
+                max(2, config.overlap_schedule_depth + 2),
+                self.max_decode_bs,
+            )
+            if self.world_size > 1:
+                from tokenspeed.runtime.distributed.process_group_manager import (
+                    process_group_manager,
+                )
+
+                group = tuple(config.world_group)
+                # Budget collectives run on the forward thread while the event
+                # loop can broadcast requests over the shared host group.
+                process_group_manager.init_process_group(
+                    group, backend="gloo", name="confidence_verify"
+                )
+                self._confidence_host_group = process_group_manager.get_process_group(
+                    "gloo", group, name="confidence_verify"
+                )
         # User intent (enforce_eager), a backend-declared restriction
         # (resolve_cuda_graph_support in ModelExecutor), or a role with no
         # decode step to capture: the prefill role of a disaggregated
@@ -360,15 +413,15 @@ class ForwardStepRunner:
             for spec in token_to_kv_pool.arena.cache_group_specs
         }
 
-        self.graphs: dict[tuple[str, int], object] = {}
-        self.output_buffers: dict[tuple[str, int], tuple] = {}
+        self.graphs: dict[DecodeGraphKey, object] = {}
+        self.output_buffers: dict[DecodeGraphKey, tuple] = {}
         # The padded batch the last call replayed a decode graph at (None: eager).
         self.last_graph_bs: int | None = None
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
         self._graph_debug = graph_debug_enabled()
-        self._metadata_snapshots: dict[tuple[str, int], dict[str, dict]] = {}
+        self._metadata_snapshots: dict[DecodeGraphKey, dict[str, dict]] = {}
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -385,6 +438,13 @@ class ForwardStepRunner:
         # decode_graph=False while leaving the prefill graph on — decode
         # capture never runs then, but the attribute must still exist.
         self.stream = self.device_module.Stream()
+        self.segmented_decode: ConfidenceDecodeGraphs | None = None
+        if self.confidence_feedback is not None:
+            if decode_stages is None:
+                raise ValueError(
+                    "confidence graphs require the forward's decode stages"
+                )
+            self.segmented_decode = ConfidenceDecodeGraphs(self, decode_stages)
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -405,6 +465,16 @@ class ForwardStepRunner:
                 it. None captures the whole ladder.
             observer: Measured around each capture, for the same caller.
         """
+        if self.segmented_decode is not None:
+            global _is_cuda_graph_phase
+            old_phase = _is_cuda_graph_phase
+            _is_cuda_graph_phase = True
+            try:
+                with freeze_gc(self.enable_cudagraph_gc):
+                    self.segmented_decode.capture(entries=entries, observer=observer)
+            finally:
+                _is_cuda_graph_phase = old_phase
+            return
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             # Capture backend-declared sampler variants explicitly.
@@ -434,8 +504,9 @@ class ForwardStepRunner:
                 graph, output_buffers = self._capture_one(
                     bs, variant=variant, observer=observer.measure(f"decode:{variant}")
                 )
-                self.graphs[(variant, bs)] = graph
-                self.output_buffers[(variant, bs)] = output_buffers
+                key = self._capture_key(variant, bs)
+                self.graphs[key] = graph
+                self.output_buffers[key] = output_buffers
 
     @property
     def capture_plan(self) -> dict[str, list[int]]:
@@ -448,6 +519,8 @@ class ForwardStepRunner:
         if self.disable:
             return {}
         ladder = sorted(self.capture_bs, reverse=True)
+        if self.segmented_decode is not None:
+            return self.segmented_decode.capture_plan
         return {
             variant: list(ladder) for variant in self._cuda_graph_capture_variants()
         }
@@ -477,6 +550,8 @@ class ForwardStepRunner:
         global global_graph_memory_pool
 
         self.graphs.clear()
+        if self.segmented_decode is not None:
+            self.segmented_decode.release()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
         # The tables name no arena; only the graphs and their pool go.
@@ -502,12 +577,36 @@ class ForwardStepRunner:
             variant=variant,
         )
 
+    def _capture_key(self, variant: str, bs: int) -> DecodeGraphKey:
+        return variant, bs
+
+    def query_layout(self, bs: int, queries: int) -> VerifyQueryLayout:
+        key = bs, queries
+        if key not in self.verify_query_layouts:
+            self.verify_query_layouts[key] = VerifyQueryLayout(
+                bs, queries, self.max_tokens_per_req, self.device
+            )
+        return self.verify_query_layouts[key]
+
+    def prepare_confidence_feedback(
+        self,
+        request_ids: list[str],
+        request_pool_indices: list[int],
+        output_layout: ForwardOutputLayout,
+    ) -> None:
+        self.confidence_request_ids = request_ids
+        if self.confidence_feedback is not None and self.global_rank == 0:
+            self.confidence_feedback.prepare(
+                request_ids, request_pool_indices, output_layout
+            )
+            self.confidence_round_prepared = True
+
     def _cuda_graph_replay_variant(self) -> str:
         if self.sampling_backend is None:
             return CUDA_GRAPH_VARIANT_DEFAULT
         return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
 
-    def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
+    def _cuda_graph_key(self, bs: int) -> DecodeGraphKey:
         variant = self._cuda_graph_replay_variant()
         key = (variant, bs)
         if key in self.graphs:
@@ -526,9 +625,13 @@ class ForwardStepRunner:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs)
 
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
+        if self.segmented_decode is not None:
+            return bs in self.segmented_decode.drafts and bool(
+                self.segmented_decode.targets
+            )
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
-    def _verify_graph_metadata(self, graph_key: tuple[str, int]) -> None:
+    def _verify_graph_metadata(self, graph_key: DecodeGraphKey) -> None:
         """Assert the refresh rebound the tensors the captured graph reads."""
         snapshots = self._metadata_snapshots.get(graph_key)
         if snapshots is None:
@@ -750,7 +853,7 @@ class ForwardStepRunner:
             snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
             if self.draft_attn_backend is not None:
                 snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
-            self._metadata_snapshots[(variant, bs)] = snapshots
+            self._metadata_snapshots[self._capture_key(variant, bs)] = snapshots
 
         return graph, out
 
@@ -791,6 +894,10 @@ class ForwardStepRunner:
                         else CaptureHiddenMode.NULL
                     ),
                 )
+                if self.segmented_decode is not None:
+                    ctx.verify_queries = self.query_layout(
+                        bs, bs * self.max_tokens_per_req
+                    )
                 if self.dp_size > 1:
                     ctx.global_num_tokens = [
                         bs * self.max_tokens_per_req
@@ -1134,6 +1241,34 @@ class ForwardStepRunner:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
+        confidence_start = None
+        if self.confidence_feedback is not None and ctx.forward_mode.is_decode():
+            self.confidence_batch = padded_bs
+            budget = [
+                (
+                    self.confidence_feedback.select(
+                        padded_bs, self.confidence_request_ids
+                    )
+                    if self.global_rank == 0
+                    else None
+                )
+            ]
+            if self._confidence_host_group is not None:
+                dist.broadcast_object_list(
+                    budget, src=0, group=self._confidence_host_group
+                )
+            self.confidence_queries = budget[0]
+            maximum = self.max_capture_bs if use_graph else self.max_decode_bs
+            ctx.verify_queries = self.query_layout(
+                min(maximum, self.confidence_queries), self.confidence_queries
+            )
+            if self.global_rank == 0 and self.confidence_feedback.can_record():
+                confidence_start = self.device_module.Event(enable_timing=True)
+                confidence_start.record()
+            # Stage graphs handle their padding. The outer forward retains the
+            # real request count for feedback and output delivery.
+            if self.segmented_decode is not None:
+                padded_bs = bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         live_output_layout = ctx.output_layout
@@ -1220,7 +1355,15 @@ class ForwardStepRunner:
                 block_tables_cpu=block_tables_cpu,
             )
 
-        if use_graph:
+        if self.segmented_decode is not None and ctx.verify_queries is not None:
+            self.segmented_decode.bind_round(
+                ctx,
+                actual_bs=bs,
+                block_tables=block_tables,
+                use_graph=use_graph,
+            )
+            result = self.segmented_decode.run_round(ctx, sampling_info)
+        elif use_graph:
             # Runtime prepare() is called by ModelExecutor with per-request rids
             # BEFORE self.forward_step — we don't refill here to avoid clobbering
             # the per-request generators with the capture-stub generator.
@@ -1270,16 +1413,51 @@ class ForwardStepRunner:
             ctx.bs = bs
             ctx.output_layout = live_output_layout
 
+        if not (self.segmented_decode is not None and ctx.verify_queries is not None):
+            self.commit_forward(ctx, result)
+
+        if self.confidence_feedback is not None and self.confidence_round_prepared:
+            slots = self.input_buffers.req_pool_indices_buf[:bs]
+            layout = ctx.verify_queries
+            query_lengths = (
+                layout.query_lengths[:bs]
+                if layout is not None
+                else torch.zeros_like(slots, dtype=torch.int32)
+            )
+            accept_lengths = (
+                layout.accept_lengths[:bs]
+                if layout is not None
+                else torch.zeros_like(slots, dtype=torch.int32)
+            )
+            self.confidence_feedback.record(
+                self.runtime_states.draft_confidence.index_select(0, slots),
+                self.runtime_states.draft_confidence_generation.index_select(0, slots),
+                self.runtime_states.previous_draft_confidence.index_select(0, slots),
+                query_lengths,
+                accept_lengths,
+                confidence_start,
+                self.confidence_batch if confidence_start is not None else None,
+                self.confidence_queries if confidence_start is not None else None,
+            )
+            self.confidence_round_prepared = False
+
+        self.last_graph_bs = padded_bs if use_graph else None
+        return result
+
+    def commit_forward(self, ctx: ForwardContext, result: tuple) -> None:
+        """Commit accepted state and advance the frontier once, after drafting."""
         if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
             self.attn_backend.commit_state_after_acceptance(
                 result[1],
                 num_extends=ctx.num_extends,
                 accepted_path=(
-                    self.sampling_backend.accepted_path(bs, self.config.spec_num_tokens)
+                    self.sampling_backend.accepted_path(
+                        ctx.bs, self.config.spec_num_tokens
+                    )
                     if self.config.spec_draft_tree and ctx.num_extends == 0
                     else None
                 ),
             )
 
-        self.last_graph_bs = padded_bs if use_graph else None
-        return result
+        if self.update_runtime_state is not None:
+            self.update_runtime_state(ctx, result)

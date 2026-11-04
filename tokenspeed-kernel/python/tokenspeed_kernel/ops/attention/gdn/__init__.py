@@ -81,7 +81,7 @@ def _blockscaled_signature_and_scales(
         )
     else:
         signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
-    return signature, dict(q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
+    return signature, {"q_scale": q_scale, "k_scale": k_scale, "v_scale": v_scale}
 
 
 LSE_LN = math.log2(math.e)
@@ -593,6 +593,8 @@ def gdn_decode_mtp(
     replay_payload: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
 ) -> torch.Tensor:
     """Run one multi-token (T>1) GDN MTP verify step through kernel selection.
 
@@ -657,17 +659,43 @@ def gdn_decode_mtp(
             each token's ``[k | v | a | b]`` as read.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        query_start_loc: Optional contiguous device offsets for packed
+            ``[1, rows, heads, dim]`` queries. State destinations and replay
+            payloads keep the original request-major verify width.
+        max_seqlen_q: Maximum verify width when device offsets are supplied;
+            must be None for the uniform layout.
 
     Returns:
         Decode output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
         Outputs for negative initial-state indices are undefined and must be
         ignored, including on the FlashInfer FP32 path.
     """
+    expected_state_shape = q.shape[:2]
+    extra = {}
+    if query_start_loc is not None:
+        batch = initial_state_indices.numel()
+        if (
+            q.shape[0] != 1
+            or query_start_loc.shape != (batch + 1,)
+            or not query_start_loc.is_contiguous()
+            or query_start_loc.dtype not in (torch.int32, torch.int64)
+            or query_start_loc.device != q.device
+            or max_seqlen_q is None
+            or max_seqlen_q < 1
+            or tree_ancestors is not None
+        ):
+            raise ValueError(
+                "packed GDN verify requires device offsets and a maximum query width"
+            )
+        expected_state_shape = (batch, max_seqlen_q)
+        extra = {"query_start_loc": query_start_loc, "max_seqlen_q": max_seqlen_q}
+    elif max_seqlen_q is not None:
+        raise ValueError("max_seqlen_q requires device query offsets")
     if output_state_indices is not None:
-        if output_state_indices.shape != q.shape[:2]:
+        if output_state_indices.shape != expected_state_shape:
             raise ValueError(
                 "output_state_indices must have shape "
-                f"{tuple(q.shape[:2])}, got {tuple(output_state_indices.shape)}"
+                f"{tuple(expected_state_shape)}, got {tuple(output_state_indices.shape)}"
             )
         if output_state_indices.dtype != torch.int32:
             raise ValueError(
@@ -731,6 +759,8 @@ def gdn_decode_mtp(
     traits = {"head_dim": head_dim, "value_head_dim": v.shape[-1]}
     if solution != "flashinfer":
         traits["state_dtype"] = initial_state.dtype
+    if query_start_loc is not None:
+        traits["varlen"] = True
     if output_state is not None:
         traits["separate_output_state"] = True
     if _qkv_rows_strided(q, k, v):
@@ -772,6 +802,7 @@ def gdn_decode_mtp(
             output_state=output_state,
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
+            **extra,
         )
 
 

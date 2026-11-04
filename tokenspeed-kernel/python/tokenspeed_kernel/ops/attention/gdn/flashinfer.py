@@ -379,6 +379,7 @@ if is_decode_available():
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "varlen": frozenset({False}),
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
             "state_dtype": frozenset({torch.float32}),
             "separate_output_state": frozenset({False}),

@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include "scheduler/confidence.h"
+
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
@@ -74,6 +76,12 @@ void BindForwardCommonFields(Cls& cls) {
 }  // namespace
 
 NB_MODULE(tokenspeed_scheduler_ext, m) {
+    nb::class_<tokenspeed::ConfidenceBudgetPlanner>(m, "ConfidenceBudgetPlanner")
+        .def(nb::init<int>())
+        .def("set_baseline", &tokenspeed::ConfidenceBudgetPlanner::SetBaseline)
+        .def("observe", &tokenspeed::ConfidenceBudgetPlanner::Observe)
+        .def("select", &tokenspeed::ConfidenceBudgetPlanner::Select);
+
     m.doc() = "TokenSpeed scheduler bindings";
 
     nb::module_ kv_event = m.def_submodule("KVEvent");

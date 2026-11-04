@@ -186,6 +186,8 @@ def _fused_gdn_decode_update_kernel(
     intermediate_states_buffer,
     per_token_output_state_indices,
     tree_ancestors,
+    query_start_loc,
+    replay_payload,
     scale,
     T,
     H: tl.constexpr,
@@ -200,6 +202,8 @@ def _fused_gdn_decode_update_kernel(
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_PER_TOKEN_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_TREE: tl.constexpr,
+    HAS_QUERY_OFFSETS: tl.constexpr,
+    HAS_REPLAY: tl.constexpr,
     T_BLOCK: tl.constexpr,
     Q_STRIDES: tl.constexpr,
     K_STRIDES: tl.constexpr,
@@ -208,7 +212,7 @@ def _fused_gdn_decode_update_kernel(
     B_STRIDES: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    """Dense-batch (no varlen) sigmoid-gating delta-rule decode/MTP update.
+    """Uniform or device-offset sigmoid-gating delta-rule decode/MTP update.
 
     q, k: [B, T, H, K]; v: [B, T, HV, V]; a, b: [B, T, HV]; o: [B, T, HV, V]
     (input strides are explicit so decode can consume packed QKV views
@@ -250,18 +254,44 @@ def _fused_gdn_decode_update_kernel(
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
+    start = 0
+    length = T
+    if HAS_QUERY_OFFSETS:
+        start = tl.load(query_start_loc + i_n).to(tl.int64)
+        length = tl.load(query_start_loc + i_n + 1).to(tl.int64) - start
+        if length == 0:
+            return
 
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + i_n * Q_STRIDES[0] + i_h * Q_STRIDES[2] + o_k * Q_STRIDES[3]
-    p_k = k + i_n * K_STRIDES[0] + i_h * K_STRIDES[2] + o_k * K_STRIDES[3]
-    p_v = v + i_n * V_STRIDES[0] + i_hv * V_STRIDES[2] + o_v * V_STRIDES[3]
-    p_b = b + i_n * B_STRIDES[0] + i_hv * B_STRIDES[2]
-    p_o = o + (i_n * T * HV + i_hv) * V + o_v
+    p_q = (
+        q
+        + i_n * Q_STRIDES[0]
+        + start * Q_STRIDES[1]
+        + i_h * Q_STRIDES[2]
+        + o_k * Q_STRIDES[3]
+    )
+    p_k = (
+        k
+        + i_n * K_STRIDES[0]
+        + start * K_STRIDES[1]
+        + i_h * K_STRIDES[2]
+        + o_k * K_STRIDES[3]
+    )
+    p_v = (
+        v
+        + i_n * V_STRIDES[0]
+        + start * V_STRIDES[1]
+        + i_hv * V_STRIDES[2]
+        + o_v * V_STRIDES[3]
+    )
+    p_b = b + i_n * B_STRIDES[0] + start * B_STRIDES[1] + i_hv * B_STRIDES[2]
+    output_start = start if HAS_QUERY_OFFSETS else i_n * T
+    p_o = o + (output_start * HV + i_hv) * V + o_v
 
     p_A_log = A_log + i_hv
-    p_a = a + i_n * A_STRIDES[0] + i_hv * A_STRIDES[2]
+    p_a = a + i_n * A_STRIDES[0] + start * A_STRIDES[1] + i_hv * A_STRIDES[2]
     p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -296,13 +326,13 @@ def _fused_gdn_decode_update_kernel(
     n_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
     n_b = tl.load(p_b).to(tl.float32)
     n_a = tl.load(p_a).to(tl.float32)
-    for step_idx in range(0, T):
+    for step_idx in range(length):
         b_q = n_q
         b_k = n_k
         b_v = n_v
         b_b = n_b
         b_a = n_a
-        has_next = step_idx + 1 < T
+        has_next = step_idx + 1 < length
         n_q = tl.load(p_q + Q_STRIDES[1], mask=mask_k & has_next, other=0).to(
             tl.float32
         )
@@ -314,6 +344,19 @@ def _fused_gdn_decode_update_kernel(
         )
         n_b = tl.load(p_b + B_STRIDES[1], mask=has_next, other=0).to(tl.float32)
         n_a = tl.load(p_a + A_STRIDES[1], mask=has_next, other=0).to(tl.float32)
+        if HAS_REPLAY:
+            # Commit still addresses [request, maximum width]. Store the raw
+            # scan inputs before L2 normalization so replay reproduces verify.
+            replay_width = H * K + HV * V + 2 * HV
+            replay_row = (
+                replay_payload + (i_n * T + step_idx).to(tl.int64) * replay_width
+            )
+            if i_v == 0 and i_hv % (HV // H) == 0:
+                tl.store(replay_row + i_h * K + o_k, b_k, mask=mask_k)
+            tl.store(replay_row + H * K + i_hv * V + o_v, b_v, mask=mask_v)
+            if i_v == 0:
+                tl.store(replay_row + H * K + HV * V + i_hv, b_a)
+                tl.store(replay_row + H * K + HV * V + HV + i_hv, b_b)
         if HAS_TREE:
             parent = _latest_ancestor(tree_ancestors + i_n * T, step_idx, True)
             if parent != step_idx - 1:
@@ -470,6 +513,9 @@ def _launch_fused_gdn_decode_update(
     intermediate_states_buffer: torch.Tensor | None,
     per_token_output_state_indices: torch.Tensor | None,
     tree_ancestors: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    replay_payload: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
@@ -479,6 +525,9 @@ def _launch_fused_gdn_decode_update(
     """
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
+    input_shape = B, T
+    if query_start_loc is not None:
+        B, T = initial_state_indices.numel(), max_seqlen_q
     HV = v.shape[2]
     V = v.shape[3]
     if scale is None:
@@ -490,7 +539,11 @@ def _launch_fused_gdn_decode_update(
             f"{output_state.stride()}"
         )
 
-    o = q.new_empty(B, T, HV, V)
+    o = (
+        q.new_empty(*input_shape, HV, V)
+        if query_start_loc is None
+        else q.new_zeros(*input_shape, HV, V)
+    )
 
     # Serial tree verify needs narrow V tiles for parallelism; chains keep BV=32.
     BK, BV = triton.next_power_of_2(K), min(
@@ -518,6 +571,8 @@ def _launch_fused_gdn_decode_update(
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=per_token_output_state_indices,
         tree_ancestors=tree_ancestors,
+        query_start_loc=query_start_loc,
+        replay_payload=replay_payload,
         scale=scale,
         T=T,
         H=H,
@@ -532,12 +587,14 @@ def _launch_fused_gdn_decode_update(
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         HAS_PER_TOKEN_OUTPUT_STATE_INDICES=(per_token_output_state_indices is not None),
         HAS_TREE=tree_ancestors is not None,
+        HAS_QUERY_OFFSETS=query_start_loc is not None,
+        HAS_REPLAY=replay_payload is not None,
         T_BLOCK=1 if tree_ancestors is None else triton.next_power_of_2(T),
-        Q_STRIDES=q.stride(),
-        K_STRIDES=k.stride(),
-        V_STRIDES=v.stride(),
-        A_STRIDES=a.stride(),
-        B_STRIDES=b.stride(),
+        Q_STRIDES=q.stride() if query_start_loc is None else (0, *q.stride()[1:]),
+        K_STRIDES=k.stride() if query_start_loc is None else (0, *k.stride()[1:]),
+        V_STRIDES=v.stride() if query_start_loc is None else (0, *v.stride()[1:]),
+        A_STRIDES=a.stride() if query_start_loc is None else (0, *a.stride()[1:]),
+        B_STRIDES=b.stride() if query_start_loc is None else (0, *b.stride()[1:]),
         num_warps=1,
         num_stages=3,
         ENABLE_PDL=enable_pdl,
@@ -889,6 +946,7 @@ def _launch_gdn_tree_verify_chunked(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "varlen": frozenset({False, True}),
         "separate_output_state": frozenset({False, True}),
         "strided_qkv": frozenset({False, True}),
     },
@@ -912,6 +970,8 @@ def triton_gdn_decode_mtp(
     output_state: torch.Tensor | None = None,
     tree_ancestors: torch.Tensor | None,
     replay_payload: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
 ) -> torch.Tensor:
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
     ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
@@ -940,8 +1000,20 @@ def triton_gdn_decode_mtp(
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
         )
-    if replay_payload is not None:
+    if replay_payload is not None and query_start_loc is None:
         raise ValueError("only a chunked ReplaySSM tree verify fills replay_payload")
+    if replay_payload is not None and (
+        replay_payload.shape
+        != (
+            initial_state_indices.numel() * max_seqlen_q,
+            k.shape[2] * k.shape[3] + v.shape[2] * v.shape[3] + 2 * v.shape[2],
+        )
+        or not replay_payload.is_contiguous()
+        or replay_payload.dtype != q.dtype
+    ):
+        raise ValueError(
+            "packed GDN replay payload must retain the full verify geometry"
+        )
     return _launch_fused_gdn_decode_update(
         q,
         k,
@@ -960,6 +1032,9 @@ def triton_gdn_decode_mtp(
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
         tree_ancestors=tree_ancestors,
+        query_start_loc=query_start_loc,
+        max_seqlen_q=max_seqlen_q,
+        replay_payload=replay_payload,
     )
 
 

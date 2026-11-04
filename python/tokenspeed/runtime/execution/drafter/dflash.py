@@ -1156,6 +1156,14 @@ class DFlash(BaseDrafter):
         kv_sync_event: torch.cuda.Event = None,
         prepared: bool = False,
     ) -> torch.Tensor:
+        return self._draft_native_forward(current_tokens, kv_sync_event, prepared)
+
+    def _draft_native_forward(
+        self,
+        current_tokens: torch.Tensor,
+        kv_sync_event: torch.cuda.Event | None,
+        prepared: bool,
+    ) -> torch.Tensor:
         bs = current_tokens.shape[0]
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         prefix_lens = self.draft_seq_lens_buf[:bs]

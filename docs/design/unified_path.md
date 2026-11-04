@@ -1328,8 +1328,10 @@ verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.
 
 The runner calls `commit_state_after_acceptance` once on the target
-after decode/mixed execution or graph replay, with live acceptance and
-`num_extends`. KDA uses the same replay lifecycle for standard target decode:
+after decode/mixed execution, with acceptance and `num_extends`. Ordinary
+decode commits after graph replay; confidence includes this hook in its B
+graph, with zero acceptance and null destinations for padding. KDA uses the
+same replay lifecycle for standard target decode:
 its verify width and accepted count are one when there are no draft tokens.
 Its cache recipe reserves the record workspace for this case before sizing
 the arena. Replay capability determines this reservation even without a drafter;
@@ -2317,3 +2319,146 @@ buffers or running a forward, including with `--disable-autotune` (which
 disables profiling, not startup warmup). Increase `--max-num-seqs` to at
 least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
 this draft decode warmup and are exempt.
+
+## DSpark confidence verification
+
+Qwen4-Exp targets can use a separate DSpark checkpoint whose capture contract
+is the FP32 mean of the four HC branches at the requested layer inputs. The
+draft configures these taps before cache construction through
+`TargetCaptureConfigurator`; the target materializes a deferred residual
+before capturing it. The drafter loads its own Markov and scalar confidence
+heads and shares the target embedding and LM head.
+
+The experimental `--speculative-verify-policy confidence` selects a per-round
+query budget.
+The C++ `ConfidenceBudgetPlanner` scores `(request capacity, query capacity)`
+budgets by expected committed tokens per round. These are cost-model keys,
+not graph keys: target execution and verification are captured by query capacity
+Q, and draft execution and state commit independently by request capacity B. The query ladder is
+the deduplicated union of the configured request capacities times 1..width.
+For request capacities `[1, 2, 4, 8, 16]` and width 8, this is 24 target graphs
+plus 5 draft graphs, rather than 40 complete-round graphs.
+Startup composes the independently timed target and draft stages. Completed
+whole-round feedback replaces those estimates online and includes metadata
+refresh and submission overhead. The complete forward is warmed at startup
+before capturing its two stages.
+Rank zero selects the bucket and agrees it over a named host group managed by
+the existing process-group manager. Its forward-thread broadcasts cannot share
+the event loop's request-broadcast sequence.
+Online feedback is bounded and asynchronous: only completed CUDA events are
+read. A budget for draft generation N uses generation N-2, tagged by request
+lifetime and checked against a device counter published beside the scores.
+Feedback copies the newly published scores; host selection defers their use by
+generation. Copying only the previous scores would unnecessarily wait for one
+additional forward to complete. Previous scores travel in the same sample only
+to compare the just-verified candidates with their actual acceptance.
+The counter is reset and imaged with the candidate state. A restored request
+can rebase the host's expendable counter against its first completed sample.
+Scores survive rounds that omit a request; reusing its slot evicts them, and
+prefill invalidates pending samples from before recomputation. Missing or
+wrong-generation scores use measured per-position conditional acceptance,
+with a Beta(1, 1) cold-start prior, rather than assuming perfect acceptance.
+The latest device
+confidence allocates contiguous prefixes inside that budget. Ties use request
+then position order. A fresh request verifies only its anchor.
+The drafter broadcasts rank zero's scores on the device group before publishing
+them. Local floating-point differences must not change per-request prefixes
+across ranks: different acceptance lengths would split their scheduler state.
+
+All captured Q values in the feasible request range compete on expected output
+per time, including graphs captured for another request capacity. Startup costs
+are baselines, separate from completed live timings. The last 5,000 live samples
+estimate a nonnegative per-query correction to the full startup curve: each Q
+with at least ten samples contributes its median, and their median is applied
+to every Q. This prevents unvisited large graphs from retaining empty-cache
+costs. Each graph also retains its last nine live samples. Completed feedback
+reports allocated and effective queries, padding, predicted and accepted lengths
+for the same requests, and conditional confidence error. Acceptance is copied
+before stop truncation, and positions after the first mismatch are censored.
+The SpecForge DSpark head consumes the draft's final-normalized hidden state
+and the previous-token Markov latent; target-layer taps are a separate input.
+
+`VerifyQueryLayout` owns persistent prefix lengths, offsets, request/column
+indices and bidirectional row maps. A target graph's request capacity is
+`min(max_capture_bs, Q)`, determined by Q alone; inactive requests have zero
+query lengths and null state destinations. The actual request count remains
+on the outer forward. Qwen4-Exp packs model inputs once and keeps the static
+query bucket through HC, attention, GDN, PLE and MLP. The body returns compact
+hidden states and taps. With a compact-capable sampler, the common model exit
+keeps Q rows through the LM head and argmax. Bucket filler is zeroed before
+projection, and verification reads each request's predictions directly through
+device prefix offsets. It emits at most that prefix's length, including its
+target correction or bonus token; zero-length requests emit nothing. The final
+token buffers retain the maximum request window for stop processing and state
+commit. NaN attribution, grammar masks and optional scalar logprobs use the
+same row maps without expanding vocabulary scores.
+
+The greedy sampler supports this compact interface. Other samplers and
+synthetic-acceptance benchmarks retain their existing maximum-window score
+layout. Both eager and graph forwards call the same executor stages. The Q
+graph includes prefix selection, target body, LM head and argmax, NaN audit,
+grammar masking, verification, optional scalar diagnostics and stop processing.
+Returned taps are concatenated while compact, expanded to the Q graph's request
+capacity and copied with tokens and lengths into persistent handoff buffers.
+Those buffers have no vocabulary dimension and do not retain request-slot state.
+
+The B graph reads a prefix of those buffers at fixed addresses, independently of
+Q. It includes context projection and KV writes, draft input preparation, native
+draft execution, confidence and candidate publication, accepted-state commit and
+frontier advance. Context projection remains outside the target graph; its B
+bucket can be smaller than the Q graph's request capacity. Padding has null
+cache destinations and zero accepted lengths. The outer forward slices tokens,
+lengths and scalar diagnostics back to the actual request count.
+
+Accepted-state commits run once after drafting, through the runner's common
+completion hook. GDN and PLE copy delivered state block tables into persistent
+metadata during refresh, so a commit graph never binds a transient scheduler
+table. Before capturing a B graph, `prepare_state_commit_capture` arms null-page
+commit inputs through the backend tree; ordinary idle refresh stays disarmed.
+Capture therefore records commit kernels even though no request is live.
+
+Metadata delivery and refresh, host budget selection and feedback, input uploads
+and output D2H remain outside the graphs. Target metadata is refreshed to the Q
+capacity before its graph and to the B capacity before the draft/commit graph.
+Temporary position tensors, multimodal overrides, explicit decode IDs or
+nonpersistent sampling inputs use the same stages eagerly so supplied arguments
+remain effective. Views of the persistent position buffers remain capturable.
+Neither stage changes cache ownership or the accepted-prefix commit protocol.
+Expert load counters map that same device-validity mask through the ordinary
+TP partition and MoE group order, so filler rows never affect placement feedback.
+
+The attention prologue gathers write slots in the selected order. QSA derives
+logical positions from the original window start and stages each key at its
+original request/column, while sparse attention consumes per-query physical
+slots. Dense MHA and TRT-LLM decode use one causal cache length per compact row.
+Unsupported paged leaves reject compact verification before capture.
+
+GDN convolution and recurrence read device offsets, skip empty requests and
+compute only selected prefixes. State destinations retain maximum verify
+width. Uniform-window chain and tree tactics remain available for fixed
+verification; device-offset verification uses the portable scan. ReplaySSM
+writes raw k/v/a/b into that same request-major layout so the
+existing accepted-prefix commit reconstructs the selected state. PLE reuses the
+device request/column map for hashing, lookup and dilated convolution; negative
+columns denote filler and never write context or convolution checkpoints.
+Cache allocation, rollback capacity and commit protocols remain maximum-width.
+
+Acceptance is limited to the selected prefix before stop conditions, frontier
+updates, draft anchoring or state commit. Cache admission still reserves the
+maximum verify window. Both confidence generations live with candidates in
+`RuntimeStates`, are reset on slot admission and are imaged by
+`SlotStateExporter` on retraction. Host feedback is an expendable cost-model
+cache and never reconstructs device request state.
+
+The policy currently requires NVIDIA, a Qwen4-Exp target, a separate DSpark
+checkpoint with complete confidence weights, and one attention-DP/pipeline
+rank. PD, trees and draft-prob rejection sampling are rejected at startup.
+Mixed and prefill rounds retain full-width execution and produce confidence
+for the next decode. Unspecified legacy launch policies resolve explicitly to
+`fixed` at argument normalization. Single-GPU and TP2/EP2 smoke runs cover
+adaptive graphs, reuse of Q=8 as request counts change, and compact eager
+verification with graph metadata identity checks enabled. Full-budget
+and adaptive output parity acceptance, distributed performance and multimodal
+validation remain outstanding. The compact GDN layout currently selects the
+portable verify kernel; serving with automatic kernel selection does not
+establish batch-invariant target numerics.

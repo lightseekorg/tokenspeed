@@ -53,6 +53,9 @@ _GRAPH_METADATA_SLOTS = (
     # The router's per-group decode write-slot views (recorded through the
     # leaves' KV writes).
     "decode_write_locations",
+    # The confidence B graph reads these persistent copies at state commit.
+    "_verify_commit_tables",
+    "_decode_commit_tables",
 )
 
 _MAX_WALK_DEPTH = 8

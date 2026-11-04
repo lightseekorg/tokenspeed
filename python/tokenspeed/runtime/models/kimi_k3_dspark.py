@@ -336,6 +336,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         self.config = config
         self.mapping = mapping
         self.attention_kind = "kimi_mla"
+        self.confidence_head = None
+        self.confidence_weights_loaded = False
         hidden_size = int(config.hidden_size)
         eps = float(config.rms_norm_eps)
 

@@ -157,7 +157,8 @@ def ple_ngram_ids(
         input_ids: Flat token ids shaped ``[total_tokens]``.
         initial: Carried context ids shaped ``[bs, ngram_size - 1]``.
         req: Owning request index per token row.
-        col: Position within the request per token row.
+        col: Position within the request per token row; a negative column is
+            graph filler, emits a valid per-head base id, and stages no state.
         lengths: Number of tokens in each request.
         starts: First flat row of each request, shaped ``[bs]``.
         multipliers: Int64 SplitMix multipliers shaped ``[ngram_size]``.
@@ -393,7 +394,8 @@ def ple_conv_sequences(
         initial: Carried conv state shaped ``[bs, channels, state_len]``.
         weight: Depthwise taps shaped ``[channels, kernel_size]``.
         req: Owning request index per token row.
-        col: Position within the request per token row.
+        col: Position within the request per token row; negative columns are
+            graph filler and produce zero output without staging windows.
         lengths: Token count per request, shaped ``[bs]``.
         starts: First flat row of each request, shaped ``[bs]``.
         total_tokens: Real rows of ``values``. A padded-bucket replay passes

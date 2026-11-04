@@ -48,6 +48,7 @@ def _verify_chain_target_sampled_kernel(
     accept_token_num_ptr,
     candidates_ptr,
     target_sampled_ptr,
+    query_start_loc,
     predicts_stride,
     accept_index_row_stride,
     accept_index_col_stride,
@@ -56,6 +57,8 @@ def _verify_chain_target_sampled_kernel(
     candidates_col_stride,
     target_sampled_stride,
     NUM_DRAFT_TOKENS: tl.constexpr,
+    HAS_QUERY_OFFSETS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     WRITE_REJECTED_TARGETS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
@@ -64,13 +67,43 @@ def _verify_chain_target_sampled_kernel(
 
     row = tl.program_id(0).to(tl.int64)
     base = row * NUM_DRAFT_TOKENS
+    target_base = base
+    length = NUM_DRAFT_TOKENS
+    if HAS_QUERY_OFFSETS:
+        target_base = tl.load(query_start_loc + row).to(tl.int64)
+        # Spans are bounded by the model's verify width; addresses stay int64.
+        length = (tl.load(query_start_loc + row + 1).to(tl.int64) - target_base).to(
+            tl.int32
+        )
+        if WRITE_REJECTED_TARGETS:
+            columns = tl.arange(0, BLOCK_N)
+            tl.store(
+                predicts_ptr + (base + columns) * predicts_stride,
+                0,
+                mask=columns < NUM_DRAFT_TOKENS,
+            )
+            tl.store(
+                accept_index_ptr
+                + row * accept_index_row_stride
+                + columns * accept_index_col_stride,
+                -1,
+                mask=columns < NUM_DRAFT_TOKENS,
+            )
+        if length == 0:
+            # Callers add the target token; an empty request must stay empty.
+            tl.store(accept_token_num_ptr + row * accept_token_num_stride, -1)
+            if ENABLE_PDL:
+                tl.extra.cuda.gdc_launch_dependents()
+            return
 
     tl.store(accept_index_ptr + row * accept_index_row_stride, base)
 
     active = tl.full((), 1, tl.int32)
     num_accepted = tl.full((), 0, tl.int32)
-    for i in tl.range(1, NUM_DRAFT_TOKENS):
-        target_id = tl.load(target_sampled_ptr + (base + i - 1) * target_sampled_stride)
+    for i in tl.range(1, length):
+        target_id = tl.load(
+            target_sampled_ptr + (target_base + i - 1) * target_sampled_stride
+        )
         if WRITE_REJECTED_TARGETS:
             # The Torch greedy reference converts target ids before comparing.
             target_id = target_id.to(tl.int32)
@@ -103,13 +136,13 @@ def _verify_chain_target_sampled_kernel(
         active = tl.where(match, 1, 0)
 
     if WRITE_REJECTED_TARGETS:
-        last = base + NUM_DRAFT_TOKENS - 1
+        last = length - 1
         tl.store(
-            predicts_ptr + last * predicts_stride,
-            tl.load(target_sampled_ptr + last * target_sampled_stride),
+            predicts_ptr + (base + last) * predicts_stride,
+            tl.load(target_sampled_ptr + (target_base + last) * target_sampled_stride),
         )
     final_id = tl.load(
-        target_sampled_ptr + (base + num_accepted) * target_sampled_stride
+        target_sampled_ptr + (target_base + num_accepted) * target_sampled_stride
     )
     tl.store(accept_token_num_ptr + row * accept_token_num_stride, num_accepted)
     tl.store(predicts_ptr + (base + num_accepted) * predicts_stride, final_id)
@@ -126,6 +159,7 @@ def verify_chain_target_sampled(
     target_sampled: torch.Tensor,
     *,
     write_rejected_targets: bool,
+    query_start_loc: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
 ) -> None:
     """Verify a chain against target token ids, with an explicit output policy.
@@ -136,12 +170,17 @@ def verify_chain_target_sampled(
         accept_token_num: Writable int32 [>= batch] accepted draft counts,
             excluding the bonus token (callers add one).
         candidates: Int32 [batch,width] draft chain; column zero is its anchor.
-        target_sampled: Int32/int64 target ids with at least batch * width entries.
+        target_sampled: Flat int32/int64 target ids. Uniform verification
+            requires at least batch * width entries; device offsets address
+            compact prefixes without expanding predictions.
         write_rejected_targets: True writes every target id as int32, compares
             after the same int32 conversion, and fills rejected indices with -1,
             matching the Torch greedy reference. False preserves rejected token
             and index tails, so accept_index must be -1-filled on entry.
         enable_pdl: Override the platform PDL setting when supplied.
+        query_start_loc: Optional contiguous device prefix offsets [batch + 1].
+            Each span is between zero and width rows inside target_sampled.
+            An empty span emits zero tokens (draft count -1 before adding one).
 
     Returns:
         None. Supplied outputs are updated in place; each chain emits its
@@ -168,7 +207,7 @@ def verify_chain_target_sampled(
         raise ValueError(
             f"accept_token_num is too small: {accept_token_num.shape[0]} < {bs}"
         )
-    if target_sampled.numel() < total:
+    if query_start_loc is None and target_sampled.numel() < total:
         raise ValueError(
             f"target_sampled is too small: {target_sampled.numel()} < {total}"
         )
@@ -193,6 +232,15 @@ def verify_chain_target_sampled(
         for t in (predicts, accept_index, accept_token_num, target_sampled)
     ):
         raise ValueError("Verification inputs and outputs must share a device")
+    if query_start_loc is not None and (
+        query_start_loc.shape != (bs + 1,)
+        or query_start_loc.dtype not in (torch.int32, torch.int64)
+        or not query_start_loc.is_contiguous()
+        or query_start_loc.device != candidates.device
+    ):
+        raise ValueError(
+            "compact verification requires device prefix offsets [batch + 1]"
+        )
     if bs == 0:
         return
 
@@ -204,12 +252,15 @@ def verify_chain_target_sampled(
         accept_token_num,
         candidates,
         target_sampled,
+        query_start_loc,
         predicts.stride(0),
         *accept_index.stride(),
         accept_token_num.stride(0),
         *candidates.stride(),
         target_sampled.stride(0),
         NUM_DRAFT_TOKENS=num_draft_tokens,
+        HAS_QUERY_OFFSETS=query_start_loc is not None,
+        BLOCK_N=triton.next_power_of_2(num_draft_tokens),
         WRITE_REJECTED_TARGETS=write_rejected_targets,
         ENABLE_PDL=enable_pdl,
         num_warps=1,

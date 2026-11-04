@@ -31,6 +31,8 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     torch.manual_seed(0)
     head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)
     drafter.markov_head = head
+    drafter.confidence_head = None
+    drafter.confidence_rates = None
     return drafter
 
 

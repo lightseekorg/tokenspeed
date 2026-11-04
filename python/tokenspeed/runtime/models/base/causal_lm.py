@@ -25,6 +25,7 @@ from __future__ import annotations
 import functools
 import inspect
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from typing import Any, ClassVar
 
 import torch
@@ -385,10 +386,7 @@ class BaseCausalLM(nn.Module):
         model_kwargs = self.prepare_model_kwargs(ctx, input_ids, kwargs)
 
         hidden_states, aux_hidden_states = self.model(
-            input_ids,
-            positions,
-            ctx,
-            **model_kwargs,
+            input_ids, positions, ctx, **model_kwargs
         )
         if not self.mapping.is_last_pp_rank:
             # Mid-pipeline stage: the executor sends this boundary state to
@@ -412,13 +410,37 @@ class BaseCausalLM(nn.Module):
         order on a shard) for the LM head; a full-hidden capture for the
         drafter stays the rows as given, which is the drafter's extend input.
         """
-        return self.logits_processor(
+        query_layout = ctx.logits_queries
+        metadata = LogitsMetadata.from_forward_context(ctx)
+        if query_layout is not None:
+            # The LM head and argmax consume Q rows. Capture restoration below
+            # only expands the draft's hidden features, never vocabulary scores.
+            hidden_states = query_layout.mask_compact_rows(hidden_states)
+            metadata = replace(metadata, gather_ids=None, logits_rows_selected=True)
+        elif ctx.verify_queries is not None:
+            # Samplers without offset-based verification keep their score layout.
+            hidden_states = ctx.verify_queries.expand(
+                hidden_states, token_dim=0, request_count=ctx.bs
+            )
+            if aux_hidden_states is not None:
+                aux_hidden_states = [
+                    ctx.verify_queries.expand(h, token_dim=0, request_count=ctx.bs)
+                    for h in aux_hidden_states
+                ]
+        output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
-            LogitsMetadata.from_forward_context(ctx),
+            metadata,
             aux_hidden_states,
         )
+        if query_layout is not None:
+            output.query_layout = query_layout
+            if output.hidden_states is not None:
+                output.hidden_states = query_layout.expand(
+                    output.hidden_states, token_dim=0, request_count=ctx.bs
+                )
+        return output
 
     def prepare_model_kwargs(
         self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict

@@ -275,6 +275,7 @@ def triton_causal_conv1d_prefill(
     solution="triton",
     signatures=format_signatures("x", "dense", _CONV_DTYPES),
     priority=Priority.PORTABLE,
+    traits={"varlen": frozenset({True, False})},
 )
 def triton_causal_conv1d_update(
     x: torch.Tensor,
@@ -291,6 +292,7 @@ def triton_causal_conv1d_update(
     validate_data=False,
     *,
     parent_indices: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ):
@@ -322,6 +324,8 @@ def triton_causal_conv1d_update(
         negative) instead of token t - 1.
     out: destination shaped and typed like x, not overlapping it; None writes over x.
     replay_payload: (payload, a, b) to fill, or None; row i * seqlen + t: [k/v channels | a | b].
+        With packed queries, a and b follow compact input rows while payload
+        destinations keep the maximum request window.
     returns: the output, (batch, dim) or (batch, dim, seqlen)
     """
     enable_pdl = pdl_enabled()
@@ -344,12 +348,14 @@ def triton_causal_conv1d_update(
             or intermediate_conv_window is not None
             or pad_slot_id != PAD_SLOT_ID
             or validate_data
+            or query_start_loc is not None
         )
         if not tree_tables_ok or chain_only_options:
             raise ValueError(
                 "parent_indices needs int32 conv_state_indices (batch,) and "
                 "output_state_indices of its shape, and none of num_accepted_tokens, "
-                "cache_seqlens, intermediate_conv_window, pad_slot_id, validate_data"
+                "cache_seqlens, intermediate_conv_window, pad_slot_id, validate_data, "
+                "query_start_loc"
             )
     if validate_data:
         assert cache_seqlens is None
@@ -377,6 +383,25 @@ def triton_causal_conv1d_update(
         # make it (batch, dim, seqlen) with seqlen == 1
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
+    if query_start_loc is not None:
+        if (
+            not unsqueeze
+            or output_state_indices is None
+            or conv_state_indices is None
+            or parent_indices is not None
+            or cache_seqlens is not None
+            or num_accepted_tokens is not None
+            or intermediate_conv_window is not None
+            or query_start_loc.shape != (conv_state_indices.numel() + 1,)
+            or not query_start_loc.is_contiguous()
+            or query_start_loc.dtype not in (torch.int32, torch.int64)
+            or query_start_loc.device != x.device
+            or output_state_indices.shape[0] != conv_state_indices.numel()
+        ):
+            raise ValueError(
+                "packed convolution requires device offsets and per-token state destinations"
+            )
+        batch, seqlen = output_state_indices.shape
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
@@ -411,6 +436,9 @@ def triton_causal_conv1d_update(
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
 
     stride_o_seq, stride_o_dim, stride_o_token = out.stride()
+    if query_start_loc is not None:
+        stride_x_seq, stride_x_token = 0, x.stride(0)
+        stride_o_seq, stride_o_token = 0, out.stride(0)
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
@@ -452,13 +480,14 @@ def triton_causal_conv1d_update(
         payload, replay_a, replay_b = replay_payload
         gate_heads = replay_a.shape[-1]
         rows = batch * seqlen
+        gate_rows = rows if query_start_loc is None else x.shape[0]
         # The payload saves the channels from this one on.
         replay_first_channel = dim + 2 * gate_heads - payload.shape[-1]
         if (
             payload.shape[0] != rows
             or payload.stride(-1) != 1
-            or replay_a.shape != (rows, gate_heads)
-            or replay_b.shape != (rows, gate_heads)
+            or replay_a.shape != (gate_rows, gate_heads)
+            or replay_b.shape != (gate_rows, gate_heads)
             or replay_a.stride(-1) != 1
             or replay_b.stride(-1) != 1
             or not 0 <= replay_first_channel < dim
@@ -466,7 +495,7 @@ def triton_causal_conv1d_update(
         ):
             raise ValueError(
                 "replay_payload needs a [batch * seqlen, width] payload saving "
-                "1 to dim channels plus two [batch * seqlen, heads] gates, all of "
+                "1 to dim channels plus two [input rows, heads] gates, all of "
                 "x's dtype with unit inner strides"
             )
         replay_strides = (payload.stride(0), replay_a.stride(0), replay_b.stride(0))
@@ -487,6 +516,7 @@ def triton_causal_conv1d_update(
         intermediate_conv_window if intermediate_conv_window is not None else x,
         output_state_indices if output_state_indices is not None else x,
         out,
+        query_start_loc,
         payload,
         replay_a,
         replay_b,
@@ -530,6 +560,7 @@ def triton_causal_conv1d_update(
         num_warps=num_warps,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
+        HAS_QUERY_OFFSETS=query_start_loc is not None,
         HAS_REPLAY_PAYLOAD=replay_payload is not None,
         REPLAY_FIRST_CHANNEL=replay_first_channel,
         GATE_HEADS=gate_heads,

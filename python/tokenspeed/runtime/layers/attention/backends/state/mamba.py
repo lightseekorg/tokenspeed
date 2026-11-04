@@ -286,6 +286,7 @@ class MambaAttnBackend(AttentionBackend):
         self.pad_slot_id = -1
         self.forward_metadata: MambaForwardMetadata | None = None
         self._mixed_forward_metadata: _MixedStateMetadata | None = None
+        self._verify_commit_tables: dict[str, torch.Tensor] = {}
         self._reset_graph_state()
         self.speculative_num_draft_tokens = self.spec_num_tokens
         self.state_paging_active = False
@@ -327,6 +328,9 @@ class MambaAttnBackend(AttentionBackend):
         # and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
+        # Commit graphs read these copies rather than each round's delivered
+        # tables. They are batch metadata, not persistent request state.
+        self._verify_commit_tables = {}
         self._verify_seed_dst_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         self._verify_grid_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._chain_ancestors_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -516,7 +520,10 @@ class MambaAttnBackend(AttentionBackend):
                     None if live_pages_out is None else live_pages_out[group_id]
                 ),
             )
-            tables[group_id] = rows
+            commit_rows = self._verify_commit_tables[group_id]
+            commit_rows[bs:].zero_()
+            commit_rows[:bs].copy_(rows[:bs, :STATE_TABLE_SLOTS])
+            tables[group_id] = commit_rows
         return tables
 
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
@@ -1291,11 +1298,36 @@ class MambaAttnBackend(AttentionBackend):
         self.commit_verified_state(accepted_lengths, accepted_path=accepted_path)
         self._mixed_forward_metadata = None
 
+    def prepare_state_commit_capture(self) -> None:
+        metadata = self.forward_metadata
+        if (
+            not self.state_paging_active
+            or not self.deferred_state_commit
+            or metadata is None
+        ):
+            return
+        reads = metadata.state_in_blocks_by_group
+        if reads is None:
+            raise RuntimeError("state commit capture requires decode state metadata")
+        batch = metadata.query_start_loc.numel() - 1
+        tables = {}
+        for group_id in self._state_groups():
+            rows = self._verify_commit_tables[group_id]
+            rows.zero_()
+            tables[group_id] = rows[:batch]
+        self._verify_commit_ctx = (tables, self.speculative_num_draft_tokens, reads)
+
     # ---- CUDA graph state ----
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
         """Rebuild the index buffers before any graph that reads them is captured."""
         self._reset_graph_state()
+        self._verify_commit_tables = {
+            gid: torch.zeros(
+                (max_bs, STATE_TABLE_SLOTS), dtype=torch.int32, device=self.device
+            )
+            for gid in self._state_group_ids
+        }
         for i in range(max_bs):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
@@ -1985,6 +2017,7 @@ class MambaAttnBackend(AttentionBackend):
         D = kwargs.get("D")
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
+        verify_queries = kwargs.get("verify_queries")
 
         is_target_verify = (
             forward_mode.is_decode_or_idle() and self.deferred_state_commit
@@ -1996,7 +2029,7 @@ class MambaAttnBackend(AttentionBackend):
         conv_rows = None
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
-            batch_size = seq_len // draft_token_num
+            batch_size = bs if verify_queries is None else verify_queries.batch_size
             output_indices = self.forward_metadata.mamba_output_indices
             state_in_blocks, _, conv_comp, ssm_comp = self._layer_state(layer_id)
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
@@ -2030,7 +2063,8 @@ class MambaAttnBackend(AttentionBackend):
                 # A chain verifies through the dense MTP kernels (FlashInfer's).
                 mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             if (
-                self.tree_verify is None
+                verify_queries is None
+                and self.tree_verify is None
                 and self._chain_verify_form(
                     batch_size, draft_token_num, value_dim // attn_tp_size // head_v_dim
                 )
@@ -2052,9 +2086,11 @@ class MambaAttnBackend(AttentionBackend):
             conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            mixed_qkv_reshaped = (
+                mixed_qkv.view(batch_size, draft_token_num, -1).transpose(1, 2)
+                if verify_queries is None
+                else mixed_qkv
+            )
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -2064,11 +2100,18 @@ class MambaAttnBackend(AttentionBackend):
                 conv_state_indices=conv_read,
                 output_state_indices=conv_out,
                 parent_indices=self._tree_parents(batch_size),
+                query_start_loc=(
+                    None if verify_queries is None else verify_queries.query_offsets
+                ),
                 out=None if conv_rows is None else conv_rows.transpose(1, 2),
                 replay_payload=conv_replay,
             )
             # needn't contiguous here.
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv = (
+                mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+                if verify_queries is None
+                else mixed_qkv_processed
+            )
         else:
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (
                 self._layer_state(layer_id)
@@ -2133,6 +2176,12 @@ class MambaAttnBackend(AttentionBackend):
 
         # GDN's chunked tree verify (no node states) fills the replay payload as it reads k/v/a/b.
         scan_replay = None
+        if replay_inputs is not None and verify_queries is not None:
+            # Compact queries still commit into request-major, maximum-width rows.
+            replay = self._gdn_replay
+            layer_slot = replay.layer_ids.index(layer_id)
+            scan_replay = replay.payload[layer_slot, : batch_size * draft_token_num]
+            replay_inputs = None
         if (
             replay_inputs is not None
             and self._verify_scan_writes_replay
@@ -2147,6 +2196,7 @@ class MambaAttnBackend(AttentionBackend):
             (
                 self._verify_packed_qkv_views
                 or scan_replay is not None
+                or verify_queries is not None
                 or conv_replay is not None
             )
             and replay_inputs is None
@@ -2203,6 +2253,11 @@ class MambaAttnBackend(AttentionBackend):
                 seq_len=seq_len,
                 lower_bound=gate_lower_bound,
                 replay_payload=scan_replay,
+                **(
+                    {}
+                    if verify_queries is None
+                    else {"query_start_loc": verify_queries.query_offsets}
+                ),
             )
         else:
             metadata = self.forward_metadata
@@ -2367,6 +2422,7 @@ class MambaAttnBackend(AttentionBackend):
         seq_len: int,
         lower_bound: float | None,
         replay_payload: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-position recurrent scan of a target-verify round.
 
@@ -2410,14 +2466,18 @@ class MambaAttnBackend(AttentionBackend):
         num_value_heads = value.shape[2]
         head_v_dim = value.shape[3]
         # Request-major varlen layout: [B, T, H, D] is a plain view, no movement.
-        query_b = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
-        key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
-        value_b = value.view(batch_size, draft_token_num, num_value_heads, head_v_dim)
-        a_b = a.view(batch_size, draft_token_num, -1)
-        b_b = b.view(batch_size, draft_token_num, -1)
+        scan_batch, scan_width = (
+            (batch_size, draft_token_num) if query_start_loc is None else (1, seq_len)
+        )
+        query_b = query.view(scan_batch, scan_width, num_heads, head_k_dim)
+        key_b = key.view(scan_batch, scan_width, num_heads, head_k_dim)
+        value_b = value.view(scan_batch, scan_width, num_value_heads, head_v_dim)
+        a_b = a.view(scan_batch, scan_width, -1)
+        b_b = b.view(scan_batch, scan_width, -1)
 
         if (
-            self.tree_verify is None
+            query_start_loc is None
+            and self.tree_verify is None
             and self._chain_verify_form(batch_size, draft_token_num, num_value_heads)
             is GdnChainVerifyForm.CHAIN
         ):
@@ -2471,11 +2531,15 @@ class MambaAttnBackend(AttentionBackend):
             output_state_indices=output_state_indices,
             output_state=output_state,
             intermediate_states_buffer=intermediate_states,
-            tree_ancestors=self._verify_ancestors(
-                batch_size, draft_token_num, num_value_heads
+            tree_ancestors=(
+                self._verify_ancestors(batch_size, draft_token_num, num_value_heads)
+                if query_start_loc is None
+                else None
             ),
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
+            query_start_loc=query_start_loc,
+            max_seqlen_q=None if query_start_loc is None else draft_token_num,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     def _prefill_scan(

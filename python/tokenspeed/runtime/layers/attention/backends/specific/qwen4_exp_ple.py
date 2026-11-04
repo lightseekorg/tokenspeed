@@ -61,6 +61,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     cache_field_layer_id,
     cache_field_plane,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import STATE_TABLE_SLOTS
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
@@ -105,6 +106,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         self._verify_commit_ctx: tuple[torch.Tensor, int, int] | None = None
         self._decode_input_blocks: torch.Tensor | None = None
         self._decode_output_blocks: torch.Tensor | None = None
+        self._decode_commit_tables: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, PLEForwardMetadata] = {}
 
     def _cache_fields(
@@ -182,6 +184,9 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             (max_bs,), -1, dtype=torch.int32, device=self.device
         )
         self._decode_output_blocks = torch.full_like(self._decode_input_blocks, -1)
+        self._decode_commit_tables = torch.zeros(
+            (max_bs, STATE_TABLE_SLOTS), dtype=torch.int32, device=self.device
+        )
 
     def _decode_view(self, bs: int) -> PLEForwardMetadata:
         if (
@@ -307,7 +312,14 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                     rows, batch_size=actual_bs, pages_out=metadata.input_blocks
                 )
                 if forward_mode.is_decode():
-                    self._verify_commit_ctx = (rows, actual_bs, metadata.verify_width)
+                    commit_rows = self._decode_commit_tables
+                    commit_rows[actual_bs:].zero_()
+                    commit_rows[:actual_bs].copy_(rows[:actual_bs, :STATE_TABLE_SLOTS])
+                    self._verify_commit_ctx = (
+                        commit_rows[:actual_bs],
+                        actual_bs,
+                        metadata.verify_width,
+                    )
             else:
                 input_blocks, output_blocks = compute_state_block_indices(
                     rows,
@@ -416,6 +428,17 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             ),
             "conv_row_bytes": conv_fields[0][0].numel() * conv_fields[0].element_size(),
         }
+
+    def prepare_state_commit_capture(self) -> None:
+        metadata = self.forward_metadata
+        if metadata is None or metadata.verify_width is None:
+            return
+        rows = self._decode_commit_tables
+        if rows is None:
+            raise RuntimeError("PLE commit capture requires initialized decode tables")
+        rows.zero_()
+        batch = metadata.input_blocks.numel()
+        self._verify_commit_ctx = (rows[:batch], batch, metadata.verify_width)
 
     def commit_verified_state(self, accepted_lengths: torch.Tensor) -> None:
         """Commit the accepted PLE checkpoint with a fused page resolve."""

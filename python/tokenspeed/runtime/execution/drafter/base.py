@@ -94,6 +94,7 @@ class BaseDrafter:
         self.draft_model_runner = draft_model_runner
         self.runtime_states = runtime_states
         self.input_buffers = input_buffers
+        self.verify_policy = "fixed"
         # This round's per-group scheduler tables, published by the runner's
         # metadata prep; block drafters re-run the unified refresh with them
         # inside their step loop (write locations themselves come from the
