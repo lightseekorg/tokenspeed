@@ -291,6 +291,10 @@ def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry, S
     if not SCALAR_COUNTERS:
         mark = (tag.to(gl.int64) << 32) | entry.pid.to(gl.int64)
         old = gl.atomic_xchg(entry.claim_line, mark, sem="relaxed", scope="gpu")
+        # The exchange's result reaches the other waves through compiler
+        # scratch in LDS; the barrier keeps every wave's read of it before
+        # any wave's next LDS write (the role's buffers may start there).
+        gl.barrier()
         duplicate = ((old >> 32) & 0xFFFFFFFF) == tag.to(gl.int64)
         # The other workgroup's program id.
         detail = (old & 0xFFFFFFFF).to(gl.int32)
