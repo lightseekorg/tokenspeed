@@ -76,11 +76,11 @@ def _host_parent_bytes(groups: Sequence[tuple[CacheGroupSpec, int]]) -> int:
     """Bytes of the shared Host parent for ``(spec, payload_bytes)`` groups."""
     largest = max(payload_bytes for _, payload_bytes in groups)
     if any(
-        spec.attn_kind != "state" and payload_bytes == largest
+        spec.attn_kind != "state" and not spec.replayable and payload_bytes == largest
         for spec, payload_bytes in groups
     ):
-        # A KV page is the largest payload and fills its parent exactly, as in
-        # every pure-attention model.
+        # A KV page Host L2 caches is the largest payload and fills its parent
+        # exactly, as in every pure-attention model without a replayable window.
         return largest
     # Host bytes per token and page of each KV group Host L2 stores.
     cached_kv = [
@@ -90,11 +90,13 @@ def _host_parent_bytes(groups: Sequence[tuple[CacheGroupSpec, int]]) -> int:
     ]
     if not cached_kv:
         return largest
-    # The largest payload is a State checkpoint, which leaves a gap after the
-    # last whole KV page of every KV parent. Rounding the parent up to whole
-    # pages of the KV group with the most Host bytes per token closes that gap
-    # but adds the same growth to every State parent as slack, so it is taken
-    # only when it lowers the Host bytes per cached token.
+    # The largest payload is a State checkpoint or a replayable window page,
+    # which Host L2 never stores and which only sizes the parent. It leaves a
+    # gap after the last whole KV page of every KV parent. Rounding the parent
+    # up to whole pages of the KV group with the most Host bytes per token
+    # closes that gap but adds the same growth to every parent of the largest
+    # payload as slack, so it is taken only when it lowers the Host bytes per
+    # cached token.
     _, page = max(cached_kv)
     rounded = -(-largest // page) * page
     if _host_bytes_per_token(rounded, groups) < _host_bytes_per_token(largest, groups):

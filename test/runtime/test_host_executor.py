@@ -44,7 +44,10 @@ def _replicated_contract(layout, *, num_lcm_blocks=None):
         num_lcm_blocks = layout.num_lcm_blocks
     specs = tuple(
         SimpleNamespace(
-            group_id=group.group_id, attn_kind="full_history", shard_count=1
+            group_id=group.group_id,
+            attn_kind="full_history",
+            shard_count=1,
+            replayable=False,
         )
         for group in layout.groups
     )
@@ -1024,7 +1027,10 @@ class TestGroupAwareWireTest:
         pool.arena.runtime_contract = SimpleNamespace(
             group_specs=(
                 SimpleNamespace(
-                    group_id="group", attn_kind="full_history", shard_count=1
+                    group_id="group",
+                    attn_kind="full_history",
+                    shard_count=1,
+                    replayable=False,
                 ),
             ),
             virtual_block_counts={"group": 3},
@@ -1390,7 +1396,10 @@ class TestHostMemoryShareTest:
         pool.arena.runtime_contract = SimpleNamespace(
             group_specs=(
                 SimpleNamespace(
-                    group_id="group", attn_kind="full_history", shard_count=1
+                    group_id="group",
+                    attn_kind="full_history",
+                    shard_count=1,
+                    replayable=False,
                 ),
             ),
             virtual_block_counts={"group": 1 + device_lcm_blocks},
@@ -2294,7 +2303,10 @@ class TestCompactLayoutRoundTripTest:
         contract = SimpleNamespace(
             group_specs=(
                 SimpleNamespace(
-                    group_id="full", attn_kind="full_history", shard_count=2
+                    group_id="full",
+                    attn_kind="full_history",
+                    shard_count=2,
+                    replayable=False,
                 ),
             ),
             virtual_block_counts={"full": 1 + 4 * 2},

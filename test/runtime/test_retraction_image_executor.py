@@ -117,7 +117,10 @@ def _layout(num_lcm_blocks, groups):
 def _contract(layout, shard_counts):
     specs = tuple(
         SimpleNamespace(
-            group_id=group.group_id, attn_kind="full_history", shard_count=shard
+            group_id=group.group_id,
+            attn_kind="full_history",
+            shard_count=shard,
+            replayable=False,
         )
         for group, shard in zip(layout.groups, shard_counts)
     )
@@ -1032,7 +1035,12 @@ def _round_trip_two_ranks(io_backend, executors):
     # Host packing is 1: 3 compact parents hold 6 virtual blocks across 2 owners.
     contract = SimpleNamespace(
         group_specs=(
-            SimpleNamespace(group_id="full", attn_kind="full_history", shard_count=2),
+            SimpleNamespace(
+                group_id="full",
+                attn_kind="full_history",
+                shard_count=2,
+                replayable=False,
+            ),
         ),
         virtual_block_counts={"full": 1 + 2 * 2 * 2},
         num_lcm_blocks=2,

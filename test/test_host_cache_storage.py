@@ -335,6 +335,23 @@ def test_a_replayable_group_neither_picks_nor_prices_the_rounding():
     assert compute_host_lcm_block_bytes(layout, group_specs=specs) == 9_000
 
 
+def test_a_replayable_window_as_the_largest_payload_rounds_like_a_state_checkpoint():
+    # Pure attention whose largest payload is a replayable sliding window beside
+    # compressed KV and compressor tails. Host L2 never stores the window, so it
+    # only sizes the parent: 1,351,680 bytes would hold 19 global_r2 and 59
+    # global_r1 pages; 20 global_r2 pages hold exactly 60 global_r1 pages too.
+    groups = (
+        (_sliding("swa", rows_per_page=64, window=128, replayable=True), 1_351_680),
+        (_kv("global_r2", rows_per_page=64, entry_stride_tokens=2), 68_352),
+        (_kv("global_r1", rows_per_page=64), 22_784),
+        (_sliding("tail", rows_per_page=2, window=2, replayable=True), 24_576),
+    )
+    layout, specs = _payload_layout(groups)
+
+    assert compute_host_lcm_block_bytes(layout, group_specs=specs) == 20 * 68_352
+    assert compute_host_group_packing(layout, group_specs=specs) == (1, 20, 60, 55)
+
+
 @pytest.mark.parametrize(
     "groups",
     [
@@ -342,19 +359,17 @@ def test_a_replayable_group_neither_picks_nor_prices_the_rounding():
             ((_kv("full_attention", rows_per_page=256), 3_407_872),),
             id="one-kv-group",
         ),
-        # Pure attention whose largest payload is a replayable sliding window
-        # beside compressed KV and compressor tails.
+        # The cached KV page is the largest payload; the replayable window only
+        # packs beside it.
         pytest.param(
             (
+                (_kv("full_attention", rows_per_page=256), 3_407_872),
                 (
                     _sliding("swa", rows_per_page=64, window=128, replayable=True),
                     1_351_680,
                 ),
-                (_kv("global_r2", rows_per_page=64, entry_stride_tokens=2), 68_352),
-                (_kv("global_r1", rows_per_page=64), 22_784),
-                (_sliding("tail", rows_per_page=2, window=2, replayable=True), 24_576),
             ),
-            id="replayable-window-largest",
+            id="cached-kv-page-largest-beside-a-replayable-window",
         ),
         pytest.param(
             (

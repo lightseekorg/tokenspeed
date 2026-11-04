@@ -1166,10 +1166,11 @@ Mooncake Store (L3)
 Host L2 and the retraction snapshot pool pack each group's payload independently
 of Device strides. A shared Host parent fits the largest single group payload,
 and each group fits as many whole children in it as possible. When that
-payload is a recurrent-state checkpoint, the KV pages of every parent leave a
-gap smaller than one page, so the parent may instead round up to a whole
-number of pages of the KV group that stores the most Host bytes per token:
-those pages then fill it without a gap, but every State parent gains the same
+payload is a recurrent-state checkpoint, or a replayable sliding-window page
+that Host L2 never stores, the KV pages of every parent leave a gap smaller
+than one page, so the parent may instead round up to a whole number of pages
+of the KV group that stores the most Host bytes per token: those pages then
+fill it without a gap, but every parent of the largest payload gains the same
 bytes as slack. The parent rounds up only when that lowers the Host bytes per
 cached token, assuming one State checkpoint per 8,192 cached tokens (a
 request publishes only a few, so a prefix cache of long prompts holds far
