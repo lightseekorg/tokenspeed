@@ -66,6 +66,35 @@ def resolve_cache_slots(
     )
 
 
+def resolve_write_slots(
+    loc: torch.Tensor, placement: CachePlacement | None, share
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``resolve_cache_slots`` once per forward for every layer's writes.
+
+    Every layer of a forward writes its cache rows at the same virtual
+    slots, so the resolved slots are kept on ``share`` (the forward's
+    ``SparseTopKShare``, cleared when the next forward's metadata is built)
+    and reused while ``loc`` is the same, unmodified tensor. The entry holds
+    ``loc``, so its storage cannot be reused for other slots meanwhile. A
+    caller that forks streams resolves before the fork, on the stream every
+    branch is ordered after.
+    """
+    if placement is None:
+        return loc, None
+    for cached_loc, version, cached_placement, resolved in share.write_slots:
+        if (
+            cached_placement == placement
+            and cached_loc.data_ptr() == loc.data_ptr()
+            and cached_loc.shape == loc.shape
+            and cached_loc.stride() == loc.stride()
+            and version == loc._version
+        ):
+            return resolved
+    resolved = resolve_cache_slots(loc, placement)
+    share.write_slots.append((loc, loc._version, placement, resolved))
+    return resolved
+
+
 def compact_owned_cache_slots(
     slots: torch.Tensor,
     lengths: torch.Tensor | None,
