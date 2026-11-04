@@ -62,10 +62,6 @@ share the transport's process group and communication stream.
 Indexer-K is submitted after its producer; current KV communication
 runs while Indexer computes. Sparse attention waits for KV. The preceding KDA
 layers can overlap historical gathers; cold Prefill skips those transfers.
-An active Prefill layer keeps one execution stream through `finish`.
-Between completed layers or forwards, including warmup to serving, a new
-execution stream waits on the previous stream before accessing persistent
-cache. Temporary buffers remain recorded on their last consumer's stream.
 
 The packaged `custom::npu_dsa_cp_metadata.out` ACLNN operator prepares the compact page table shared by Indexer
 and sparse attention, cumulative lengths, causal scans and current-page aliases.
@@ -181,6 +177,15 @@ consumer. Shutdown drains execution before releasing the group. The transport
 records its peak owned buffer bytes; serving acceptance also measures device
 allocation/reservation peaks. `chunk_prefill_kv_size` only controls scheduler
 admission and never enables transport or fixes its buffer size.
+
+The NPU backends pass the existing kernel-startup warmup flag to Prefill.
+Warmup uses the current stream without binding the persistent serving stream;
+the startup owner synchronizes warmup before serving begins. The first
+non-warmup call binds the serving stream, which cannot change after `finish`.
+Warmup and serving may use the same stream. Within an active layer, the stream
+and warmup flag must stay unchanged through `finish`; its temporary stream
+reference is then cleared. Buffer recording always uses that layer's current
+stream, including while no serving stream is bound.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It covers compact shared history pages, empty/uneven owners, both

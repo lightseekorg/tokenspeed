@@ -26,7 +26,7 @@ import torch_npu
 
 
 class AscendDSAPrefill:
-    """Temporary KV/Indexer-K gathers on one execution stream per active layer.
+    """Temporary KV/Indexer-K gathers with one bound serving stream.
 
     History and current rows each use one collective. DSA packs both cache
     planes into the same packet; MLA supplies only KV. The synchronous HCCL
@@ -71,6 +71,8 @@ class AscendDSAPrefill:
         ):
             raise ValueError("Prefill collective group must match cache owners")
         self.compute_stream = None
+        self._layer_stream = None
+        self._warming_up = False
         self.history_group = history_group
         self.layer_id = None
         self.batch_key = None
@@ -100,17 +102,22 @@ class AscendDSAPrefill:
             ):
                 raise ValueError("Prefill needs matching contiguous BF16 cache planes")
 
-    def _stream(self):
+    def _stream(self, *, warmup):
         stream = torch.npu.current_stream(self.device)
-        if self.compute_stream is None:
-            self.compute_stream = stream
-        elif stream != self.compute_stream:
-            if self.layer_id is not None:
+        if self.layer_id is not None:
+            if stream != self._layer_stream:
                 raise RuntimeError("Prefill must reuse its original execution stream")
-            # Warmup and serving can use different streams. A finished layer
-            # has no live transport buffers, but its cache writes may be queued.
-            stream.wait_stream(self.compute_stream)
-            self.compute_stream = stream
+            if warmup != self._warming_up:
+                raise RuntimeError(
+                    "Prefill warmup phase changed during an active layer"
+                )
+        elif not warmup:
+            # Startup owns warmup completion. Only a serving call binds the
+            # persistent stream, even when warmup happened on that same stream.
+            if self.compute_stream is None:
+                self.compute_stream = stream
+            elif stream != self.compute_stream:
+                raise RuntimeError("Prefill must reuse its original execution stream")
         return stream
 
     @property
@@ -140,8 +147,9 @@ class AscendDSAPrefill:
                 )
         # HCCL's synchronous interface establishes execution-stream ordering.
         # Keep allocator ownership valid even for inputs from another stream.
-        packet.record_stream(self._stream())
-        receive.record_stream(self.compute_stream)
+        stream = self._stream(warmup=self._warming_up)
+        packet.record_stream(stream)
+        receive.record_stream(stream)
         return receive
 
     def prefetch(
@@ -150,18 +158,24 @@ class AscendDSAPrefill:
         kv_cache,
         index_cache,
         *,
+        warmup,
         batch_key,
         total_rows,
         has_history,
         history_slots,
         history_counts,
     ):
-        """Submit history once; repeating the same batch/layer is an ensure."""
+        """Submit history once; repeating the same batch/layer is an ensure.
+
+        ``warmup`` is the caller's kernel-startup phase, not a stream identity.
+        Warmup uses the current stream without binding the serving stream.
+        The startup owner must complete warmup before serving starts.
+        """
         if self._closed:
             raise RuntimeError("Prefill transport is closed")
         self._validate_cache(kv_cache, index_cache)
         if self.layer_id is not None:
-            self._stream()
+            self._stream(warmup=warmup)
             if self.layer_id != layer_id or self.batch_key is not batch_key:
                 raise RuntimeError(
                     "Prefill history from a different batch/layer is active"
@@ -182,8 +196,9 @@ class AscendDSAPrefill:
             or not 0 <= total_rows <= self.max_current_rows
         ):
             raise ValueError("Prefill requires matching batch page-gather geometry")
-        stream = self._stream()
+        stream = self._stream(warmup=warmup)
         self.layer_id, self.batch_key = layer_id, batch_key
+        self._layer_stream, self._warming_up = stream, warmup
         self._sources = (kv_cache, index_cache)
         self._meta = {"history_slots": history_slots}
         self._current = {}
@@ -250,7 +265,7 @@ class AscendDSAPrefill:
             raise ValueError(
                 "Current Prefill planes must match local token rows exactly once"
             )
-        value.record_stream(self._stream())
+        value.record_stream(self._stream(warmup=self._warming_up))
         self._current[width] = value
         if len(self._current) != (2 if self._has_index else 1):
             return
@@ -325,7 +340,7 @@ class AscendDSAPrefill:
             or self.local_rows % block_rows
         ):
             raise ValueError("Prefill update has incompatible slots or layout")
-        stream = self._stream()
+        stream = self._stream(warmup=self._warming_up)
         committed = slots_workspace[: slots.numel()]
         committed.copy_(slots)
         for value in (slots, committed, direct, mapped_slots):
@@ -359,11 +374,12 @@ class AscendDSAPrefill:
         """Release temporary buffers after queueing their last consumers."""
         if self.layer_id != layer_id:
             raise RuntimeError("Prefill completion differs from its active layer")
-        stream = self._stream()
+        stream = self._stream(warmup=self._warming_up)
         for value in (self.kv, self.index, *self._current.values()):
             if value is not None:
                 value.record_stream(stream)
         self.layer_id = self.batch_key = self._sources = None
+        self._layer_stream, self._warming_up = None, False
         self.kv = self.index = None
         self._current.clear()
         self._meta.clear()
@@ -372,8 +388,14 @@ class AscendDSAPrefill:
         """Drain execution; the runtime manager owns the collective group."""
         if self._closed:
             return
-        if self.compute_stream is not None:
+        if self._layer_stream is not None:
+            self._layer_stream.synchronize()
+        if (
+            self.compute_stream is not None
+            and self.compute_stream != self._layer_stream
+        ):
             self.compute_stream.synchronize()
+        self._layer_stream, self._warming_up = None, False
         self.history_group = None
         self.kv = self.index = self._sources = self.batch_key = self.layer_id = None
         self._current.clear()
