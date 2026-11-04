@@ -55,6 +55,24 @@ inline void Sha256UpdateU32LE(SHA256_CTX& ctx, uint32_t v) {
     SHA256_Update(&ctx, buf, 4);
 }
 
+// Feed token IDs as little-endian bytes using bounded stack storage.
+inline void Sha256UpdateTokensExplicitLE(SHA256_CTX& ctx, std::span<const std::int32_t> tokens) {
+    constexpr std::size_t kChunkTokens = 64;
+    uint8_t buffer[kChunkTokens * sizeof(std::uint32_t)];
+    for (std::size_t start = 0; start < tokens.size();) {
+        const std::size_t count = std::min<std::size_t>(kChunkTokens, tokens.size() - start);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto token = static_cast<std::uint32_t>(tokens[start + i]);
+            buffer[4 * i] = static_cast<uint8_t>(token);
+            buffer[4 * i + 1] = static_cast<uint8_t>(token >> 8);
+            buffer[4 * i + 2] = static_cast<uint8_t>(token >> 16);
+            buffer[4 * i + 3] = static_cast<uint8_t>(token >> 24);
+        }
+        SHA256_Update(&ctx, buffer, count * sizeof(std::uint32_t));
+        start += count;
+    }
+}
+
 // Encode a 32-byte SHA-256 digest as a 64-char lowercase hex string.
 inline std::string DigestToHex(const unsigned char* digest) {
     std::string out;
@@ -104,20 +122,7 @@ inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const st
         if constexpr (std::endian::native == std::endian::little) {
             SHA256_Update(&ctx, tokens.data(), tokens.size_bytes());
         } else {
-            // Batch the same little-endian token bytes without allocating.
-            uint8_t buffer[64 * sizeof(std::uint32_t)];
-            for (std::size_t start = 0; start < tokens.size();) {
-                const std::size_t count = std::min<std::size_t>(64, tokens.size() - start);
-                for (std::size_t i = 0; i < count; ++i) {
-                    const auto token = static_cast<std::uint32_t>(tokens[start + i]);
-                    buffer[4 * i] = static_cast<uint8_t>(token);
-                    buffer[4 * i + 1] = static_cast<uint8_t>(token >> 8);
-                    buffer[4 * i + 2] = static_cast<uint8_t>(token >> 16);
-                    buffer[4 * i + 3] = static_cast<uint8_t>(token >> 24);
-                }
-                SHA256_Update(&ctx, buffer, count * sizeof(std::uint32_t));
-                start += count;
-            }
+            Sha256UpdateTokensExplicitLE(ctx, tokens);
         }
     }
 
