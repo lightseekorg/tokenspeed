@@ -797,6 +797,8 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             pre_expert_proj=None,
             post_expert_proj=None,
             down_columns=None,
+            expert_tp8_mxfp4=False,
+            moe_stream=None,
         )
     layer = SimpleNamespace(
         iris_state=None,
@@ -1550,9 +1552,19 @@ def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
         if line.strip() and not line.strip().startswith((".", ";"))
     ]
     memory = re.compile(r"^(?:global|buffer)_(?:load|store|atomic)")
+    # Poll loops (the finisher's sums) also load with SC0 SC1 and wait for
+    # each load; they are not page-index loads. The page loop holds MFMAs.
+    polled = {
+        line.strip()
+        for cycle in polling_cycles(kernel.asm["amdgcn"])
+        if not any("v_mfma" in line for line in cycle)
+        for line in cycle
+    }
     page_loads = 0
     for index, line in enumerate(lines):
         if not (line.startswith("global_load_dword ") and "sc0 sc1" in line):
+            continue
+        if line in polled:
             continue
         page_loads += 1
         for after in lines[index + 1 :]:
@@ -2870,6 +2882,8 @@ def _muse_tp_routes_worker(rank, world_size, device):
     moe.pre_expert_proj = None
     moe.post_expert_proj = None
     moe.down_columns = None
+    moe.expert_tp8_mxfp4 = False
+    moe.moe_stream = None
     moe.tp_group, moe.tp_size, moe.topk = group, world_size, topk
     moe.ep_group, moe.ep_size = (rank,), 1
     moe.post_expert_norm = MuseSparkRMSNorm(width, 1e-8, True, 1.0)
@@ -3791,6 +3805,8 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     moe.pre_expert_proj = None
     moe.post_expert_proj = None
     moe.down_columns = None
+    moe.expert_tp8_mxfp4 = False
+    moe.moe_stream = None
     moe.ep_group, moe.ep_size, moe.topk = group, world_size, 8
     moe.tp_size = 1
     moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)
