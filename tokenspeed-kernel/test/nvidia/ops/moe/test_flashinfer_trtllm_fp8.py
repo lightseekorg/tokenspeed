@@ -286,3 +286,86 @@ def test_empty_apply_preserves_deferred_finalize_contract() -> None:
     assert expert_weights is topk_weights
     assert expanded_idx.shape == (0,)
     assert expanded_idx.dtype == torch.int32
+
+
+def _block_dequantize(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    blocks = scales.repeat_interleave(128, dim=-2).repeat_interleave(128, dim=-1)
+    return values.float() * blocks
+
+
+def _fp8_group_round_trip(values: torch.Tensor) -> torch.Tensor:
+    """E4M3 round trip with one amax scale per 128 values along the last dim."""
+    groups = values.view(*values.shape[:-1], -1, 128)
+    scales = groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448.0
+    return ((groups / scales).to(torch.float8_e4m3fn).float() * scales).view_as(values)
+
+
+@requires_flashinfer
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_tokens", [3, 16])
+def test_apply_matches_the_dequantized_expert_mixture(num_tokens: int) -> None:
+    from tokenspeed_kernel.ops.moe.flashinfer import (
+        flashinfer_trtllm_fp8_moe_apply,
+        flashinfer_trtllm_fp8_moe_process_weights,
+    )
+
+    torch.manual_seed(num_tokens)
+    device = "cuda"
+    num_experts, hidden, intermediate, top_k = 4, 256, 256, 2
+    w13 = torch.randn(num_experts, 2 * intermediate, hidden, device=device)
+    w2 = torch.randn(num_experts, hidden, intermediate, device=device)
+    w13 = w13.to(torch.float8_e4m3fn)
+    w2 = w2.to(torch.float8_e4m3fn)
+    s13 = (
+        torch.rand(num_experts, 2 * intermediate // 128, hidden // 128, device=device)
+        + 0.5
+    ) / hidden**0.5
+    s2 = (
+        torch.rand(num_experts, hidden // 128, intermediate // 128, device=device) + 0.5
+    ) / intermediate**0.5
+    weights = _MoEWeights(w13.clone(), w2.clone(), s13.clone(), s2.clone())
+    weights.num_experts = num_experts
+    weights.num_local_experts = num_experts
+    weights.top_k = top_k
+    weights.ep_rank = 0
+    flashinfer_trtllm_fp8_moe_process_weights({}, weights)
+
+    # Token magnitudes spread over 16x, so a scale read for another token
+    # misses that token's output by about its own norm.
+    x = torch.randn(num_tokens, hidden, device=device) * torch.linspace(
+        1.0, 16.0, num_tokens, device=device
+    ).unsqueeze(1)
+    x = x.to(torch.bfloat16)
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, device=device)[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    topk_weights = torch.rand(num_tokens, top_k, device=device).softmax(-1)
+    topk_weights = topk_weights.to(torch.bfloat16)
+
+    out = flashinfer_trtllm_fp8_moe_apply(
+        {},
+        x,
+        weights,
+        router_logits=torch.empty(num_tokens, num_experts, device=device),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+    x_deq = _fp8_group_round_trip(x.float())
+    w13_deq = _block_dequantize(w13, s13)
+    w2_deq = _block_dequantize(w2, s2)
+    expected = torch.zeros(num_tokens, hidden, device=device)
+    for t in range(num_tokens):
+        for slot in range(top_k):
+            e = int(topk_ids[t, slot])
+            gate_up = w13_deq[e] @ x_deq[t]
+            act = (
+                torch.nn.functional.silu(gate_up[:intermediate])
+                * gate_up[intermediate:]
+            )
+            act = _fp8_group_round_trip(act)
+            expected[t] += float(topk_weights[t, slot]) * (w2_deq[e] @ act)
+    # Two E4M3 activation quantizations leave about 6% relative error per
+    # token against this reference; a misplaced scale gives about 100%.
+    error = (out.float() - expected).norm(dim=1) / expected.norm(dim=1)
+    assert error.max().item() < 0.1, error

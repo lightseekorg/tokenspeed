@@ -684,3 +684,67 @@ def test_nextn_fused_qkv_fp8_scale_uses_block_row_offset() -> None:
     )
 
     assert calls == [(scale, loaded_scale, 12)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 4, 300])
+def test_mhc_pre_norm_returns_the_normed_sublayer_input(
+    monkeypatch, num_tokens: int
+) -> None:
+    mapping = Mapping(rank=0, world_size=1)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    monkeypatch.setitem(global_server_args_dict, "attention_backend", "dsa")
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    config = _tiny_text_config()
+    # The serving hidden size, so the fused mHC kernel path is the one taken.
+    config.hidden_size = 4096
+    layer = Glm53FlashForCausalLM(config, mapping).model.layers[0].cuda()
+    assert layer.mhc
+
+    torch.manual_seed(5)
+    hc_dim = config.hc_mult * config.hidden_size
+    with torch.no_grad():
+        layer.hc_attn_fn.copy_(torch.randn_like(layer.hc_attn_fn) / hc_dim**0.5)
+        layer.hc_attn_scale.copy_(torch.randn_like(layer.hc_attn_scale) * 0.1)
+        layer.hc_attn_base.copy_(torch.randn_like(layer.hc_attn_base) * 0.1)
+    # Loaded checkpoints hold BF16 norm weights, as the fused kernel requires.
+    layer.input_layernorm.weight = nn.Parameter(
+        torch.randn(config.hidden_size, device="cuda", dtype=torch.bfloat16),
+        requires_grad=False,
+    )
+    residual = torch.randn(
+        num_tokens,
+        config.hc_mult,
+        config.hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    hidden, post, comb = layer.mhc_pre_norm(
+        residual,
+        layer.hc_attn_fn,
+        layer.hc_attn_scale,
+        layer.hc_attn_base,
+        layer.input_layernorm,
+    )
+
+    mixed, expected_post, expected_comb = glm53_flash.mhc_pre(
+        residual,
+        layer.hc_attn_fn,
+        layer.hc_attn_scale,
+        layer.hc_attn_base,
+        config.rms_norm_eps,
+        config.hc_eps,
+        config.hc_sinkhorn_iters,
+        norm_weight=None,
+        norm_eps=None,
+    )
+    expected = torch.nn.functional.rms_norm(
+        mixed.float(),
+        (config.hidden_size,),
+        layer.input_layernorm.weight.float(),
+        config.rms_norm_eps,
+    )
+    torch.testing.assert_close(hidden.float(), expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(post, expected_post)
+    torch.testing.assert_close(comb, expected_comb)

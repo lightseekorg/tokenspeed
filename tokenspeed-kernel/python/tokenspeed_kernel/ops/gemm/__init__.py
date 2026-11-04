@@ -81,6 +81,7 @@ __all__ = [
     # GEMM
     "bmm",
     "mm",
+    "mm_fp8_blockscale_reads_mn_major_scales",
     "plan_dense_gemm",
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
@@ -3533,6 +3534,7 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: E402
     autotune_bf16_gemm,
     flashinfer_bf16_gemm,
     flashinfer_joint_bf16_supported,
+    flashinfer_trtllm_fp8_blockscale_serves,
     gemm_fp8_nt_groupwise,
     has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_mxfp8,
@@ -3556,6 +3558,25 @@ from tokenspeed_kernel.ops.gemm.triton import (  # noqa: E402
 
 
 # isort: on
+def mm_fp8_blockscale_reads_mn_major_scales(m: int, k: int) -> bool:
+    """Whether auto ``mm`` reads MN-major activation scales for ``m x k``.
+
+    Applies to standard 128x128 block-FP8 GEMMs. The small-M TRT-LLM-Gen kernel
+    reads them; a caller that quantizes its own activations can then request
+    ``mn_major_scales`` to skip a scale layout copy. Any layout stays correct.
+
+    Args:
+        m: Activation rows of the GEMM.
+        k: Reduction size of the GEMM.
+
+    Returns:
+        True when the auto-selected kernel reads MN-major scales natively.
+    """
+    if resolve_kernel_override("gemm", "mm", None) is not None:
+        return False
+    return flashinfer_trtllm_fp8_blockscale_serves(m, k)
+
+
 def fp32_router_gemv(
     x: torch.Tensor,
     weight: torch.Tensor,

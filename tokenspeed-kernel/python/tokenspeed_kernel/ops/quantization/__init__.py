@@ -420,10 +420,12 @@ def _select_fp8_dynamic(
     override: str | None,
     required_features: frozenset[str] | None = None,
 ) -> SelectedKernel:
+    mn_major = required_features is not None and "mn_major_scales" in required_features
     traits = {
         "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
-        "scale_layout": "token_major",
+        # Requiring mn_major_scales asks for a [M, K/g] view of MN-major storage.
+        "scale_layout": "mn_major" if mn_major else "token_major",
     }
     if rows is not None:
         # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
