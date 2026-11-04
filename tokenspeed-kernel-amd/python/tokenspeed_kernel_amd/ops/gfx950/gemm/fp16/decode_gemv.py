@@ -131,7 +131,6 @@ def _rows_x_step(
     M,
     K: gl.constexpr,
     start: gl.constexpr,
-    X_CACHE: gl.constexpr,
 ):
     """Load one K step of every activation row; rows past M read zero."""
     # No ``other``: a masked lane's buffer load gets an out-of-range offset
@@ -141,7 +140,6 @@ def _rows_x_step(
         x_ptr,
         (rows[:, None] * K + start + x_columns[None, :]).to(gl.int32),
         mask=(rows < M)[:, None],
-        cache=X_CACHE,
     )
 
 
@@ -216,7 +214,6 @@ def gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950(
     WAVES_PER_OUTPUT: gl.constexpr,
     OUTPUTS_PER_WAVE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    X_CACHE: gl.constexpr,
 ):
     """Issue the first activation K steps of every row (rows past M read
     zero); returns them for :func:`gluon_rowcta_bf16_gemv_rows_finish_gfx950`."""
@@ -228,7 +225,7 @@ def gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950(
     x_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, x_layout))
     xs = ()
     for step in gl.static_range(min(_X_AHEAD, K // BLOCK_K)):
-        xs += (_rows_x_step(x_ptr, rows, x_columns, M, K, step * BLOCK_K, X_CACHE),)
+        xs += (_rows_x_step(x_ptr, rows, x_columns, M, K, step * BLOCK_K),)
     return xs
 
 
@@ -244,14 +241,11 @@ def gluon_rowcta_bf16_gemv_rows_finish_gfx950(
     WAVES_PER_OUTPUT: gl.constexpr,
     OUTPUTS_PER_WAVE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    X_CACHE: gl.constexpr,
 ):
     """Return ``[BLOCK_M, OUTPUTS]`` sums of the issued ``weights`` for every row.
 
     ``xs`` holds the first activation K steps
-    (:func:`gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950`); ``X_CACHE`` is the
-    activation loads' cache modifier: "" when an earlier launch wrote x,
-    ".cv" when another workgroup of this launch did.
+    (:func:`gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950`).
     """
     layout: gl.constexpr = _rows_layout(
         BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE, NUM_WARPS
@@ -270,9 +264,7 @@ def gluon_rowcta_bf16_gemv_rows_finish_gfx950(
     for step in gl.static_range(STEPS):
         if step + X_AHEAD < STEPS:
             xs += (
-                _rows_x_step(
-                    x_ptr, rows, x_columns, M, K, (step + X_AHEAD) * BLOCK_K, X_CACHE
-                ),
+                _rows_x_step(x_ptr, rows, x_columns, M, K, (step + X_AHEAD) * BLOCK_K),
             )
         weight = weights[step].to(gl.float32)
         x = xs[step].to(gl.float32)
@@ -292,7 +284,6 @@ def gluon_rowcta_bf16_gemv_rows_stage_x_gfx950(
     K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    X_CACHE: gl.constexpr,
 ):
     """Copy every activation row into LDS (rows past M read zero), 16 bytes
     per lane per copy; returns the buffer for
@@ -314,7 +305,6 @@ def gluon_rowcta_bf16_gemv_rows_stage_x_gfx950(
         x_ptr,
         elements,
         mask=elements // K < M,
-        cache_modifier=X_CACHE,
     )
     async_copy.commit_group()
     return flat.reinterpret(
@@ -367,7 +357,6 @@ def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     WAVES_PER_OUTPUT: gl.constexpr,
     OUTPUTS_PER_WAVE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    X_CACHE: gl.constexpr,
 ):
     """Return ``[BLOCK_M, OUTPUTS]`` sums of outputs ``first ..`` for every row.
 
@@ -376,14 +365,12 @@ def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     then one sum over the output's subgroups, so row ``m`` is bitwise the
     single-row GEMV of ``x[m]``. Rows sit in each lane's registers, so every
     weight load serves all of them. Composes the ``x_ahead`` / ``weights`` /
-    ``finish`` parts, which a persistent kernel calls separately to issue
-    the weights earlier.
+    ``finish`` parts.
     """
     # The first activation step issues before the weights, so step 0's
     # FMAs need not wait for every weight step to return.
     xs = gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950(
-        x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE, NUM_WARPS,
-        X_CACHE
+        x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE, NUM_WARPS
     )  # fmt: skip
     weights = gluon_rowcta_bf16_gemv_rows_weights_gfx950(
         weight_ptr, first, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE,
@@ -391,7 +378,7 @@ def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     )  # fmt: skip
     return gluon_rowcta_bf16_gemv_rows_finish_gfx950(
         weights, xs, x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT,
-        OUTPUTS_PER_WAVE, NUM_WARPS, X_CACHE
+        OUTPUTS_PER_WAVE, NUM_WARPS
     )  # fmt: skip
 
 

@@ -20,10 +20,10 @@
 
 """Fuse Muse's post-expert projection, column gather and layer boundary for decode rows.
 
-The tail is a set of device functions that both the standalone launches here
-and a persistent layer kernel call with explicit ids:
+The launches here are built from these device functions:
 
-* senders: ``iris_muse_moetail_project`` (column GEMV) or
+* senders: ``iris_muse_moetail_stage_rows``, ``iris_muse_moetail_project_weights``
+  and ``iris_muse_moetail_project_staged`` (column GEMV) or
   ``iris_muse_moetail_load_columns`` (columns projected beforehand), then
   ``iris_muse_moetail_send`` (Lamport push of every row's columns to every
   rank; peer stores go through a caller-supplied sink);
@@ -44,12 +44,9 @@ from tokenspeed_kernel.platform import current_platform
 if current_platform().is_cdna4:
     # Senders keep the replicated single-row GEMV's per-output reduction.
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
-        gluon_rowcta_bf16_gemv_rows_finish_gfx950,
         gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950,
         gluon_rowcta_bf16_gemv_rows_stage_x_gfx950,
-        gluon_rowcta_bf16_gemv_rows_sums_gfx950,
         gluon_rowcta_bf16_gemv_rows_weights_gfx950,
-        gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950,
     )
 
 
@@ -71,45 +68,6 @@ def _row_layout(width: int, num_warps: int):
 
 
 @gluon.jit
-def iris_muse_moetail_project(
-    x_ptr,
-    weight_ptr,
-    first_output,
-    M,
-    K: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    OUTPUTS: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    WAVES_PER_OUTPUT: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-    X_CACHE: gl.constexpr,
-):
-    """Project outputs [first_output, first_output + OUTPUTS) of every row.
-
-    Each (row, output) keeps the replicated single-row GEMV's reduction.
-    ``X_CACHE`` is the row loads' cache modifier (".cv" when this launch
-    wrote x).
-
-    Returns:
-        BF16 [BLOCK_M, OUTPUTS] in the send layout.
-    """
-    values = gluon_rowcta_bf16_gemv_rows_sums_gfx950(
-        x_ptr,
-        weight_ptr,
-        first_output,
-        M,
-        K,
-        BLOCK_M,
-        BLOCK_K,
-        WAVES_PER_OUTPUT,
-        1,
-        NUM_WARPS,
-        X_CACHE,
-    )
-    return gl.convert_layout(values.to(gl.bfloat16), _send_layout(OUTPUTS, NUM_WARPS))
-
-
-@gluon.jit
 def iris_muse_moetail_project_weights(
     weight_ptr,
     first_output,
@@ -119,37 +77,11 @@ def iris_muse_moetail_project_weights(
     WAVES_PER_OUTPUT: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Issue the weights of outputs [first_output, first_output + OUTPUTS);
-    a persistent kernel calls this at entry and
-    :func:`iris_muse_moetail_project_issued` once its rows are ready."""
+    """Issue the weights of outputs [first_output, first_output + OUTPUTS)
+    for :func:`iris_muse_moetail_project_staged`."""
     return gluon_rowcta_bf16_gemv_rows_weights_gfx950(
         weight_ptr, first_output, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, 1, NUM_WARPS
     )  # fmt: skip
-
-
-@gluon.jit
-def iris_muse_moetail_project_issued(
-    weights,
-    x_ptr,
-    M,
-    K: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    OUTPUTS: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    WAVES_PER_OUTPUT: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-    X_CACHE: gl.constexpr,
-):
-    """:func:`iris_muse_moetail_project` on weights issued earlier
-    (:func:`iris_muse_moetail_project_weights`); same reduction and result."""
-    xs = gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950(
-        x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, 1, NUM_WARPS, X_CACHE
-    )  # fmt: skip
-    values = gluon_rowcta_bf16_gemv_rows_finish_gfx950(
-        weights, xs, x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, 1, NUM_WARPS,
-        X_CACHE
-    )  # fmt: skip
-    return gl.convert_layout(values.to(gl.bfloat16), _send_layout(OUTPUTS, NUM_WARPS))
 
 
 @gluon.jit
@@ -159,14 +91,11 @@ def iris_muse_moetail_stage_rows(
     K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    X_CACHE: gl.constexpr,
 ):
     """Stage every row to project in LDS once per workgroup (16-byte copies);
     every sender program of the workgroup then reads it
     (:func:`iris_muse_moetail_project_staged`)."""
-    return gluon_rowcta_bf16_gemv_rows_stage_x_gfx950(
-        x_ptr, M, K, BLOCK_M, NUM_WARPS, X_CACHE
-    )
+    return gluon_rowcta_bf16_gemv_rows_stage_x_gfx950(x_ptr, M, K, BLOCK_M, NUM_WARPS)
 
 
 @gluon.jit
@@ -180,8 +109,13 @@ def iris_muse_moetail_project_staged(
     WAVES_PER_OUTPUT: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """:func:`iris_muse_moetail_project` on issued weights and LDS-staged rows;
-    same reduction and result."""
+    """Project the issued weights' OUTPUTS outputs for every LDS-staged row.
+
+    Each (row, output) keeps the replicated single-row GEMV's reduction.
+
+    Returns:
+        BF16 [BLOCK_M, OUTPUTS] in the send layout.
+    """
     values = gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950(
         weights, x_smem, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, 1, NUM_WARPS
     )
@@ -197,7 +131,6 @@ def iris_muse_moetail_load_columns(
     BLOCK_M: gl.constexpr,
     OUTPUTS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    Y_CACHE: gl.constexpr,
 ):
     """Load outputs [first_output, first_output + OUTPUTS) of every row of y [M, LOCAL_WIDTH].
 
@@ -209,36 +142,7 @@ def iris_muse_moetail_load_columns(
     outputs = first_output + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(0, layout))
     elements = rows[:, None] * LOCAL_WIDTH + outputs[None, :]
     valid = (rows < M)[:, None] & (outputs >= 0)[None, :]
-    return gl.amd.cdna4.buffer_load(
-        y_ptr, elements, mask=valid, other=0.0, cache=Y_CACHE
-    )
-
-
-@gluon.jit
-def iris_muse_moetail_send_stage(
-    epochs,
-    first_output,
-    M,
-    LOCAL_WIDTH: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    OUTPUTS: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-):
-    """Mailbox stage of each row's outputs from ``first_output``, from the stage words.
-
-    ``epochs`` holds one stage word per 512-element tile, advanced by the
-    row's reducer (iris_muse_moetail_release). OUTPUTS divides the tile, so a
-    row's outputs share one stage.
-
-    Returns:
-        uint32 [BLOCK_M, OUTPUTS] stages in the send layout.
-    """
-    layout: gl.constexpr = _send_layout(OUTPUTS, NUM_WARPS)
-    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
-    outputs = first_output + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(0, layout))
-    elements = rows[:, None] * LOCAL_WIDTH + outputs[None, :]
-    valid = (rows < M)[:, None] & (outputs >= 0)[None, :]
-    return gl.load(epochs + elements // 512, mask=valid, other=0).to(gl.uint32) % 3
+    return gl.amd.cdna4.buffer_load(y_ptr, elements, mask=valid, other=0.0)
 
 
 @gluon.jit
@@ -246,7 +150,7 @@ def iris_muse_moetail_send(
     values,
     first_output,
     program,
-    stage,
+    epochs,
     regions,
     M,
     sink: gl.constexpr,
@@ -262,9 +166,9 @@ def iris_muse_moetail_send(
 ):
     """Store ``values`` (outputs from ``first_output`` of every row) in slot RANK of every mailbox.
 
-    Row m lands at elements [m * LOCAL_WIDTH, (m + 1) * LOCAL_WIDTH) of
-    ``stage``'s copy (a scalar, or iris_muse_moetail_send_stage's per-row
-    stages); a copy holds WORLD_SIZE slots of MAX_ELEMENTS.
+    Row m lands at elements [m * LOCAL_WIDTH, (m + 1) * LOCAL_WIDTH) of the
+    copy its tile's stage word in ``epochs`` picks; a copy holds WORLD_SIZE
+    slots of MAX_ELEMENTS.
     ``sink(published, regions, offset, offsets, mask, program, RANK,
     WORLD_SIZE, PEER_STORE_CACHE)`` stores the peers' copies, ``published[d -
     1]`` for peer RANK + d (``_iris_lamport_push``'s signature); ``program``
@@ -276,6 +180,8 @@ def iris_muse_moetail_send(
     outputs = first_output + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(0, layout))
     elements = rows[:, None] * LOCAL_WIDTH + outputs[None, :]
     valid = (rows < M)[:, None] & (outputs >= 0)[None, :]
+    # OUTPUTS divides the 512-element tile, so a row's outputs share one stage.
+    stage = gl.load(epochs + elements // 512, mask=valid, other=0).to(gl.uint32) % 3
     # Many lanes may hold each value; the store lowering masks the duplicates,
     # so one lane writes each 8-byte packet.
     values = _iris_sanitize_lamport_bf16(gl.convert_layout(values, layout))
@@ -473,9 +379,7 @@ def iris_muse_moetail_release(
 
     Call after iris_muse_moetail_reduce (and, to publish sooner, after
     iris_muse_moetail_publish): the next use of these words is a later
-    launch on another stage, so clearing late is safe. With ``epochs`` None
-    (the caller picks stages itself, such as a persistent launch's epoch
-    parity) no stage word advances.
+    launch on another stage, so clearing late is safe.
     """
     TILES: gl.constexpr = LOCAL_WIDTH // 512
     mailbox = _iris_muse_moetail_mailbox(
@@ -488,14 +392,12 @@ def iris_muse_moetail_release(
         mailbox,
         cache=CLEAR_CACHE,
     )
-    if epochs is not None:
-        # Every subgroup has left its poll, so every local sender has read
-        # this row's stages before pushing a polled own-slot word. The next
-        # use of these tiles is a later launch, which also sees the restored
-        # markers.
-        gl.barrier()
-        for tile in gl.static_range(TILES):
-            gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
+    # Every subgroup has left its poll, so every local sender has read this
+    # row's stages before pushing a polled own-slot word. The next use of
+    # these tiles is a later launch, which also sees the restored markers.
+    gl.barrier()
+    for tile in gl.static_range(TILES):
+        gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
 
 
 @gluon.jit
@@ -607,18 +509,15 @@ def iris_fused_gemv_lamport_allgather_muse_moetail(
         )  # fmt: skip
     else:
         # The rows go to LDS in a few wide copies, then the weights issue.
-        x_smem = iris_muse_moetail_stage_rows(x_ptr, M, K, BLOCK_M, NUM_WARPS, "")
+        x_smem = iris_muse_moetail_stage_rows(x_ptr, M, K, BLOCK_M, NUM_WARPS)
         weights = iris_muse_moetail_project_weights(
             weight_ptr, program * OUTPUTS, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, NUM_WARPS
         )  # fmt: skip
         values = iris_muse_moetail_project_staged(
             weights, x_smem, K, BLOCK_M, OUTPUTS, BLOCK_K, WAVES_PER_OUTPUT, NUM_WARPS
         )  # fmt: skip
-        stage = iris_muse_moetail_send_stage(
-            epochs, program * OUTPUTS, M, LOCAL_WIDTH, BLOCK_M, OUTPUTS, NUM_WARPS
-        )
         iris_muse_moetail_send(
-            values, program * OUTPUTS, program, stage, regions, M, _iris_lamport_push,
+            values, program * OUTPUTS, program, epochs, regions, M, _iris_lamport_push,
             RANK, WORLD_SIZE, LOCAL_WIDTH, MAX_ELEMENTS, BLOCK_M, OUTPUTS, NUM_WARPS,
             PEER_SIGNAL_STORE_CACHE, ".wt"
         )  # fmt: skip
@@ -675,13 +574,10 @@ def iris_columns_lamport_allgather_muse_moetail(
         )  # fmt: skip
     else:
         values = iris_muse_moetail_load_columns(
-            y_ptr, program * OUTPUTS, M, LOCAL_WIDTH, BLOCK_M, OUTPUTS, NUM_WARPS, ""
-        )
-        stage = iris_muse_moetail_send_stage(
-            epochs, program * OUTPUTS, M, LOCAL_WIDTH, BLOCK_M, OUTPUTS, NUM_WARPS
+            y_ptr, program * OUTPUTS, M, LOCAL_WIDTH, BLOCK_M, OUTPUTS, NUM_WARPS
         )
         iris_muse_moetail_send(
-            values, program * OUTPUTS, program, stage, regions, M, _iris_lamport_push,
+            values, program * OUTPUTS, program, epochs, regions, M, _iris_lamport_push,
             RANK, WORLD_SIZE, LOCAL_WIDTH, MAX_ELEMENTS, BLOCK_M, OUTPUTS, NUM_WARPS,
             PEER_SIGNAL_STORE_CACHE, ".wt"
         )  # fmt: skip
