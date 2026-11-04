@@ -76,7 +76,7 @@ class _TileConfig(NamedTuple):
     num_warps: int
     warp_bases: tuple[tuple[int, int], ...]
     prefetch: int
-    num_xcds: int = 1
+    num_xcds: int
 
 
 class _PersistentTiles(NamedTuple):
@@ -87,29 +87,33 @@ class _PersistentTiles(NamedTuple):
     num_warps: int
     warp_bases: tuple[tuple[int, int], ...]
     programs_per_cu: int
-    num_xcds: int = 1
+    num_xcds: int
 
 
 # Warp bases count 16x16 WMMA tiles; tiles the warps leave repeat in registers.
 # Two buffers with one tile in flight keep shared memory small enough for many
 # resident programs, which hides load latency better than deeper prefetch.
-_FEW_PROGRAMS_GATE_UP = _TileConfig(16, 16, 512, 2, 1, (), 1)
-_DECODE_DOWN = _TileConfig(16, 128, 128, 2, 4, ((0, 1), (0, 2)), 1)
-_MEDIUM_DOWN = _TileConfig(32, 256, 128, 2, 8, ((0, 1), (0, 2), (1, 0)), 1)
+_FEW_PROGRAMS_GATE_UP = _TileConfig(16, 16, 512, 2, 1, (), 1, 1)
+_DECODE_DOWN = _TileConfig(16, 128, 128, 2, 4, ((0, 1), (0, 2)), 1, 1)
+_MEDIUM_DOWN = _TileConfig(32, 256, 128, 2, 8, ((0, 1), (0, 2), (1, 0)), 1, 1)
 # Two programs per CU fit only while the single accumulator stays in 512 VGPRs.
 _PERSISTENT_MEDIUM_DOWN = _PersistentTiles(64, 256, 4, ((0, 1), (0, 2)), 2, _NUM_XCDS)
 _PERSISTENT_LARGE_DOWN = _PersistentTiles(128, 256, 4, ((0, 1), (1, 0)), 2, _NUM_XCDS)
 # (max average routes per expert, gate/up tiles, down tiles)
 _REGIMES = (
-    (0.25, _TileConfig(16, 16, 256, 2, 1, (), 1), _DECODE_DOWN),
-    (1, _TileConfig(16, 32, 128, 2, 1, (), 1), _DECODE_DOWN),
-    (8, _TileConfig(16, 32, 256, 2, 1, (), 1), _DECODE_DOWN),
-    (16, _TileConfig(16, 32, 256, 2, 1, (), 1), _MEDIUM_DOWN),
-    (24, _TileConfig(32, 64, 128, 2, 4, ((0, 1), (0, 2)), 1), _MEDIUM_DOWN),
-    (40, _TileConfig(32, 64, 128, 2, 4, ((0, 1), (0, 2)), 1), _PERSISTENT_MEDIUM_DOWN),
+    (0.25, _TileConfig(16, 16, 256, 2, 1, (), 1, 1), _DECODE_DOWN),
+    (1, _TileConfig(16, 32, 128, 2, 1, (), 1, 1), _DECODE_DOWN),
+    (8, _TileConfig(16, 32, 256, 2, 1, (), 1, 1), _DECODE_DOWN),
+    (16, _TileConfig(16, 32, 256, 2, 1, (), 1, 1), _MEDIUM_DOWN),
+    (24, _TileConfig(32, 64, 128, 2, 4, ((0, 1), (0, 2)), 1, 1), _MEDIUM_DOWN),
+    (
+        40,
+        _TileConfig(32, 64, 128, 2, 4, ((0, 1), (0, 2)), 1, 1),
+        _PERSISTENT_MEDIUM_DOWN,
+    ),
     (
         64,
-        _TileConfig(64, 128, 128, 2, 8, ((0, 1), (0, 2), (1, 0)), 1),
+        _TileConfig(64, 128, 128, 2, 8, ((0, 1), (0, 2), (1, 0)), 1, 1),
         _PERSISTENT_MEDIUM_DOWN,
     ),
     (
@@ -353,8 +357,8 @@ def _fp8_block_gate_up_gfx1250(
     NUM_BUFFERS: gl.constexpr,
     PREFETCH: gl.constexpr,
     WARP_BASES: gl.constexpr,
-    NUM_XCDS: gl.constexpr = 1,
-    SORTED: gl.constexpr = False,
+    NUM_XCDS: gl.constexpr,
+    SORTED: gl.constexpr,
 ):
     """One ``BLOCK_M x BLOCK_N`` SwiGLU tile of an expert's gate/up projection."""
     SCALE_BLOCK: gl.constexpr = 128
@@ -678,6 +682,7 @@ def _fp8_block_down_gfx1250(
             off_n,
             BLOCK_K,
             NUM_BUFFERS,
+            False,
         )
     acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, wmma_layout)
     for k_tile in range(NUM_K_TILES - PREFETCH):
@@ -695,6 +700,7 @@ def _fp8_block_down_gfx1250(
             off_n,
             BLOCK_K,
             NUM_BUFFERS,
+            False,
         )
         gl.amd.cdna5.tdm.async_wait(LOADS_PER_TILE * PREFETCH)
         acc = _down_tile(
@@ -744,7 +750,7 @@ def _issue_down(
     off_n,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    SORTED: gl.constexpr = False,
+    SORTED: gl.constexpr,
 ):
     slot = k_tile % NUM_BUFFERS
     k = k_tile * BLOCK_K
@@ -921,8 +927,8 @@ def _fp8_block_down_persistent_gfx1250(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     WARP_BASES: gl.constexpr,
-    NUM_XCDS: gl.constexpr = 1,
-    SORTED: gl.constexpr = False,
+    NUM_XCDS: gl.constexpr,
+    SORTED: gl.constexpr,
 ):
     """Down-projection tiles strided over a fixed grid.
 
@@ -1138,7 +1144,7 @@ def _launch_down_persistent(
     expert_route_ids: torch.Tensor,
     expert_counts: torch.Tensor,
     route_output: torch.Tensor,
-    sorted_rows: bool = False,
+    sorted_rows: bool,
 ) -> None:
     num_routes, inter = intermediate.shape
     num_experts, hidden, _ = w2.shape
