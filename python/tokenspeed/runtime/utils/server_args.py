@@ -127,8 +127,13 @@ AUX_CAPTURE_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4")
 #: Drafters that propose one token per draft step (a chain of steps + 1 tokens, or a tree).
 STEP_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4", "MTP")
 # Drafters whose topk=1 chain can record sampled proposals for block
-# verification (--enable-block-rejection).
+# verification or synthetic rejection on the flashinfer backend.
 BLOCK_REJECTION_ALGORITHMS = ("DSPARK", "EAGLE3")
+# Verify rules, named as vLLM's rejection_sample_method.
+REJECTION_SAMPLE_METHODS = ("standard", "block", "synthetic")
+# Draft sampling, named as vLLM's draft_sample_method; "probabilistic" is
+# --enable-speculative-sampling.
+DRAFT_SAMPLE_METHODS = ("greedy", "probabilistic")
 
 
 def expert_placement_requested(server_args) -> bool:
@@ -603,9 +608,13 @@ class ServerArgs:
     # target distribution; this one trades a sampled proposal for a higher
     # acceptance rate under sampling temperatures.
     enable_speculative_sampling: bool = False
-    # Opt-in block verification for DSpark and EAGLE3 topk=1 chains; OFF
-    # preserves the existing verifier.
-    enable_block_rejection: bool = False
+    # Verify rule, named as vLLM's rejection_sample_method. "standard" is the
+    # existing token-wise rule; "block" is block verification of a sampled
+    # DSpark or EAGLE3 topk=1 chain; "synthetic" forces benchmark acceptance
+    # lengths (set by --synthetic-acceptance-length).
+    speculative_rejection_sample_method: Literal["standard", "block", "synthetic"] = (
+        "standard"
+    )
     # Recorded draft probabilities above this value mark a slot with no
     # proposal (fresh admission, PD landing): always reject. Sentinel rows
     # are written as threshold + 1, so it must lie within
@@ -930,6 +939,38 @@ class ServerArgs:
                     )
                 if self.synthetic_acceptance_length is None:
                     self.synthetic_acceptance_length = length
+
+            if "rejection_sample_method" in config:
+                rejection = config["rejection_sample_method"]
+                if rejection not in REJECTION_SAMPLE_METHODS:
+                    raise ValueError(
+                        f"rejection_sample_method must be one of "
+                        f"{REJECTION_SAMPLE_METHODS}, got {rejection!r}"
+                    )
+                if (
+                    self.speculative_rejection_sample_method != "standard"
+                    and self.speculative_rejection_sample_method != rejection
+                ):
+                    raise ValueError(
+                        "--speculative-rejection-sample-method conflicts with "
+                        "rejection_sample_method in --speculative-config"
+                    )
+                self.speculative_rejection_sample_method = rejection
+
+            if "draft_sample_method" in config:
+                draft_sample = config["draft_sample_method"]
+                if draft_sample not in DRAFT_SAMPLE_METHODS:
+                    raise ValueError(
+                        f"draft_sample_method must be one of "
+                        f"{DRAFT_SAMPLE_METHODS}, got {draft_sample!r}"
+                    )
+                if self.enable_speculative_sampling and draft_sample == "greedy":
+                    raise ValueError(
+                        "--enable-speculative-sampling conflicts with "
+                        "draft_sample_method='greedy' in --speculative-config"
+                    )
+                if draft_sample == "probabilistic":
+                    self.enable_speculative_sampling = True
 
             method = config.get("method")
             if method is not None and self.speculative_algorithm is None:
@@ -1545,6 +1586,26 @@ class ServerArgs:
                 raise ValueError(
                     "DUMMY drafting requires --speculative-num-draft-tokens > 1"
                 )
+        if self.speculative_rejection_sample_method not in REJECTION_SAMPLE_METHODS:
+            raise ValueError(
+                f"--speculative-rejection-sample-method must be one of "
+                f"{REJECTION_SAMPLE_METHODS}, got "
+                f"{self.speculative_rejection_sample_method!r}"
+            )
+        if self.synthetic_acceptance_length is not None:
+            # A synthetic length selects synthetic rejection, as on main.
+            if self.speculative_rejection_sample_method == "block":
+                raise ValueError(
+                    "--synthetic-acceptance-length selects the synthetic rejection "
+                    "method; it cannot be combined with "
+                    "--speculative-rejection-sample-method block"
+                )
+            self.speculative_rejection_sample_method = "synthetic"
+        elif self.speculative_rejection_sample_method == "synthetic":
+            raise ValueError(
+                "--speculative-rejection-sample-method synthetic requires "
+                "--synthetic-acceptance-length"
+            )
         if self.synthetic_acceptance_length is not None:
             length = self.synthetic_acceptance_length
             if (
@@ -1571,14 +1632,16 @@ class ServerArgs:
                     f"[1, {self.speculative_num_draft_tokens}] "
                     "(the speculative verify width including the target token)"
                 )
-            # Block rejection keeps stochastic drafting on the path and forces
-            # only the verify outcome, so it uses the flashinfer verifier.
+            # With sampled drafts (vLLM's draft_sample_method=probabilistic) the
+            # drafter stays on the path and only the verify outcome is forced,
+            # so it uses the flashinfer verifier.
             if self.sampling_backend != "greedy" and not (
-                self.enable_block_rejection and self.sampling_backend == "flashinfer"
+                self.enable_speculative_sampling
+                and self.sampling_backend == "flashinfer"
             ):
                 raise ValueError(
                     "--synthetic-acceptance-length requires --sampling-backend greedy, "
-                    "or --sampling-backend flashinfer with --enable-block-rejection"
+                    "or --sampling-backend flashinfer with --enable-speculative-sampling"
                 )
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
@@ -1660,7 +1723,13 @@ class ServerArgs:
                 f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}"
             )
 
-        if self.enable_block_rejection:
+        # Block verification, and synthetic rejection over sampled drafts, run
+        # the sampled-chain verify on the flashinfer backend.
+        sampled_chain_verify = self.speculative_rejection_sample_method == "block" or (
+            self.speculative_rejection_sample_method == "synthetic"
+            and self.sampling_backend != "greedy"
+        )
+        if sampled_chain_verify:
             if (
                 not self.enable_speculative_sampling
                 or self.speculative_algorithm not in BLOCK_REJECTION_ALGORITHMS
@@ -1672,20 +1741,22 @@ class ServerArgs:
                 or self.disaggregation_mode != "null"
             ):
                 raise ValueError(
-                    "--enable-block-rejection requires a DSPARK or EAGLE3 chain "
+                    f"--speculative-rejection-sample-method "
+                    f"{self.speculative_rejection_sample_method} with sampled drafts "
+                    "requires a DSPARK or EAGLE3 chain "
                     "(--speculative-eagle-topk 1), --enable-speculative-sampling, "
                     "the flashinfer sampling backend, and aggregate TP without attention DP, "
                     "DP sampling, pipeline parallelism, or PD disaggregation"
                 )
-            if self.synthetic_acceptance_length is not None:
+            if self.speculative_rejection_sample_method == "synthetic":
                 # vLLM's draft_sample_method=probabilistic with
                 # rejection_sample_method=synthetic: drafts stay sampled, the
                 # standard draft-probability verify runs for its cost, and the
-                # synthetic length replaces both its outcome and block rejection.
+                # synthetic length replaces its outcome.
                 logger.warning(
-                    "Block rejection with synthetic acceptance: drafts are "
-                    "sampled and recorded, but the accepted length is forced and "
-                    "the block verifier is not run."
+                    "Synthetic rejection over sampled drafts: drafts are sampled "
+                    "and recorded, but the accepted length is forced and the "
+                    "verify outcome is discarded."
                 )
         if self.enable_speculative_sampling:
             self._validate_speculative_sampling()
@@ -1779,15 +1850,19 @@ class ServerArgs:
                 "--enable-speculative-sampling needs speculative decoding: pass "
                 "--speculative-algorithm EAGLE3 or MTP"
             )
+        # DSpark samples its Markov steps only for block verification or for
+        # synthetic rejection over sampled drafts.
         if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS and not (
-            self.speculative_algorithm == "DSPARK" and self.enable_block_rejection
+            self.speculative_algorithm == "DSPARK"
+            and self.speculative_rejection_sample_method in ("block", "synthetic")
         ):
             raise ValueError(
                 "--enable-speculative-sampling needs a chain drafter that samples "
                 "one token per step from its own distribution; "
                 f"{self.speculative_algorithm} proposes a whole block greedily"
                 + (
-                    "; pass --enable-block-rejection for sampled DSPARK drafting"
+                    "; pass --speculative-rejection-sample-method block (or "
+                    "synthetic) for sampled DSPARK drafting"
                     if self.speculative_algorithm == "DSPARK"
                     else ""
                 )
@@ -3505,7 +3580,7 @@ class ServerArgs:
             "--speculative_config",
             type=str,
             default=ServerArgs.speculative_config,
-            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, and synthetic_acceptance_length.",
+            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, synthetic_acceptance_length, rejection_sample_method, and draft_sample_method (vLLM names).",
         )
         parser.add_argument(
             "--speculative-algorithm",
@@ -3590,8 +3665,9 @@ class ServerArgs:
             help="Benchmark-only mean accepted length including the guaranteed "
             "target token, in [1, speculative_num_draft_tokens]. Forces a "
             "floor/ceil acceptance distribution; generated text is not valid "
-            "for correctness evaluation. Requires --sampling-backend greedy (or "
-            "flashinfer with --enable-block-rejection) without "
+            "for correctness evaluation. Selects the synthetic rejection method. "
+            "Requires --sampling-backend greedy (or flashinfer with "
+            "--enable-speculative-sampling for sampled drafts) without "
             "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
         parser.add_argument(
@@ -3601,8 +3677,10 @@ class ServerArgs:
             help="Standard rejection sampling for chain speculative decoding: the "
             "drafter samples each step from its own distribution q (per-request "
             "temperature; greedy rows stay argmax) and verify accepts with "
-            "coin * q(x) < p(x) instead of the target-only rule. Needs EAGLE3 "
-            "or MTP with --speculative-eagle-topk 1 and the flashinfer or "
+            "coin * q(x) < p(x) instead of the target-only rule (vLLM's "
+            "draft_sample_method=probabilistic). Needs EAGLE3 or MTP, or DSPARK "
+            "with the block or synthetic rejection method, with "
+            "--speculative-eagle-topk 1 and the flashinfer or "
             "flashinfer_full sampling backend, or EAGLE4 on EAGLE-Harness "
             "(--speculative-exec-mode 0 or 1, trees or chains) and the "
             "flashinfer backend; refused on the prefill role of "
@@ -3610,16 +3688,17 @@ class ServerArgs:
             "distribution buffer; see docs/configuration/server.md.",
         )
         parser.add_argument(
-            "--enable-block-rejection",
-            action="store_true",
-            default=ServerArgs.enable_block_rejection,
-            help="Opt in to block rejection verification of sampled DSPARK or EAGLE3 "
-            "chain drafts (--speculative-eagle-topk 1). Requires "
-            "--enable-speculative-sampling and --sampling-backend flashinfer. "
-            "Supports aggregate TP (including DCP), without DP, PP or PD "
-            "disaggregation. "
-            "With --synthetic-acceptance-length, drafts stay sampled but the "
-            "accepted length is forced (benchmark only); greedy requests remain greedy.",
+            "--speculative-rejection-sample-method",
+            type=str,
+            choices=REJECTION_SAMPLE_METHODS,
+            default=ServerArgs.speculative_rejection_sample_method,
+            help="Verify rule, as vLLM's rejection_sample_method. 'standard': the "
+            "existing token-wise rule. 'block': block verification of a sampled "
+            "DSPARK or EAGLE3 chain (--speculative-eagle-topk 1); requires "
+            "--enable-speculative-sampling and --sampling-backend flashinfer, "
+            "aggregate TP (including DCP) without DP, PP or PD disaggregation. "
+            "'synthetic': benchmark-only forced acceptance; set by "
+            "--synthetic-acceptance-length.",
         )
         parser.add_argument(
             "--spec-reject-draft-prob-threshold",

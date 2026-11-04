@@ -575,6 +575,7 @@ parser option keeps its existing behavior.
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees and chains (see below). Off by default. |
+| `--speculative-rejection-sample-method` | Verify rule, named as vLLM's `rejection_sample_method`: `standard` (default, token-wise), `block` (block verification; see [Block verification](#block-verification-experimental)) or `synthetic` (set by `--synthetic-acceptance-length`). |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. A target whose forward returns no layer taps (for example Qwen3, Qwen3-MoE or DeepSeek V4.1) refuses these drafts and `DFLASH` at startup. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
@@ -622,8 +623,9 @@ AL `2.6`:
 
 Conflicting values between the flag and JSON configuration are rejected.
 The value must be finite and speculative decoding must be enabled.
-The flashinfer backend accepts it only together with `--enable-block-rejection`;
-see [Block verification](#block-verification-experimental).
+It selects the `synthetic` rejection method. The flashinfer backend accepts it
+only over sampled drafts (`--enable-speculative-sampling`); see
+[Block verification](#block-verification-experimental).
 For block drafters with implicit widths, the upper bound is checked against
 the checkpoint's resolved verify width when the sampler is initialized.
 
@@ -1379,9 +1381,11 @@ store client reads `MC_USE_IPV6` on its own when the store starts, so export
 
 ### Block verification (experimental)
 
-`--enable-block-rejection --enable-speculative-sampling --sampling-backend flashinfer`
+`--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`
 verifies a sampled draft chain by block verification instead of token-wise
-rejection. It supports `DSPARK` (probabilistic Markov drafting) and `EAGLE3`
+rejection. The names follow vLLM: `--enable-speculative-sampling` is
+`draft_sample_method=probabilistic`, and `--speculative-config` also accepts
+the `draft_sample_method` and `rejection_sample_method` keys. It supports `DSPARK` (probabilistic Markov drafting) and `EAGLE3`
 with `--speculative-eagle-topk 1`; block verification is defined on a single
 chain, so draft trees are refused. EAGLE3 already samples its chain under
 `--enable-speculative-sampling`, and its hot-token `q` is recorded over the full
@@ -1402,8 +1406,10 @@ The existing per-request proposal RNG and verifier coin streams are reused.
 A stochastic output difference from greedy decoding is expected; validate the
 output distribution and accuracy, rather than requiring identical token IDs.
 
-Adding `--synthetic-acceptance-length L` gives a benchmark-only mode, the
-equivalent of vLLM's probabilistic draft sampling with synthetic rejection.
+Replacing `block` with `--synthetic-acceptance-length L` (the `synthetic`
+method) gives a benchmark-only mode, the equivalent of vLLM's probabilistic
+draft sampling with synthetic rejection; for `DSPARK` it also turns on sampled
+Markov drafting.
 The drafter still samples: the full-vocabulary draft logits (and DSpark's Markov
 steps) and the recorded fp32 draft probabilities all stay on the path. Verify
 gathers those probabilities and runs the standard draft-probability chain rule

@@ -318,7 +318,7 @@ def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
     reason="FlashInfer chain verification requires an NVIDIA CUDA GPU",
 )
 @pytest.mark.parametrize("al", [1.0, 2.6, 4.0])
-def test_block_rejection_synthetic_verify_and_cuda_graph_replay(monkeypatch, al):
+def test_sampled_draft_synthetic_verify_and_cuda_graph_replay(monkeypatch, al):
     """Probabilistic-draft synthetic mode on the real flashinfer verify path."""
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends import flashinfer as fi
@@ -326,7 +326,9 @@ def test_block_rejection_synthetic_verify_and_cuda_graph_replay(monkeypatch, al)
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    monkeypatch.setitem(global_server_args_dict, "enable_block_rejection", True)
+    monkeypatch.setitem(
+        global_server_args_dict, "speculative_rejection_sample_method", "synthetic"
+    )
     pool, width, vocab = 6, 4, 512
     config = SamplingBackendConfig(
         enable_speculative_sampling=True,

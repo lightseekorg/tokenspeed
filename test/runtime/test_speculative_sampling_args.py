@@ -44,7 +44,7 @@ def _args(**overrides) -> ServerArgs:
 def test_default_is_off_and_the_flags_travel_by_config_not_global_dict():
     args = ServerArgs(model="x")
     assert args.enable_speculative_sampling is False
-    assert args.enable_block_rejection is False
+    assert args.speculative_rejection_sample_method == "standard"
     assert args.spec_reject_draft_prob_threshold == 2.0
     # The executor and sampling-backend configs carry the flags explicitly;
     # nothing reads them from the process-global dict.
@@ -85,19 +85,21 @@ def test_refuses_without_speculative_decoding():
 def test_refuses_block_drafters(algorithm):
     with pytest.raises(ValueError, match="whole block greedily") as error:
         _args(speculative_algorithm=algorithm)
-    hinted = "pass --enable-block-rejection" in str(error.value)
+    hinted = "pass --speculative-rejection-sample-method block" in str(error.value)
     assert hinted == (algorithm == "DSPARK")
 
 
 @pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3"])
-def test_block_verification_requires_both_opt_in_flags(algorithm):
-    args = _args(speculative_algorithm=algorithm, enable_block_rejection=True)
-    assert args.enable_block_rejection and args.enable_speculative_sampling
-    assert args.speculative_eagle_topk == 1
-    with pytest.raises(ValueError, match="enable-block-rejection requires"):
+def test_block_verification_requires_sampled_drafts(algorithm):
+    args = _args(
+        speculative_algorithm=algorithm, speculative_rejection_sample_method="block"
+    )
+    assert args.speculative_rejection_sample_method == "block"
+    assert args.enable_speculative_sampling and args.speculative_eagle_topk == 1
+    with pytest.raises(ValueError, match="block with sampled drafts requires"):
         _args(
             speculative_algorithm=algorithm,
-            enable_block_rejection=True,
+            speculative_rejection_sample_method="block",
             enable_speculative_sampling=False,
         )
 
@@ -120,38 +122,90 @@ def test_block_verification_requires_both_opt_in_flags(algorithm):
     ],
 )
 def test_block_verification_refuses_unvalidated_execution_modes(changes):
-    kwargs = {"speculative_algorithm": "DSPARK", "enable_block_rejection": True}
+    kwargs = {
+        "speculative_algorithm": "DSPARK",
+        "speculative_rejection_sample_method": "block",
+    }
     kwargs.update(changes)
-    with pytest.raises(ValueError, match="enable-block-rejection requires"):
+    with pytest.raises(ValueError, match="block with sampled drafts requires"):
         _args(**kwargs)
 
 
 @pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3"])
-def test_block_verification_accepts_synthetic_benchmark_acceptance(algorithm):
-    args = _args(
+def test_synthetic_rejection_over_sampled_drafts(algorithm):
+    # vLLM's draft_sample_method=probabilistic + rejection_sample_method=synthetic.
+    args = _args(speculative_algorithm=algorithm, synthetic_acceptance_length=3.36)
+    assert args.speculative_rejection_sample_method == "synthetic"
+    assert args.enable_speculative_sampling and args.sampling_backend == "flashinfer"
+    assert args.synthetic_acceptance_length == 3.36
+    explicit = _args(
         speculative_algorithm=algorithm,
-        enable_block_rejection=True,
+        speculative_rejection_sample_method="synthetic",
         synthetic_acceptance_length=3.36,
     )
-    assert args.enable_block_rejection and args.enable_speculative_sampling
-    assert args.synthetic_acceptance_length == 3.36
-    assert args.sampling_backend == "flashinfer"
+    assert explicit.speculative_rejection_sample_method == "synthetic"
 
 
-def test_flashinfer_synthetic_acceptance_requires_block_verification():
-    # Plain draft-prob verify keeps synthetic acceptance on the greedy backend.
-    with pytest.raises(ValueError, match="flashinfer with --enable-block-rejection"):
-        _args(synthetic_acceptance_length=2.0)
+def test_synthetic_rejection_needs_a_length_and_excludes_block():
+    with pytest.raises(ValueError, match="requires --synthetic-acceptance-length"):
+        _args(speculative_rejection_sample_method="synthetic")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _args(
+            speculative_rejection_sample_method="block",
+            synthetic_acceptance_length=3.0,
+        )
 
 
-def test_block_verification_synthetic_acceptance_keeps_its_refusals():
+def test_flashinfer_synthetic_acceptance_requires_sampled_drafts():
+    # Without sampled drafts, synthetic acceptance stays on the greedy backend.
+    with pytest.raises(
+        ValueError, match="flashinfer with --enable-speculative-sampling"
+    ):
+        _args(enable_speculative_sampling=False, synthetic_acceptance_length=2.0)
+
+
+def test_greedy_synthetic_acceptance_is_unchanged():
+    args = ServerArgs(
+        model="x",
+        speculative_algorithm="EAGLE3",
+        speculative_draft_model_path="draft",
+        sampling_backend="greedy",
+        synthetic_acceptance_length=2.0,
+    )
+    assert args.speculative_rejection_sample_method == "synthetic"
+    assert not args.enable_speculative_sampling
+
+
+def test_synthetic_rejection_over_sampled_drafts_keeps_its_refusals():
     with pytest.raises(ValueError, match="enable-output-logprobs"):
         _args(
             speculative_algorithm="DSPARK",
-            enable_block_rejection=True,
             synthetic_acceptance_length=3.36,
             enable_output_logprobs=True,
         )
+
+
+def test_speculative_config_accepts_the_vllm_method_names():
+    config = (
+        '{"draft_sample_method": "probabilistic", '
+        '"rejection_sample_method": "block"}'
+    )
+    args = _args(
+        speculative_algorithm="DSPARK",
+        enable_speculative_sampling=False,
+        speculative_config=config,
+    )
+    assert args.enable_speculative_sampling
+    assert args.speculative_rejection_sample_method == "block"
+    with pytest.raises(ValueError, match="conflicts with rejection_sample_method"):
+        _args(
+            speculative_rejection_sample_method="block",
+            speculative_config='{"rejection_sample_method": "standard"}',
+        )
+    with pytest.raises(ValueError, match="draft_sample_method='greedy'"):
+        _args(speculative_config='{"draft_sample_method": "greedy"}')
+    with pytest.raises(ValueError, match="rejection_sample_method must be one of"):
+        _args(speculative_config='{"rejection_sample_method": "tree"}')
 
 
 def test_refuses_the_greedy_verifier():
@@ -195,15 +249,16 @@ def test_cli_flags_parse():
             "--model",
             "x",
             "--enable-speculative-sampling",
-            "--enable-block-rejection",
+            "--speculative-rejection-sample-method",
+            "block",
             "--spec-reject-draft-prob-threshold",
             "3.5",
         ]
     )
     assert ns.enable_speculative_sampling is True
-    assert ns.enable_block_rejection is True
+    assert ns.speculative_rejection_sample_method == "block"
     assert ns.spec_reject_draft_prob_threshold == 3.5
     ns = parser.parse_args(["--model", "x"])
     assert ns.enable_speculative_sampling is False
-    assert ns.enable_block_rejection is False
+    assert ns.speculative_rejection_sample_method == "standard"
     assert ns.spec_reject_draft_prob_threshold == 2.0

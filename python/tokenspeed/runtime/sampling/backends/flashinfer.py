@@ -176,21 +176,25 @@ class FlashInferSamplingBackend(SamplingBackend):
     supports_tree_verify = True
     _SUPPORTS_DP_VERIFY = True
     _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
-    # Only as the block-rejection benchmark mode; checked in __init__.
+    # Only over sampled drafts (speculative sampling); checked in __init__.
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
-        # Block verification is a server-wide choice read from the server
-        # args like ``numerics``; it only applies under speculative sampling.
-        self._block_rejection = (
-            global_server_args_dict["enable_block_rejection"]
+        # The rejection method is a server-wide choice read from the server
+        # args like ``numerics``; block verification only applies under
+        # speculative sampling.
+        self._block_verify = (
+            global_server_args_dict["speculative_rejection_sample_method"] == "block"
             and config.enable_speculative_sampling
         )
-        if config.synthetic_acceptance_length is not None and not self._block_rejection:
+        if (
+            config.synthetic_acceptance_length is not None
+            and not config.enable_speculative_sampling
+        ):
             raise ValueError(
-                "synthetic acceptance on a flashinfer backend requires block "
-                "rejection with speculative sampling; otherwise use the greedy "
+                "synthetic acceptance on a flashinfer backend requires sampled "
+                "drafts (speculative sampling); otherwise use the greedy "
                 "sampling backend"
             )
         super().__init__(config)
@@ -840,15 +844,16 @@ class FlashInferSamplingBackend(SamplingBackend):
                 else None
             )
             synthetic = self.config.synthetic_acceptance_length is not None
-            if self._block_rejection and draft_probs is None:
+            if (self._block_verify or synthetic) and draft_probs is None:
                 raise RuntimeError(
-                    "block verification requires recorded draft probabilities"
+                    "block verification and synthetic acceptance on this backend "
+                    "require recorded draft probabilities"
                 )
             # Synthetic acceptance mirrors vLLM's rejection_sample_method
             # "synthetic": the standard draft-probability chain rule below runs
             # for its cost, then the forced lengths replace its outcome. The
             # block verifier is a different rejection method and is not run.
-            if self._block_rejection and not synthetic:
+            if self._block_verify and not synthetic:
                 block_speculative_sampling(
                     predicts=predict,
                     accept_index=accept_index,
