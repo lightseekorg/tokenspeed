@@ -95,6 +95,7 @@ __all__ = [
     "dspark_anchors",
     "dspark_block",
     "dspark_workspace",
+    "history_pack",
 ]
 
 
@@ -631,12 +632,14 @@ def index_topk(
     FP32 scores and int64 IDs use12 bytes per partial entry; capacities round
     to powers of two and at least the score tile width (at most256 lanes).
     With replicated32 heads and compatible Blackwell pages, optional DeepGEMM
-    scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
-    and block maxima; on Hopper, DeepGEMM scores FP8 ``index_v4`` rows and the
-    in-tree CuTe DSL DeepSelect kernel selects. This native accumulation
+    scores packed FP4 inputs with FP32 accumulation and BF16 logits, and
+    DeepSelect selects rows and FP32 block maxima; on Hopper, DeepGEMM scores
+    FP8 ``index_v4`` rows into FP32 logits and the in-tree CuTe DSL DeepSelect
+    kernel selects. This native accumulation
     differs from the portable reference's intermediate BF16 rounding.
-    Full-scoring query tiles cap logits at 32MiB for paged queries and
-    128MiB for a zero-row-stride request table.
+    Blackwell paged scoring uses query_chunk_size; zero-row-stride broadcast
+    scoring retains a 128MiB logits budget. Native logits and their cleaned
+    copy can coexist. Hopper retains its 32MiB paged / 128MiB broadcast budgets.
     That broadcast layout gathers packed history once per call and packs Q
     once before the score tiles; no payload survives the call. For unsharded
     68-byte MXFP4 caches, AMD Gluon Full similarly caps each FP32 logits query
@@ -1368,10 +1371,29 @@ def merge_index_candidates(packed, rows, lengths):
     return _kernel("merge_index_candidates", packed)(packed, rows, lengths)
 
 
+def history_pack(cache, table, visible_rows, *, virtual_block_count, degree, rank):
+    """Copy this rank's packed history pages for a byte-wise MAX all-reduce.
+
+    cache is a possibly strided uint8 [local_pages,64,row_bytes] field and
+    table an integer [pages] row of virtual pages, possibly strided. Virtual
+    page v > 0 lives on rank (v - 1) % degree; ids at or past
+    virtual_block_count are invalid. visible_rows is an integer device
+    scalar. Returns contiguous uint8 [pages+1,64,row_bytes]: a zero null page,
+    then each owned, valid page that starts below visible_rows with all its
+    bytes (scales included), and zeros elsewhere. A MAX all-reduce of the
+    owners' results restores every visible page exactly, with shapes fixed
+    for graph replay.
+    """
+    return _kernel("history_pack", cache)(
+        cache, table, visible_rows, virtual_block_count, degree, rank
+    )
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41._triton.kvp  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401

@@ -195,6 +195,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         device="cuda",
         contract=pool.arena.runtime_contract,
         num_requests=1,
+        validate_page_ids=True,
     )
     tables = metadata.tables(active_forward_op=forward_op)
     assert tables[FULL_ATTENTION].shape == (1, 1)

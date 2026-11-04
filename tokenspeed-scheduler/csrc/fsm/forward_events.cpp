@@ -43,6 +43,7 @@ SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
         .prefix_granularity = prefix_granularity,
         .req_pool_index = req_pool_allocator_->Allocate(),
         .block_tables = std::move(block_tables_),
+        .copy_in_blocks = std::move(copy_in_blocks_),
         .cache_progress = std::move(cache_progress_),
         .results_in_flight = 0,
     };
@@ -200,7 +201,7 @@ Retracted SnapshotRetractEvent::retract(State&& state, ResumeShape shape) {
         .shape = std::move(shape),
         .retraction_epoch = epoch_,
         .resumes_generation = resumes_generation_,
-        .pending_store_ops = std::move(pending_store_ops_),
+        .image_stores = std::move(image_stores_),
     };
 }
 
@@ -236,6 +237,7 @@ Restoring ScheduleRestoreEvent::operator()(Retracted&& state) {
                 .prefix_granularity = state.prefix_granularity,
                 .req_pool_index = ReqPoolIndex{},  // the restore op holds the row until its ACK
                 .block_tables = std::move(block_tables_),
+                .copy_in_blocks = std::move(copy_in_blocks_),
                 .cache_progress = std::move(state.cache_progress),
                 .results_in_flight = 0,
             },

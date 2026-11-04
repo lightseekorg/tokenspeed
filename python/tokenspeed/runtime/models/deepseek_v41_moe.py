@@ -34,11 +34,7 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
-from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.linear import (
-    MergedColumnParallelLinear,
-    RowParallelLinear,
-)
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
     StandardTopKOutput,
@@ -69,62 +65,6 @@ def _deepseek_v4_mega_moe_max_num_tokens() -> int:
         global_server_args_dict.get("max_num_seqs", 0),
     ]
     return max([int(value or 0) for value in candidates] + [1])
-
-
-class DeepseekV4MLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-        swiglu_limit: float | None = None,
-        reduce_results: bool = False,
-        is_shared_expert: bool = False,
-    ) -> None:
-        super().__init__()
-        if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}")
-        tp = mapping.moe if is_shared_expert else mapping.dense
-        tp_rank = tp.tp_ep_rank if is_shared_expert else tp.tp_rank
-        tp_size = tp.tp_ep_size if is_shared_expert else tp.tp_size
-        tp_group = tp.tp_ep_group if is_shared_expert else tp.tp_group
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            reduce_results=reduce_results,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.swiglu_limit = swiglu_limit
-        self.act_fn = SiluAndMul(swiglu_limit)
-        self.reduce_results = reduce_results
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.tp_group = tp_group
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[0] == 0:
-            return x.new_empty((0, self.down_proj.output_size))
-        gate_up, _ = self.gate_up_proj(x)
-        out, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
-        return out
 
 
 def _random_expert_ids(
@@ -327,19 +267,29 @@ class DeepseekV4MoE(nn.Module):
         )
 
         if config.n_shared_experts is not None:
-            self.shared_experts = DeepseekV4MLP(
-                config.hidden_size,
-                config.moe_intermediate_size * config.n_shared_experts,
-                config.hidden_act,
-                mapping,
-                quant_config,
-                add_prefix("shared_experts", prefix),
-                swiglu_limit=getattr(config, "swiglu_limit", None),
+            # MegaMoE outputs are complete, so its shared expert stays dense and local.
+            if self.use_mega_moe or self.use_gluon_petit:
+                shared_tp_rank = mapping.dense.tp_rank
+                shared_tp_size = mapping.dense.tp_size
+                shared_tp_group = mapping.dense.tp_group
+            else:
+                shared_tp_rank = mapping.moe.tp_ep_rank
+                shared_tp_size = mapping.moe.tp_ep_size
+                shared_tp_group = mapping.moe.tp_ep_group
+            self.shared_experts = GatedMLP.tensor_parallel(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
+                activation=gated_activation(
+                    config.hidden_act, getattr(config, "swiglu_limit", None)
+                ),
+                tp_rank=shared_tp_rank,
+                tp_size=shared_tp_size,
+                tp_group=shared_tp_group,
                 reduce_results=False,
-                # Normal EP sums routed and shared partials over the same TPxEP
-                # group. Fused MegaMoE paths return complete routed outputs and
-                # therefore keep the shared expert dense and local.
-                is_shared_expert=not (self.use_mega_moe or self.use_gluon_petit),
+                fusions=(),
+                quant_config=quant_config,
+                prefix=add_prefix("shared_experts", prefix),
             )
         else:
             self.shared_experts = None

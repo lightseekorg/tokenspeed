@@ -47,6 +47,13 @@ public:
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
 
     const std::string& Id() const { return id_; }
+    const std::string& SessionId() const { return session_id_; }
+    // The registration of SessionId() under the request's access epoch that
+    // its first admission returned: held for the request's whole life, which
+    // every later admission, publication and restore under that epoch lies in.
+    void HoldSessionAccess(CacheCoordinator::SessionAccess session_access) {
+        session_access_ = std::move(session_access);
+    }
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -218,9 +225,19 @@ public:
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
         return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }
+    // Full prefix pages [first_page, past_end_page), all of them complete. A
+    // step hashes only the pages it completed through this, never a view of
+    // the whole context.
+    std::vector<std::span<const std::int32_t>> PrefixPages(std::int32_t first_page, std::int32_t past_end_page) const {
+        return token_container_.PrefixPages(prefix_granularity_, first_page, past_end_page);
+    }
     // Immutable input-page identities, owned by this request. Admission may
     // retry against changing cache contents without hashing the input again.
     std::span<const std::string> PromptPrefixHashes();
+    // The external KV-event hashes (HashKvBlock) of the first num_pages full
+    // pages, each chained on the one before. A page is hashed once, the first
+    // time it is asked for: its tokens never change.
+    std::span<const std::uint64_t> KvEventBlockHashes(std::size_t num_pages);
     std::span<const std::int32_t> TokenSlice(std::int32_t begin, std::int32_t size) const {
         return token_container_.TokenSlice(TokenContainer::Window{.begin = begin, .size = size});
     }
@@ -260,6 +277,12 @@ public:
     const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
     std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
+
+    // The copy-in blocks the request holds for its prompt end
+    // (fsm::ForwardResources::copy_in_blocks).
+    std::vector<std::vector<CacheBlockRef>>& CopyInBlocksRef() {
+        return forwardResources("CopyInBlocksRef").copy_in_blocks;
+    }
 
     fsm::CacheProgress CacheProgress() const { return forwardResources("CacheProgress").cache_progress; }
     // Written by the scheduler when an admission succeeds, like the block
@@ -317,6 +340,8 @@ private:
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 
     std::string id_;
+    std::string session_id_;
+    CacheCoordinator::SessionAccess session_access_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
@@ -327,6 +352,7 @@ private:
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
     std::optional<std::vector<std::string>> prompt_prefix_hashes_{};
+    std::vector<std::uint64_t> kv_event_block_hashes_;
     fsm::State state_;
 };
 

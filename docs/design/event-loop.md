@@ -18,8 +18,24 @@ One engine rank is one `ts-host` process. Its threads:
 | forward (`ts-forward`) | the Python `HostDataPlane`'s operations, one at a time in queue order: everything that touches CUDA | the `DeviceHandle`, behind it the executor, models, KV pools, CUDA graphs; takes the GIL per operation |
 
 Peripheral threads stay off the round: the wire's Tokio runtime
-(`ts_control::transport`), the PD transfer peer's workers (`ts-pd`), the
-grammar compilers, the KV event publisher, the expert-rebalance solver.
+(`ts_control::transport`, which also encodes each round's outputs), the PD
+transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
+publisher, the expert-rebalance solver.
+
+Request traces use a bounded, lossy background queue. Plugins register a provider
+with `register_trace_provider`, selected explicitly by `--trace-provider NAME`.
+The provider maps a request ID to `(trace_id, optional_parent_span_id)` or `None`;
+ID policies belong to plugins. It runs only on the export thread and must be
+short and nonblocking, without I/O or GPU access. Missing or invalid context
+preserves native IDs; span lifecycle and RID sampling remain unchanged.
+
+With `--enable-async-logging`, the Rust tracing writer and Python root logger
+also run off the serving threads. Each has a bounded, lossy queue: a slow
+output stream must not introduce I/O backpressure into a round. The host
+owns Python log cleanup explicitly after serving returns, including errors
+and encode ranks, before notifying its launcher of a failure. Returning from
+Rust does not finalize Python, so an `atexit` hook alone cannot drain those
+records. Cleanup is bounded because an output stream can remain stalled.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
@@ -55,11 +71,38 @@ comes back, so the loop sees only its own operations.
 
 Scheduler load travels on the same output wire, including an empty batch at
 startup and at most once per second without token outputs. Reports carry
-running and waiting counts and resident, active, and total LCM blocks. The
+running and waiting counts and resident, active, and total LCM blocks; the
+active count is at most 100 ms old (see the page gauges below). The
 native frontend timestamps receipt and exposes a complete per-rank snapshot
 set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
+
+## Request identity and submission failures
+
+The wire identifies a request and its output stream by `rid` alone. A new
+request, including a retry after abort, should use a fresh id. Before ingress
+can publish a refusal or register data-plane state, the loop discards repeated
+ids in the same received round and ids still owned by the output processor.
+The original request keeps its state and stream; a warning records the
+duplicate. Sending a final error for that duplicate would end the original
+stream, since the wire cannot distinguish the two submissions.
+
+Output completion and scheduler retirement are separate fences. After the
+output processor forgets a request, the scheduler may still hold it while
+forward results drain or until the next plan removes its finished entry.
+An id in that interval receives a 409 refusal before data-plane admission.
+The check uses the scheduler's existing request lookup; it does not reclaim
+an id ahead of its in-flight work. Once both owners have released an id, this
+admission guard allows it again.
+
+The Rust/C++ submission bridge returns `Result`: native validation exceptions
+must never escape a `noexcept` bridge. The scheduler validates a complete
+submission batch before inserting requests. If it rejects the batch, the
+loop finishes and releases those unscheduled requests with a client error
+and continues serving; it starts PD transfers only after submission succeeds.
+Already running requests remain intact. Other requests in a rejected batch
+also receive its error and can be retried with fresh ids.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
@@ -148,6 +191,10 @@ writes are not ordered with the device's -- and the forward thread checks it
 did. On a Prefill rank streaming layerwise, the forward thread arms the
 forward's chunks when it hands the plan over and counts the producer steps;
 the attention backends only tick the device counter (`StepCounter`).
+Each armed producer step gets one tick, after all of its cache writes have
+been queued on the producer stream. Splitting a layer's DSA index-cache write
+into kernel-sized chunks does not add producer steps: only the final chunk
+publishes cache readiness.
 
 Common MoE weight processing reserves persistent DeepEP communication
 storage, before attention/cache construction profiles available memory. The
@@ -537,6 +584,16 @@ Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
+`active_lcm_blocks()` walks every live request's block tables, which at long
+contexts costs more than the rest of a round, so the loop takes it at most
+once per 100 ms and the frontend's load report, the metrics and the batch line
+share that value; a round with no request running takes it again (it then
+costs nothing), so an engine that goes idle reports none active at once, and
+does not keep it, so the first round with requests takes a fresh one. The
+scheduler's other counts (`sizes()`) are a pass over its requests per state:
+a round takes them for the load report, and as it planned only when the
+metrics or a batch line read them (they share that read); the idle check takes
+them only when the loop holds no request, in-flight forward or open cache op.
 
 ## Subsystems in detail
 
@@ -832,4 +889,6 @@ a changed snapshot is also sent in an empty output batch. Client cancellation
 can reap the final request without producing a final token, so reporting only
 nonempty outputs would leave routing and drain checks with a stale running
 count. An unchanged idle load is sent at most once per second as a heartbeat,
-so the frontend can distinguish an idle engine from a stale connection.
+so the frontend can distinguish an idle engine from a stale connection. The
+active page count in it is reused for up to 100 ms (see the page gauges),
+far inside the three seconds the frontend considers a report fresh.

@@ -49,6 +49,9 @@ public:
     void Extend(const std::vector<std::int32_t>& new_tokens);
 
     std::vector<std::span<const std::int32_t>> FullPrefixPages(std::int32_t prefix_granularity, bool except_last) const;
+    // Full prefix pages [first_page, past_end_page), all of them complete.
+    std::vector<std::span<const std::int32_t>> PrefixPages(std::int32_t prefix_granularity, std::int32_t first_page,
+                                                           std::int32_t past_end_page) const;
     std::int32_t Size() const { return static_cast<std::int32_t>(tokens_.size()); }
     std::int32_t PrefillSize() const { return num_prefill_tokens_; }
     std::span<const std::int32_t> TokenSlice(Window window) const;

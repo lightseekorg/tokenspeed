@@ -171,7 +171,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
-        .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward);
+        .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
+        .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
+        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -323,7 +325,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
         .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
-        .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions);
+        .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
+        .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
 
@@ -454,11 +457,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
         .def_ro("spec_candidate_ids", &tokenspeed::ForwardBatch::spec_candidate_ids)
-        .def_prop_ro(
-            "block_tables",
-            [](const tokenspeed::ForwardBatch& op)
-                -> const std::map<std::string, std::vector<std::vector<std::int32_t>>>& { return op.block_tables; },
-            nb::rv_policy::reference_internal)
+        .def_prop_ro("block_tables", &tokenspeed::ForwardBatch::BlockTables)
         .def("block_tables_arrays",
              [](nb::handle self) {
                  // Zero-copy 2-D int32 views; `self` keeps the backing

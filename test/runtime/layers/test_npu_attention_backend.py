@@ -167,6 +167,7 @@ def test_cache_batch_metadata_accepts_npu_tables():
         device="npu",
         contract=contract,
         num_requests=1,
+        validate_page_ids=True,
     )
     table = metadata.tables(active_forward_op=forward_op)["full_attention"]
 

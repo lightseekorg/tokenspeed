@@ -193,6 +193,35 @@ def test_the_in_forward_state_checkpoint_is_off_unless_the_flag_is_given(
     assert cfg.state_checkpoint_in_forward is enabled
 
 
+@pytest.mark.parametrize(
+    "flags, requests",
+    [
+        ([], None),
+        (["--checkpoint-retention-requests", "0"], 0),
+        (["--checkpoint-retention-requests", "300"], 300),
+    ],
+)
+def test_checkpoint_retention_is_passed_only_when_given(flags, requests):
+    # Unset keeps the scheduler's default, 16 times the rank's batch size.
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.checkpoint_retention_requests == requests
+
+
+@pytest.mark.parametrize(
+    "flags, leaf_distance",
+    [([], 0), (["--checkpoint-retention-leaf-distance", "1"], 1)],
+)
+def test_checkpoint_retention_leaf_distance_is_passed_when_given(flags, leaf_distance):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.checkpoint_retention_leaf_distance == leaf_distance
+
+
 def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
     # Its checkpoint is only reachable through a prefix hit.
     with pytest.raises(ValueError, match="requires prefix caching"):

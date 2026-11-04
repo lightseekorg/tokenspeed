@@ -1686,9 +1686,11 @@ def _rope_inplace_kernel(
     X1,
     P0,
     CS0,
+    H,
     R: tl.constexpr,
     MAX_POS: tl.constexpr,
     B: tl.constexpr,
+    HB: tl.constexpr,
     WEIGHTS,
     W0,
     W1,
@@ -1696,27 +1698,29 @@ def _rope_inplace_kernel(
     SCALE_WEIGHTS: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    head = tl.program_id(1) * HB + tl.arange(0, HB)
+    live = head < H
     if SCALE_WEIGHTS:
         weight_ptr = WEIGHTS + token * W0 + head * W1
-        weight = tl.load(weight_ptr).to(tl.float32)
-        tl.store(weight_ptr, weight * WEIGHT_SCALE)
+        weight = tl.load(weight_ptr, live).to(tl.float32)
+        tl.store(weight_ptr, weight * WEIGHT_SCALE, live)
     # Keep padding/compressor sentinels in the caller's metadata. Only this
     # frequency-table lookup maps negative positions to the identity row.
     position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
     valid = position < MAX_POS
     tl.device_assert(valid, "RoPE position is outside the cosine/sine table")
     pair = tl.arange(0, B)
-    mask = (pair < R // 2) & valid
-    base = X + token * X0 + head * X1
-    even = tl.load(base + 2 * pair, mask, 0.0)
-    odd = tl.load(base + 2 * pair + 1, mask, 0.0)
-    cosine = tl.load(CS + position * CS0 + pair, mask, 0.0)
-    sine = tl.load(CS + position * CS0 + R // 2 + pair, mask, 0.0)
+    pair_mask = (pair < R // 2) & valid
+    mask = live[:, None] & pair_mask[None, :]
+    base = X + token * X0 + head[:, None] * X1 + 2 * pair[None, :]
+    even = tl.load(base, mask, 0.0)
+    odd = tl.load(base + 1, mask, 0.0)
+    cosine = tl.load(CS + position * CS0 + pair, pair_mask, 0.0)[None, :]
+    sine = tl.load(CS + position * CS0 + R // 2 + pair, pair_mask, 0.0)[None, :]
     out_even = _rotate_interleaved(even, odd, cosine, sine, False)
     out_odd = _rotate_interleaved(odd, even, cosine, sine, True)
-    tl.store(base + 2 * pair, out_even.to(even.dtype), mask)
-    tl.store(base + 2 * pair + 1, out_odd.to(odd.dtype), mask)
+    tl.store(base, out_even.to(even.dtype), mask)
+    tl.store(base + 1, out_odd.to(odd.dtype), mask)
 
 
 @_register_rope("dsv41_rope_inplace")
@@ -1739,7 +1743,9 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
     # launch there and scale the owned weights with the existing tensor op.
     scale_separately = weights is not None and values.shape[0] * heads > 4096
     fused_weights = None if scale_separately else weights
-    _rope_inplace_kernel[(values.shape[0], heads)](
+    # A program per token and 8 heads: one head's tail is too little work for a program.
+    heads_per_program = min(triton.next_power_of_2(heads), 8)
+    _rope_inplace_kernel[(values.shape[0], triton.cdiv(heads, heads_per_program))](
         values[..., -rotary_dim:],
         positions,
         cache,
@@ -1747,9 +1753,11 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
         0 if values.ndim == 2 else values.stride(1),
         positions.stride(0),
         cache.stride(0),
+        heads,
         rotary_dim,
         cache.shape[0],
         max(triton.next_power_of_2(rotary_dim // 2), 16),
+        heads_per_program,
         fused_weights,
         0 if fused_weights is None else fused_weights.stride(0),
         0 if fused_weights is None else fused_weights.stride(1),
@@ -2884,9 +2892,8 @@ def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
     width = logits.shape[1]
     logical_width = (width + block_size - 1) // block_size
     stride = (logical_width + alignment - 1) // alignment * alignment
-    scores = torch.empty(
-        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
-    )
+    dtype = logits.dtype if block_size == 1 and not pin_newest else torch.float32
+    scores = torch.empty((logits.shape[0], stride), dtype=dtype, device=logits.device)
     end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
     if block_size == 1 and not pin_newest:
         _prepare_dense[(logits.shape[0], triton.cdiv(stride, 1024))](
@@ -2931,7 +2938,7 @@ def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment)
     end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
     stride = (count * block_size + alignment - 1) // alignment * alignment
     scores = torch.empty(
-        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
+        (logits.shape[0], stride), dtype=logits.dtype, device=logits.device
     )
     # Small candidate sets fit their scores in the normalization CTA. Larger
     # sets need the separate tiled gather to retain memory-level parallelism.
@@ -3478,7 +3485,7 @@ def _block_maxima_kernel(
     blocks,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1) * TILE + tl.arange(0, TILE)
     col = block[:, None] * 8 + tl.arange(0, 8)[None, :]
     values = tl.load(
@@ -3571,7 +3578,7 @@ def _clean_block_maxima_kernel(
     workers,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     worker = tl.program_id(1)
     length = tl.minimum(tl.maximum(tl.load(Lengths + row * length_stride), 0), width)
     end = (length + 7) // 8
@@ -3605,7 +3612,7 @@ def _clean_block_maxima_kernel(
 def clean_block_maxima(
     scores: torch.Tensor, visible: torch.Tensor, table: torch.Tensor, num_pages: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Clean paged FP32 scores and reduce their visible eight-token blocks.
+    """Clean paged FP32/BF16 scores and return FP32 eight-token block maxima.
 
     ``table`` maps each row's logical 64-token pages to physical page IDs.
     Invalid pages inside the visible prefix are masked to -inf. Return fixed-
@@ -3617,7 +3624,7 @@ def clean_block_maxima(
         scores.ndim != 2
         or scores.shape[1] == 0
         or scores.stride(1) != 1
-        or scores.dtype != torch.float32
+        or scores.dtype not in (torch.float32, torch.bfloat16)
         or visible.ndim != 1
         or visible.numel() != scores.shape[0]
         or table.ndim != 2
@@ -3629,7 +3636,7 @@ def clean_block_maxima(
     # Enough independent tiles for long contexts; short rows exit on the GPU.
     workers = min(triton.cdiv(width, 1024), 256)
     cleaned = torch.empty((rows, width), device=scores.device, dtype=scores.dtype)
-    maxima = torch.empty((rows, blocks), device=scores.device, dtype=scores.dtype)
+    maxima = torch.empty((rows, blocks), device=scores.device, dtype=torch.float32)
     ends = torch.empty((rows,), device=scores.device, dtype=torch.int32)
     if rows:
         _clean_block_maxima_kernel[(rows, workers)](
@@ -3925,11 +3932,11 @@ def _clean_logits_output(
         or values.shape[0] != lengths.numel()
         or values.shape[1] < capacity
         or values.stride(1) != 1
-        or values.dtype != torch.float32
+        or values.dtype not in (torch.float32, torch.bfloat16)
     ):
-        raise RuntimeError("DeepGEMM returned incompatible FP32 score geometry")
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
     output = torch.empty(
-        (values.shape[0], capacity), dtype=torch.float32, device=values.device
+        (values.shape[0], capacity), dtype=values.dtype, device=values.device
     )
     if output.numel():
         _clean_logits[(values.shape[0], triton.cdiv(capacity, 1024))](

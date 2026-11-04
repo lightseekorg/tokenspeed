@@ -1,4 +1,4 @@
-name: PR Test NVIDIA ARM
+name: NVIDIA ARM Tests
 
 # Split GB200/Grace NVIDIA CI into its own workflow so ARM jobs can be rerun
 # without waiting for the other NVIDIA runner pools.
@@ -17,7 +17,7 @@ on:
       - ".github/workflows/amd-mi350-tests.yml"
       - ".github/workflows/amd-mi450-tests.yml"
       - ".github/workflows/nvidia-b200-tests.yml"
-      - ".github/workflows/pr-test-nvidia-arm.yml"
+      - ".github/workflows/nvidia-arm-tests.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -34,7 +34,7 @@ on:
       - ".github/workflows/amd-mi350-tests.yml"
       - ".github/workflows/amd-mi450-tests.yml"
       - ".github/workflows/nvidia-b200-tests.yml"
-      - ".github/workflows/pr-test-nvidia-arm.yml"
+      - ".github/workflows/nvidia-arm-tests.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
     inputs:
@@ -58,7 +58,7 @@ env:
 
 concurrency:
   group: pr-test-nvidia-arm-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   scan:
@@ -210,8 +210,8 @@ jobs:
         run: |
           for result in "$UNIT_TEST_RESULT" "$MODEL_TEST_RESULT"; do
             if [[ "$result" != "success" && "$result" != "skipped" ]]; then
-              echo "PR Test NVIDIA ARM did not finish successfully: dependency result=$result"
+              echo "NVIDIA ARM Tests did not finish successfully: dependency result=$result"
               exit 1
             fi
           done
-          echo "PR Test NVIDIA ARM finished."
+          echo "NVIDIA ARM Tests finished."

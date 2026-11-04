@@ -121,6 +121,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_swa_group.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
+        tests/cpp/test_checkpoint_retention.cpp
         tests/cpp/test_storage_query.cpp
         tests/cpp/test_state_checkpoints.cpp
         tests/cpp/test_joint_match_invariants.cpp
@@ -139,6 +140,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_capacity_model.cpp
         tests/cpp/test_shadow_occupancy.cpp
         tests/cpp/test_closed_loop_random.cpp
+        tests/cpp/test_utils.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests
