@@ -120,10 +120,10 @@ def gemv_a16w16_splitk_weights_paced_gfx950(
     """:func:`gemv_a16w16_splitk_weights_gfx950` with at most ``WINDOW``
     tiles' loads in flight per wave: before issuing tile ``t >= WINDOW`` the
     wave waits until ``(WINDOW - 1)`` tiles' loads remain (a counted
-    ``s_waitcnt vmcnt``, never ``vmcnt(0)``). A stream that overlaps a
-    latency-bound chain stays below the fabric's knee this way; the rate is
-    about ``waves * WINDOW * tile bytes`` per load latency per CU. Loads the
-    wave issued earlier count against the window too.
+    ``s_waitcnt vmcnt``, never ``vmcnt(0)``). This bounds a stream that
+    overlaps a latency-bound chain to about ``waves * WINDOW * tile bytes``
+    per load latency per CU, so it leaves memory bandwidth for the chain.
+    Loads the wave issued earlier count against the window too.
     """
     WAVES: gl.constexpr = gl.num_warps()
     TILES: gl.constexpr = ROWS_PER_TASK // 16
@@ -463,7 +463,7 @@ def gemv_a16w16_splitk_weight_steps_windowed_gfx950(
     """:func:`gemv_a16w16_splitk_weight_steps_gfx950` paced by K step: at
     most ``LOADS`` of the stream's step loads (one 16-byte load per lane,
     ``16 * 32 * 2 * waves`` bytes per workgroup) in flight, for streams
-    finer than one tile per window (a 16-row router task is one tile).
+    finer than one tile per window (a 16-row task is one tile).
     ``ISSUED`` is how many of the same stream's loads the wave issued just
     before (a previous call), so two calls pace as one stream."""
     TILES: gl.constexpr = ROWS_PER_TASK // 16

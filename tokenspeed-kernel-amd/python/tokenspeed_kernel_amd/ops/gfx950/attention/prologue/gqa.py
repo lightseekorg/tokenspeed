@@ -27,7 +27,7 @@ sin)`` / ``fma(x2, cos, x1 * sin)`` over the whole head, and one rounding
 (RTNE) to the destination dtype.
 
 ``gqa_prologue_query_gfx950`` / ``_key_gfx950`` / ``_value_gfx950`` take one
-head's rows as values, so a kernel that computes them (a fused decoder layer
+head's rows as values, so a kernel that computes them (for example by
 summing split-K partials) needs no round trip through memory;
 ``gqa_prologue_head_gfx950`` loads them first. ``gluon_gqa_prologue_gfx950``
 runs every head of a token block in its own program.

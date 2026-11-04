@@ -743,7 +743,7 @@ class AttentionProgram:
         retire in order but reach the L2 channels in any order, so its record
         must follow the wait that covers them, and no barrier is needed. The
         wait also covers any loads the wave still has in flight, so the
-        caller should hold none (attention workgroups carry no weights).
+        caller should hold none.
         ``tag`` is a nonzero int32 that differs from the buffer's previous
         use (the launch tag). ``merge_split_records`` reads the records on the
         same XCD.
@@ -779,9 +779,8 @@ class AttentionProgram:
         returns in every wave once that wave has seen the ``count`` int32
         records from ``first`` equal ``tag`` (each wave polls them, or one
         polls behind a workgroup barrier), or stops the launch at its
-        deadline. In
-        the layer it is the scalar 16-tag poll (``poll_tags16``) over the
-        block's 64-byte record lines. The splits merge in split order, as
+        deadline, for example a scalar poll of the block's 64-byte record
+        lines (``poll_tags16``). The splits merge in split order, as
         ``finalize_splits`` merges them, so the rows are bitwise the same; the
         partials are read ``.cg``.
 
@@ -861,9 +860,9 @@ class AttentionProgram:
         WAIT_RECORDS: gl.constexpr,
         launch,
     ):
-        """``merge_split_records`` for block rows ``offs_m`` only: the spread
-        merge, in which every split of the block merges its own share of the
-        rows once every record carries ``tag``.
+        """``merge_split_records`` for block rows ``offs_m`` only, so every
+        split of the block can merge its own share of the rows once every
+        record carries ``tag``.
 
         ``offs_m`` / ``offs_d`` are the rows and the head-dimension offsets,
         slices of one 2-D layout, which is the result's (such as one row per
@@ -2282,8 +2281,8 @@ def store_balanced_partial_gfx950(
     The token load is issued after the stores and before anything later
     (``issue_order`` on both sides). One wave's vector memory operations
     complete in issue order, so waiting for the token covers the stores but
-    none of the loads the caller issues after this call: a persistent kernel
-    issues its next role's weights here, between the store and the record.
+    none of the loads the caller issues after this call, so a persistent
+    caller can issue its next task's weights between the store and the record.
 
     Returns:
         The token, int32 ``[64 * NUM_WARPS]`` (one lane per lane).
