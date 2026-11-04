@@ -225,7 +225,7 @@ fn export(agent: &ureq::Agent, endpoint: &str, model_name: &str, batch: &[TraceR
 /// The `ExportTraceServiceRequest` one batch becomes. Integers are strings
 /// and ids hex, as protobuf's JSON mapping writes 64-bit and bytes fields.
 fn otlp_request(model_name: &str, batch: &[TraceRecord]) -> Value {
-    let spans: Vec<Value> = batch.iter().map(|record| span(record)).collect();
+    let spans: Vec<Value> = batch.iter().map(span).collect();
     json!({
         "resourceSpans": [{
             "resource": {"attributes": [
@@ -478,11 +478,10 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buffer = [0u8; 8192];
             let mut head = Vec::new();
-            let mut read = 0usize;
             // Read until the header's end; a peer that closes early fails
             // the test instead of hanging it.
             while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                read = stream.read(&mut buffer).expect("read the head");
+                let read = stream.read(&mut buffer).expect("read the head");
                 assert!(read > 0, "the peer closed before the header ended");
                 head.extend_from_slice(&buffer[..read]);
             }
@@ -495,7 +494,7 @@ mod tests {
                 .parse()
                 .expect("a number");
             let header_end = head.find("\r\n\r\n").expect("the end") + 4;
-            let mut body = head[header_end..].as_bytes().to_vec();
+            let mut body = head.as_bytes()[header_end..].to_vec();
             while body.len() < length {
                 let n = stream.read(&mut buffer).expect("read the body");
                 body.extend_from_slice(&buffer[..n]);
