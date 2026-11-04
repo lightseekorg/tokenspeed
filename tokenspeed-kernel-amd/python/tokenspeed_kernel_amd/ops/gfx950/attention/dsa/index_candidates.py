@@ -39,6 +39,20 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import
 )
 
 
+def _owned_query_group_metadata(q, pages, lengths, query_group_size):
+    """Validate the dense plan before forming its strided per-request view."""
+    if query_group_size not in (1, 2, 3, 4, 5, 6):
+        raise ValueError("owned-page query groups must contain one to six verify rows")
+    if q.shape[0] % query_group_size:
+        raise ValueError("owned-page query groups must be complete")
+    if pages.shape[0] != q.shape[0] or lengths.numel() != q.shape[0]:
+        raise ValueError("owned-page metadata must cover every query row")
+    _check_standard_decode_metadata(q, lengths, pages, 1)
+    table = pages[query_group_size - 1 :: query_group_size]
+    seq_lens = lengths[query_group_size - 1 :: query_group_size].contiguous()
+    return table, seq_lens
+
+
 def launch_gluon_dsa_index_candidates_gfx950(
     q: torch.Tensor,
     q_scales: torch.Tensor,
@@ -67,19 +81,9 @@ def launch_gluon_dsa_index_candidates_gfx950(
         raise TypeError(
             "owned-page native scorer requires FP8 queries and explicit scales"
         )
-    if query_group_size not in (1, 2, 3, 4, 5, 6):
-        raise ValueError("owned-page query groups must contain one to six verify rows")
-    if q.shape[0] % query_group_size:
-        raise ValueError("owned-page query groups must be complete")
-    if pages.shape[0] != q.shape[0] or lengths.numel() != q.shape[0]:
-        raise ValueError("owned-page metadata must cover every query row")
-    if lengths.dtype != torch.int32 or not lengths.is_contiguous():
-        raise ValueError("owned-page visible lengths must be contiguous int32")
+    table, seq_lens = _owned_query_group_metadata(q, pages, lengths, query_group_size)
     if any(value.nbytes >= 2**31 for value in (q, q_scales, weights, lengths)):
         raise ValueError("owned-page query buffers must fit int32 offsets")
-    table = pages[query_group_size - 1 :: query_group_size]
-    seq_lens = lengths[query_group_size - 1 :: query_group_size].contiguous()
-    _check_standard_decode_metadata(q, seq_lens, table, query_group_size)
     width = pages.shape[1] * page_size
     if width < 1:
         raise ValueError("owned-page metadata needs positive column capacity")
