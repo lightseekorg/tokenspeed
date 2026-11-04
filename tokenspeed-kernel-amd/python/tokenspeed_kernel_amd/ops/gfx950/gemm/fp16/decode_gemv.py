@@ -419,7 +419,6 @@ def gluon_rowcta_bf16_gemv_rows_gfx950(
         WAVES_PER_OUTPUT,
         OUTPUTS_PER_WAVE,
         NUM_WARPS,
-        "",
     )
     layout: gl.constexpr = sums.type.layout
     rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
