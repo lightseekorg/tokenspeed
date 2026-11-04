@@ -1077,6 +1077,30 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert all(spec.transfer_policy is None for spec in specs.values())
 
 
+@pytest.mark.parametrize("chunk", [4096, 32768])
+@pytest.mark.parametrize("overlap_depth", [0, 1])
+def test_workspace_reserves_full_paged_decode_scores(chunk, overlap_depth):
+    recipe = _recipe("cpu")
+    max_bs, verify_width, context = 1024, 4, 1 << 20
+    config = recipe.attn_config
+    spec = config.component(DeepseekV41Config)
+    recipe.attn_config = replace(
+        config,
+        context_len=context,
+        max_bs=max_bs,
+        speculative_num_draft_tokens=verify_width,
+        components=(replace(spec, max_query_tokens=max(chunk, max_bs * verify_width)),),
+    )
+    recipe.decode_input_tokens = verify_width
+    recipe.overlap_schedule_depth = overlap_depth
+    columns = v41_table_widths(context, (1 + overlap_depth) * verify_width)[R1] * 64
+    # An exact-page context still needs another page for in-flight tokens.
+    assert columns > context
+    # Native BF16 logits and the cleaned scores are simultaneously live.
+    score_bytes = max_bs * verify_width * columns * 2
+    assert recipe.workspace_bytes() >= 2 * score_bytes
+
+
 def test_pool_reports_the_whole_arena_as_kv_bytes():
     # The startup memory summary reads this; without it the arena is
     # misattributed to activations and the KV row prints 0.
