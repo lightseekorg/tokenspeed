@@ -20,7 +20,7 @@
 
 """Block verification with vocabulary-block residual reductions.
 
-Steps and notation follow ``tokenspeed_kernel.ops.sampling.block``. Four
+Steps and notation follow ``tokenspeed_kernel.ops.sampling.block_verify``. Four
 launches, each request owned by one program per launch:
 
 - ``_prefix_ratios`` (B): prefix ratios ``r_i`` in log space and the number of

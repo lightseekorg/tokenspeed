@@ -23,7 +23,7 @@
 import numpy as np
 import pytest
 import torch
-from tokenspeed_kernel.ops.sampling.block import block_speculative_sampling
+from tokenspeed_kernel.ops.sampling.block_verify import block_speculative_sampling
 
 
 def run(p, q, c, u, f, device):
@@ -269,7 +269,7 @@ def test_gpu_batch_size_and_strides_do_not_recompile():
     # N and V are server geometry; the batch size and coin/candidate strides
     # change every step and must stay runtime values.
     # The shared test utilities need a GPU platform at import time.
-    from tokenspeed_kernel.ops.sampling.triton import block as triton_block
+    from tokenspeed_kernel.ops.sampling.triton import block_verify as triton_block
     from utils import assert_no_triton_compile
 
     rng = np.random.default_rng(47)

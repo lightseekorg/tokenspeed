@@ -95,7 +95,7 @@ def block_speculative_sampling(
     if not target_probs.is_cuda:
         kernel = torch_block_verify
     else:
-        import tokenspeed_kernel.ops.sampling.triton.block  # noqa: F401
+        import tokenspeed_kernel.ops.sampling.triton.block_verify  # noqa: F401
 
         # The torch oracle loops over rows on the host and shares the triton
         # leaf's priority, so device tensors name the triton solution.
