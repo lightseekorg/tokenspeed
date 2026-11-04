@@ -42,6 +42,8 @@ use std::{
 
 use serde_json::{json, Value};
 
+use crate::output::Role;
+
 /// How many spans may wait for the export thread.
 const CHANNEL_SPANS: usize = 4096;
 
@@ -59,6 +61,8 @@ const DROPPED_WARN_EVERY: u64 = 1024;
 pub struct TraceRecord {
     /// The request's id, the span's `gen_ai.response.id`.
     pub rid: String,
+    /// Whether this span covers local prefill, decode, or both.
+    pub role: Role,
     /// The continual-prompting session, when the request named one.
     pub session: Option<String>,
     /// Request creation supplied by the frontend: the span's start.
@@ -335,32 +339,42 @@ fn span(record: &TraceRecord) -> Value {
         "tokenspeed.timing_scope",
         "request_created_to_engine_release",
     ));
+    attributes.push(string_attribute(
+        "tokenspeed.engine_role",
+        match record.role {
+            Role::Plain => "plain",
+            Role::Prefill => "prefill",
+            Role::Decode => "decode",
+        },
+    ));
     // These are host-observed lifecycle intervals, not GPU execution times.
+    // Creation is frontend-supplied; queue time can include frontend preparation
+    // and, on D, remote prefill. Neither is a scheduler-only measurement.
     for (name, start, end) in [
         ("tokenspeed.ttft_ms", record.created, record.first_token),
         ("tokenspeed.total_ms", record.created, record.finish),
         ("tokenspeed.queue_ms", record.created, record.scheduled),
-        (
-            "tokenspeed.prefill_process_ms",
-            record.scheduled,
-            record.prefill_done,
-        ),
-        (
-            "tokenspeed.decode_process_ms",
-            record.first_token,
-            record.finish,
-        ),
     ] {
         if let Some(ms) = elapsed_ms(start, end) {
             attributes.push(double_attribute(name, ms));
         }
     }
-    if record.output_tokens > 1 {
+    // A D worker does not observe remote prefill dispatch. A P worker's
+    // post-token lifetime is KV-transfer waiting, not decode processing.
+    if record.role != Role::Decode {
+        if let Some(ms) = elapsed_ms(record.scheduled, record.prefill_done) {
+            attributes.push(double_attribute("tokenspeed.prefill_process_ms", ms));
+        }
+    }
+    if record.role != Role::Prefill {
         if let Some(ms) = elapsed_ms(record.first_token, record.finish) {
-            attributes.push(double_attribute(
-                "tokenspeed.tpot_ms",
-                ms / (record.output_tokens - 1) as f64,
-            ));
+            attributes.push(double_attribute("tokenspeed.decode_process_ms", ms));
+            if record.output_tokens > 1 {
+                attributes.push(double_attribute(
+                    "tokenspeed.tpot_ms",
+                    ms / (record.output_tokens - 1) as f64,
+                ));
+            }
         }
     }
     if let Some(session) = &record.session {
@@ -462,6 +476,7 @@ mod tests {
     fn record() -> TraceRecord {
         TraceRecord {
             rid: "chatcmpl-1".to_owned(),
+            role: Role::Plain,
             session: Some("sess-7".to_owned()),
             created: 1_700_000_000.0,
             scheduled: 1_700_000_000.5,
@@ -585,6 +600,31 @@ mod tests {
                 "tokenspeed.timing_scope",
                 "request_created_to_engine_release",
             )));
+    }
+
+    #[test]
+    fn phase_durations_follow_the_engine_role() {
+        let mut record = record();
+        for (role, name) in [(Role::Prefill, "prefill"), (Role::Decode, "decode")] {
+            record.role = role;
+            let value = span(&record);
+            assert!(value["attributes"]
+                .as_array()
+                .unwrap()
+                .contains(&string_attribute("tokenspeed.engine_role", name),));
+            assert_eq!(timing(&value, "total"), Some(2000.0));
+            assert_eq!(timing(&value, "ttft"), Some(1250.0));
+            assert_eq!(timing(&value, "queue"), Some(500.0));
+            if role == Role::Prefill {
+                assert_eq!(timing(&value, "prefill_process"), Some(500.0));
+                assert_eq!(timing(&value, "decode_process"), None);
+                assert_eq!(timing(&value, "tpot"), None);
+            } else {
+                assert_eq!(timing(&value, "prefill_process"), None);
+                assert_eq!(timing(&value, "decode_process"), Some(750.0));
+                assert_eq!(timing(&value, "tpot"), Some(750.0 / 7.0));
+            }
+        }
     }
 
     #[test]
