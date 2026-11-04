@@ -19,10 +19,12 @@
 # SOFTWARE.
 
 """``--decode-monokernel`` at launch: a model without decode monokernels fails
-startup instead of serving without them. CPU only."""
+startup instead of serving without them, and a model with them reads the
+switch from its config. CPU only."""
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -32,7 +34,7 @@ import pytest
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
-from test.runtime.models.conftest import server_args  # noqa: E402
+from test.runtime.models.conftest import model_config, server_args  # noqa: E402
 
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -46,3 +48,25 @@ def test_the_switch_fails_a_model_without_monokernels(checkpoints) -> None:
 
 def test_without_the_switch_the_model_launches(checkpoints) -> None:
     assert not server_args(checkpoints["other"]).decode_monokernel
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_the_switch_reaches_the_model_config(tmp_path, switch) -> None:
+    """A Qwen4-Exp model builds its monokernel layers when its text config
+    says so: ModelConfig sets it from the switch."""
+    config = {
+        "architectures": ["Qwen4ExpForCausalLM"],
+        "model_type": "qwen4_exp_text",
+        "vocab_size": 128,
+        "hidden_size": 128,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "max_position_embeddings": 2048,
+        "torch_dtype": "bfloat16",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    args = server_args(tmp_path, decode_monokernel=switch)
+    assert model_config(args).hf_text_config.decode_monokernel is switch

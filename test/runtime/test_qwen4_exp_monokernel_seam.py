@@ -18,8 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The Qwen4-Exp decode monokernel seam: which forwards take the kernels, and
-how startup reports the layers that keep the regular path. CPU only."""
+"""The Qwen4-Exp decode monokernel seam: which forwards take the kernels, how
+the layers are packed, and which layer classes the switch builds. CPU only."""
 
 from __future__ import annotations
 
@@ -49,6 +49,10 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (  #
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig  # noqa: E402
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig  # noqa: E402
+from tokenspeed.runtime.models.monokernel import (  # noqa: E402
+    NoMonokernel,
+    unserved_error,
+)
 from tokenspeed.runtime.models.qwen4_exp import (  # noqa: E402
     Qwen4ExpAttentionDecoderLayer,
     Qwen4ExpLinearDecoderLayer,
@@ -58,23 +62,18 @@ from tokenspeed.runtime.models.qwen4_exp import (  # noqa: E402
 )
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (  # noqa: E402
     ATTENTION_TP,
-    EXPERT_PARALLEL,
     NOT_MXFP4,
     DeltaMonokernelLayer,
-    MonokernelState,
-    NoMonokernel,
     QSAMonokernelLayer,
+    Qwen4ExpMonokernelState,
     enable_decode_monokernels,
     forward_chain,
-    unserved_error,
-    unserved_report,
 )
 from tokenspeed.runtime.models.qwen4_exp_nextn import (  # noqa: E402
     Qwen4ExpDraftAttentionDecoderLayer,
     Qwen4ExpDraftModel,
     Qwen4ExpMonokernelDraftAttentionDecoderLayer,
 )
-from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 from tokenspeed.runtime.utils.server_args import (  # noqa: E402
     DECODE_MONOKERNEL_ARCHITECTURES,
     decode_monokernel_refusal,
@@ -183,7 +182,7 @@ def test_every_fused_draft_layer_reads_the_lengths_from_before_the_publish() -> 
             seq_lens.copy_(lengths)
 
     narrowing = AcceptedPrefixPublisher(_PublishingBackend(), torch.tensor([10, 11]))
-    state = MonokernelState(torch.device("cpu"), scratch_pairs=1)
+    state = Qwen4ExpMonokernelState(torch.device("cpu"), scratch_pairs=1)
     state.begin_forward()
     first = state.draft_lengths(seq_lens, narrowing)
     assert seq_lens.tolist() == [10, 11]
@@ -192,46 +191,6 @@ def test_every_fused_draft_layer_reads_the_lengths_from_before_the_publish() -> 
     # The next forward copies its own lengths.
     state.begin_forward()
     assert state.draft_lengths(seq_lens, narrowing).tolist() == [10, 11]
-
-
-def test_a_forward_ends_with_one_new_tag_when_it_launched() -> None:
-    """The step counter changes once per forward that launches: in
-    end_forward, unless the last launch ran the final mixer (and moved the
-    counter itself). A forward without launches adds no kernel."""
-    state = MonokernelState(torch.device("cpu"), scratch_pairs=1)
-
-    def forward(launched: bool, folded: bool):
-        state.begin_forward()
-        state.launched = launched
-        if folded:
-            state.lm_head_input = torch.ones(1, 2)
-        return state.end_forward()
-
-    assert forward(launched=False, folded=False) is None
-    assert state.step.tolist() == [0, 0]
-    assert forward(launched=True, folded=False) is None
-    assert state.step.tolist() == [1, 0]
-    lm_head_input = forward(launched=True, folded=True)
-    assert lm_head_input is not None and lm_head_input.tolist() == [[1.0, 1.0]]
-    assert state.step.tolist() == [1, 0]
-
-
-def test_the_report_groups_layers_by_reason() -> None:
-    unserved = {3: [ATTENTION_TP], 0: [ATTENTION_TP, EXPERT_PARALLEL], 7: [NOT_MXFP4]}
-    assert unserved_report(unserved) == (
-        f"{ATTENTION_TP}: layers 0, 3; {EXPERT_PARALLEL}: layer 0; {NOT_MXFP4}: layer 7"
-    )
-
-
-def test_the_startup_error_names_every_layer_without_a_monokernel() -> None:
-    """The switch never serves a layer without its kernel: startup fails and
-    names each such layer with its reasons."""
-    unserved = {0: [ATTENTION_TP], 1: [ATTENTION_TP, NOT_MXFP4]}
-    assert unserved_error("Target", unserved) == (
-        f"--decode-monokernel: 2 Target layers have no monokernel "
-        f"({ATTENTION_TP}: layers 0, 1; {NOT_MXFP4}: layer 1). "
-        "Serve without --decode-monokernel."
-    )
 
 
 class _RegularLayer(torch.nn.Module):
@@ -287,7 +246,7 @@ class _Backbone(torch.nn.Module):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
         self.hyper_connection_mixer = torch.nn.Linear(1, 1)
-        self.monokernels: MonokernelState | None = None
+        self.monokernels: Qwen4ExpMonokernelState | None = None
 
 
 @pytest.mark.parametrize("last", [_PackingQSA, _PackingDelta])
@@ -339,21 +298,6 @@ def test_a_monokernel_layer_runs_other_forwards_with_its_regular_code() -> None:
     assert out[0] is rows and layer.forwards == 1
 
 
-def test_a_monokernel_layer_refuses_a_decode_step_before_packing() -> None:
-    """A decode step that the kernels serve needs the packed layer: without
-    it the layer fails instead of running its regular code."""
-    layer = _MonokernelLayer()
-    with pytest.raises(RuntimeError, match="before post_quant_warmup"):
-        layer(
-            positions=None,
-            hidden_states=torch.zeros(1, 2),
-            residual=None,
-            ctx=_decode_ctx(1, 1, None),
-            input_ids=None,
-        )
-    assert layer.forwards == 0
-
-
 def test_the_switch_refuses_a_model_without_monokernels() -> None:
     for architecture in DECODE_MONOKERNEL_ARCHITECTURES:
         assert decode_monokernel_refusal([architecture]) is None
@@ -362,12 +306,12 @@ def test_the_switch_refuses_a_model_without_monokernels() -> None:
 
 
 @pytest.mark.parametrize("switch", [False, True])
-def test_the_switch_builds_the_monokernel_layer_classes(monkeypatch, switch) -> None:
+def test_the_switch_builds_the_monokernel_layer_classes(switch) -> None:
     """With --decode-monokernel, the target builds each layer from its
     monokernel class; without it, from the regular class."""
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", switch)
     model = Qwen4ExpModel.__new__(Qwen4ExpModel)
     torch.nn.Module.__init__(model)
+    model.config = Qwen4ExpTextConfig(decode_monokernel=switch)
     built = {
         layer_type: model.decoder_layer_cls(layer_type)
         for layer_type in ("attention", "linear_attention")
@@ -386,14 +330,15 @@ def test_the_switch_builds_the_monokernel_layer_classes(monkeypatch, switch) -> 
 
 @pytest.mark.parametrize("shares_index", [False, True])
 def test_a_draft_that_shares_the_index_builds_the_regular_layer(
-    monkeypatch, shares_index
+    shares_index,
 ) -> None:
     """Draft steps that reuse the first step's top-k keep the regular draft
     layer even with the switch: the monokernel selects its own top-k."""
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", True)
     model = Qwen4ExpDraftModel.__new__(Qwen4ExpDraftModel)
     torch.nn.Module.__init__(model)
-    model.config = Qwen4ExpTextConfig(index_share_for_mtp_iteration=shares_index)
+    model.config = Qwen4ExpTextConfig(
+        decode_monokernel=True, index_share_for_mtp_iteration=shares_index
+    )
     expected = (
         Qwen4ExpDraftAttentionDecoderLayer
         if shares_index

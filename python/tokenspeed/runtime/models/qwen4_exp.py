@@ -63,6 +63,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.monokernel import MonokernelState
 from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5ForCausalLM,
@@ -77,14 +78,12 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
 )
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (
     DeltaMonokernelLayer,
-    MonokernelState,
     QSAMonokernelLayer,
     enable_decode_monokernels,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -548,8 +547,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         }[layer_type]
 
     def _decode_monokernel(self) -> bool:
-        """Whether the layers are the monokernel classes."""
-        return global_server_args_dict["decode_monokernel"]
+        """Whether the layers are the monokernel classes
+        (``--decode-monokernel``)."""
+        return self.config.decode_monokernel
 
     def __init__(
         self,

@@ -14,7 +14,7 @@ while earlier stages still compute.
 |---|---|---|
 | Kernel boundary | [`tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/`](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md) | The ops that a model calls: `prepare_*` and `*_decode`, through `select_kernel`. `prepare_*` packs a layer once after loading and returns `None` when no kernel serves the layer. The README gives the API, the steps to add a model and links to each vendor's README. |
 | Vendor kernels | The vendor's kernel package, under `ops/<arch>/monokernel/` | The building blocks that every model's kernels share (plans, mailboxes, GEMVs, trace), and one directory for each model's stages and layer kernels. Its README describes the files, the rules for writing a stage and the performance workflow. |
-| Runtime seam | `python/tokenspeed/runtime/models/<model>_monokernel.py` | The monokernel layer classes (subclasses of the regular layers), packing from the model's modules with the reasons of a layer that cannot be packed, and the step counter. |
+| Runtime seam | `python/tokenspeed/runtime/models/monokernel.py`, and `<model>_monokernel.py` next to it | The shared part: the layer mixin that selects the launch or the regular layer's code, the state that all launches share (the scratch and the step counter), and the startup error. For each model: its monokernel layer classes (subclasses of the regular layers), the packing from the model's modules with the reasons of a layer that cannot be packed, and the launches. |
 
 ## Invariants
 

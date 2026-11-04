@@ -27,9 +27,10 @@ regular layers with :class:`DeltaMonokernelLayer` or
 ``MAX_ROWS`` rows as one persistent launch from
 ``tokenspeed_kernel.ops.monokernel``, and every other forward (prefill, larger
 steps) with its regular code. After loading, :func:`enable_decode_monokernels`
-packs every layer and gives all of them one :class:`MonokernelState`. Startup
-fails when a layer cannot be packed: the switch never serves a layer without
-its kernel.
+packs every layer and gives all of them one :class:`Qwen4ExpMonokernelState`.
+Startup fails when a layer cannot be packed: the switch never serves a layer
+without its kernel. ``tokenspeed.runtime.models.monokernel`` holds the part
+that every model shares.
 
 The decode step of a layer launch contains:
 
@@ -47,7 +48,7 @@ follow each other freely.
 The launches tag their mailbox writes with the layer index and a device step
 counter, which changes once per forward that launches, inside the CUDA graph:
 the last layer's launch moves it when it also runs the final mixer, else
-:meth:`MonokernelState.end_forward` does.
+``MonokernelState.end_forward`` does.
 
 A target's MTP verify (``k + 1`` tokens per request, request-major rows) runs
 the same launches with ``chain = k + 1``:
@@ -89,6 +90,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+from tokenspeed.runtime.models.monokernel import (
+    NO_KERNEL,
+    MonokernelLayer,
+    MonokernelState,
+    NoMonokernel,
+    unserved_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,20 +107,12 @@ logger = logging.getLogger(__name__)
 MAX_ROWS = 4
 
 
-class MonokernelState:
-    """The state that all monokernel launches of one backbone share.
-
-    It holds the mailbox scratch, the step counter, constants that the
-    launches read, and the values that one forward's launches pass on. The
-    model calls :meth:`begin_forward` before its layers and
-    :meth:`end_forward` after them.
-    """
+class Qwen4ExpMonokernelState(MonokernelState):
+    """:class:`MonokernelState` with the constants that the Qwen4-Exp
+    launches read and the draft's lengths of the current forward."""
 
     def __init__(self, device: torch.device, scratch_pairs: int) -> None:
-        self.scratch = torch.zeros(scratch_pairs, dtype=torch.int64, device=device)
-        # The launches' tag and a count of a launch's finished CTAs (0
-        # between launches).
-        self.step = torch.zeros(2, dtype=torch.int32, device=device)
+        super().__init__(device, scratch_pairs)
         # Constants the launches read, made here, outside any CUDA graph
         # capture: a capture records a kernel without running it, so a
         # constant made there holds garbage for every other graph. A launch
@@ -130,33 +130,13 @@ class MonokernelState:
             for bs in range(1, MAX_ROWS + 1)
             for chain in range(2, MAX_ROWS // bs + 1)
         }
-        # The current forward's values. begin_forward resets them.
-        # Whether a layer launched.
-        self.launched = False
-        # The final mixer's output, when the last layer's launch ran it.
-        self.lm_head_input: torch.Tensor | None = None
-        # The verified rows' lengths of a draft's first step.
+        # The verified rows' lengths of the current forward's draft first
+        # step. begin_forward resets it.
         self._draft_lengths: torch.Tensor | None = None
 
     def begin_forward(self) -> None:
-        """Start a forward, before its first layer."""
-        self.launched = False
-        self.lm_head_input = None
+        super().begin_forward()
         self._draft_lengths = None
-
-    def end_forward(self) -> torch.Tensor | None:
-        """End a forward, after its last layer. Returns the final mixer's
-        output when the last layer's launch ran it, else None.
-
-        The next forward's launches need a new tag. A launch that runs the
-        final mixer moves the step counter as it ends. After other launches,
-        this moves it (graph safe). A forward without launches adds no
-        kernel.
-        """
-        if self.launched and self.lm_head_input is None:
-            self.step[:1].add_(1)
-        lm_head_input, self.lm_head_input = self.lm_head_input, None
-        return lm_head_input
 
     def draft_lengths(
         self, seq_lens: torch.Tensor, narrowing: DraftNarrowing
@@ -222,6 +202,11 @@ NOT_BF16_SHARED = "the shared expert is not BF16"
 NOT_SUPPORTED_EXPERTS = (
     "the routed experts run neither the W4A4 MXFP4 nor the BF16 kernel"
 )
+NOT_SPLIT_IN_PROJ = "split in_proj_qkvz / in_proj_ba"
+NOT_PLE_TABLE = "a PLE table that is offloaded, cast or sharded"
+NO_INDEXER = "no QSA indexer"
+NO_OUTPUT_GATE = "no attention output gate"
+NOT_ROTARY = "a rotary cache that is not FP32 with 64 dims"
 # The routed experts' kernels whose weights the monokernel reads in place,
 # and the expert format (the kernel's ``layer.EXPERTS``) of each: the W4A4
 # kernel's N16 banks, or the unquantized BF16 weights (the Quark
@@ -230,15 +215,6 @@ EXPERT_KERNELS = {
     "gluon_mxfp4_a4w4_moe_apply_gfx950": "mxfp4",
     "gluon_bf16_precomputed_moe_apply": "bf16",
 }
-NO_KERNEL = "no monokernel for this platform"
-
-
-class NoMonokernel(Exception):
-    """No monokernel can serve a layer. ``reasons`` says why."""
-
-    def __init__(self, *reasons: str) -> None:
-        super().__init__("; ".join(reasons))
-        self.reasons = list(reasons)
 
 
 def _common_reasons(layer: torch.nn.Module) -> list[str]:
@@ -350,28 +326,13 @@ def _out_rows(rows: int, chain: int, ctx: ForwardContext) -> int:
     return ctx.bs if chain > 1 and ctx.draft_narrowing is not None else rows
 
 
-def unserved_report(unserved: dict[int, list[str]]) -> str:
-    """``unserved`` (layer index -> reasons) grouped by reason, for a log or an
-    error: ``"reason: layers 0, 2; other reason: layer 5"``."""
-    layers_by_reason: dict[str, list[int]] = {}
-    for index, reasons in sorted(unserved.items()):
-        for reason in reasons:
-            layers_by_reason.setdefault(reason, []).append(index)
-    return "; ".join(
-        f"{reason}: layer{'s' if len(layers) > 1 else ''} "
-        f"{', '.join(str(i) for i in layers)}"
-        for reason, layers in layers_by_reason.items()
-    )
+class _Qwen4ExpMonokernelLayer(MonokernelLayer):
+    """A Qwen4-Exp decoder layer that runs a decode step of at most
+    ``MAX_ROWS`` rows (:func:`forward_chain`) as one monokernel launch.
 
-
-class _MonokernelLayer:
-    """A decoder layer that runs a decode step of at most ``MAX_ROWS`` rows as
-    one monokernel launch, and every other forward with its regular code.
-
-    Put it before the regular layer class in the bases. The launch takes and
-    returns the regular layer's boundary: the hyper-connection streams, with
-    no pending residual. :func:`enable_decode_monokernels` packs the layer
-    after loading.
+    The launch takes and returns the regular layer's boundary: the
+    hyper-connection streams, with no pending residual.
+    :func:`enable_decode_monokernels` packs the layer after loading.
     """
 
     # Whether this layer type's launch can also run the model's final mixer,
@@ -381,11 +342,10 @@ class _MonokernelLayer:
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Set after loading by enable_decode_monokernels: the packed layer,
-        # the next layer's late weights for the launch to warm (None for the
-        # last layer), and the state that all layers share.
+        # and the next layer's late weights for the launch to warm (None for
+        # the last layer).
         self.fused: FusedDecodeLayer | None = None
         self.warm: torch.Tensor | None = None
-        self.monokernel_state: MonokernelState | None = None
 
     def prepare_monokernel(self, final_mixer: torch.nn.Module | None) -> None:
         """Pack the layer for its monokernel into ``fused``.
@@ -400,56 +360,16 @@ class _MonokernelLayer:
         """
         raise NotImplementedError
 
+    def launch_chain(self, rows: int, ctx: ForwardContext) -> int | None:
+        return forward_chain(rows, ctx)
+
     def prefetches_ple(self, rows: int, ctx: ForwardContext) -> bool:
         """Whether the model starts this layer's PLE lookup before the layer
         runs. A launch does its own lookup."""
-        return self.ple is not None and forward_chain(rows, ctx) is None
-
-    def forward(
-        self,
-        *,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual,
-        ctx: ForwardContext,
-        input_ids: torch.Tensor,
-        **kwargs,
-    ):
-        chain = forward_chain(hidden_states.shape[0], ctx)
-        if chain is None:
-            return super().forward(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-                ctx=ctx,
-                input_ids=input_ids,
-                **kwargs,
-            )
-        if self.monokernel_state is None:
-            raise RuntimeError(
-                f"{type(self).__name__} {self.layer_id}: a decode step before "
-                "post_quant_warmup packed the layer's monokernel"
-            )
-        # As the regular layer's forward, the launch reads none of kwargs.
-        self.monokernel_state.launched = True
-        out = self._decode(chain, positions, hidden_states, residual, ctx, input_ids)
-        return out, None
-
-    def _decode(
-        self,
-        chain: int,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual,
-        ctx: ForwardContext,
-        input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the layer's launch for a decode step of ``chain`` tokens per
-        request. Returns the output streams."""
-        raise NotImplementedError
+        return self.ple is not None and self.launch_chain(rows, ctx) is None
 
 
-class DeltaMonokernelLayer(_MonokernelLayer):
+class DeltaMonokernelLayer(_Qwen4ExpMonokernelLayer):
     """A Gated DeltaNet decoder layer with a monokernel (its PLE block
     included)."""
 
@@ -467,7 +387,7 @@ class DeltaMonokernelLayer(_MonokernelLayer):
         attn, mlp, ple = self.linear_attn, self.mlp, self.ple
         reasons = _common_reasons(self)
         if attn._split_in_proj:
-            reasons.append("split in_proj_qkvz / in_proj_ba")
+            reasons.append(NOT_SPLIT_IN_PROJ)
         if reasons:
             raise NoMonokernel(*reasons)
         projections = [attn.in_proj_qkvzba, attn.out_proj]
@@ -497,7 +417,7 @@ class DeltaMonokernelLayer(_MonokernelLayer):
                 or lookup.embed_store_dtype is not None
                 or lookup.ngram_embedding.tp_size != 1
             ):
-                raise NoMonokernel("a PLE table that is offloaded, cast or sharded")
+                raise NoMonokernel(NOT_PLE_TABLE)
             tensors["ple"] = {
                 "kv": ple_kv[0],
                 "norm_key": ple.norm_key.gemma_weight,
@@ -519,13 +439,14 @@ class DeltaMonokernelLayer(_MonokernelLayer):
     def _decode(
         self,
         chain: int,
+        *,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the Gated DeltaNet layer's launch.
+    ) -> tuple[torch.Tensor, None]:
+        """Run the Gated DeltaNet layer's launch. Returns the output streams.
 
         For the layer with a PLE block, the kernel also does the n-gram lookup
         from the token and the block's context page. The model skips the
@@ -577,10 +498,10 @@ class DeltaMonokernelLayer(_MonokernelLayer):
             ple=ple,
             warm=self.warm,
         )
-        return out
+        return out, None
 
 
-class QSAMonokernelLayer(_MonokernelLayer):
+class QSAMonokernelLayer(_Qwen4ExpMonokernelLayer):
     """A QSA attention decoder layer with a monokernel. The last layer's
     launch also runs the model's final mixer."""
 
@@ -606,12 +527,12 @@ class QSAMonokernelLayer(_MonokernelLayer):
         mlp, indexer = self.mlp, self.indexer
         reasons = _common_reasons(self)
         if indexer is None:
-            reasons.append("no QSA indexer")
+            reasons.append(NO_INDEXER)
         if not self.attn_output_gate:
-            reasons.append("no attention output gate")
+            reasons.append(NO_OUTPUT_GATE)
         cos_sin = self.rotary_emb.cos_sin_cache
         if cos_sin.dtype != torch.float32 or cos_sin.shape[-1] != 64:
-            reasons.append("a rotary cache that is not FP32 with 64 dims")
+            reasons.append(NOT_ROTARY)
         if reasons:
             raise NoMonokernel(*reasons)
         dense = _bf16_all((self.qkv_proj, indexer.index_qk_proj, self.o_proj))
@@ -643,13 +564,14 @@ class QSAMonokernelLayer(_MonokernelLayer):
     def _decode(
         self,
         chain: int,
+        *,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the QSA layer's launch.
+    ) -> tuple[torch.Tensor, None]:
+        """Run the QSA layer's launch. Returns the output streams.
 
         Reads the same per-step tables that the regular path reads. All of
         them refresh in place for CUDA graph replay. The tables are the
@@ -750,7 +672,7 @@ class QSAMonokernelLayer(_MonokernelLayer):
             # The final mixer's launch is the forward's last.
             advance_step=self.folds_final_mixer,
         )
-        return out
+        return out, None
 
 
 def _streams(
@@ -772,21 +694,12 @@ def _paged(field: torch.Tensor, rows: int) -> torch.Tensor:
     return field
 
 
-def unserved_error(name: str, unserved: dict[int, list[str]]) -> str:
-    """The startup error of a backbone whose layers ``unserved`` (layer index
-    -> reasons) have no monokernel."""
-    return (
-        f"--decode-monokernel: {len(unserved)} {name} layers have no monokernel "
-        f"({unserved_report(unserved)}). Serve without --decode-monokernel."
-    )
-
-
 def enable_decode_monokernels(model: torch.nn.Module) -> None:
     """Pack the monokernel layers of ``model`` after loading.
 
     ``model`` builds its layers from the monokernel classes with
     ``--decode-monokernel``. Then every layer is packed, and all of them and
-    ``model.monokernels`` get one :class:`MonokernelState`. Without
+    ``model.monokernels`` get one :class:`Qwen4ExpMonokernelState`. Without
     monokernel layers this does nothing.
 
     The last layer's launch also runs the final mixer when its type can
@@ -802,7 +715,7 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
             layer with its reasons.
     """
     layers = model.layers
-    if not any(isinstance(layer, _MonokernelLayer) for layer in layers):
+    if not any(isinstance(layer, MonokernelLayer) for layer in layers):
         return
     last = len(layers) - 1
     unserved: dict[int, list[str]] = {}
@@ -815,7 +728,9 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
     if unserved:
         raise ValueError(unserved_error(type(model).__name__, unserved))
     device = next(model.parameters()).device
-    state = MonokernelState(device, max(layer.fused.scratch_pairs for layer in layers))
+    state = Qwen4ExpMonokernelState(
+        device, max(layer.fused.scratch_pairs for layer in layers)
+    )
     for index, layer in enumerate(layers):
         if index < last:
             layer.warm = layers[index + 1].fused.late_weights
@@ -827,9 +742,7 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
 __all__ = [
     "MAX_ROWS",
     "DeltaMonokernelLayer",
-    "MonokernelState",
-    "NoMonokernel",
     "QSAMonokernelLayer",
+    "Qwen4ExpMonokernelState",
     "enable_decode_monokernels",
-    "unserved_error",
 ]

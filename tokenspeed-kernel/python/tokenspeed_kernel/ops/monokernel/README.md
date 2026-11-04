@@ -42,26 +42,46 @@ step's rows in one launch instead of six.
 
 ## How a model uses the ops
 
-A model calls the ops from its monokernel layer classes in its runtime
-seam, `python/tokenspeed/runtime/models/<model>_monokernel.py` (see
-`qwen4_exp_monokernel.py`).
+A model calls the ops from its runtime seam,
+`python/tokenspeed/runtime/models/<model>_monokernel.py` (see
+`qwen4_exp_monokernel.py`). The part that every model shares is in
+`python/tokenspeed/runtime/models/monokernel.py`.
 
 - **Building the layers.** With `--decode-monokernel`, the model's
   `decoder_layer_cls` gives `get_layer` the monokernel class of each layer
-  type: a subclass of the regular layer class with the same parameters. The
-  checkpoint architecture must be in `DECODE_MONOKERNEL_ARCHITECTURES` in
+  type: a subclass of the regular layer class with the same parameters, with
+  the model's `MonokernelLayer` subclass first in the bases. The model reads
+  the switch from its config, which `ModelConfig` sets. The checkpoint
+  architecture must be in `DECODE_MONOKERNEL_ARCHITECTURES` in
   `server_args.py`.
-- **After loading.** The seam calls `prepare_*` for each layer once the
-  weights load and the quantization post-processing gives their final layout
-  (the model's `post_quant_warmup` hook, which the model loader calls once).
-  It also allocates the scratch buffer and the step counter, which all the
-  layers share. Startup fails when a layer cannot be packed, and the error
-  names each such layer with its reasons.
-- **Each layer.** A monokernel layer's `forward` runs a decode step that the
-  kernels' plans serve as one launch. Every other forward (prefill, or a row
-  count or chain length past the kernels' plans) runs the regular layer's
-  code. A launch takes and returns the same tensors as the regular layer.
-- **After the layers.** The last layer's launch moves the step counter on.
+- **The layer class.** The model's `MonokernelLayer` subclass gives:
+  - `launch_chain(rows, ctx)`: the tokens per request of the launch for a
+    forward of `rows` token rows, or `None`. The result must be fixed per
+    CUDA graph.
+  - `_decode(chain, **forward_args)`: the launch. It takes the regular
+    layer's forward arguments and returns the regular layer's outputs.
+  - A packing method that calls `prepare_*` and raises
+    `NoMonokernel(*reasons)` when the layer cannot be packed. Qwen4-Exp
+    layers have `prepare_monokernel(final_mixer)`, and the class attribute
+    `FOLDS_FINAL_MIXER` says whether the last layer's launch can also run
+    the model's final mixer.
+
+  `MonokernelLayer.forward` runs the regular layer's code when
+  `launch_chain` returns `None` (prefill, or a row count or chain length past
+  the kernels' plans). It fails when a launch comes before packing, and
+  otherwise runs `_decode`.
+- **After loading.** The seam packs every layer once the weights load and
+  the quantization post-processing gives their final layout (the model's
+  `post_quant_warmup` hook, which the model loader calls once). Then it gives
+  all layers and the model one `MonokernelState`, which holds the scratch
+  buffer and the step counter. Startup fails when a layer cannot be packed,
+  and the error (`unserved_error`) names each such layer with its reasons.
+- **Each forward.** The model calls `MonokernelState.begin_forward()` before
+  its layers and `end_forward()` after them. A launch that also runs the
+  model's final norm or mixer sets `lm_head_input` and moves the step
+  counter as it ends (`advance_step=True`). Then `end_forward()` returns that
+  output for the LM head. After other launches, `end_forward()` moves the
+  step counter. A forward without launches adds no kernel.
 
 ## Adding a model
 
