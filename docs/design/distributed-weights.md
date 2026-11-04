@@ -44,8 +44,11 @@ Weight operations belong on the data plane. The ordinary model forward primes
 the first required MoE. Before each MoE, the compute stream waits for its weights;
 after all readers are enqueued, the layer records that its slot can be reused
 and starts the next layer's prefetch. Copies into a reused slot wait for the
-previous reader's release event. This includes the final readers of a forward:
-events are not reset at forward boundaries.
+previous reader's release. This includes the final readers of a forward:
+the ordering is not reset at forward boundaries. Fetch completion and reader
+release are 64-bit sequence flags in device memory, written and waited on by
+streams. A flag wait is enqueued only after its write: a wait ahead of its
+producer blocks the GPU, and lazy module loading on any thread then deadlocks.
 
 Any side-stream weight reader must join the compute stream before release.
 A new reader on a different stream waits for the preceding release, including
@@ -54,8 +57,15 @@ Host run-ahead is allowed. Only startup and collective teardown coordinate with
 other weight owners, over a dedicated named process group; ordinary prefetch,
 acquire and release do not.
 
-A prefetch is either copy-engine copies or one SM copy kernel on the store's
-copy stream; both follow the same slot events. The kernel's tile table is built
+A prefetch is either one batch of copy-engine copies or one SM copy kernel on
+the store's copy stream; both follow the same slot flags. Copy engines keep
+their bandwidth when every owner is read at once only if the reads are spread:
+the batch splits each peer's bytes into chunks of 8 MB divided by the number of
+owners and takes one chunk from every peer per round, in a fixed per-rank
+random order. Submitting a layer's tens of thousands of copies blocks while
+the copy stream's queue is full, so a worker thread submits it; the reader
+waits on the host until the worker has enqueued the ready write, then enqueues
+its flag wait. The kernel's tile table is built
 at finalize, interleaves peers so every owner is read at once, and lets CTAs
 claim tiles so late-starting CTAs do not delay completion. Its CTA count trades
 fetch bandwidth against SMs taken from concurrent compute. The CTAs launch in

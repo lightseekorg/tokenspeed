@@ -25,6 +25,11 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication._cuda.peer_copy import (
+    CopyEngineWorker,
+    SequenceFlags,
+    build_copy_schedule,
+)
 from tokenspeed_kernel.ops.communication._cuda.peer_fetch import (
     CLUSTER_SIZE,
     FetchPlan,
@@ -65,10 +70,22 @@ class _Layer:
 
 @dataclass
 class _Slot:
-    ready: torch.cuda.Event
-    released: torch.cuda.Event
+    # Sequence numbers of the latest fetch into the slot and the latest reader
+    # release; the GPU flags at _ready_flag/_released_flag reach them in order.
+    fetched: int
+    released: int
+    # Copy-engine worker job that writes the slot's ready flag for ``fetched``.
+    job: int
     layer: int | None
     last_reader_stream: int | None
+
+
+def _ready_flag(slot: int) -> int:
+    return slot
+
+
+def _released_flag(slot: int) -> int:
+    return 2 + slot
 
 
 class CudaPeerWeightStore:
@@ -115,14 +132,15 @@ class CudaPeerWeightStore:
         self._stream = torch.cuda.Stream(device=device)
         self._published = torch.cuda.Event()
         self._published.record(torch.cuda.current_stream(device))
-        self._slots = [
-            _Slot(torch.cuda.Event(), torch.cuda.Event(), None, None) for _ in range(2)
-        ]
-        for slot in self._slots:
-            slot.released.record(torch.cuda.current_stream(device))
+        self._slots = [_Slot(0, 0, 0, None, None) for _ in range(2)]
+        self._flags = SequenceFlags(4, device)
+        self._copy_engine = (
+            CopyEngineWorker(device, self._stream)
+            if copy_implementation == "simple"
+            else None
+        )
         self._layers: dict[int, _Layer] = {}
         self._views: dict[int, dict[str, torch.Tensor]] = {}
-        self._plans: dict[int, list[tuple[int, int, int]]] = {}
         self._copy_kernel_ctas = copy_kernel_ctas
         if copy_kernel_ctas is not None:
             # Persistent kernels compiled from here on fit beside the copy CTAs.
@@ -303,7 +321,8 @@ class CudaPeerWeightStore:
         intervals: tuple[tuple[int, int], ...],
         destination: int,
         peer_addresses: dict[tuple[int, int, str], int],
-    ) -> list[tuple[int, int, int]]:
+    ) -> list[tuple[int, int, int, int]]:
+        """(peer, destination, source, bytes) copies of ``intervals`` from every peer."""
         copies = []
         for step in range(1, self.partition.size):
             peer = (self.partition.rank + step) % self.partition.size
@@ -315,6 +334,7 @@ class CudaPeerWeightStore:
                 if begin < end:
                     copies.append(
                         (
+                            peer,
                             destination + begin,
                             source + begin - geometry.page_begin,
                             end - begin,
@@ -354,7 +374,7 @@ class CudaPeerWeightStore:
                 if field.layout is None:
                     continue
                 # Only immutable boundary bytes share the owner's physical pages.
-                for dst, src, size in self._copies(
+                for _, dst, src, size in self._copies(
                     layer,
                     field,
                     field.layout.edge_intervals(),
@@ -418,11 +438,20 @@ class CudaPeerWeightStore:
                     )
                 )
             self._views[layer.index] = views
-            self._plans[layer.index] = plan
-            if self._copy_kernel_ctas is not None:
+            if self._copy_engine is not None:
+                by_peer: dict[int, list[tuple[int, int, int]]] = {}
+                for peer, dst, src, size in plan:
+                    by_peer.setdefault(peer, []).append((dst, src, size))
+                self._copy_engine.set_layer(
+                    layer.index,
+                    build_copy_schedule(
+                        by_peer, ranks=self.partition.size, rank=self.partition.rank
+                    ),
+                )
+            else:
                 load_peer_fetch_module()
                 self._fetch_plans[layer.index] = build_fetch_plan(
-                    plan,
+                    [(dst, src, size) for _, dst, src, size in plan],
                     base=self._fetch_base.data_ptr(),
                     tile_bytes=_FETCH_TILE_BYTES,
                     device=self.device,
@@ -443,7 +472,8 @@ class CudaPeerWeightStore:
 
     def prefetch(self, layer: int) -> None:
         self._require_ready()
-        slot = self._slots[self._layers[layer].slot]
+        index = self._layers[layer].slot
+        slot = self._slots[index]
         if slot.layer == layer:
             return
         if (
@@ -453,11 +483,18 @@ class CudaPeerWeightStore:
             raise RuntimeError(
                 "Cannot overwrite a weight slot before releasing its reader"
             )
-        self._stream.wait_event(slot.released)
-        if self._copy_kernel_ctas is None:
-            for destination, source, size in self._plans[layer]:
-                vmm.copy(destination, source, size, self._stream)
+        slot.fetched += 1
+        if self._copy_engine is not None:
+            slot.job = self._copy_engine.fetch(
+                layer,
+                self._flags,
+                wait_index=_released_flag(index),
+                wait_value=slot.released,
+                ready_index=_ready_flag(index),
+                ready_value=slot.fetched,
+            )
         else:
+            self._flags.wait(_released_flag(index), slot.released, self._stream)
             fetch = self._fetch_plans[layer]
             for destination, source, size in fetch.leftovers:
                 vmm.copy(destination, source, size, self._stream)
@@ -468,7 +505,7 @@ class CudaPeerWeightStore:
                     counter=self._fetch_counter,
                     ctas=self._copy_kernel_ctas,
                 )
-        slot.ready.record(self._stream)
+            self._flags.write(_ready_flag(index), slot.fetched, self._stream)
         slot.layer = layer
 
     def acquire(self, layer: int) -> None:
@@ -477,10 +514,14 @@ class CudaPeerWeightStore:
             raise RuntimeError("The previous weight reader must be released first")
         self.prefetch(layer)
         stream = torch.cuda.current_stream(self.device)
-        slot = self._slots[self._layers[layer].slot]
+        index = self._layers[layer].slot
+        slot = self._slots[index]
         if slot.last_reader_stream != stream.cuda_stream:
-            stream.wait_event(slot.released)
-        stream.wait_event(slot.ready)
+            self._flags.wait(_released_flag(index), slot.released, stream)
+        if self._copy_engine is not None:
+            # Enqueue the ready wait only after the worker enqueued its write.
+            self._copy_engine.wait_submitted(slot.job)
+        self._flags.wait(_ready_flag(index), slot.fetched, stream)
         self._reader = layer
         self._reader_stream = stream.cuda_stream
 
@@ -491,8 +532,10 @@ class CudaPeerWeightStore:
             raise RuntimeError(
                 "Release must follow the matching reader on its compute stream"
             )
-        slot = self._slots[self._layers[layer].slot]
-        slot.released.record(stream)
+        index = self._layers[layer].slot
+        slot = self._slots[index]
+        slot.released += 1
+        self._flags.write(_released_flag(index), slot.released, stream)
         slot.last_reader_stream = stream.cuda_stream
         self._reader = None
         self._reader_stream = None
@@ -505,9 +548,10 @@ class CudaPeerWeightStore:
                 "Release the final weight reader before closing the store"
             )
         self._published.synchronize()
-        self._stream.synchronize()
-        for slot in self._slots:
-            slot.released.synchronize()
+        if self._copy_engine is not None:
+            self._copy_engine.close()
+        # Readers release on their own streams through device flags.
+        torch.cuda.synchronize(self.device)
         if self._finalized:
             dist.barrier(group=self.group)
         self._views.clear()

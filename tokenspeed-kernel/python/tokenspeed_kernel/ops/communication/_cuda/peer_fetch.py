@@ -20,11 +20,11 @@
 
 """SM-driven copy of a fixed list of byte ranges, such as one layer's peer weights.
 
-When every GPU pulls peer weights at once, copy-engine reads slow to about
-420 GB/s per GPU and slow further with the rate of compute kernel launches.
-TMA bulk copies from 24 single-warp CTAs reach about 650 GB/s. The CTAs launch
-in clusters of ``CLUSTER_SIZE`` so they hold whole 8-SM slots; reserve them
-with ``tokenspeed_kernel.sm_reservation`` so persistent grids fit beside them.
+TMA bulk copies from 24 single-warp CTAs reach about 650 GB/s per GPU while
+every GPU pulls peer weights at once, but hold their SMs for the whole copy;
+``peer_copy`` reaches a similar rate with copy engines. The CTAs launch in
+clusters of ``CLUSTER_SIZE`` so they hold whole 8-SM slots; reserve them with
+``tokenspeed_kernel.sm_reservation`` so persistent grids fit beside them.
 """
 
 from __future__ import annotations

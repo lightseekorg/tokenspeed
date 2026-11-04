@@ -3934,9 +3934,10 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_weight_sharing_copy_ctas,
             help="Fetch peer expert weights with a copy kernel on this many CTAs (a "
-            "multiple of 8) instead of copy engines, which slow down while every "
-            "worker pulls at once. Persistent GEMM grids leave these SMs free. "
-            "Omission keeps copy-engine transfers. Requires --moe-weight-sharing-size.",
+            "multiple of 8) instead of copy engines. The kernel holds these SMs for "
+            "the whole forward and persistent GEMM grids leave them free. Omission "
+            "keeps copy-engine transfers, which take no SMs. Requires "
+            "--moe-weight-sharing-size.",
         )
         parser.add_argument(
             "--moe-tp-size",
