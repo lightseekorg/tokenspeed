@@ -61,8 +61,8 @@ claim tiles so late-starting CTAs do not delay completion. Its CTA count trades
 fetch bandwidth against SMs taken from concurrent compute. The CTAs launch in
 clusters of 8 and the store reserves them (`tokenspeed_kernel.sm_reservation`)
 before kernels compile: a persistent grid sized to every SM would run its
-leftover CTAs as a second wave, so persistent GEMMs size their grids to the
-cluster slots the copy leaves free.
+leftover CTAs as a second wave, so persistent kernels (the FP8 blockwise GEMM,
+AttnRes) size their grids to the cluster slots and SMs the copy leaves free.
 
 The event loop receives only `DeviceSpecs.requires_forward_coordination`,
 derived from execution groups. It continues using the same scheduler and

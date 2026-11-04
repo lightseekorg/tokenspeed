@@ -183,3 +183,38 @@ def test_online_v2_cuda_graph_capture(with_out_norm: bool) -> None:
     graph.replay()
 
     torch.testing.assert_close(captured, expected, atol=0.5, rtol=2e-2)
+
+
+@pytest.mark.parametrize("with_out_norm", [False, True])
+def test_online_v2_reserved_sms_keep_results_exact(with_out_norm: bool) -> None:
+    from tokenspeed_kernel.sm_reservation import reserve_sm_clusters
+
+    torch.manual_seed(29)
+    # More token rows than SMs so every persistent CTA loops over several rows.
+    layer = torch.randn(1000, 1, 7168, device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn_like(layer)
+    blocks = torch.randn(5, 1000, 1, 7168, device="cuda", dtype=torch.bfloat16)
+    res_weight = torch.randn(7168, device="cuda", dtype=torch.bfloat16)
+    rms_weight = torch.randn(7168, device="cuda", dtype=torch.bfloat16)
+    out_norm_weight = (
+        torch.randn(7168, device="cuda", dtype=torch.bfloat16)
+        if with_out_norm
+        else None
+    )
+
+    def run():
+        updated = layer.clone()
+        output = attn_res_fwd_packed(
+            updated, blocks, res_weight, rms_weight, 1e-5, out_norm_weight, delta
+        )
+        return output, updated
+
+    expected, expected_layer = run()
+    device = torch.device("cuda", torch.cuda.current_device())
+    reserve_sm_clusters(device, 3)
+    try:
+        actual, actual_layer = run()
+    finally:
+        reserve_sm_clusters(device, 0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_layer, expected_layer, rtol=0, atol=0)

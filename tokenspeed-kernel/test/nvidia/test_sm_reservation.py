@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.sm_reservation import (
+    free_sm_count,
     max_active_clusters,
     reserve_sm_clusters,
     reserved_sm_clusters,
@@ -56,6 +57,8 @@ def test_reserved_clusters_leave_matching_slots(device):
     assert max_active_clusters(device, 4) == free[4] - 6
     assert max_active_clusters(device, 8) == free[8] - 3
     assert max_active_clusters(device, 16) == free[16] - 3
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    assert free_sm_count(device) == sms - 24
 
 
 def test_invalid_reservations_are_rejected(device):
@@ -66,3 +69,5 @@ def test_invalid_reservations_are_rejected(device):
     reserve_sm_clusters(device, 1 << 10)
     with pytest.raises(ValueError):
         max_active_clusters(device, 1)
+    with pytest.raises(ValueError):
+        free_sm_count(device)

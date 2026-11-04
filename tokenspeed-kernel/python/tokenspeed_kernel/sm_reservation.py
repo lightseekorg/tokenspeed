@@ -33,6 +33,8 @@ slot instead of fragmenting the slots of larger clusters.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 CLUSTER_SIZE = 8
@@ -72,3 +74,16 @@ def max_active_clusters(device: torch.device, cluster_size: int) -> int:
             f"Reserved SMs leave no room for clusters of {cluster_size} CTAs"
         )
     return slots - taken
+
+
+@functools.cache
+def _sm_count(index: int) -> int:
+    return torch.cuda.get_device_properties(index).multi_processor_count
+
+
+def free_sm_count(device: torch.device) -> int:
+    """SMs left beside the reserved clusters, for one-CTA-per-SM persistent grids."""
+    free = _sm_count(device.index) - reserved_sm_clusters(device) * CLUSTER_SIZE
+    if free <= 0:
+        raise ValueError("Reserved SMs leave no SM for persistent grids")
+    return free

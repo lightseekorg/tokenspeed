@@ -17,8 +17,6 @@
 
 using bf16_t = __nv_bfloat16;
 
-int attn_res_fwd_grid_size(int dev);
-
 void run_attn_res_fwd_online_v2(
     const bf16_t* block_residual,
     bf16_t* layer_residual,

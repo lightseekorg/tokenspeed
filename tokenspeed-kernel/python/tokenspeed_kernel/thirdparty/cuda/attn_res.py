@@ -25,6 +25,7 @@ from pathlib import Path
 
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.sm_reservation import free_sm_count
 
 
 @functools.cache
@@ -92,7 +93,14 @@ def attn_res_fwd_packed(
     args = (layer_residual, delta, block_residual, res_weight, rms_weight)
     if out_norm_weight is not None:
         args += (out_norm_weight,)
-    args += (output, int(block_count), float(rms_eps), pdl_enabled())
+    # The persistent grid fits beside SMs held by reserved background kernels.
+    args += (
+        output,
+        int(block_count),
+        float(rms_eps),
+        free_sm_count(layer_residual.device),
+        pdl_enabled(),
+    )
     entry = "attn_res_fwd" + ("_out_norm" if out_norm_weight is not None else "")
     getattr(module, entry)(*args)
     return output
