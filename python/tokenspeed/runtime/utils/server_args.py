@@ -758,6 +758,11 @@ class ServerArgs:
     _speculative_widths_explicit: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
+    # Auto-enabled allreduce fusion that only holds if one Iris heap maps the
+    # world, which distributed initialization decides.
+    _allreduce_fusion_needs_mapped_world: bool = dataclasses.field(
+        default=False, init=False, repr=False
+    )
 
     @property
     def spec_context_pad(self) -> int:
@@ -1794,24 +1799,30 @@ class ServerArgs:
             )
 
     def resolve_communication(self):
-        # Auto-enable allreduce fusion on supported single-node TP configurations,
-        # and for Beam on Hopper or newer at any node count: across nodes Beam's
+        # Auto-enable allreduce fusion on supported TP configurations: on NVIDIA
+        # within one node, and for Beam on Hopper or newer at any node count;
+        # on AMD wherever one Iris heap maps the world. Across nodes Beam's
         # boundaries fuse only where the attention TP group has an MNNVL
         # workspace and keep the unfused chain otherwise (beam_sandwich_fusion.py).
         platform = current_platform()
         if (
             not self.enable_allreduce_fusion
             and not self.emulate_rank_zero
-            and (current_platform().is_hopper_plus or platform.is_amd)
-            and (
-                self.mapping.nnodes == 1
-                or (self._beam_checkpoint and platform.is_hopper_plus)
-            )
+            and (platform.is_hopper_plus or platform.is_amd)
             and self.mapping.has_attn_tp
             and not self.mapping.has_attn_dp
         ):
-            self.enable_allreduce_fusion = True
-            logger.info("Auto-enabled allreduce fusion")
+            if platform.is_amd:
+                # The fused kernel reads peers through the Iris heap, which
+                # spans the world: one host, or gfx1250 hosts in one fabric
+                # domain. Distributed initialization decides whether the heap
+                # maps this world and turns the fusion off where it does not.
+                self.enable_allreduce_fusion = True
+                self._allreduce_fusion_needs_mapped_world = True
+                logger.info("Auto-enabled allreduce fusion where Iris maps the world")
+            elif self.mapping.nnodes == 1 or self._beam_checkpoint:
+                self.enable_allreduce_fusion = True
+                logger.info("Auto-enabled allreduce fusion")
 
         if self.mapping.attn.tp_size != self.mapping.dense.tp_size:
             self.comm_fusion_max_num_tokens = -1
@@ -4248,7 +4259,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-allreduce-fusion",
             action="store_true",
-            help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations, and for Beam on any number of nodes (its boundaries fuse where an MNNVL workspace serves them).",
+            help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported TP configurations: on NVIDIA within one node, and for Beam on any number of nodes (its boundaries fuse where an MNNVL workspace serves them); on AMD wherever one Iris heap maps the world (one host, or gfx1250 hosts in one fabric domain).",
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",

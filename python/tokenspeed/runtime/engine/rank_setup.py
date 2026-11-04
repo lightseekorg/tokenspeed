@@ -151,7 +151,29 @@ def init_distributed(
         hidden_size=hidden_size,
         max_num_tokens=max_num_input_tokens,
     )
-    return DistributedInitializer.initialize(distributed_config)
+    memory_floor = DistributedInitializer.initialize(distributed_config)
+    apply_iris_world_verdict(server_args)
+    return memory_floor
+
+
+def apply_iris_world_verdict(server_args: ServerArgs) -> None:
+    """Keep auto-enabled allreduce fusion only where one Iris heap maps the world.
+
+    Call after distributed initialization, which decides that on AMD.
+    """
+    if not (
+        server_args._allreduce_fusion_needs_mapped_world
+        and server_args.enable_allreduce_fusion
+    ):
+        return
+    from tokenspeed_kernel.ops.communication.iris import iris_maps_world
+
+    # Every rank reads the same world verdict. Declining the fused kernel per
+    # call is not an option: its unfused fallback skips the all-reduce.
+    if not iris_maps_world():
+        server_args.enable_allreduce_fusion = False
+        global_server_args_dict_update(server_args)
+        logger.info("Allreduce fusion is off: one Iris heap cannot map this world")
 
 
 def request_length_limits(

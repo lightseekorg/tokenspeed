@@ -61,6 +61,7 @@ from tokenspeed.runtime.engine.gc_hooks import (
     freeze_startup_heap,
 )
 from tokenspeed.runtime.engine.io_struct import MsgpackDecoder
+from tokenspeed.runtime.engine.rank_setup import apply_iris_world_verdict
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
@@ -502,6 +503,7 @@ class EncodeBootstrap:
                 max_num_tokens=server_args.chunked_prefill_size or 8192,
             )
         )
+        apply_iris_world_verdict(server_args)
         # Built vision-only (``disaggregation_mode == "encode"`` skips the
         # language model and its weights); no cache pool is allocated.
         model_runner = create_model_runner(
