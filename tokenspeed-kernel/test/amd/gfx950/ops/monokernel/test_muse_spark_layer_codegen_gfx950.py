@@ -226,7 +226,7 @@ def test_entry_is_an_epoch_store_and_a_claim_exchange(key):
 @pytest.mark.parametrize("key", _variants())
 def test_router_weights_stay_in_flight_until_the_all_gather(key):
     # The router's tiles are issued after the sender's push (slot 0: after
-    # OWN1); nothing may retire them before the router's x build waits for
+    # AR_OWNER); nothing may retire them before the router's x build waits for
     # the all-gather.
     texts, chains = attributed(key)
     issued = _loads(texts, _in(chains, "_router_weights"))
@@ -258,7 +258,7 @@ def test_sender_clears_drain_before_its_push(key):
         i for i in _in(chains, "iris_clear_share") if i in send and "_store" in texts[i]
     ]
     pushes = [
-        i for i in _in(chains, "h1_rs_sink") if i in send and "_store" in texts[i]
+        i for i in _in(chains, "ar_rs_sink") if i in send and "_store" in texts[i]
     ]
     assert clears and pushes
     assert drains_of(texts, clears[-1], pushes[0])
@@ -297,9 +297,9 @@ def test_launch_types_are_checked_against_the_offline_signature():
     _, _, constexprs, _ = layer.offline_compile_args(layer.PLAN_VARIANTS[0], 3)
     assert layer.signature_problems(_launch_args(constexprs), constexprs) == []
     problems = layer.signature_problems(
-        _launch_args(constexprs, h1=torch.int32, box=torch.int32), constexprs
+        _launch_args(constexprs, ar=torch.int32, box=torch.int32), constexprs
     )
     assert problems == [
         "box: launched *i32, offline *u32",
-        "h1: launched *i32, offline *bf16",
+        "ar: launched *i32, offline *bf16",
     ]

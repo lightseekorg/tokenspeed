@@ -466,7 +466,7 @@ def poll_until_all(word_ptrs, valid, expected, launch, LOAD: gl.constexpr):
 @gluon.jit
 def store_pairs(pair_ptrs, values, launch, mask, SCOPE: gl.constexpr):
     """Publish int32 ``values`` as (value, tag) pairs: one 8-byte relaxed
-    atomic store each (``dwordx2``), ``tag << 32 | value``, the H1 norm sums'
+    atomic store each (``dwordx2``), ``tag << 32 | value``, the AR norm sums'
     format. No wait after it.
 
     ``SCOPE``: ``"cta"`` (``sc0``) for readers on this XCD only, ``"gpu"``

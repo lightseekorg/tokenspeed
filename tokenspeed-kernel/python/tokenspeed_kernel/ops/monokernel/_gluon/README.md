@@ -13,14 +13,14 @@ A workgroup's roles come from its XCD (hardware) and its slot (program id //
 
 | Slots per XCD | Front | MoE | Tail |
 |---|---|---|---|
-| 0-15 | o_proj sender (SND); slot 0 also owns 128 columns of the all-reduce (OWN1); router K part (RTR) | stream | slot 0: route owner (OWN4), finisher (FIN), prologue head (HEAD); others: QKV task |
-| 16-23 | pooler K part (POOL); slot 16 + t on XCD t reduces pooled tile t | stream | post-expert sender (UNP); slot 16: sum reducer (RED); QKV task |
-| 24-31 | sliding attention splits on XCDs 0 .. 2 x requests - 1 (split = slot - 24); top-k (slot 24, XCD 7 - g), pooled-row norm + MXFP4 (XN, slot 25+) | stream | slots 24-30: OWN4, FIN, HEAD; slot 31: QKV task |
+| 0-15 | o_proj sender (SENDER); slot 0 also owns 128 columns of the all-reduce (AR_OWNER); router K part (ROUTER) | stream | slot 0: route owner (ROUTE_OWNER), finisher (FINISHER), prologue head (PROLOGUE); others: QKV task |
+| 16-23 | pooler K part (POOLER); slot 16 + t on XCD t reduces pooled tile t | stream | post-expert sender (POST_SENDER); slot 16: sum reducer (REDUCER); QKV task |
+| 24-31 | sliding attention splits on XCDs 0 .. 2 x requests - 1 (split = slot - 24); top-k (slot 24, XCD 7 - g), pooled-row norm + MXFP4 (POOLED_NORM, slot 25+) | stream | slots 24-30: ROUTE_OWNER, FINISHER, PROLOGUE; slot 31: QKV task |
 
 Full-attention layers run the balanced decode's items on every workgroup
 (program indices `cta` and `cta + 256`) and merge on slots 24 onward. When
-the next layer is regular, the FIN workgroups write the regular boundary
-(BND2) instead of QKV and HEAD. `muse_spark/plan.py` models these roles and
+the next layer is regular, the FINISHER workgroups write the regular boundary
+(BOUNDARY) instead of QKV and PROLOGUE. `muse_spark/plan.py` models these roles and
 checks every wait: no cycle, and no vector poll behind the role's own loads
 unless the loads land first.
 

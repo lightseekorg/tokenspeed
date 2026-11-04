@@ -23,7 +23,7 @@
 One launch kind owns every cross-GPU receive area and the local attention
 box, each in two copies chosen by ``launch.copy = epoch & 1`` and sized for
 ``MAX_ROWS`` rows. Consumers never clear: at the entry of launch L the 128
-senders of the all-to-all H1 reduce-scatter (SND) re-arm copy ``(L + 1) & 1``
+senders of the all-to-all AR reduce-scatter (SENDER) re-arm copy ``(L + 1) & 1``
 of every area, each its 1 / 128 share, and drain the stores before their
 first push of L. A peer writes that copy again only in L + 1, which it reaches
 only after every one of this rank's L pushes.
@@ -84,24 +84,24 @@ if current_platform().is_cdna4:
 else:  # host-side sizes only
     ERROR_ABORT, ERROR_CALLER, ERROR_WORDS, FIRST_KERNEL_SITE = 32, 64, 128, 16
     SITE_ABORTED = 3
-    Launch = None  # a device type; H4SinkArgs only names it on the host
+    Launch = None  # a device type; RoutePushArgs only names it on the host
 
 WORLD_SIZE = 8
 # Failure sites of the hop waits (fail_stop records them).
-SITE_OWN1 = FIRST_KERNEL_SITE + 16
-SITE_XN = SITE_OWN1 + 1
-SITE_OWN4_OWN = SITE_OWN1 + 2
-SITE_OWN4 = SITE_OWN1 + 3
-SITE_FIN = SITE_OWN1 + 4
-SITE_RED = SITE_OWN1 + 5
-SITE_H6_SUMS = SITE_OWN1 + 6
-_SITE_OWN1 = gl.constexpr(SITE_OWN1)
-_SITE_XN = gl.constexpr(SITE_XN)
-_SITE_OWN4_OWN = gl.constexpr(SITE_OWN4_OWN)
-_SITE_OWN4 = gl.constexpr(SITE_OWN4)
-_SITE_FIN = gl.constexpr(SITE_FIN)
-_SITE_RED = gl.constexpr(SITE_RED)
-_SITE_H6_SUMS = gl.constexpr(SITE_H6_SUMS)
+SITE_AR_OWNER = FIRST_KERNEL_SITE + 16
+SITE_POOLED_NORM = SITE_AR_OWNER + 1
+SITE_ROUTE_OWNER_OWN = SITE_AR_OWNER + 2
+SITE_ROUTE_OWNER = SITE_AR_OWNER + 3
+SITE_FINISHER = SITE_AR_OWNER + 4
+SITE_REDUCER = SITE_AR_OWNER + 5
+SITE_POST_AG_SUMS = SITE_AR_OWNER + 6
+_SITE_AR_OWNER = gl.constexpr(SITE_AR_OWNER)
+_SITE_POOLED_NORM = gl.constexpr(SITE_POOLED_NORM)
+_SITE_ROUTE_OWNER_OWN = gl.constexpr(SITE_ROUTE_OWNER_OWN)
+_SITE_ROUTE_OWNER = gl.constexpr(SITE_ROUTE_OWNER)
+_SITE_FINISHER = gl.constexpr(SITE_FINISHER)
+_SITE_REDUCER = gl.constexpr(SITE_REDUCER)
+_SITE_POST_AG_SUMS = gl.constexpr(SITE_POST_AG_SUMS)
 _ERROR_ABORT = gl.constexpr(ERROR_ABORT)
 _SITE_ABORTED = gl.constexpr(SITE_ABORTED)
 _ERROR_CALLER = gl.constexpr(ERROR_CALLER)
@@ -123,28 +123,28 @@ BOX_EMPTY_WORD = 0x80008000
 
 # Elements and 32-bit words of one copy of each area (the copy stride).
 _OWNED = HIDDEN // WORLD_SIZE
-H1_SHARD = MAX_ROWS * _OWNED  # BF16 elements of one H1 source slot
-H1_WORDS = 2 * WORLD_SIZE * H1_SHARD // 2  # [RS, AG][source][shard]
-H1_SUM_WORDS = WORLD_SIZE * (_OWNED // OWNER_COLUMNS) * MAX_ROWS * 4  # int64, tagged
+AR_SHARD = MAX_ROWS * _OWNED  # BF16 elements of one AR source slot
+AR_WORDS = 2 * WORLD_SIZE * AR_SHARD // 2  # [RS, AG][source][shard]
+AR_SUM_WORDS = WORLD_SIZE * (_OWNED // OWNER_COLUMNS) * MAX_ROWS * 4  # int64, tagged
 BOX_WORDS = MAX_ROWS * 1024 // 2
-H3_LOCAL = 512
-H3_SLOT = MAX_ROWS * H3_LOCAL
-H3_WORDS = WORLD_SIZE * H3_SLOT // 2
+POOLED_AG_LOCAL = 512
+POOLED_AG_SLOT = MAX_ROWS * POOLED_AG_LOCAL
+POOLED_AG_WORDS = WORLD_SIZE * POOLED_AG_SLOT // 2
 _ROUTE_WORDS = ROUTE_WIDTH // 2
 _SLICE_WORDS = _ROUTE_WORDS // WORLD_SIZE
 ROUTES_WORDS = MAX_ROWS * (
     (2 * WORLD_SIZE - 1) * _ROUTE_WORDS + WORLD_SIZE * WORLD_SIZE * TOPK
 )
-H4_OWN_WORDS = MAX_ROWS * TOPK * _SLICE_WORDS
-H6_LOCAL = HIDDEN // WORLD_SIZE
-H6_SLOT = MAX_ROWS * H6_LOCAL
-H6_WORDS = WORLD_SIZE * H6_SLOT // 2
-# The FFN boundary's per-row norm sums: UNP (b, x) -> RED x (local pairs),
-# RED x -> every rank (tagged int64 words), like the H1 sums.
+ROUTE_PUSH_OWN_WORDS = MAX_ROWS * TOPK * _SLICE_WORDS
+POST_AG_LOCAL = HIDDEN // WORLD_SIZE
+POST_AG_SLOT = MAX_ROWS * POST_AG_LOCAL
+POST_AG_WORDS = WORLD_SIZE * POST_AG_SLOT // 2
+# The FFN boundary's per-row norm sums: POST_SENDER (b, x) -> REDUCER x (local pairs),
+# REDUCER x -> every rank (tagged int64 words), like the AR sums.
 SUMS = 4
-RED_SENDERS = 8
-RED_IN_WORDS = WORLD_SIZE * RED_SENDERS * MAX_ROWS * SUMS  # int64, local
-H6_SUM_WORDS = WORLD_SIZE * WORLD_SIZE * MAX_ROWS * SUMS  # int64, symmetric
+REDUCER_SENDERS = 8
+REDUCER_IN_WORDS = WORLD_SIZE * REDUCER_SENDERS * MAX_ROWS * SUMS  # int64, local
+POST_AG_SUM_WORDS = WORLD_SIZE * WORLD_SIZE * MAX_ROWS * SUMS  # int64, symmetric
 
 _WORLD = gl.constexpr(WORLD_SIZE)
 _MAX_ROWS = gl.constexpr(MAX_ROWS)
@@ -152,16 +152,16 @@ _HIDDEN = gl.constexpr(HIDDEN)
 _OWNER_COLUMNS = gl.constexpr(OWNER_COLUMNS)
 _SHARES = gl.constexpr(SENDERS)
 _BOX_WORDS = gl.constexpr(BOX_WORDS)
-_H1_WORDS = gl.constexpr(H1_WORDS)
-_H1_SHARD = gl.constexpr(H1_SHARD)
-_H3_WORDS = gl.constexpr(H3_WORDS)
-_H3_SLOT = gl.constexpr(H3_SLOT)
+_AR_WORDS = gl.constexpr(AR_WORDS)
+_AR_SHARD = gl.constexpr(AR_SHARD)
+_POOLED_AG_WORDS = gl.constexpr(POOLED_AG_WORDS)
+_POOLED_AG_SLOT = gl.constexpr(POOLED_AG_SLOT)
 _ROUTES_WORDS = gl.constexpr(ROUTES_WORDS)
-_H4_OWN_WORDS = gl.constexpr(H4_OWN_WORDS)
-_H6_WORDS = gl.constexpr(H6_WORDS)
-_H6_SLOT = gl.constexpr(H6_SLOT)
+_ROUTE_PUSH_OWN_WORDS = gl.constexpr(ROUTE_PUSH_OWN_WORDS)
+_POST_AG_WORDS = gl.constexpr(POST_AG_WORDS)
+_POST_AG_SLOT = gl.constexpr(POST_AG_SLOT)
 _SUMS = gl.constexpr(SUMS)
-HIDDEN_LOCAL = gl.constexpr(H6_LOCAL)
+HIDDEN_LOCAL = gl.constexpr(POST_AG_LOCAL)
 _SLICE = gl.constexpr(_SLICE_WORDS)
 _LAMPORT_EMPTY = gl.constexpr(LAMPORT_EMPTY_WORD)
 _BOX_EMPTY = gl.constexpr(BOX_EMPTY_WORD)
@@ -175,7 +175,7 @@ class ClearedArea:
         name: The area (its hop).
         copy_words: 32-bit words of one copy; the area holds two.
         sentinel: The empty word every copy is re-armed with.
-        local: Only this GPU writes it (the attention box, the own H4
+        local: Only this GPU writes it (the attention box, the own ROUTE_PUSH
             slices); the others are peer-symmetric (Iris heap).
     """
 
@@ -187,13 +187,13 @@ class ClearedArea:
 
 CLEARED_AREAS = (
     ClearedArea("att_box", BOX_WORDS, BOX_EMPTY_WORD, True),
-    ClearedArea("h1", H1_WORDS, LAMPORT_EMPTY_WORD, False),
-    ClearedArea("h3", H3_WORDS, LAMPORT_EMPTY_WORD, False),
-    ClearedArea("h4_own", H4_OWN_WORDS, LAMPORT_EMPTY_WORD, True),
+    ClearedArea("ar", AR_WORDS, LAMPORT_EMPTY_WORD, False),
+    ClearedArea("pooled_ag", POOLED_AG_WORDS, LAMPORT_EMPTY_WORD, False),
+    ClearedArea("route_push_own", ROUTE_PUSH_OWN_WORDS, LAMPORT_EMPTY_WORD, True),
     ClearedArea("routes", ROUTES_WORDS, LAMPORT_EMPTY_WORD, False),
-    ClearedArea("h6", H6_WORDS, LAMPORT_EMPTY_WORD, False),
+    ClearedArea("post_ag", POST_AG_WORDS, LAMPORT_EMPTY_WORD, False),
 )
-"""The areas :func:`clear_next_copies` re-arms (H1 sums are epoch-tagged and
+"""The areas :func:`clear_next_copies` re-arms (AR sums are epoch-tagged and
 never cleared)."""
 
 
@@ -208,51 +208,62 @@ class MuseSparkIrisView:
         rank: This rank in the group (int32; the hop ends that need it at
             compile time take a RANK constexpr too).
         box: The attention box, uint32 words, two copies (local).
-        h1: H1 [copy][RS, AG][source][shard], BF16 (symmetric).
-        h1_sums: H1 norm sums, int64 tagged words (symmetric).
-        h3: H3 [copy][source][row * 512], BF16 (symmetric).
-        h4_own: This rank's own route slices [copy][route row][256 words]
+        ar: AR [copy][RS, AG][source][shard], BF16 (symmetric).
+        ar_sums: AR norm sums, int64 tagged words (symmetric).
+        pooled_ag: POOLED_AG [copy][source][row * 512], BF16 (symmetric).
+        route_push_own: This rank's own route slices [copy][route row][256 words]
             (local).
-        routes: H4 / H5 [copy][column-route stage words], uint32 (symmetric).
-        h6: H6 [copy][source][row * 1024], BF16 (symmetric).
-        red_in: UNP's norm-sum partials [xcd][sender][row][4], int64 pairs
+        routes: ROUTE_PUSH / ROUTE_AG [copy][column-route stage words], uint32 (symmetric).
+        post_ag: POST_AG [copy][source][row * 1024], BF16 (symmetric).
+        reducer_in: POST_SENDER's norm-sum partials [xcd][sender][row][4], int64 pairs
             (local, epoch-tagged).
-        h6_sums: RED's norm sums [rank][xcd][row][4], int64 tagged words
+        post_ag_sums: REDUCER's norm sums [rank][xcd][row][4], int64 tagged words
             (symmetric, epoch-tagged).
     """
 
     heaps: gl.tuple
     rank: gl.tensor
     box: gl.tensor
-    h1: gl.tensor
-    h1_sums: gl.tensor
-    h3: gl.tensor
-    h4_own: gl.tensor
+    ar: gl.tensor
+    ar_sums: gl.tensor
+    pooled_ag: gl.tensor
+    route_push_own: gl.tensor
     routes: gl.tensor
-    h6: gl.tensor
-    red_in: gl.tensor
-    h6_sums: gl.tensor
+    post_ag: gl.tensor
+    reducer_in: gl.tensor
+    post_ag_sums: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
-        self, heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
+        self,
+        heaps,
+        rank,
+        box,
+        ar,
+        ar_sums,
+        pooled_ag,
+        route_push_own,
+        routes,
+        post_ag,
+        reducer_in,
+        post_ag_sums,
     ):
         self.heaps = heaps
         self.rank = rank
         self.box = box
-        self.h1 = h1
-        self.h1_sums = h1_sums
-        self.h3 = h3
-        self.h4_own = h4_own
+        self.ar = ar
+        self.ar_sums = ar_sums
+        self.pooled_ag = pooled_ag
+        self.route_push_own = route_push_own
         self.routes = routes
-        self.h6 = h6
-        self.red_in = red_in
-        self.h6_sums = h6_sums
+        self.post_ag = post_ag
+        self.reducer_in = reducer_in
+        self.post_ag_sums = post_ag_sums
 
 
 @aggregate
-class H4SinkArgs:
-    """h4_sink's arguments, as the MoE stream hands them over: the view, the
+class RoutePushArgs:
+    """route_push_sink's arguments, as the MoE stream hands them over: the view, the
     launch and this rank at compile time (a tuple would turn it into a
     runtime value)."""
 
@@ -309,42 +320,49 @@ def iris_clear_share(copy_base, share, WORDS: gl.constexpr, SENTINEL: gl.constex
 
 @gluon.jit
 def clear_next_copies(view, launch, sender):
-    """SND ``sender``'s (0-127) entry clear of copy ``(L + 1) & 1`` of every
+    """SENDER ``sender``'s (0-127) entry clear of copy ``(L + 1) & 1`` of every
     area in :data:`CLEARED_AREAS`, this rank's slots only. The caller drains
-    (``release_drain``) before its H1 reduce-scatter push."""
+    (``release_drain``) before its AR reduce-scatter push."""
     nxt = 1 - launch.copy
     box = view.box.to(gl.pointer_type(gl.uint32), bitcast=True)
-    h1 = view.h1.to(gl.pointer_type(gl.uint32), bitcast=True)
-    h3 = view.h3.to(gl.pointer_type(gl.uint32), bitcast=True)
-    h4_own = view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True)
+    ar = view.ar.to(gl.pointer_type(gl.uint32), bitcast=True)
+    pooled_ag = view.pooled_ag.to(gl.pointer_type(gl.uint32), bitcast=True)
+    route_push_own = view.route_push_own.to(gl.pointer_type(gl.uint32), bitcast=True)
     routes = view.routes.to(gl.pointer_type(gl.uint32), bitcast=True)
-    h6 = view.h6.to(gl.pointer_type(gl.uint32), bitcast=True)
+    post_ag = view.post_ag.to(gl.pointer_type(gl.uint32), bitcast=True)
     iris_clear_share(box + nxt * _BOX_WORDS, sender, _BOX_WORDS, _BOX_EMPTY)
-    iris_clear_share(h1 + nxt * _H1_WORDS, sender, _H1_WORDS, _LAMPORT_EMPTY)
-    iris_clear_share(h3 + nxt * _H3_WORDS, sender, _H3_WORDS, _LAMPORT_EMPTY)
+    iris_clear_share(ar + nxt * _AR_WORDS, sender, _AR_WORDS, _LAMPORT_EMPTY)
     iris_clear_share(
-        h4_own + nxt * _H4_OWN_WORDS, sender, _H4_OWN_WORDS, _LAMPORT_EMPTY
+        pooled_ag + nxt * _POOLED_AG_WORDS, sender, _POOLED_AG_WORDS, _LAMPORT_EMPTY
+    )
+    iris_clear_share(
+        route_push_own + nxt * _ROUTE_PUSH_OWN_WORDS,
+        sender,
+        _ROUTE_PUSH_OWN_WORDS,
+        _LAMPORT_EMPTY,
     )
     iris_clear_share(
         routes + nxt * _ROUTES_WORDS, sender, _ROUTES_WORDS, _LAMPORT_EMPTY
     )
-    iris_clear_share(h6 + nxt * _H6_WORDS, sender, _H6_WORDS, _LAMPORT_EMPTY)
+    iris_clear_share(
+        post_ag + nxt * _POST_AG_WORDS, sender, _POST_AG_WORDS, _LAMPORT_EMPTY
+    )
 
 
 @gluon.jit
-def h1_rs_sink(
+def ar_rs_sink(
     view, launch, out, block, rows, RANK: gl.constexpr, PEER_CACHE: gl.constexpr
 ):
-    """SND ``block``'s H1 reduce-scatter push: ``out`` is its FP32 [16
+    """SENDER ``block``'s AR reduce-scatter push: ``out`` is its FP32 [16
     tokens, 64] o_proj partial for columns [64 block, ...)."""
     muse_attntail_rs_push(
-        out, block, _peer_addresses(view.h1, view.heaps, RANK), launch.copy, rows,
-        64, _HIDDEN, RANK, _WORLD, _H1_SHARD, PEER_CACHE,
+        out, block, _peer_addresses(view.ar, view.heaps, RANK), launch.copy, rows,
+        64, _HIDDEN, RANK, _WORLD, _AR_SHARD, PEER_CACHE,
     )  # fmt: skip
 
 
 @gluon.jit
-def own1(
+def ar_owner(
     view,
     launch,
     owner,
@@ -359,19 +377,19 @@ def own1(
     POST_HAS_WEIGHT: gl.constexpr,
     PEER_CACHE: gl.constexpr,
 ):
-    """OWN1 ``owner`` (0-7): wait for the 16 sources of its 128 columns, sum
+    """AR_OWNER ``owner`` (0-7): wait for the 16 sources of its 128 columns, sum
     in rank order, push the AG words and the four norm sums (tagged with
     launch.tag) to every rank. Then zero its sums of rows [rows, MAX_ROWS)
     on every rank: 32-bit tags repeat after 2**32 - 1 launches, so a row a
     later, wider launch reads must not keep a tag that old (tags repeat
     after 2**32 - 1 launches)."""
-    sums_peers = _peer_addresses(view.h1_sums, view.heaps, RANK)
+    sums_peers = _peer_addresses(view.ar_sums, view.heaps, RANK)
     muse_attntail_own(
-        owner, launch.cta, view.h1, _peer_addresses(view.h1, view.heaps, RANK),
+        owner, launch.cta, view.ar, _peer_addresses(view.ar, view.heaps, RANK),
         sums_peers, launch.tag, launch.copy, rows, stream_ptr, post_weight_ptr,
-        alpha_ptr, beta_ptr, _HIDDEN, RANK, _WORLD, _H1_SHARD, _MAX_ROWS,
+        alpha_ptr, beta_ptr, _HIDDEN, RANK, _WORLD, _AR_SHARD, _MAX_ROWS,
         _OWNER_COLUMNS, POST_WEIGHT_OFFSET, POST_HAS_WEIGHT, PEER_CACHE, False,
-        launch, on_expiry, _SITE_OWN1,
+        launch, on_expiry, _SITE_AR_OWNER,
     )  # fmt: skip
     OWNERS: gl.constexpr = _HIDDEN // _WORLD // _OWNER_COLUMNS
     layout: gl.constexpr = gl.BlockedLayout(
@@ -388,7 +406,7 @@ def own1(
 
 
 @gluon.jit
-def h3_sink(
+def pooled_ag_sink(
     view,
     launch,
     values,
@@ -399,40 +417,42 @@ def h3_sink(
     PEER_CACHE: gl.constexpr,
 ):
     """The pooler reducer of ``tile`` pushes its reduced [ROWS, 64] columns
-    (any float layout) to slot RANK of every rank's H3 copy, its own
-    included (written through: XN reads it from any XCD)."""
+    (any float layout) to slot RANK of every rank's POOLED_AG copy, its own
+    included (written through: POOLED_NORM reads it from any XCD)."""
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [gl.num_warps(), 1], [1, 0])
     v = _iris_sanitize_lamport_bf16(gl.convert_layout(values, layout).to(gl.bfloat16))
     row = gl.arange(0, ROWS, layout=gl.SliceLayout(1, layout))
     column = gl.arange(0, 64, layout=gl.SliceLayout(0, layout))
     offsets = (
-        launch.copy * (2 * _H3_WORDS)
-        + RANK * _H3_SLOT
+        launch.copy * (2 * _POOLED_AG_WORDS)
+        + RANK * _POOLED_AG_SLOT
         + row[:, None] * 512
         + tile * 64
         + column[None, :]
     )
     valid = (row < rows)[:, None] & (column >= 0)[None, :]
-    peers = _peer_addresses(view.h3, view.heaps, RANK)
+    peers = _peer_addresses(view.pooled_ag, view.heaps, RANK)
     published = ()
     for _ in gl.static_range(1, _WORLD):
         published += (v,)
     _iris_lamport_push(
         published, peers, 0, offsets, valid, tile, RANK, _WORLD, PEER_CACHE
     )
-    own = gl.multiple_of(view.h3.to(gl.pointer_type(gl.bfloat16), bitcast=True), 16)
+    own = gl.multiple_of(
+        view.pooled_ag.to(gl.pointer_type(gl.bfloat16), bitcast=True), 16
+    )
     gl.amd.cdna4.buffer_store(v, own, offsets, mask=valid, cache=".wt")
 
 
 @gluon.jit
-def xn_wait(view, launch, row, on_expiry: gl.constexpr, RANK: gl.constexpr):
-    """XN of ``row``: wait for every rank's 512 pooled columns (the own slot
+def pooled_norm_wait(view, launch, row, on_expiry: gl.constexpr, RANK: gl.constexpr):
+    """POOLED_NORM of ``row``: wait for every rank's 512 pooled columns (the own slot
     polled too); returns iris_lamport_allgather_wait's words for
     iris_rmsnorm_mxfp4_row."""
-    words = view.h3.to(gl.pointer_type(gl.uint32), bitcast=True)
+    words = view.pooled_ag.to(gl.pointer_type(gl.uint32), bitcast=True)
     return iris_lamport_allgather_wait(
-        view.h3, words, row * 256, (launch.copy.to(gl.uint32),), RANK, _WORLD, 512,
-        4096, _H3_WORDS, _H3_SLOT // 2, False, True, launch, on_expiry, _SITE_XN,
+        view.pooled_ag, words, row * 256, (launch.copy.to(gl.uint32),), RANK, _WORLD, 512,
+        4096, _POOLED_AG_WORDS, _POOLED_AG_SLOT // 2, False, True, launch, on_expiry, _SITE_POOLED_NORM,
     )  # fmt: skip
 
 
@@ -449,19 +469,21 @@ def _wave_strips(layout, warps):
 
 
 @gluon.jit
-def _h4_store(view, launch, words, route_row, slice_words, owner, RANK: gl.constexpr):
-    """One H4 store of BF16-pair ``words`` at ``slice_words`` of route rows
+def _route_push_store(
+    view, launch, words, route_row, slice_words, owner, RANK: gl.constexpr
+):
+    """One ROUTE_PUSH store of BF16-pair ``words`` at ``slice_words`` of route rows
     ``route_row`` in ``owner``'s 512-column slice (``owner`` a per-wave
     scalar): to the local own slices, or pushed to that owner's mailbox."""
     valid = (route_row >= 0) & (slice_words >= 0)
     if owner == RANK:
         own = gl.multiple_of(
-            view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16
+            view.route_push_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16
         )
         gl.amd.cdna4.buffer_store(
             _iris_sanitize_lamport_bf16x2(words),
             own,
-            launch.copy * _H4_OWN_WORDS + route_row * _SLICE + slice_words,
+            launch.copy * _ROUTE_PUSH_OWN_WORDS + route_row * _SLICE + slice_words,
             mask=valid,
             cache=".wt",
         )
@@ -482,10 +504,10 @@ def _bf16_pairs(even, odd):
 
 
 @gluon.jit
-def h4_sink(args, ys, route, cols, col0):
-    """The MoE down unit's output pushed to its route's column owner (H4):
+def route_push_sink(args, ys, route, cols, col0):
+    """The MoE down unit's output pushed to its route's column owner (ROUTE_PUSH):
     the MoE stream's ``sink(args, ys, route, cols, col0)`` with ``args`` an
-    H4SinkArgs. Called from per-wave code, so it moves no data between
+    RoutePushArgs. Called from per-wave code, so it moves no data between
     lanes (no layout conversion, LDS or barrier).
 
     ``ys`` holds FP32 partials [R, 16 * num_warps] in a BlockedLayout where
@@ -496,7 +518,7 @@ def h4_sink(args, ys, route, cols, col0):
     512-column slice holds all of the wave's columns (its owner). Each
     column pair goes out as one 32-bit word (receivers test a word's high
     half). Columns this rank owns go to the local own slices (read by
-    own4_complete), the rest to the owner's mailbox
+    route_owner_complete), the rest to the owner's mailbox
     (iris_column_routes_push_words, copy ``launch.copy``), no wait.
 
     - One strip (``ys = (y,)``, ``col0`` a multiple of 16): a lane's 4
@@ -512,11 +534,11 @@ def h4_sink(args, ys, route, cols, col0):
     owner = col0 // 512
     gl.static_assert(
         _wave_strips(ys[0].type.layout, gl.num_warps()),
-        "h4_sink: wave w must hold columns 16 w .. 16 w + 15, 4 per lane",
+        "route_push_sink: wave w must hold columns 16 w .. 16 w + 15, 4 per lane",
     )
     R: gl.constexpr = ys[0].shape[0]
     C: gl.constexpr = ys[0].shape[1]
-    gl.static_assert(C == 16 * gl.num_warps(), "h4_sink: 16 columns a wave")
+    gl.static_assert(C == 16 * gl.num_warps(), "route_push_sink: 16 columns a wave")
     if len(ys) == 1:
         halves = gl.reshape(ys[0], [R, C // 2, 2])
         even, odd = gl.split(halves)
@@ -529,20 +551,20 @@ def h4_sink(args, ys, route, cols, col0):
         # the store sees each lane's two words as adjacent.
         within = gl.arange(0, C // 2, gl.SliceLayout(0, words_l)) % 8
         slice_words = (gl.multiple_of((col0 % 512) // 2, 8) + within)[None, :]
-        _h4_store(view, launch, words, route_row, slice_words, owner, RANK)
+        _route_push_store(view, launch, words, route_row, slice_words, owner, RANK)
     else:
-        gl.static_assert(len(ys) == 4, "h4_sink: one or four strips")
+        gl.static_assert(len(ys) == 4, "route_push_sink: one or four strips")
         for line in gl.static_range(2):
             words = _bf16_pairs(ys[line], ys[line + 2])
             # A lane's 4 words are adjacent and 16-byte aligned.
             slice_words = gl.max_contiguous(
                 gl.multiple_of((cols[line] % 512) // 2, [1, 4]), [1, 4]
             )
-            _h4_store(view, launch, words, route, slice_words, owner, RANK)
+            _route_push_store(view, launch, words, route, slice_words, owner, RANK)
 
 
 @gluon.jit
-def own4_complete(
+def route_owner_complete(
     view,
     launch,
     route_row,
@@ -552,22 +574,22 @@ def own4_complete(
     WEIGHT_OFFSET: gl.constexpr,
     PEER_CACHE: gl.constexpr,
 ):
-    """OWN4 of ``route_row``: wait for this rank's own 512-column slice (the
+    """ROUTE_OWNER of ``route_row``: wait for this rank's own 512-column slice (the
     local dn units' share), then complete it with the peers' partials and
-    push the completed columns and sum of squares to every rank (H5)."""
+    push the completed columns and sum of squares to every rank (ROUTE_AG)."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
     )
     lane = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
     offsets = (
-        launch.copy * _H4_OWN_WORDS
+        launch.copy * _ROUTE_PUSH_OWN_WORDS
         + route_row * _SLICE
         + lane[:, None] * 4
         + word[None, :]
     )
     own_ptr = gl.multiple_of(
-        view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16
+        view.route_push_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16
     )
     own = gl.amd.cdna4.buffer_load(own_ptr, offsets, cache=".cv")
     start = gl.to_tensor(0).to(gl.int64)
@@ -581,17 +603,17 @@ def own4_complete(
         if retries % 64 == 0:
             stop, start = poll_check(launch, start, retries, False)
     if stop:
-        on_expiry(launch, poll_stop_site(launch, _SITE_OWN4_OWN), route_row)
+        on_expiry(launch, poll_stop_site(launch, _SITE_ROUTE_OWNER_OWN), route_row)
     iris_column_routes_complete(
         own, launch.copy, norm_weight, view.routes,
         _peer_addresses(view.routes, view.heaps, RANK), route_row, RANK, _WORLD,
         _MAX_ROWS, _ROUTES_WORDS, WEIGHT_OFFSET, PEER_CACHE, False, launch,
-        on_expiry, _SITE_OWN4,
+        on_expiry, _SITE_ROUTE_OWNER,
     )  # fmt: skip
 
 
 @gluon.jit
-def fin(
+def finisher(
     view,
     launch,
     token,
@@ -602,12 +624,12 @@ def fin(
     EPS: gl.constexpr,
     WEIGHT_OFFSET: gl.constexpr,
 ):
-    """FIN of (token, owner): wait for owner's completed columns of the
-    token's 8 routes and every rank's sums of squares (H5), then the routed
+    """FINISHER of (token, owner): wait for owner's completed columns of the
+    token's 8 routes and every rank's sums of squares (ROUTE_AG), then the routed
     RMSNorm and weighted route sum over those 512 columns (FP32 [512])."""
     loaded, squares = iris_column_routes_wait(
         view.routes, launch.copy, token, owner, _WORLD, _MAX_ROWS, _ROUTES_WORDS, False,
-        launch, on_expiry, _SITE_FIN,
+        launch, on_expiry, _SITE_FINISHER,
     )  # fmt: skip
     return iris_column_routes_combine(
         loaded, squares, route_weights, norm_weight, token, owner, EPS, WEIGHT_OFFSET
@@ -615,7 +637,7 @@ def fin(
 
 
 @gluon.jit
-def h6_sink(
+def post_ag_sink(
     view,
     launch,
     values,
@@ -626,20 +648,20 @@ def h6_sink(
     RANK: gl.constexpr,
     PEER_CACHE: gl.constexpr,
 ):
-    """UNP's post-expert columns [first_output, + OUTPUTS) of every row to
-    slot RANK of every rank's H6 copy, its own included (moetail's push)."""
+    """POST_SENDER's post-expert columns [first_output, + OUTPUTS) of every row to
+    slot RANK of every rank's POST_AG copy, its own included (moetail's push)."""
     iris_muse_moetail_send(
         values, first_output, launch.cta, launch.copy.to(gl.uint32),
-        _peer_addresses(view.h6, view.heaps, RANK), rows, _iris_lamport_push, RANK,
-        _WORLD, HIDDEN_LOCAL, _H6_SLOT, BLOCK_M, OUTPUTS, gl.num_warps(), PEER_CACHE,
+        _peer_addresses(view.post_ag, view.heaps, RANK), rows, _iris_lamport_push, RANK,
+        _WORLD, HIDDEN_LOCAL, _POST_AG_SLOT, BLOCK_M, OUTPUTS, gl.num_warps(), PEER_CACHE,
         ".wt",
     )  # fmt: skip
 
 
 @gluon.jit
-def unp_sums_publish(view, launch, sums, sender, rows):
-    """UNP ``sender`` (0-7) of this XCD publishes its FP32 [16, SUMS] norm-sum
-    partials (rows < rows) to its XCD's RED: one (value, tag) pair each; the
+def post_sender_sums_publish(view, launch, sums, sender, rows):
+    """POST_SENDER ``sender`` (0-7) of this XCD publishes its FP32 [16, SUMS] norm-sum
+    partials (rows < rows) to its XCD's REDUCER: one (value, tag) pair each; the
     pairs of rows [rows, 16) are zeroed."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [16, 4], [gl.num_warps(), 1], [1, 0]
@@ -651,11 +673,11 @@ def unp_sums_publish(view, launch, sums, sender, rows):
         None, :
     ]
     valid = (row < rows)[:, None] & (which >= 0)[None, :]
-    store_pairs(view.red_in + slot, values, launch, valid, "gpu")
+    store_pairs(view.reducer_in + slot, values, launch, valid, "gpu")
     # Rows past ``rows`` get tag 0, which never matches (tags repeat after
     # 2**32 - 1 launches, so no slot may keep an old one).
     gl.atomic_store(
-        view.red_in + slot,
+        view.reducer_in + slot,
         gl.zeros_like(slot).to(gl.int64),
         mask=(row >= rows)[:, None] & (which >= 0)[None, :],
         sem="relaxed",
@@ -664,11 +686,11 @@ def unp_sums_publish(view, launch, sums, sender, rows):
 
 
 @gluon.jit
-def red_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PEER_CACHE: gl.constexpr,):  # fmt: skip
-    """RED of this XCD: wait for its 8 senders' partials of rows < rows (at
+def reducer_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PEER_CACHE: gl.constexpr,):  # fmt: skip
+    """REDUCER of this XCD: wait for its 8 senders' partials of rows < rows (at
     most 16), add them in FP32 (the same reduction on every rank), and push
     the [row][SUMS] totals as tagged int64 words to slot (RANK, xcd) of every
-    rank's h6_sums; rows [rows, MAX_ROWS) of the slot are zeroed (tags repeat
+    rank's post_ag_sums; rows [rows, MAX_ROWS) of the slot are zeroed (tags repeat
     after 2**32 - 1 launches).
     Needs 8 waves (one pair per lane)."""
     gl.static_assert(gl.num_warps() == 8)
@@ -677,9 +699,9 @@ def red_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PE
     entry = gl.arange(0, 16 * _SUMS, layout=gl.SliceLayout(0, poll))
     slot = ((launch.xcd * 8 + sender[:, None]) * _MAX_ROWS) * _SUMS + entry[None, :]
     valid = (sender >= 0)[:, None] & (entry // _SUMS < rows)[None, :]
-    values, seen = poll_pairs(view.red_in + slot, valid, launch, "gpu")
+    values, seen = poll_pairs(view.reducer_in + slot, valid, launch, "gpu")
     if not seen:
-        on_expiry(launch, poll_stop_site(launch, _SITE_RED), 0)
+        on_expiry(launch, poll_stop_site(launch, _SITE_REDUCER), 0)
     totals = gl.sum(values.to(gl.float32, bitcast=True), 0)  # [16 * SUMS]
     push: gl.constexpr = gl.BlockedLayout([1, 4], [32, 2], [gl.num_warps(), 1], [1, 0])
     row = gl.arange(0, _MAX_ROWS, layout=gl.SliceLayout(1, push))
@@ -702,7 +724,7 @@ def red_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PE
         0,
     )
     destination_slot = (RANK * 8 + launch.xcd) * (_MAX_ROWS * _SUMS) + flat
-    peers = _peer_addresses(view.h6_sums, view.heaps, RANK)
+    peers = _peer_addresses(view.post_ag_sums, view.heaps, RANK)
     for peer in gl.static_range(_WORLD):
         destination = gl.multiple_of(peers[peer].to(gl.pointer_type(gl.int64)), 16)
         if peer == RANK:
@@ -714,7 +736,7 @@ def red_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PE
 
 
 @gluon.jit
-def h6_sums_wait(view, launch, row, on_expiry: gl.constexpr):
+def post_ag_sums_wait(view, launch, row, on_expiry: gl.constexpr):
     """The FFN boundary's norm sums of ``row`` from every rank's 8 REDs:
     FP32 [64 sources (rank, xcd), SUMS], polled on their tags (one pair per
     lane), returned with the sources over a wave's lanes and the SUMS sums
@@ -726,9 +748,9 @@ def h6_sums_wait(view, launch, row, on_expiry: gl.constexpr):
     which = gl.arange(0, _SUMS, layout=gl.SliceLayout(0, layout))
     slot = (source[:, None] * _MAX_ROWS + row) * _SUMS + which[None, :]
     valid = (source >= 0)[:, None] & (which >= 0)[None, :]
-    values, seen = poll_pairs(view.h6_sums + slot, valid, launch, "sys")
+    values, seen = poll_pairs(view.post_ag_sums + slot, valid, launch, "sys")
     if not seen:
-        on_expiry(launch, poll_stop_site(launch, _SITE_H6_SUMS), row)
+        on_expiry(launch, poll_stop_site(launch, _SITE_POST_AG_SUMS), row)
     sums_layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
     )
@@ -783,7 +805,7 @@ class MuseSparkIrisState:
 
     Symmetric areas come from the group's Iris heap at the same offset on
     every rank; local areas are device memory. Lamport areas start empty
-    (every copy), the H1 sums at zero (tags are never zero).
+    (every copy), the AR sums at zero (tags are never zero).
 
     Args:
         peers: The group's ``IrisGroup`` (its heap must hold
@@ -797,23 +819,23 @@ class MuseSparkIrisState:
             )
         empty = LAMPORT_EMPTY_WORD - (1 << 32)
         self.peers = peers
-        self.h1 = peers.ctx.empty((2 * H1_WORDS,), dtype=torch.int32)
-        self.h1_sums = peers.ctx.zeros((H1_SUM_WORDS,), dtype=torch.int64)
-        self.h3 = peers.ctx.empty((2 * H3_WORDS,), dtype=torch.int32)
+        self.ar = peers.ctx.empty((2 * AR_WORDS,), dtype=torch.int32)
+        self.ar_sums = peers.ctx.zeros((AR_SUM_WORDS,), dtype=torch.int64)
+        self.pooled_ag = peers.ctx.empty((2 * POOLED_AG_WORDS,), dtype=torch.int32)
         self.routes = peers.ctx.empty((2 * ROUTES_WORDS,), dtype=torch.int32)
-        self.h6 = peers.ctx.empty((2 * H6_WORDS,), dtype=torch.int32)
-        for area in (self.h1, self.h3, self.routes, self.h6):
+        self.post_ag = peers.ctx.empty((2 * POST_AG_WORDS,), dtype=torch.int32)
+        for area in (self.ar, self.pooled_ag, self.routes, self.post_ag):
             area.fill_(empty)
-        self.h6_sums = peers.ctx.zeros((H6_SUM_WORDS,), dtype=torch.int64)
-        self.red_in = torch.zeros(
-            (RED_IN_WORDS,), dtype=torch.int64, device=peers.device
+        self.post_ag_sums = peers.ctx.zeros((POST_AG_SUM_WORDS,), dtype=torch.int64)
+        self.reducer_in = torch.zeros(
+            (REDUCER_IN_WORDS,), dtype=torch.int64, device=peers.device
         )
         self.box = torch.full(
             (2 * BOX_WORDS,), BOX_EMPTY_WORD - (1 << 32), dtype=torch.int32,
             device=peers.device,
         )  # fmt: skip
-        self.h4_own = torch.full(
-            (2 * H4_OWN_WORDS,), empty, dtype=torch.int32, device=peers.device
+        self.route_push_own = torch.full(
+            (2 * ROUTE_PUSH_OWN_WORDS,), empty, dtype=torch.int32, device=peers.device
         )
         self.heaps = tuple(int(address) for address in peers.addresses[:WORLD_SIZE])
         # The launch's error words, on the heap so that iris_fail_stop can
@@ -831,23 +853,23 @@ class MuseSparkIrisState:
     def heap_bytes() -> int:
         """Iris heap bytes of the symmetric areas."""
         return (
-            allocation_bytes((2 * H1_WORDS,), torch.int32)
-            + allocation_bytes((H1_SUM_WORDS,), torch.int64)
-            + allocation_bytes((2 * H3_WORDS,), torch.int32)
+            allocation_bytes((2 * AR_WORDS,), torch.int32)
+            + allocation_bytes((AR_SUM_WORDS,), torch.int64)
+            + allocation_bytes((2 * POOLED_AG_WORDS,), torch.int32)
             + allocation_bytes((2 * ROUTES_WORDS,), torch.int32)
-            + allocation_bytes((2 * H6_WORDS,), torch.int32)
+            + allocation_bytes((2 * POST_AG_WORDS,), torch.int32)
             + allocation_bytes((ERROR_WORDS,), torch.int32)
-            + allocation_bytes((H6_SUM_WORDS,), torch.int64)
+            + allocation_bytes((POST_AG_SUM_WORDS,), torch.int64)
         )
 
     def view_args(self) -> tuple:
         """Kernel arguments that build :class:`MuseSparkIrisView` in order:
-        ``heaps`` (a tuple of 8 int64), rank, then box, h1, h1_sums, h3,
-        h4_own, routes, h6, red_in, h6_sums. The Lamport areas are typed as
+        ``heaps`` (a tuple of 8 int64), rank, then box, ar, ar_sums, pooled_ag,
+        route_push_own, routes, post_ag, reducer_in, post_ag_sums. The Lamport areas are typed as
         the kernel reads them (BF16 halves, or 32-bit words)."""
         return (
             self.heaps, self.peers.rank, self.box.view(torch.uint32),
-            self.h1.view(torch.bfloat16), self.h1_sums, self.h3.view(torch.bfloat16),
-            self.h4_own.view(torch.uint32), self.routes.view(torch.uint32),
-            self.h6.view(torch.bfloat16), self.red_in, self.h6_sums,
+            self.ar.view(torch.bfloat16), self.ar_sums, self.pooled_ag.view(torch.bfloat16),
+            self.route_push_own.view(torch.uint32), self.routes.view(torch.uint32),
+            self.post_ag.view(torch.bfloat16), self.reducer_in, self.post_ag_sums,
         )  # fmt: skip

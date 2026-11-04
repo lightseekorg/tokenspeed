@@ -155,8 +155,8 @@ def _assert_areas_empty(state):
     dist.barrier()
     copy = (_epoch(state) + 1) & 1
     areas = dict(
-        att_box=state.iris.box, h1=state.iris.h1, h3=state.iris.h3,
-        h4_own=state.iris.h4_own, routes=state.iris.routes, h6=state.iris.h6,
+        att_box=state.iris.box, ar=state.iris.ar, pooled_ag=state.iris.pooled_ag,
+        route_push_own=state.iris.route_push_own, routes=state.iris.routes, post_ag=state.iris.post_ag,
     )  # fmt: skip
     for area in CLEARED_AREAS:
         words = areas[area.name].view(2, area.copy_words)[copy]

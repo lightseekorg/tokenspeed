@@ -164,7 +164,7 @@ def test_gluon_declines_what_it_does_not_implement(change):
 
 @pytest.mark.parametrize("rows", [8, 16])
 def test_head_tasks_on_summed_partials_write_the_triton_bytes(rows):
-    """The fused layer's HEAD tasks sum the QKV task's 16 K-part partials in
+    """The fused layer's PROLOGUE tasks sum the QKV task's 16 K-part partials in
     part order, round once to BF16 and run the prologue in registers: the
     bytes equal the Triton prologue's on those BF16 rows."""
     from monokernel_body_helpers import head_task_kernel

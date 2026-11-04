@@ -366,7 +366,7 @@ def test_qkv_task_paces_its_weights_and_fits(window: int, kernel, max_vgprs: int
 
 
 def test_head_task_prologue_runs_on_summed_partials():
-    """A HEAD task sums its head's 16 K-part partials (tag-polled 64-bit
+    """A PROLOGUE task sums its head's 16 K-part partials (tag-polled 64-bit
     words) and runs the GQA prologue on the rows in registers: no store and
     reload of the rows, no scratch."""
     assembly = compile_gfx950(

@@ -2315,7 +2315,7 @@ store each.
   (what the EP1 direct decode reads). `scale_lanes` adds a lane-major copy
   of the gate/up scales, 32 MiB per layer.
 - Every down unit's fp32 `[16, 128]` result goes to a sink function with
-  its per-token routes and columns; the layer passes its H4 push, the
+  its per-token routes and columns; the layer passes its ROUTE_PUSH push, the
   standalone launch stores `out[route, :]` in bf16. The sink gets one
   16-column strip per call, or with `DN_LINES` the unit's 4 strips at once.
 - Bitwise equal to the direct decode: the same per-column MFMA chain,

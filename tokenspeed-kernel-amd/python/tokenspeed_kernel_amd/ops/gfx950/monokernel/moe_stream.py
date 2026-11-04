@@ -890,7 +890,7 @@ def store_routes_sink(args, ys, route, cols, col0):
     bf16(y)`` with ``out = args[0]`` of shape ``(rows * top_k, hidden)``;
     rows with ``route < 0`` are skipped. With 4 strips (whole lines) each
     lane stores its two lines as 32-bit column pairs, one 16-byte store per
-    line. The layer passes its H4 push."""
+    line. The layer passes its ROUTE_PUSH push."""
     out = args[0]
     if len(ys) == 1:
         gl.amd.cdna4.buffer_store(
@@ -1494,7 +1494,7 @@ def run_moe(
                 )
             ring2 = ring2[: c % RING] + (nb,) + ring2[c % RING + 1 :]
             gl.amd.hint.sched_barrier()
-        # Down unit -> sink (the layer's H4 push). Handed over in
+        # Down unit -> sink (the layer's ROUTE_PUSH push). Handed over in
         # MOE_SINK_LAYOUT, which is the MFMA result's own layout: no data
         # moves, and each wave owns its 16 columns.
         rows = gl.arange(0, 16, layout=gl.SliceLayout(1, rowl))

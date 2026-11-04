@@ -872,7 +872,7 @@ def muse_attntail_rs_push(
     """Push a sender's FP32 [16 tokens, OUTPUTS] o_proj partial (columns
     [block * OUTPUTS, ...)) as BF16 to reduce-scatter slot RANK of the rank
     owning those columns, in mailbox copy ``stage``; rows past ``rows`` are
-    not stored. The H1 reduce-scatter push of muse_attntail_send."""
+    not stored. The AR reduce-scatter push of muse_attntail_send."""
     WAVES: gl.constexpr = gl.num_warps()
     # Each wave stores whole token rows (OUTPUTS BF16 = one 128 B line), so
     # no line crosses the link in partial writes.

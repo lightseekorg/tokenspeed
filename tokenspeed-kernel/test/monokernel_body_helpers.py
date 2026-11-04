@@ -498,7 +498,7 @@ def sender_kernel(
     OUTPUTS: gl.constexpr,
     VECTOR: gl.constexpr,
 ):
-    """The native layer's o_proj sender (SND) on a plain x: program b issues
+    """The native layer's o_proj sender (SENDER) on a plain x: program b issues
     weight rows ``[b * OUTPUTS, ...)`` over the whole K, multiplies them by
     the first 16 rows of x (rows past ``M`` reread row ``M - 1``) and stores
     the BF16 sums ``[16, OUTPUTS]`` at ``out_ptr`` row-major per program."""
@@ -586,7 +586,7 @@ def kpart_router_kernel(
     POST_EPS: gl.constexpr,
     PRE_EPS: gl.constexpr,
 ):
-    """The router K-part task (RTR): 16 experts x WIDTH / PARTS of the FP32
+    """The router K-part task (ROUTER): 16 experts x WIDTH / PARTS of the FP32
     router as BF16 hi + lo, over the FP32 x this K part builds."""
     task = gl.program_id(0)
     GROUPS: gl.constexpr = EXPERTS // 16
@@ -624,7 +624,7 @@ def kpart_pooler_kernel(
     POST_EPS: gl.constexpr,
     PRE_EPS: gl.constexpr,
 ):
-    """The pooler K-part task (POOL): ``ROWS`` pooled columns x WIDTH / PARTS
+    """The pooler K-part task (POOLER): ``ROWS`` pooled columns x WIDTH / PARTS
     of the BF16 pooler over the BF16-rounded x this K part builds."""
     task = gl.program_id(0)
     GROUPS: gl.constexpr = OUTPUTS // ROWS
@@ -987,7 +987,7 @@ def head_task_kernel(
     NUM_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
 ):
-    """The native layer's HEAD tasks: program h < NUM_Q_HEADS + NUM_KV_HEADS
+    """The native layer's PROLOGUE tasks: program h < NUM_Q_HEADS + NUM_KV_HEADS
     sums its head's QKV partials (the K-split task's tagged words) and runs
     the GQA prologue on them in registers (FP8 query, FP8 cache)."""
     N: gl.constexpr = (
@@ -1054,7 +1054,7 @@ def head_task_kernel(
 
 @gluon.jit
 def column_relay_kernel(x_ptr, w_ptr, out_ptr, M, K: gl.constexpr):
-    """The native layer's post-expert sender (UNP): program b relays the
+    """The native layer's post-expert sender (POST_SENDER): program b relays the
     16-column tile ``[16 b, 16 b + 16)`` of ``x [M, K] @ w.T`` across its
     waves and stores the rows below ``M`` in BF16."""
     WAVES: gl.constexpr = gl.num_warps()
@@ -1116,7 +1116,7 @@ def sender_sums_kernel(
     N: gl.constexpr,
 ):
     """The post-expert sender's partial norm sums: the relayed 16-column
-    tile rounded to BF16 (the H6 value), and per row the FFN boundary's four
+    tile rounded to BF16 (the POST_AG value), and per row the FFN boundary's four
     sums over those columns (``deferred_norm_terms_gfx950``), published as
     tagged FP32 words ``[program, row, 4]`` for the sum reducer."""
     WAVES: gl.constexpr = gl.num_warps()

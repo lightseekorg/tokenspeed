@@ -430,8 +430,8 @@ class MuseSparkMonokernelLayer:
             alpha=_require("alpha", alpha, (HIDDEN,), torch.float32),
             beta=_require("beta", beta, (HIDDEN,), torch.float32),
             # A weightless post-attention norm (Muse) passes the multiplier
-            # vector of ones and no weight to OWN1.
-            # Without a weight (Muse), OWN1 reads none: the BF16 multiplier
+            # vector of ones and no weight to AR_OWNER.
+            # Without a weight (Muse), AR_OWNER reads none: the BF16 multiplier
             # vector of ones stands in for the pointer.
             post_attn_norm=(
                 _bf16_with_offset(None, 0.0, HIDDEN, device)
