@@ -143,8 +143,7 @@ def test_startup_failure_drains_pending_device_work_and_propagates():
     assert device.settled == device.drained == 1
 
 
-@pytest.mark.parametrize("mixed", [False, True])
-def test_startup_reaches_sixteen_requests_after_chunked_admission(mixed):
+def test_startup_reaches_sixteen_requests_after_chunked_admission():
     config = _config(4)
     config.max_batch_size = 16
     config.max_scheduled_tokens = 4096
@@ -157,7 +156,7 @@ def test_startup_reaches_sixteen_requests_after_chunked_admission(mixed):
             attn_kind=AttnKind.Full,
         )
     ]
-    config.enable_mixed_prefill_decode = mixed
+    config.enable_mixed_prefill_decode = False
     config.overlap_schedule_depth = 1
     device = _Device(4, fail_decode=False)
     warmup_request_path(
@@ -168,6 +167,21 @@ def test_startup_reaches_sixteen_requests_after_chunked_admission(mixed):
         decode_steps=2,
     )
     assert device.batches.count((16, 0)) == 2
+
+
+def test_startup_rejects_mixed_rounds_without_device_work():
+    config = _config(4)
+    config.enable_mixed_prefill_decode = True
+    device = _Device(4, fail_decode=False)
+    with pytest.raises(ValueError, match="separate prefill and decode"):
+        warmup_request_path(
+            device,
+            config,
+            phases=((3, 31),),
+            decode_width=4,
+            decode_steps=2,
+        )
+    assert not device.batches
 
 
 @pytest.mark.parametrize("batch,prompt", [(0, 5), (1, 0)])

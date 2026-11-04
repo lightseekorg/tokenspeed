@@ -2344,9 +2344,9 @@ untouched. Capturing decode alone does not prepare eager prefill against
 those final allocations.
 
 For AMD CDNA4 padded DSA prefill with greedy EAGLE3 and no host cache,
-pipeline parallelism, attention data parallelism or disaggregation, startup
-therefore drives bounded synthetic requests through the ordinary scheduler
-and device path before constructing the live scheduler. Separate temporary
+mixed prefill/decode, pipeline parallelism, attention data parallelism or
+disaggregation, startup drives bounded synthetic requests through the ordinary
+scheduler and device path before constructing the live scheduler. Separate temporary
 schedulers cover a short cold prefix, a medium cold prefix and a full
 request batch with chunked prefill and two decode rounds. Temporary request
 identities and outputs remain private. Each phase drains pending drafting
