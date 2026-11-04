@@ -125,6 +125,7 @@ __all__ = [
     "launch_gluon_dsa_decode_topk_standard_gfx950",
     "gluon_dsa_kpool_prefill_logits_gfx950",
     "gluon_dsa_kpool_prefill_plan_logits_gfx950",
+    "gluon_dsa_live_logical_topk_gfx950",
     "gluon_dsa_logical_topk_gfx950",
     "gluon_dsa_row_bounded_logical_topk_gfx950",
     "launch_gluon_dsa_prefill_topk_bf16_gfx950",
@@ -1753,6 +1754,7 @@ def _accumulate_oneblock_histogram_tile(
     FIRST_PASS: gl.constexpr,
     IS_TAIL: gl.constexpr,
     HIST_COPIES: gl.constexpr = 1,
+    LIVE_ONLY: gl.constexpr = False,
 ):
     _, values, valid = _load_oneblock_tile(
         candidate_logits,
@@ -1766,6 +1768,8 @@ def _accumulate_oneblock_histogram_tile(
     keys = _fp32_to_topk_key(values)
     if FIRST_PASS:
         prefix_match = valid
+        if LIVE_ONLY:
+            prefix_match = prefix_match & (values != -float("inf"))
     else:
         prefix_match = valid & ((keys >> (shift + radix_bits)) == prefix)
     buckets = (keys >> shift) & ((1 << radix_bits) - 1)
@@ -1791,6 +1795,7 @@ def _accumulate_oneblock_histogram_tile_pair(
     BLOCK_N: gl.constexpr,
     FIRST_PASS: gl.constexpr,
     HIST_COPIES: gl.constexpr = 1,
+    LIVE_ONLY: gl.constexpr = False,
 ):
     _, first_values, first_valid = _load_oneblock_tile(
         candidate_logits,
@@ -1815,6 +1820,9 @@ def _accumulate_oneblock_histogram_tile_pair(
     if FIRST_PASS:
         first_match = first_valid
         second_match = second_valid
+        if LIVE_ONLY:
+            first_match = first_match & (first_values != -float("inf"))
+            second_match = second_match & (second_values != -float("inf"))
     else:
         prefix_shift = shift + radix_bits
         first_match = first_valid & ((first_keys >> prefix_shift) == prefix)
@@ -1896,6 +1904,44 @@ def _emit_oneblock_topk_tile(
         out + row * out_stride + equal_position,
         logical_offsets,
         mask=equal_write,
+    )
+
+
+@gluon.jit
+def _emit_oneblock_live_tile(
+    candidate_logits,
+    tile_start,
+    candidate_len,
+    vector_end,
+    candidate_start,
+    shared_output_counters,
+    out,
+    row,
+    out_stride: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    IS_TAIL: gl.constexpr,
+):
+    offsets, values, valid = _load_oneblock_tile(
+        candidate_logits,
+        tile_start,
+        candidate_len,
+        vector_end,
+        value_layout,
+        BLOCK_N,
+        IS_TAIL,
+    )
+    live = valid & (values != -float("inf"))
+    position = shared_output_counters.atomic_scatter_add(
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+        gl.zeros([BLOCK_N], gl.int32, layout=value_layout),
+        axis=0,
+        mask=live,
+    )
+    gl.store(
+        out + row * out_stride + position,
+        candidate_start + offsets.to(gl.int32),
+        mask=live,
     )
 
 
@@ -2136,6 +2182,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     ALIGNED_ROWS: gl.constexpr,
     HIST_COPIES: gl.constexpr = 1,
     TIE_CAP: gl.constexpr = 0,
+    LIVE_ONLY: gl.constexpr = False,
 ):
     gl.static_assert(
         HIST_COPIES == 1 or not USE_COMPACT_FINAL,
@@ -2144,6 +2191,10 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     gl.static_assert(
         TIE_CAP == 0 or not USE_COMPACT_FINAL,
         "the compact final pass resolves its own threshold bucket",
+    )
+    gl.static_assert(
+        not LIVE_ONLY or (not IS_DECODE and TIE_CAP == 0),
+        "live-only selection returns logical columns without tie lists",
     )
     row = gl.program_id(0)
     value_layout: gl.constexpr = _vector_layout(
@@ -2246,27 +2297,29 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     candidate_len = gl.maximum(candidate_end - candidate_start, 0)
     selected_count = gl.minimum(candidate_len, topk).to(gl.int32)
     output_offsets = gl.arange(0, topk, layout=output_layout)
-    gl.store(lens_out + row, selected_count)
+    # Live-only rows learn how many candidates they hold from the first pass.
+    if not LIVE_ONLY:
+        gl.store(lens_out + row, selected_count)
 
-    if candidate_len <= topk:
-        valid = output_offsets < candidate_len
-        logical_offsets = candidate_start + output_offsets.to(gl.int32)
-        if IS_DECODE:
-            block_idx = logical_offsets // page_size
-            block_offset = logical_offsets - block_idx * page_size
-            page = gl.load(
-                block_table + req * block_table_cols + block_idx,
-                mask=valid & (block_idx < block_table_cols),
-                other=0,
-            ).to(gl.int32)
-            indices = page * page_size + block_offset
-        else:
-            indices = logical_offsets
-        gl.store(
-            out + row * out_stride + output_offsets,
-            gl.where(valid, indices, -1),
-        )
-        return
+        if candidate_len <= topk:
+            valid = output_offsets < candidate_len
+            logical_offsets = candidate_start + output_offsets.to(gl.int32)
+            if IS_DECODE:
+                block_idx = logical_offsets // page_size
+                block_offset = logical_offsets - block_idx * page_size
+                page = gl.load(
+                    block_table + req * block_table_cols + block_idx,
+                    mask=valid & (block_idx < block_table_cols),
+                    other=0,
+                ).to(gl.int32)
+                indices = page * page_size + block_offset
+            else:
+                indices = logical_offsets
+            gl.store(
+                out + row * out_stride + output_offsets,
+                gl.where(valid, indices, -1),
+            )
+            return
 
     shared_histogram.store(slot_zeros)
     shared_output_counters.store(output_counter_zeros)
@@ -2394,6 +2447,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                         BLOCK_N,
                         pass_index == 0,
                         pass_copies,
+                        LIVE_ONLY,
                     )
                 for tile_start in range(paired_end, full_end, BLOCK_N):
                     _accumulate_oneblock_histogram_tile(
@@ -2410,6 +2464,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                         pass_index == 0,
                         False,
                         pass_copies,
+                        LIVE_ONLY,
                     )
             else:
                 for tile_start in range(0, full_end, BLOCK_N):
@@ -2426,6 +2481,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                         BLOCK_N,
                         pass_index == 0,
                         False,
+                        1,
+                        LIVE_ONLY,
                     )
             if full_end < candidate_len:
                 _accumulate_oneblock_histogram_tile(
@@ -2442,6 +2499,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     pass_index == 0,
                     True,
                     pass_copies,
+                    LIVE_ONLY,
                 )
 
         if pass_copies == 1:
@@ -2451,6 +2509,51 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                 [MAX_BUCKETS, HIST_COPIES]
             )
             counts = gl.convert_layout(gl.sum(copies, axis=1), histogram_layout)
+        if LIVE_ONLY and pass_index == 0:
+            # The first pass counted only scores other than -inf. A row
+            # holding at most topk of them returns them all rather than
+            # resolving a tie among its -inf scores, which serializes every
+            # pass's atomics on one counter.
+            live_count = gl.sum(counts, axis=0)
+            gl.store(lens_out + row, gl.minimum(live_count, topk))
+            if live_count <= topk:
+                emit_full_end = candidate_len & -BLOCK_N
+                for tile_start in range(0, emit_full_end, BLOCK_N):
+                    _emit_oneblock_live_tile(
+                        candidate_logits,
+                        tile_start,
+                        candidate_len,
+                        vector_end,
+                        candidate_start,
+                        shared_output_counters,
+                        out,
+                        row,
+                        out_stride,
+                        value_layout,
+                        BLOCK_N,
+                        False,
+                    )
+                if emit_full_end < candidate_len:
+                    _emit_oneblock_live_tile(
+                        candidate_logits,
+                        emit_full_end,
+                        candidate_len,
+                        vector_end,
+                        candidate_start,
+                        shared_output_counters,
+                        out,
+                        row,
+                        out_stride,
+                        value_layout,
+                        BLOCK_N,
+                        True,
+                    )
+                gl.store(
+                    out + row * out_stride + output_offsets,
+                    gl.full([topk], -1, gl.int32, layout=output_layout),
+                    mask=output_offsets >= live_count,
+                )
+                return
         count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
         count_low, count_high = gl.split(count_pairs)
         count_low = gl.convert_layout(count_low, group_layout)
@@ -3138,11 +3241,19 @@ def _dsa_oneblock_topk_indices(
     plan: _TopKLaunchPlan,
     out: torch.Tensor,
     lens_out: torch.Tensor,
+    live_only: bool = False,
+    hist_copies: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device_index = logits.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
     waves_per_eu = 8 if logits.shape[0] > _device_compute_units(device_index) else 0
+    if hist_copies is None:
+        hist_copies = (
+            _ONEBLOCK_DECODE_HIST_COPIES
+            if is_decode and not plan.use_compact_final
+            else 1
+        )
     # Fixed per decode call site; prefill rows start at runtime row_starts, unaligned.
     aligned_rows = (
         is_decode
@@ -3173,14 +3284,11 @@ def _dsa_oneblock_topk_indices(
         COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
         USE_COMPACT_FINAL=plan.use_compact_final,
         ALIGNED_ROWS=aligned_rows,
-        HIST_COPIES=(
-            _ONEBLOCK_DECODE_HIST_COPIES
-            if is_decode and not plan.use_compact_final
-            else 1
-        ),
+        HIST_COPIES=hist_copies,
         TIE_CAP=(
             _ONEBLOCK_DECODE_TIE_CAP if is_decode and not plan.use_compact_final else 0
         ),
+        LIVE_ONLY=live_only,
         num_warps=16,
         # Preserve two resident workgroups only when the grid can use them.
         waves_per_eu=waves_per_eu,
@@ -3376,6 +3484,55 @@ def gluon_dsa_row_bounded_logical_topk_gfx950(
         plan=_oneblock_launch_plan(cols, is_decode=False),
         out=out,
         lens_out=lens_out,
+    )
+
+
+def gluon_dsa_live_logical_topk_gfx950(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`gluon_dsa_logical_topk_gfx950` over each row's live scores,
+    those other than -inf.
+
+    A row with at most ``topk`` live scores returns all of them, and
+    ``lens_out`` counts them; other rows return a top-k of their live
+    scores. :func:`gluon_dsa_logical_topk_gfx950` instead pads such rows
+    with tied -inf scores, and resolving that tie serializes its atomics:
+    the top-k of 8 x 2048 merged candidates over 64 rows, 4 of them with
+    none live, takes 67 us that way and 16 us this way (MI350X).
+
+    Args and returns as :func:`gluon_dsa_logical_topk_gfx950`.
+    """
+    topk = int(topk)
+    out, lens_out = _check_logical_topk_args(
+        logits, row_starts, row_ends, topk=topk, out=out, lens_out=lens_out
+    )
+    if logits.shape[0] == 0:
+        return out, lens_out
+    plan = _oneblock_launch_plan(logits.shape[1], is_decode=False)
+    return _dsa_oneblock_topk_indices(
+        logits,
+        row_starts,
+        row_starts,
+        row_ends,
+        block_table_cols=0,
+        page_size=1,
+        topk=topk,
+        q_len_per_req=1,
+        is_decode=False,
+        plan=plan,
+        out=out,
+        lens_out=lens_out,
+        live_only=True,
+        # Merged candidates are every rank's top scores, crowded into a few
+        # first-pass buckets like decode logits (MI350X, 64 rows of 8 x 2048
+        # merged candidates: 16 us against 25 us with one copy).
+        hist_copies=1 if plan.use_compact_final else _ONEBLOCK_DECODE_HIST_COPIES,
     )
 
 

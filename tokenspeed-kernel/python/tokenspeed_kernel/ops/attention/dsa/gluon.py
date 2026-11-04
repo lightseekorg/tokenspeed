@@ -826,9 +826,11 @@ if current_platform().is_amd:
     def gluon_dsa_merge_candidates_gfx950(
         records: torch.Tensor, *, topk: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``dsa_merge_candidates`` with the one-block radix top-k. Only its
-        k-th score is used: the selection is redone from it deterministically,
-        as every KVP rank must select the same tied candidates."""
+        """``dsa_merge_candidates`` with the one-block radix top-k of the
+        live candidates. Only its lowest score is used: the selection is
+        redone from it deterministically, as every KVP rank must select the
+        same tied candidates. Rows with at most ``topk`` live candidates,
+        such as a decode graph's padding rows, keep them all."""
         from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
             rank_major_scores_with_bounds,
             select_through_threshold,
@@ -836,12 +838,12 @@ if current_platform().is_amd:
         )
         from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
             _device_compute_units,
-            gluon_dsa_logical_topk_gfx950,
+            gluon_dsa_live_logical_topk_gfx950,
         )
 
         scores, starts, ends = rank_major_scores_with_bounds(records)
         rows = scores.shape[0]
-        order, _ = gluon_dsa_logical_topk_gfx950(scores, starts, ends, topk=topk)
+        order, _ = gluon_dsa_live_logical_topk_gfx950(scores, starts, ends, topk=topk)
         # Measured on MI350X: the per-source programs halve the selection up
         # to about four waves of them and lose beyond eight.
         degree = records.shape[0]
