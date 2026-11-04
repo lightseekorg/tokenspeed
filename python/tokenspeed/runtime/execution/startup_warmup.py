@@ -68,6 +68,13 @@ def warmup_request_path(
 
     if decode_width < 1 or decode_steps < 1:
         raise ValueError("startup decode width and steps must be positive")
+    # The bounded output budget assumes no decoding during another request's
+    # admission. Mixed rounds could exhaust an early request before the full
+    # batch is resident, bypassing the intended full-batch preparation.
+    if scheduler_config.enable_mixed_prefill_decode:
+        raise ValueError(
+            "startup rehearsal requires separate prefill and decode rounds"
+        )
     forwards = 0
     with (
         torch.no_grad(),

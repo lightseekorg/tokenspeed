@@ -1262,6 +1262,7 @@ class HostBootstrap:
                 and model_config.dsa_padded_prefill_replay
                 and spec_algorithm == "EAGLE3"
                 and server_args.disable_kvstore
+                and not server_args.enable_mixed_batch
                 and not mapping.has_pp
                 and not mapping.has_attn_dp
                 and server_args.disaggregation_mode == "null"
