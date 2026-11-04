@@ -89,6 +89,7 @@ class MoeStreamDecode:
 def prepare_moe_stream_decode(
     device: torch.device,
     *,
+    weight_dtype: str,
     hidden: int,
     ispp: int,
     num_experts: int,
@@ -100,6 +101,8 @@ def prepare_moe_stream_decode(
 
     Args:
         device: The GPU the launches run on (outside graph capture).
+        weight_dtype: The experts' weight format (registry ``weight_dtype``
+            trait, e.g. ``"mxfp4"``).
         hidden: The experts' hidden size.
         ispp: Intermediate size per partition (this rank's slice).
         num_experts: Local experts.
@@ -118,6 +121,7 @@ def prepare_moe_stream_decode(
             "stream_decode",
             _SIGNATURE,
             traits={
+                "weight_dtype": weight_dtype,
                 "hidden": hidden,
                 "ispp": ispp,
                 "num_experts": num_experts,

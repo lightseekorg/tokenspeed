@@ -326,6 +326,11 @@ class UncachedBuffer:
             )
             if status != 0:
                 raise RuntimeError(f"hipMemset failed ({status})")
+            # hipMemset may return before the zeros land; finish it so the
+            # first launch, on whatever stream, reads zeroed words.
+            status = self._hip.hipDeviceSynchronize()
+            if status != 0:
+                raise RuntimeError(f"hipDeviceSynchronize failed ({status})")
 
     def data_ptr(self) -> int:
         return self._pointer

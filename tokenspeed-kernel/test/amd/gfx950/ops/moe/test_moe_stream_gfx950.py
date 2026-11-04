@@ -75,6 +75,7 @@ def stream():
     device = torch.device("cuda")
     selected = prepare_moe_stream_decode(
         device,
+        weight_dtype="mxfp4",
         hidden=HIDDEN,
         ispp=512,
         num_experts=EXPERTS,

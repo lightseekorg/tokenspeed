@@ -2914,6 +2914,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
             stream = prepare_moe_stream_decode(
                 device,
+                # expert_tp8_mxfp4 holds only for MXFP4 experts.
+                weight_dtype="mxfp4",
                 hidden=self.config.moe_hidden_size,
                 ispp=self.config.moe_intermediate_size // mapping.moe.tp_size,
                 num_experts=stream_mlps[0].experts_per_rank,

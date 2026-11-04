@@ -104,6 +104,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
     _mxfp4_quantize_tile_in_layout,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+    is_swizzled_cdna4_mxfp4_scale,
+)
 
 __all__ = [
     "GRID",
@@ -1243,7 +1246,12 @@ class MoeStreamState:
     """
 
     def __init__(self, device: torch.device) -> None:
-        self.device = torch.device(device)
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            # Launches compare this with their tensors' devices, which carry
+            # an index.
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.device = device
         self.epochs = torch.zeros(COUNTER_WORDS, dtype=torch.int64, device=device)
         self.claims = torch.zeros(COUNTER_WORDS, dtype=torch.int64, device=device)
         routes = MAX_ROWS * TOPK
@@ -1421,6 +1429,12 @@ def launch_gluon_mxfp4_moe_stream_gfx950(
         raise ValueError(
             "launch_gluon_mxfp4_moe_stream_gfx950: out must be contiguous "
             f"({rows * TOPK}, {HIDDEN}) bf16, got {tuple(out.shape)} {out.dtype}"
+        )
+    if xs.dtype != torch.uint8 or not is_swizzled_cdna4_mxfp4_scale(xs):
+        raise ValueError(
+            "launch_gluon_mxfp4_moe_stream_gfx950: activation scales must be "
+            f"CDNA4-swizzled E8M0, got {xs.dtype} shape {tuple(xs.shape)} "
+            f"strides {xs.stride()}"
         )
     if state.device != out.device:
         raise ValueError(

@@ -38,7 +38,9 @@ from tokenspeed_kernel.selection import (  # noqa: E402
 )
 from tokenspeed_kernel.signature import dense_format_signature  # noqa: E402
 
-GEOMETRY = dict(hidden=4096, ispp=512, num_experts=256, top_k=8, ep_size=1)
+GEOMETRY = dict(
+    weight_dtype="mxfp4", hidden=4096, ispp=512, num_experts=256, top_k=8, ep_size=1
+)
 
 
 @pytest.fixture
@@ -65,6 +67,7 @@ def test_selects_the_stream_for_the_expert_tp_slice(mi355_platform):
     "change",
     [
         dict(ep_size=8),
+        dict(weight_dtype="nvfp4"),
         dict(ispp=4096),
         dict(num_experts=32),
         dict(hidden=7168),
