@@ -815,7 +815,10 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             ),
         ),
         config=SimpleNamespace(
-            hidden_size=8192, moe_hidden_size=4096, num_experts_per_tok=8
+            hidden_size=8192,
+            moe_hidden_size=4096,
+            moe_intermediate_size=4096,
+            num_experts_per_tok=8,
         ),
         model=SimpleNamespace(iris_state=None, layers=[layer]),
     )
