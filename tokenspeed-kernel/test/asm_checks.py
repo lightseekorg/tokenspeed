@@ -372,9 +372,12 @@ def persistent_codegen_problems(assembly: str, *, entry: str | None) -> list[str
             problems.append("workgroup barrier or LDS exchange inside a poll loop")
         # A retry exits on a lane mask written by a compare (one per polled
         # array, or the one polling lane's of gl.atomic_poll), never on a
-        # cross-lane reduction.
+        # cross-lane reduction. The compare may write VCC (a ballot of it
+        # then tests VCC with s_cmp).
         if vector and not re.search(
-            r"v_cmp_\w+_e64 s\[\d+:\d+\]|v_readfirstlane_b32", loop
+            r"v_cmp_\w+_e64 s\[\d+:\d+\]|v_readfirstlane_b32"
+            r"|v_cmp_\w+_e32 vcc,[^\n]*\n(?:[^\n]*\n)?\s*s_cmp_lg_u64 vcc, 0",
+            loop,
         ):
             problems.append("poll loop without a lane-mask exit")
         if not _clock_on_retry_path(raw, set(indices)):
