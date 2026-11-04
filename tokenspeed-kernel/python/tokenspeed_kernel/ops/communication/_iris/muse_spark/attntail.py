@@ -19,7 +19,13 @@
 # SOFTWARE.
 
 
-"""Fuse attention reduction with Muse's residual update and MoE input norms."""
+"""Fuse attention reduction with Muse's residual update and MoE input norms.
+
+The attention box (``att_box``) is the local area where attention publishes
+its gated, normalized output rows ``[tokens, heads * head_dim]`` as BF16
+Lamport words (empty marker: negative zero in both halves) for the o_proj
+senders to poll.
+"""
 
 from tokenspeed_kernel._triton import gl, gluon, tl
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
@@ -872,7 +878,7 @@ def muse_attntail_rs_push(
     """Push a sender's FP32 [16 tokens, OUTPUTS] o_proj partial (columns
     [block * OUTPUTS, ...)) as BF16 to reduce-scatter slot RANK of the rank
     owning those columns, in mailbox copy ``stage``; rows past ``rows`` are
-    not stored. The AR reduce-scatter push of muse_attntail_send."""
+    not stored. The reduce-scatter push of :func:`muse_attntail_send`."""
     WAVES: gl.constexpr = gl.num_warps()
     # Each wave stores whole token rows (OUTPUTS BF16 = one 128 B line), so
     # no line crosses the link in partial writes.
@@ -959,13 +965,12 @@ def muse_attntail_own(
     on; a two-copy caller clears its areas at entry instead. ``program``
     picks the first peer of the pushes (see _iris_lamport_push). With
     ``on_expiry`` (not None) its waits stop at ``launch``'s deadline or
-    abort. Then waits for all WORLD_SIZE sources
-    and sums them in rank order with one BF16 rounding
-    (iris_lamport_twoshot_rs_wait_reduce), pushes b to every rank's
-    all-gather slot RANK (its own included) and, per row, four FP32 norm sums
-    of these columns as 64-bit tagged words: sum b^2, B = sum (alpha h)
-    (beta b), A = sum (alpha h)^2, C = sum (beta b)^2, with b weighted by the
-    post-norm when POST_HAS_WEIGHT.
+    abort. Then waits for all WORLD_SIZE sources and sums them in rank order
+    with one BF16 rounding (iris_lamport_twoshot_rs_wait_reduce), pushes the
+    sum b to every rank's all-gather slot RANK (its own included) and, per
+    row, four FP32 norm sums of these columns as 64-bit tagged words, with h
+    the residual: sum b^2, B = sum (alpha h)(beta b), A = sum (alpha h)^2,
+    C = sum (beta b)^2, with b weighted by the post-norm when POST_HAS_WEIGHT.
     """
     WAVES: gl.constexpr = gl.num_warps()
     OWNED: gl.constexpr = WIDTH // WORLD_SIZE

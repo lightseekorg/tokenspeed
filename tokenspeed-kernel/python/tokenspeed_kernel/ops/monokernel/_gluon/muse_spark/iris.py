@@ -18,20 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Iris state and hop bodies of the native fused Muse Spark layer (one launch per layer).
+"""Cross-GPU state and exchange ends of the Muse Spark monokernel.
 
-One launch kind owns every cross-GPU receive area and the local attention
-box, each in two copies chosen by ``launch.copy = epoch & 1`` and sized for
-``MAX_ROWS`` rows. Consumers never clear: at the entry of launch L the 128
-senders of the all-to-all AR reduce-scatter (SENDER) re-arm copy ``(L + 1) & 1``
-of every area, each its 1 / 128 share, and drain the stores before their
-first push of L. A peer writes that copy again only in L + 1, which it reaches
-only after every one of this rank's L pushes.
+The roles named here (SENDER, AR_OWNER, ...) are defined in ``layer.py``.
+This module owns the receive areas of the layer's cross-GPU exchanges:
 
-Device side: :class:`MuseSparkIrisView` (local bases and the peers' heap bases),
-:func:`clear_next_copies`, and one function per hop end, each calling the
-standalone kernels' bodies with ``copy`` as the mailbox stage and no in-body
-clears. Host side: :class:`MuseSparkIrisState` allocates the areas.
+- AR: the o_proj all-reduce, a reduce-scatter (RS) from the senders to the
+  column owners, then an all-gather (AG) of the owned columns and their norm
+  sums;
+- POOLED_AG: the all-gather of the pooled (pre-expert) rows;
+- ROUTE_PUSH: an expert down unit's output, pushed to its route's column
+  owner;
+- ROUTE_AG: a route owner's completed columns and sums of squares, sent to
+  every rank;
+- POST_AG: the all-gather of the post-expert columns and their norm sums.
+
+Each area, like the local attention output area (``box``), has two copies
+chosen by ``launch.copy = epoch & 1`` and is sized for ``MAX_ROWS`` rows.
+Consumers never clear: at the entry of launch L the 128 senders re-arm copy
+``(L + 1) & 1`` of every area, 1 / 128 each, and drain those stores before
+their first push of L. A peer writes that copy again only in launch L + 1,
+which it reaches only after all of this rank's pushes of L.
+
+Device side: :class:`MuseSparkIrisView` (local and peer heap bases),
+:func:`clear_next_copies`, and one function per exchange end, which calls the
+standalone Iris bodies with ``copy`` as the mailbox stage. Host side:
+:class:`MuseSparkIrisState` allocates the areas.
 """
 
 from dataclasses import dataclass
@@ -105,9 +117,9 @@ _SITE_POST_AG_SUMS = gl.constexpr(SITE_POST_AG_SUMS)
 _ERROR_ABORT = gl.constexpr(ERROR_ABORT)
 _SITE_ABORTED = gl.constexpr(SITE_ABORTED)
 _ERROR_CALLER = gl.constexpr(ERROR_CALLER)
-# Rows every area is sized for, whatever a launch's rows (8 or 16 today), so
-# an area's rows never shrink between launches (stale rows of a wider launch
-# would read as data).
+# Rows every area is sized for, whatever a launch's rows, so an area's rows
+# never shrink between launches (stale rows of a wider launch would read as
+# data).
 MAX_ROWS = 32
 HIDDEN = 8192
 ROUTE_WIDTH = 4096
@@ -118,7 +130,7 @@ OWNER_COLUMNS = 128
 # Empty markers, as 32-bit words: a BF16 pair whose high half is negative
 # zero (receivers test the high half; senders never send negative zero).
 LAMPORT_EMPTY_WORD = 0x80000000
-# The attention box tests both halves.
+# The attention output area tests both halves.
 BOX_EMPTY_WORD = 0x80008000
 
 # Elements and 32-bit words of one copy of each area (the copy stride).
@@ -139,8 +151,8 @@ ROUTE_PUSH_OWN_WORDS = MAX_ROWS * TOPK * _SLICE_WORDS
 POST_AG_LOCAL = HIDDEN // WORLD_SIZE
 POST_AG_SLOT = MAX_ROWS * POST_AG_LOCAL
 POST_AG_WORDS = WORLD_SIZE * POST_AG_SLOT // 2
-# The FFN boundary's per-row norm sums: POST_SENDER (b, x) -> REDUCER x (local pairs),
-# REDUCER x -> every rank (tagged int64 words), like the AR sums.
+# The FFN boundary's per-row norm sums: post-expert senders -> their XCD's
+# reducer (local pairs), reducer -> every rank (tagged int64 words).
 SUMS = 4
 REDUCER_SENDERS = 8
 REDUCER_IN_WORDS = WORLD_SIZE * REDUCER_SENDERS * MAX_ROWS * SUMS  # int64, local
@@ -172,11 +184,11 @@ class ClearedArea:
     """One two-copy area of the launch state.
 
     Attributes:
-        name: The area (its hop).
+        name: The area (its exchange).
         copy_words: 32-bit words of one copy; the area holds two.
         sentinel: The empty word every copy is re-armed with.
-        local: Only this GPU writes it (the attention box, the own ROUTE_PUSH
-            slices); the others are peer-symmetric (Iris heap).
+        local: Only this GPU writes it (the attention output area, this
+            rank's own route slices); the others are symmetric (Iris heap).
     """
 
     name: str
@@ -205,20 +217,21 @@ class MuseSparkIrisView:
         heaps: The group's Iris heap bases (int64, group order); a peer's
             address of a symmetric area is ``heaps[peer] + (local -
             heaps[rank])``.
-        rank: This rank in the group (int32; the hop ends that need it at
-            compile time take a RANK constexpr too).
-        box: The attention box, uint32 words, two copies (local).
+        rank: This rank in the group (int32; the exchange ends that need it
+            at compile time take a RANK constexpr too).
+        box: The attention output area, uint32 words, two copies (local).
         ar: AR [copy][RS, AG][source][shard], BF16 (symmetric).
         ar_sums: AR norm sums, int64 tagged words (symmetric).
         pooled_ag: POOLED_AG [copy][source][row * 512], BF16 (symmetric).
         route_push_own: This rank's own route slices [copy][route row][256 words]
             (local).
-        routes: ROUTE_PUSH / ROUTE_AG [copy][column-route stage words], uint32 (symmetric).
+        routes: ROUTE_PUSH / ROUTE_AG [copy][column-route stage words],
+            uint32 (symmetric).
         post_ag: POST_AG [copy][source][row * 1024], BF16 (symmetric).
-        reducer_in: POST_SENDER's norm-sum partials [xcd][sender][row][4], int64 pairs
-            (local, epoch-tagged).
-        post_ag_sums: REDUCER's norm sums [rank][xcd][row][4], int64 tagged words
-            (symmetric, epoch-tagged).
+        reducer_in: The post-expert senders' norm-sum partials
+            [xcd][sender][row][4], int64 pairs (local, epoch-tagged).
+        post_ag_sums: The reducers' norm sums [rank][xcd][row][4], int64
+            tagged words (symmetric, epoch-tagged).
     """
 
     heaps: gl.tuple
@@ -263,9 +276,9 @@ class MuseSparkIrisView:
 
 @aggregate
 class RoutePushArgs:
-    """route_push_sink's arguments, as the MoE stream hands them over: the view, the
-    launch and this rank at compile time (a tuple would turn it into a
-    runtime value)."""
+    """:func:`route_push_sink`'s arguments, as the MoE stream hands them over:
+    the view, the launch and this rank at compile time (a tuple would turn it
+    into a runtime value)."""
 
     view: MuseSparkIrisView
     launch: Launch
@@ -320,9 +333,9 @@ def iris_clear_share(copy_base, share, WORDS: gl.constexpr, SENTINEL: gl.constex
 
 @gluon.jit
 def clear_next_copies(view, launch, sender):
-    """SENDER ``sender``'s (0-127) entry clear of copy ``(L + 1) & 1`` of every
-    area in :data:`CLEARED_AREAS`, this rank's slots only. The caller drains
-    (``release_drain``) before its AR reduce-scatter push."""
+    """Sender ``sender`` (0-127) re-arms its share of copy ``(L + 1) & 1`` of
+    every area in :data:`CLEARED_AREAS`, this rank's slots only. The caller
+    drains (``release_drain``) before its reduce-scatter push."""
     nxt = 1 - launch.copy
     box = view.box.to(gl.pointer_type(gl.uint32), bitcast=True)
     ar = view.ar.to(gl.pointer_type(gl.uint32), bitcast=True)
@@ -353,8 +366,9 @@ def clear_next_copies(view, launch, sender):
 def ar_rs_sink(
     view, launch, out, block, rows, RANK: gl.constexpr, PEER_CACHE: gl.constexpr
 ):
-    """SENDER ``block``'s AR reduce-scatter push: ``out`` is its FP32 [16
-    tokens, 64] o_proj partial for columns [64 block, ...)."""
+    """Sender ``block``'s reduce-scatter push of the o_proj all-reduce:
+    ``out`` is its FP32 [16 tokens, 64] o_proj partial for columns
+    [64 block, 64 block + 64)."""
     muse_attntail_rs_push(
         out, block, _peer_addresses(view.ar, view.heaps, RANK), launch.copy, rows,
         64, _HIDDEN, RANK, _WORLD, _AR_SHARD, PEER_CACHE,
@@ -377,12 +391,12 @@ def ar_owner(
     POST_HAS_WEIGHT: gl.constexpr,
     PEER_CACHE: gl.constexpr,
 ):
-    """AR_OWNER ``owner`` (0-7): wait for the 16 sources of its 128 columns, sum
-    in rank order, push the AG words and the four norm sums (tagged with
-    launch.tag) to every rank. Then zero its sums of rows [rows, MAX_ROWS)
-    on every rank: 32-bit tags repeat after 2**32 - 1 launches, so a row a
-    later, wider launch reads must not keep a tag that old (tags repeat
-    after 2**32 - 1 launches)."""
+    """All-reduce owner ``owner`` (0-7): wait for the 16 sources of its 128
+    columns, sum them in rank order, and push the all-gather words and the
+    four norm sums (tagged with ``launch.tag``) to every rank. Then zero its
+    sums of rows [rows, MAX_ROWS) on every rank: 32-bit tags repeat after
+    2**32 - 1 launches, so a row that a later, wider launch reads must not
+    keep an old tag."""
     sums_peers = _peer_addresses(view.ar_sums, view.heaps, RANK)
     muse_attntail_own(
         owner, launch.cta, view.ar, _peer_addresses(view.ar, view.heaps, RANK),
@@ -418,7 +432,7 @@ def pooled_ag_sink(
 ):
     """The pooler reducer of ``tile`` pushes its reduced [ROWS, 64] columns
     (any float layout) to slot RANK of every rank's POOLED_AG copy, its own
-    included (written through: POOLED_NORM reads it from any XCD)."""
+    included (written through: the pooled-row norm reads it from any XCD)."""
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [gl.num_warps(), 1], [1, 0])
     v = _iris_sanitize_lamport_bf16(gl.convert_layout(values, layout).to(gl.bfloat16))
     row = gl.arange(0, ROWS, layout=gl.SliceLayout(1, layout))
@@ -446,9 +460,9 @@ def pooled_ag_sink(
 
 @gluon.jit
 def pooled_norm_wait(view, launch, row, on_expiry: gl.constexpr, RANK: gl.constexpr):
-    """POOLED_NORM of ``row``: wait for every rank's 512 pooled columns (the own slot
-    polled too); returns iris_lamport_allgather_wait's words for
-    iris_rmsnorm_mxfp4_row."""
+    """Pooled-row norm of ``row``: wait for every rank's 512 pooled columns
+    (this rank's own slot is polled too). Returns
+    ``iris_lamport_allgather_wait``'s words for ``iris_rmsnorm_mxfp4_row``."""
     words = view.pooled_ag.to(gl.pointer_type(gl.uint32), bitcast=True)
     return iris_lamport_allgather_wait(
         view.pooled_ag, words, row * 256, (launch.copy.to(gl.uint32),), RANK, _WORLD, 512,
@@ -472,9 +486,9 @@ def _wave_strips(layout, warps):
 def _route_push_store(
     view, launch, words, route_row, slice_words, owner, RANK: gl.constexpr
 ):
-    """One ROUTE_PUSH store of BF16-pair ``words`` at ``slice_words`` of route rows
-    ``route_row`` in ``owner``'s 512-column slice (``owner`` a per-wave
-    scalar): to the local own slices, or pushed to that owner's mailbox."""
+    """One route-push store of BF16-pair ``words`` at ``slice_words`` of
+    route rows ``route_row`` in ``owner``'s 512-column slice (``owner`` a
+    per-wave scalar): to this rank's own slices, or to that owner's mailbox."""
     valid = (route_row >= 0) & (slice_words >= 0)
     if owner == RANK:
         own = gl.multiple_of(
@@ -505,10 +519,10 @@ def _bf16_pairs(even, odd):
 
 @gluon.jit
 def route_push_sink(args, ys, route, cols, col0):
-    """The MoE down unit's output pushed to its route's column owner (ROUTE_PUSH):
-    the MoE stream's ``sink(args, ys, route, cols, col0)`` with ``args`` an
-    RoutePushArgs. Called from per-wave code, so it moves no data between
-    lanes (no layout conversion, LDS or barrier).
+    """Push an MoE down unit's output to its route's column owner
+    (ROUTE_PUSH): the MoE stream's ``sink(args, ys, route, cols, col0)`` with
+    ``args`` a :class:`RoutePushArgs`. Called from per-wave code, so it moves
+    no data between lanes (no layout conversion, LDS or barrier).
 
     ``ys`` holds FP32 partials [R, 16 * num_warps] in a BlockedLayout where
     wave w holds columns [16 w, 16 w + 16) of every row, 4 per lane
@@ -517,8 +531,8 @@ def route_push_sink(args, ys, route, cols, col0):
     that layout; ``col0``: the wave's first column, a per-wave scalar whose
     512-column slice holds all of the wave's columns (its owner). Each
     column pair goes out as one 32-bit word (receivers test a word's high
-    half). Columns this rank owns go to the local own slices (read by
-    route_owner_complete), the rest to the owner's mailbox
+    half). Columns this rank owns go to its own slices (read by
+    :func:`route_owner_complete`), the rest to the owner's mailbox
     (iris_column_routes_push_words, copy ``launch.copy``), no wait.
 
     - One strip (``ys = (y,)``, ``col0`` a multiple of 16): a lane's 4
@@ -574,9 +588,10 @@ def route_owner_complete(
     WEIGHT_OFFSET: gl.constexpr,
     PEER_CACHE: gl.constexpr,
 ):
-    """ROUTE_OWNER of ``route_row``: wait for this rank's own 512-column slice (the
-    local dn units' share), then complete it with the peers' partials and
-    push the completed columns and sum of squares to every rank (ROUTE_AG)."""
+    """Route owner of ``route_row``: wait for this rank's own 512-column slice
+    (written by the local down units), complete it with the peers' partials,
+    and send the completed columns and sum of squares to every rank
+    (ROUTE_AG)."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
     )
@@ -624,9 +639,10 @@ def finisher(
     EPS: gl.constexpr,
     WEIGHT_OFFSET: gl.constexpr,
 ):
-    """FINISHER of (token, owner): wait for owner's completed columns of the
-    token's 8 routes and every rank's sums of squares (ROUTE_AG), then the routed
-    RMSNorm and weighted route sum over those 512 columns (FP32 [512])."""
+    """Finisher of (token, owner): wait for the owner's completed columns of
+    the token's 8 routes and every rank's sums of squares (ROUTE_AG), then
+    return the routed RMSNorm and weighted route sum over those 512 columns
+    (FP32 [512])."""
     loaded, squares = iris_column_routes_wait(
         view.routes, launch.copy, token, owner, _WORLD, _MAX_ROWS, _ROUTES_WORDS, False,
         launch, on_expiry, _SITE_FINISHER,
@@ -648,8 +664,9 @@ def post_ag_sink(
     RANK: gl.constexpr,
     PEER_CACHE: gl.constexpr,
 ):
-    """POST_SENDER's post-expert columns [first_output, + OUTPUTS) of every row to
-    slot RANK of every rank's POST_AG copy, its own included (moetail's push)."""
+    """Push a post-expert sender's columns [first_output, first_output +
+    OUTPUTS) of every row to slot RANK of every rank's POST_AG copy, its own
+    included (the moetail push)."""
     iris_muse_moetail_send(
         values, first_output, launch.cta, launch.copy.to(gl.uint32),
         _peer_addresses(view.post_ag, view.heaps, RANK), rows, _iris_lamport_push, RANK,
@@ -660,9 +677,9 @@ def post_ag_sink(
 
 @gluon.jit
 def post_sender_sums_publish(view, launch, sums, sender, rows):
-    """POST_SENDER ``sender`` (0-7) of this XCD publishes its FP32 [16, SUMS] norm-sum
-    partials (rows < rows) to its XCD's REDUCER: one (value, tag) pair each; the
-    pairs of rows [rows, 16) are zeroed."""
+    """Post-expert sender ``sender`` (0-7) of this XCD publishes its FP32
+    [16, SUMS] norm-sum partials (rows < rows) to its XCD's reducer, one
+    (value, tag) pair each; the pairs of rows [rows, 16) are zeroed."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [16, 4], [gl.num_warps(), 1], [1, 0]
     )
@@ -687,12 +704,12 @@ def post_sender_sums_publish(view, launch, sums, sender, rows):
 
 @gluon.jit
 def reducer_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PEER_CACHE: gl.constexpr,):  # fmt: skip
-    """REDUCER of this XCD: wait for its 8 senders' partials of rows < rows (at
-    most 16), add them in FP32 (the same reduction on every rank), and push
-    the [row][SUMS] totals as tagged int64 words to slot (RANK, xcd) of every
-    rank's post_ag_sums; rows [rows, MAX_ROWS) of the slot are zeroed (tags repeat
-    after 2**32 - 1 launches).
-    Needs 8 waves (one pair per lane)."""
+    """The norm-sum reducer of this XCD: wait for its 8 senders' partials of
+    rows < rows (at most 16), add them in FP32 (the same order on every
+    rank), and push the [row][SUMS] totals as tagged int64 words to slot
+    (RANK, xcd) of every rank's ``post_ag_sums``. Rows [rows, MAX_ROWS) of the
+    slot are zeroed, as tags repeat after 2**32 - 1 launches. Needs 8 waves
+    (one pair per lane)."""
     gl.static_assert(gl.num_warps() == 8)
     poll: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [8, 1], [1, 0])
     sender = gl.arange(0, 8, layout=gl.SliceLayout(1, poll))
@@ -737,7 +754,7 @@ def reducer_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr
 
 @gluon.jit
 def post_ag_sums_wait(view, launch, row, on_expiry: gl.constexpr):
-    """The FFN boundary's norm sums of ``row`` from every rank's 8 REDs:
+    """The FFN boundary's norm sums of ``row`` from every rank's 8 reducers:
     FP32 [64 sources (rank, xcd), SUMS], polled on their tags (one pair per
     lane), returned with the sources over a wave's lanes and the SUMS sums
     of a source in one lane (deferred_norm_scales_gfx950's layout)."""
@@ -759,8 +776,8 @@ def post_ag_sums_wait(view, launch, row, on_expiry: gl.constexpr):
 
 @gluon.jit
 def iris_fail_stop(launch, site, detail):
-    """The fused layer's ``on_expiry``: stop every rank's waits, then record
-    the failure and trap (fail_stop); never returns.
+    """The monokernel's ``on_expiry``: stop every rank's waits, then record
+    the failure and trap; never returns.
 
     Callable from any subset of waves. A rank that failed on its own stores
     the abort marker ``(rank + 1) << 16 | site`` into every rank's abort word
@@ -768,9 +785,8 @@ def iris_fail_stop(launch, site, detail):
     stays), after claiming its own record with its site and detail. A rank
     stopped by a peer's marker records ``SITE_ABORTED`` with the marker as
     the detail and leaves the abort words alone, so every rank's record
-    names the origin. The
-    peers' addresses come from the error words' caller lines that
-    MuseSparkIrisState fills.
+    names the origin. The peers' addresses come from the error words' caller
+    lines that :class:`MuseSparkIrisState` fills.
     """
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     lane = gl.arange(0, 64 * gl.num_warps(), layout) % 64
@@ -864,9 +880,10 @@ class MuseSparkIrisState:
 
     def view_args(self) -> tuple:
         """Kernel arguments that build :class:`MuseSparkIrisView` in order:
-        ``heaps`` (a tuple of 8 int64), rank, then box, ar, ar_sums, pooled_ag,
-        route_push_own, routes, post_ag, reducer_in, post_ag_sums. The Lamport areas are typed as
-        the kernel reads them (BF16 halves, or 32-bit words)."""
+        ``heaps`` (a tuple of 8 int64), rank, then box, ar, ar_sums,
+        pooled_ag, route_push_own, routes, post_ag, reducer_in, post_ag_sums.
+        The Lamport areas are typed as the kernel reads them (BF16 halves, or
+        32-bit words)."""
         return (
             self.heaps, self.peers.rank, self.box.view(torch.uint32),
             self.ar.view(torch.bfloat16), self.ar_sums, self.pooled_ag.view(torch.bfloat16),
