@@ -30,9 +30,10 @@ an s_barrier, a flag, or one store that carries both value and tag) before
 the consumer's poll can see them.
 
 Values: h is the residual entering the layer; h' (``hprime``) the residual
-after attention; x the normed router and pooler input built from h'; the
-routed sum (``routed_sums``, "S") the route-weighted sum of the experts' outputs;
-h'' the residual after the FFN; x'' the next layer's normed input.
+after attention; x the normed router and pooler input built from h'; xq the
+MXFP4 pooled rows (the experts' input); the routed sum (``routed_sums``) the
+route-weighted sum of the experts' outputs; h'' the residual after the FFN;
+x'' the next layer's normed input.
 
 Roles, by plan name, in the order a workgroup runs them:
 
@@ -286,7 +287,7 @@ assert all(
 )
 assert MAX_ROWS % 16 == 0
 
-# Failure sites of the layer's own waits (iris.py hop ends use
+# Failure sites of the layer's own waits (iris.py's exchange ends use
 # FIRST_KERNEL_SITE + 16 .. + 22, the MoE stream + 8 and + 9).
 SITE_RECORDS = FIRST_KERNEL_SITE + 32
 SITE_BOX = SITE_RECORDS + 1
@@ -457,10 +458,11 @@ def _wait_records(record_ptr, first, count: gl.constexpr, tag, launch):
 @gluon.jit
 def _publish_attention_rows(program, offs_m, merged, gate, att_box, EPS: gl.constexpr):
     """``muse_attntail_publish_attention`` for block rows ``offs_m`` only
-    (the spread merge's share): ``merged`` and ``gate`` are those rows'
-    ``[len(offs_m), head_dim]`` FP32 merge and gate logits in ``offs_m``'s
-    parent layout. Each row is one (token, head), so its norm is the row's
-    alone; the box gets whole 32-bit words (eight BF16 per lane)."""
+    (this workgroup's share of the balanced merge): ``merged`` and ``gate``
+    are those rows' ``[len(offs_m), head_dim]`` FP32 merge and gate logits in
+    ``offs_m``'s parent layout. Each row is one (token, head), so its norm is
+    the row's alone; the attention output area gets whole 32-bit words (eight
+    BF16 per lane)."""
     cfg = program.cfg
     rows = muse_attntail_gated_rows(merged, gate, EPS)
     box_layout: gl.constexpr = gl.BlockedLayout(

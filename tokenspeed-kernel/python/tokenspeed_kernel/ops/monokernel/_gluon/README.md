@@ -20,13 +20,6 @@ below.
 - Every wait checks the deadline (60 s by default) and the abort word every
   64 retries. On expiry the workgroup records the failure (also in a host
   page), sets every rank's abort word and traps.
-- `DEFAULT_PLAN_FIELDS` (`prepared.py`) are the compile-time choices that
-  benchmarks vary one at a time: the MoE ring depth, its wave and down-unit
-  orders and address form, the tail workgroups' share of the expert bytes,
-  the attention pipeline depth, the QKV weight window and who merges a
-  sliding block (`att_merge`). Serving uses the defaults.
-- `STAMPS` (compiled out by default) stores each workgroup's clock at its
-  phase boundaries, for benchmarks.
 
 #### Algorithm
 
@@ -50,10 +43,21 @@ loads land first.
 The hand-off rules of `docs/design/monokernel.md` apply. On gfx950:
 
 - Same-XCD flags (attention records) are polled with scalar `glc` loads.
-- Words written on one XCD and polled on another (routed ids, xq rows, h',
-  the routed sums, MoE readiness) live in uncached memory (`UncachedBuffer`)
-  and are polled with scalar loads.
+- Words written on one XCD and polled on another (routed ids, the MXFP4
+  pooled rows, h', the routed sums, MoE readiness) live in uncached memory
+  (`UncachedBuffer`) and are polled with scalar loads.
 - Cross-GPU areas (Iris heap) hold Lamport words (data that replaces an
   empty marker) or 64-bit (value, tag) words, read with `.cv` vector loads.
   Each area has two copies by epoch parity; the 128 o_proj senders re-arm
   the next copy at entry.
+
+#### Tuning
+
+- `DEFAULT_PLAN_FIELDS` (`prepared.py`) are the compile-time choices that
+  benchmarks vary one at a time: the MoE ring depth, its 4-wave group order
+  (`quad_map`, see `gfx950/monokernel/moe_stream.py`) and down-unit order
+  and address form, the tail workgroups' share of the expert bytes, the
+  attention pipeline depth, the QKV weight window and who merges a sliding
+  block (`att_merge`). Serving uses the defaults.
+- `STAMPS` (compiled out by default) stores each workgroup's clock at its
+  phase boundaries, for benchmarks.

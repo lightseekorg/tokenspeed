@@ -42,7 +42,7 @@ which it reaches only after all of this rank's pushes of L.
 
 Device side: :class:`MuseSparkIrisView` (local and peer heap bases),
 :func:`clear_next_copies`, and one function per exchange end, which calls the
-standalone Iris bodies with ``copy`` as the mailbox stage. Host side:
+standalone Iris bodies with ``copy`` as the copy index. Host side:
 :class:`MuseSparkIrisState` allocates the areas.
 """
 
@@ -99,7 +99,7 @@ else:  # host-side sizes only
     Launch = None  # a device type; RoutePushArgs only names it on the host
 
 WORLD_SIZE = 8
-# Failure sites of the hop waits (fail_stop records them).
+# Failure sites of the exchange waits (fail_stop records them).
 SITE_AR_OWNER = FIRST_KERNEL_SITE + 16
 SITE_POOLED_NORM = SITE_AR_OWNER + 1
 SITE_ROUTE_OWNER_OWN = SITE_AR_OWNER + 2

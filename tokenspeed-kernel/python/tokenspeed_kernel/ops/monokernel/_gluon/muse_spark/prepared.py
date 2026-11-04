@@ -105,6 +105,7 @@ DEADLINE_TICKS = 6_000_000_000
 # their loads in flight across unit ends.
 DEFAULT_PLAN_FIELDS = dict(
     ring=16,
+    # The order of the MoE stream's 4-wave groups (see moe_stream.py).
     quad_map=0,
     dn_order=0,
     dn_lines=0,
