@@ -62,6 +62,10 @@ share the transport's process group and communication stream.
 Indexer-K is submitted after its producer; current KV communication
 runs while Indexer computes. Sparse attention waits for KV. The preceding KDA
 layers can overlap historical gathers; cold Prefill skips those transfers.
+An active Prefill layer keeps one execution stream through `finish`.
+Between completed layers or forwards, including warmup to serving, a new
+execution stream waits on the previous stream before accessing persistent
+cache. Temporary buffers remain recorded on their last consumer's stream.
 
 The packaged `custom::npu_dsa_cp_metadata.out` ACLNN operator prepares the compact page table shared by Indexer
 and sparse attention, cumulative lengths, causal scans and current-page aliases.

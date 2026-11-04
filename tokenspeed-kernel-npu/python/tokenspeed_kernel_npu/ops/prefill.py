@@ -26,7 +26,7 @@ import torch_npu
 
 
 class AscendDSAPrefill:
-    """Temporary KV/Indexer-K gathers on one fixed execution stream.
+    """Temporary KV/Indexer-K gathers on one execution stream per active layer.
 
     History and current rows each use one collective. DSA packs both cache
     planes into the same packet; MLA supplies only KV. The synchronous HCCL
@@ -105,7 +105,12 @@ class AscendDSAPrefill:
         if self.compute_stream is None:
             self.compute_stream = stream
         elif stream != self.compute_stream:
-            raise RuntimeError("Prefill must reuse its original execution stream")
+            if self.layer_id is not None:
+                raise RuntimeError("Prefill must reuse its original execution stream")
+            # Warmup and serving can use different streams. A finished layer
+            # has no live transport buffers, but its cache writes may be queued.
+            stream.wait_stream(self.compute_stream)
+            self.compute_stream = stream
         return stream
 
     @property
@@ -156,6 +161,7 @@ class AscendDSAPrefill:
             raise RuntimeError("Prefill transport is closed")
         self._validate_cache(kv_cache, index_cache)
         if self.layer_id is not None:
+            self._stream()
             if self.layer_id != layer_id or self.batch_key is not batch_key:
                 raise RuntimeError(
                     "Prefill history from a different batch/layer is active"
