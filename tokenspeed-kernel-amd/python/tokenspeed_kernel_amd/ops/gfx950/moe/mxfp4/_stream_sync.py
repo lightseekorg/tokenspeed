@@ -27,7 +27,8 @@ models a workgroup as one program. The helpers here state the per-wave facts
 Gluon cannot express:
 
 - through ``_stream_sync.ll`` (the backend sees the instruction): the XCD id,
-  the trap, the store drain and a per-wave acquire;
+  the trap and a per-wave acquire (the store drain is the scheduling
+  library's ``release_drain``);
 - as inline asm, where no intrinsic exists: moving a wave-uniform value into
   Gluon's scalar type, an unfoldable zero, a data dependence on a load, the
   LDS exchange counter and its spin, and scalar loads that bypass the scalar
@@ -53,7 +54,7 @@ _SYMBOL = "__tokenspeed_stream_sync_"
 
 def stream_sync_compile_options() -> dict:
     """Launch options for kernels using these helpers (with the scheduling
-    library, whose ``readfirstlane`` they also use)."""
+    library, whose ``readfirstlane`` and ``release_drain`` they also use)."""
     libs = dict(sched_compile_options()["extern_libs"])
     libs[_LIBRARY_NAME] = _LIBRARY_PATH
     return {"extern_libs": libs}
@@ -81,14 +82,6 @@ def trap(_semantic=None):
     """Raise a queue error (``s_trap 2``); never returns. The host sees the
     error at its next synchronization with the device."""
     return _call("trap", tl.int32, [], (), _semantic)
-
-
-@tl.core.extern
-def release_drain(_semantic=None):
-    """Wait for this wave's vector memory operations (``vmcnt(0)``), keeping
-    earlier stores above the wait in the IR; no L2 write-back. It also waits
-    for loads the wave issued earlier (one in-order counter)."""
-    return _call("release_drain", tl.int32, [], (), _semantic)
 
 
 @tl.core.extern

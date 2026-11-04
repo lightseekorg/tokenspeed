@@ -77,6 +77,7 @@ import dataclasses
 
 import numpy as np
 import torch
+from tokenspeed_kernel_amd._scheduling import release_drain
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._stream_sync import (
     UncachedBuffer,
@@ -84,7 +85,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._stream_sync import (
     lds_spin_until,
     lds_store_count,
     opaque_zero,
-    release_drain,
     scalar_load_glc_i64,
     stream_sync_compile_options,
     trap,

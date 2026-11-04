@@ -47,22 +47,6 @@ entry:
   ret i32 0
 }
 
-; Wait until this wave's vector memory operations completed (s_waitcnt
-; vmcnt(0); 0x0F70 keeps expcnt and lgkmcnt untouched), so its stores reached
-; the L2 before a later flag store. The workgroup release fence keeps earlier
-; stores above this point in the IR (llvm.amdgcn.s.waitcnt is declared not to
-; touch memory, so on its own a store could move across it); on gfx950 that
-; fence emits no instruction. An agent-scope release fence would also write
-; back the whole L2 (buffer_wbl2), which this must not do.
-declare void @llvm.amdgcn.s.waitcnt(i32 immarg)
-
-define i32 @__tokenspeed_stream_sync_release_drain() alwaysinline {
-entry:
-  fence syncscope("workgroup") release
-  call void @llvm.amdgcn.s.waitcnt(i32 3952)
-  ret i32 0
-}
-
 ; Acquire for one wave: an IR ordering point (loads after it cannot move
 ; above it), with no instruction on gfx950. It ends a per-wave poll whose
 ; result only this wave uses, in place of a workgroup barrier.

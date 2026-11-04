@@ -27,7 +27,11 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._scheduling import sched_compile_options, wave_uniform_i32
+from tokenspeed_kernel_amd._scheduling import (
+    release_drain,
+    sched_compile_options,
+    wave_uniform_i32,
+)
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950._xcd import _remap_xcd
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
@@ -694,17 +698,7 @@ class AttentionProgram:
             # wave's stores before the increment. The release then writes
             # back the L2 cache (BUFFER_WBL2), which makes all of those stores
             # visible to the other L2 caches.
-            offs_m = gl.arange(
-                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
-            )
-            gl.inline_asm_elementwise(
-                asm="s_waitcnt vmcnt(0)",
-                constraints="=v,0",
-                args=[offs_m],
-                dtype=gl.int32,
-                is_pure=False,
-                pack=1,
-            )
+            release_drain()
         old = gl.atomic_add(
             counters_ptr + counter_offset,
             1,

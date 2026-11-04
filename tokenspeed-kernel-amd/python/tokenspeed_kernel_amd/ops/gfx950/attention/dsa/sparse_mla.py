@@ -28,6 +28,7 @@ from threading import Lock
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._scheduling import release_drain, sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
@@ -438,16 +439,7 @@ def _dsa_persistent_radix_topk_kernel(
         # the whole program, and s_barrier does not wait for memory. So each
         # wave first waits until its no-return atomics reach L2 (vmcnt counts
         # them like stores).
-        # asm: Gluon has no fence that waits for stores without an L2
-        # write-back.
-        gl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)",
-            constraints="=r,~{memory}",
-            args=[],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        release_drain()
         gl.barrier()
 
         row_pass_arrival = pass_arrivals + row * _PERSISTENT_COUNTER_STRIDE
@@ -1781,6 +1773,7 @@ def _dsa_persistent_radix_topk(
         TOPK=topk,
         BLOCK_N=block_n,
         num_warps=_PERSISTENT_NUM_WARPS,
+        **sched_compile_options(),
     )
     return out, lens_out
 

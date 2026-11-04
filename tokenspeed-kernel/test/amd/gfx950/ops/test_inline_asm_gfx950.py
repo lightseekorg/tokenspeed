@@ -659,25 +659,9 @@ INLINE_ASM = {
         "one 16-word scalar load of tags compared in scalar registers",
         "a volatile or atomic scalar (SMEM) load with glc",
     ),
-    # s_waitcnt vmcnt(0) before a split's or a pass's arrival.
-    "gluon_fp32_router_gemv_splitk_gfx950": (
-        _AMD + "gemm.fp32.router_gemv:gluon_fp32_router_gemv_splitk_gfx950",
-        "waits for the wave's partial stores before the split-K arrival",
-        "a release fence that waits for stores without an L2 write-back",
-    ),
-    "_dsa_persistent_radix_topk_kernel": (
-        _AMD + "attention.dsa.sparse_mla:_dsa_persistent_radix_topk_kernel",
-        "waits for the wave's histogram atomics before the pass arrival",
-        "a release fence that waits for stores without an L2 write-back",
-    ),
 }
 # Inline asm that main already has, which the kernels above compile in.
 INLINE_ASM_ON_MAIN = {
-    "arrive": (
-        _AMD + "attention.mha.decode:AttentionProgram.arrive",
-        "waits for the wave's partial stores before the split's arrival",
-        "a release fence that waits for stores without an L2 write-back",
-    ),
     "_keep_in_cluster": (
         _AMD + "attention._common:_keep_in_cluster",
         "keeps the ops producing a value in its warp-pipeline cluster",

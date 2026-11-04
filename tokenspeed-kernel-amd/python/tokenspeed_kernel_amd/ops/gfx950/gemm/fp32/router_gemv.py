@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._scheduling import release_drain, sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     GROUP_SIZE_M,
@@ -315,15 +316,7 @@ def gluon_fp32_router_gemv_splitk_gfx950(
     # ".wt" writes through to memory, each wave waits for its stores to
     # complete, and the barrier orders every wave's stores before the counter
     # bump; a release atomic would also write back and invalidate the whole L2.
-    # asm: Gluon has no fence that waits for stores without an L2 write-back.
-    gl.inline_asm_elementwise(
-        asm="s_waitcnt vmcnt(0)",
-        constraints="=v,0",
-        args=[om],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    release_drain()
     gl.barrier()
     arrived = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
     if arrived == SPLIT_K - 1:
@@ -448,6 +441,7 @@ def launch_gluon_fp32_router_gemv_gfx950(
         CHUNKS=chunks,
         MULTIPLIER=float(multiplier),
         num_warps=waves,
+        **sched_compile_options(),
     )
     return out
 
@@ -646,7 +640,7 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
         MM_BLOCK_N=mm_block_n, MM_BLOCK_K=mm_block_k, MM_WARPS_M=warps_m,
         MM_WARPS_N=warps_n, MM_NUM_BUFFERS=buffers, MM_SPLIT_K=mm_split,
         MM_NUM_XCDS=xcds, num_warps=waves,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),)
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),), **sched_compile_options(),
     )  # fmt: skip
     return out
 
