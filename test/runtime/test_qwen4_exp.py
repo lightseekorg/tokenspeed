@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.ple import (
     ple_page_gather_pair,
     prepare_ngram_reciprocals,
 )
+from transformers import PretrainedConfig
 
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
@@ -3783,3 +3784,68 @@ def test_ple_host_table_skips_device_allocation(
 
     table_bytes = embedding.lookup.ngram_embedding.weight.numel() * 2
     assert growth < table_bytes // 4
+
+
+class _SharedHeadDraftTransformer(torch.nn.Module):
+    """CPU substitute for the GPU transformer; head construction remains real."""
+
+    def __init__(self, config, mapping, quant_config, prefix):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+        self.qsa_indexers = []
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_qwen4_exp_nextn_shares_unquantized_target_head(monkeypatch, attention_dp):
+    from tokenspeed.runtime.layers.linear import ReplicatedLinear
+    from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+    from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+
+    monkeypatch.setattr(
+        qwen4_exp_nextn, "Qwen4ExpDraftModel", _SharedHeadDraftTransformer
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    config = PretrainedConfig(
+        hidden_size=128,
+        vocab_size=128,
+        hc_count=4,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    mapping = Mapping(
+        rank=0,
+        world_size=2 if attention_dp else 1,
+        attn_tp_size=1,
+        attn_dp_size=2 if attention_dp else 1,
+    )
+    quant = Nvfp4Config(
+        exclude_modules=["lm_head", "mtp.fc_embedding", "mtp.fc_hidden"]
+    )
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping, quant)
+    target_head = ReplicatedLinear(
+        128,
+        128,
+        bias=False,
+        quant_config=quant,
+        prefix="lm_head",
+        params_dtype=torch.bfloat16,
+    )
+    with torch.no_grad():
+        target_head.weight.copy_(torch.randn_like(target_head.weight))
+    embed = torch.nn.Embedding(128, 128, dtype=torch.bfloat16).weight
+    draft.set_embed_and_head_module(embed, target_head)
+    hidden = torch.randn(3, 128, dtype=torch.bfloat16)
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    actual = draft.logits_processor._get_logits(
+        hidden,
+        draft.lm_head,
+        metadata,
+        require_full_vocab=False,
+    )
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(hidden, target_head.weight)
+    )
+    assert draft.lm_head is target_head
+    assert draft.model.embed_tokens.weight is embed
