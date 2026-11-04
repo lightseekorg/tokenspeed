@@ -254,7 +254,7 @@ _BF16_BOUND = 2**-6
 _FP8_BOUND = 2**-3
 
 
-def phase_errors(state, expected, rows):
+def phase_errors(state, weights, expected, rows):
     """Relative RMS error of the fused launch's intermediates that stay in
     its state against the reference's, to locate the first phase that
     differs: h' (the residual after attention), the router logits (the sum
@@ -265,7 +265,10 @@ def phase_errors(state, expected, rows):
     errors["hprime"] = _relative_rms(hprime, phases["hprime"])
     words = state.logits_parts[:, :rows]
     parts = (words & 0xFFFFFFFF).to(torch.int32).view(torch.float32).sum(0)
-    errors["logits"] = _relative_rms(parts, phases["logits"])
+    # The parts hold x . w; the multiplier applies after their sum.
+    errors["logits"] = _relative_rms(
+        parts * weights["router_multiplier"], phases["logits"]
+    )
     errors["combined"] = _relative_rms(state.s_rows[:rows].float(), phases["combined"])
     return errors
 

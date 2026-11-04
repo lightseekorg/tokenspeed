@@ -125,6 +125,23 @@ def _check_attention_box(state, inputs):
     )
 
 
+def _attention_box_error(state, inputs):
+    """Relative RMS error of the launch's attention box (the gated-normed
+    attention rows, before o_proj) against the reference."""
+    q, gate = inputs["prepared_query"]
+    rows = q.shape[0]
+    expected = weightless_rmsnorm_gated_sigmoid(
+        attention_reference(inputs), gate, Q_HEADS, HEAD_DIM, EPS, False
+    )
+    epoch = int(state.epochs[0])
+    box = state.iris.box.view(2, BOX_WORDS)[epoch & 1]
+    actual = box.view(torch.bfloat16).view(-1, Q_WIDTH)[:rows].double()
+    expected = expected.double()
+    return (
+        ((actual - expected).square().mean() / expected.square().mean()).sqrt().item()
+    )
+
+
 def _worker(rank, port, record_dir, errors):
     try:
         torch.cuda.set_device(rank)
@@ -166,9 +183,9 @@ def _worker(rank, port, record_dir, errors):
                 assert_matches(key, actual, expected)
             except AssertionError as error:
                 rows = inputs["residual"].shape[0]
-                raise AssertionError(
-                    f"{error}; phases {phase_errors(state, expected, rows)}"
-                ) from error
+                phases = phase_errors(state, weights, expected, rows)
+                phases["box"] = _attention_box_error(state, inputs)
+                raise AssertionError(f"{error}; phases {phases}") from error
 
             # Deterministic: the same launch again, at the next epoch and
             # the other copy of every two-copy area, gives the same bits.
