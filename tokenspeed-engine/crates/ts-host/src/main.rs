@@ -173,10 +173,39 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
     })
 }
 
+/// Load once at startup; Python is called only by the background exporter.
+fn trace_provider(config: &Bound<'_, PyAny>) -> PyResult<Option<ts_control::trace::TraceProvider>> {
+    let callback = config.getattr("trace_provider")?;
+    if callback.is_none() {
+        return Ok(None);
+    }
+    if !callback.is_callable() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "trace provider must be callable",
+        ));
+    }
+    let callback = callback.unbind();
+    Ok(Some(Arc::new(move |rid| {
+        Python::attach(|py| {
+            match callback
+                .call1(py, (rid,))
+                .and_then(|value| value.extract::<Option<(String, Option<String>)>>(py))
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(%error, "trace provider failed; retaining native context");
+                    None
+                }
+            }
+        })
+    })))
+}
+
 /// OTLP tracing as the Python server args carry it.
 struct TraceConfig {
     endpoint: String,
     sample_ratio: f64,
+    provider: Option<ts_control::trace::TraceProvider>,
 }
 
 /// What `rust_host.HostConfig` carries.
@@ -461,6 +490,7 @@ impl HostConfig {
                 Some(endpoint) => Some(TraceConfig {
                     endpoint,
                     sample_ratio: config.getattr("trace_sample_ratio")?.extract()?,
+                    provider: trace_provider(config)?,
                 }),
                 None => None,
             },
@@ -663,6 +693,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
                     trace.endpoint.clone(),
                     trace.sample_ratio,
                     config.metrics.labels.model_name.clone(),
+                    trace.provider.clone(),
                 )
             })
         });
@@ -786,6 +817,45 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::parse_args;
+
+    #[test]
+    fn python_trace_provider_loads_and_falls_back_on_error() {
+        use pyo3::{prelude::*, types::PyModule};
+        use std::ffi::CString;
+        Python::initialize();
+        Python::attach(|py| {
+            let code = CString::new(
+                r#"
+def resolve(rid):
+    if rid == 'error': raise ValueError('bad context')
+    if rid == 'none': return None
+    if rid == 'wrong': return 123
+    if rid == 'root': return ('1' * 32, None)
+    return ('1' * 32, '2' * 16)
+trace_provider = resolve
+"#,
+            )
+            .unwrap();
+            let module =
+                PyModule::from_code(py, &code, c"ts_context_test.py", c"ts_context_test").unwrap();
+            let modules = py.import("sys").unwrap().getattr("modules").unwrap();
+            modules.set_item("ts_context_test", &module).unwrap();
+            let provider = super::trace_provider(module.as_any()).unwrap().unwrap();
+            assert_eq!(
+                provider("valid"),
+                Some(("1".repeat(32), Some("2".repeat(16))))
+            );
+            assert_eq!(provider("root"), Some(("1".repeat(32), None)));
+            assert_eq!(provider("none"), None);
+            assert_eq!(provider("error"), None);
+            assert_eq!(provider("wrong"), None);
+            module.setattr("trace_provider", 123).unwrap();
+            assert!(super::trace_provider(module.as_any()).is_err());
+            module.setattr("trace_provider", py.None()).unwrap();
+            assert!(super::trace_provider(module.as_any()).unwrap().is_none());
+            modules.del_item("ts_context_test").unwrap();
+        });
+    }
 
     #[test]
     fn logging_mode_is_explicit_and_validated() {

@@ -553,6 +553,7 @@ impl OutputProcessor {
             .map_or((0.0, 0.0, 0.0, 0, 0.0), |timings| timings.trace_points());
         trace.emit(crate::trace::TraceRecord {
             rid: rid.to_owned(),
+            role: self.role,
             session: state.session_id.clone(),
             created: state.created_time,
             scheduled,
@@ -661,6 +662,13 @@ impl OutputProcessor {
         };
         state.cached_tokens = cached_tokens;
         state.output_ids.push(bootstrap_token);
+        // D observes the first token with remote KV, before its first local
+        // decode commit. Preserve this boundary for TTFT and TPOT.
+        if let Some(timings) = state.timings.as_mut() {
+            let now = wall_seconds();
+            timings.mark_prefill_done(now);
+            timings.mark_first_token(now);
+        }
         if state.return_logprob {
             match bootstrap_logprob {
                 Some(logprob) => state.output_logprobs.push(logprob),
@@ -707,13 +715,6 @@ impl OutputProcessor {
             ForwardEventKind::Finish
         };
         committed.events.push(event(kind, rid, Vec::new(), 0));
-        if let Some(timings) = state.timings.as_mut() {
-            let now = wall_seconds();
-            timings.mark_prefill_done(now);
-            if !state.output_ids.is_empty() {
-                timings.mark_first_token(now);
-            }
-        }
         self.log_end(rid, &state);
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
@@ -1969,6 +1970,98 @@ mod tests {
         assert!(received
             .recv_timeout(std::time::Duration::from_millis(50))
             .is_err());
+    }
+
+    #[test]
+    fn decode_trace_starts_at_the_remote_token_before_local_dispatch() {
+        for max_new in [1, 2] {
+            let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
+            let mut p = OutputProcessor::new(
+                None,
+                1,
+                Some(4096),
+                Role::Decode,
+                NO_FINISH_LOG,
+                Some(trace),
+            );
+            register(&mut p, "r", 4, max_new, &[]);
+            p.remote_prefill_done("r", 7, 2, None);
+            let (_, prefill_done, first_token, _, _) = p
+                .state("r")
+                .unwrap()
+                .timings
+                .as_ref()
+                .unwrap()
+                .trace_points();
+            assert!(first_token > 0.0, "stamp arrival before any local decode");
+            assert_eq!(prefill_done, first_token);
+            if max_new == 1 {
+                assert_eq!(p.finish_remote_prefill_only("r").released, ["r"]);
+            } else {
+                assert!(p.finish_remote_prefill_only("r").released.is_empty());
+                p.mark_scheduled(&["r".to_owned()]);
+                let c = p
+                    .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[8], &[1]))
+                    .unwrap();
+                assert_eq!(c.released, ["r"]);
+            }
+            let record = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(record.role, Role::Decode);
+            assert_eq!(record.first_token, first_token);
+            assert_eq!(record.prefill_done, prefill_done);
+            assert_eq!(record.output_tokens, max_new);
+            if max_new == 1 {
+                assert_eq!(record.scheduled, 0.0);
+            } else {
+                assert!(record.scheduled >= first_token);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_prefill_abort_does_not_invent_completion_boundaries() {
+        let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, Some(trace));
+        register(&mut p, "r", 4, 2, &[]);
+        p.mark_abort("r", true);
+        assert_eq!(p.finish_remote_prefill_only("r").released, ["r"]);
+        let record = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(record.finish_reason, "abort");
+        assert_eq!(record.first_token, 0.0);
+        assert_eq!(record.prefill_done, 0.0);
+        assert_eq!(record.output_tokens, 0);
+    }
+
+    #[test]
+    fn prefill_trace_keeps_its_role_through_transfer_completion() {
+        let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            Some(4096),
+            Role::Prefill,
+            NO_FINISH_LOG,
+            Some(trace),
+        );
+        register(&mut p, "r", 4, 2, &[]);
+        p.mark_scheduled(&["r".to_owned()]);
+        let c = p
+            .commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        assert!(c.released.is_empty());
+        let (_, _, first_token, _, _) = p
+            .state("r")
+            .unwrap()
+            .timings
+            .as_ref()
+            .unwrap()
+            .trace_points();
+        assert_eq!(p.finish_prefill("r").released, ["r"]);
+        let record = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(record.role, Role::Prefill);
+        assert_eq!(record.first_token, first_token);
+        assert!(record.prefill_done >= record.scheduled);
+        assert!(record.finish >= first_token);
     }
 
     #[test]

@@ -22,6 +22,13 @@ Peripheral threads stay off the round: the wire's Tokio runtime
 transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
 publisher, the expert-rebalance solver.
 
+Request traces use a bounded, lossy background queue. Plugins register a provider
+with `register_trace_provider`, selected explicitly by `--trace-provider NAME`.
+The provider maps a request ID to `(trace_id, optional_parent_span_id)` or `None`;
+ID policies belong to plugins. It runs only on the export thread and must be
+short and nonblocking, without I/O or GPU access. Missing or invalid context
+preserves native IDs; span lifecycle and RID sampling remain unchanged.
+
 With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host

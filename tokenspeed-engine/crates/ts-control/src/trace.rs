@@ -42,6 +42,8 @@ use std::{
 
 use serde_json::{json, Value};
 
+use crate::output::Role;
+
 /// How many spans may wait for the export thread.
 const CHANNEL_SPANS: usize = 4096;
 
@@ -59,9 +61,11 @@ const DROPPED_WARN_EVERY: u64 = 1024;
 pub struct TraceRecord {
     /// The request's id, the span's `gen_ai.response.id`.
     pub rid: String,
+    /// Whether this span covers local prefill, decode, or both.
+    pub role: Role,
     /// The continual-prompting session, when the request named one.
     pub session: Option<String>,
-    /// Received: the span's start.
+    /// Request creation supplied by the frontend: the span's start.
     pub created: f64,
     /// First dispatched into a forward batch.
     pub scheduled: f64,
@@ -85,6 +89,10 @@ pub struct TraceRecord {
     pub preempt_seconds: f64,
 }
 
+/// Optional extension evaluated on the export thread, never on the control loop.
+/// None preserves the native root trace. Returned IDs are validated before use.
+pub type TraceProvider = Arc<dyn Fn(&str) -> Option<(String, Option<String>)> + Send + Sync>;
+
 /// Sends request spans to an OTLP/HTTP endpoint on a thread of its own.
 #[derive(Debug)]
 pub struct TracePublisher {
@@ -98,13 +106,18 @@ pub struct TracePublisher {
 impl TracePublisher {
     /// Export to `endpoint` (an OTLP/HTTP receiver, e.g. a collector's
     /// `/v1/traces`), keeping `sample_ratio` of requests — 0 disables.
-    pub fn new(endpoint: String, sample_ratio: f64, model_name: String) -> Arc<Self> {
+    pub fn new(
+        endpoint: String,
+        sample_ratio: f64,
+        model_name: String,
+        provider: Option<TraceProvider>,
+    ) -> Arc<Self> {
         let (sender, receiver) = sync_channel(CHANNEL_SPANS);
         let publisher = Self::with_sender(Some((endpoint, model_name)), sample_ratio, sender);
         if let Some((endpoint, model_name)) = publisher.endpoint.clone() {
             thread::Builder::new()
                 .name("ts-trace".to_owned())
-                .spawn(move || export_loop(receiver, endpoint, model_name))
+                .spawn(move || export_loop(receiver, endpoint, model_name, provider))
                 .expect("spawning the trace export thread");
         }
         publisher
@@ -174,7 +187,12 @@ impl TracePublisher {
 /// The export loop: batch what arrived, POST one OTLP/HTTP JSON request,
 /// repeat. A failed POST logs and drops its batch; traces never queue up
 /// behind an unreachable collector.
-fn export_loop(receiver: Receiver<TraceRecord>, endpoint: String, model_name: String) {
+fn export_loop(
+    receiver: Receiver<TraceRecord>,
+    endpoint: String,
+    model_name: String,
+    provider: Option<TraceProvider>,
+) {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(5))
         .build();
@@ -194,19 +212,65 @@ fn export_loop(receiver: Receiver<TraceRecord>, endpoint: String, model_name: St
                 Ok(record) => batch.push(record),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
-                    export(&agent, &endpoint, &model_name, &batch);
+                    export(&agent, &endpoint, &model_name, &batch, provider.as_ref());
                     return;
                 }
             }
         }
-        export(&agent, &endpoint, &model_name, &batch);
+        export(&agent, &endpoint, &model_name, &batch, provider.as_ref());
+    }
+}
+
+fn apply_trace_context(span: &mut Value, rid: &str, provider: &TraceProvider) {
+    let Some((trace_id, parent_span_id)) = provider(rid) else {
+        return;
+    };
+    let valid = |id: &str, size: usize| {
+        id.len() == size
+            && id.bytes().all(|b| b.is_ascii_hexdigit())
+            && id.bytes().any(|b| b != b'0')
+    };
+    if !valid(&trace_id, 32) || parent_span_id.as_ref().is_some_and(|id| !valid(id, 16)) {
+        tracing::warn!("trace provider returned invalid IDs; retaining native context");
+        return;
+    }
+    if parent_span_id.as_ref().is_some_and(|parent| {
+        span["spanId"]
+            .as_str()
+            .is_some_and(|own| parent.eq_ignore_ascii_case(own))
+    }) {
+        tracing::warn!(
+            "trace provider returned the current span as parent; retaining native context"
+        );
+        return;
+    }
+    span["traceId"] = Value::String(trace_id.to_ascii_lowercase());
+    if let Some(parent_span_id) = parent_span_id {
+        span["parentSpanId"] = Value::String(parent_span_id.to_ascii_lowercase());
     }
 }
 
 /// One POST. The body is OTLP/HTTP JSON — every OTLP/HTTP receiver takes
 /// it — so the export needs no protobuf or opentelemetry dependency.
-fn export(agent: &ureq::Agent, endpoint: &str, model_name: &str, batch: &[TraceRecord]) {
-    let body = match serde_json::to_vec(&otlp_request(model_name, batch)) {
+fn export(
+    agent: &ureq::Agent,
+    endpoint: &str,
+    model_name: &str,
+    batch: &[TraceRecord],
+    provider: Option<&TraceProvider>,
+) {
+    let mut request = otlp_request(model_name, batch);
+    if let Some(provider) = provider {
+        for (span, record) in request["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array_mut()
+            .expect("native span array")
+            .iter_mut()
+            .zip(batch)
+        {
+            apply_trace_context(span, &record.rid, provider);
+        }
+    }
+    let body = match serde_json::to_vec(&request) {
         Ok(body) => body,
         Err(error) => {
             tracing::warn!(%error, "encoding a trace batch failed");
@@ -271,6 +335,48 @@ fn span(record: &TraceRecord) -> Value {
         int_attribute("tokenspeed.preempt_count", record.preempt_count),
         double_attribute("tokenspeed.preempt_seconds", record.preempt_seconds),
     ];
+    attributes.push(string_attribute(
+        "tokenspeed.timing_scope",
+        "request_created_to_engine_release",
+    ));
+    attributes.push(string_attribute(
+        "tokenspeed.engine_role",
+        match record.role {
+            Role::Plain => "plain",
+            Role::Prefill => "prefill",
+            Role::Decode => "decode",
+        },
+    ));
+    // These are host-observed lifecycle intervals, not GPU execution times.
+    // Creation is frontend-supplied; queue time can include frontend preparation
+    // and, on D, remote prefill. Neither is a scheduler-only measurement.
+    for (name, start, end) in [
+        ("tokenspeed.ttft_ms", record.created, record.first_token),
+        ("tokenspeed.total_ms", record.created, record.finish),
+        ("tokenspeed.queue_ms", record.created, record.scheduled),
+    ] {
+        if let Some(ms) = elapsed_ms(start, end) {
+            attributes.push(double_attribute(name, ms));
+        }
+    }
+    // A D worker does not observe remote prefill dispatch. A P worker's
+    // post-token lifetime is KV-transfer waiting, not decode processing.
+    if record.role != Role::Decode {
+        if let Some(ms) = elapsed_ms(record.scheduled, record.prefill_done) {
+            attributes.push(double_attribute("tokenspeed.prefill_process_ms", ms));
+        }
+    }
+    if record.role != Role::Prefill {
+        if let Some(ms) = elapsed_ms(record.first_token, record.finish) {
+            attributes.push(double_attribute("tokenspeed.decode_process_ms", ms));
+            if record.output_tokens > 1 {
+                attributes.push(double_attribute(
+                    "tokenspeed.tpot_ms",
+                    ms / (record.output_tokens - 1) as f64,
+                ));
+            }
+        }
+    }
     if let Some(session) = &record.session {
         // The GenAI session convention: same id, one conversation in the
         // tracing UI, each request its own trace.
@@ -294,6 +400,13 @@ fn span(record: &TraceRecord) -> Value {
             json!({})
         },
     })
+}
+
+/// Zero marks an unreached boundary; clock reversals must not become zero latency.
+fn elapsed_ms(start: f64, end: f64) -> Option<f64> {
+    let ms = (end - start) * 1000.0;
+    (start.is_finite() && end.is_finite() && start > 0.0 && end >= start && ms.is_finite())
+        .then_some(ms)
 }
 
 fn string_attribute(key: &str, value: &str) -> Value {
@@ -363,6 +476,7 @@ mod tests {
     fn record() -> TraceRecord {
         TraceRecord {
             rid: "chatcmpl-1".to_owned(),
+            role: Role::Plain,
             session: Some("sess-7".to_owned()),
             created: 1_700_000_000.0,
             scheduled: 1_700_000_000.5,
@@ -379,12 +493,67 @@ mod tests {
     }
 
     #[test]
+    fn parent_context_preserves_span_identity_and_lifecycle() {
+        let mut value = span(&record());
+        let before = value.clone();
+        let provider: TraceProvider = Arc::new(|_| {
+            Some((
+                "ABCDEF0123456789ABCDEF0123456789".into(),
+                Some("ABCDEF0123456789".into()),
+            ))
+        });
+        apply_trace_context(&mut value, "rid", &provider);
+        assert_eq!(value["traceId"], "abcdef0123456789abcdef0123456789");
+        assert_eq!(value["parentSpanId"], "abcdef0123456789");
+        value.as_object_mut().unwrap().remove("parentSpanId");
+        value["traceId"] = before["traceId"].clone();
+        assert_eq!(value, before);
+    }
+
+    #[test]
+    fn provider_can_generate_a_root_trace_without_a_parent() {
+        let mut value = span(&record());
+        let provider: TraceProvider = Arc::new(|_| Some(("a".repeat(32), None)));
+        apply_trace_context(&mut value, "ordinary-rid", &provider);
+        assert_eq!(value["traceId"], "a".repeat(32));
+        assert!(value.get("parentSpanId").is_none());
+    }
+
+    #[test]
+    fn a_span_cannot_be_its_own_parent() {
+        let mut value = span(&record());
+        let before = value.clone();
+        let own = value["spanId"].as_str().unwrap().to_ascii_uppercase();
+        let provider: TraceProvider = Arc::new(move |_| Some(("a".repeat(32), Some(own.clone()))));
+        apply_trace_context(&mut value, "rid", &provider);
+        assert_eq!(value, before);
+    }
+
+    #[test]
+    fn missing_or_invalid_context_preserves_native_span() {
+        let before = span(&record());
+        for context in [
+            None,
+            Some(("bad".into(), Some("1234567890abcdef".into()))),
+            Some(("0".repeat(32), Some("1234567890abcdef".into()))),
+            Some(("1".repeat(32), Some("0".repeat(16)))),
+            Some(("1".repeat(32), Some("g".repeat(16)))),
+        ] {
+            let provider: TraceProvider = Arc::new(move |_| context.clone());
+            let mut value = before.clone();
+            apply_trace_context(&mut value, "rid", &provider);
+            assert_eq!(value, before);
+        }
+    }
+
+    #[test]
     fn a_record_becomes_a_genai_conventioned_span() {
         let span = span(&record());
         assert_eq!(span["name"], "tokenspeed.request");
         assert_eq!(span["kind"], 2);
         assert_eq!(span["status"], serde_json::json!({}));
-        assert_eq!(span["traceId"].as_str().unwrap().len(), 32);
+        assert_eq!(span["traceId"], trace_id(&record().rid));
+        assert!(span.get("parentSpanId").is_none());
         assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
         assert_eq!(span["startTimeUnixNano"], "1700000000000000000");
         assert_eq!(span["endTimeUnixNano"], "1700000002000000000");
@@ -400,6 +569,115 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events[0]["name"], "tokenspeed.request.scheduled");
         assert_eq!(events[0]["timeUnixNano"], "1700000000500000000");
+    }
+
+    fn timing(value: &Value, name: &str) -> Option<f64> {
+        value["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|attribute| attribute["key"] == format!("tokenspeed.{name}_ms"))
+            .and_then(|attribute| attribute["value"]["doubleValue"].as_f64())
+    }
+
+    #[test]
+    fn span_reports_host_lifecycle_durations() {
+        let value = span(&record());
+        for (name, expected) in [
+            ("ttft", 1250.0),
+            ("total", 2000.0),
+            ("queue", 500.0),
+            ("prefill_process", 500.0),
+            ("decode_process", 750.0),
+            ("tpot", 750.0 / 7.0),
+        ] {
+            assert_eq!(timing(&value, name), Some(expected), "{name}");
+        }
+        assert!(value["attributes"]
+            .as_array()
+            .unwrap()
+            .contains(&string_attribute(
+                "tokenspeed.timing_scope",
+                "request_created_to_engine_release",
+            )));
+    }
+
+    #[test]
+    fn phase_durations_follow_the_engine_role() {
+        let mut record = record();
+        for (role, name) in [(Role::Prefill, "prefill"), (Role::Decode, "decode")] {
+            record.role = role;
+            let value = span(&record);
+            assert!(value["attributes"]
+                .as_array()
+                .unwrap()
+                .contains(&string_attribute("tokenspeed.engine_role", name),));
+            assert_eq!(timing(&value, "total"), Some(2000.0));
+            assert_eq!(timing(&value, "ttft"), Some(1250.0));
+            assert_eq!(timing(&value, "queue"), Some(500.0));
+            if role == Role::Prefill {
+                assert_eq!(timing(&value, "prefill_process"), Some(500.0));
+                assert_eq!(timing(&value, "decode_process"), None);
+                assert_eq!(timing(&value, "tpot"), None);
+            } else {
+                assert_eq!(timing(&value, "prefill_process"), None);
+                assert_eq!(timing(&value, "decode_process"), Some(750.0));
+                assert_eq!(timing(&value, "tpot"), Some(750.0 / 7.0));
+            }
+        }
+    }
+
+    #[test]
+    fn abort_before_dispatch_reports_only_total_duration() {
+        let mut record = record();
+        record.scheduled = 0.0;
+        record.prefill_done = 0.0;
+        record.first_token = 0.0;
+        record.output_tokens = 0;
+        record.finish_reason = "abort";
+        let value = span(&record);
+        assert_eq!(timing(&value, "total"), Some(2000.0));
+        for name in ["ttft", "queue", "prefill_process", "decode_process", "tpot"] {
+            assert_eq!(timing(&value, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn tpot_requires_more_than_one_output_token() {
+        for count in [0, 1] {
+            let mut record = record();
+            record.output_tokens = count;
+            assert_eq!(timing(&span(&record), "tpot"), None);
+        }
+        let mut record = record();
+        record.finish = record.first_token;
+        assert_eq!(timing(&span(&record), "tpot"), Some(0.0));
+    }
+
+    #[test]
+    fn invalid_boundaries_omit_only_affected_durations() {
+        for invalid in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1_700_000_003.0,
+        ] {
+            let mut record = record();
+            record.created = invalid;
+            let value = span(&record);
+            for name in ["ttft", "total", "queue"] {
+                assert_eq!(timing(&value, name), None, "{name}: {invalid}");
+            }
+            assert_eq!(timing(&value, "decode_process"), Some(750.0));
+        }
+        let mut record = record();
+        record.finish = record.first_token - 0.25;
+        let value = span(&record);
+        assert_eq!(timing(&value, "decode_process"), None);
+        assert_eq!(timing(&value, "tpot"), None);
+        assert_eq!(timing(&value, "ttft"), Some(1250.0));
     }
 
     #[test]
@@ -505,8 +783,15 @@ mod tests {
             (head, body)
         });
 
-        let publisher =
-            TracePublisher::new(format!("http://{address}/v1/traces"), 1.0, "m".to_owned());
+        let publisher = TracePublisher::new(
+            format!("http://{address}/v1/traces"),
+            1.0,
+            "m".to_owned(),
+            Some(Arc::new(|rid| {
+                assert_eq!(rid, "chatcmpl-1");
+                Some(("1".repeat(32), Some("2".repeat(16))))
+            })),
+        );
         publisher.emit(record());
         let (head, body) = received.join().expect("the receiver thread");
 
@@ -522,10 +807,17 @@ mod tests {
         let batch: Value = serde_json::from_slice(&body).expect("the OTLP body");
         let spans = &batch["resourceSpans"][0]["scopeSpans"][0]["spans"];
         let span = &spans[0];
+        assert_eq!(timing(span, "ttft"), Some(1250.0));
+        assert_eq!(timing(span, "total"), Some(2000.0));
+        assert_eq!(timing(span, "tpot"), Some(750.0 / 7.0));
+        assert_eq!(timing(span, "queue"), Some(500.0));
+        assert_eq!(timing(span, "prefill_process"), Some(500.0));
+        assert_eq!(timing(span, "decode_process"), Some(750.0));
         assert_eq!(span["name"], "tokenspeed.request");
         assert_eq!(span["kind"], 2);
         assert_eq!(span["status"], serde_json::json!({}));
-        assert_eq!(span["traceId"].as_str().unwrap().len(), 32);
+        assert_eq!(span["traceId"], "1".repeat(32));
+        assert_eq!(span["parentSpanId"], "2".repeat(16));
         let attributes = span["attributes"].as_array().unwrap();
         assert!(attributes.contains(&string_attribute("gen_ai.response.id", "chatcmpl-1")));
         assert!(attributes.contains(&int_attribute("gen_ai.usage.input_tokens", 100)));
