@@ -1250,6 +1250,55 @@ class HostBootstrap:
                     draft_model_config=draft_model_config,
                 ),
             )
+            # The model-only warmup ran on the temporary cache. Rehearse
+            # actual request preparation and accepted-state commits against
+            # the final cache before the live scheduler owns any pages.
+            # This bounds startup coverage for the AMD eager-prefill path;
+            # all kernel selection still follows the ordinary registry.
+            from tokenspeed_kernel.platform import current_platform
+
+            if (
+                current_platform().is_cdna4
+                and model_config.dsa_padded_prefill_replay
+                and spec_algorithm == "EAGLE3"
+                and server_args.disable_kvstore
+                and not mapping.has_pp
+                and not mapping.has_attn_dp
+                and server_args.disaggregation_mode == "null"
+                and server_args.sampling_backend == "greedy"
+                and server_args.chunked_prefill_size > 0
+                and model_config.context_len > 5 * decode_input_tokens
+            ):
+                from tokenspeed.runtime.execution.startup_warmup import (
+                    warmup_request_path,
+                )
+                from tokenspeed.runtime.utils import set_random_seed
+
+                # TP8's short final chunk has 128 rows per rank at bs16,
+                # reaching the medium-M MoE path as well as full chunks.
+                tail = max(1, 128 * mapping.attn.tp_size // max_batch_size)
+                long_prompt = min(
+                    server_args.chunked_prefill_size + tail,
+                    model_config.context_len - 5 * decode_input_tokens,
+                )
+                with startup_phase("kernels.request_path"):
+                    forwards = warmup_request_path(
+                        device.handle,
+                        scheduler_config,
+                        phases=(
+                            (1, min(5, long_prompt)),
+                            (1, min(1024, long_prompt)),
+                            (max_batch_size, long_prompt),
+                        ),
+                        decode_width=decode_input_tokens,
+                        decode_steps=2,
+                    )
+                set_random_seed(48)
+                logger.info(
+                    f"Startup request-path warmup completed {forwards} forwards; "
+                    f"free device memory {torch.cuda.mem_get_info(gpu_id)[0] / 2**30:.2f} GiB"
+                )
+
             #: Driven by the control thread only, once the host takes it.
             self.scheduler = Scheduler(scheduler_config)
             self._max_single_request_tokens = self.scheduler.max_single_request_tokens()

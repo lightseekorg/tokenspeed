@@ -40,7 +40,8 @@ def _require_iris():
 
 
 @pytest.mark.parametrize("rank", range(8))
-def test_lamport_buffer_polling_codegen(rank, tmp_path):
+@pytest.mark.parametrize("fused_moe", (False, True))
+def test_lamport_buffer_polling_codegen(rank, fused_moe, tmp_path):
     """Cache flags alone do not prevent a future compiler from hoisting loads.
 
     Compile without launching and require all seven 16-byte peer reads to
@@ -52,26 +53,52 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
         iris_arch_policy,
         iris_lamport_allreduce,
     )
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.moe_reduce import (
+        iris_k3moe_lamport_allreduce_topk,
+    )
 
-    fn = iris_lamport_allreduce
-    signature = {
-        name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
+    constants = {
+        "RANK": rank,
+        "WORLD_SIZE": 8,
+        "MAX_ELEMENTS": 6 * 10752,
+        "NUM_STAGES": 3,
+        "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
+            ArchVersion(9, 5)
+        ).peer_signal_store,
     }
-    signature.update({name: "i64" for name in fn.arg_names[4:12]})
+    if fused_moe:
+        fn = iris_k3moe_lamport_allreduce_topk
+        signature = {
+            "partials_ptr": "*bf16",
+            "input_sym_ptr": "*bf16",
+            "region_sym_ptr": "*bf16",
+            "output_ptr": "*bf16",
+            "epochs": "*i32",
+            "regions": ("i64",) * 8,
+            "TOTAL_ELEMENTS": "i32",
+            "ROUTED_ELEMENTS": "i32",
+        }
+        constants.update(ROUTED_WIDTH=3584, TOPK=8)
+    else:
+        fn = iris_lamport_allreduce
+        signature = {
+            name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
+        }
+        signature.update({name: "i64" for name in fn.arg_names[4:12]})
+        signature["TOTAL_ELEMENTS"] = "i32"
+    attrs = {}
+    for index, name in enumerate(fn.arg_names):
+        if name == "regions":
+            attrs.update(
+                {(index, peer): [["tt.divisibility", 16]] for peer in range(8)}
+            )
+        elif name in signature and name not in ("TOTAL_ELEMENTS", "ROUTED_ELEMENTS"):
+            attrs[(index,)] = [["tt.divisibility", 16]]
     source = gluon._runtime.GluonASTSource(
         fn,
         signature,
-        constexprs={
-            "RANK": rank,
-            "WORLD_SIZE": 8,
-            "TOTAL_ELEMENTS": 6 * 10752,
-            "MAX_ELEMENTS": 6 * 10752,
-            "NUM_STAGES": 3,
-            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
-                ArchVersion(9, 5)
-            ).peer_signal_store,
-        },
-        attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
+        constexprs=constants,
+        attrs=attrs,
     )
     kernel = triton.compile(
         source,
