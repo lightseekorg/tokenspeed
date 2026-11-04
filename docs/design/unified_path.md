@@ -1900,8 +1900,8 @@ and the same slice of every per-row input; per-request inputs keep the whole
 batch with `RequestTokenHistoryView.row_offset = start`; a pipeline stage's
 boundary bundle carries shard rows. `ctx.input_num_tokens` and
 `global_num_tokens` keep the scheduler's full-chunk meaning: only collective
-sizing (`CommManager`, `models/base/comm_ops.py`) reads them, a model reads
-its rows from its tensors or `ctx.query_shard`.
+sizing (`CommManager`) reads them, a model reads its rows from its tensors or
+`ctx.query_shard`.
 
 The contract a model (in tree or a plugin) implements:
 
