@@ -38,7 +38,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (  # no
     iris_muse_moetail_row_stages,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
     ERROR_ABORT,
     ERROR_RECORD,
     ERROR_WORDS,

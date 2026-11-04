@@ -53,7 +53,7 @@ from native_body_helpers import (  # noqa: E402
     split_records_kernel,
     topk_keys_kernel,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
     persistent_compile_options,
 )
 

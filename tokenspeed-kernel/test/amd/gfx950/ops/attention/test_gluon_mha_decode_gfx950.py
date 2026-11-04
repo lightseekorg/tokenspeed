@@ -867,7 +867,7 @@ def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool, merge: str) 
     share of the rows), folds the same partials in the same order as the
     last-arriver merge, so the rows are bitwise equal."""
     from native_body_helpers import split_records_kernel
-    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
         ERROR_WORDS,
         persistent_compile_options,
     )
@@ -983,7 +983,7 @@ def test_full_records_merge_is_bitwise_the_balanced_decode(
     read ``.cv``) streams the same splits and folds them in the same order as
     the balanced decode and its reduce, so the rows are bitwise equal."""
     from native_body_helpers import full_records_kernel
-    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
         ERROR_WORDS,
         persistent_compile_options,
     )

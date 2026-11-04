@@ -77,13 +77,13 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
     TAG_WORDS,
     native_moe_weights,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
     ENTRY_WORDS,
     GRID,
     persistent_compile_options,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent.arena import UncachedBuffer
-from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.arena import UncachedBuffer
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import FailureMirror
 
 __all__ = ["MuseSparkDecoderLayerState", "MuseSparkFusedDecoderLayer"]
 

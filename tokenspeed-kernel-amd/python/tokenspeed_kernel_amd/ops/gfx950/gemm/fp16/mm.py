@@ -33,7 +33,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _dense16_mm_launch_metadata,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
-from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.wave import (
     lds_spin_until,
     lds_store_count,
 )

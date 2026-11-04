@@ -51,7 +51,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (  #
     iris_column_routes_push_words,
     iris_column_routes_wait,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
     persistent_compile_options,
 )
 
@@ -242,8 +242,13 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E
     xn_wait,
 )
 from tokenspeed_kernel_amd._scheduling import wave_uniform_i32  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.persistent import Launch, vote  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import wave_scalar  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
+    Launch,
+    vote,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.wave import (  # noqa: E402
+    wave_scalar,
+)
 
 _VIEW = {
     "heaps": ("i64",) * 8, "rank": "i32", "box": "*i32", "h1": "*bf16", "h1_sums": "*i64",

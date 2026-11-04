@@ -47,7 +47,10 @@ if current_platform().is_cdna4:
         _mxfp4_store_cdna4_scale,
         scaled_downcast_layout,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.persistent import poll_check, poll_stop_site
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
+        poll_check,
+        poll_stop_site,
+    )
 
 
 class IrisAllGather:

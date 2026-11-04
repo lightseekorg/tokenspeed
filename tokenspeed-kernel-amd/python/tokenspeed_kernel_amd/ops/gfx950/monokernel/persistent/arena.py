@@ -35,7 +35,7 @@ from __future__ import annotations
 import ctypes
 
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import _hip
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import _hip
 
 # hipExtMallocWithFlags flag: device memory no cache keeps lines of.
 _HIP_DEVICE_MALLOC_UNCACHED = 0x3

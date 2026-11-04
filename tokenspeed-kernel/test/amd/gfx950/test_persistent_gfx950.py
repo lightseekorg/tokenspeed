@@ -35,7 +35,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("Persistent helpers target gfx950", allow_module_level=True)
 
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
     ENTRY_WORDS,
     ERROR_ABORT,
     ERROR_WORDS,
@@ -306,7 +306,7 @@ _TRAP_CHILD = textwrap.dedent("""
     sys.path[:0] = sys.argv[1].split(os.pathsep)
     import torch
     import test_persistent_gfx950 as t
-    from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import FailureMirror
     state = t._State()
     mirror = FailureMirror(state.errors, sys.argv[2])
     # 8 workgroups are missing, so the join stalls. "aborted": a peer's
@@ -342,7 +342,9 @@ _MARKER = (5 + 1) << 16 | 40
 
 
 def _run_trap_child(tmp_path, mode):
-    from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import (
+        FailureMirror,
+    )
 
     path = str(tmp_path / f"failure-record-{mode}")
     start = time.monotonic()

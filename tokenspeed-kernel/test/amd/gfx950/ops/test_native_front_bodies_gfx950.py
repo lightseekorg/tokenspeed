@@ -159,7 +159,7 @@ def test_kpart_steps_are_bitwise_the_full_x_build(role: str, rows: int) -> None:
     """Building x one K step at a time (norm vectors and b from LDS) runs the
     same elementwise operations and each tile's MFMAs in the same K order as
     the full-x build, so the partial words are bitwise equal."""
-    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
         persistent_compile_options,
     )
 

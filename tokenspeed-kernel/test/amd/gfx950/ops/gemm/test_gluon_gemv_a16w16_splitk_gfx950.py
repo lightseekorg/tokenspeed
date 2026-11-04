@@ -35,7 +35,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (  # noqa: E4
     gluon_gemv_a16w16_splitk_gfx950,
     launch_gluon_gemv_a16w16_splitk_gfx950,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
     ERROR_ABORT,
     Launch,
     persistent_compile_options,

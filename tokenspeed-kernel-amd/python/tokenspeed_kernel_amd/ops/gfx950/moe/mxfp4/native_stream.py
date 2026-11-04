@@ -42,7 +42,7 @@ into the next strip or unit past the current one's end. Nothing a stream
 wave waits for is a vector load issued behind its weights (vector memory
 completes in issue order): item metadata comes from LDS, readiness polls are
 scalar loads, and the quad exchange runs in LDS without a barrier
-(``persistent/wave.py``).
+(``monokernel/persistent/wave.py``).
 
 The plan is closed-form from the routed ids, in every workgroup: whole
 experts go to XCDs round-robin and the ``E % 8`` leftover experts are split by
@@ -80,7 +80,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     pack_cdna4_mxfp4_scale_lanes,
     unswizzle_cdna4_mxfp4_scale,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
     ENTRY_WORDS,
     ERROR_WORDS,
     FIRST_KERNEL_SITE,
@@ -94,8 +94,8 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     release_drain,
     vote,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent.arena import UncachedBuffer
-from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.arena import UncachedBuffer
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.wave import (
     LDS_SPIN_TRIES,
     after,
     lds_spin_bounded,

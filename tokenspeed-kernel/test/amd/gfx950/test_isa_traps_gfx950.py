@@ -46,7 +46,7 @@ from asm_checks import (  # noqa: E402
     write_through_store_drains,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon, triton  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent._intrinsics import (  # noqa: E402
     memrealtime,
     persistent_compile_options,
     scalar_load_glc,

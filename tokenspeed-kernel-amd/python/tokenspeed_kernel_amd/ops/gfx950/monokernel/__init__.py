@@ -18,29 +18,5 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Clock and stage-stamp helpers for persistent gfx950 kernels."""
 
-from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import memrealtime
-
-# s_memrealtime counts a constant 100 MHz clock on gfx950: 10 ns per tick.
-REALTIME_TICK_NS = 10
-
-
-@gluon.jit
-def realtime_ticks():
-    """Return the 64-bit constant-rate clock (10 ns ticks); uniform per wave
-    (``llvm.amdgcn.s.memrealtime``; launch with ``persistent_compile_options``).
-
-    The clock is per GPU: stamps from different GPUs are not comparable.
-    """
-    return memrealtime()
-
-
-@gluon.jit
-def trace_stamp(trace_ptr, index):
-    """Store the clock at ``trace_ptr[index]``.
-
-    A plain store: it adds no wait to the stage it stamps.
-    """
-    gl.store(trace_ptr + index, realtime_ticks())
+"""Persistent decode monokernels for gfx950: plan, mailboxes, building blocks."""

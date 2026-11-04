@@ -34,7 +34,7 @@ import mmap
 import os
 
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.sync import (
     ERROR_MIRROR,
     ERROR_RECORD_FIELDS,
 )

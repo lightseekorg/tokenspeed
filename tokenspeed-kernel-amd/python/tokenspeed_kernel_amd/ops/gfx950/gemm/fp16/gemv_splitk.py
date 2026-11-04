@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
     MAX_VMCNT_WAIT,
     poll_expired,
     poll_stop_site,
@@ -50,7 +50,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     vote,
     wait_vmcnt,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.timing import realtime_ticks
 
 cdna4 = gl.amd.cdna4
 

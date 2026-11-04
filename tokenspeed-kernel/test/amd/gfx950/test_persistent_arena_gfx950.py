@@ -28,7 +28,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("Persistent helpers target gfx950", allow_module_level=True)
 
-from tokenspeed_kernel_amd.ops.gfx950.persistent.arena import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.arena import (  # noqa: E402
     UncachedBuffer,
 )
 

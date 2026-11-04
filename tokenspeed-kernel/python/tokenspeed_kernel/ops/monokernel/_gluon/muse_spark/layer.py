@@ -142,7 +142,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
     sigmoid_bias_topk_keys_gfx950,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
     FIRST_KERNEL_SITE,
     GRID,
     enter_check,

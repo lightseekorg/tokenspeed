@@ -49,7 +49,7 @@ must not return (:func:`fail_stop` is the local handler).
 """
 
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent._intrinsics import (
     memrealtime,
     release_drain,
     scalar_load_glc,
@@ -60,7 +60,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     wave_acquire,
     xcc_id,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.timing import realtime_ticks
 
 # Workgroups per launch, XCDs per GPU, and workgroups per XCD.
 GRID = 256

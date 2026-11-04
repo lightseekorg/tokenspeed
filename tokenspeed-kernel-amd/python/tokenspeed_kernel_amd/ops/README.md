@@ -48,7 +48,7 @@ skew and regress performance even when the generated kernel remains correct.
 
 ## Persistent kernels (gfx950)
 
-`gfx950/persistent/` holds device helpers for kernels that keep one
+`gfx950/monokernel/persistent/` holds device helpers for kernels that keep one
 workgroup on every CU for the whole launch and hand work between workgroups
 through memory instead of kernel boundaries. They carry no model knowledge.
 

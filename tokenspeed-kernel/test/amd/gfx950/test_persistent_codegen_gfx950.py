@@ -38,7 +38,7 @@ from asm_checks import (
 
 triton = pytest.importorskip("tokenspeed_triton")
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
     enter_check,
     enter_issue,
     fail_stop,
@@ -52,12 +52,14 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
     store_pairs,
     wait_vmcnt,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent._intrinsics import (  # noqa: E402
     scalar_load_glc,
     scalar_load_glc_i64,
     wave_index,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import wave_scalar  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.wave import (  # noqa: E402
+    wave_scalar,
+)
 
 _LOADS = 4
 
@@ -480,18 +482,18 @@ _REPO = Path(__file__).resolve().parents[4]
 _KA = "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/"
 _KT = "tokenspeed-kernel/python/tokenspeed_kernel/ops/"
 _ASM_SITES = {
-    _KA + "persistent/_intrinsics.py": (
+    _KA + "monokernel/persistent/_intrinsics.py": (
         True,
         {"first_lane_scalar", "scalar_load_glc", "scalar_load_glc_i64",
          "scalar_tags16_differ"},
     ),
-    _KA + "persistent/wave.py": (
+    _KA + "monokernel/persistent/wave.py": (
         True,
         {"opaque_zero", "after", "issue_order", "lds_store_count",
          "lds_spin_until", "lds_spin_bounded"},
     ),
-    _KA + "persistent/sync.py": (True, set()),
-    _KA + "persistent/timing.py": (True, set()),
+    _KA + "monokernel/persistent/sync.py": (True, set()),
+    _KA + "monokernel/persistent/timing.py": (True, set()),
     _KT + "communication/_iris/all_reduce.py": (True, {"_iris_subgroup_any"}),
     _KT + "communication/_iris/synchronization.py": (
         False,

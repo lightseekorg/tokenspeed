@@ -25,7 +25,7 @@ hands work between its workgroups through memory instead of kernel
 boundaries. These helpers carry no model or operation knowledge.
 """
 
-from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent._intrinsics import (
     MAX_VMCNT_WAIT,
     memrealtime,
     persistent_compile_options,
@@ -39,7 +39,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     wave_index,
     xcc_id,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.sync import (
     ENTRY_WORDS,
     ERROR_ABORT,
     ERROR_CALLER,
@@ -74,7 +74,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
     poll_until_all,
     store_pairs,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.timing import (
     REALTIME_TICK_NS,
     realtime_ticks,
     trace_stamp,

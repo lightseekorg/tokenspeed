@@ -78,12 +78,12 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (  # noq
     DEFAULT_PLAN_FIELDS,
     MuseSparkFusedDecoderLayer,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import GRID  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import GRID  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import (  # noqa: E402
     FailureMirror,
     _hip,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.sync import (  # noqa: E402
     FIRST_KERNEL_SITE,
     SITE_ABORTED,
 )

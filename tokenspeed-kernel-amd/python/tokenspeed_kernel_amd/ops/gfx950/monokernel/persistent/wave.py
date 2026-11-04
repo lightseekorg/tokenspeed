@@ -46,7 +46,9 @@ per-wave facts Gluon cannot express, until Gluon can state them itself.
 """
 
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import first_lane_scalar
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent._intrinsics import (
+    first_lane_scalar,
+)
 
 
 @gluon.jit

@@ -42,8 +42,11 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     reject_block_scales,
     select_kv_splits,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import release_drain
-from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import after, issue_order
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import release_drain
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.wave import (
+    after,
+    issue_order,
+)
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy

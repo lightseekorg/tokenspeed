@@ -83,7 +83,9 @@ def failure_records(record_dir, world):
     """Every rank's mirrored failure record (site, logical workgroup, detail,
     epoch, label), one line per rank: a fail_stop trap ends the ranks with a
     queue error, and the record names the wait that failed."""
-    from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import (
+        FailureMirror,
+    )
 
     lines = []
     for rank in range(world):

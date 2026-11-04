@@ -52,11 +52,13 @@ if current_platform().is_cdna4:
         gluon_rowcta_bf16_gemv_rows_weights_gfx950,
         gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
         poll_expired,
         poll_stop_site,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.timing import (
+        realtime_ticks,
+    )
 
 
 @gluon.constexpr_function

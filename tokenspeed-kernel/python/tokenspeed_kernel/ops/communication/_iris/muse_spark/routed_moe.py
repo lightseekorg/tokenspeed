@@ -40,7 +40,10 @@ from tokenspeed_kernel.platform import current_platform
 
 if current_platform().is_cdna4:
     # Deadline and abort checks of the waits a persistent layer runs.
-    from tokenspeed_kernel_amd.ops.gfx950.persistent import poll_check, poll_stop_site
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
+        poll_check,
+        poll_stop_site,
+    )
 
 
 @gluon.jit

@@ -65,7 +65,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
 from tokenspeed_kernel.platform import current_platform
 
 if current_platform().is_cdna4:
-    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
         ERROR_ABORT,
         ERROR_CALLER,
         ERROR_WORDS,
