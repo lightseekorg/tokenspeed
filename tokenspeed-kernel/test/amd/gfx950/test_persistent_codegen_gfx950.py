@@ -55,6 +55,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (  # noqa: E
     scalar_load_glc_i64,
     wave_index,
 )
+from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import wave_scalar  # noqa: E402
 
 _LOADS = 4
 # The serving entry form (vector counters), for tests of what follows it.
@@ -464,3 +465,38 @@ def test_scalar_load_results_never_share_the_address_registers():
     assert len(loads) == 2
     for dst, base in loads:
         assert not _sgprs(dst) & _sgprs(base), (dst, base)
+
+
+@gluon.jit
+def _wave_scalars_kernel(words, out):
+    """A per-wave address from each helper, read by a scalar load and by an
+    exec-masked vector store."""
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [8], [0])
+    lane = gl.arange(0, 512, lanes)
+    a = wave_index()
+    b = wave_scalar(lane // 64 + 8)
+    v = scalar_load_glc(words + a * 2) + scalar_load_glc(words + b * 2)
+    gl.store(
+        out + a * 64 + b + lane * 0,
+        gl.zeros([512], gl.int32, lanes) + v,
+        mask=lane % 64 == 0,
+    )
+
+
+def test_per_wave_scalars_are_compiler_visible_lane_reads():
+    """The per-wave scalars come from ``llvm.amdgcn.readfirstlane``, not from
+    a ``v_readfirstlane`` hidden in inline asm, so the compiler knows the
+    SGPR was written by a vector instruction and orders its consumers."""
+    assembly = _compile(_wave_scalars_kernel, {"words": "*i32", "out": "*i32"})
+    inside = False
+    reads = 0
+    for line in assembly.splitlines():
+        text = line.strip()
+        if text.startswith(";;#ASMSTART"):
+            inside = True
+        elif text.startswith(";;#ASMEND"):
+            inside = False
+        elif text.startswith("v_readfirstlane"):
+            reads += 1
+            assert not inside, line
+    assert reads
