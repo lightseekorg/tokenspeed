@@ -104,10 +104,9 @@ change.
   parameter of the chain path (compaction), position vs slot, one tree
   attention path (trtllm-gen prefix plus window cascade), and position-keyed
   sampled verify.
-* `docs/design/monokernel.md` — one persistent launch per decoder
-  layer: the layer-stack hook that chooses it per step from an agreed served
-  set, residency and its decline list, fail-stop, the launch state's
-  lifetime, and the deployment contract.
+* `docs/design/monokernel.md` — decode monokernels (one persistent launch
+  per decoder layer): the layer-stack hook that picks them per step,
+  residency, fail-stop, launch state, and the deployment contract.
 
 ## Public pull requests
 

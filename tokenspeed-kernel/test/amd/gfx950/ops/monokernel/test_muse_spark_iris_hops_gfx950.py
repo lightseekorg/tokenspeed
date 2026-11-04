@@ -18,9 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Offline gfx950 codegen of the native fused layer's Iris hop bodies.
+"""Offline gfx950 codegen of the Muse Spark monokernel's Iris exchange bodies.
 
-The hop bodies of the standalone kernels run inside the 8-wave fused-layer
+The exchange bodies of the standalone kernels run inside the 8-wave monokernel
 launch. These tests compile them at 8 waves (no device needed) and check the
 ordering contract of each: pushes are whole-line system-scope stores with no
 wait, polls stay in their loop with system-scope loads, and with the entry
@@ -82,8 +82,11 @@ def _compile(fn, signature, constexprs, num_warps=8):
 
 
 @gluon.jit
-def _own4_kernel(routes, norm_weight, region, regions, row, copy, RANK: gl.constexpr):
-    """H4 push of one route slice, then OWN4: complete + H5, as in the layer."""
+def _route_owner_kernel(
+    routes, norm_weight, region, regions, row, copy, RANK: gl.constexpr
+):
+    """Push one route slice to its owner, then, as the route owner, complete
+    the route and send it to every rank, as in the layer."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
     )
@@ -102,8 +105,9 @@ def _own4_kernel(routes, norm_weight, region, regions, row, copy, RANK: gl.const
 
 
 @gluon.jit
-def _fin_kernel(route_weights, norm_weight, region, out, token, owner, copy):
-    """FIN for (token, owner): wait + routed norm + weighted sum."""
+def _finisher_kernel(route_weights, norm_weight, region, out, token, owner, copy):
+    """The finisher for (token, owner): wait for the completed routes, then
+    the routed norm and the weighted sum."""
     loaded, squares = iris_column_routes_wait(
         region, copy, token, owner, 8, 32, _STAGE, False, None, None, 0
     )
@@ -116,7 +120,7 @@ def _fin_kernel(route_weights, norm_weight, region, out, token, owner, copy):
 
 def test_column_route_owner_compiles_at_8_waves():
     assembly = _compile(
-        _own4_kernel,
+        _route_owner_kernel,
         {"routes": "*bf16", "norm_weight": "*bf16", "region": "*i32",
          "regions": ("i64",) * 8, "row": "i32", "copy": "i32"},
         {"RANK": 3},
@@ -140,7 +144,7 @@ def test_column_route_owner_compiles_at_8_waves():
 
 def test_column_route_finisher_compiles_at_8_waves():
     assembly = _compile(
-        _fin_kernel,
+        _finisher_kernel,
         {"route_weights": "*fp32", "norm_weight": "*bf16", "region": "*i32",
          "out": "*fp32", "token": "i32", "owner": "i32", "copy": "i32"},
         {},
@@ -155,8 +159,9 @@ def test_column_route_finisher_compiles_at_8_waves():
 
 
 @gluon.jit
-def _xn_kernel(local_input, weight, packed, scales, region, regions, row, copy,RANK: gl.constexpr):  # fmt: skip
-    """H3 push of one row's 512 reduced columns, then XN: wait, RMSNorm, MXFP4."""
+def _pooled_norm_kernel(local_input, weight, packed, scales, region, regions, row, copy,RANK: gl.constexpr):  # fmt: skip
+    """Push one row's 512 reduced pooled columns to every rank, then, as the
+    pooled-row norm, wait for all of them, RMSNorm and quantize to MXFP4."""
     STAGE_WORDS: gl.constexpr = 8 * 16384 // 2
     stages = (copy.to(gl.uint32),)
     local_words = tl.cast(local_input, gl.pointer_type(gl.uint32)) + row * 256
@@ -179,9 +184,9 @@ def _xn_kernel(local_input, weight, packed, scales, region, regions, row, copy,R
     )
 
 
-def test_h3_push_and_xn_compile_at_8_waves():
+def test_pooled_ag_push_and_pooled_norm_compile_at_8_waves():
     assembly = _compile(
-        _xn_kernel,
+        _pooled_norm_kernel,
         {"local_input": "*bf16", "weight": "*bf16", "packed": "*u8", "scales": "*u8",
          "region": "*bf16", "regions": ("i64",) * 8, "row": "i32", "copy": "i32"},
         {"RANK": 3},
@@ -196,8 +201,8 @@ def test_h3_push_and_xn_compile_at_8_waves():
 
 
 @gluon.jit
-def _h6_kernel(values_ptr, regions, copy, RANK: gl.constexpr):
-    """H6: one UNP sender's 16 columns of 8 rows pushed to every rank."""
+def _post_ag_kernel(values_ptr, regions, copy, RANK: gl.constexpr):
+    """One post-expert sender's 16 columns of 8 rows pushed to every rank."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 16], [64, 1], [gl.num_warps(), 1], [1, 0]
     )
@@ -210,9 +215,9 @@ def _h6_kernel(values_ptr, regions, copy, RANK: gl.constexpr):
     )  # fmt: skip
 
 
-def test_h6_push_compiles_at_8_waves():
+def test_post_ag_push_compiles_at_8_waves():
     assembly = _compile(
-        _h6_kernel, {"values_ptr": "*bf16", "regions": ("i64",) * 8, "copy": "i32"},
+        _post_ag_kernel, {"values_ptr": "*bf16", "regions": ("i64",) * 8, "copy": "i32"},
         {"RANK": 3},
     )  # fmt: skip
     lines = instruction_lines(assembly)
@@ -225,21 +230,21 @@ def test_h6_push_compiles_at_8_waves():
 
 
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E402
-    H4SinkArgs,
     MuseSparkIrisView,
+    RoutePushArgs,
+    ar_owner,
+    ar_rs_sink,
     clear_next_copies,
-    fin,
-    h1_rs_sink,
-    h3_sink,
-    h4_sink,
-    h6_sink,
-    h6_sums_wait,
+    finisher,
     iris_fail_stop,
-    own1,
-    own4_complete,
-    red_sums,
-    unp_sums_publish,
-    xn_wait,
+    pooled_ag_sink,
+    pooled_norm_wait,
+    post_ag_sink,
+    post_ag_sums_wait,
+    post_sender_sums_publish,
+    reducer_sums,
+    route_owner_complete,
+    route_push_sink,
 )
 from tokenspeed_kernel_amd._scheduling import wave_uniform_i32  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (  # noqa: E402
@@ -251,17 +256,27 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.wave import (  # noq
 )
 
 _VIEW = {
-    "heaps": ("i64",) * 8, "rank": "i32", "box": "*i32", "h1": "*bf16", "h1_sums": "*i64",
-    "h3": "*bf16", "h4_own": "*i32", "routes": "*i32", "h6": "*bf16",
-    "red_in": "*i64", "h6_sums": "*i64",
+    "heaps": ("i64",) * 8, "rank": "i32", "box": "*i32", "ar": "*bf16", "ar_sums": "*i64",
+    "pooled_ag": "*bf16", "route_push_own": "*i32", "routes": "*i32", "post_ag": "*bf16",
+    "reducer_in": "*i64", "post_ag_sums": "*i64",
 }  # fmt: skip
 
 
 @gluon.jit
-def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in,h6_sums, errors,floats, words, copy, rows, ROLE: gl.constexpr):  # fmt: skip
-    """Each fused-layer hop end on the view, at 8 waves, by ROLE."""
+def _layer_hops_kernel(heaps, rank, box, ar, ar_sums, pooled_ag, route_push_own, routes, post_ag, reducer_in,post_ag_sums, errors,floats, words, copy, rows, ROLE: gl.constexpr):  # fmt: skip
+    """Each monokernel exchange end on the view, at 8 waves, by ROLE."""
     view = MuseSparkIrisView(
-        heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
+        heaps,
+        rank,
+        box,
+        ar,
+        ar_sums,
+        pooled_ag,
+        route_push_own,
+        routes,
+        post_ag,
+        reducer_in,
+        post_ag_sums,
     )
     zero = gl.program_id(0) * 0
     launch = Launch(
@@ -270,28 +285,28 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, re
     )  # fmt: skip
     if ROLE == "clear":
         clear_next_copies(view, launch, gl.program_id(0))
-    elif ROLE == "h1":
+    elif ROLE == "ar":
         layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [8, 1], [1, 0])
         r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
         c = gl.arange(0, 64, layout=gl.SliceLayout(0, layout))
         out = gl.load(floats + r[:, None] * 64 + c[None, :])
-        h1_rs_sink(view, launch, out, 5, rows, 3, ".wt")
-    elif ROLE == "own1":
-        own1(view, launch, 2, rows, floats, words.to(gl.pointer_type(gl.bfloat16),
+        ar_rs_sink(view, launch, out, 5, rows, 3, ".wt")
+    elif ROLE == "ar_owner":
+        ar_owner(view, launch, 2, rows, floats, words.to(gl.pointer_type(gl.bfloat16),
              bitcast=True), floats, floats, iris_fail_stop, 3, 0.0, True, ".wt")  # fmt: skip
-    elif ROLE == "h3":
+    elif ROLE == "pooled_ag":
         layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [8, 1], [1, 0])
         r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
         c = gl.arange(0, 64, layout=gl.SliceLayout(0, layout))
-        h3_sink(view, launch, gl.load(floats + r[:, None] * 64 + c[None, :]), 4, rows,
+        pooled_ag_sink(view, launch, gl.load(floats + r[:, None] * 64 + c[None, :]), 4, rows,
                 16, 3, ".wt")  # fmt: skip
-        got = xn_wait(view, launch, 1, iris_fail_stop, 3)
+        got = pooled_norm_wait(view, launch, 1, iris_fail_stop, 3)
         gl.store(
             words
             + gl.arange(0, 64, gl.SliceLayout(0, gl.SliceLayout(2, got.type.layout))),
             gl.sum(gl.sum(got, 2), 0),
         )
-    elif ROLE == "h4":
+    elif ROLE == "route_push":
         layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 4], [1, 8], [0, 1])
         r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
         c = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
@@ -301,29 +316,29 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, re
         wave = wave_scalar(
             gl.arange(0, 512, gl.BlockedLayout([1], [64], [8], [0])) // 64
         )
-        h4_sink(
-            H4SinkArgs(view, launch, 3),
+        route_push_sink(
+            RoutePushArgs(view, launch, 3),
             (y,),
             route,
             ((1024 + c)[None, :],),
             1024 + 16 * wave,
         )
-    elif ROLE == "own4":
-        own4_complete(view, launch, rows, words.to(gl.pointer_type(gl.bfloat16),
+    elif ROLE == "route_owner":
+        route_owner_complete(view, launch, rows, words.to(gl.pointer_type(gl.bfloat16),
                       bitcast=True), iris_fail_stop, 3, 0.0, ".wt")  # fmt: skip
-    elif ROLE == "fin":
-        combined = fin(view, launch, 1, 2, floats, words.to(gl.pointer_type(gl.bfloat16),
+    elif ROLE == "finisher":
+        combined = finisher(view, launch, 1, 2, floats, words.to(gl.pointer_type(gl.bfloat16),
                        bitcast=True), iris_fail_stop, 1e-6, 0.0)  # fmt: skip
         gl.store(floats + gl.arange(0, 512, layout=combined.type.layout), combined)
-    elif ROLE == "red":
+    elif ROLE == "reducer":
         layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 4], [8, 1], [1, 0])
         r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
         c = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
-        unp_sums_publish(
+        post_sender_sums_publish(
             view, launch, gl.load(floats + r[:, None] * 4 + c[None, :]), 3, rows
         )
-        red_sums(view, launch, rows, iris_fail_stop, 3, ".wt")
-        sums = h6_sums_wait(view, launch, 1, iris_fail_stop)
+        reducer_sums(view, launch, rows, iris_fail_stop, 3, ".wt")
+        sums = post_ag_sums_wait(view, launch, 1, iris_fail_stop)
         s4 = gl.arange(0, 4, layout=gl.SliceLayout(0, sums.type.layout))
         gl.store(floats + s4, gl.sum(sums, 0))
     else:
@@ -331,14 +346,25 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, re
         r = gl.arange(0, 8, layout=gl.SliceLayout(1, layout))
         c = gl.arange(0, 16, layout=gl.SliceLayout(0, layout))
         values = gl.load(floats + r[:, None] * 16 + c[None, :]).to(gl.bfloat16)
-        h6_sink(view, launch, values, 32, rows, 8, 16, 3, ".wt")
+        post_ag_sink(view, launch, values, 32, rows, 8, 16, 3, ".wt")
 
 
 @pytest.mark.parametrize(
-    "role", ["clear", "h1", "own1", "h3", "h4", "own4", "fin", "h6", "red"]
+    "role",
+    [
+        "clear",
+        "ar",
+        "ar_owner",
+        "pooled_ag",
+        "route_push",
+        "route_owner",
+        "finisher",
+        "post_ag",
+        "reducer",
+    ],
 )
-def test_fused_layer_hop_compiles_at_8_waves(role):
-    """Every hop end of the fused layer compiles at 8 waves, with no L2
+def test_every_exchange_end_compiles_at_8_waves(role):
+    """Every exchange end of the monokernel compiles at 8 waves, with no L2
     invalidate or write-back, no scratch, and system-scope peer stores."""
     signature = dict(
         _VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32", rows="i32"
@@ -346,20 +372,28 @@ def test_fused_layer_hop_compiles_at_8_waves(role):
     assembly = _compile(_layer_hops_kernel, signature, {"ROLE": role})
     assert "buffer_inv" not in assembly and "buffer_wbl2" not in assembly
     assert re.search(r"\.private_segment_fixed_size:\s+0|ScratchSize: 0", assembly)
-    if role in ("own1", "h3", "own4", "fin", "red"):
+    if role in ("ar_owner", "pooled_ag", "route_owner", "finisher", "reducer"):
         # Every poll loop reads the clock (deadline) on its retry path, and
         # the failure path traps after storing the peers' abort words.
-        from asm_checks import _clock_on_retry_path, _innermost_loop_lines
+        from asm_checks import clock_on_retry_path, innermost_loop_lines
 
         raw = assembly.splitlines()
         polls = [
             set(lines)
-            for lines in _innermost_loop_lines(assembly).values()
+            for lines in innermost_loop_lines(assembly).values()
             if any(re.search(r"_load_dword\w* .*sc1", raw[i]) for i in lines)
         ]
-        assert polls and all(_clock_on_retry_path(raw, loop) for loop in polls)
+        assert polls and all(clock_on_retry_path(raw, loop) for loop in polls)
         assert "s_trap 2" in assembly
-    if role in ("h1", "own1", "h3", "h4", "own4", "h6", "red"):
+    if role in (
+        "ar",
+        "ar_owner",
+        "pooled_ag",
+        "route_push",
+        "route_owner",
+        "post_ag",
+        "reducer",
+    ):
         assert re.search(r"(buffer|global)_(store|atomic)\w* .*sc0 sc1", assembly)
     if role == "clear":
         lines = instruction_lines(assembly)
@@ -373,7 +407,7 @@ def test_fused_layer_hop_compiles_at_8_waves(role):
 
 def test_every_cleared_area_splits_into_whole_sender_shares():
     """128 senders clear equal 16-byte-multiple shares of every area copy, and
-    the area sizes follow the 32-row geometry the hop bodies index."""
+    the area sizes follow the 32-row geometry the exchange bodies index."""
     from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import iris as f
 
     for area in f.CLEARED_AREAS:
@@ -386,13 +420,23 @@ def test_every_cleared_area_splits_into_whole_sender_shares():
 
 
 @gluon.jit
-def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in,h6_sums, errors, floats, words, copy, LINES: gl.constexpr):  # fmt: skip
-    """h4_sink inside a loop whose trip count differs per wave, as in the
+def _route_push_per_wave_kernel(heaps, rank, box, ar, ar_sums, pooled_ag, route_push_own, routes, post_ag, reducer_in,post_ag_sums, errors, floats, words, copy, LINES: gl.constexpr):  # fmt: skip
+    """route_push_sink inside a loop whose trip count differs per wave, as in the
     MoE down units: a workgroup barrier inside would deadlock. ``LINES``:
     one call per down unit with its 4 strips (the stream's whole-line
     column map), else one call per strip."""
     view = MuseSparkIrisView(
-        heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
+        heaps,
+        rank,
+        box,
+        ar,
+        ar_sums,
+        pooled_ag,
+        route_push_own,
+        routes,
+        post_ag,
+        reducer_in,
+        post_ag_sums,
     )
     zero = gl.program_id(0) * 0
     launch = Launch(
@@ -422,23 +466,23 @@ def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, r
                 ys += (gl.load(floats + (4 * unit + s) * 2048 + r[:, None] * 128 + c[None, :]),)  # fmt: skip
             cols = ((first + local)[None, :], (first + local + 16)[None, :])
             cols += (cols[0] + 1, cols[1] + 1)
-            h4_sink(
-                H4SinkArgs(view, launch, 3), ys, route, cols, unit * 512 + 64 * wave
+            route_push_sink(
+                RoutePushArgs(view, launch, 3), ys, route, cols, unit * 512 + 64 * wave
             )
         else:
             y = gl.load(floats + unit * 2048 + r[:, None] * 128 + c[None, :])
-            h4_sink(
-                H4SinkArgs(view, launch, 3), (y,), route, ((unit * 128 + c)[None, :],),
+            route_push_sink(
+                RoutePushArgs(view, launch, 3), (y,), route, ((unit * 128 + c)[None, :],),
                 unit * 128 + 16 * wave,
             )  # fmt: skip
 
 
 @pytest.mark.parametrize("lines", [0, 1])
-def test_h4_sink_moves_no_data_between_lanes(lines):
+def test_route_push_sink_moves_no_data_between_lanes(lines):
     """The sink runs in per-wave code: no workgroup barrier and no LDS
     traffic, so waves with different trip counts never wait for each other."""
     signature = dict(_VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32")
-    assembly = _compile(_h4_per_wave_kernel, signature, {"LINES": lines})
+    assembly = _compile(_route_push_per_wave_kernel, signature, {"LINES": lines})
     # The loop that pushes (finding the wave index before it needs one
     # cross-wave reduction, which is the test's, not the sink's).
     loops = [l for l in innermost_loops(assembly) if "sc0 sc1" in l]
@@ -452,13 +496,13 @@ def test_h4_sink_moves_no_data_between_lanes(lines):
     "lines, stores",
     [(0, ["buffer_store_dwordx2"] * 2), (1, ["buffer_store_dwordx4"] * 4)],
 )
-def test_h4_sink_stores_each_lanes_words_once(lines, stores):
+def test_route_push_sink_stores_each_lanes_words_once(lines, stores):
     """A wave's columns have one owner (``col0``), so each lane's words go
     out once, to the own slice or to that owner's mailbox, never as one
     masked store per possible owner: one 8-byte store per strip, or one
     16-byte line per strip pair with the down unit's 4 strips."""
     signature = dict(_VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32")
-    assembly = _compile(_h4_per_wave_kernel, signature, {"LINES": lines})
+    assembly = _compile(_route_push_per_wave_kernel, signature, {"LINES": lines})
     loops = [l for l in innermost_loops(assembly) if "sc0 sc1" in l]
     assert loops
     for loop in loops:

@@ -125,8 +125,6 @@ def first_lane_scalar(x):
     SGPR and inserts the wait states its memory consumers need; the asm
     only moves the (already scalar) value into Gluon's scalar type."""
     # asm: Gluon has no op that turns a wave-uniform tensor into a scalar.
-    # The value is already in an SGPR (the readfirstlane intrinsic); the asm
-    # only moves it into Gluon's scalar type.
     return gl.inline_asm(
         _scalar_move_asm, ("=s", "s"), [wave_uniform_i32(x)], gl.int32, is_pure=True
     )
@@ -170,8 +168,8 @@ def scalar_load_glc(word_ptr):
     """Load an int32 with a scalar load past the scalar cache (``glc``).
 
     Counts in ``lgkmcnt``: it never waits behind the wave's vector loads.
-    ``glc`` reads see same-XCD stores and uncached memory (measured); words
-    written on another XCD to coarse memory are unmeasured. The result never
+    ``glc`` reads see same-XCD stores and uncached memory; put words that
+    another XCD writes in uncached memory (``arena.py``). The result never
     shares registers with the address (early clobber), so the load cannot
     overwrite its own base while it is in flight."""
     # asm: no scalar load with glc and memory semantics exists: a volatile

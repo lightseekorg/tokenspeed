@@ -2446,8 +2446,8 @@ def prepare_muse_communication(
     if its fixed capacities cover the request. The first preparation sizes the
     shared heap; Iris's allocator enforces later allocations.
     ``reserved_heap_bytes`` sizes the heap this call creates for states the
-    caller allocates from it next (fused decoder layers), so they do not come
-    out of the headroom kept for other operations.
+    caller allocates from it next (the monokernel's state), so they do not
+    come out of the headroom kept for other operations.
     """
     if all_reduce is not None:
         if (

@@ -24,12 +24,12 @@ A model's forward hands its layer loop to a layer stack, chosen at
 construction through the model's ``layer_stack_cls``. The stack owns which
 implementation runs each layer for a step; the model owns everything around
 the loop (embedding, final norm, logits). The default stack runs every layer
-in order, as the model was written. A model with its own forward defines the
+in order, as ``BaseTransformerModel``'s loop does. A model with its own forward defines the
 stack its forward calls, with the boundary values its layers pass.
 
 ``prepare`` runs once at startup, after the weights are loaded and before
 the KV cache is sized or a graph is captured. A stack that runs some layers
-through other kernels (a fused decoder layer, for one) prepares them there
+through other kernels (a decode monokernel, for one) prepares them there
 and decides per step, from the step's shape alone, which layers they run;
 every other step runs the default loop. See
 ``docs/design/monokernel.md``.

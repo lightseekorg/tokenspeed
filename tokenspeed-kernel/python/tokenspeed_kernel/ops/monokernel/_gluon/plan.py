@@ -18,16 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Plans of a persistent fused-layer launch and the checks that accept them.
+"""Plans of a persistent monokernel launch and the checks that accept them.
 
 A launch runs one workgroup on each of the ``GRID`` CUs, all resident. Each
 workgroup, keyed by its physical ``(xcd, slot)``, runs a fixed sequence of
-role steps on wave groups of its 8 waves:
+role steps on wave groups (subsets of its 8 waves):
 
 - ``Load``: vector loads (weights, KV) issued and still in flight;
 - ``Wait``: poll until every listed key has been published;
-- ``Publish``: make keys visible (payload-as-flag words, tagged pairs,
-  flags, peer pushes);
+- ``Publish``: make keys visible (Lamport words, whose payload is its own
+  flag; tagged pairs; flags; peer pushes);
 - ``Clear``: re-arm this workgroup's share of two-copy regions;
 - ``Barrier``: a workgroup rendezvous of all its wave groups.
 
@@ -49,9 +49,9 @@ resident cannot deadlock and its hand-offs keep their contracts:
    all-to-all key, each before that publish (a peer reaches the next launch
    only after every one of those publishes, so every clear of the copy it
    will write has drained); the all-to-all key is present in every plan;
-5. poll-behind-own-loads: a vector poll of another workgroup's key never sits behind the
-   group's own loads in flight (a CU returns loads in order), unless the
-   wait states why (``Wait.queued``); scalar polls are exempt;
+5. a vector poll of another workgroup's key never sits behind the group's
+   own vector loads in flight (a wave's vector loads return in issue order),
+   unless the wait states why (``Wait.queued``); scalar polls are exempt;
 6. every region spans at least the plan's rows.
 """
 
@@ -84,7 +84,7 @@ class Wait:
     Attributes:
         load: ``"vector"`` (``sc1``/``.cv``/Lamport words) or ``"smem"``.
         queued: Why a vector poll may sit behind the group's own loads in
-            flight (poll-behind-own-loads), or ``""``: ``"issue-wait-compute"`` (the loads
+            flight (check 5), or ``""``: ``"issue-wait-compute"`` (the loads
             feed the compute after this wait) or ``"landed"`` (the plan
             issues them early enough to land before this wait, a timing
             assumption the design states).
@@ -252,7 +252,7 @@ def check_plan(plan: LayerPlan) -> int:
                 for region in step.regions:
                     clears[region].append(node)
     if not all_to_all_publishers:
-        raise PlanError(f"{plan.name}: no all-to-all hop ({plan.all_to_all})")
+        raise PlanError(f"{plan.name}: no all-to-all exchange ({plan.all_to_all})")
     names = {region.name for region in plan.regions}
     for region in plan.regions:
         if region.copies != 2:

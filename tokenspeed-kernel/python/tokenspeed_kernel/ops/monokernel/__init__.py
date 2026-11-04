@@ -18,21 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused decoder layers: one persistent launch per decoder layer.
+"""Decode monokernels: one persistent launch per decoder layer.
 
-A fused decoder layer runs one decoder layer of a model recipe (attention, its
-output projection and all-reduce, the router, the experts and their exchange,
-the post-expert projection, the FFN boundary) and the next layer's query
-projection, attention prologue and KV write in one plain launch that keeps one
-workgroup on every CU. The kernel boundary between two launches orders the KV
-write before the next layer's attention.
+A monokernel runs one decoder layer's decode step as one persistent launch
+that keeps one workgroup on every compute unit. What a leaf's launch covers
+beyond its layer (such as the next layer's query and K/V write) is in its
+leaf's README.
 
-The registry entry is ``("monokernel", "prepare")``, traited by
-``recipe``. A leaf is a class: its static ``prepare_state(...)`` allocates the
-group's shared state, and its constructor ``(plan_keys=, weights=, state=)``
-compiles every plan variant it serves and returns a :class:`MonokernelLayer`;
-per-step calls go to that object. Vendor bodies live in private,
-solution-named packages (``_gluon/`` for gfx950).
+The registry entry is ``("monokernel", "prepare")``, selected by the
+``recipe`` trait. A leaf is a class: its static ``prepare_state(...)``
+allocates the group's shared state, and its constructor
+``(plan_keys=, weights=, state=)`` compiles every plan variant it serves and
+returns a :class:`MonokernelLayer` that takes the per-step calls. Vendor
+kernels live in private, solution-named packages (``_gluon/`` for gfx950).
 """
 
 from __future__ import annotations
@@ -53,7 +51,7 @@ LAYER_KINDS = ("sliding", "full")
 
 @dataclass(frozen=True)
 class PlanKey:
-    """The compile-time shape of one fused-layer launch.
+    """The compile-time shape of one monokernel launch.
 
     Attributes:
         requests: Requests in the step (rows = requests x verify width).
@@ -88,7 +86,7 @@ MONOKERNEL_SIGNATURE = format_signature(
 
 
 class MonokernelLayer(Protocol):
-    """A prepared fused decoder layer (one per decoder layer of a model)."""
+    """A prepared monokernel layer (one per decoder layer of a model)."""
 
     def decline_reasons(self, requests: int) -> list[str]:
         """Rank-local reasons this layer cannot serve ``requests`` requests
@@ -111,11 +109,11 @@ class MonokernelLayer(Protocol):
         """
 
     def forward_last(self, prepared_query, residual, *, positions, cache, next_norm):
-        """Run the last fused layer, whose next layer is regular.
+        """Run the last monokernel layer of a range, whose next layer is regular.
 
         Args:
             next_norm: ``(weight, eps, weight_offset)`` of the next layer's
-                input norm.
+                input norm. The other arguments are as in :meth:`forward`.
 
         Returns:
             ``(normed_rows, residual)`` in the regular boundary layout.
@@ -137,14 +135,22 @@ def _select(recipe: str, traits: dict[str, Any]):
 def prepare_monokernel_state(
     *, recipe, group, rank_in_group, max_requests, failure_record_path, device
 ):
-    """Allocate the per-group state the fused layers of one model share.
+    """Allocate the per-group state the monokernel layers of one model share.
 
     It holds the launch state (per-workgroup epochs, role claims, the uncached
-    flag arena, the host-mirrored failure record) and the cross-GPU regions,
-    so call it once per group before capture, on every rank alike.
+    flag arena, the host copy of the failure record) and the cross-GPU
+    regions. Every rank calls it once per group, before capture. Selection
+    uses the recipe alone, since layers whose shape traits differ share the
+    state.
 
-    Selection uses the recipe alone, since the state is shared by layers whose
-    shape traits differ.
+    Args:
+        recipe: Model recipe, such as ``"muse_spark"``.
+        group: The attention tensor-parallel group the layers exchange over.
+        rank_in_group: This rank's index in ``group``.
+        max_requests: The most requests a step serves.
+        failure_record_path: File that backs the host copy of the failure
+            record, so the record outlives the process.
+        device: This rank's device.
 
     Returns:
         The state, or ``None`` when no leaf serves ``recipe`` on this platform.
@@ -164,7 +170,7 @@ def prepare_monokernel_state(
 def prepare_monokernel_layer(
     *, recipe, plan_keys, traits, weights, state
 ) -> MonokernelLayer | None:
-    """Prepare one fused decoder layer: compile every plan variant in
+    """Prepare one monokernel layer: compile every plan variant in
     ``plan_keys`` and check it before capture.
 
     Args:
@@ -185,9 +191,17 @@ def prepare_monokernel_layer(
 
 
 def monokernel_state_heap_bytes(*, recipe, world_size, max_requests) -> int:
-    """Iris heap bytes :func:`prepare_monokernel_state` will allocate for
-    ``recipe``, or 0 when no leaf serves it; reserve them when the group's
-    heap is created."""
+    """Communication-heap bytes :func:`prepare_monokernel_state` allocates.
+
+    Args:
+        recipe: Model recipe, such as ``"muse_spark"``.
+        world_size: Ranks in the group.
+        max_requests: The most requests a step serves.
+
+    Returns:
+        The bytes to reserve when the group's heap is created, or 0 when no
+        leaf serves ``recipe``.
+    """
     kernel = _select(recipe, {})
     if kernel is None:
         return 0

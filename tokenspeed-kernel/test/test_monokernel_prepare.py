@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Selection of fused decoder layers through the kernel registry."""
+"""Selection of monokernel layers through the kernel registry."""
 
 import pytest
 from tokenspeed_kernel.ops.monokernel import (

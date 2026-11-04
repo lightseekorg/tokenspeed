@@ -351,9 +351,10 @@ def test_forward_threads_attention_input_rows_between_layers() -> None:
 
 
 class _FusedAddLayer(_AddLayer):
-    """A layer whose fused launch adds its value to the residual and hands the
-    next fused layer a query of the rows it saw; the last one hands the
-    regular layer after it normed rows (here the residual times 10)."""
+    """A layer whose monokernel launch adds its value to the residual and
+    hands the next monokernel layer a query of the rows it saw; the last one
+    hands the regular layer after it normed rows (here the residual times
+    10)."""
 
     def __init__(self, value: float) -> None:
         super().__init__(value)
@@ -363,7 +364,7 @@ class _FusedAddLayer(_AddLayer):
         return ("query", attention_input)
 
     def forward_fused(self, fused, positions, prepared_query, hidden_states, ctx, next_layer, next_fused,):  # fmt: skip
-        # The stack hands each layer its own prepared fused layer.
+        # The stack hands each layer its own prepared monokernel layer.
         assert fused == f"fused{self.value}"
         self.received_query = prepared_query
         residual = hidden_states + self.value
@@ -373,14 +374,15 @@ class _FusedAddLayer(_AddLayer):
 
 
 def _fused_model(served: frozenset):
-    """Layer 0 and 3 regular, 1 and 2 fused, serving ``served`` shapes."""
+    """Layers 0 and 3 regular, 1 and 2 monokernels, serving ``served``
+    shapes."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(
         [_AddLayer(1.0), _FusedAddLayer(2.0), _FusedAddLayer(3.0), _AddLayer(4.0)]
     )
     stack = MuseSparkLayerStack()
-    # What prepare leaves when the group serves ``served``; the fused
-    # kernels need a GPU, so names stand in for the prepared layers.
+    # What prepare leaves when the group serves ``served``; the monokernels
+    # need a GPU, so names stand in for the prepared layers.
     stack.fused_layers = ["fused2.0", "fused3.0"]
     stack.fused_indices = range(1, 3)
     stack.served_shapes = served
@@ -389,7 +391,8 @@ def _fused_model(served: frozenset):
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
     model.layers_to_capture = []
-    # Decode metadata: what the fused layers read (an extend forward has none).
+    # Decode metadata: what the monokernel layers read (an extend forward has
+    # none).
     view = object()
     for layer in model.layers:
         layer.self_attn = SimpleNamespace(
@@ -406,13 +409,14 @@ def test_fused_layers_run_only_on_served_decode_shapes() -> None:
     model = _fused_model(frozenset({(2, 1)}))
     out, _ = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
     after_regular = hidden + 1.0
-    # The first fused layer prepares its query from the regular boundary rows;
-    # the next one gets the query the previous launch prepared.
+    # The first monokernel layer prepares its query from the regular boundary
+    # rows; the next one gets the query the previous launch prepared.
     assert model.layers[1].received_query[1] is not None
     # (layer 0 emits its input times its value as the next attention input).
     torch.testing.assert_close(model.layers[1].received_query[1], hidden * 1.0)
     torch.testing.assert_close(model.layers[2].received_query[1], after_regular + 2.0)
-    # The last fused launch hands the regular layer its attention input rows.
+    # The last monokernel launch hands the regular layer its attention input
+    # rows.
     residual = after_regular + 2.0 + 3.0
     torch.testing.assert_close(model.layers[3].received_attention_input, residual * 10)
     torch.testing.assert_close(out, -(residual + 4.0).to(torch.bfloat16))
@@ -1315,7 +1319,7 @@ def test_replicated_qkv_gate_weight_hands_out_this_ranks_rows(
     bf16_default_dtype,
 ) -> None:
     """Replicated for owned rows, the packed weight holds every rank's rows;
-    the rank's own rows (what a fused layer is handed) are exactly the
+    the rank's own rows (what a monokernel layer is handed) are exactly the
     sharded weight the regular path keeps on that rank."""
     hidden, head_dim, heads, kv_heads, ranks = 32, 8, 8, 4, 4
     shards = (("q", heads), ("k", kv_heads), ("v", kv_heads), ("g", heads))

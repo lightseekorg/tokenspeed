@@ -20,20 +20,21 @@
 
 """The residual boundary's two RMSNorms folded into their consumers (gfx950).
 
-At a residual boundary the post-norm of the branch ``b``, the gated residual
-``h' = alpha * h + beta * post_norm(b)`` and the next pre-norm of ``h'``
-need two row-wide sums of squares. Their producers publish four partial sums
-per row instead of the normalized rows (``sum b^2``, ``B = sum (alpha h)
-(beta b)``, ``A = sum (alpha h)^2``, ``C = sum (beta b)^2``); each consumer
-combines every producer's sums and builds its own columns of ``x``, so no
-consumer waits for a second exchange:
+At a residual boundary, the post-norm of the branch output ``b``, the gated
+residual ``h' = alpha * h + beta * post_norm(b)`` and the next layer's
+pre-norm of ``h'`` need two row-wide sums of squares. Instead of the
+normalized rows, the producers of ``b`` publish four partial sums per row
+(with ``b' = b * post``: ``sum b'^2``, ``B = sum (alpha h)(beta b')``,
+``A = sum (alpha h)^2``, ``C = sum (beta b')^2``). Each consumer adds every
+producer's sums and builds its own columns of the normalized input ``x``,
+so no consumer waits for a second exchange:
 
-    inv1 = rsqrt(sum b^2 / WIDTH + POST_EPS)
+    inv1 = rsqrt(sum b'^2 / WIDTH + POST_EPS)
     inv2 = rsqrt((A + 2 inv1 B + inv1^2 C) / WIDTH + PRE_EPS)
     h'   = fma(beta, b * post * inv1, alpha * h)
     x    = h' * inv2 * pre
 
-These are the attention tail finisher's operations, in its order.
+The operations and their order are the regular residual-boundary kernel's.
 """
 
 from tokenspeed_kernel_amd._triton import gl, gluon
@@ -50,7 +51,7 @@ def deferred_norm_terms_gfx950(b, h, alpha, beta, post):
     """A producer's per-element terms of the four sums, elementwise:
     ``[..., 4]`` = ``(b'^2, (alpha h)(beta b'), (alpha h)^2, (beta b')^2)``
     with ``b' = b * post`` (FP32). The producer sums them over its columns
-    (in its own fixed order) and publishes ``sum b^2, B, A, C``."""
+    in a fixed order and publishes ``sum b'^2, B, A, C``."""
     weighted = b.to(gl.float32) * post.to(gl.float32)
     alpha_h = alpha * h
     beta_b = beta * weighted
@@ -71,7 +72,7 @@ def deferred_norm_scales_gfx950(
 ):
     """Each row's two inverse RMS scales from its producers' sums.
 
-    ``sums`` is FP32 ``[rows, producers, 4]`` (``sum b^2, B, A, C`` last),
+    ``sums`` is FP32 ``[rows, producers, 4]`` (``sum b'^2, B, A, C`` last),
     in a layout whose producers lie across one wave's lanes and whose four
     sums lie in one thread, so each row's producers add in one wave, in the
     same lane order for every row. Returns ``(inv1, inv2)``, ``[rows]`` in
@@ -95,8 +96,8 @@ def deferred_norm_rows_gfx950(b, h, alpha, beta, post, pre, inv1, inv2):
     caller): ``h' = fma(beta, b * post * inv1, alpha * h)``,
     ``x = h' * inv2 * pre``. ``b`` is the branch value (BF16 or FP32);
     ``post`` and ``pre`` are the norms' weights with their offsets added
-    (``weight + offset`` rounded to BF16 as the finisher rounds it; BF16
-    operands halve their registers and convert exactly). Returns
+    (``weight + offset`` rounded to BF16, as the regular boundary rounds
+    it; BF16 operands halve their registers and convert exactly). Returns
     ``(h', x)``."""
     hp = gl.fma(beta, b.to(gl.float32) * post.to(gl.float32) * inv1, alpha * h)
     return hp, hp * inv2 * pre.to(gl.float32)

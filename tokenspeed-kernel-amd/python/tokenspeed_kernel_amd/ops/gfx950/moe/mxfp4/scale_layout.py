@@ -216,8 +216,8 @@ def pack_cdna4_mxfp4_scale_lanes(scale: torch.Tensor) -> torch.Tensor:
     """Lane-major MXFP4 block scales for the 16x16x128 scaled MFMA.
 
     In the MFMA's B-scale operand, lane ``l = 16 * q + n`` of a 16-column
-    strip needs the scale of column ``n`` and K quad ``q`` at every 128-K
-    step. This layout stores those bytes contiguously per lane, so a lane
+    strip needs the scale of column ``n`` and 32-value K block ``q`` at every
+    128-K step. This layout stores those bytes contiguously per lane, so a lane
     reads 16 steps' scales with one dwordx4 (the swizzled layout gives one
     dword per two steps).
 

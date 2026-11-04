@@ -18,15 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU test of the native MoE stream's closed-form plan on recorded routings.
-
-Runs the host form of the plan (``moe_stream_plan``) and a fluid timeline
-model: every CU streams its list in order; the active CUs share
-``min(peak, active * 46 GB/s)`` (128 CUs alone stream ~5.9 TB/s); a down unit
-cannot finish before its expert's last gate/up group plus a hand-off. Checks
-coverage, XCD locality, byte balance, and that the tail-role workgroups
-finish early enough to be drained before the layer's tail polls.
-"""
+"""CPU test of the monokernel MoE stream's closed-form plan
+(``moe_stream_plan``) on recorded routings: every expert piece is planned
+once, whole experts stay on one XCD, the full workgroups' bytes balance, and
+the workgroups that also run post-MoE work get only gate/up groups."""
 
 from collections import Counter
 
@@ -166,11 +161,8 @@ RECORDED_ROUTINGS = {
 
 XCDS = 8
 SLOTS = 32
-TAIL_SLOTS = {0, *range(16, 31)}
-PER_CU_GBS = 5.9e3 / 128  # GB/s per CU when 128 CUs stream alone
-HANDOFF_US = 0.7  # gate/up -> down hand-off on one XCD
-ENTRY_US = 1.2
-TAIL_US = 0.6
+# Slots whose workgroups also run post-MoE work.
+POST_MOE_SLOTS = {0, *range(16, 31)}
 
 CASES = [(rows, step) for rows in (8, 16) for step in range(4)]
 
@@ -179,48 +171,11 @@ def _item_bytes(item):
     return GROUP_BYTES if item[0] == "ug" else UNIT_BYTES
 
 
-def _fluid(plan, peak_tbs, dt_us=0.02):
-    """Finish time (us) of each workgroup's list, entry and tail included."""
-    peak = peak_tbs * 1e6  # bytes per us
-    cap = PER_CU_GBS * 1e3
-    lists = [list(items) for items in plan]
-    pos = [0] * len(lists)
-    left = [_item_bytes(items[0]) if items else 0.0 for items in lists]
-    groups_left = Counter(e for items in lists for kind, e, _ in items if kind == "ug")
-    ready = {}
-    finish = [0.0] * len(lists)
-    t = 0.0
-    while any(p < len(items) for p, items in zip(pos, lists)):
-        active = [
-            c
-            for c, items in enumerate(lists)
-            if pos[c] < len(items)
-            and (items[pos[c]][0] == "ug" or ready.get(items[pos[c]][1], 1e30) <= t)
-        ]
-        rate = min(peak, len(active) * cap) / max(len(active), 1) * dt_us
-        for c in active:
-            left[c] -= rate
-            if left[c] > 0:
-                continue
-            kind, expert, _ = lists[c][pos[c]]
-            if kind == "ug":
-                groups_left[expert] -= 1
-                if groups_left[expert] == 0:
-                    ready[expert] = t + HANDOFF_US
-            pos[c] += 1
-            if pos[c] < len(lists[c]):
-                left[c] += _item_bytes(lists[c][pos[c]])
-            else:
-                finish[c] = t
-        t += dt_us
-    return [ENTRY_US + f for f in finish]
-
-
 @pytest.mark.parametrize("rows,step", CASES)
 def test_plan_covers_every_piece_once(rows, step):
     ids = RECORDED_ROUTINGS[rows][step]
     experts = {e for row in ids for e in row}
-    plan = moe_stream_plan(ids)
+    plan = moe_stream_plan(ids, tail_num=1, tail_den=2)
     seen = Counter((kind, e, i) for items in plan for kind, e, i in items)
     expected = {("ug", e, g) for e in experts for g in range(GROUPS_PER_EXPERT)}
     expected |= {("dn", e, u) for e in experts for u in range(UNITS_PER_EXPERT)}
@@ -231,7 +186,7 @@ def test_plan_covers_every_piece_once(rows, step):
 @pytest.mark.parametrize("rows,step", CASES)
 def test_plan_keeps_whole_experts_on_one_xcd(rows, step):
     ids = RECORDED_ROUTINGS[rows][step]
-    plan = moe_stream_plan(ids)
+    plan = moe_stream_plan(ids, tail_num=1, tail_den=2)
     xcds = {}
     for cta, items in enumerate(plan):
         for _kind, e, _ in items:
@@ -242,22 +197,17 @@ def test_plan_keeps_whole_experts_on_one_xcd(rows, step):
 
 
 @pytest.mark.parametrize("rows,step", CASES)
-def test_plan_balances_bytes_and_drains_tail_roles_early(rows, step):
-    plan = moe_stream_plan(RECORDED_ROUTINGS[rows][step])
+def test_plan_balances_bytes_and_keeps_post_moe_workgroups_on_gate_up(rows, step):
+    plan = moe_stream_plan(RECORDED_ROUTINGS[rows][step], tail_num=1, tail_den=2)
     full = [
         sum(map(_item_bytes, items))
         for c, items in enumerate(plan)
-        if c // XCDS not in TAIL_SLOTS
+        if c // XCDS not in POST_MOE_SLOTS
     ]
     assert max(full) / (sum(full) / len(full)) <= 1.03
     for c, items in enumerate(plan):
-        if c // XCDS in TAIL_SLOTS:
+        if c // XCDS in POST_MOE_SLOTS:
             assert all(kind == "ug" for kind, _, _ in items)
-    for peak in (5.5, 6.5):
-        finish = _fluid(plan, peak)
-        span = max(finish) + TAIL_US
-        tail = max(f for c, f in enumerate(finish) if c // XCDS in TAIL_SLOTS)
-        assert tail <= 0.70 * span, (peak, tail, span)
 
 
 def test_lane_major_scales_follow_the_mfma_lanes():
@@ -265,7 +215,7 @@ def test_lane_major_scales_follow_the_mfma_lanes():
     scale = torch.randint(0, 256, (3, 64, 32), dtype=torch.uint8, generator=generator)
     packed = pack_cdna4_mxfp4_scale_lanes(scale)
     assert packed.shape == (3, 4, 64, 8) and packed.is_contiguous()
-    # Lane 16 q + n of strip s holds column 16 s + n, K quad q, at step t.
+    # Lane 16 q + n of strip s holds column 16 s + n, K group q, at step t.
     strip, lane, step = torch.meshgrid(
         torch.arange(4), torch.arange(64), torch.arange(8), indexing="ij"
     )

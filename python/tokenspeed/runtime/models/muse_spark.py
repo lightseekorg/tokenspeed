@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Iterable
 from functools import partial
@@ -140,8 +139,6 @@ if TYPE_CHECKING:
 
     from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
-
-logger = logging.getLogger(__name__)
 
 # Row limit of the generic column gather and the NVLS mailbox.
 _GATHER_WORKSPACE_ROWS = 64
@@ -964,7 +961,7 @@ class MuseSparkAttention(nn.Module):
         ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project and prepare this layer's query and write its K/V, the way
-        a fused layer hands the next one its query: ``(q, output gate)``."""
+        a monokernel layer hands the next one its query: ``(q, output gate)``."""
         qkv_gate, _ = self.qkv_proj(normalized)
         q, k, v, output_gate = qkv_gate.split(
             (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
@@ -2080,7 +2077,7 @@ class MuseSparkDecoderLayer(nn.Module):
         )
 
     def fused_weights(self, next_layer: MuseSparkDecoderLayer) -> dict[str, object]:
-        """The tensors a fused launch of this layer reads in place: this
+        """The tensors a monokernel launch of this layer reads in place: this
         layer's attention output, boundaries, router, pooler, experts and
         post-expert projection, and the next layer's input norm and query
         projection (the launch ends with them)."""
@@ -2129,8 +2126,8 @@ class MuseSparkDecoderLayer(nn.Module):
         attention_input: torch.Tensor,
         ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The first fused layer's query, prepared from the regular boundary's
-        attention input; its K/V rows are written."""
+        """The first monokernel layer's query, prepared from the regular
+        boundary's attention input; its K/V rows are written."""
         return self.self_attn.prepare_query(
             positions, self.comm_manager.pre_attn_comm(attention_input, ctx), ctx
         )
@@ -2147,15 +2144,15 @@ class MuseSparkDecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor | None
     ]:
-        """Run this layer as one launch of its prepared fused layer.
+        """Run this layer as one launch of its prepared monokernel layer.
 
         Args:
-            fused: This layer's prepared fused layer.
+            fused: This layer's prepared monokernel layer.
             prepared_query: This layer's ``(q, output gate)``, its K/V rows
                 already written.
             next_layer: The next decoder layer.
-            next_fused: Whether ``next_layer`` runs fused too: this launch
-                then prepares its query and writes its K/V; otherwise the
+            next_fused: Whether ``next_layer`` runs as a monokernel too: this
+                launch then prepares its query and writes its K/V; otherwise the
                 launch ends at the FFN boundary with its input norm applied.
 
         Returns:
@@ -2163,7 +2160,7 @@ class MuseSparkDecoderLayer(nn.Module):
             else ``(residual, None, next layer's attention input)``.
         """
         cache = self.self_attn.attn.decode_kv_view(ctx)
-        assert cache is not None, "fused layers run decode forwards only"
+        assert cache is not None, "monokernel layers run decode forwards only"
         if not next_fused:
             norm = next_layer.input_layernorm
             normed, residual = fused.forward_last(
@@ -2416,7 +2413,8 @@ class MuseSparkModel(BaseTransformerModel):
     """Text decoder using TokenSpeed's ordinary MHA cache route."""
 
     layer_cls = MuseSparkDecoderLayer
-    # Runs the layers each forward: regular, or fused on served decode steps.
+    # Runs the layers each forward: regular, or as monokernels on served
+    # decode steps.
     layer_stack_cls = MuseSparkLayerStack
 
     def __init__(

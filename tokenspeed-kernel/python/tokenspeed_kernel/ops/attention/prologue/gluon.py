@@ -44,9 +44,8 @@ if current_platform().is_amd:
         launch_gluon_gqa_prologue_gfx950,
     )
 
-    # The gfx950 GQA prologue: the Triton prologue's bytes from Gluon device
-    # functions a fused decoder layer also runs, so a layer's prologue and the
-    # standalone one share one body (attention-prologue.md).
+    # The Triton prologue's bytes from Gluon device functions that a
+    # monokernel also runs, so both share one body (attention-prologue.md).
     @register_kernel(
         "attention",
         "gqa_prologue",

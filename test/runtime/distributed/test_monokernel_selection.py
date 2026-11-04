@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Which decode row shapes a group serves with fused decoder layers."""
+"""Which decode row shapes a group serves with monokernels."""
 
 import dataclasses
 from datetime import timedelta

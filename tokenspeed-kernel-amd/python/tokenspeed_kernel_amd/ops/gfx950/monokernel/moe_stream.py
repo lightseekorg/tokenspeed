@@ -21,40 +21,43 @@
 
 """MXFP4 MoE decode as a persistent per-wave stream (gfx950).
 
-The MoE phase of a persistent decode layer: 256 workgroups x 8 waves, one per
-CU, each rank holding a slice of every expert's intermediate (EP1). Every
-token is an A row of every expert (MFMA M = 16), so each touched expert's
-weights are read once.
+The MoE phase of a persistent decode launch: 256 workgroups x 8 waves, one
+per CU, each rank holding a slice of every expert's intermediate (EP1).
+Every token is an A row of every expert (MFMA M = 16), so each touched
+expert's weights are read once.
 
-Work units, all per wave:
+Work items, all per wave:
 
 - A gate/up *strip* is (expert, 16 gate/up columns, all K): one 1 KB
-  ``buffer_load_dwordx4`` per lane per 128-K step, which is exactly the MFMA
-  B operand in the gdot128 layout, plus one E8M0 dword per lane per two
-  steps. A *group* is 4 strips = 64 gate/up columns = one 32-value MXFP4
-  group of mids; the 4 strips of a group run on one quad of 4 waves.
+  ``buffer_load_dwordx4`` per lane per 128-K step (the MFMA B operand in the
+  gdot128 layout) plus one E8M0 dword per lane per two steps.
+- A *group* is 4 strips: 64 gate/up columns, one 32-value MXFP4 block of
+  mids. A group's 4 strips run on a *quad*, a fixed set of 4 waves that
+  exchange their SwiGLU values through LDS before quantizing.
 - A down *unit* is (expert, 64 output columns, all 512 K): 16 chunks of 1 KB
   plus scales, with the expert's mids as the A operand.
 
 Each wave keeps ``RING`` weight chunks in flight in registers and never
 drains them: the chunk it just consumed is refilled ``RING`` steps ahead,
-into the next strip or unit past the current one's end. Nothing a stream
-wave waits for is a vector load issued behind its weights (vector memory
-completes in issue order): item metadata comes from LDS, readiness polls are
-scalar loads, and the quad exchange runs in LDS without a barrier
-(``monokernel/persistent/wave.py``).
+into the next strip or unit when the current one ends. A wave's vector
+memory operations complete in issue order, so the stream never waits on a
+vector load issued behind its weights: item metadata comes from LDS,
+readiness polls are scalar loads, and the quad exchange spins on LDS
+without ``s_barrier`` (``persistent/wave.py``).
 
-The plan is closed-form from the routed ids, in every workgroup: whole
-experts go to XCDs round-robin and the ``E % 8`` leftover experts are split by
-group over all XCDs, so every XCD carries the same bytes; within an XCD the
-16 tail-role workgroups (slots 0 and 16-30) get whole groups worth half a
-full workgroup's bytes and no down units, so they finish early, and the 16
-others take the remaining groups, then down units, earliest-ready expert
-first. :func:`moe_stream_plan` is the same plan on the host.
+The plan is closed-form from the routed ids, computed in every workgroup.
+Whole experts go to XCDs round-robin, and the ``E % 8`` leftover experts are
+split by group over all XCDs, so every XCD carries the same bytes. Within an
+XCD, 16 *tail* workgroups (slots 0 and 16-30, which also run the layer's
+post-MoE roles) get whole groups worth ``TAIL_NUM / TAIL_DEN`` of a *full*
+workgroup's bytes and no down units, so they finish first; the 16 full
+workgroups take the remaining groups, then the down units, earliest-ready
+expert first. :func:`moe_stream_plan` is the same plan on the host.
 
-Numerics are today's direct decode (``decode_common``, ``decode_stage1``,
-``quantize_gluon``): the same per-column MFMA chain over K, SwiGLU, 32-value
-MXFP4 quantization of the mids and down chain, so the output is bitwise equal.
+Numerics follow the direct MXFP4 decode (``decode_common``,
+``decode_stage1``, ``quantize_gluon``): the same per-column MFMA chain over
+K, SwiGLU, 32-value MXFP4 quantization of the mids and down chain, so the
+output is bitwise equal.
 """
 
 from __future__ import annotations
@@ -113,8 +116,6 @@ __all__ = [
     "MoeBuffers",
     "MoeStreamState",
     "MoeStreamWeights",
-    "gluon_mxfp4_moe_stream_gfx950",
-    "launch_gluon_mxfp4_moe_stream_gfx950",
     "moe_stream_plan",
     "moe_stream_weights",
     "prefetch_moe",
@@ -124,7 +125,7 @@ __all__ = [
 
 XCDS = 8
 SLOTS = 32
-# Tail-role slots per XCD: 0 and TAIL_FIRST..TAIL_LAST (16 of 32).
+# Tail slots per XCD: 0 and TAIL_FIRST..TAIL_LAST (16 of 32).
 TAIL_FIRST = 16
 TAIL_LAST = 30
 HIDDEN = 4096
@@ -134,15 +135,14 @@ GROUP_COLUMNS = 64
 GROUPS_PER_EXPERT = GATE_UP // GROUP_COLUMNS  # 16
 UNIT_COLUMNS = 64
 UNITS_PER_EXPERT = HIDDEN // UNIT_COLUMNS  # 64
-# Group tags: one word per (group, strip) — each wave publishes its own rows.
+# Group tags: one word per (group, strip); each wave publishes its own rows.
 TAG_WORDS_PER_EXPERT = GROUPS_PER_EXPERT * 4
 # Distinct experts of one launch: at most 16 rows x top 8.
 MAX_RANKS = 128
 # Group tags live in two copies, indexed by expert rank. A launch polls and
-# publishes copy (epoch & 1) and zeroes the other one for the next launch.
-# Launch tags repeat after 2**32 - 1 launches, and a rank no launch touches
-# for that long would otherwise still hold a matching tag; zeroed slots never
-# match (tags are never 0).
+# publishes copy (epoch & 1) and zeroes the other one for the next launch:
+# launch tags repeat after 2**32 - 1 launches, and a zeroed slot never
+# matches (tags are never 0).
 TAG_COPY_WORDS = MAX_RANKS * TAG_WORDS_PER_EXPERT
 TAG_WORDS = 2 * TAG_COPY_WORDS
 # Bytes of one group (64 gate/up columns x K, plus scales) and one unit.
@@ -152,7 +152,7 @@ UNIT_BYTES = UNIT_COLUMNS * INTER // 2 + UNIT_COLUMNS * INTER // 32
 # Failure site of a down unit's readiness wait (detail: the expert's rank).
 SITE_MOE_READY = FIRST_KERNEL_SITE + 8
 _SITE_MOE_READY = gl.constexpr(SITE_MOE_READY)
-# Failure site of a quad's mids exchange wait (detail: ``(rank * 16 + group)
+# Failure site of a quad's LDS exchange wait (detail: ``(rank * 16 + group)
 # * 2 + quad`` of the group being exchanged).
 SITE_MOE_QUAD = FIRST_KERNEL_SITE + 9
 _SITE_MOE_QUAD = gl.constexpr(SITE_MOE_QUAD)
@@ -179,7 +179,7 @@ _MID_SCALES = gl.constexpr(INTER // 32)  # E8M0 bytes per mid row
 
 
 def _tail_index(slot):
-    """Tail-role index 0-15 of a slot, or -1 for a full slot."""
+    """Tail index 0-15 of a slot, or -1 for a full slot."""
     if slot == 0:
         return 0
     if TAIL_FIRST <= slot <= TAIL_LAST:
@@ -214,7 +214,7 @@ def _plan_counts(experts, tail_num, tail_den):
     groups = GROUPS_PER_EXPERT * n_whole + 2 * leftover
     units = UNITS_PER_EXPERT * n_whole + 8 * leftover
     # In unit-sized pieces (a group is 8 units of bytes): 16 tail workgroups
-    # at w = tail_num / tail_den of a full one, rounded to whole groups.
+    # at tail_num / tail_den of a full one's bytes, rounded to whole groups.
     pieces = 8 * groups + units
     denom = 8 * 16 * (tail_den + tail_num)
     t = (2 * pieces * tail_num + denom) // (2 * denom)
@@ -241,12 +241,12 @@ def _full_units(groups, units, t, b):
     return first, end
 
 
-def moe_stream_plan(topk_ids, tail_num=1, tail_den=2):
+def moe_stream_plan(topk_ids, *, tail_num, tail_den):
     """The closed-form plan on the host.
 
     Args:
         topk_ids: ``(rows, top_k)`` integer expert ids.
-        tail_num, tail_den: A tail-role workgroup's bytes as a fraction of a
+        tail_num, tail_den: A tail workgroup's bytes as a fraction of a
             full one's (``prefetch_moe``'s ``TAIL_NUM`` / ``TAIL_DEN``).
 
     Returns:
@@ -298,8 +298,8 @@ def moe_stream_plan(topk_ids, tail_num=1, tail_den=2):
 def _stage_ids(ids_ptr, rank_smem, ids_t_smem, ROWS: gl.constexpr, TOPK: gl.constexpr):
     """Sorted distinct experts into ``rank_smem`` (rank -> expert id) and the
     ids transposed into ``ids_t_smem`` (``[TOPK, 16]``, -1 past ``ROWS``).
-    Returns the number of distinct experts. Runs once at entry (workgroup-wide
-    reductions, before the barrier that ends the entry).
+    Returns the number of distinct experts. Runs once at entry, before the
+    workgroup barrier that ends it (the reductions span the workgroup).
     """
     PICKS: gl.constexpr = ROWS * TOPK
     L2: gl.constexpr = gl.BlockedLayout([1, 4], [4, 16], [gl.num_warps(), 1], [1, 0])
@@ -317,8 +317,8 @@ def _stage_ids(ids_ptr, rank_smem, ids_t_smem, ROWS: gl.constexpr, TOPK: gl.cons
     sel = (first_b[None, :] & (rank_b[None, :] == ra[:, None])).to(gl.int32)
     rank_smem.store(gl.sum(sel * idb[None, :], axis=1))
     # The count comes out of a cross-wave reduction in a VGPR; move it to an
-    # SGPR so the plan's trip counts and branches stay scalar (a divergent
-    # loop would merge its waits conservatively).
+    # SGPR so the plan's trip counts and branches stay uniform (the compiler
+    # merges the waits of a divergent loop conservatively).
     LANE: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     experts = wave_scalar(
         gl.full([64 * gl.num_warps()], 0, gl.int32, LANE)
@@ -461,7 +461,8 @@ def _plan_wave(
     first, end = _full_units_dev(groups, units, t, b)
     first = gl.where(is_tail, 0, first)
     end = gl.where(is_tail, 0, end)
-    # Per wave: quad and strip; the quad takes every other group of the list.
+    # Per wave: its quad and strip; each of the 2 quads takes every other
+    # group of the list.
     WL: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     wave = wave_scalar(gl.arange(0, 64 * gl.num_warps(), WL) // 64)
     if QUAD_MAP == 0:
@@ -647,8 +648,8 @@ def _strip_offsets(
     lsb: gl.constexpr = _layouts()[4]
     bk = gl.arange(0, 64, layout=gl.SliceLayout(1, lb))[:, None]
     bn = gl.arange(0, 128, layout=gl.SliceLayout(0, lb))[None, :]
-    # Strips start on 16-column boundaries; telling the compiler keeps every
-    # lane's 16 bytes one dwordx4.
+    # Strips start on 16-column boundaries; saying so keeps every lane's 16
+    # bytes one dwordx4.
     column = gl.multiple_of(column, 16)
     w_expert = expert.to(gl.int64) * w_stride
     if LINE_STRIP < 0:
@@ -667,8 +668,8 @@ def _strip_offsets(
         s_col = column + _line_column(bsn % 16, LINE_STRIP)
     s0 = _cdna4_swizzled_mxfp4_scale_offset(s_expert, s_col, bsk, s_lin, s_nb)
     s2 = _cdna4_swizzled_mxfp4_scale_offset(s_expert, s_col, 8 + bsk, s_lin, s_nb)
-    # The advances are whole 1 KB chunks and whole scale dwords (asserted by
-    # the codegen test's dwordx4 / dword loads).
+    # The advances are whole 1 KB chunks and whole scale dwords (the codegen
+    # test checks the dwordx4 / dword loads).
     return (
         w0.to(gl.int32),
         gl.multiple_of(wave_scalar((w2 - w0).to(gl.int32)), 1024),
@@ -715,8 +716,8 @@ def _scale_byte(dword, base, kt: gl.constexpr):
 
 @gluon.constexpr_function
 def _lanes_layout():
-    """The B-scale layout of the MFMA (a lane holds one (column, K quad)) with
-    4 consecutive dwords per lane added as the last dimension."""
+    """The MFMA's B-scale layout (a lane holds one column and one of 4 K
+    slices) with 4 consecutive dwords per lane added as the last dimension."""
     return gl.DistributedLinearLayout(
         reg_bases=[[0, 0, 1], [0, 0, 2]],
         lane_bases=[[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 1, 0], [0, 2, 0]],
@@ -729,7 +730,7 @@ def _lanes_layout():
 @gluon.jit
 def _lanes_base(expert, column, N_PHYS: gl.constexpr, K_STEPS: gl.constexpr):
     """Dword offsets of a 16-column strip's lane-major E8M0 scales (see
-    ``scale_layout.pack_cdna4_mxfp4_scale_lanes``): lane (k quad, column)
+    ``scale_layout.pack_cdna4_mxfp4_scale_lanes``): lane (K slice, column)
     holds its K steps' bytes contiguously, 16 steps per dwordx4."""
     L: gl.constexpr = _lanes_layout()
     n = gl.arange(0, 128, layout=gl.SliceLayout(1, gl.SliceLayout(2, L)))[:, None, None]
@@ -764,7 +765,7 @@ def _lanes_byte(quad, kt: gl.constexpr):
 @gluon.jit
 def _group_of(plan, k, rank_smem):
     """This wave's k-th group: (expert id, rank, group index, leftover?)."""
-    # The quad takes every other group of the workgroup's list (16 apart).
+    # A quad takes every other group of the workgroup's list.
     q = plan.q0 + 32 * k
     rank, group = _group_item(q, plan.xcd, plan.whole, plan.n_whole)
     expert = _expert_at(rank_smem, rank)
@@ -890,7 +891,7 @@ def store_routes_sink(args, ys, route, cols, col0):
     bf16(y)`` with ``out = args[0]`` of shape ``(rows * top_k, hidden)``;
     rows with ``route < 0`` are skipped. With 4 strips (whole lines) each
     lane stores its two lines as 32-bit column pairs, one 16-byte store per
-    line. The layer passes its H4 push."""
+    line. A caller can pass its own sink, such as a push to another GPU."""
     out = args[0]
     if len(ys) == 1:
         gl.amd.cdna4.buffer_store(
@@ -1028,7 +1029,7 @@ def _load_a(mids_d, route_a, kt: gl.constexpr, live):
 @gluon.jit
 def _load_a_scale(mids_sd, route_s, kt: gl.constexpr, live):
     """The A operand's E8M0 bytes of K step ``kt``: ``mids_s[route][g]`` is
-    group g = 4 kt + k quad, so one dword holds a step's 4 quads."""
+    group g = 4 kt + K slice, so one dword holds a step's 4 slices."""
     lsa: gl.constexpr = _layouts()[3]
     ask = gl.arange(0, 4, layout=gl.SliceLayout(0, lsa))[None, :]
     return gl.amd.cdna3.buffer.load(
@@ -1043,8 +1044,8 @@ def _load_a_scale(mids_sd, route_s, kt: gl.constexpr, live):
 def _wait_quad(ctx, ex_count, counter, target, detail):
     """Wait until the quad's exchange counter (byte ``counter`` into the
     shared ``ex_count``) reaches ``target``: all 4 waves stored the group's
-    SwiGLU values. LDS reads only; the deadline is checked between bounded
-    spins and fails the launch with ``SITE_MOE_QUAD``."""
+    SwiGLU values. Reads LDS only; the deadline is checked between bounded
+    spins, and expiry fails the launch with ``SITE_MOE_QUAD``."""
     lane: gl.constexpr = _layouts()[6]
     offsets = counter + gl.zeros([64 * gl.num_warps()], gl.int32, lane)
     goal = target + gl.zeros([64 * gl.num_warps()], gl.int32, lane)
@@ -1067,10 +1068,10 @@ def _wait_ready(ctx, tags, rank, TAG_POLL: gl.constexpr):
     wave). Per wave, without a workgroup barrier: the wave's own mids loads
     follow its poll in program order. Fails the launch on expiry.
 
-    ``TAG_POLL`` 0 and 1 poll with scalar loads (1 past the scalar cache),
-    which do not wait behind the wave's weight loads; 2 polls with one
-    uncached vector load per lane (a lane per tag word) and a wave vote,
-    which waits for every load the wave issued before it.
+    ``TAG_POLL`` 0 and 1 poll with scalar loads (1 with ``glc``, past the
+    scalar cache), which do not wait behind the wave's weight loads; 2 polls
+    with one coherent vector load per lane (a lane per tag word) and a wave
+    vote, which waits for every load the wave issued before it.
     """
     if TAG_POLL == 2:
         lane: gl.constexpr = _layouts()[6]
@@ -1151,10 +1152,11 @@ def run_moe(
     runs a group's 4 strips on waves 4q..4q+3, 1 on waves q, q+2, q+4, q+6;
     ``DN_ORDER`` 0 runs a down unit K-step-major, 1 strip-major;
     ``DN_LINES`` maps a down unit's columns to strips so each lane's results
-    form whole lines (above; same sums, bit for bit); ``ADDR_SOFFSET`` advances weight addresses in the scalar offset;
-    ``TAG_POLL`` picks the readiness poll (:func:`_wait_ready`); ``SCALE_LANES`` reads the
-    gate/up scales lane-major (``bufs.s13_lanes``, one dwordx4 per lane per
-    16 steps) instead of one swizzled dword per 2 steps.
+    form whole lines (above; same sums, bit for bit); ``ADDR_SOFFSET``
+    advances weight addresses in the scalar offset; ``TAG_POLL`` picks the
+    readiness poll (:func:`_wait_ready`); ``SCALE_LANES`` reads the gate/up
+    scales lane-major (``bufs.s13_lanes``, one dwordx4 per lane per 16 steps)
+    instead of one swizzled dword per 2 steps.
     """
     mfma: gl.constexpr = _layouts()[0]
     la: gl.constexpr = _layouts()[1]
@@ -1357,7 +1359,7 @@ def run_moe(
             :, None
         ]
         sg = gl.arange(0, 1, layout=gl.SliceLayout(0, SLY))[None, :]
-        # mids_s[route][g]: group g is K step g // 4, quad g % 4.
+        # mids_s[route][g]: group g is K step g // 4, K slice g % 4.
         _store(mids_sb, sbyte, sroute * _MID_SCALES + group + sg, sroute >= 0, left)
         pend_word = rank * _TAGS + group * 4 + plan.strip
         pend_left = left
@@ -1365,8 +1367,8 @@ def run_moe(
         w, w_pair, w_odd, s, s_pair = nw, nw_pair, nw_odd, ns, ns_pair
         lscale = nlscale
 
-    # ---- gate/up -> down: publish the last strip's tag after a drain (once
-    # per wave; its next loads would wait on this wave's own tag otherwise)
+    # ---- gate/up -> down: publish the last strip's tag after a drain, once
+    # per wave (otherwise the wave's next loads would wait on its own tag)
     if pend_word >= 0:
         release_drain()
         _publish_tags(
@@ -1494,9 +1496,8 @@ def run_moe(
                 )
             ring2 = ring2[: c % RING] + (nb,) + ring2[c % RING + 1 :]
             gl.amd.hint.sched_barrier()
-        # Down unit -> sink (the layer's H4 push). Handed over in
-        # MOE_SINK_LAYOUT, which is the MFMA result's own layout: no data
-        # moves, and each wave owns its 16 columns.
+        # Down unit -> sink, in MOE_SINK_LAYOUT, the MFMA result's own
+        # layout: no data moves, and each wave owns its 16 columns.
         rows = gl.arange(0, 16, layout=gl.SliceLayout(1, rowl))
         route = _routes(ids_t, dexpert, rows, TOPK)[:, None]
         pos = gl.arange(0, 128, layout=gl.SliceLayout(0, rowl))[None, :] % 16
@@ -1518,7 +1519,7 @@ def run_moe(
 
 
 # ----------------------------------------------------------------------------
-# Standalone launch (tests and benchmarks; the decoder layer composes
+# Standalone launch (tests and benchmarks; a monokernel composes
 # prefetch_moe / run_moe itself)
 # ----------------------------------------------------------------------------
 
@@ -1571,8 +1572,9 @@ def gluon_mxfp4_moe_stream_gfx950(
     SINK: gl.constexpr,
 ):
     """The MoE stream as its own persistent launch of 256 workgroups x 8
-    waves; ``SINK((out,), ys, route, cols, col0)`` takes the down units' output
-    (``store_routes_sink``: ``out[route, :]`` in bf16)."""
+    waves, for tests (not registered). ``SINK((out,), ys, route, cols,
+    col0)`` takes the down units' output (``store_routes_sink``:
+    ``out[route, :]`` in bf16)."""
     # Entry counters first, then the plan and the first weights (they depend
     # only on the ids), then the entry check.
     entry = enter_issue(epochs, claims)
@@ -1702,7 +1704,7 @@ class MoeStreamWeights:
 def moe_stream_weights(experts, *, scale_lanes: bool) -> MoeStreamWeights:
     """The stream's view of a processed gfx950 MXFP4 MoE layer.
 
-    Reads the tensors today's EP1 decode reads (``w13_weight_triton_tensor``
+    Reads the tensors the direct EP1 decode reads (``w13_weight_triton_tensor``
     and ``w2_weight_triton_tensor``, gdot128-shuffled, with their
     precision configs' CDNA4-swizzled scales), without copying them.
 
@@ -1711,7 +1713,7 @@ def moe_stream_weights(experts, *, scale_lanes: bool) -> MoeStreamWeights:
             (the model's ``mlp.experts``).
         scale_lanes: Also build the lane-major gate/up scales
             (``SCALE_LANES``). That is a copy: 32 MiB per layer of 256
-            local experts (2 GB over 60 layers).
+            local experts.
 
     Raises:
         ValueError: The layout is not the EP1 slice the stream tiles
@@ -1730,18 +1732,18 @@ def moe_stream_weights(experts, *, scale_lanes: bool) -> MoeStreamWeights:
     experts_n = w13.shape[0]
     if w13.dtype != torch.uint8 or w13.shape[1:] != (HIDDEN // 2, GATE_UP):
         raise ValueError(
-            f"native MoE stream: gate/up weights must be (E, {HIDDEN // 2}, "
+            f"moe_stream_weights: gate/up weights must be (E, {HIDDEN // 2}, "
             f"{GATE_UP}) uint8 gdot128, got {tuple(w13.shape)} {w13.dtype}"
         )
     if w2.dtype != torch.uint8 or w2.shape != (experts_n, INTER // 2, HIDDEN):
         raise ValueError(
-            f"native MoE stream: down weights must be (E, {INTER // 2}, "
+            f"moe_stream_weights: down weights must be (E, {INTER // 2}, "
             f"{HIDDEN}) uint8 gdot128, got {tuple(w2.shape)} {w2.dtype}"
         )
     for name, scale in (("gate/up", s13), ("down", s2)):
         if scale.dtype != torch.uint8 or scale.stride(1) != 1:
             raise ValueError(
-                f"native MoE stream: {name} scales must be CDNA4-swizzled uint8 "
+                f"moe_stream_weights: {name} scales must be CDNA4-swizzled uint8 "
                 f"(stride(1) == 1), got {scale.dtype} strides {scale.stride()}"
             )
     strides = dict(
@@ -1757,7 +1759,7 @@ def moe_stream_weights(experts, *, scale_lanes: bool) -> MoeStreamWeights:
     uneven = {k: v for k, v in strides.items() if not k.endswith("lin") and v % 16}
     if uneven:
         raise ValueError(
-            f"native MoE stream: strides must be multiples of 16, got {uneven}"
+            f"moe_stream_weights: strides must be multiples of 16, got {uneven}"
         )
     lanes = None
     if scale_lanes:
@@ -1796,7 +1798,7 @@ def launch_gluon_mxfp4_moe_stream_gfx950(
     swiglu_beta: float,
     deadline_ticks: int,
 ):
-    """Run the MoE stream as its own launch.
+    """Run the MoE stream as its own launch, for tests (not registered).
 
     Args:
         xq, xs: MXFP4 activation rows ``(rows, 2048)`` and their CDNA4-swizzled
@@ -1815,12 +1817,13 @@ def launch_gluon_mxfp4_moe_stream_gfx950(
     rows, top_k = topk_ids.shape
     if xq.shape[1] != HIDDEN // 2:
         raise ValueError(
-            f"native MoE stream: activations must be (rows, {HIDDEN // 2}), "
-            f"got {tuple(xq.shape)}"
+            "launch_gluon_mxfp4_moe_stream_gfx950: activations must be "
+            f"(rows, {HIDDEN // 2}), got {tuple(xq.shape)}"
         )
     if rows > 16 or out.shape != (rows * top_k, HIDDEN):
         raise ValueError(
-            "native MoE stream: at most 16 rows, out is (rows * top_k, hidden)"
+            "launch_gluon_mxfp4_moe_stream_gfx950: at most 16 rows, "
+            "out is (rows * top_k, hidden)"
         )
     w = weights
     gluon_mxfp4_moe_stream_gfx950[(GRID,)](

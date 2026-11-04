@@ -26,12 +26,6 @@ from typing import Any
 from unittest.mock import patch
 
 import torch
-from asm_checks import (  # noqa: F401  (re-exported for existing tests)
-    innermost_loops,
-    persistent_codegen_problems,
-    polling_cycles,
-    votes_with_subgroup_mask,
-)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
     ArchVersion,

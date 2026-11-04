@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compile gate of the fused Muse Spark decoder layer on gfx950.
+"""Compile gate of the Muse Spark monokernel on gfx950.
 
 Every plan variant is compiled without a GPU, with the argument attributes a
 launch gives it, and its assembly is checked against the rules the layer's
@@ -42,10 +42,10 @@ pytest.importorskip("tokenspeed_kernel_amd")
 layer = pytest.importorskip("tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer")
 
 from asm_checks import (  # noqa: E402
-    _innermost_loop_lines,
     banned_instruction_problems,
     drains_of,
     frame_functions,
+    innermost_loop_lines,
     isa_report,
     persistent_codegen_problems,
     register_problems,
@@ -182,7 +182,7 @@ def test_moe_loops_keep_the_ring_and_have_no_barrier(key):
     by_index = {line.index: line for line in source_lines(assembly)}
     moe_loops = [
         indices
-        for indices in _innermost_loop_lines(assembly).values()
+        for indices in innermost_loop_lines(assembly).values()
         if any(
             "moe_stream.py" in (name for name, _ in by_index[i].frames)
             for i in indices
@@ -225,9 +225,9 @@ def test_entry_is_an_epoch_store_and_a_claim_exchange(key):
 
 @pytest.mark.parametrize("key", _variants())
 def test_router_weights_stay_in_flight_until_the_all_gather(key):
-    # The router's tiles are issued after the sender's push (slot 0: after
-    # OWN1); nothing may retire them before the router's x build waits for
-    # the all-gather.
+    # The router's tiles are issued after the o_proj sender's push (on slot
+    # 0, after its all-reduce owner role); nothing may retire them before the
+    # router's x build waits for the all-gather.
     texts, chains = attributed(key)
     issued = _loads(texts, _in(chains, "_router_weights"))
     assert issued
@@ -258,7 +258,7 @@ def test_sender_clears_drain_before_its_push(key):
         i for i in _in(chains, "iris_clear_share") if i in send and "_store" in texts[i]
     ]
     pushes = [
-        i for i in _in(chains, "h1_rs_sink") if i in send and "_store" in texts[i]
+        i for i in _in(chains, "ar_rs_sink") if i in send and "_store" in texts[i]
     ]
     assert clears and pushes
     assert drains_of(texts, clears[-1], pushes[0])
@@ -297,9 +297,9 @@ def test_launch_types_are_checked_against_the_offline_signature():
     _, _, constexprs, _ = layer.offline_compile_args(layer.PLAN_VARIANTS[0], 3)
     assert layer.signature_problems(_launch_args(constexprs), constexprs) == []
     problems = layer.signature_problems(
-        _launch_args(constexprs, h1=torch.int32, box=torch.int32), constexprs
+        _launch_args(constexprs, ar=torch.int32, box=torch.int32), constexprs
     )
     assert problems == [
         "box: launched *i32, offline *u32",
-        "h1: launched *i32, offline *bf16",
+        "ar: launched *i32, offline *bf16",
     ]

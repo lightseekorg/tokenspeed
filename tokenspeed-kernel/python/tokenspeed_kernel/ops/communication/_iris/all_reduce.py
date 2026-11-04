@@ -44,7 +44,7 @@ from tokenspeed_kernel.ops.communication.iris import (
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 if current_platform().is_cdna4:
-    # Deadline and abort checks of the hop waits a persistent layer runs.
+    # Deadline and abort checks for the waits of a persistent kernel.
     from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
         poll_check,
         poll_stop_site,

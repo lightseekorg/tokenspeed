@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Host-side pieces of the fused Muse Spark layer, checked without a GPU.
+"""Host-side pieces of the Muse Spark monokernel, checked without a GPU.
 
 The layer's own math runs only on gfx950 (Gluon has no interpreter), but what
-the host prepares for it and the constants it shares with today's kernels can
+the host prepares for it and the constants it shares with the regular kernels can
 be checked on CPU: the router's BF16 hi/lo copy, the norm multipliers'
 rounding, the full-attention grid against the balanced decode's schedule, the
 rows each per-row region holds, and selection and heap sizing through the
@@ -40,7 +40,6 @@ from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
     LAYER_KINDS,
     PlanKey,
     monokernel_state_heap_bytes,
-    prepare_monokernel_layer,
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import (  # noqa: E402
     PLAN_REQUESTS,
@@ -126,8 +125,8 @@ def test_full_attention_items_fit_the_layers_grid(requests):
 
 def test_per_row_regions_hold_every_served_row():
     """Every per-row region (exchange tags and ids, tagged K-part partials,
-    the xq rows and swizzled scales, the MoE mids scales) is sized for at
-    least the rows of the largest served launch."""
+    the quantized pooled rows and their swizzled scales, the MoE mids
+    scales) is sized for at least the rows of the largest served launch."""
     rows = max(PLAN_REQUESTS) * WIDTH
     assert rows <= composer.PART_ROWS <= composer.MAX_ROWS
     # Exchange regions, in order, each sized for MAX_ROWS rows.
@@ -137,13 +136,13 @@ def test_per_row_regions_hold_every_served_row():
         (composer.EX_IDS_TAGS, composer.MAX_ROWS),
         (composer.EX_XQ_TAGS, composer.MAX_ROWS),
         (composer.EX_HP_TAGS, composer.KPARTS * 16),
-        (composer.EX_S_TAGS, composer.KPARTS * composer.MAX_ROWS),
+        (composer.EX_ROUTED_SUM_TAGS, composer.KPARTS * composer.MAX_ROWS),
     ]
     for (start, size), (following, _) in zip(regions, regions[1:]):
         assert start + size <= following
     start, size = regions[-1]
     assert start + size <= composer.EXCHANGE_WORDS
-    # The xq scales: one 32-row swizzled block holds every served row.
+    # The pooled rows' scales: one 32-row swizzled block holds every served row.
     assert composer.XS_MBLOCK_STRIDE == composer.MAX_ROWS * composer.XS_ROW_BYTES
     # The MoE mids scales: the state keeps routes * INTER / 32 bytes, which
     # is the swizzled layout's size at the served route counts (no padding).
@@ -171,10 +170,9 @@ def gfx950(monkeypatch, mi350_platform):
 
 
 @pytest.mark.usefixtures("gfx950")
-def test_selection_and_heap_follow_the_leafs_traits():
-    """The registered leaf serves the Muse recipe at TP 8 / EP1, verify
-    width 8 and an FP8 KV cache, and reserves its Iris areas only for the
-    group it serves; any other trait value gets no layer."""
+def test_heap_is_reserved_only_for_the_served_group():
+    """The leaf reserves its Iris areas only for the 8-rank group it serves;
+    another group size reserves nothing."""
     assert (
         monokernel_state_heap_bytes(recipe="muse_spark", world_size=8, max_requests=2)
         > 0
@@ -183,18 +181,3 @@ def test_selection_and_heap_follow_the_leafs_traits():
         monokernel_state_heap_bytes(recipe="muse_spark", world_size=4, max_requests=2)
         == 0
     )
-    served = dict(verify_width=8, tp_size=8, ep_size=1, kv_cache_dtype="fp8_e4m3")
-    for name, value in (
-        ("verify_width", 1),
-        ("tp_size", 4),
-        ("ep_size", 8),
-        ("kv_cache_dtype", "bf16"),
-    ):
-        layer = prepare_monokernel_layer(
-            recipe="muse_spark",
-            plan_keys=[PlanKey(1, "sliding", "sliding")],
-            traits=dict(served, **{name: value}),
-            weights={},
-            state=object(),
-        )
-        assert layer is None, name

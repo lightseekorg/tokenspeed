@@ -31,9 +31,9 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from asm_checks import polling_cycles, votes_with_subgroup_mask
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.platform import ArchVersion, current_platform
-from utils import polling_cycles, votes_with_subgroup_mask
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_cdna4, reason="Muse Iris fusions require gfx950"
@@ -818,7 +818,7 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
         config=SimpleNamespace(
             hidden_size=8192, moe_hidden_size=4096, num_experts_per_tok=8
         ),
-        # The default stack: this model runs no fused layers, so it reserves
+        # The default stack: this model runs no monokernel layers, so it reserves
         # no heap for them and prepares nothing.
         model=SimpleNamespace(
             iris_state=None, layers=[layer], layer_stack=DecoderLayerStack()

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Random Muse Spark layers in the production layouts, for the fused-layer
+"""Random Muse Spark layers in the production layouts, for the monokernel
 test and benchmark on 8 gfx950 ranks.
 
 ``build_layer_inputs`` gives one rank's weights (as

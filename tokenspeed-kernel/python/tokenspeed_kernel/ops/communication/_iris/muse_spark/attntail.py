@@ -19,7 +19,13 @@
 # SOFTWARE.
 
 
-"""Fuse attention reduction with Muse's residual update and MoE input norms."""
+"""Fuse attention reduction with Muse's residual update and MoE input norms.
+
+The attention box (``att_box``) is the local area where attention publishes
+its gated, normalized output rows ``[tokens, heads * head_dim]`` as BF16
+Lamport words (empty marker: negative zero in both halves) for the o_proj
+senders to poll.
+"""
 
 from tokenspeed_kernel._triton import gl, gluon, tl
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
@@ -597,37 +603,6 @@ def muse_attntail_publish_attention(program, merged, gate, att_box, EPS: gl.cons
 
 
 @gluon.jit
-def muse_attntail_publish_rows(
-    program, offs_m, merged, gate, att_box, EPS: gl.constexpr
-):
-    """:func:`muse_attntail_publish_attention` for block rows ``offs_m`` only
-    (the spread merge's share): ``merged`` and ``gate`` are those rows'
-    ``[len(offs_m), head_dim]`` FP32 merge and gate logits in ``offs_m``'s
-    parent layout. Each row is one (token, head), so its norm is the row's
-    alone; the box gets whole 32-bit words (eight BF16 per lane)."""
-    cfg = program.cfg
-    rows = muse_attntail_gated_rows(merged, gate, EPS)
-    box_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [8, 8], [cfg.NUM_WARPS, 1], [1, 0]
-    )
-    rows = gl.convert_layout(rows, box_layout)
-    m = gl.convert_layout(offs_m, gl.SliceLayout(1, box_layout))
-    d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, box_layout))
-    base = gl.multiple_of(
-        program.row_tokens(m) * (cfg.NUM_Q_HEADS * cfg.HEAD_DIM)
-        + program.row_heads(m) * cfg.HEAD_DIM,
-        cfg.HEAD_DIM,
-    )
-    gl.amd.cdna4.buffer_store(
-        rows,
-        gl.multiple_of(att_box.to(gl.pointer_type(gl.bfloat16), bitcast=True), 16),
-        base[:, None] + d[None, :],
-        mask=program.row_valid(m)[:, None] & (d >= 0)[None, :],
-        cache=".wt",
-    )
-
-
-@gluon.jit
 def muse_attntail_attention(
     request,
     head_block,
@@ -872,7 +847,7 @@ def muse_attntail_rs_push(
     """Push a sender's FP32 [16 tokens, OUTPUTS] o_proj partial (columns
     [block * OUTPUTS, ...)) as BF16 to reduce-scatter slot RANK of the rank
     owning those columns, in mailbox copy ``stage``; rows past ``rows`` are
-    not stored. The H1 reduce-scatter push of muse_attntail_send."""
+    not stored. The reduce-scatter push of :func:`muse_attntail_send`."""
     WAVES: gl.constexpr = gl.num_warps()
     # Each wave stores whole token rows (OUTPUTS BF16 = one 128 B line), so
     # no line crosses the link in partial writes.
@@ -959,13 +934,12 @@ def muse_attntail_own(
     on; a two-copy caller clears its areas at entry instead. ``program``
     picks the first peer of the pushes (see _iris_lamport_push). With
     ``on_expiry`` (not None) its waits stop at ``launch``'s deadline or
-    abort. Then waits for all WORLD_SIZE sources
-    and sums them in rank order with one BF16 rounding
-    (iris_lamport_twoshot_rs_wait_reduce), pushes b to every rank's
-    all-gather slot RANK (its own included) and, per row, four FP32 norm sums
-    of these columns as 64-bit tagged words: sum b^2, B = sum (alpha h)
-    (beta b), A = sum (alpha h)^2, C = sum (beta b)^2, with b weighted by the
-    post-norm when POST_HAS_WEIGHT.
+    abort. Then waits for all WORLD_SIZE sources and sums them in rank order
+    with one BF16 rounding (iris_lamport_twoshot_rs_wait_reduce), pushes the
+    sum b to every rank's all-gather slot RANK (its own included) and, per
+    row, four FP32 norm sums of these columns as 64-bit tagged words, with h
+    the residual: sum b^2, B = sum (alpha h)(beta b), A = sum (alpha h)^2,
+    C = sum (beta b)^2, with b weighted by the post-norm when POST_HAS_WEIGHT.
     """
     WAVES: gl.constexpr = gl.num_warps()
     OWNED: gl.constexpr = WIDTH // WORLD_SIZE

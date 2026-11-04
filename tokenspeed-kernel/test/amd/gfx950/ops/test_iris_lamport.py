@@ -26,8 +26,8 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from asm_checks import polling_cycles, votes_with_subgroup_mask
 from tokenspeed_kernel.platform import ArchVersion, current_platform
-from utils import polling_cycles, votes_with_subgroup_mask
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_amd, reason="Iris requires AMD ROCm"

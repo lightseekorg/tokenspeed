@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The fused Muse Spark layer's launch state under the conditions serving
+"""The Muse Spark monokernel's launch state under the conditions serving
 creates, on 8 gfx950 ranks.
 
 One state serves every launch of a group: launches alternate request counts
@@ -69,7 +69,7 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (  # noqa: E402
     EX_IDS_TAGS,
-    EX_S_TAGS,
+    EX_ROUTED_SUM_TAGS,
     EX_XQ_TAGS,
     KPARTS,
     MAX_ROWS,
@@ -155,8 +155,8 @@ def _assert_areas_empty(state):
     dist.barrier()
     copy = (_epoch(state) + 1) & 1
     areas = dict(
-        att_box=state.iris.box, h1=state.iris.h1, h3=state.iris.h3,
-        h4_own=state.iris.h4_own, routes=state.iris.routes, h6=state.iris.h6,
+        att_box=state.iris.box, ar=state.iris.ar, pooled_ag=state.iris.pooled_ag,
+        route_push_own=state.iris.route_push_own, routes=state.iris.routes, post_ag=state.iris.post_ag,
     )  # fmt: skip
     for area in CLEARED_AREAS:
         words = areas[area.name].view(2, area.copy_words)[copy]
@@ -180,9 +180,10 @@ def _write_exchange(state, word_offset: int, values: list[int]) -> None:
 def _alternation(rank, record_dir):
     """1 -> 2 -> 1 requests on one state; before the second 1-request
     launch, the next launch's tag sits in the exchange's per-row tag lines
-    of rows 8-15 (ids, xq, every S part) and NaN in their S and h' rows. The
-    launch must match the reference without reading rows 8-15, and leave a
-    residual's rows 8-15 alone."""
+    of rows 8-15 (expert ids, quantized pooled rows, every part of the summed
+    experts) and NaN in their summed-expert and post-attention residual rows.
+    The launch must match the reference without reading rows 8-15, and leave
+    a residual's rows 8-15 alone."""
     state = _state(rank, record_dir)
     weights, steps, references = _steps(rank)
     fused = _layer(state, weights, 2.0)
@@ -195,8 +196,10 @@ def _alternation(rank, record_dir):
     _write_exchange(state, EX_IDS_TAGS + WIDTH, [stale] * WIDTH)
     _write_exchange(state, EX_XQ_TAGS + WIDTH, [stale] * WIDTH)
     for part in range(KPARTS):
-        _write_exchange(state, EX_S_TAGS + part * MAX_ROWS + WIDTH, [stale] * WIDTH)
-    state.s_rows[rows.start : rows.stop] = float("nan")
+        _write_exchange(
+            state, EX_ROUTED_SUM_TAGS + part * MAX_ROWS + WIDTH, [stale] * WIDTH
+        )
+    state.routed_sums[rows.start : rows.stop] = float("nan")
     state.hprime[rows.start : rows.stop] = float("nan")
     # A 16-row residual whose first 8 rows are the step's.
     residual = torch.randn((2 * WIDTH, HIDDEN), device=f"cuda:{rank}")

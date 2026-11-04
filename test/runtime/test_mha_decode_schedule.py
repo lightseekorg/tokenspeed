@@ -310,7 +310,7 @@ def test_captured_verify_computes_each_steps_schedule_in_the_graph(schedule_call
 
 
 def test_full_layer_views_carry_the_forwards_schedule(schedule_calls):
-    """A fused layer runs a full layer's verify attention itself: its view of
+    """A monokernel runs a full layer's verify attention itself: its view of
     the FP8 cache carries the forward's schedule, computed when the first
     view is taken and reused by the next full layer's decode call. A sliding
     view carries none; a layer of another shape, or a draft's, has no view."""
