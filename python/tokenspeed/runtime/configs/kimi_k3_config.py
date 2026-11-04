@@ -487,3 +487,7 @@ class KimiK31Config(KimiK3Config):
     """Kimi-K3.1: the Kimi-K3 config whose text config carries ``dsa_config``."""
 
     model_type = "kimi_k31"
+
+    # Explicit, so transformers keeps KimiK3Config's sub-config construction.
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)

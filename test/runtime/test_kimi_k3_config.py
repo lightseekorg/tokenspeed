@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3Config,
     KimiK3VisionConfig,
+    KimiK31Config,
     KimiLinearConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
@@ -64,6 +65,17 @@ class TestKimiK3ConfigTests:
         assert isinstance((cfg.vision_config), (KimiK3VisionConfig))
         assert (cfg.text_config.hidden_size) == (4096)
         assert (cfg.vision_config.vt_hidden_size) == (512)
+
+    def test_k31_materializes_its_subconfigs_through_from_dict(self):
+        # from_dict is the path from_pretrained takes; a subclass without its
+        # own __init__ left text_config a dict there.
+        cfg = KimiK31Config.from_dict(
+            {"model_type": "kimi_k31", "text_config": {"hidden_size": 4096}}
+        )
+        assert cfg.model_type == "kimi_k31"
+        assert isinstance(cfg.text_config, KimiLinearConfig)
+        assert isinstance(cfg.vision_config, KimiK3VisionConfig)
+        assert cfg.text_config.hidden_size == 4096
 
     def test_vision_text_hidden_forced_to_text_hidden(self):
         # The projector must emit the text hidden size, overriding any value
