@@ -343,9 +343,13 @@ nothing, and keeps no token. (Pipeline parallelism serves only the prefill
 role, which neither decodes nor overlaps, so its stages, which do not sample,
 never run a forward behind a stopped request.) The finish checkpoint is thus the state before
 the stop token under every schedule ([Scheduler
-§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)); a finish
-dispatched as a rotating first decode publishes at the prompt end, where the
-prompt-end checkpoint it still holds in slot 0 is the canonical block.
+§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)). A finish
+behind a rotating first decode that ran as a padding row publishes at the
+prompt end from slot 0, the block the prefill wrote: slot 1 is the fresh
+block the padding row never wrote (`CompletedPages::state_slot`). Slot 0 is
+the request's own block even when another request published the prompt end
+first, so the finish publishes the prompt-end state again if that first copy
+was evicted in the meantime.
 
 State groups may additionally restrict reusable checkpoints with
 `checkpoint_granularity`: intermediate prefill forwards end on its multiples,

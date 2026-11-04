@@ -92,6 +92,12 @@ struct CacheProgress {
     // the finish (Scheduler::demoteSupersededCheckpoint). Neither reads it on
     // the D role, the only one whose first admission is a remote landing.
     std::int32_t resume_tokens{0};
+    // Whether the first decode published the prompt end and rotated the
+    // State slots (PublicationPoint::kOwnerContinues). Until a forward past
+    // the prompt end lands, the state there sits in slot 0, and slot 1 is a
+    // block no forward wrote: a finish at the prompt end, whose first decode
+    // ran as a padding row, publishes slot 0 (CompletedPages::state_slot).
+    bool prompt_end_rotated{false};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,

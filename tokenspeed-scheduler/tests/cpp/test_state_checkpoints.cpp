@@ -2468,6 +2468,72 @@ TEST_F(StateCheckpointSuite, AQuiescentFinishSettlesWithTheFinishEvent) {
     EXPECT_EQ(Probe("hit", {1, 2, 3, 4, 5, 6, 101, 77}).prefix_tokens, 7);
 }
 
+// Mixed batches under the overlap schedule, in a pool small enough for a long
+// prompt to evict what no request holds.
+class PaddedFirstDecodeSuite : public StateCheckpointSuite {
+protected:
+    static constexpr std::int32_t kPages = 28;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.device_allocator.total_pages = kPages;
+        cfg.host_allocator.total_pages = kPages;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = kPages;
+        }
+        cfg.max_scheduled_tokens = 48;
+        cfg.max_batch_size = 4;
+        cfg.overlap_schedule_depth = 1;
+        cfg.enable_mixed_prefill_decode = true;
+        return cfg;
+    }
+};
+
+// Two requests prefill the same prompt and both first decodes rotate their
+// State slots behind the prefills. "a" publishes the prompt end first, so
+// "b"'s prompt-end state stays b's own block, now in slot 0. b stops on its
+// first sampled token: its first decode runs as a padding row and never
+// writes the fresh slot 1. a's second decode lets the published copy go and
+// a long prompt evicts it before b's padded decode lands; b then settles at
+// the prompt end and publishes slot 0, the block its prefill wrote, so the
+// next prompt resumes from the prompt-end state and not from a block no
+// forward wrote.
+TEST_F(PaddedFirstDecodeSuite, AFinishBehindAPaddedFirstDecodePublishesThePromptEndFromSlotZero) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    const std::vector<std::int32_t> prompt = MakeTokens(6);
+    Submit(RequestSpec{.request_id = "a", .tokens = prompt, .max_new_tokens = 8});
+    Submit(RequestSpec{.request_id = "b", .tokens = prompt, .max_new_tokens = 1});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);  // both prefills
+    const ExecutionPlan first_decodes = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(first_decodes);
+    ASSERT_NE(batch, nullptr);
+    const std::vector<std::int32_t> a_row = StateRow(*batch, "state0", "a");
+    const std::vector<std::int32_t> b_row = StateRow(*batch, "state0", "b");
+    ASSERT_GT(b_row.at(0), 0) << "b's prompt-end state, rotated into slot 0";
+    ASSERT_NE(b_row.at(0), a_row.at(0)) << "a published the prompt end; b keeps its own block";
+    SendForwardDone("a", {101});
+    SendForwardDone("b", {102});
+    SendFinish("b");  // its first token reached its limit; its first decode is out
+    Submit(RequestSpec{.request_id = "long", .tokens = MakeTokens(12, 100), .max_new_tokens = 1});
+    const ExecutionPlan evicting = PlanOnce();  // a's second decode and the long prompt
+    batch = FindForwardBatch(evicting);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"long", "a"}));
+    SendForwardDone("a", {103});
+    SendForwardDone("b");  // the padding row keeps no token: b settles at the prompt end
+    SendForwardDone("long", {104});
+    SendAbortEvent("a");
+    SendFinish("long");
+
+    std::vector<std::int32_t> next = prompt;
+    next.push_back(77);
+    const Resume resume = Probe("next", next);
+    EXPECT_EQ(resume.prefix_tokens, 6);
+    ASSERT_NE(resume.state_row.at(0), a_row.at(0)) << "the long prompt evicts a's published prompt end";
+    EXPECT_EQ(resume.state_row.at(0), b_row.at(0))
+        << "b publishes the block its prefill wrote, not the fresh slot " << b_row.at(1) << " no forward wrote";
+}
+
 // An abort of a finishing request releases its pages without publishing.
 TEST_F(StateCheckpointSuite, AnAbortWhileFinishingPublishesNothing) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);

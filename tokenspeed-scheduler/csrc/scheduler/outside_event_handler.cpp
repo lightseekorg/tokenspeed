@@ -150,9 +150,10 @@ void Scheduler::settleFinishedRequests() {
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
     fsm::CacheProgress progress = request.CacheProgress();
-    // The frontier is final: every forward has landed, so the live state slot
-    // holds the state after the last consumed token and the KV rows below it
-    // are complete.
+    // The frontier is final: every forward has landed, so the State slot the
+    // last kept token's forward wrote holds the state after it (slot 1, or
+    // slot 0 behind a first decode that ran as a padding row:
+    // CompletedPages::state_slot) and the KV rows below it are complete.
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     RequestProgress completed = AdvanceRequestProgress(
         request, progress, num_computed_tokens, coordinator_.PrefixGranularity(),

@@ -266,6 +266,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
                                                                         : OwnerTail::kFinal,
             .preserve_source_blocks = preserve_source_blocks,
             .publish_state = publish_state,
+            .state_slot = cache_progress.prompt_end_rotated && num_computed_tokens == request.PrefillSize() ? 0 : 1,
             .state_checkpoint_pages = state_checkpoint_pages,
             .state_checkpoint_blocks = cache_progress.published_state_checkpoint_blocks,
             .boundary_kind =
@@ -924,6 +925,9 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         return std::nullopt;
     }
     staged.Commit();
+    if (prompt_end) {
+        cache_progress.prompt_end_rotated = true;
+    }
 
     if (first_decode && cache_progress.retained_input_checkpoint.empty()) {
         const std::int32_t checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
