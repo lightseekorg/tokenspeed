@@ -368,8 +368,8 @@ class MuseSparkMonokernelLayer:
         the defaults; benchmarks vary them); ``stamps``: store per-workgroup
         clock stamps into ``state.stamps``; ``deadline_ticks``: how long a
         wait may last before the launch stops with an error, in 10 ns clock
-        ticks (``persistent.deadline_ticks`` converts seconds). Serving
-        derives it from the server's watchdog; tests pass a short one."""
+        ticks (``persistent.deadline_ticks`` converts seconds); serving and
+        tests each pass their own."""
         if set(plan_fields) != set(DEFAULT_PLAN_FIELDS):
             raise ValueError(f"plan fields must be {sorted(DEFAULT_PLAN_FIELDS)}")
         if deadline_ticks <= 0:

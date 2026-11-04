@@ -97,14 +97,13 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig  # noqa: E
 from tokenspeed.runtime.layers.attention.kv_cache.mha import (  # noqa: E402
     MHATokenToKVPool,
 )
-from tokenspeed.runtime.layers.monokernel import wait_deadline_seconds  # noqa: E402
+from tokenspeed.runtime.layers.monokernel import WAIT_DEADLINE_SECONDS  # noqa: E402
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config  # noqa: E402
 from tokenspeed.runtime.models import muse_spark  # noqa: E402
 from tokenspeed.runtime.models.muse_spark_layer_stack import (  # noqa: E402
     FUSED_REQUESTS,
     MuseSparkLayerStack,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 WORLD = 8
 VERIFY_WIDTH = 8
@@ -115,7 +114,6 @@ SERVER_ARGS = {
     "speculative_algorithm": "DFLASH",
     "speculative_num_draft_tokens": VERIFY_WIDTH,
     "kv_cache_dtype": "fp8_e4m3",
-    "watchdog_timeout": ServerArgs.watchdog_timeout,
 }
 
 
@@ -609,8 +607,7 @@ def check_handoff(config: MuseSparkConfig, quant_config, rank: int) -> LaunchRec
         )
         traits = stack.selection_traits(SERVER_ARGS, model.mapping)
         recorder.layer = "prepare"
-        deadline = wait_deadline_seconds(SERVER_ARGS["watchdog_timeout"])
-        layers = stack.prepare_layers(model, state, traits, deadline)
+        layers = stack.prepare_layers(model, state, traits, WAIT_DEADLINE_SECONDS)
         assert all(layer is not None for layer in layers), "no leaf was selected"
         step = DecodeStep(model, config, max(FUSED_REQUESTS))
         for requests in FUSED_REQUESTS:
@@ -681,9 +678,7 @@ def test_every_fused_launch_matches_its_compiled_signature(rank):
         )
     }
     assert set(recorder.launched) == keys
-    # The serving deadline (from the watchdog setting) reaches every launch.
-    assert recorder.deadlines == {
-        deadline_ticks(wait_deadline_seconds(ServerArgs.watchdog_timeout))
-    }
+    # The serving deadline reaches every launch.
+    assert recorder.deadlines == {deadline_ticks(WAIT_DEADLINE_SECONDS)}
     # Layers 1-60 run fused at each of the two shapes.
     assert len(recorder.launched) == 2 * 60

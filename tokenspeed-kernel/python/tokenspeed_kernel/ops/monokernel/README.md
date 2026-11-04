@@ -24,7 +24,7 @@ trait and shape traits such as `verify_width`, `tp_size`, `ep_size` and
   without a leaf. It reads the layer's weights in place, and compiles and
   checks every plan variant before capture. `deadline_seconds` bounds how long
   a launch waits for another workgroup or GPU before it stops with an error;
-  the runtime derives it from the server's watchdog timeout.
+  the runtime passes it explicitly.
 
 A `PlanKey` is `(requests, layer_kind, next_kind)`: the requests in the step
 (rows = requests x verify width), this layer's attention kind, and the next
