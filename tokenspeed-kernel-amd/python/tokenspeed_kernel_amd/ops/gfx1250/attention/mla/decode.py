@@ -977,6 +977,7 @@ def launch_gluon_mla_decode_gfx1250(
             num_q_programs=total_num_q_blocks,
             max_seqlen_k=max_seqlen_k,
             tile_size=page_size,
+            two_per_cu=True,
         )
 
     split_output = torch.empty(
@@ -1085,7 +1086,7 @@ def _select_num_kv_splits(
     num_q_programs: int,
     max_seqlen_k: int,
     tile_size: int,
-    two_per_cu: bool = True,
+    two_per_cu: bool,
 ) -> int:
     """Choose the KV split count for decode and query-block programs.
 
