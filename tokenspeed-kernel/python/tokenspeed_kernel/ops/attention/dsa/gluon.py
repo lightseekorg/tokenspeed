@@ -702,8 +702,8 @@ if current_platform().is_amd:
     # This experimental leaf is selected only by an explicit solution. The
     # portable candidate implementation keeps automatic/default selection.
     from tokenspeed_kernel.ops.attention.dsa import (
-        DSAIndexCandidatePages,
         INDEX_CANDIDATE_PAGES_FEATURE,
+        DSAIndexCandidatePages,
     )
 
     @register_kernel(

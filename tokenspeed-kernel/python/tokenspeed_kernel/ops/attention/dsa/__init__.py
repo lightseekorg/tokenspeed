@@ -115,9 +115,9 @@ def _blockscaled_signature_and_scales(
     Returns (signature, scale_kwargs) for the paged-KV-cache entry points.
     """
     if q_scale is not None:
-        assert k_scale is not None and v_scale is not None, (
-            "MXFP8 attention requires q_scale, k_scale, and v_scale together"
-        )
+        assert (
+            k_scale is not None and v_scale is not None
+        ), "MXFP8 attention requires q_scale, k_scale, and v_scale together"
         signature = _mxfp8_attention_format_signature(
             q=q, k_cache=k_cache, v_cache=v_cache
         )
