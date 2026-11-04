@@ -32,15 +32,15 @@ from collections import Counter
 
 import pytest
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+    pack_cdna4_mxfp4_scale_lanes,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (
     GROUP_BYTES,
     GROUPS_PER_EXPERT,
     UNIT_BYTES,
     UNITS_PER_EXPERT,
     native_moe_plan,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
-    pack_cdna4_mxfp4_scale_lanes,
 )
 
 # Recorded verify routings of Muse Spark at EP1: 4 decode steps each at 8 and 16

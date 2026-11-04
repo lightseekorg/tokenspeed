@@ -502,7 +502,7 @@ _ASM_SITES = {
     _KA + "gemm/fp16/gemv_splitk.py": (False, set()),
     _KA + "gemm/fp16/mm.py": (False, {"gluon_mm_a16w16_medium_gfx950"}),
     _KA + "attention/mha/decode.py": (False, {"_opaque_f32", "arrive"}),
-    _KA + "moe/mxfp4/native_stream.py": (False, set()),
+    _KA + "monokernel/moe_stream.py": (False, set()),
     _KT + "monokernel/_gluon/muse_spark/iris.py": (True, set()),
     _KT + "monokernel/_gluon/muse_spark/layer.py": (True, set()),
 }  # fmt: skip

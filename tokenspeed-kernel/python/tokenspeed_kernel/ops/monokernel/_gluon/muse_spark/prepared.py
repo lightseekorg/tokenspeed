@@ -72,7 +72,7 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (
     offline_signature,
     signature_problems,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (
     INTER,
     TAG_WORDS,
     native_moe_weights,

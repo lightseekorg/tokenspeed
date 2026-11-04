@@ -176,7 +176,7 @@ def test_moe_loops_keep_the_ring_and_have_no_barrier(key):
         indices
         for indices in _innermost_loop_lines(assembly).values()
         if any(
-            "native_stream.py" in (name for name, _ in by_index[i].frames)
+            "moe_stream.py" in (name for name, _ in by_index[i].frames)
             for i in indices
             if i in by_index
         )

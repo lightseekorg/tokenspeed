@@ -32,13 +32,13 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
     _extract_gluon_raw_s,
     _extract_gluon_raw_w,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
-    native_moe_weights,
-)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     pack_cdna4_mxfp4_scale_lanes,
     swizzle_cdna4_mxfp4_scale,
     unswizzle_cdna4_mxfp4_scale,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (
+    native_moe_weights,
 )
 
 EXPERTS = 4

@@ -134,13 +134,13 @@ from tokenspeed_kernel_amd.ops.gfx950.layernorm.deferred import (
     deferred_norm_scales_gfx950,
     deferred_norm_terms_gfx950,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
+    sigmoid_bias_topk_keys_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (
     MoeBuffers,
     prefetch_moe,
     run_moe,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
-    sigmoid_bias_topk_keys_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
     FIRST_KERNEL_SITE,
@@ -1552,7 +1552,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     QKV_WINDOW: gl.constexpr,
     ATT_MERGE: gl.constexpr,
     STAMPS: gl.constexpr,
-    # MoE plan fields (native_stream.run_moe).
+    # MoE plan fields (moe_stream.run_moe).
     N_PHYS1: gl.constexpr,
     N_PHYS2: gl.constexpr,
     RING: gl.constexpr,

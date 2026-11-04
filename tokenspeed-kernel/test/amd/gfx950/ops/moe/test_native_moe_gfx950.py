@@ -48,14 +48,14 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     _extract_gluon_raw_w,
     _quantize_mxfp4_activation,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E402
+    empty_swizzled_cdna4_mxfp4_scale,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (  # noqa: E402
     TAG_COPY_WORDS,
     NativeMoeState,
     launch_gluon_mxfp4_moe_native_stream_gfx950,
     native_moe_weights,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E402
-    empty_swizzled_cdna4_mxfp4_scale,
 )
 
 EXPERTS, HIDDEN, INTER, TOPK = 256, 4096, 512, 8

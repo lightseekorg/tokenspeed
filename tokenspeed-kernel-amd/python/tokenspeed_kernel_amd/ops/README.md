@@ -2303,7 +2303,7 @@ store each.
 
 ### gfx950 native MXFP4 MoE stream
 
-`moe/mxfp4/native_stream.py`: the MoE phase of a persistent decode layer
+`monokernel/moe_stream.py`: the MoE phase of a persistent decode layer
 (EP1 slice, up to 16 rows), as device functions `prefetch_moe` /
 `run_moe` and a standalone launch for tests.
 
