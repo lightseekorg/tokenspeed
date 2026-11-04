@@ -655,17 +655,20 @@ def _unit_of(plan, u, rank_smem):
 
 
 @gluon.jit
-def _store(desc, value, offsets, mask, cross_xcd):
-    """Plain store, or a device-scope one when the reader may sit on another
-    XCD (the split leftover experts)."""
-    if cross_xcd:
-        gl.amd.cdna3.buffer.store(value, desc, offsets, mask=mask, scope="gpu")
-    else:
-        gl.amd.cdna3.buffer.store(value, desc, offsets, mask=mask)
+def _store_mids(desc, value, offsets, mask):
+    """Store intermediates written through to memory (SC0 SC1).
+
+    Each XCD has its own L2, and the L2s do not snoop one another. Readers of
+    a split leftover expert sit on other XCDs, and every launch reuses the
+    same buffer, so a reader's L2 may still hold the previous launch's line.
+    Writing through here and reading with SC0 SC1 (:func:`_load_a`) bypasses
+    every L2 coherently (CDNA4 ISA 9.1.10.2), whichever XCD reads.
+    """
+    gl.amd.cdna3.buffer.store(value, desc, offsets, mask=mask, scope="sys")
 
 
 @gluon.jit
-def _publish_tags(tags_d, word, tag, live, cross_xcd, dep):
+def _publish_tags(tags_d, word, tag, live, dep):
     """Store ``tag`` at word ``word`` of ``tags_d`` from one lane of this wave,
     computed from ``dep``: the store issues only after the wave waited for
     the load ``dep`` came from, which also covers this wave's earlier stores
@@ -676,8 +679,13 @@ def _publish_tags(tags_d, word, tag, live, cross_xcd, dep):
     value = after(
         gl.full([16, 128], 0, gl.int32, mfma) + tag, dep.to(gl.int32, bitcast=True)
     )
-    _store(
-        tags_d, value, word + r * 0 + c * 0, live & (r == 0) & (c % 16 == 0), cross_xcd
+    # The tags are uncached memory, so the store reaches every XCD's readers.
+    gl.amd.cdna3.buffer.store(
+        value,
+        tags_d,
+        word + r * 0 + c * 0,
+        mask=live & (r == 0) & (c % 16 == 0),
+        scope="sys",
     )
 
 
@@ -756,7 +764,7 @@ def _load_a(mids_d, route_a, kt: gl.constexpr, live):
         mids_d,
         route_a * _MID_ROW + kt * 64 + ak,
         mask=live & (route_a >= 0),
-        scope="gpu",
+        scope="sys",  # see _store_mids
     )
 
 
@@ -770,7 +778,7 @@ def _load_a_scale(mids_sd, route_s, kt: gl.constexpr, live):
         mids_sd,
         route_s * (_MID_SCALES // 4) + kt + ask * 0,
         mask=live & (route_s >= 0),
-        scope="gpu",
+        scope="sys",  # see _store_mids
     )
 
 
@@ -869,7 +877,7 @@ def gluon_mxfp4_moe_stream_gfx950(
     )  # fmt: skip
 
     # ---- role: the plan places whole experts by the XCD that runs the
-    # workgroup (their mids stay in that XCD's L2), so the role comes from
+    # workgroup, so the role comes from
     # the hardware XCD id and the program id; the entry check below proves
     # every role is taken once.
     pid = gl.program_id(0)
@@ -896,7 +904,7 @@ def gluon_mxfp4_moe_stream_gfx950(
     token = _token_of_quant_row(rho)
     ids_q.store(gl.load(ids + token * TOPK + qj, mask=token < ROWS, other=-1))
     plan = _plan_wave(xcd, slot, experts, TAIL_NUM, TAIL_DEN)
-    expert, rank, group, left = _group_of(plan, 0, rank_smem)
+    expert, rank, group, _ = _group_of(plan, 0, rank_smem)
     w, w_pair, w_odd, s, s_pair = _strip_offsets(
         expert,
         group * 64 + plan.strip * 16,
@@ -1016,10 +1024,9 @@ def gluon_mxfp4_moe_stream_gfx950(
 
     # ---- gate/up strips
     pend_word = rank * 0 - 1
-    pend_left = left
     for k in range(plan.n_ug):
         # The next strip's plan, from LDS only.
-        nexpert, nrank, ngroup, nleft = _group_of(plan, k + 1, rank_smem)
+        nexpert, nrank, ngroup, _ = _group_of(plan, k + 1, rank_smem)
         nlive = k + 1 < plan.n_ug
         nw, nw_pair, nw_odd, ns, ns_pair = _strip_offsets(
             nexpert,
@@ -1067,9 +1074,7 @@ def gluon_mxfp4_moe_stream_gfx950(
                 # The previous strip's tag: this step's chunk was issued after
                 # that strip's mids stores, and the wave's memory operations
                 # complete in issue order, so waiting for it covers them.
-                _publish_tags(
-                    tags_d, tag_base + pend_word, tag, pend_word >= 0, pend_left, acc
-                )
+                _publish_tags(tags_d, tag_base + pend_word, tag, pend_word >= 0, acc)
             gl.amd.hint.sched_barrier()
         pend_word = rank * 0 - 1
 
@@ -1096,16 +1101,15 @@ def gluon_mxfp4_moe_stream_gfx950(
         prho = gl.arange(0, 32, layout=gl.SliceLayout(1, PL))
         route = _routes(ids_q, expert, _token_of_quant_row(prho), TOPK)[:, None]
         pb = gl.arange(0, 16, layout=gl.SliceLayout(0, PL))[None, :]
-        _store(mids_d, packed, route * _MID_ROW + group * 16 + pb, route >= 0, left)
+        _store_mids(mids_d, packed, route * _MID_ROW + group * 16 + pb, route >= 0)
         SLY: gl.constexpr = sbyte.type.layout
         srho = gl.arange(0, 32, layout=gl.SliceLayout(1, SLY))
         sroute = _routes(ids_q, expert, _token_of_quant_row(srho), TOPK)[:, None]
         sg = gl.arange(0, 1, layout=gl.SliceLayout(0, SLY))[None, :]
         # mids_s[route][g]: group g is K step g // 4, K slice g % 4.
-        _store(mids_sb, sbyte, sroute * _MID_SCALES + group + sg, sroute >= 0, left)
+        _store_mids(mids_sb, sbyte, sroute * _MID_SCALES + group + sg, sroute >= 0)
         pend_word = rank * _TAGS + group * 4 + plan.strip
-        pend_left = left
-        expert, rank, group, left = nexpert, nrank, ngroup, nleft
+        expert, rank, group = nexpert, nrank, ngroup
         w, w_pair, w_odd, s, s_pair = nw, nw_pair, nw_odd, ns, ns_pair
 
     # ---- gate/up -> down: publish the last strip's tag after a drain, once
@@ -1117,7 +1121,6 @@ def gluon_mxfp4_moe_stream_gfx950(
             tag_base + pend_word,
             tag,
             pend_word >= 0,
-            pend_left,
             gl.zeros((16, 128), gl.float32, mfma),
         )
 
