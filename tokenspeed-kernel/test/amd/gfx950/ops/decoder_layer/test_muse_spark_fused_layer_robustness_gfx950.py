@@ -60,12 +60,12 @@ from muse_layer_reference import (  # noqa: E402
     regular_reference,
     run_fused,
 )
-from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
-    CLEARED_AREAS,
-)
 from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
     PlanKey,
     prepare_decoder_layer_state,
+)
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E402
+    CLEARED_AREAS,
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (  # noqa: E402
     EX_IDS_TAGS,

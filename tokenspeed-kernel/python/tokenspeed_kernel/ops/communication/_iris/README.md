@@ -92,7 +92,7 @@ the partials of columns [512q, 512q + 512) of every route and publishes them
 with their partial sums of squares, then every rank normalizes, weights and
 sums all columns.
 
-The native fused layer (`muse_spark/fused_layer.py`, one persistent launch
+The native fused layer (`ops/monokernel/_gluon/muse_spark/iris.py`, one persistent launch
 per decoder layer) calls these bodies as hop ends: the TP8 two-shot, the
 column-owned route exchange (`iris_column_routes_push_words` is the one push
 body; the MoE stream's down units push from their epilogue), the Lamport

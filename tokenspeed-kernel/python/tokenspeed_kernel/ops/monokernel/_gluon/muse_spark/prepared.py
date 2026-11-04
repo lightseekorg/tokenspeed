@@ -40,11 +40,11 @@ from tokenspeed_kernel.ops.communication._iris import (
     IrisGroup,
     get_or_create_context,
 )
-from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
+from tokenspeed_kernel.ops.monokernel import PlanKey
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (
     MAX_ROWS,
     MuseNativeIrisState,
 )
-from tokenspeed_kernel.ops.monokernel import PlanKey
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (
     ATT_BLOCK_M,
     EXCHANGE_WORDS,

@@ -224,7 +224,7 @@ def test_h6_push_compiles_at_8_waves():
     assert not any("vmcnt" in l for l in lines[first:last])
 
 
-from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E402
     H4SinkArgs,
     MuseNativeView,
     clear_next_copies,
@@ -369,7 +369,7 @@ def test_fused_layer_hop_compiles_at_8_waves(role):
 def test_every_cleared_area_splits_into_whole_sender_shares():
     """128 senders clear equal 16-byte-multiple shares of every area copy, and
     the area sizes follow the 32-row geometry the hop bodies index."""
-    from tokenspeed_kernel.ops.communication._iris.muse_spark import fused_layer as f
+    from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import iris as f
 
     for area in f.CLEARED_AREAS:
         assert area.copy_words % (f.SENDERS * 4) == 0, area

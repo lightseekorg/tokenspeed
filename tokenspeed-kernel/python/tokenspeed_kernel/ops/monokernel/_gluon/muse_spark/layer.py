@@ -66,7 +66,9 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     muse_attntail_read_box,
     muse_attntail_read_box_rows,
 )
-from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
+from tokenspeed_kernel.ops.monokernel import PlanKey
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import plan_variants
+from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (
     BOX_WORDS,
     H1_SHARD,
     H1_WORDS,
@@ -88,8 +90,6 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
     unp_sums_publish,
     xn_wait,
 )
-from tokenspeed_kernel.ops.monokernel import PlanKey
-from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import plan_variants
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import InputStrides
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     AttentionConfig,
@@ -261,7 +261,7 @@ assert all(
 )
 assert MAX_ROWS % 16 == 0
 
-# Failure sites of the layer's own waits (fused_layer's hop ends use
+# Failure sites of the layer's own waits (iris.py hop ends use
 # FIRST_KERNEL_SITE + 16 .. + 22, the MoE stream + 8 and + 9).
 SITE_RECORDS = FIRST_KERNEL_SITE + 32
 SITE_BOX = SITE_RECORDS + 1
@@ -1431,7 +1431,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     xs_ptr,
     deadline_ticks,
     label,
-    # Iris areas (fused_layer.MuseNativeIrisState.view_args()).
+    # Iris areas (iris.MuseNativeIrisState.view_args()).
     heaps,
     rank,
     box,
