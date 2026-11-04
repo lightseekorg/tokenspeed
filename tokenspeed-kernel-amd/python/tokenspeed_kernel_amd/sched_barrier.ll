@@ -86,3 +86,15 @@ entry:
   call void @llvm.amdgcn.s.waitcnt(i32 3952)
   ret i32 0
 }
+
+; An f32 value LLVM must treat as new: llvm.arithmetic.fence emits no
+; instruction, but no optimization looks through it, so arithmetic on the
+; result is neither merged with the same arithmetic on the input (CSE) nor
+; reassociated across it.
+declare float @llvm.arithmetic.fence.f32(float)
+
+define float @__tokenspeed_sched_arithmetic_fence_f32(float %x) alwaysinline {
+entry:
+  %r = call float @llvm.arithmetic.fence.f32(float %x)
+  ret float %r
+}

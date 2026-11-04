@@ -132,6 +132,16 @@ def _mha_decode_sliding_split():
     return _compile_gfx950(fn, types, constexprs, 4, options=_sched_options())
 
 
+def _mha_decode_split():
+    # Full attention split over the KV pages; the reduce kernel merges.
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        gluon_mha_decode_gfx950 as fn,
+    )
+
+    constexprs = dict(_ATTENTION, NUM_KV_SPLITS=8, IS_SLIDING=False, WINDOW_LEFT=-1)
+    return _compile_gfx950(fn, _ATTENTION_POINTERS, constexprs, 4, (), _sched_options())
+
+
 def _mha_decode_balanced():
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
         gluon_mha_decode_balanced_gfx950 as fn,
@@ -570,6 +580,7 @@ VARIANTS = {
     "moe_stream-rows8": lambda: _moe_stream(8),
     "moe_stream-rows16": lambda: _moe_stream(16),
     "mha_decode_sliding_split": _mha_decode_sliding_split,
+    "mha_decode_split": _mha_decode_split,
     "mha_decode_balanced": _mha_decode_balanced,
     "sliding_tail-rows8": lambda: _sliding_tail(8),
     "sliding_tail-rows16": lambda: _sliding_tail(16),
@@ -611,11 +622,6 @@ INLINE_ASM = {
         _AMD + "gemm.fp16.decode_gemv:_pin",
         "keeps each K step's FMAs at their step instead of after every load",
         "a Gluon op that pins a value to a program point",
-    ),
-    "_opaque_f32": (
-        _AMD + "attention.mha.decode:_opaque_f32",
-        "keeps LLVM from reusing a product computed before this point",
-        "a Gluon op that hides a value's origin from the optimizer",
     ),
     "_issue_here": (
         _AMD + "moe.mxfp4.decode_stage2:_issue_here",

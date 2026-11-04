@@ -28,6 +28,7 @@ from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel_amd._scheduling import (
+    arithmetic_fence,
     release_drain,
     sched_compile_options,
     wave_uniform_i32,
@@ -794,22 +795,6 @@ class AttentionProgram:
 
 
 @gluon.jit
-def _opaque_f32(values):
-    """Return ``values`` through an empty side-effecting asm, so LLVM cannot
-    reuse expressions computed from them before this point."""
-    # asm: an empty template (no instruction). Gluon has no op that hides a
-    # value's origin from the optimizer.
-    return gl.inline_asm_elementwise(
-        asm="",
-        constraints="=v,0",
-        args=[values],
-        dtype=gl.float32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@gluon.jit
 def _stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
     """Load, wait for and consume one K/V page at a time; enough when other
     waves of the grid cover the load latency."""
@@ -921,7 +906,7 @@ def _stream_split_pipelined(
                 # value, and m_i * SM_SCALE fuses into the rescale's FMA. Here
                 # the next page would reuse this page's rounded m_new *
                 # SM_SCALE instead, changing the last bit.
-                m_i = _opaque_f32(m_i)
+                m_i = arithmetic_fence(m_i)
         pages = next_pages
         next_pages = later_pages
 
