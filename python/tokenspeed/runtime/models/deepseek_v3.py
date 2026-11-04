@@ -107,6 +107,7 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensor
 from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
 )
+from tokenspeed.runtime.layers.quantization.fp8 import preprocess_modelopt_mxfp8_weights
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
@@ -189,15 +190,10 @@ def absorb_mla_kv_b_proj(self_attn) -> None:
     w = kv_b_proj.weight
     if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         method = kv_b_proj.quant_method
-        # The absorbed pair carries no scale, so only float block scales are taken.
-        if not (
-            isinstance(method, Fp8LinearMethod)
-            and method.block_quant
-            and kv_b_proj.weight_scale_inv.is_floating_point()
-        ):
+        if not (isinstance(method, Fp8LinearMethod) and method.block_quant):
             raise NotImplementedError(
-                f"MLA weight absorption needs a block-FP8 kv_b_proj with float "
-                f"scales, got {type(method).__name__}"
+                f"MLA weight absorption needs a block-FP8 kv_b_proj, "
+                f"got {type(method).__name__}"
             )
         w = block_dequant(
             w, kv_b_proj.weight_scale_inv, method.quant_config.weight_block_size
@@ -2088,6 +2084,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
         )
+        weights = preprocess_modelopt_mxfp8_weights(weights, self.quant_config)
         for name, loaded_weight in weights:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers

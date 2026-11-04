@@ -58,7 +58,9 @@ from tokenspeed.runtime.layers.quantization.base_config import (
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config, Nvfp4W4A16Config
 from tokenspeed.runtime.layers.quantization.utils import (
+    block_dequant,
     modelopt_block_scale_to_2d,
+    modelopt_quantization_section,
     should_exclude_quant_module,
 )
 
@@ -199,16 +201,9 @@ class ModelOptMixedConfig(QuantizationConfig):
     def get_config_filenames() -> list[str]:
         return ["hf_quant_config.json"]
 
-    @staticmethod
-    def _quantization_section(config: dict[str, Any]) -> dict[str, Any]:
-        # hf_quant_config.json nests under "quantization"; config.json's
-        # quantization_config is flat.
-        section = config.get("quantization", config)
-        return section if isinstance(section, dict) else config
-
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ModelOptMixedConfig":
-        section = cls._quantization_section(config)
+        section = modelopt_quantization_section(config)
         quant_algo = section.get("quant_algo", "")
         if quant_algo != "MIXED_PRECISION":
             raise ValueError(
@@ -252,7 +247,7 @@ class ModelOptMixedConfig(QuantizationConfig):
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
         if not isinstance(hf_quant_cfg, dict):
             return None
-        section = cls._quantization_section(hf_quant_cfg)
+        section = modelopt_quantization_section(hf_quant_cfg)
         if section.get("quant_algo") == "MIXED_PRECISION":
             return "modelopt_mixed"
         return None
@@ -459,36 +454,19 @@ def _assert_routed_or_known(
     )
 
 
-def _expand_block_scale(
-    scale: torch.Tensor, n: int, k: int, block_n: int, block_k: int
-) -> torch.Tensor:
-    """Expand a 2-D block-scale grid to per-element [n, k] (ragged-clipped)."""
-    return (
-        scale.to(torch.float32)
-        .repeat_interleave(block_n, dim=0)[:n]
-        .repeat_interleave(block_k, dim=1)[:, :k]
-    )
-
-
 def _block_dequant_fp8_to_bf16(
     weight: torch.Tensor, scale: torch.Tensor, block_n: int, block_k: int
 ) -> torch.Tensor:
-    """Vectorized per-block dequant ``(fp8 * f32 scale) -> bf16``.
+    """Per-block dequant ``(fp8 * f32 scale) -> bf16``.
 
-    Ragged trailing blocks are handled by clipping the expanded scale grid.
-    Runs on CUDA when available (load-time throughput; the quantization utils
-    ``block_dequant`` loops per tile — tolerable for today's few small
-    dequant-routed tensors such as Kimi-K3's per-layer f_b_proj, but this
-    vectorized form keeps the path shape-agnostic).
+    Runs on CUDA when available for load-time throughput.
     """
     if weight.dtype not in _FP8_WEIGHT_DTYPES:
         raise TypeError(f"expected an FP8 weight to dequantize, got {weight.dtype}")
     if weight.device.type != "cuda" and torch.cuda.is_available():
         weight = weight.cuda()
         scale = scale.cuda()
-    n, k = weight.shape
-    s_full = _expand_block_scale(scale, n, k, block_n, block_k)
-    return (weight.to(torch.float32) * s_full).to(torch.bfloat16)
+    return block_dequant(weight, scale, [block_n, block_k]).to(torch.bfloat16)
 
 
 def preprocess_fp8_pb_wo_weights(

@@ -113,7 +113,7 @@ def test_fp8_kv_b_without_block_scales_is_refused():
     assert attn.w_kc is None and attn.w_vc is None
 
 
-def test_ue8m0_scaled_kv_b_is_refused():
+def test_mxfp8_kv_b_is_dequantized_with_its_e8m0_scales():
     attn = _Attention(
         Mxfp8Config(
             is_checkpoint_fp8_serialized=True,
@@ -122,9 +122,19 @@ def test_ue8m0_scaled_kv_b_is_refused():
             scale_fmt="ue8m0",
         )
     )
+    gen = torch.Generator().manual_seed(0)
+    weight = torch.randn(HEADS * (NOPE + VDIM), LATENT, generator=gen)
+    attn.kv_b_proj.weight.data.copy_(weight.to(torch.float8_e4m3fn))
+    exponents = torch.randint(
+        120, 134, (HEADS * (NOPE + VDIM), LATENT // 32), generator=gen
+    ).to(torch.uint8)
+    attn.kv_b_proj.weight_scale_inv.data.copy_(exponents)
 
-    with pytest.raises(NotImplementedError, match="float scales"):
-        absorb_mla_kv_b_proj(attn)
+    absorb_mla_kv_b_proj(attn)
+
+    factors = torch.exp2(exponents.float() - 127).repeat_interleave(32, 1)
+    dequantized = attn.kv_b_proj.weight.float() * factors
+    _assert_absorbed(attn, dequantized.to(torch.bfloat16))
 
 
 def test_deepseek_v3_post_load_refuses_a_per_tensor_fp8_kv_b():

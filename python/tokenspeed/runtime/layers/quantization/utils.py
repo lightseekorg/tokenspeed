@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
+from typing import Any
 
 import numpy
 import torch
@@ -428,7 +429,12 @@ def block_dequant(
     x_q_block: torch.Tensor,
     x_s: torch.Tensor,
     block_size: list[int],
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
+    """FP32 values of a block-quantized 2-D weight.
+
+    ``x_s`` holds one scale per ``block_size`` tile (ragged trailing tiles
+    included): float, or E8M0 exponents stored as ``uint8``.
+    """
     block_n, block_k = block_size[0], block_size[1]
     n, k = x_q_block.shape
     n_tiles = (n + block_n - 1) // block_n
@@ -439,24 +445,24 @@ def block_dequant(
             f"({n_tiles}, {k_tiles})."
         )
 
-    x_dq_block = x_q_block.to(torch.float32)
+    if x_s.dtype == torch.uint8:
+        x_s = x_s.view(torch.float8_e8m0fnu)
+    scale = (
+        x_s.to(torch.float32)
+        .repeat_interleave(block_n, dim=0)[:n]
+        .repeat_interleave(block_k, dim=1)[:, :k]
+    )
+    return x_q_block.to(torch.float32) * scale
 
-    x_dq_block_tiles = [
-        [
-            x_dq_block[
-                j * block_n : min((j + 1) * block_n, n),
-                i * block_k : min((i + 1) * block_k, k),
-            ]
-            for i in range(k_tiles)
-        ]
-        for j in range(n_tiles)
-    ]
 
-    for i in range(k_tiles):
-        for j in range(n_tiles):
-            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
+def modelopt_quantization_section(config: dict[str, Any]) -> dict[str, Any]:
+    """The ModelOpt quantization fields of ``config``.
 
-    return x_dq_block
+    hf_quant_config.json nests them under ``"quantization"``; config.json's
+    ``quantization_config`` is flat.
+    """
+    section = config.get("quantization", config)
+    return section if isinstance(section, dict) else config
 
 
 def modelopt_block_scale_to_2d(scale: torch.Tensor) -> torch.Tensor:

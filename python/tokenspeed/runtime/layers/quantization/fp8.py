@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch
@@ -30,6 +31,7 @@ from tokenspeed.runtime.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
 )
+from tokenspeed.runtime.layers.quantization.utils import modelopt_quantization_section
 from tokenspeed.runtime.utils import log_info_on_rank0
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -59,10 +61,11 @@ class Fp8Config(QuantizationConfig):
         weight_block_size: list[int] = None,
         scale_fmt: str | None = None,
         modules_to_convert: list[str] | None = None,
+        exclude_modules: list[str] | None = None,
     ) -> None:
         if not is_checkpoint_fp8_serialized:
             ignored_layers = (ignored_layers or []) + self.ONLINE_IGNORED_LAYERS
-        super().__init__(ignored_layers=ignored_layers)
+        super().__init__(ignored_layers=ignored_layers, exclude_modules=exclude_modules)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -146,7 +149,12 @@ class Fp8Config(QuantizationConfig):
 
 
 class Mxfp8Config(Fp8Config):
-    """Config class for MXFP8."""
+    """Config class for MXFP8.
+
+    Also loads ModelOpt ``quant_algo: MXFP8`` exports: E4M3 weights with one
+    E8M0 scale per 1x32 block, dynamically quantized activations, and
+    ``exclude_modules`` globs.
+    """
 
     weight_scale_dtype = torch.uint8
 
@@ -155,11 +163,58 @@ class Mxfp8Config(Fp8Config):
         return "mxfp8"
 
     @classmethod
+    def get_config_filenames(cls) -> list[str]:
+        return ["hf_quant_config.json"]
+
+    @classmethod
     def from_config(cls, config: dict[str, Any]) -> Mxfp8Config:
+        section = modelopt_quantization_section(config)
+        if section.get("quant_algo") == "MXFP8":
+            return cls(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[1, 32],
+                scale_fmt="ue8m0",
+                exclude_modules=section.get("exclude_modules") or section.get("ignore"),
+            )
         config = dict(config)
         if config.get("scale_fmt") is None:
             config["scale_fmt"] = "ue8m0"
         return super().from_config(config)
 
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
+        if (
+            isinstance(hf_quant_cfg, dict)
+            and modelopt_quantization_section(hf_quant_cfg).get("quant_algo") == "MXFP8"
+            and user_quant in (None, cls.get_name())
+        ):
+            return cls.get_name()
+        return None
+
     def moe_weight_dtype(self, prefix: str = "") -> str:
         return "fp8"
+
+
+def preprocess_modelopt_mxfp8_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    quant_config: QuantizationConfig | None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Rename ModelOpt MXFP8 block scales to the runtime parameter names.
+
+    ModelOpt stores each E8M0 scale grid as ``weight_scale``, as ``uint8`` or
+    ``float8_e8m0fnu``; :class:`Fp8LinearMethod` and the FP8 MoE weights
+    register it as a ``uint8`` ``weight_scale_inv``. Every other tensor, and
+    every tensor of other quant configs, passes through unchanged.
+    """
+    if not isinstance(quant_config, Mxfp8Config):
+        yield from weights
+        return
+
+    for name, weight in weights:
+        if name.endswith(".weight_scale") and weight.dtype in (
+            torch.uint8,
+            torch.float8_e8m0fnu,
+        ):
+            name, weight = f"{name}_inv", weight.view(torch.uint8)
+        yield name, weight
