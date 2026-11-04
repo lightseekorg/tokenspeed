@@ -27,9 +27,9 @@ per-wave facts Gluon cannot express, until Gluon can state them itself.
 
 - :func:`wave_scalar`: a value uniform within a wave but different across
   waves, in an SGPR (``llvm.amdgcn.readfirstlane``, visible to the
-  compiler's hazard checks). Use it for addresses, trip counts and branches whose
-  bodies hold no workgroup-wide operation (reduction across waves, layout
-  conversion through LDS, barrier).
+  compiler's hazard checks). Use it for addresses, trip counts and branches
+  whose bodies hold no workgroup-wide operation (reduction across waves,
+  layout conversion through LDS, barrier).
 - :func:`opaque_zero`: an SGPR zero the compiler cannot fold. Indexing a
   ``[1, ...]`` shared view with it keeps loop-invariant LDS reads inside a
   loop instead of hoisting every iteration's reads into registers.
@@ -38,11 +38,11 @@ per-wave facts Gluon cannot express, until Gluon can state them itself.
 - :func:`issue_order`: a point vector memory operations do not cross, so a
   wave issues the ones before it first (the queue then completes them first).
 - :func:`lds_store_count`, :func:`lds_spin_until` and
-  :func:`lds_spin_bounded`: an LDS exchange among
-  the waves of a workgroup that the compiler does not model, so it adds no
-  barrier. The waves share LDS and one wave's LDS operations complete in
-  issue order: a wave that sees a counter value also sees every store its
-  writers made before their increments.
+  :func:`lds_spin_bounded`: an LDS exchange among the waves of a workgroup
+  that the compiler does not model, so it adds no barrier. The waves share
+  LDS and one wave's LDS operations complete in issue order: a wave that
+  sees a counter value also sees every store its writers made before their
+  increments.
 """
 
 from tokenspeed_kernel_amd._triton import gl, gluon
@@ -158,9 +158,10 @@ def lds_store_count(data, offsets, values, count, counters):
 
 @gluon.jit
 def lds_spin_until(count, counter, target):
-    """Wait until the word at byte ``counter`` into the shared buffer ``count`` reaches
-    ``target`` (unsigned). ``counter`` and ``target`` are int32 tensors with
-    one element per lane, as in ``BlockedLayout([1], [64], [num_warps], [0])``.
+    """Wait until the word at byte ``counter`` into the shared buffer
+    ``count`` reaches ``target`` (unsigned). ``counter`` and ``target`` are
+    int32 tensors with one element per lane, as in
+    ``BlockedLayout([1], [64], [num_warps], [0])``.
 
     Reads LDS only (``lgkmcnt``), so the wave's vector loads stay in flight.
     Later shared-memory reads stay after it (memory clobber).

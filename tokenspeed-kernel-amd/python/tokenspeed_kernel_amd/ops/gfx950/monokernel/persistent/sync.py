@@ -104,8 +104,8 @@ _SITE_CLAIM = gl.constexpr(SITE_CLAIM)
 _SITE_JOIN = gl.constexpr(SITE_JOIN)
 _SITE_ABORTED = gl.constexpr(SITE_ABORTED)
 
-# Polls read the clock and the abort word once per this many retries; doing
-# it on every retry costs ~0.2 us per handoff round trip.
+# Polls read the clock and the abort word once per this many retries, so a
+# wait met quickly pays for neither.
 _CHECK_RETRIES = gl.constexpr(64)
 
 # Join counters: one line per XCD, then one line for the whole grid, in two
@@ -366,7 +366,7 @@ def poll_stop_site(launch, site):
 @gluon.jit
 def poll_check(launch, start, retries, SCALAR: gl.constexpr):
     """The deadline and abort check of a poll loop, for loops written
-    elsewhere (the Iris hop waits); call it every 64 retries with ``start``
+    elsewhere (such as cross-GPU waits); call it every 64 retries with ``start``
     initialized to 0. Returns ``(stop, start)``: the first check starts the
     deadline, so a wait met within 64 retries reads no clock. ``SCALAR``
     reads the abort word with a scalar load, which does not wait behind the
@@ -466,8 +466,8 @@ def poll_until_all(word_ptrs, valid, expected, launch, LOAD: gl.constexpr):
 @gluon.jit
 def store_pairs(pair_ptrs, values, launch, mask, SCOPE: gl.constexpr):
     """Publish int32 ``values`` as (value, tag) pairs: one 8-byte relaxed
-    atomic store each (``dwordx2``), ``tag << 32 | value``, the AR norm sums'
-    format. No wait after it.
+    atomic store each (``dwordx2``), ``tag << 32 | value``. No wait after
+    it.
 
     ``SCOPE``: ``"cta"`` (``sc0``) for readers on this XCD only, ``"gpu"``
     (``sc1``) for readers on any XCD. Every pair is written at most once per
@@ -515,8 +515,8 @@ def poll_tags16(word_ptr, tag, launch, GLC: gl.constexpr, BARRIER: gl.constexpr)
     ``tag``, with scalar loads only (never behind the wave's vector loads).
 
     ``GLC`` (no default): ``True`` reads past the scalar cache (same-XCD
-    words, or uncached memory, measured); ``False`` reads through it after
-    ``s_dcache_inv`` (unmeasured). ``BARRIER``: end with a workgroup barrier
+    words, or uncached memory); ``False`` reads through it after
+    ``s_dcache_inv``. ``BARRIER``: end with a workgroup barrier
     (other waves use what the tags guard), or only with a per-wave acquire
     (this wave alone polls and reads, as in per-wave work loops). Returns
     whether the tags were seen, per wave.
@@ -548,7 +548,8 @@ def grid_join(join_ptr, launch, on_expiry, SET: gl.constexpr, detail):
     """Wait until every workgroup of the grid has reached this join.
 
     ``detail`` names the join in a failure record (such as the phase before
-    it). Prefer data-driven waits: a grid join costs ~2.1 us.
+    it). Prefer data-driven waits: a grid join waits for the slowest
+    workgroup.
 
     A two-level top-bit toggle (``JOIN_WORDS`` int32 words, zeroed once when
     the state is created): the 32 workgroups of an XCD arrive on their XCD's
