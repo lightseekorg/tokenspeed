@@ -186,6 +186,11 @@ if pid == 0:
     assert settings["max_split_size"] == 64 * 1024 * 1024
     if os.environ["EXPECT_PINNED_THRESHOLD"] == "1":
         assert settings["max_round_threshold"] == 1024 * 1024 * 1024
+    staged = tensor.to("cpu", non_blocking=True)
+    torch.cuda.synchronize()
+    assert staged.item() == 1
+    del staged
+    assert torch.empty(1, pin_memory=True).is_pinned()
     os._exit(0)
 _, status = os.waitpid(pid, 0)
 assert os.waitstatus_to_exitcode(status) == 0
@@ -198,6 +203,11 @@ settings = torch.cuda.memory._snapshot()["allocator_settings"]
 assert settings["max_split_size"] == 64 * 1024 * 1024
 if os.environ["EXPECT_PINNED_THRESHOLD"] == "1":
     assert settings["max_round_threshold"] == 1024 * 1024 * 1024
+staged = tensor.to("cpu", non_blocking=True)
+torch.cuda.synchronize()
+assert staged.item() == 1
+del staged
+assert torch.empty(1, pin_memory=True).is_pinned()
 """
 result = os.spawnve(os.P_WAIT, sys.executable,
     [sys.executable, "-c", worker],
