@@ -38,9 +38,8 @@ lengths.
 
 from __future__ import annotations
 
-import importlib.util
-
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_persistent_topk,
     persistent_topk,
@@ -59,6 +58,11 @@ __all__ = [
 ]
 
 platform = current_platform()
+
+# FlashMLA's DSA kernels register only where the package is present.
+_HAS_FLASH_MLA = (
+    platform.is_nvidia and platform.is_hopper_plus and has_optional_package("flash_mla")
+)
 
 if platform.is_hopper_plus:
     from tokenspeed_kernel.ops.attention.mla.cuda import (
@@ -246,11 +250,7 @@ def _finish_sparse_attention(
     return (result, lse) if return_lse else result
 
 
-if (
-    platform.is_nvidia
-    and platform.is_hopper_plus
-    and importlib.util.find_spec("flash_mla") is not None
-):
+if _HAS_FLASH_MLA:
 
     @register_kernel(
         "attention",
@@ -335,11 +335,7 @@ if (
         return _finish_sparse_attention(result, lse, slots, out, return_lse)
 
 
-if (
-    platform.is_nvidia
-    and platform.is_hopper_plus
-    and importlib.util.find_spec("flash_mla") is not None
-):
+if _HAS_FLASH_MLA:
 
     @register_kernel(
         "attention",
