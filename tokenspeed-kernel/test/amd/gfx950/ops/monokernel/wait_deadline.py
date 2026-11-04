@@ -20,8 +20,7 @@
 
 """The wait deadline persistent-kernel tests and benchmarks launch with.
 
-Serving derives its deadline from the server's watchdog; tests and
-benchmarks pass this one instead. It must still outlast a rank that reaches
+Serving passes its own deadline; tests and benchmarks pass this one. It must still outlast a rank that reaches
 its first launch late (its first compile, or loading the binary), because the
 tests do not line the ranks up before that launch.
 """
