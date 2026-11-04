@@ -69,13 +69,13 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     mm_a16w16_column_relay_gfx950,
     mm_a16w16_column_relay_weights_gfx950,
 )
-from tokenspeed_kernel_amd.ops.gfx950.layernorm.deferred import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
+    sigmoid_bias_topk_keys_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.deferred_norm import (
     deferred_norm_rows_gfx950,
     deferred_norm_scales_gfx950,
     deferred_norm_terms_gfx950,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
-    sigmoid_bias_topk_keys_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
     ERROR_ABORT,

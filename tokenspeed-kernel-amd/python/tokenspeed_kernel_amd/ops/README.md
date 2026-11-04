@@ -392,7 +392,7 @@ and adds the waves in wave order in registers.
 
 ### gfx950 deferred residual norms
 
-`layernorm/deferred.py` folds a residual boundary's post-norm and the next
+`monokernel/deferred_norm.py` folds a residual boundary's post-norm and the next
 pre-norm into their consumers.
 
 #### Contract
