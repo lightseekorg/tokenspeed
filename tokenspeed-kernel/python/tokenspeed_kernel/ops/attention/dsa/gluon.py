@@ -756,7 +756,7 @@ if current_platform().is_amd:
             launch_gluon_dsa_index_candidates_gfx950,
         )
         from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-            gluon_dsa_logical_topk_gfx950,
+            gluon_dsa_row_bounded_logical_topk_gfx950,
         )
 
         if not 0 < topk <= 2048:
@@ -792,7 +792,8 @@ if current_platform().is_amd:
             mask_tail=False,
         )
         select_width = next(width for width in (512, 1024, 2048) if width >= topk)
-        offsets, _ = gluon_dsa_logical_topk_gfx950(
+        # Owned rows are a fraction of the table-wide scores buffer.
+        offsets, _ = gluon_dsa_row_bounded_logical_topk_gfx950(
             scores, torch.zeros_like(lengths), lengths, topk=select_width
         )
         if select_width != topk:
@@ -805,3 +806,43 @@ if current_platform().is_amd:
         return gather_index_candidates(
             offsets, scores, positions, page_size, lengths=lengths
         )
+
+    @register_kernel(
+        "attention",
+        "dsa_merge_candidates",
+        name="gluon_dsa_merge_candidates_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {format_signature(records=dense_tensor_format(torch.int32))}
+        ),
+        traits={"topk": frozenset({512, 1024, 2048})},
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_dsa_merge_candidates_gfx950(
+        records: torch.Tensor, *, topk: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``dsa_merge_candidates`` with the one-block radix top-k. Only its
+        k-th score is used: the selection is redone from it deterministically,
+        as every KVP rank must select the same tied candidates."""
+        from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
+            rank_major_scores,
+            select_through_threshold,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+            gluon_dsa_logical_topk_gfx950,
+        )
+
+        scores = rank_major_scores(records)
+        rows, columns = scores.shape
+        order, _ = gluon_dsa_logical_topk_gfx950(
+            scores,
+            torch.zeros((rows,), device=scores.device, dtype=torch.int32),
+            torch.full((rows,), columns, device=scores.device, dtype=torch.int32),
+            topk=topk,
+        )
+        return select_through_threshold(records, scores, order, topk=topk)
