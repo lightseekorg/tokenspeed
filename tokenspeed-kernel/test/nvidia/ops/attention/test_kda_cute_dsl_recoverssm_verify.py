@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_nvidia
+from utils import assert_no_cute_compile, is_nvidia
 
 if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
@@ -557,6 +557,19 @@ VALUE_CASES = [
 )
 def test_cute_dsl_recoverssm_verify_matches_reference(case: dict) -> None:
     _compare(_inputs(seed=case["batch"] * 7 + case["width"], **case))
+
+
+def test_cute_dsl_recoverssm_verify_does_not_recompile_across_batches() -> None:
+    # At twelve heads, batches 4 to 16 share the 64-row tile: warm once, then vary
+    # the batch, contents, boundaries, pages and record starts without a trace.
+    _compare(_inputs(batch=8, width=8, lower_bound=-5.0, seed=31))
+    with assert_no_cute_compile():
+        for batch, seed in ((4, 32), (13, 33), (16, 34)):
+            _compare(
+                _inputs(
+                    batch=batch, width=8, lower_bound=-5.0, seed=seed, start=seed * 997
+                )
+            )
 
 
 def test_all_empty_windows_write_nothing() -> None:
