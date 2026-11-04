@@ -82,9 +82,7 @@ through memory instead of kernel boundaries. They carry no model knowledge.
     read what the tags guard) or only with `wave_acquire` (this wave reads
     alone, as in per-wave loops).
   - `store_pairs` / `poll_pairs`: (value, tag) pairs, one 8-byte store each
-    (`tag << 32 | value`), so no drain and no flag. `poll_pair_sums8` reads
-    eight lines of four same-XCD pairs with scalar loads and returns their
-    sums in line order.
+    (`tag << 32 | value`), so no drain and no flag.
   - Payload plus flag: the payload stores, `release_drain()` in every
     storing wave, `gl.barrier()`, then the flag.
 - `grid_join(joins, launch, on_expiry, SET, detail)` waits for every
