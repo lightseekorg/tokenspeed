@@ -672,6 +672,7 @@ def test_a_speculative_cap_below_attention_tp_starts_and_is_honored(cap):
             host_group_packing=(),
             max_retracted_requests=0,
             host_write_policy="write_through",
+            prefill_decode_interval=args.prefill_decode_interval,
             storage_config=None,
             cache_groups=[
                 ts.CacheGroupConfig(
