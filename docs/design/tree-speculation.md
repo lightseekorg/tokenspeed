@@ -40,15 +40,6 @@ selection after step 0 (`Eagle._seed_tree_lanes`) and, in a stateful backend's
 commit, the steps that read `accepted_path` (the GDN source row and replay
 payload packing).
 
-### Shared target heads use the LM-head group
-
-A drafter sharing the target's head must construct its head and logits
-processor with `mapping.lm_head`, including Qwen3.5 and Qwen4 MTP. Attention
-TP can differ from LM-head TP under attention DP. A replicated head uses
-its complete vocabulary locally; a vocabulary-sharded head uses the LM-head
-group and the DP logits exchange. The startup layout check remains enabled
-for both chain and tree speculation.
-
 ### Position follows depth, slot follows node index
 
 Node `i` of a request's verify window has RoPE position `vc + depth[i]` and KV
