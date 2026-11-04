@@ -97,6 +97,9 @@ def _execute(handle, plan, planned):
         ("DFLASH", True, False, False, False, False),
     ],
 )
+# Whether the checkpoint declares the DSA padded-replay contract (Kimi-K3.1):
+# only then does the aggregated role agree on its prefill graph plan.
+@pytest.mark.parametrize("declares_padded_replay", [True, False])
 def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch,
     algorithm,
@@ -105,10 +108,16 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     reserve,
     warmup_fails,
     expected_rewarm,
+    declares_padded_replay,
 ):
     """Drive real startup/rebind; substitute unavailable weights/cache/device work."""
     from tokenspeed.runtime.engine import scheduler_utils
-    from tokenspeed.runtime.execution import cudagraph_memory, device, factory
+    from tokenspeed.runtime.execution import (
+        cudagraph_memory,
+        device,
+        factory,
+        prefill_graph,
+    )
     from tokenspeed.runtime.layers.attention import registry
 
     events = []
@@ -121,6 +130,8 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
 
     class Executor:
         attn_backend = draft_attn_backend = None
+        # Read by Kimi-K3.1's aggregated plan agreement, faked out below.
+        prefill_graph = None
 
         def __init__(self):
             self.config = SimpleNamespace(prefill_only=prefill_only)
@@ -184,6 +195,13 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     )
     monkeypatch.setattr(registry, "create_attn_components", build)
     monkeypatch.setattr(cudagraph_memory, "probe_cudagraph_memory", probe)
+    # Kimi-K3.1's aggregated role agrees on the prefill graph plan like the
+    # prefill role: its eager DSA breaks run collectives too.
+    monkeypatch.setattr(
+        prefill_graph,
+        "check_rank_uniform_prefill_plan",
+        lambda owner, server_args: events.append(("plan-check",)),
+    )
     monkeypatch.setattr(device, "probe_arena_floor", lambda *args, **kwargs: 1)
     monkeypatch.setattr(
         device,
@@ -200,13 +218,14 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch.setattr(scheduler_utils, "pool_to_cache_groups", lambda pool: [])
     args = SimpleNamespace(
         disaggregation_mode="null",
+        # Read by the EPD receive pool sizing (#2714): no external encoder here.
+        enable_external_encoder=False,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
         disable_cudagraph_memory_reserve=not reserve,
         enforce_eager=False,
         enable_memory_saver=False,
-        enable_external_encoder=False,
         device="cuda",
         speculative_algorithm=algorithm,
     )
@@ -214,7 +233,11 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     with pytest.raises(failure):
         device.build_device_side(
             server_args=args,
-            model_config=SimpleNamespace(context_len=4096, is_multimodal_active=False),
+            model_config=SimpleNamespace(
+                context_len=4096,
+                is_multimodal_active=False,
+                dsa_padded_prefill_replay=declares_padded_replay,
+            ),
             draft_model_config=None,
             gpu_id=0,
             global_rank=0,
@@ -225,6 +248,11 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             max_batch_size=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
+    # Once, before tuning and any capture, where the checkpoint declares the
+    # contract; other models' aggregated boots run no agreement.
+    assert events.count(("plan-check",)) == int(declares_padded_replay)
+    if declares_padded_replay:
+        assert events[0] == ("plan-check",)
     rebound_warmup = ("warmup", 1, (1,), False)
     assert (rebound_warmup in events) == expected_rewarm
     if reserve:

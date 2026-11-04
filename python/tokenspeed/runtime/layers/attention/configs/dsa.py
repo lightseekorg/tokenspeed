@@ -100,13 +100,18 @@ def dsa_history_gather_workspace_rows(max_model_len: int, *, page_size: int) -> 
     return -(-int(max_model_len) // int(page_size)) * int(page_size)
 
 
-def dsa_history_gather_page_size(config: AttnConfig) -> int:
+def dsa_kernel_page_size(config: AttnConfig) -> int:
     """The kernel page size the GPU DSA leaf runs at under ``config``: the
     explicit override, else the sparse kernels' fixed page
     (``DSABackend.resolve_kernel_page_size`` makes the same choice)."""
     if config.kernel_page_size is not None:
         return int(config.kernel_page_size)
     return DSA_SPARSE_PAGE_SIZE
+
+
+def dsa_history_gather_page_size(config: AttnConfig) -> int:
+    """The kernel page size the history gather workspace rounds rows to."""
+    return dsa_kernel_page_size(config)
 
 
 def dsa_history_gather_workspace_bytes(
@@ -137,6 +142,61 @@ def dsa_history_gather_workspace_bytes(
     )
 
 
+def dsa_padded_prefill_replay(
+    server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+) -> bool:
+    """Whether the DSA target replays breakable prefill graphs (padded to a
+    token bucket) with its DSA attention at eager breaks.
+
+    The model declares the contract (``dsa_padded_prefill_replay``: every DSA
+    operation sits in one eager break that narrows a padded replay to its
+    live rows). It is admitted for the target on the roles that run prefill
+    forwards: the PD prefill role and the aggregated (``null``) role, never
+    the PD decode role, whose extend forwards are not prompt prefills. On the
+    prefill role it further needs layerwise KV transfer off
+    (``--disaggregation-layerwise-interval 0``): the transfer step counter it
+    arms there turns the inline KDA route off. The aggregated role transfers
+    nothing and arms no counter, so the interval, which defaults to 1, does
+    not apply to it. Both roles need no pipeline stages (whose DSpark context
+    producer the captured segments would bake in) and no
+    ``--disable-dsa-prefill-graph``.
+
+    The aggregated role is opt-in, and admits it only under the conditions
+    it has been checked in. The launch must name its bucket ladder
+    (``--prefill-graph-capture-token-sizes``): the automatic ladder (up to
+    ``min(8192, chunk)`` tokens in steps of at most 12.5 % from a 16-token
+    floor, an inline variant per bucket) has not been measured beside the
+    decode ladder, and an aggregated launch that names none keeps its
+    prefill eager, as before the role was admitted. And it must leave
+    ``--enable-mixed-batch`` off (aggregated DCP refuses it anyway): a MIXED
+    round may replay a padded bucket on the ordinary route with decode rows
+    inside the narrowed DSA break, which no test covers. Every replayed
+    round is then a pure extend and may take the inline KDA variants.
+
+    On the aggregated role the prefill graphs live beside the decode graphs:
+    the decode ladder is captured first into its own private pool, then the
+    prefill buckets into theirs on the same capture stream. With a drafter,
+    both record the FULL hidden-state capture it reads (no context producer
+    without pipeline stages).
+    """
+    if server_args.disaggregation_mode == "prefill":
+        role_admits = server_args.disaggregation_layerwise_interval <= 0
+    elif server_args.disaggregation_mode == "null":
+        role_admits = (
+            bool(server_args.prefill_graph_capture_sizes)
+            and not server_args.enable_mixed_batch
+        )
+    else:
+        role_admits = False
+    return (
+        model_config.dsa_padded_prefill_replay
+        and not is_draft
+        and role_admits
+        and server_args.pipeline_parallel_size == 1
+        and not server_args.disable_dsa_prefill_graph
+    )
+
+
 @dataclass(kw_only=True)
 class DSAConfig(MLAConfig):
     is_dsa: ClassVar[bool] = True
@@ -146,6 +206,8 @@ class DSAConfig(MLAConfig):
     # Storage of the index-key plane, one of INDEX_K_FORMATS.
     index_k_format: str
     index_kpool: int | None = None
+    # The DSA leaf admits breakable prefill graphs (dsa_padded_prefill_replay).
+    padded_prefill_replay: bool = False
 
     def __post_init__(self) -> None:
         # None is a DSA configure-attention hook that named no plane.
@@ -167,6 +229,9 @@ class DSAConfig(MLAConfig):
             # plugin that scores the checkpoint's bf16 keys names "bf16".
             index_k_format=model_config.index_k_format,
             index_kpool=getattr(model_config, "index_kpool", None),
+            padded_prefill_replay=dsa_padded_prefill_replay(
+                server_args, model_config, is_draft
+            ),
         )
 
     @classmethod

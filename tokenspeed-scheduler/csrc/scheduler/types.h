@@ -87,6 +87,19 @@ struct SchedulerConfig {
     // Sum of ceil((cached prefix + this chunk) / prefix_granularity) across
     // all local prefill requests in one batch. Zero leaves this unbounded.
     std::int32_t max_kv_page_num{0};
+    // P role only, opt-in (0 = off): the round budget a new prompt may take
+    // AHEAD of an incomplete resident prefill when the whole rest of that
+    // prompt fits in one final chunk of at most this many input tokens. Off,
+    // an incomplete prefill holds the head of line for every round it
+    // spends chunking, so a short continuation turn arriving behind a long
+    // cold prompt waits for all of its chunks. On, the resident still
+    // advances by at least max_scheduled_tokens minus this every round and
+    // keeps capacity priority (Scheduler::scheduleShortFirst). The fused and
+    // D roles ignore it. The environment variable
+    // TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS sets it when it is left 0
+    // (Scheduler construction), so a deployment can turn it on without a
+    // server arg; an explicit value wins.
+    std::int32_t prefill_short_first_tokens{0};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the

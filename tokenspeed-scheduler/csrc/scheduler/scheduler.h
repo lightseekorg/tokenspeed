@@ -39,6 +39,7 @@
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
 #include "resource/allocator/req_pool_allocator.h"
+#include "scheduler/capacity_model.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
@@ -246,9 +247,16 @@ private:
         bool state_prefix_cached{false};
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
     };
+    // `final_chunk_only` (the short-first bypass, scheduleShortFirst): admit
+    // only a first chunk that completes the prompt within `remaining`, and
+    // otherwise nothing -- no cut at an in-forward checkpoint whose block
+    // does not fit. The re-check of the plan against the cache backs out
+    // before the KV-event registration; an Admit that fails after it leaves
+    // the registration behind, as every failed first-chunk admission does
+    // (it is idempotent). False is the ordinary admission.
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
                                                 std::int32_t remaining, std::int32_t decode_input_tokens,
-                                                std::int64_t kv_token_limit);
+                                                std::int64_t kv_token_limit, bool final_chunk_only = false);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
@@ -261,7 +269,18 @@ private:
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event);
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
-    AdmissionMatch matchPrefixAtAdmission(Request* request);
+    // `probe_only` fills just `probe` and `waits_for_eviction_store` (the
+    // short-first planner reads nothing else): no hash views and no prefix
+    // diagnostic, which only an admission emits.
+    AdmissionMatch matchPrefixAtAdmission(Request* request, bool probe_only = false);
+    // The input tokens a waiting prompt's first chunk debits when it carries
+    // the whole rest of the prompt within `budget`, shaped exactly as
+    // schedulePrefillFirstChunk shapes it: the uncached tokens plus the
+    // replay window re-fed before a hit (the op's input_length). nullopt
+    // when that chunk would be cut short of the prompt end (the budget, a
+    // junction, an in-forward State checkpoint reached from inside a page).
+    std::optional<std::int32_t> singleFinalChunkCost(const Request& request, const AdmissionMatch& match,
+                                                     std::int32_t budget) const;
     // Records an admission's fresh pages (to zero) and copies on the plan.
     void recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result);
     // copy_in_blocks and copy_in_point as for CacheCoordinator::Admit.
@@ -417,11 +436,13 @@ private:
 
     // A resumed chunk or a new prompt's first chunk. Waiting for storage
     // returns nullopt without reporting a capacity failure.
+    // `final_chunk_only` applies to a new prompt (schedulePrefillFirstChunk).
     std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
                                                              std::vector<LoadBackOperation>& load_backs,
-                                                             std::int32_t kv_page_budget);
+                                                             std::int32_t kv_page_budget,
+                                                             bool final_chunk_only = false);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
@@ -502,11 +523,42 @@ private:
                                std::vector<WriteBackOperation>& write_back_operations);
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
+    // `short_first_tokens` > 0 turns on the short-first bypass
+    // (SchedulerConfig::prefill_short_first_tokens; the P grammar passes it,
+    // the fused grammar 0). At 0 this is the head-of-line loop unchanged.
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                                  bool new_prompts_sealed, std::int32_t decode_reserve);
+                                  bool new_prompts_sealed, std::int32_t decode_reserve,
+                                  std::int32_t short_first_tokens);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
+    // The short-first bypass of the prefill head of line (see forward.cpp).
+    // The waiting prompts it admits beside an incomplete resident prefill,
+    // in submission order, and the round budget they keep from it.
+    struct ShortFirstPlan {
+        std::vector<Request*> prompts;
+        std::int32_t reserved_tokens{0};
+    };
+    // Runs the round's local prefill work when the bypass applies: the
+    // resident's chunk on the budget the bypass leaves it, then the planned
+    // prompts. False -- with nothing scheduled or changed -- when it does not
+    // apply, and the head-of-line loop runs as it always has.
+    bool scheduleShortFirst(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                            std::int32_t decode_reserve, std::int32_t short_first_tokens);
+    // Chooses the prompts (probes and arithmetic: no cache or FSM change,
+    // only the waiting-prompt memo) and applies the headroom guard.
+    ShortFirstPlan planShortFirst(const PlanBuild& build, std::span<Request* const> candidates, const Request& resident,
+                                  std::int32_t decode_reserve, std::int32_t short_first_tokens);
+    // LCM blocks one request of `tokens` (prompt plus decode reserve) can
+    // hold at its peak, plus the in-forward checkpoint's block per State
+    // group when that is on: the headroom guard's upper bound.
+    std::int64_t shortFirstLcmBlocksBound(std::int32_t tokens) const;
+    // One INFO line with every short-first counter (short_first_stats_).
+    void logShortFirstStats() const;
+
     SchedulerConfig config_;
+    // The per-request working-set model (MaxSingleRequestTokens, the
+    // short-first headroom guard), over config_.
+    CapacityModel capacity_model_;
     ReqPoolAllocator req_pool_allocator_;
     // One slot per retracted request: the index of its slot-state blob in
     // the runtime's arena, released by the FSM transition that drops the image.
@@ -543,6 +595,33 @@ private:
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work or leaves work in flight.
     std::int64_t stalled_rounds_{0};
+
+    // The short-first bypass probes the same waiting prompts round after
+    // round. Their candidate page hashes and prepared prefix keys are already
+    // memoized on the request (Request::PromptPrefixHashes, the Submitted
+    // admission's prefix_keys); this keeps only, by request id until its
+    // first chunk is admitted or it finishes, `passes_to_skip`: the passes
+    // planShortFirst still makes over a prompt a probe found too long for the
+    // share (kShortFirstPassesAfterTooLong). Filled and read only while the
+    // bypass is on (P role, prefill_short_first_tokens > 0); empty otherwise.
+    struct ShortFirstWaitingPrompt {
+        std::int32_t passes_to_skip{0};
+    };
+    std::unordered_map<std::string, ShortFirstWaitingPrompt> short_first_waiting_;
+    // Cumulative bypass counters, logged as they grow (logShortFirstStats):
+    // rounds and prompts admitted beside an incomplete resident and their
+    // input tokens; rounds whose headroom guard dropped a planned prompt; and
+    // rounds whose resident gave up tokens for planned prompts none of which
+    // could then be admitted (its admission evicted part of their hit, or
+    // the parents the guard counted were still pinned).
+    struct ShortFirstStats {
+        std::int64_t rounds{0};
+        std::int64_t prompts{0};
+        std::int64_t tokens{0};
+        std::int64_t guard_skips{0};
+        std::int64_t unused_reservations{0};
+    };
+    ShortFirstStats short_first_stats_;
 
     // Submission order -- the FIFO every scheduling phase walks, identical
     // on every rank because the mirrored schedulers receive identical

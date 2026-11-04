@@ -59,6 +59,8 @@ narrowed row count is rank-local, so the split graph is disabled there.
 from __future__ import annotations
 
 import bisect
+import os
+import zlib
 from contextlib import AbstractContextManager, contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
@@ -66,6 +68,7 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
 import torch
 import tqdm
 
+from tokenspeed.runtime.configs.dsa_kvp_prefill import canonical_dsa_kvp_prefill_levers
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
     HandoffSlot,
@@ -108,6 +111,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 # Smallest prefill bucket; below this, denser rungs would only add capture time.
@@ -118,6 +122,9 @@ PREFILL_BUCKET_STEP_DIVISOR: int = 8
 
 # Absolute rung-spacing cap, bounding the worst case at the top of the ladder.
 PREFILL_BUCKET_MAX_STEP: int = 512
+
+# Replays between two logs of the per-route replay counts.
+PREFILL_ROUTE_LOG_INTERVAL: int = 256
 
 
 def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
@@ -500,6 +507,9 @@ class PrefillGraph:
         self._encoder_handoff_storage: dict[HandoffSlot, torch.Tensor] = {}
         self._outputs: list[torch.Tensor] | None = None
         self._engaged_logged: set[str] = set()
+        # Replays per route ("ordinary", or "inline@<request capacity>"),
+        # logged by global rank 0 every PREFILL_ROUTE_LOG_INTERVAL replays.
+        self._route_counts: dict[str, int] = {}
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
         # One owner for ordinary and attention-containing captures. None is the
@@ -1312,6 +1322,7 @@ class PrefillGraph:
             )
         else:
             cap, output = self._captures[bucket, None]
+            route = "ordinary"
             if self.dp_size == 1 and self.attn_backend.step_counter is None:
                 capture_bs = self._merged_capture_bs(bucket, ctx)
                 ready = self.attn_backend.prepare_prefill_metadata(
@@ -1322,6 +1333,8 @@ class PrefillGraph:
                 )
                 if ready and capture_bs is not None:
                     cap, output = self._captures[bucket, capture_bs]
+                    route = f"inline@{capture_bs:d}"
+            self._count_route(route)
             with self._padded_to(ctx, bucket):
                 if self._expert_load_rows is not None:
                     self._expert_load_rows.mark_padded(
@@ -1341,6 +1354,25 @@ class PrefillGraph:
             logits_metadata,
             aux_hidden_states,
         )
+
+    def _count_route(self, route: str) -> None:
+        """Count a replay of ``route``; global rank 0 logs the route mix every
+        ``PREFILL_ROUTE_LOG_INTERVAL`` replays, so a run shows how many
+        forwards took the inline variants rather than the ordinary graph.
+
+        Every rank also logs the first replay of each route: a run of fewer
+        replays than the interval, such as an accuracy smoke, then still
+        shows which routes its replays took, the inline variants an
+        aggregated launch is meant to reach included."""
+        counts = self._route_counts
+        if route not in counts:
+            logger.info(f"prefill graph route first replayed: {route!s}")
+        counts[route] = counts.get(route, 0) + 1
+        if (
+            sum(counts.values()) % PREFILL_ROUTE_LOG_INTERVAL == 0
+            and self.config.global_rank == 0
+        ):
+            logger.info(f"prefill graph routes: {dict(sorted(counts.items()))!s}")
 
     def _replay_narrowed(
         self, bucket: int, ctx: ForwardContext, num_tokens: int
@@ -1545,4 +1577,94 @@ class PrefillGraph:
             f"{self.dp_size > 1 and ctx.global_num_tokens is not None!s} mode="
             f"{ctx.forward_mode!s} "
             "(mixed prefill+decode batches supported)",
+        )
+
+
+def check_rank_uniform_prefill_plan(
+    prefill_graph: PrefillGraph, server_args: ServerArgs
+) -> None:
+    """Fail the boot unless every rank will capture the same prefill graphs
+    and run the same KVP sparse prefill in their DSA breaks.
+
+    The ranks of an instance must take the same graph-or-eager decision,
+    bucket and variant for every forward: captured segments and the eager
+    breaks between them run collectives (a DSA break's KVP all-gathers and
+    all-to-all among them), so a rank running eager where its peers replay
+    hangs them. That decision follows per-process server arguments (such as
+    ``--disable-dsa-prefill-graph``), so the ranks compare whether prefill
+    graphs are on, how many graphs the capture plan holds and a digest of
+    that plan over the world's gloo group, before any capture runs.
+
+    The digest also covers the two arguments that choose the collectives of
+    a DSA break's KVP sparse prefill, replayed or eager: the
+    ``--dsa-kvp-prefill-levers`` set, in its one spelling, which picks how
+    the index candidates and the attention partials are exchanged, and
+    ``--deepseek-v4-indexer-prefill-max-logits-mb``, which sizes the index
+    tiles and so how many exchanges a forward makes. Ranks that differ in
+    either issue different collectives and hang each other.
+
+    And it covers ``--cudagraph-memory-probe-all-entries``: the startup
+    memory probe that follows captures every entry or a sample of each
+    ladder by it, and the warmups and breaks of a capture run collectives,
+    so ranks that differ in it hang each other in the probe.
+
+    It runs on the prefill role, and on the aggregated role of a model that
+    declares the DSA padded-replay contract (``build_device_side``), on
+    every rank whatever its graph decision.
+
+    It also refuses ``NCCL_GRAPH_MIXING_SUPPORT=0`` with prefill graphs on:
+    the eager breaks issue NCCL collectives on communicators whose
+    collectives the captured segments also record.
+
+    Args:
+        prefill_graph: This rank's prefill graph owner, before capture.
+        server_args: The launch; supplies the world size and group, the
+            KVP sparse prefill arguments and the probe's entry choice.
+
+    Raises:
+        RuntimeError: The ranks' plans differ, or graph mixing is off.
+    """
+    enabled = not prefill_graph.disable
+    plan = prefill_graph.capture_plan
+    kvp_prefill = (
+        canonical_dsa_kvp_prefill_levers(server_args.dsa_kvp_prefill_levers),
+        server_args.deepseek_v4_indexer_prefill_max_logits_mb,
+    )
+    probe_all_entries = bool(server_args.cudagraph_memory_probe_all_entries)
+    key = repr((sorted(plan.items()), kvp_prefill, probe_all_entries)).encode()
+    digest = zlib.crc32(key) & 0x7FFFFFFF
+    mixing_off = os.environ.get("NCCL_GRAPH_MIXING_SUPPORT", "1") == "0"
+    entries = sum(len(graphs) for graphs in plan.values())
+    local = torch.tensor(
+        [int(enabled), entries, digest, int(mixing_off)], dtype=torch.int64
+    )
+    logger.info(
+        f"prefill graph plan: enabled={enabled!s} entries={entries:d} "
+        f"digest={digest:08x} dsa_kvp_prefill_levers={kvp_prefill[0]!r} "
+        f"indexer_prefill_max_logits_mb={kvp_prefill[1]:d} "
+        f"probe_all_entries={probe_all_entries!s}"
+    )
+    if server_args.mapping.world_size > 1:
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        group = pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+        low, high = local.clone(), local.clone()
+        torch.distributed.all_reduce(
+            low, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        torch.distributed.all_reduce(
+            high, op=torch.distributed.ReduceOp.MAX, group=group
+        )
+        if not torch.equal(low, high):
+            raise RuntimeError(
+                "prefill graph plan differs across ranks: (enabled, entries, "
+                f"digest, mixing_off) ranges from {low.tolist()} to "
+                f"{high.tolist()}; launch every rank with the same arguments"
+            )
+    if enabled and mixing_off:
+        raise RuntimeError(
+            "prefill graphs interleave captured and eager NCCL collectives; "
+            "unset NCCL_GRAPH_MIXING_SUPPORT=0"
         )

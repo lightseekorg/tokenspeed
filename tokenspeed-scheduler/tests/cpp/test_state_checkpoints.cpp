@@ -1002,6 +1002,55 @@ TEST_F(StateCheckpointInForwardPrefillRoleSuite, TheNextPromptResumesAtTheCheckp
     AckWriteBacks(PlanOnce());
 }
 
+// The short-first bypass (prefill_short_first_tokens = 4 of the 8-token
+// round) takes only a prompt whose rest is one final chunk. "cont" resends
+// the 22-token seed plus 4 tokens: it hits the seed's prompt-end tail at 22
+// and its 4 tokens would fit, but they span its own checkpoint boundary 24
+// from inside a page, so its first chunk ends there -- two chunks, no
+// bypass. A plain 4-token prompt behind it takes the bypass instead.
+class StateCheckpointInForwardShortFirstSuite : public StateCheckpointInForwardPrefillRoleSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointInForwardPrefillRoleSuite::MakeConfig();
+        cfg.prefill_short_first_tokens = 4;
+        return cfg;
+    }
+};
+
+TEST_F(StateCheckpointInForwardShortFirstSuite, ATailHitCutAtTheInForwardCheckpointDoesNotBypass) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    const std::vector<std::int32_t> seed = MakeTokens(22);
+    Submit(RequestWithTokens("seed", seed));
+    SendBootstrapped("seed");
+    ASSERT_EQ(RunPrefill("seed", 22).size(), 3u);
+    ASSERT_TRUE(PlanOnce().remote_decode.has_value());
+    SendPdSucceeded("seed");  // the finish publishes the prompt-end tail [20, 22) and its state
+    PlanOnce();
+
+    Submit(RequestWithTokens("long", MakeTokens(40, /*start=*/1001)));
+    SendBootstrapped("long");
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"long"});
+    SendForwardDone("long");
+
+    std::vector<std::int32_t> cont = seed;
+    for (std::int32_t i = 0; i < 4; ++i) {
+        cont.push_back(500 + i);
+    }
+    Submit(RequestWithTokens("cont", cont));
+    SendBootstrapped("cont");
+    Submit(RequestWithTokens("fresh", MakeTokens(4, /*start=*/3001)));
+    SendBootstrapped("fresh");
+    plan = PlanOnce();
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"fresh", "long"}));
+    EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{4, 4}));
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "cont waits for an ordinary admission";
+}
+
 // Dead checkpoints on the P role: the 22-token prompt's end lies inside the
 // page its pre-tail checkpoint 20 starts, so with the in-forward checkpoint,
 // once that checkpoint exists, the finish publishes no prompt-end tail and no

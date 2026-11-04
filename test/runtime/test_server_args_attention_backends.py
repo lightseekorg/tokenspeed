@@ -30,6 +30,11 @@ from unittest import mock
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.dsa_kvp_prefill import (
+    DSA_KVP_PREFILL_LEVERS,
+    effective_dsa_kvp_prefill_levers,
+    parse_dsa_kvp_prefill_levers,
+)
 from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.layers.attention import registry
 from tokenspeed.runtime.layers.attention.backends.state import kda
@@ -40,6 +45,10 @@ from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 from tokenspeed.runtime.layers.attention.registry import (
     _cache_backend_name,
     _get_default_backend_name,
+)
+from tokenspeed.runtime.utils.env import (
+    global_server_args_dict,
+    global_server_args_dict_update,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
@@ -187,6 +196,18 @@ class TestAttentionBackendChoices:
                         not disabled
                     )
                     assert (backend.linear_attn_backend.kda_backend) == ("cutedsl_kda")
+
+    def test_dsa_prefill_graph_flag_parses_to_its_own_field(self):
+        for disabled in (False, True):
+            argv = ["--model", "x"]
+            if disabled:
+                argv.append("--disable-dsa-prefill-graph")
+            args = prepare_server_args(argv)
+            assert args.disable_dsa_prefill_graph is disabled
+            # It switches the DSA opt-in only, not the other prefill graphs.
+            assert not args.disable_prefill_graph
+            assert not args.disable_kda_prefill_graph
+            assert not args.enforce_eager
 
     def test_model_path_alias_sets_model(self):
         args = self._build_parser().parse_args(["--model-path", "x"])
@@ -457,6 +478,86 @@ class TestAttentionBackendChoices:
         assert (config.speculative_num_steps) == (3)
         assert (config.speculative_num_draft_tokens) == (4)
         assert (config.context_len) == (4108)
+
+
+class TestDsaKvpPrefillLevers:
+    """--dsa-kvp-prefill-levers: validated and spelled one way at startup,
+    handed to model initialization parsed, narrowed per DSA leaf."""
+
+    @staticmethod
+    def _args(value: str) -> ServerArgs:
+        return prepare_server_args(["--model", "x", "--dsa-kvp-prefill-levers", value])
+
+    def test_default_applies_every_lever(self):
+        levers = prepare_server_args(["--model", "x"]).dsa_kvp_prefill_levers
+        assert levers == "merge,qlayout,owned"
+        assert parse_dsa_kvp_prefill_levers(levers) == set(DSA_KVP_PREFILL_LEVERS)
+
+    def test_any_spelling_of_a_set_resolves_to_one_value(self, subtests):
+        for value, resolved in (
+            ("owned, merge", "merge,owned"),
+            ("qlayout,merge,qlayout", "merge,qlayout"),
+            ("owned,", "owned"),
+            ("", ""),
+            (" ", ""),
+            ("none", ""),
+        ):
+            with subtests.test(value=value):
+                assert self._args(value).dsa_kvp_prefill_levers == resolved
+
+    def test_unknown_levers_are_refused_at_startup(self, subtests):
+        for value, unknown in (
+            ("merge,fast", "fast"),
+            ("Merge", "Merge"),
+            ("none,merge", "none"),
+        ):
+            message = rf"--dsa-kvp-prefill-levers.*unknown \['{unknown}'\]"
+            with subtests.test(value=value), pytest.raises(ValueError, match=message):
+                self._args(value)
+
+    def test_parsed_levers_reach_model_initialization(self, subtests):
+        original = global_server_args_dict.copy()
+        try:
+            for value, levers in (
+                ("owned,merge", {"merge", "owned"}),
+                ("", set()),
+                ("merge,qlayout,owned", set(DSA_KVP_PREFILL_LEVERS)),
+            ):
+                with subtests.test(value=value):
+                    global_server_args_dict_update(self._args(value))
+                    parsed = global_server_args_dict["dsa_kvp_prefill_levers"]
+                    assert parsed == frozenset(levers)
+        finally:
+            global_server_args_dict.clear()
+            global_server_args_dict.update(original)
+
+    def test_a_pinned_prefill_plan_keeps_its_core(self, subtests):
+        every = frozenset(DSA_KVP_PREFILL_LEVERS)
+        for batch_invariant, pinned, effective in (
+            (False, False, every),
+            # The row-owner merge and owned-width tiles keep every row's
+            # selection, and the rank-major core is bitwise: all serve a
+            # batch-invariant leaf.
+            (True, False, every),
+            # A pinned plan names the sparse core; the rank-major core
+            # would replace it.
+            (False, True, every - {"qlayout"}),
+            (True, True, every - {"qlayout"}),
+        ):
+            with subtests.test(batch_invariant=batch_invariant, pinned=pinned):
+                narrowed = effective_dsa_kvp_prefill_levers(
+                    every,
+                    batch_invariant=batch_invariant,
+                    prefill_kernel_plan_pinned=pinned,
+                )
+                assert narrowed == effective
+                # Narrowing never adds a lever the launch did not name.
+                owned_only = effective_dsa_kvp_prefill_levers(
+                    frozenset({"owned"}),
+                    batch_invariant=batch_invariant,
+                    prefill_kernel_plan_pinned=pinned,
+                )
+                assert owned_only == {"owned"}
 
 
 class _GpuBackendStandIn:

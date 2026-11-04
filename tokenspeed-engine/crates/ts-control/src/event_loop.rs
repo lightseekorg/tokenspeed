@@ -25,8 +25,9 @@
 //! without waiting on the device, commits the forwards that are more than
 //! `in_flight_depth` rounds old, and feeds the results back to the
 //! scheduler in one `advance`. Depth 0 commits a forward in the round that
-//! dispatched it; depth 1 is the overlap schedule. Those two advances are
-//! the scheduler's only feedback.
+//! dispatched it; depth 1 is the overlap schedule. Those two advances, and
+//! a prefill node's transfer poll before it plans, are the scheduler's only
+//! feedback.
 //!
 //! Every rank of a replica -- an attention-TP group, across every pipeline
 //! stage -- runs the same scheduler. The replica's first member owns the
@@ -78,7 +79,7 @@ use crate::{
     l3::{L3Error, Tier},
     output::{
         CommitStats, Committed, ForwardResult, HistoryRows, HistorySeeds, InputLogprobPlan,
-        LogprobPlan, NgramWindows, OutputProcessor, StreamedOutput,
+        LogprobPlan, NgramWindows, OutputProcessor, Role, StreamedOutput,
     },
     relay::{self, RelayError},
     request::RequestGrammar,
@@ -141,6 +142,35 @@ fn decode_rows(bytes: &[u8]) -> Option<Vec<Vec<i32>>> {
 
 /// How long an idle loop waits for a request before checking `stop` again.
 const IDLE_WAIT: Duration = Duration::from_millis(10);
+
+/// How often a P rank re-polls the transfers it handed over while its
+/// forward runs.
+const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// The P role's transfer polls, for A/B runs: the head poll
+/// (`TOKENSPEED_PD_HEAD_POLL=0` turns it off) and the interval of the poll
+/// while a forward runs (`TOKENSPEED_PD_POLL_DURING_FORWARD_MS`, 0 turns it
+/// off). Both decide collectives, whose tags pair by kind, group and
+/// sequence, so they must be the same on every rank.
+fn pd_round_options() -> (bool, Option<Duration>) {
+    let head_poll = std::env::var("TOKENSPEED_PD_HEAD_POLL")
+        .ok()
+        .is_none_or(|on| on.trim() != "0");
+    let interval = match std::env::var("TOKENSPEED_PD_POLL_DURING_FORWARD_MS") {
+        Err(_) => Some(TRANSFER_POLL_INTERVAL),
+        Ok(ms) => match ms.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => {
+                tracing::warn!(
+                    "TOKENSPEED_PD_POLL_DURING_FORWARD_MS={ms:?} is not a count of ms; using 2 ms"
+                );
+                Some(TRANSFER_POLL_INTERVAL)
+            }
+        },
+    };
+    (head_poll, interval)
+}
 
 /// How long the scheduler's active page count is reused before it is taken
 /// again.
@@ -211,6 +241,12 @@ pub trait DataPlane {
 
     /// Wait for a forward's results.
     fn complete(&mut self, pending: Self::Pending) -> Result<ForwardResult, DataPlaneError>;
+
+    /// Whether a dispatched forward's results landed, so `complete` would
+    /// not wait; never waits. The default keeps `complete` the only wait.
+    fn landed(&mut self, _pending: &Self::Pending) -> Result<bool, DataPlaneError> {
+        Ok(true)
+    }
 
     /// The cache ops acknowledged since the last poll, in the order they
     /// landed; never waits on the device.
@@ -535,6 +571,16 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     last_load_report: Option<Instant>,
     /// Last load sent to the frontend, including rounds with no token output.
     reported_load: Option<Load>,
+    /// P role: requests whose remote decode was dispatched and whose
+    /// transfer has not concluded, polled while a forward runs. Filled from
+    /// the plan and pruned by the mirrored output states, so the same on
+    /// every rank.
+    handed_over: HashSet<String>,
+    /// P role: poll the transfers at the round head (A/B switch).
+    head_poll: bool,
+    /// P role: how often to poll the handed-over transfers while a forward
+    /// runs; `None` turns that off (A/B switch).
+    transfer_poll_interval: Option<Duration>,
     /// The scheduler's active page count, reused across rounds.
     active_pages: ActivePages,
 }
@@ -564,6 +610,17 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         ranks: Ranks,
         subsystems: Subsystems,
     ) -> Self {
+        let (head_poll, transfer_poll_interval) = pd_round_options();
+        if outputs.role() == Role::Prefill {
+            // Every P rank logs them: a mismatch would pair collectives
+            // wrongly.
+            let every_ms = transfer_poll_interval.map_or(0, |every| every.as_millis() as u64);
+            tracing::info!(
+                head_poll,
+                poll_during_forward_ms = every_ms,
+                "PD prefill round options"
+            );
+        }
         Self {
             controls: Controls::new(config.controls.clone()),
             batch_logger: BatchLogger::new(config.batch_log.clone()),
@@ -591,6 +648,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             forward_allowed: true,
             last_load_report: None,
             reported_load: None,
+            handed_over: HashSet::new(),
+            head_poll,
+            transfer_poll_interval,
             active_pages: ActivePages::default(),
         }
     }
@@ -710,7 +770,31 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.note_forward(forwarded);
             std::thread::sleep(PAUSED_IDLE_SLEEP);
         } else {
-            self.plan_and_dispatch(&mut stop, &mut events, &mut outputs, &mut released)?;
+            if self.head_poll && self.outputs.role() == Role::Prefill {
+                // Advance point 3 (Principle 3): the P role's bootstrap gate.
+                // A request admitted at this head whose decode node already
+                // pre-allocated is planned in this round, not after this
+                // round's forward and its tail poll. The poll's collective
+                // depends only on the peer's tracked order, the same on every
+                // rank; with a forward in flight (depth >= 1) this is what the
+                // tail poll already does. Finished outputs stream at once;
+                // the releases wait for the round's end.
+                let (mut head_events, mut head_outputs) = (Vec::new(), Vec::new());
+                self.poll_transfers(&mut head_events, &mut head_outputs, &mut released)?;
+                self.send_now(head_outputs);
+                if !head_events.is_empty() {
+                    self.scheduler
+                        .advance(&head_events)
+                        .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+                }
+            }
+            let depth =
+                self.plan_and_dispatch(&mut stop, &mut events, &mut outputs, &mut released)?;
+            // P with synchronous commit: detect the transfers handed over
+            // beside this round's forward, and stream their outputs, before
+            // its commit.
+            self.poll_transfers_while_forward_runs(&mut events, &mut released)?;
+            self.commit_down_to(depth, &mut events, &mut outputs, &mut released)?;
             self.poll_transfers(&mut events, &mut outputs, &mut released)?;
         }
         // The forward-result feedback point: everything committed this round
@@ -731,14 +815,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.data_plane.release(&released)?;
         }
         if self.owns_frontend() {
-            let sizes = self.scheduler.sizes();
-            let load = Load {
-                num_running: self.outputs.num_running() as i64,
-                num_waiting: sizes.waiting as i64,
-                kv_active_pages: i64::from(self.active_pages()),
-                kv_total_pages: self.config.kv_total_pages,
-                kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
-            };
+            let load = self.load();
             // Silent aborts must refresh load immediately; periodic heartbeats
             // also keep an idle engine's load snapshot fresh at its frontend.
             if !outputs.is_empty()
@@ -760,15 +837,41 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(stop)
     }
 
-    /// The round's plan, dispatched, and the forwards older than the
-    /// in-flight depth committed.
+    /// The scheduler's load, as reported with each output batch.
+    fn load(&mut self) -> Load {
+        let sizes = self.scheduler.sizes();
+        Load {
+            num_running: self.outputs.num_running() as i64,
+            num_waiting: sizes.waiting as i64,
+            kv_active_pages: i64::from(self.active_pages()),
+            kv_total_pages: self.config.kv_total_pages,
+            kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
+        }
+    }
+
+    /// Stream `outputs` now, between the round's fixed points: the
+    /// frontend's owner sends them with the load; the other ranks drop them,
+    /// as at the round's end.
+    fn send_now(&mut self, outputs: Vec<StreamedOutput>) {
+        if outputs.is_empty() || !self.owns_frontend() {
+            return;
+        }
+        let load = self.load();
+        self.frontend.send(outputs, load);
+        self.reported_load = Some(load);
+        self.last_load_report = Some(Instant::now());
+    }
+
+    /// The round's plan, dispatched, with the queue committed first where
+    /// the dispatch depends on it. Returns the depth `round` then commits
+    /// the queue down to.
     fn plan_and_dispatch(
         &mut self,
         stop: &mut bool,
         events: &mut Vec<ForwardEvent>,
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
-    ) -> Result<(), LoopError> {
+    ) -> Result<usize, LoopError> {
         let plan = self.scheduler.next_execution_plan();
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Some(batch) = plan.remote_prefill() {
@@ -776,6 +879,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             if let Some(batch) = plan.remote_decode() {
                 tracing::debug!(rids = ?batch.request_ids, "remote decode planned");
+            }
+        }
+        if self.outputs.role() == Role::Prefill {
+            if let Some(batch) = plan.remote_decode() {
+                self.handed_over.extend(batch.request_ids);
             }
         }
         // The storage operations start on the L3 executor at once, apart
@@ -894,14 +1002,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         self.note_forward(forwarded);
 
-        // Commit from the head once the queue exceeds the depth; a round with
-        // no new work drains fully so results never wait on future traffic.
+        // `round` commits from the head once the queue exceeds the depth; a
+        // round with no new work drains fully so results never wait on
+        // future traffic.
         let depth = if has_forward {
             self.config.in_flight_depth
         } else {
             0
         };
-        self.commit_down_to(depth, events, outputs, released)
+        Ok(depth)
     }
 
     /// Count this round's forward, real or idle, for the expert rebalance;
@@ -2066,6 +2175,85 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     }
                 }
             }
+        }
+        // This bounds the set where the forward-time poll never runs.
+        self.prune_handed_over();
+        Ok(())
+    }
+
+    /// Forget the handed-over requests whose output state is gone:
+    /// `finish_prefill` and `fail_transfer` drop it.
+    fn prune_handed_over(&mut self) {
+        let states = &self.outputs;
+        self.handed_over.retain(|rid| states.state(rid).is_some());
+    }
+
+    /// Whether the in-flight forward landed on any rank of the replica: the
+    /// agreed (MAX) exit of the transfer polls beside it. A failing data
+    /// plane counts as landed: every rank leaves, and the commit reports the
+    /// failure.
+    fn forward_landed_on_any_rank(&mut self) -> Result<bool, LoopError> {
+        let (_, _, pending) = self.in_flight.front().expect("one forward in flight");
+        let local = self.data_plane.landed(pending).unwrap_or(true);
+        let replica = &self.ranks.replica;
+        let agreed = self
+            .ranks
+            .mesh
+            .all_reduce(replica, &[i64::from(local)], Reduce::Max)?;
+        Ok(agreed[0] != 0)
+    }
+
+    /// P role at depth 0: while this round's forward runs, re-poll the
+    /// transfers it handed over and stream the outputs of those that
+    /// concluded. Leaving is agreed (MAX of "my forward landed"), so every
+    /// rank runs the same number of agreements and polls; the events still
+    /// advance at the round's tail. The first agreement precedes any wait:
+    /// a forward that already landed, or a plane whose `landed` cannot tell
+    /// (always true), costs that one agreement and no sleep.
+    fn poll_transfers_while_forward_runs(
+        &mut self,
+        events: &mut Vec<ForwardEvent>,
+        released: &mut Vec<String>,
+    ) -> Result<(), LoopError> {
+        let Some(interval) = self.transfer_poll_interval else {
+            return Ok(());
+        };
+        if self.config.in_flight_depth != 0
+            || self.in_flight.len() != 1
+            || self.outputs.role() != Role::Prefill
+            || self.ranks.pp.is_some()
+            || self.ranks.dp.is_some()
+        {
+            return Ok(());
+        }
+        self.prune_handed_over();
+        if self.handed_over.is_empty() || self.forward_landed_on_any_rank()? {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut polls = 0_u64;
+        loop {
+            // Before the first poll too: the hand-over was dispatched
+            // microseconds ago. Each poll follows its own agreement.
+            std::thread::sleep(interval);
+            if self.forward_landed_on_any_rank()? {
+                break;
+            }
+            let mut finished = Vec::new();
+            self.poll_transfers(events, &mut finished, released)?;
+            self.send_now(finished);
+            polls += 1;
+            // The poll pruned the set.
+            if self.handed_over.is_empty() {
+                break;
+            }
+        }
+        if polls > 0 {
+            tracing::debug!(
+                polls,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "transfers polled while the forward ran"
+            );
         }
         Ok(())
     }

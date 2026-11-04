@@ -91,6 +91,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
     KimiK3Config.model_type: KimiK3Config,
+    # Kimi-K3.1: the K3 config plus a DSA indexer (text_config.dsa_config).
+    "kimi_k31": KimiK3Config,
     KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
@@ -515,6 +517,7 @@ def get_config(
         "KimiK25Config",
         "KimiK3ForConditionalGeneration",
         "KimiK3ForConditionalGenerationNextN",
+        "KimiK31ForConditionalGeneration",
         "KimiK3Config",
         "Glm53FlashForConditionalGeneration",
         "Glm53FlashForConditionalGenerationNextN",

@@ -61,7 +61,9 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
     verify_state_blocks,
 )
 from tokenspeed_kernel.ops.conv import (
+    PREFILL_QKV_CHANNEL_MULTIPLE,
     causal_conv1d_fn,
+    causal_conv1d_qkv_fn,
     causal_conv1d_update,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -228,6 +230,18 @@ class MambaForwardMetadata:
     def scrub_padding(self, *tensors: torch.Tensor | None) -> None:
         """Zero the padded tail rows of token-shaped inputs in place."""
         scrub_padding_tail(self.prefill_token_extent, *tensors)
+
+
+def _prefill_conv_writes_qkv(key_split_dim: int, value_split_dim: int) -> bool:
+    """Whether the prefill convolution writes q, k and v rows itself (AMD).
+
+    The direct write skips the q/k/v split pass and leaves the same values.
+    """
+    return (
+        current_platform().is_amd
+        and key_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
+        and value_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
+    )
 
 
 @dataclass
@@ -1994,6 +2008,7 @@ class MambaAttnBackend(AttentionBackend):
 
         conv_replay = None
         conv_rows = None
+        conv_qkv = None
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
             batch_size = seq_len // draft_token_num
@@ -2103,22 +2118,44 @@ class MambaAttnBackend(AttentionBackend):
                 ] = (mixed_qkv[rows].transpose(1, 2).to(conv_states.dtype))
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv_t,
-                conv_weights,
-                bias,
-                activation=activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=conv_cache_indices,
-                query_start_loc=query_start_loc,
-                prefill_metadata=self.forward_metadata.conv_prefill_metadata,
-            ).transpose(0, 1)[:seq_len]
-            if extend_seq_lens_cpu is not None:
-                # The convolution allocates its output uninitialized and gives
-                # the padded rows no work, so the rows a capacity scan reads
-                # past the live tokens are zeroed again here.
-                self.forward_metadata.scrub_padding(mixed_qkv)
+            if _prefill_conv_writes_qkv(
+                key_dim // attn_tp_size, value_dim // attn_tp_size
+            ):
+                # The convolution writes q, k and v rows directly; no split pass.
+                conv_qkv = tuple(
+                    rows[:seq_len]
+                    for rows in causal_conv1d_qkv_fn(
+                        mixed_qkv_t,
+                        conv_weights,
+                        bias,
+                        activation=activation,
+                        conv_states=conv_states,
+                        has_initial_state=has_initial_states,
+                        cache_indices=conv_cache_indices,
+                        query_start_loc=query_start_loc,
+                        prefill_metadata=self.forward_metadata.conv_prefill_metadata,
+                        key_dim=key_dim // attn_tp_size,
+                    )
+                )
+                if extend_seq_lens_cpu is not None:
+                    self.forward_metadata.scrub_padding(*conv_qkv)
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv_t,
+                    conv_weights,
+                    bias,
+                    activation=activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states,
+                    cache_indices=conv_cache_indices,
+                    query_start_loc=query_start_loc,
+                    prefill_metadata=self.forward_metadata.conv_prefill_metadata,
+                ).transpose(0, 1)[:seq_len]
+                if extend_seq_lens_cpu is not None:
+                    # The convolution allocates its output uninitialized and gives
+                    # the padded rows no work, so the rows a capacity scan reads
+                    # past the live tokens are zeroed again here.
+                    self.forward_metadata.scrub_padding(mixed_qkv)
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -2161,6 +2198,13 @@ class MambaAttnBackend(AttentionBackend):
                 head_q=head_k_dim,
                 head_k=head_k_dim,
                 head_v=head_v_dim,
+            )
+        elif conv_qkv is not None:
+            query, key, value = (
+                rows.view(1, seq_len, -1, head_dim)
+                for rows, head_dim in zip(
+                    conv_qkv, (head_k_dim, head_k_dim, head_v_dim)
+                )
             )
         else:
             valid_tokens = (

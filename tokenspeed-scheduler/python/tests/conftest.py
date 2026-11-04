@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import os
+
 try:
     import tokenspeed_scheduler as ts
 except ImportError:  # test modules importorskip on their own
     ts = None
+
+# A scheduler built with prefill_short_first_tokens left 0 takes it from this
+# variable; the tests set the field where they want the bypass, so a shell
+# that exports it (as a P server's does) must not turn it on under them.
+os.environ.pop("TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS", None)
 
 # Kimi-K3 shape: cfg.prefix_granularity == P (1536 in production; ratio semantics
 # identical at P=2).

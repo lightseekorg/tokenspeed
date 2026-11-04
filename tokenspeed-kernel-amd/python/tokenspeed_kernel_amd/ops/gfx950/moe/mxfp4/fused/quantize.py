@@ -40,6 +40,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     MXFP4_BLOCK,
     empty_swizzled_cdna4_mxfp4_scale,
+    is_swizzled_cdna4_mxfp4_scale,
 )
 
 _MXFP4_QUANT_TILED_MIN_ROWS = 128
@@ -358,7 +359,14 @@ def _quantize_mxfp4_activation(
     ragged_metadata: Any | None = None,
     *,
     _force_scalar: bool = False,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows to packed E2M1 data and CDNA4-swizzled E8M0 scales.
+
+    ``out`` optionally supplies the ``(data, scale)`` destinations: contiguous
+    uint8 ``[rows, k // 2]`` data and a swizzled ``[k_scale_pad * 32,
+    rows // 32]`` scale view, so ungathered rows can be written in place.
+    """
     if activations.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(
             "MXFP4 activation quantization requires bf16/fp16 input, "
@@ -380,7 +388,12 @@ def _quantize_mxfp4_activation(
     rows = int(gather_tensor.shape[0]) if gather_tensor is not None else int(x.shape[0])
     k = int(x.shape[1])
     k_scale = k // MXFP4_BLOCK
-    out = torch.empty((rows, k // 2), dtype=torch.uint8, device=x.device)
+    destinations = out
+    out = (
+        torch.empty((rows, k // 2), dtype=torch.uint8, device=x.device)
+        if destinations is None
+        else destinations[0]
+    )
     if ragged_metadata is not None:
         n_slices = int(ragged_metadata.slice_sizes.shape[0])
         scale_rows = (
@@ -400,7 +413,28 @@ def _quantize_mxfp4_activation(
         slice_offs = _make_dummy(x.device, torch.int32)
         scale_block_offs = _make_dummy(x.device, torch.int32)
         expert_search_steps = 0
-    scale = empty_swizzled_cdna4_mxfp4_scale(scale_rows, k_scale, device=x.device)
+    if destinations is None:
+        scale = empty_swizzled_cdna4_mxfp4_scale(scale_rows, k_scale, device=x.device)
+    else:
+        scale = destinations[1]
+        k_blocks = triton.cdiv(k_scale, _ALIGN_K_SCALE_SWIZZLE)
+        if (
+            ragged_metadata is not None
+            or out.shape != (rows, k // 2)
+            or out.dtype != torch.uint8
+            or not out.is_contiguous()
+            or scale.dtype != torch.uint8
+            or scale.shape
+            != (
+                k_blocks * _ALIGN_K_SCALE_SWIZZLE * _NON_K_PRESHUFFLE_BLOCK_SIZE,
+                triton.cdiv(rows, _NON_K_PRESHUFFLE_BLOCK_SIZE),
+            )
+            or not is_swizzled_cdna4_mxfp4_scale(scale)
+        ):
+            raise ValueError(
+                "MXFP4 quantize destinations must be contiguous [rows, k // 2] "
+                "data and a complete swizzled scale view"
+            )
     if rows == 0:
         return out, scale
 
@@ -530,22 +564,23 @@ _DYNAMIC_FP8_MIN_AMAX = 1.0e-12
 #
 # Below this the single launch is the cheapest option: the two-pass reduction
 # needs a second launch, and at these sizes the launch -- not the arithmetic --
-# is the whole cost (~10 us single-pass against ~26 us two-pass at 65,536
-# padded elements).
+# is the whole cost. Decode runs these sizes under graph replay, where a launch
+# costs ~2 us rather than the ~10 us of an eager one, so one workgroup streaming
+# the whole tensor stops paying off early. Measured on MI350X under graph
+# replay at width 3584: 3.4 us single-pass against 4.3 us two-pass at 16,384
+# padded elements (4 rows), but 5.1 against 4.1-4.6 us at 32,768 (5-8 rows)
+# and 8.8 against 4.7 us at 65,536 (9-18 rows).
 #
-# The bound is a tier lower than the point where the one-workgroup form breaks,
-# because it stops paying off well before then. Measured, one workgroup at
-# 131,072 padded elements costs ~33 us -- already worse than the two-pass -- and
-# from there it degrades to 903 us at 262,144 and fails to dispatch past roughly
-# 344k with HSA_STATUS_ERROR_OUT_OF_RESOURCES. Keeping the bound on the
-# unambiguous side also keeps it clear of that failure, whose own threshold
-# moves with how loaded the device is.
+# One workgroup also breaks outright on large tensors: ~33 us at 131,072 padded
+# elements, 903 us at 262,144, and no dispatch past roughly 344k with
+# HSA_STATUS_ERROR_OUT_OF_RESOURCES, a threshold that moves with how loaded the
+# device is.
 #
 # Beware when re-tuning: a tensor whose length is well under its power of two
 # looks artificially good, because the compiler can drop the masked tail. At
 # 114,688 elements the one-workgroup form measures 16 us, but 129,024 elements
 # -- the same padded size -- costs 33 us. Tune against padded size, not numel.
-_DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS = 1 << 16
+_DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS = 1 << 14
 
 
 def _dynamic_fp8_use_single_pass(numel: int) -> bool:

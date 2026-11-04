@@ -80,6 +80,7 @@ def _config(
     max_retracted_requests: int,
     force_retraction_interval: int,
     mixed: bool,
+    short_first_tokens: int = 0,
 ) -> "ts.SchedulerConfig":
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = P
@@ -89,6 +90,7 @@ def _config(
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = force_retraction_interval
     cfg.max_scheduled_tokens = 48
+    cfg.prefill_short_first_tokens = short_first_tokens
     cfg.max_batch_size = 6
     cfg.enable_l3_storage = False
     # A Host tier states what feeds it; Validate refuses what it cannot run.
@@ -157,6 +159,10 @@ class _Loop:
         mixed: bool,
         inject_aborts: bool,
         shuffle_groups: bool,
+        short_first_tokens: int = 0,
+        pages: tuple[int, ...] = (24, 40, 64),
+        max_prompt_tokens: int | None = None,
+        cold_prompt_tokens: tuple[int, int] | None = None,
     ):
         self.rng = random.Random(seed)
         # Mid-run aborts draw from their own stream.
@@ -169,9 +175,11 @@ class _Loop:
         self.uses_write_back = policy == ts.SchedulerConfig.HostWritePolicy.WriteBack
         self.remote = role == ts.SchedulerConfig.Role.D
         self.prefill_only = role == ts.SchedulerConfig.Role.P
+        self.max_prompt_tokens = max_prompt_tokens
+        self.cold_prompt_tokens = cold_prompt_tokens
         cfg = _config(
             role,
-            pages=self.rng.choice([24, 40, 64]),
+            pages=self.rng.choice(list(pages)),
             history_block=self.rng.choice([P, P // 2]),
             sliding=self.rng.random() < 0.4,
             host_pages=host_pages,
@@ -181,6 +189,7 @@ class _Loop:
             max_retracted_requests=max_retracted_requests,
             force_retraction_interval=force_retraction_interval,
             mixed=mixed,
+            short_first_tokens=short_first_tokens,
         )
         if shuffle_groups:
             # The declaration order draws from its own stream, so a seed
@@ -201,6 +210,10 @@ class _Loop:
         self.acks: list[tuple[int, object]] = []
         self.round = 0
         self.write_back_rows = 0
+        # Requests that have had a prefill row, and the rounds whose batch
+        # has the short-first shape (_note_short_first).
+        self.chunked: set[str] = set()
+        self.short_first_rounds = 0
         self.systems = [
             [self.rng.randrange(2, 500) for _ in range(self.rng.randrange(3, 40))]
             for _ in range(3)
@@ -222,7 +235,11 @@ class _Loop:
                 self.rng.randrange(2, 500) for _ in range(self.rng.randrange(1, 30))
             ]
             draw = self.rng.random()
-            if draw < 0.15 and self.live:
+            if self.cold_prompt_tokens is not None and draw >= 0.85:
+                # A long cold prompt with nothing to hit: several chunks.
+                count = self.rng.randrange(*self.cold_prompt_tokens)
+                tokens = [self.rng.randrange(2, 500) for _ in range(count)]
+            elif draw < 0.15 and self.live:
                 tokens = list(self.rng.choice(list(self.live.values()))["prompt"])
             elif draw < 0.45 and self.done:
                 tokens = list(self.rng.choice(self.done))
@@ -231,9 +248,10 @@ class _Loop:
             else:
                 tokens = self.rng.choice(self.systems) + user
             max_new = self.rng.randrange(1, 10)
-            tokens = tokens[
-                : max(1, self.scheduler.max_single_request_tokens() - max_new - 1)
-            ]
+            limit = self.scheduler.max_single_request_tokens() - max_new - 1
+            if self.max_prompt_tokens is not None:
+                limit = min(limit, self.max_prompt_tokens)
+            tokens = tokens[: max(1, limit)]
             spec = ts.RequestSpec()
             spec.request_id = request_id = f"r{self.next_id}"
             self.next_id += 1
@@ -250,6 +268,27 @@ class _Loop:
                 "out": [],
             }
         self.scheduler.submit_requests(specs)
+
+    def _note_short_first(self, plan) -> None:
+        """Counts the rounds whose batch has the short-first shape: a new
+        prompt's row ahead of the incomplete chunk of a prefill that already
+        had one. The head-of-line loop alone never builds it -- resident
+        chunks come first and an incomplete one ends the phase."""
+        for op in plan.forward:
+            rows = list(op.request_ids)[: op.num_extends()]
+            if len(rows) >= 2:
+                last = len(rows) - 1
+                incomplete = (
+                    op.extend_prefix_lens[last] + op.input_lengths[last]
+                    < op.prefill_lengths[last]
+                )
+                if (
+                    incomplete
+                    and rows[last] in self.chunked
+                    and any(r not in self.chunked for r in rows[:last])
+                ):
+                    self.short_first_rounds += 1
+            self.chunked.update(rows)
 
     def land(self, plan) -> None:
         """One result per planned row; finishes decided on the landed token."""
@@ -388,6 +427,7 @@ class _Loop:
                 self.scheduler.host_cache_stats().retraction_stores.image_refused == 0
             )
             self.queue_acks(plan)
+            self._note_short_first(plan)
             self.pending.append(plan)
             if self.remote or self.prefill_only:
                 self.peer(plan)
@@ -548,3 +588,54 @@ def test_random_host_acks_leave_nothing_in_flight(
     if inject_aborts:
         for name, count in activity.items():
             assert count > 0, f"no {name} across the twelve seeds"
+
+
+# The P role with the short-first bypass on: up to 16 of the 48-token round
+# go to waiting prompts that complete in one chunk beside an incomplete
+# resident prefill, under the same overlap (a bypass planned while the
+# resident's previous chunk is still in flight), eviction, shared prefixes
+# and continuation turns. Some prompts are long and cold (100-200 tokens,
+# three to five chunks), so residents that cannot finish in a round are
+# common, as on a K3 P node. In the smallest pools such a resident needs
+# most of the pool and the headroom guard refuses nearly every bypass; the
+# 64- and 96-page pools still evict and let it run, which the last test
+# checks.
+SHORT_FIRST_TOKENS = 16
+COLD_PROMPT_TOKENS = (100, 200)
+
+
+def _short_first_loop(seed: int, pages: tuple[int, ...]) -> _Loop:
+    # The never-raises row's P configuration, with the bypass on.
+    return _Loop(
+        seed,
+        ts.SchedulerConfig.Role.P,
+        host_pages=0,
+        policy=ts.SchedulerConfig.HostWritePolicy.Unspecified,
+        kv_shards=1,
+        num_snapshot_pages=1,
+        max_retracted_requests=0,
+        force_retraction_interval=0,
+        mixed=False,
+        inject_aborts=False,
+        shuffle_groups=False,
+        short_first_tokens=SHORT_FIRST_TOKENS,
+        pages=pages,
+        cold_prompt_tokens=COLD_PROMPT_TOKENS,
+    )
+
+
+@pytest.mark.parametrize("pages", [(24, 40, 64), (64, 96)])
+@pytest.mark.parametrize("seed", [*range(12), 42])
+def test_random_closed_loop_with_short_first_never_raises(
+    seed: int, pages: tuple[int, ...]
+) -> None:
+    _short_first_loop(seed, pages).run(ROUNDS)
+
+
+def test_random_closed_loops_run_the_short_first_bypass() -> None:
+    rounds = 0
+    for seed in [*range(12), 42]:
+        loop = _short_first_loop(seed, (64, 96))
+        loop.run(ROUNDS)
+        rounds += loop.short_first_rounds
+    assert rounds > 0, "no round ran a prompt beside an incomplete prefill"

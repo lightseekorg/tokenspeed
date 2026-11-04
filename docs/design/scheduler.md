@@ -232,6 +232,26 @@ Outside mixed mode, prefill and decode never share a round at all — decodes
 get the round only when no prefill scheduled — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
 
+**The one exception is opt-in and P-only: the short-first bypass.** With
+`SchedulerConfig::prefill_short_first_tokens = S > 0` (the environment variable
+`TOKENSPEED_PREFILL_SHORT_FIRST_TOKENS` fills it when it is left 0), a P round
+whose resident prefill cannot finish keeps up to `S` tokens of its budget for
+waiting prompts whose whole uncached rest — with the replay window, and not
+cut at a junction or an in-forward checkpoint — fits one final chunk. The
+resident's chunk is admitted first, on the budget minus what they reserve, so
+it keeps capacity priority and advances by at least `max_scheduled_tokens - S`
+every round; if it fails, no bypass prompt runs. A bypass prompt is admitted
+only as a completing chunk, so it never becomes an incomplete prefill: on the
+P role its pages leave through the PD transfer alone, and the set of
+incomplete prefills is still the one this section allows. A headroom guard
+keeps the free and evictable parents covering the resident's whole remaining
+prompt besides the bypass prompts. The batch lists the bypass prompts first
+and the resident's incomplete chunk last, so the truncated row is still the
+last one. The fused role passes 0 (outside mixed mode the bypassed prompt's
+decodes would wait behind the resident anyway, and its prepaid headroom would
+make the resident a retraction victim); the D role has no local prefill
+phase. Unset, the loop above is unchanged.
+
 ### 1.2 State groups: two slots, natural checkpoints
 
 A State group (a recurrent layer's state, `AttnKind::kState`) keeps no

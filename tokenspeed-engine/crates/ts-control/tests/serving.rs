@@ -332,6 +332,17 @@ struct FakeDevice {
     epd_released: Arc<Mutex<Vec<usize>>>,
     /// Grammar: each constrained request's matcher handle.
     grammars: HashMap<String, u64>,
+    /// What the device ran, in order, with the scripted frontend's round and
+    /// send markers on a frontend's rank: `cache <kind>` per cache op,
+    /// `handover <rids>` per remote decode, `forward <rids>` per batch and
+    /// `complete` per commit.
+    trace: Arc<Mutex<Vec<String>>>,
+    /// The `landed` queries each forward answers false before it lands.
+    unlanded: usize,
+    /// The in-flight forward's false answers left.
+    unlanded_left: usize,
+    /// Every `landed` query.
+    landed_calls: Arc<Mutex<usize>>,
 }
 
 /// EPLB chunks applied: their layers and those layers' new rows.
@@ -408,13 +419,30 @@ struct WireRoom {
 
 /// A stand-in transfer peer over a [`Wire`]: a transfer advances as soon as
 /// both engines' devices did their part, as every rank of the replica sees
-/// it.
+/// it. Like the real peers, the replica agrees on each transfer's least
+/// advanced state (MIN over its members) whenever something is tracked.
 struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Tracked requests: rid, room, bootstrapped.
-    tracked: Vec<(String, u64, bool)>,
+    tracked: Vec<Tracked>,
+    /// The agreed polls that see a transfer's KV sent before the one it
+    /// concludes at: the KV moves for that long.
+    success_after: usize,
+    /// Agreed polls so far.
+    polls: usize,
+    /// This room's transfer breaks on this rank from this agreed poll on
+    /// (counting from 1).
+    fails_at: Option<(u64, usize)>,
+}
+
+/// A transfer a [`FakePeer`] tracks.
+struct Tracked {
+    rid: String,
+    room: u64,
+    bootstrapped: bool,
+    /// Agreed polls that saw its KV sent.
+    sent_polls: usize,
 }
 
 impl TransferPeer for FakePeer {
@@ -428,7 +456,12 @@ impl TransferPeer for FakePeer {
                 .or_default()
                 .decode_registered = true;
         }
-        self.tracked.push((rid.to_owned(), bootstrap.room, false));
+        self.tracked.push(Tracked {
+            rid: rid.to_owned(),
+            room: bootstrap.room,
+            bootstrapped: false,
+            sent_polls: 0,
+        });
         Ok(())
     }
 
@@ -440,19 +473,25 @@ impl TransferPeer for FakePeer {
         if self.tracked.is_empty() {
             return Ok(Vec::new());
         }
-        let (role, rank) = (self.role, self.rank);
+        let (role, rank, fails_at) = (self.role, self.rank, self.fails_at);
+        let poll = self.polls + 1;
         let polls: Vec<i64> = {
             let mut wire = self.wire.lock().unwrap();
             let prefill_ranks = wire.prefill_ranks;
             self.tracked
                 .iter()
-                .map(|(_, room, bootstrapped)| {
-                    let room = wire.rooms.entry(*room).or_default();
-                    let poll = if room.fails
+                .map(|tracked| {
+                    // `fails_at`: this rank's view breaks from that agreed
+                    // poll on.
+                    let breaks =
+                        fails_at.is_some_and(|(room, from)| room == tracked.room && poll >= from);
+                    let room = wire.rooms.entry(tracked.room).or_default();
+                    let state = if room.fails
+                        || breaks
                         || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
                     {
                         TransferPoll::Failed
-                    } else if !*bootstrapped {
+                    } else if !tracked.bootstrapped {
                         let connected = match role {
                             Role::Prefill => room.preallocated.is_some(),
                             _ => room.decode_registered,
@@ -475,7 +514,7 @@ impl TransferPeer for FakePeer {
                             TransferPoll::Bootstrapped
                         }
                     };
-                    poll as i64
+                    state as i64
                 })
                 .collect()
         };
@@ -484,30 +523,38 @@ impl TransferPeer for FakePeer {
         } else {
             polls
         };
+        self.polls = poll;
 
         let mut wire = self.wire.lock().unwrap();
+        let success_after = self.success_after;
         let mut events = Vec::new();
         let mut agreed = agreed.into_iter();
-        self.tracked.retain_mut(|(rid, room, bootstrapped)| {
-            let poll = agreed.next().expect("one state per tracked request");
-            let room = wire.rooms.entry(*room).or_default();
-            match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
+        self.tracked.retain_mut(|tracked| {
+            let state = agreed.next().expect("one state per tracked transfer");
+            let room = wire.rooms.entry(tracked.room).or_default();
+            match TransferPoll::from_wire(state).unwrap_or(TransferPoll::Failed) {
                 TransferPoll::Failed => {
                     // The peer engine sees the failure only on the wire.
                     room.fails = true;
-                    events.push(PdEvent::Failed(rid.clone()));
+                    events.push(PdEvent::Failed(tracked.rid.clone()));
                     false
                 }
-                TransferPoll::Bootstrapped if !*bootstrapped => {
-                    *bootstrapped = true;
-                    events.push(PdEvent::Bootstrapped(rid.clone()));
+                TransferPoll::Bootstrapped if !tracked.bootstrapped => {
+                    tracked.bootstrapped = true;
+                    events.push(PdEvent::Bootstrapped(tracked.rid.clone()));
                     true
                 }
                 TransferPoll::Success => {
+                    // The KV moves for `success_after` agreed polls after
+                    // the first that sees it sent.
+                    tracked.sent_polls += 1;
+                    if tracked.sent_polls <= success_after {
+                        return true;
+                    }
                     events.push(match role {
-                        Role::Prefill => PdEvent::Succeeded(rid.clone()),
+                        Role::Prefill => PdEvent::Succeeded(tracked.rid.clone()),
                         _ => PdEvent::RemotePrefillDone(RemotePrefill {
-                            rid: rid.clone(),
+                            rid: tracked.rid.clone(),
                             bootstrap_token: room.sent.expect("sent with the KV"),
                             cached_tokens: 0,
                             bootstrap_logprob: None,
@@ -664,6 +711,10 @@ impl DataPlane for FakeDevice {
             forward.map_or_else(Vec::new, |batch| batch.request_ids.clone()),
             ops.clone(),
         ));
+        self.trace
+            .lock()
+            .unwrap()
+            .extend(ops.iter().map(|op| format!("cache {:?}", op.kind)));
         self.unacknowledged
             .extend(ops.into_iter().map(|op| (self.ack_polls, op)));
         if let Some(wire) = &self.wire {
@@ -686,11 +737,16 @@ impl DataPlane for FakeDevice {
                     room.sent = Some(first);
                     room.sent_by.push(self.rank);
                 }
+                let handover = format!("handover {}", prompts.request_ids.join(" "));
+                self.trace.lock().unwrap().push(handover);
             }
         }
         let Some(batch) = forward else {
             return Ok(None);
         };
+        let forwarded = format!("forward {}", batch.request_ids.join(" "));
+        self.trace.lock().unwrap().push(forwarded);
+        self.unlanded_left = self.unlanded;
         thread::sleep(FORWARD_TIME);
         let mut result = ForwardResult::default();
         for (i, rid) in batch.request_ids.iter().enumerate() {
@@ -729,7 +785,18 @@ impl DataPlane for FakeDevice {
     }
 
     fn complete(&mut self, pending: ForwardResult) -> Result<ForwardResult, DataPlaneError> {
+        self.trace.lock().unwrap().push("complete".to_owned());
         Ok(pending)
+    }
+
+    /// The forward lands at its `unlanded + 1`-th query.
+    fn landed(&mut self, _pending: &ForwardResult) -> Result<bool, DataPlaneError> {
+        *self.landed_calls.lock().unwrap() += 1;
+        if self.unlanded_left > 0 {
+            self.unlanded_left -= 1;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
@@ -1238,6 +1305,13 @@ struct Setup {
     weight_update_failure_rank: Option<usize>,
     /// The ranks whose load prerequisites refuse until the test clears them.
     weight_load_refused: Option<fn(usize) -> bool>,
+    /// PD: the agreed polls that see a transfer's KV sent before the one it
+    /// concludes at (0: the first that sees it sent).
+    success_after: usize,
+    /// PD: this room's transfer breaks from this agreed poll on (from 1).
+    fails_at: Option<(u64, usize)>,
+    /// The `landed` queries each forward answers false on each rank.
+    unlanded: Option<fn(usize) -> usize>,
 }
 
 impl Layout {
@@ -1345,6 +1419,8 @@ fn run_rank<F: Frontend>(
         grammar,
         grammar_timeouts,
         epd_receive_enabled,
+        success_after,
+        fails_at,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1365,6 +1441,9 @@ fn run_rank<F: Frontend>(
             rank,
             wire: pd.wire,
             tracked: Vec::new(),
+            success_after,
+            polls: 0,
+            fails_at,
         }) as Box<dyn TransferPeer + Send>
     });
     let pp =
@@ -1435,6 +1514,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         },
         placeholder_stage: matches!(layout, Layout::Pp(_)) && rank + 1 < world,
         wire: setup.pd.as_ref().map(|pd| pd.wire.clone()),
+        unlanded: setup.unlanded.map_or(0, |unlanded| unlanded(rank)),
         ep_rank: rank,
         fail_weight_update: setup.weight_update_failure_rank == Some(rank),
         weight_load_refused: Arc::new(AtomicBool::new(
@@ -1587,11 +1667,19 @@ struct ScriptedFrontend {
     replies: Arc<Mutex<Vec<ControlOutput>>>,
     /// The requests that finished, with their reasons.
     finished: Arc<Mutex<Vec<(String, String)>>>,
+    /// Rounds the engine started so far.
+    rounds: usize,
+    /// Its rank's device trace, which it marks with `round <n>` as each
+    /// round starts and `send <rid> <reason>` per finished output sent.
+    trace: Arc<Mutex<Vec<String>>>,
     outputs: Arc<Mutex<Vec<StreamedOutput>>>,
 }
 
 impl Frontend for ScriptedFrontend {
     fn receive(&mut self, _wait: Option<Duration>) -> Vec<EngineRequest> {
+        let round = format!("round {}", self.rounds);
+        self.trace.lock().unwrap().push(round);
+        self.rounds += 1;
         let mut messages = std::mem::take(&mut self.reacted);
         messages.extend(self.script.pop_front().unwrap_or_default());
         messages
@@ -1603,15 +1691,17 @@ impl Frontend for ScriptedFrontend {
 
     fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
         self.reacted.extend((self.react)(&outputs));
-        self.outputs.lock().unwrap().extend(outputs.iter().cloned());
-        self.finished
-            .lock()
-            .unwrap()
-            .extend(outputs.iter().filter_map(|output| {
-                output
-                    .finish_reason
-                    .map(|reason| (output.rid.clone(), reason.to_owned()))
-            }));
+        for output in &outputs {
+            if let Some(reason) = output.finish_reason {
+                let sent = format!("send {} {reason}", output.rid);
+                self.trace.lock().unwrap().push(sent);
+                self.finished
+                    .lock()
+                    .unwrap()
+                    .push((output.rid.clone(), reason.to_owned()));
+            }
+        }
+        self.outputs.lock().unwrap().extend(outputs);
     }
 
     fn reply(&mut self, output: ControlOutput) {
@@ -1629,6 +1719,30 @@ struct ScriptedRank {
     released: Vec<(String, i32)>,
     cache_ops: Vec<CacheOpKind>,
     idle_forwards: usize,
+    /// Its device's trace, with the frontend's markers on the engine's
+    /// first rank (`FakeDevice::trace`).
+    trace: Vec<String>,
+    /// The `landed` queries its loop made.
+    landed_calls: usize,
+}
+
+/// A rank's device state that a scripted run reads back once it stopped.
+struct Probes {
+    plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    idle_forwards: Arc<Mutex<usize>>,
+    trace: Arc<Mutex<Vec<String>>>,
+    landed_calls: Arc<Mutex<usize>>,
+}
+
+impl Probes {
+    fn of(device: &FakeDevice) -> Self {
+        Self {
+            plans: device.plans.clone(),
+            idle_forwards: device.idle_forwards.clone(),
+            trace: device.trace.clone(),
+            landed_calls: device.landed_calls.clone(),
+        }
+    }
 }
 
 /// Run `layout`'s ranks, one script per engine (its first rank's frontend
@@ -1654,7 +1768,7 @@ fn run_scripted(
         .enumerate()
         .map(|(rank, mesh_listener)| {
             let device = fake_device(layout, rank, &setup);
-            let (plans, idle_forwards) = (device.plans.clone(), device.idle_forwards.clone());
+            let probes = Probes::of(&device);
             let replies = Arc::new(Mutex::new(Vec::new()));
             let finished = Arc::new(Mutex::new(Vec::new()));
             let outputs = Arc::new(Mutex::new(Vec::new()));
@@ -1665,6 +1779,8 @@ fn run_scripted(
                 reacted: Vec::new(),
                 replies: replies.clone(),
                 finished: finished.clone(),
+                rounds: 0,
+                trace: probes.trace.clone(),
                 outputs: outputs.clone(),
             });
             let spec = RankSpec {
@@ -1683,15 +1799,7 @@ fn run_scripted(
                 done.send(rank).unwrap();
                 outcome
             });
-            (
-                thread,
-                replies,
-                finished,
-                outputs,
-                released,
-                plans,
-                idle_forwards,
-            )
+            (thread, replies, finished, outputs, released, probes)
         })
         .collect();
     for _ in 0..world {
@@ -1703,19 +1811,22 @@ fn run_scripted(
     ranks
         .into_iter()
         .map(
-            |(thread, replies, finished, outputs, released, plans, idle_forwards)| ScriptedRank {
+            |(thread, replies, finished, outputs, released, probes)| ScriptedRank {
                 outcome: thread.join().unwrap(),
                 replies: replies.lock().unwrap().clone(),
                 finished: finished.lock().unwrap().clone(),
                 outputs: outputs.lock().unwrap().clone(),
                 released: released.lock().unwrap().clone(),
-                cache_ops: plans
+                cache_ops: probes
+                    .plans
                     .lock()
                     .unwrap()
                     .iter()
                     .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
                     .collect(),
-                idle_forwards: *idle_forwards.lock().unwrap(),
+                idle_forwards: *probes.idle_forwards.lock().unwrap(),
+                trace: probes.trace.lock().unwrap().clone(),
+                landed_calls: *probes.landed_calls.lock().unwrap(),
             },
         )
         .collect()
@@ -4716,4 +4827,234 @@ fn a_flush_under_a_keep_pause_runs_once_the_cache_work_did() {
         ]
     );
     assert!(rank.cache_ops.contains(&CacheOpKind::WriteBack));
+}
+
+/// A prefill engine whose decode node already admitted the pages of each
+/// `(room, slot)`, so its requests bootstrap at their first transfer poll.
+fn prefill_setup(rooms: &[(u64, i32)]) -> Setup {
+    Setup {
+        pd: Some(Pd {
+            role: Role::Prefill,
+            wire: prefill_wire(rooms),
+        }),
+        ..Setup::default()
+    }
+}
+
+/// A wire on which the decode node already admitted the pages of each
+/// `(room, slot)`.
+fn prefill_wire(rooms: &[(u64, i32)]) -> Arc<Mutex<Wire>> {
+    let mut wire = Wire::default();
+    for &(room, slot) in rooms {
+        wire.rooms.entry(room).or_default().preallocated = Some(slot);
+    }
+    Arc::new(Mutex::new(wire))
+}
+
+/// A script's message: a disaggregated request for `room`.
+fn add(rid: &str, room: u64, prompt_len: usize) -> EngineRequest {
+    EngineRequest::Add(Box::new(disaggregated(rid, room, prompt_len, 4)))
+}
+
+/// Where `line` first appears in `trace` at or after `from`.
+fn find(trace: &[String], from: usize, line: &str) -> usize {
+    match trace[from..].iter().position(|seen| seen == line) {
+        Some(found) => from + found,
+        None => panic!("no `{line}` from line {from}: {trace:?}"),
+    }
+}
+
+/// The requests of each `forward` line of `trace`, sorted.
+fn forwards(trace: &[String]) -> Vec<Vec<&str>> {
+    trace
+        .iter()
+        .filter_map(|line| line.strip_prefix("forward "))
+        .map(|rids| {
+            let mut rids: Vec<&str> = rids.split(' ').collect();
+            rids.sort_unstable();
+            rids
+        })
+        .collect()
+}
+
+/// A rank's finished requests as `<rid> <reason>`, sorted.
+fn finished(rank: &ScriptedRank) -> Vec<String> {
+    let mut finished: Vec<String> = rank
+        .finished
+        .iter()
+        .map(|(rid, reason)| format!("{rid} {reason}"))
+        .collect();
+    finished.sort();
+    finished
+}
+
+#[test]
+fn a_prefill_engine_plans_a_bootstrapped_request_in_the_round_it_arrives() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        // Both decode-side admissions precede the requests. `s0` takes two
+        // chunks. The transfer poll at the round head bootstraps each
+        // request in the round it arrives: `s0`'s first chunk runs in round
+        // 0, and `r0` joins its second in round 1. Without it nothing runs
+        // in round 0, and round 1's forward is `s0`'s first chunk alone.
+        let mut script: Script = vec![Vec::new(); 22];
+        script[0].push(add("s0", 80, 300));
+        script[1].push(add("r0", 81, 20));
+        let ranks = run_scripted(
+            layout,
+            0,
+            Tiers::DeviceOnly,
+            prefill_setup(&[(80, 0), (81, 1)]),
+            vec![script],
+            no_reaction,
+        );
+        let expected = forwards(&ranks[0].trace);
+        for (index, rank) in ranks.iter().enumerate() {
+            assert_eq!(rank.outcome, Ok(()), "{layout:?} rank {index}");
+            assert_eq!(forwards(&rank.trace), expected, "{layout:?} rank {index}");
+        }
+        let trace = &ranks[0].trace;
+        let after_arrival = forwards(&trace[find(trace, 0, "round 1")..]);
+        assert_eq!(after_arrival[0], ["r0", "s0"], "{layout:?}: {trace:?}");
+        let done = finished(&ranks[0]);
+        assert_eq!(done, ["r0 length", "s0 length"], "{layout:?}");
+    }
+}
+
+#[test]
+fn a_head_poll_success_writes_back_in_the_same_round() {
+    // `r0` prefills in round 0 and its KV leaves in round 1, whose tail poll
+    // sees it sent once; the round-2 head poll concludes the transfer. The
+    // finish publishes the prompt's last page, and its write-back to Host
+    // rides round 2's own plan, not round 3's.
+    let mut script: Script = vec![Vec::new(); 11];
+    script[0].push(add("r0", 80, 40));
+    let ranks = run_scripted(
+        Layout::Single,
+        0,
+        Tiers::HostL2,
+        Setup {
+            success_after: 1,
+            ..prefill_setup(&[(80, 0)])
+        },
+        vec![script],
+        no_reaction,
+    );
+    let rank = &ranks[0];
+    assert_eq!(rank.outcome, Ok(()));
+    assert_eq!(finished(rank), ["r0 length"]);
+    let trace = &rank.trace;
+    let (start, end) = (find(trace, 0, "round 2"), find(trace, 0, "round 3"));
+    let sent = find(trace, start, "send r0 length");
+    let written = find(trace, sent, "cache WriteBack");
+    assert!(sent < end && written < end, "{trace:?}");
+}
+
+#[test]
+fn a_prefill_output_streams_while_the_next_forward_runs() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        // `r0` completes its prompt in round 0 beside `s0`'s first chunk,
+        // and round 1 hands its KV over beside `s0`'s second. Each rank's
+        // forward lands only at its fifth query or later, while the
+        // transfer concludes at the second poll: `r0`'s output streams
+        // before that forward commits, not a round later. The queries: one
+        // agreement before the first wait, then one before each poll.
+        let mut script: Script = vec![Vec::new(); 21];
+        script[0].extend([add("r0", 80, 20), add("s0", 81, 600)]);
+        let ranks = run_scripted(
+            layout,
+            0,
+            Tiers::DeviceOnly,
+            Setup {
+                success_after: 1,
+                unlanded: Some(|rank| 4 + 3 * rank),
+                ..prefill_setup(&[(80, 0), (81, 1)])
+            },
+            vec![script],
+            no_reaction,
+        );
+        for (index, rank) in ranks.iter().enumerate() {
+            assert_eq!(rank.outcome, Ok(()), "{layout:?} rank {index}");
+            assert_eq!(rank.landed_calls, 3, "{layout:?} rank {index}");
+        }
+        let trace = &ranks[0].trace;
+        let handover = find(trace, 0, "handover r0");
+        let sent = find(trace, handover, "send r0 length");
+        let committed = find(trace, handover, "complete");
+        assert!(sent < committed, "{layout:?}: {trace:?}");
+        let done = finished(&ranks[0]);
+        assert_eq!(done, ["r0 length", "s0 length"], "{layout:?}");
+    }
+}
+
+#[test]
+fn prefill_ranks_leave_the_transfer_wait_together() {
+    // `r0`'s transfer outlasts the forwards it was handed over beside, and
+    // the ranks see each forward land at different queries: rank 1 must
+    // leave the wait with rank 0, at the same agreement, or their
+    // collectives stop pairing. They leave at rank 0's second query (one
+    // agreement before the wait, one after): the agreement is a MAX, so the
+    // fastest rank's landing ends it; a MIN would hold both to rank 1's
+    // seventh.
+    let mut script: Script = vec![Vec::new(); 101];
+    script[0].extend([add("r0", 80, 20), add("s0", 81, 600)]);
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            success_after: 50,
+            unlanded: Some(|rank| if rank == 0 { 1 } else { 6 }),
+            ..prefill_setup(&[(80, 0), (81, 1)])
+        },
+        vec![script],
+        no_reaction,
+    );
+    let trace = &ranks[0].trace;
+    let handover = find(trace, 0, "handover r0");
+    let beside = forwards(&trace[handover..]).len();
+    assert!(beside > 0, "{trace:?}");
+    for (index, rank) in ranks.iter().enumerate() {
+        assert_eq!(rank.outcome, Ok(()), "rank {index}");
+        assert_eq!(rank.landed_calls, 2 * beside, "rank {index}");
+    }
+    // The premise: the transfer concludes only after the forward commits.
+    let committed = find(trace, handover, "complete");
+    let sent = find(trace, handover, "send r0 length");
+    assert!(committed < sent, "{trace:?}");
+    assert_eq!(finished(&ranks[0]), ["r0 length", "s0 length"]);
+}
+
+#[test]
+fn a_transfer_failing_mid_forward_aborts_only_its_request() {
+    // Round 0 prefills `r0` and `f0`'s first chunk; round 1 hands `r0`'s KV
+    // over beside `f0`'s last chunk. `f0`'s transfer breaks at the first
+    // poll during that forward (the agreed polls before it: round 0's head
+    // and tail, round 1's head), so the scheduler sees its failure ahead of
+    // its chunk's result, at the round's tail; a second release of its
+    // pages would fail the device. `r0`'s transfer concludes during the
+    // same forward, at its third poll; the forward lands at its fifth query.
+    let mut script: Script = vec![Vec::new(); 21];
+    script[0].extend([add("r0", 80, 20), add("f0", 81, 300)]);
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            success_after: 2,
+            fails_at: Some((81, 4)),
+            unlanded: Some(|_| 4),
+            ..prefill_setup(&[(80, 0), (81, 1)])
+        },
+        vec![script],
+        no_reaction,
+    );
+    for (index, rank) in ranks.iter().enumerate() {
+        assert_eq!(rank.outcome, Ok(()), "rank {index}");
+    }
+    let trace = &ranks[0].trace;
+    let last_chunk = find(trace, 0, "forward f0");
+    let aborted = find(trace, last_chunk, "send f0 abort");
+    let committed = find(trace, last_chunk, "complete");
+    assert!(aborted < committed, "{trace:?}");
+    assert_eq!(finished(&ranks[0]), ["f0 abort", "r0 length"]);
 }
