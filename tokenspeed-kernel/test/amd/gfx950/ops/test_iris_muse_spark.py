@@ -1361,7 +1361,7 @@ def test_sliding_attention_tail_epoch_store_follows_a_barrier():
             "cache_seqlens_ptr": "*i32",
             "mid_o_ptr": "*fp32",
             "mid_lse_ptr": "*fp32",
-            "records_ptr": "*i32",
+            "counters_ptr": "*i32",
             "gate_ptr": "*bf16",
             "weight_ptr": "*bf16",
             "att_box": "*i32",
@@ -1433,10 +1433,15 @@ def test_sliding_attention_tail_epoch_store_follows_a_barrier():
     assert "s_barrier" in lines[index], "the epoch store does not follow a barrier"
 
 
-def _sliding_attntail_assembly(rows):
-    """The fused sliding tail's gfx950 assembly for rows verify rows: the
-    4-wave sliding split over a 2048-token window of 64-token FP8 pages, as
-    sliding_attention_boundary selects it."""
+@pytest.mark.parametrize("rows", [8, 16])
+def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
+    """The fused sliding tail's page-index loads do not drain the KV copies.
+
+    The split loads each page index two pages ahead with a volatile load, so
+    the next pages' K/V copies stay in flight. LLVM follows a volatile load
+    from global memory with `s_waitcnt vmcnt(0)`, which would wait for every
+    copy issued before it; from a const page table it does not.
+    """
     from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
         iris_fused_sliding_attention_twoshot_muse_attntail as fn,
@@ -1451,7 +1456,7 @@ def _sliding_attntail_assembly(rows):
         "cache_seqlens_ptr": "*i32",
         "mid_o_ptr": "*fp32",
         "mid_lse_ptr": "*fp32",
-        "records_ptr": "*i32",
+        "counters_ptr": "*i32",
         "gate_ptr": "*bf16",
         "gate_stride": "i32",
         "weight_ptr": "*bf16",
@@ -1471,6 +1476,8 @@ def _sliding_attntail_assembly(rows):
         "pre_bf16_ptr": "*bf16",
         "rows": "i32",
     }
+    # The 4-wave sliding split of 8 or 16 verify rows over a 2048-token
+    # window of 64-token FP8 pages, as sliding_attention_boundary selects it.
     kernel = _compile_gfx950(
         fn,
         types,
@@ -1513,21 +1520,9 @@ def _sliding_attntail_assembly(rows):
         unspecialized=("rows", "gate_stride"),
         options=sched_compile_options(),
     )
-    return kernel.asm["amdgcn"]
-
-
-@pytest.mark.parametrize("rows", [8, 16])
-def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
-    """The fused sliding tail's page-index loads do not drain the KV copies.
-
-    The split loads each page index two pages ahead with a volatile load, so
-    the next pages' K/V copies stay in flight. LLVM follows a volatile load
-    from global memory with `s_waitcnt vmcnt(0)`, which would wait for every
-    copy issued before it; from a const page table it does not.
-    """
     lines = [
         line.strip()
-        for line in _sliding_attntail_assembly(rows).splitlines()
+        for line in kernel.asm["amdgcn"].splitlines()
         if line.strip() and not line.strip().startswith((".", ";"))
     ]
     memory = re.compile(r"^(?:global|buffer)_(?:load|store|atomic)")
@@ -1543,64 +1538,6 @@ def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
                 after.startswith("s_waitcnt") and "vmcnt(0)" in after
             ), f"a page-index load drains the KV copies in flight: {line}"
     assert page_loads >= 2, "the split no longer loads page indices ahead"
-
-
-@pytest.mark.parametrize("rows", [8, 16])
-def test_sliding_attntail_split_records_codegen(rows):
-    """The splits hand their partials to the row block's merger through
-    tagged records, with no atomic, L2 writeback or invalidate.
-
-    Each split writes its partial through, waits for its stores in every
-    wave (vmcnt(0)) and joins at a barrier before one lane writes the record
-    through; the merger polls the records with relaxed device-scope loads
-    and reads the partials with system-scope (SC0 SC1) loads, which bypass
-    every L2.
-    """
-    from utils import vmcnt_zero_before_barrier
-
-    assembly = _sliding_attntail_assembly(rows)
-    assert re.search(r"\bbuffer_(?:wbl2|inv)\b|_atomic", assembly) is None
-    lines = assembly.splitlines()
-    polls = [
-        cycle
-        for cycle in polling_cycles(assembly)
-        if any(
-            re.search(r"\bglobal_load_dword v\d+, v\[\d+:\d+\], off sc1$", line)
-            for line in cycle
-        )
-    ]
-    assert len(polls) == 1, "expected one record poll"
-    poll = lines.index(polls[0][0])
-    record = max(
-        i for i in range(poll) if lines[i].lstrip().startswith("buffer_store_dword ")
-    )
-    assert (
-        lines[record].rstrip().endswith("sc0 sc1")
-    ), "the record is not written through"
-    # The partial stores since the split's last load are written through too.
-    load = max(
-        i for i in range(record) if re.match(r"\s*(?:buffer|global)_load", lines[i])
-    )
-    partials = [
-        line
-        for line in lines[load:record]
-        if re.match(r"\s*(?:buffer|global)_store", line)
-    ]
-    assert partials and all(line.rstrip().endswith("sc0 sc1") for line in partials)
-    # Every wave's partial stores have reached memory before the record.
-    checks = vmcnt_zero_before_barrier(
-        assembly,
-        "iris_fused_sliding_attention_twoshot_muse_attntail",
-        re.escape(lines[record].split(";")[0].strip()),
-    )
-    assert checks and all(waited for _, waited, _ in checks)
-    # The merge's first partial loads bypass the caches.
-    merge = [
-        line
-        for line in lines[poll + len(polls[0]) :]
-        if re.match(r"\s*(?:buffer|global)_load", line)
-    ][:4]
-    assert merge and all(line.rstrip().endswith("sc0 sc1") for line in merge)
 
 
 def test_gather_lamport_polling_codegen():
@@ -2359,8 +2296,7 @@ def _muse_sliding_attention_tail_worker(rank, world_size, device):
     expansion), so it agrees within rounding while ranks agree bit for bit.
     Row counts alternate 8 -> 16 -> 8 -> 16 eagerly and under graph replay
     with fresh inputs, one rank lags, and both post-norm forms run; afterwards
-    the next launch's mailboxes are empty and the split records hold the
-    last launch's tag.
+    the next launch's mailboxes are empty.
     """
     from tokenspeed_kernel.ops.gemm import mv
     from tokenspeed_kernel.ops.layernorm.fused_norm import (
@@ -2505,12 +2441,6 @@ def _muse_sliding_attention_tail_worker(rank, world_size, device):
     stage = int(epochs[0]) % 3
     assert bool((state.attntail_region[stage].view(torch.int32) == -(2**31)).all())
     assert bool((state.attention_box == -2147450880).all())
-    # The last launch (16 rows: 2 requests x 2 KV heads) left exactly its
-    # splits' records at its tag, the current epoch; earlier tags are lower.
-    config = state._sliding_attention_config(16, 2, k_cache, context, window, 0.125)
-    records = state.attntail_records
-    assert int((records == epochs[0]).sum()) == 4 * config.num_kv_splits
-    assert bool((records <= epochs[0]).all())
 
 
 def _muse_decode_step_lamport_worker(rank, world_size, device):

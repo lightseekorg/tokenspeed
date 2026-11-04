@@ -600,13 +600,7 @@ class AttentionProgram:
         return cdna4.mfma(p, v, acc)
 
     @gluon.jit
-    def store_split(self, acc, l_i, m_i, CACHE: gl.constexpr):
-        """Store this split's partial rows and their log2-sum-exp.
-
-        ``CACHE`` is the store cache modifier: ``""`` when the last arriver
-        merges (``arrive``), ``".wt"`` when a designated merger reads the
-        partials after the split records (``publish_split_record``).
-        """
+    def store_split(self, acc, l_i, m_i):
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
@@ -634,12 +628,8 @@ class AttentionProgram:
         mid_lse_offsets = (
             tokens * cfg.NUM_Q_HEADS + q_heads
         ) * cfg.NUM_KV_SPLITS + self.split_id
-        cdna4.buffer_store(
-            part_o, self.mid_o_ptr, mid_o_offsets, mask=valid[:, None], cache=CACHE
-        )
-        cdna4.buffer_store(
-            part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid, cache=CACHE
-        )
+        cdna4.buffer_store(part_o, self.mid_o_ptr, mid_o_offsets, mask=valid[:, None])
+        cdna4.buffer_store(part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid)
 
     @gluon.jit
     def store_output(self, acc, l_i):
@@ -661,9 +651,7 @@ class AttentionProgram:
     def finalize_splits(self, out_ptr, sink_ptr, counters_ptr, has_sink: gl.constexpr):
         """Let the last arriving split merge this row block and reset its counter."""
         if self.arrive(counters_ptr) == self.cfg.NUM_KV_SPLITS - 1:
-            output = self.merge_splits(sink_ptr, has_sink, "").to(
-                out_ptr.dtype.element_ty
-            )
+            output = self.merge_splits(sink_ptr, has_sink).to(out_ptr.dtype.element_ty)
             cfg = self.cfg
             offs_m = gl.arange(
                 0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
@@ -691,23 +679,6 @@ class AttentionProgram:
         )
 
     @gluon.jit
-    def wait_own_stores(self):
-        """Wait in every wave until the wave's stores have reached L2
-        (``s_waitcnt vmcnt(0)``, CDNA4 ISA 4.4), or memory for stores that
-        bypass the L2 (write-through). It also waits for the wave's loads."""
-        offs_m = gl.arange(
-            0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, self.cfg.store_layout)
-        )
-        gl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)",
-            constraints="=v,0",
-            args=[offs_m],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
-
-    @gluon.jit
     def arrive(self, counters_ptr):
         """Count this split's partial as stored; return the splits counted
         before it (NUM_KV_SPLITS - 1 for the last). The last arriver merges
@@ -716,13 +687,24 @@ class AttentionProgram:
         counter_offset = self.split_counter_offset()
         if cfg.NUM_WARPS > 1:
             # One thread performs the increment, and its release waits only
-            # for its own wave's stores. So every wave waits for its own
-            # stores; S_BARRIER waits on no counter, so the barrier the
+            # for its own wave's stores. So every wave runs s_waitcnt
+            # vmcnt(0), which waits until its stores have reached L2 (CDNA4
+            # ISA 4.4); S_BARRIER waits on no counter, so the barrier the
             # compiler places before the acq_rel atomic then orders every
             # wave's stores before the increment. The release then writes
             # back the L2 cache (BUFFER_WBL2), which makes all of those stores
             # visible to the other L2 caches.
-            self.wait_own_stores()
+            offs_m = gl.arange(
+                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
+            )
+            gl.inline_asm_elementwise(
+                asm="s_waitcnt vmcnt(0)",
+                constraints="=v,0",
+                args=[offs_m],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
         old = gl.atomic_add(
             counters_ptr + counter_offset,
             1,
@@ -732,80 +714,10 @@ class AttentionProgram:
         return old
 
     @gluon.jit
-    def split_record_offset(self):
-        """This split's record among the request's row blocks: NUM_KV_SPLITS
-        int32 records per row block, in split order."""
-        return self.split_counter_offset() * self.cfg.NUM_KV_SPLITS + self.split_id
-
-    @gluon.jit
-    def publish_split_record(self, records_ptr, tag):
-        """Mark this split's partial (stored ``".wt"`` by ``store_split``) as
-        complete: the alternative to ``arrive`` for a designated merger.
-
-        Every wave waits until its write-through stores have reached memory,
-        a workgroup barrier joins the waves, then one lane stores ``tag`` to
-        the split's record, also written through. ``tag`` must differ from
-        every value the record held before, such as a per-launch count, so
-        no record left by an earlier launch can match it; the records then
-        need no reset. Write-through stores and the merger's loads at device
-        scope (SC1) bypass the L2 caches when the device has more than one
-        (CDNA4 ISA 9.1.10.2, Tables 49 and 50), so the merger may run on
-        another L2 and needs no cache writeback or invalidate.
-        """
-        cfg = self.cfg
-        self.wait_own_stores()
-        gl.barrier()
-        lanes = gl.arange(
-            0,
-            64 * cfg.NUM_WARPS,
-            layout=gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0]),
-        )
-        # A buffer store from lane 0 of the first wave: a write-through
-        # pointer store would be volatile, and LLVM follows a volatile store
-        # with s_waitcnt vmcnt(0).
-        cdna4.buffer_store(
-            gl.full(lanes.shape, 0, gl.int32, lanes.type.layout) + tag,
-            records_ptr,
-            self.split_record_offset() + lanes * 0,
-            mask=lanes == 0,
-            cache=".wt",
-        )
-
-    @gluon.jit
-    def wait_split_records(self, records_ptr, tag):
-        """Wait until the row block's other splits have published ``tag``
-        (``publish_split_record``). Only the row block's last split, the
-        designated merger, may call it, after publishing its own record
-        (whose wait also puts its own partial in memory for its loads).
-
-        Each wave polls the records itself, one per lane (lanes past the
-        records repeat the last one), with relaxed device-scope loads that
-        bypass the L2 caches; a workgroup barrier then orders the waves'
-        partial loads (``merge_splits`` with ``".cv"``) after every wave's
-        poll.
-        """
-        cfg = self.cfg
-        gl.static_assert(cfg.NUM_KV_SPLITS >= 2 and cfg.NUM_KV_SPLITS <= 65)
-        lanes = gl.arange(
-            0,
-            64 * cfg.NUM_WARPS,
-            layout=gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0]),
-        )
-        split = gl.minimum(lanes % 64, cfg.NUM_KV_SPLITS - 2)
-        first = self.split_counter_offset() * cfg.NUM_KV_SPLITS
-        gl.atomic_poll(records_ptr + first + split, tag, sem="relaxed", scope="gpu")
-        gl.barrier()
-
-    @gluon.jit
-    def merge_splits(
-        self, sink_ptr, has_sink: gl.constexpr, PARTIAL_CACHE: gl.constexpr
-    ):
+    def merge_splits(self, sink_ptr, has_sink: gl.constexpr):
         """Merge the row block's split partials (and the sink) into its FP32
-        output rows, ``[BLOCK_M, HEAD_DIM]`` in ``cfg.store_layout``, in split
-        order. Only the last arriver (see ``arrive``, with ``PARTIAL_CACHE``
-        ``""``) or the designated merger (see ``wait_split_records``, with
-        ``".cv"``) may call it. ``PARTIAL_CACHE`` is the partial loads' cache
-        modifier."""
+        output rows, ``[BLOCK_M, HEAD_DIM]`` in ``cfg.store_layout``. Only the
+        last arriver (see ``arrive``) may call it."""
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
@@ -828,54 +740,34 @@ class AttentionProgram:
             dtype=gl.float32,
             layout=cfg.store_layout,
         )
-        # After arrive, each split's waves stored their partials before its
-        # acq_rel increment, so this split's increment orders the partial
-        # loads after all of them, and the loads can be ordinary cached
-        # loads; volatile loads would bypass the caches and slow the merge.
-        # Only the incrementing wave acquires, but its BUFFER_INV invalidates
+        # Each split's waves stored their partials before its acq_rel
+        # increment, so this split's increment orders the partial loads
+        # after all of them, and the loads can be ordinary cached loads;
+        # volatile loads would bypass the caches and slow the merge. Only
+        # the incrementing wave acquires, but its BUFFER_INV invalidates
         # the CU's whole vector L1 cache, which all of the work-group's
         # waves share, and the L2's non-coherently cached lines (CDNA4
         # ISA 9.1.10.2, Table 52), and the barrier that
-        # broadcasts the old count orders their loads after it. After the
-        # split records, the partials were written through and the ".cv"
-        # loads bypass the CU and L2 caches instead.
+        # broadcasts the old count orders their loads after it.
         for split in range(0, cfg.NUM_KV_SPLITS):
             base = (
                 (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
                 * cfg.NUM_KV_SPLITS
                 + split
             ) * cfg.HEAD_DIM + offs_d[None, :]
+            part_o = gl.load(
+                self.mid_o_ptr + base,
+                mask=valid[:, None],
+                other=0.0,
+            ).to(gl.float32)
             lse_offset = (
                 tokens * cfg.NUM_Q_HEADS + q_heads
             ) * cfg.NUM_KV_SPLITS + split
-            if PARTIAL_CACHE == "":
-                part_o = gl.load(
-                    self.mid_o_ptr + base,
-                    mask=valid[:, None],
-                    other=0.0,
-                ).to(gl.float32)
-                part_lse = gl.load(
-                    self.mid_lse_ptr + lse_offset,
-                    mask=valid,
-                    other=-float("inf"),
-                ).to(gl.float32)
-            else:
-                # Buffer loads carry the cache bits without being volatile,
-                # so the loads of consecutive splits stay in flight together.
-                part_o = cdna4.buffer_load(
-                    self.mid_o_ptr,
-                    base,
-                    mask=valid[:, None],
-                    other=0.0,
-                    cache=PARTIAL_CACHE,
-                ).to(gl.float32)
-                part_lse = cdna4.buffer_load(
-                    self.mid_lse_ptr,
-                    lse_offset,
-                    mask=valid,
-                    other=-float("inf"),
-                    cache=PARTIAL_CACHE,
-                ).to(gl.float32)
+            part_lse = gl.load(
+                self.mid_lse_ptr + lse_offset,
+                mask=valid,
+                other=-float("inf"),
+            ).to(gl.float32)
             next_m = maximum(final_m, part_lse)
             if cfg.MAX_SEQLEN_Q > 1:
                 # A later query position's first splits can all precede
@@ -1119,7 +1011,7 @@ def gluon_mha_decode_gfx950(
         m_i, l_i, acc = _stream_split_pipelined(
             program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
-    program.store_split(acc, l_i, m_i, "")
+    program.store_split(acc, l_i, m_i)
 
 
 @gluon.jit
@@ -1287,7 +1179,7 @@ def _mha_decode_sliding_split_atomic(
             program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
 
-    program.store_split(acc, l_i, m_i, "")
+    program.store_split(acc, l_i, m_i)
     program.finalize_splits(out_ptr, sink_ptr, counters_ptr, HAS_SINK)
 
 

@@ -528,8 +528,7 @@ def _muse_attntail_wait_box(box_ptr, offsets, valid, LAYOUT: gl.constexpr):
 def muse_attntail_store_attention(program, gate, att_box, EPS: gl.constexpr):
     """Merge this row block's splits, gate and normalize, and publish them.
 
-    Only the row block's merging split calls it, once the other splits'
-    records carry this launch's tag. As attention followed by
+    Only the last-arriving split calls it. As attention followed by
     weightless_rmsnorm_gated_sigmoid: the merged rows round to BF16, then per
     head x * rsqrt(mean(x^2) + EPS) * sigmoid(gate) in FP32, rounded to BF16.
     The rows go to att_box ([tokens, heads * head_dim] BF16, empty marker
@@ -537,7 +536,7 @@ def muse_attntail_store_attention(program, gate, att_box, EPS: gl.constexpr):
     zero is stored as zero.
     """
     cfg = program.cfg
-    x = program.merge_splits(att_box, False, ".cv").to(gl.bfloat16).to(gl.float32)
+    x = program.merge_splits(att_box, False).to(gl.bfloat16).to(gl.float32)
     inv = gl.rsqrt(gl.sum(x * x, 1) / cfg.HEAD_DIM + EPS)
     g = gate.to(gl.float32)
     rows = _iris_sanitize_lamport_bf16(
@@ -576,8 +575,7 @@ def muse_attntail_attention(
     cache_seqlens_ptr,
     mid_o_ptr,
     mid_lse_ptr,
-    records_ptr,
-    tag,
+    counters_ptr,
     gate_ptr,
     gate_stride,
     att_box,
@@ -585,13 +583,9 @@ def muse_attntail_attention(
     EPS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
-    """One sliding split of _mha_decode_sliding_split_atomic. Every split
-    writes its partial through and publishes tag to its record; the row
-    block's last split (the highest program id of the block, so its wait
-    points to lower ids) waits for the other records, merges in split order
-    as the last arriver of the split decode does, and publishes the gated,
-    normalized rows (muse_attntail_store_attention). NUM_STAGES pages stream
-    in flight, as the split decode's launch config sets."""
+    """One sliding split of _mha_decode_sliding_split_atomic; the last split
+    publishes the gated, normalized rows (muse_attntail_store_attention).
+    NUM_STAGES pages stream in flight, as the split decode's launch config sets."""
     program = AttentionProgram.create(
         cfg,
         q_ptr,
@@ -605,7 +599,7 @@ def muse_attntail_attention(
         head_block,
         split,
     )
-    # Every split loads its row block's gate now; only the merging split uses it.
+    # Every split loads its row block's gate now; only the last arriver uses it.
     m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
     d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
     gate_rows = (
@@ -632,11 +626,10 @@ def muse_attntail_attention(
         m_i, l_i, acc = _stream_split_pipelined(
             program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
-    program.store_split(acc, l_i, m_i, ".wt")
-    program.publish_split_record(records_ptr, tag)
-    if split == cfg.NUM_KV_SPLITS - 1:
-        program.wait_split_records(records_ptr, tag)
+    program.store_split(acc, l_i, m_i)
+    if program.arrive(counters_ptr) == cfg.NUM_KV_SPLITS - 1:
         muse_attntail_store_attention(program, gate, att_box, EPS)
+        gl.store(counters_ptr + program.split_counter_offset(), 0)
 
 
 @gluon.jit
@@ -1115,7 +1108,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
     cache_seqlens_ptr,
     mid_o_ptr,
     mid_lse_ptr,
-    records_ptr,
+    counters_ptr,
     gate_ptr,
     gate_stride,
     weight_ptr,
@@ -1171,10 +1164,8 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
     Grid of 256 workgroups x num_warps, roles by program id (every wait points
     to a lower id, so the launch progresses without co-residency):
     - [0, A): the sliding attention splits (A = requests x KV heads x splits);
-      each publishes its record (records_ptr: one int32 per split, at
-      least A, tagged epoch + 1), and the last split of a row block merges
-      and publishes the gated, normalized rows to att_box
-      (muse_attntail_attention).
+      the last split of a row block publishes its gated, normalized rows to
+      att_box (muse_attntail_attention).
     - [A, A + 128): senders of 64 o_proj columns each; their weights load at
       entry, while attention runs (muse_attntail_o_proj_prefetch / _send).
     - [A + 128, A + 136): owners of 128 of this rank's WIDTH / WORLD_SIZE
@@ -1246,8 +1237,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
             cache_seqlens_ptr,
             mid_o_ptr,
             mid_lse_ptr,
-            records_ptr,
-            epoch + 1,
+            counters_ptr,
             gate_ptr,
             gate_stride,
             att_box,
