@@ -1484,17 +1484,19 @@ def new_index_metadata(
 
     page_table and visible_lens have the index_topk contract. request_indices
     is contiguous int32 [queries] on the same device, or None for independent
-    rows. Equal consecutive nonnegative IDs group queries of one request:
-    their page tables must match and their visible lengths must be nondecreasing.
-    Callers must emit nonnegative IDs in that order; the values are not scanned
-    here because a device-to-host check would synchronize the step. Rows whose
-    visible length is 0 are scheduled independently before the grouped call, so
-    a padding row cannot end an active request's run. All supplied tensors must
-    remain unchanged for this object's lifetime. Share it only between layers
-    of one forward; create a new object for every eager invocation and graph
-    capture. Replay recomputes the captured producers. No KV values or scores
-    are cached. Consumers on other streams wait for metadata producers before
-    reading. Cached geometry is retained until this object is released.
+    rows. Equal consecutive IDs group queries of one request: their page tables
+    must match and their visible lengths must be nondecreasing. Rows with a
+    positive visible length must carry nonnegative IDs in that order; the values
+    are not scanned here because a device-to-host check would synchronize the
+    step. Rows whose visible length is 0 are relabeled with distinct negative
+    IDs before the grouped call, whatever ID they carry (decode padding carries
+    -1), so a padding row cannot end an active request's run. All supplied
+    tensors must remain unchanged for this object's lifetime. Share it only
+    between layers of one forward; create a new object for every eager
+    invocation and graph capture. Replay recomputes the captured producers. No
+    KV values or scores are cached. Consumers on other streams wait for metadata
+    producers before reading. Cached geometry is retained until this object is
+    released.
     """
     from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
