@@ -18,36 +18,38 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The Muse Spark layer's role table, as layer.py composes it, as a plan.
+"""The Muse Spark layer's roles, as layer.py composes them, as a plan.
 
 :func:`muse_plan` builds the step sequence of every workgroup ``(xcd, slot)``
 for one :class:`PlanKey`, following ``gluon_monokernel_muse_spark_gfx950``
-role for role; :func:`expected_counts` is the per-XCD role table written apart
-from the builder, so the checker compares two descriptions. Keys name the
-hand-offs (``AR.rs[n]``, ``ids[g]``, ...); cross-GPU keys are modelled on one
-rank (as rank 0). Waits whose producers depend on the routes or on the
-balanced attention schedule list every possible producer.
+role for role; :func:`expected_counts` is the per-XCD role table written
+apart from the builder, so the checker compares two descriptions. Role names
+and exchanges (SENDER, AR_OWNER, ..., AR, POOLED_AG, ...) are defined in
+layer.py's module docstring. Keys name the hand-offs (``AR.rs[n]``,
+``ids[g]``, ...); cross-GPU keys are modelled on one rank (as rank 0). Waits
+whose producers depend on the routes or on the balanced attention schedule
+list every possible producer.
 
 Per XCD, in launch order:
 
-- front: slots 0-15 SENDER (o_proj at entry, or at full layers after the
+- pre-MoE: slots 0-15 SENDER (o_proj at entry, or at full layers after the
   first attention item; the router weights after the push, on slot 0 after
-  AR_OWNER) then ROUTER, slot 0 also AR_OWNER between them and
-  slot 1 publishing h'[:, part xcd]; slots 16-23 POOLER (slot 16 + T on XCD T
-  reduces tile T); sliding attention blocks b on XCD b, slots 24-31 (split s
-  on slot 24 + s, merger split 0); full layers run balanced items cta and cta
-  + 256 everywhere and merge task t < requests x 16 on (slot 24 + t // 8,
-  xcd t % 8); TOPK of 8-row group g on (xcd 7 - g, slot 24); POOLED_NORM of row r on
-  (xcd r % 8, slot 25 + r // 8);
+  AR_OWNER), then ROUTER; slot 0 also runs AR_OWNER between them, and slot 1
+  publishes h'[:, part xcd]; slots 16-23 POOLER (slot 16 + T on XCD T sums
+  tile T); sliding attention block b on XCD b, slots 24-31 (split s on slot
+  24 + s, merged by split 0); full layers run balanced items cta and cta +
+  256 everywhere and merge task t < requests x 16 on (slot 24 + t // 8, xcd
+  t % 8); TOPK of 8-row group g on (xcd 7 - g, slot 24); POOLED_NORM of row
+  r on (xcd r % 8, slot 25 + r // 8);
 - MoE: every workgroup, after the ids and xq tag lines (scalar polls);
-- tail: the QKV task's weights at the MoE end (not when the next layer is
-  regular; POST_SENDER workgroups issue the relay's weights, then the QKV task's
-  first window, and the rest of it after POST_SENDER and REDUCER),
-  then ROUTE_OWNER of every row, then FINISHER, on slots 0 and 24-30 (tail index i,
-  tokens i + 8 r), POST_SENDER on 16-23 (slot 16 also REDUCER), then the QKV task (part
-  2 xcd + slot % 2, group slot // 2) on every workgroup, then PROLOGUE i * 8 +
-  xcd < 34 on tail workgroups; or BOUNDARY on tail workgroups when the next
-  layer is regular.
+- post-MoE: the QKV task's weights at the MoE end (not when the next layer
+  is regular; POST_SENDER workgroups issue the relay's weights, then the QKV
+  task's first window, and the rest of it after POST_SENDER and REDUCER);
+  then ROUTE_OWNER of every row, then FINISHER, on the tail workgroups
+  (slots 0 and 24-30, tail index i, tokens i + 8 r); POST_SENDER on 16-23
+  (slot 16 also REDUCER); then the QKV task (part 2 xcd + slot % 2, group
+  slot // 2) on every workgroup; then PROLOGUE i * 8 + xcd < 34 on the tail
+  workgroups, or BOUNDARY there when the next layer is regular.
 """
 
 from __future__ import annotations
@@ -76,12 +78,13 @@ TAIL_SLOTS = (0, 24, 25, 26, 27, 28, 29, 30)
 _ALL = "all"
 # Why some vector polls may sit behind loads in flight (plan.Wait.queued).
 _IWC = "issue-wait-compute"
-# The tail roles' QKV weights go out at their MoE end and land before the
-# first tail poll (an assumption the phase stamps check).
+# The tail workgroups' QKV weights go out at their MoE end and land before
+# their first post-MoE poll (an assumption the phase stamps check).
 _LANDED = "landed"
 
-# Two-copy cross-GPU receive areas and the local attention box: re-armed by
-# the SENDER workgroups at entry. Tagged words: never cleared.
+# Two-copy cross-GPU receive areas and the local attention output area
+# (``att_box``): re-armed by the o_proj senders at entry. Tagged words
+# (``S``: the routed sums): never cleared.
 _CLEARED = ("att_box", "AR", "POOLED_AG", "ROUTE_PUSH_own", "routes", "POST_AG")
 _TAGGED = ("att_rec", "AR_sums", "rtr", "pool", "exchange", "S", "hprime",
            "reducer_in", "POST_AG_sums", "qkv")  # fmt: skip
@@ -148,8 +151,8 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
 
     if slot < 16:
         sender = xcd * 16 + slot
-        # o_proj (SENDER) at entry (paced), or at full layers at the attention
-        # items' hook; the router's hi / lo (ROUTER) after the push and AR_OWNER.
+        # o_proj at entry (paced), or at full layers after the attention
+        # items; the router's hi / lo tiles after the push and AR_OWNER.
         if full:
             steps += items(("SENDER",))
         else:
@@ -240,7 +243,7 @@ def _moe(key: PlanKey, xcd: int, slot: int) -> list:
         Wait("MOE", _ALL, ids, "smem", ""),
         Load("MOE", _ALL),  # the ring's first weights, before the xq rows
         Wait("MOE", _ALL, tuple(f"xq[{r}]" for r in range(rows)), "smem", ""),
-        # dn epilogue: ROUTE_PUSH pushes from this workgroup's units (producer-direct).
+        # The down units' epilogue pushes their outputs (ROUTE_PUSH).
         Publish("MOE", _ALL, (f"ROUTE_PUSH[{xcd}][{slot}]",)),
     ]
 
@@ -261,7 +264,8 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
     if tail:
         index = TAIL_SLOTS.index(slot)
         tokens = [index + 8 * r for r in range(requests)]
-        # Every row's ROUTE_OWNER push before any FINISHER wait; one S publish.
+        # Every row's route-owner push before any finisher wait; one publish
+        # of the routed sums.
         for token in tokens:
             steps += [
                 Wait("ROUTE_OWNER", _ALL, all_route_push, "vector", _LANDED),
@@ -327,7 +331,7 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
 
 
 def muse_plan(key: PlanKey) -> LayerPlan:
-    """The plan of one Muse Spark fused-layer launch for ``key``."""
+    """The plan of one Muse Spark monokernel launch for ``key``."""
     programs = {}
     for xcd in range(XCDS):
         for slot in range(SLOTS):
