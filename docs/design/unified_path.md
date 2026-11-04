@@ -2358,6 +2358,7 @@ The small Iris all-reduce keeps fixed mailbox geometry, validates complete
 tiles on the host and uses a uniform tile predicate so runtime payload
 bounds retain coherent 16-byte peer transactions. Paged history-table row
 offsets are computed in 64 bits before multiplying by the runtime stride.
+Scalar prefix-length reads share one binary across slice alignments.
 
 `test_startup_request_warmup.py` checks scheduler isolation and draining;
 `test_startup_compile_keys.py` checks binary reuse across runtime sizes;

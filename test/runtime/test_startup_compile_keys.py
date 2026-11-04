@@ -160,3 +160,31 @@ def test_sharded_scorer_table_width_reuses_one_binary():
             _source_hash(_dsa_decode_logits_fp8_kernel, args, kwargs, gluon=False)
         )
     assert len(set(hashes)) == 1
+
+
+def test_prefix_slice_alignment_reuses_one_binary():
+    from tokenspeed.runtime.layers.attention.chunk import (
+        create_chunked_cache_kv_indices_paged,
+    )
+
+    table = torch.empty(16, 1024, dtype=torch.int32)
+    lengths = torch.empty(128, dtype=torch.int32)
+    cumulative = torch.empty(128, dtype=torch.int32)
+    output = torch.empty(8192, dtype=torch.int32)
+    hashes = []
+    for offset, cumulative_offset in ((0, 0), (1, 1), (1, 4)):
+        hashes.append(
+            _source_hash(
+                create_chunked_cache_kv_indices_paged,
+                (
+                    table,
+                    lengths[offset : offset + 16],
+                    lengths[offset : offset + 16],
+                    cumulative[cumulative_offset : cumulative_offset + 17],
+                    output,
+                ),
+                dict(page_table_ptr_stride=1024, PAGE_SIZE=64),
+                gluon=False,
+            )
+        )
+    assert len(set(hashes)) == 1
