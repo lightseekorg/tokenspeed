@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._scheduling import arithmetic_fence, sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
 
 async_copy = gl.amd.cdna4.async_copy
@@ -107,23 +108,6 @@ def supports_gluon_rowcta_bf16_gemv_gfx950(m: int, n: int, k: int) -> bool:
     Any single row runs; more rows need a measured bucket in ``_ROWS_CONFIGS``.
     """
     return m == 1 or _rows_config(m, n, k) is not None
-
-
-@gluon.jit
-def _pin(values):
-    """Return ``values`` through an empty side-effecting asm, which LLVM can
-    neither move nor merge with the same computation of another K step."""
-    # asm: an empty template (no instruction). Gluon has no op that keeps a
-    # value at a program point, and the Iris kernels that call this link no
-    # LLVM library.
-    return gl.inline_asm_elementwise(
-        asm="",
-        constraints="=v,0",
-        args=[values],
-        dtype=gl.float32,
-        is_pure=False,
-        pack=1,
-    )
 
 
 @gluon.jit
@@ -272,10 +256,11 @@ def gluon_rowcta_bf16_gemv_rows_finish_gfx950(
         weight = weights[step].to(gl.float32)
         x = xs[step].to(gl.float32)
         accumulator += x[:, None, :] * weight[None, :, :]
-        # Pin this step's math here. Otherwise LLVM vectorizes the math of
-        # all steps together after every load, keeping each step's
-        # activation registers live (128 VGPRs and spills at 8 rows).
-        accumulator = _pin(accumulator)
+        # Pin this step's math here (a value LLVM treats as new). Otherwise
+        # LLVM vectorizes the math of all steps together after every load,
+        # keeping each step's activation registers live (128 VGPRs and spills
+        # at 8 rows).
+        accumulator = arithmetic_fence(accumulator)
         gl.amd.hint.sched_barrier()
     return gl.sum(accumulator, axis=2)
 
@@ -343,7 +328,7 @@ def gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950(
         x = x_smem.slice(step * BLOCK_K, BLOCK_K, 1).load(x_layout).to(gl.float32)
         weight = weights[step].to(gl.float32)
         accumulator += x[:, None, :] * weight[None, :, :]
-        accumulator = _pin(accumulator)
+        accumulator = arithmetic_fence(accumulator)
         gl.amd.hint.sched_barrier()
     return gl.sum(accumulator, axis=2)
 
@@ -548,6 +533,7 @@ def gluon_rowcta_bf16_gemv_gfx950(
         OUTPUTS_PER_WAVE=outputs_per_wave,
         NUM_WARPS=num_warps,
         num_warps=num_warps,
+        **sched_compile_options(),
     )
     return out
 

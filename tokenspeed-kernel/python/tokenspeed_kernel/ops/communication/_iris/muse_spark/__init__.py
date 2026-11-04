@@ -1772,6 +1772,8 @@ class MuseIrisState:
             HAS_PRE=pre_weight is not None,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=16,
+            # The GEMV's per-step pin is in the scheduling library.
+            **sched_compile_options(),
         )
         return out_stream, pre_bf16
 

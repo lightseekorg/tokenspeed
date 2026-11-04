@@ -292,7 +292,7 @@ def _rows_gemv(rows):
         OUTPUTS_PER_WAVE=outputs_per_wave,
         NUM_WARPS=num_warps,
     )
-    return _compile_gfx950(fn, types, constexprs, num_warps, ("M",))
+    return _compile_gfx950(fn, types, constexprs, num_warps, ("M",), _sched_options())
 
 
 _MOETAIL = dict(
@@ -335,7 +335,7 @@ def _moetail_fused():
         WAVES_PER_OUTPUT=4,
         PEER_SIGNAL_STORE_CACHE=_peer_signal_store(),
     )
-    return _compile_gfx950(fn, types, constexprs, 16, ("region", "M"))
+    return _compile_gfx950(fn, types, constexprs, 16, ("region", "M"), _sched_options())
 
 
 def _moetail_columns():
@@ -623,11 +623,6 @@ _AMD = "tokenspeed_kernel_amd.ops.gfx950."
 _STREAM_SYNC = _AMD + "moe.mxfp4._stream_sync:"
 INLINE_ASM = {
     # Empty templates (no instruction): a point the value must pass.
-    "_pin": (
-        _AMD + "gemm.fp16.decode_gemv:_pin",
-        "keeps each K step's FMAs at their step instead of after every load",
-        "a Gluon op that pins a value to a program point",
-    ),
     "_issue_here": (
         _AMD + "moe.mxfp4.decode_stage2:_issue_here",
         "keeps a scalar load above the job loop's bound check",

@@ -1705,6 +1705,7 @@ def test_moetail_lamport_codegen(block_m):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
         iris_fused_gemv_lamport_allgather_muse_moetail as fn,
     )
+    from tokenspeed_kernel_amd._scheduling import sched_compile_options
 
     types = {
         "x_ptr": "*bf16",
@@ -1744,6 +1745,7 @@ def test_moetail_lamport_codegen(block_m):
         },
         num_warps=16,
         unspecialized=("region", "M"),
+        options=sched_compile_options(),
     )
     assembly = kernel.asm["amdgcn"]
     lines = assembly.splitlines()
