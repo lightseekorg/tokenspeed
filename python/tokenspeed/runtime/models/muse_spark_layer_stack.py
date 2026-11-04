@@ -40,7 +40,7 @@ from tokenspeed_kernel.ops.monokernel import FusedDecoderLayer, PlanKey
 
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.fused_decoder_layer import (
+from tokenspeed.runtime.layers.monokernel import (
     agree_served_shapes,
     current_deployment,
     deployment_decline_reasons,

@@ -27,7 +27,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tokenspeed.runtime.layers.fused_decoder_layer import (
+from tokenspeed.runtime.layers.monokernel import (
     FusedLayerDeployment,
     agree_served_shapes,
     deployment_decline_reasons,

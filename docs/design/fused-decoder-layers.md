@@ -70,7 +70,7 @@ model class's `layer_stack_cls`:
   every plan variant. Nothing compiles or checks inside a captured graph.
 * Each rank's refusals (deployment settings, a variant that does not fit one
   workgroup per compute unit, state the kernel cannot allocate) go through
-  `agree_served_shapes` (`runtime/layers/fused_decoder_layer.py`) over the
+  `agree_served_shapes` (`runtime/layers/monokernel.py`) over the
   group's CPU group. A refusal on one rank removes the row shape on every
   rank. The startup report lists every declined shape with its rank and
   reason.
