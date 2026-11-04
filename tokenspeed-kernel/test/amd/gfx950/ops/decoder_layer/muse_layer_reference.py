@@ -182,6 +182,7 @@ def regular_reference(key, weights, inputs):
         post_offset, *weights["post_attention_gate"], pre_w, pre_eps, pre_offset,
         False, None, 1,
     )  # fmt: skip
+    phases = dict(attention=attention, hprime=stream.float())
 
     # Router: FP32 logits scaled, sigmoid scores, the bias picks only.
     logits = (pre.float() @ weights["router"]) * weights["router_multiplier"]
@@ -192,6 +193,7 @@ def regular_reference(key, weights, inputs):
     if gap <= ROUTING_GAP:
         raise RoutingTie(f"routing ties within {gap}")
     ids = biased.topk(TOPK, dim=-1).indices
+    phases.update(logits=logits, ids=ids.sort(-1).values)
     route_weights = scores.gather(1, ids)
     route_weights = route_weights / route_weights.sum(-1, keepdim=True)
     route_weights = route_weights * weights["routed_scaling_factor"]
@@ -207,6 +209,7 @@ def regular_reference(key, weights, inputs):
         _rmsnorm(routes, *weights["post_expert_norm"])
         * route_weights.double()[..., None]
     ).sum(1)
+    phases.update(pooled=pooled, combined=combined)
     mlp = combined.to(torch.bfloat16).float() @ weights["post_expert_proj"].float().t()
     post2_w, post2_eps, post2_offset = weights["post_feedforward_norm"]
     next_w, next_eps, next_offset = weights["next_input_norm"]
@@ -215,8 +218,9 @@ def regular_reference(key, weights, inputs):
         *weights["post_feedforward_gate"], next_w, next_eps, next_offset,
         False, None, 1,
     )  # fmt: skip
+    phases.update(residual=stream.float())
     if key.next_kind == "regular":
-        return dict(normed=next_input, residual=stream.float())
+        return dict(normed=next_input, residual=stream.float(), phases=phases)
 
     qkvg = (next_input.float() @ weights["next_qkv_proj"].float().t()).to(
         torch.bfloat16
@@ -228,7 +232,8 @@ def regular_reference(key, weights, inputs):
         query_dtype=target.query_dtype, return_kv=False, solution=None, override=None,
     )  # fmt: skip
     return dict(q=prepared.q, gate=next_gate, residual=stream.float(),
-                next_k=target.cache.k_cache, next_v=target.cache.v_cache)  # fmt: skip
+                next_k=target.cache.k_cache, next_v=target.cache.v_cache,
+                phases=phases)  # fmt: skip
 
 
 def _relative_rms(actual, expected):
@@ -245,6 +250,22 @@ def _relative_rms(actual, expected):
 _BF16_BOUND = 2**-6
 # The FP8 E4M3 query and K/V: one rounding is 2**-4 relative.
 _FP8_BOUND = 2**-3
+
+
+def phase_errors(state, expected, rows):
+    """Relative RMS error of the fused launch's intermediates that stay in
+    its state against the reference's, to locate the first phase that
+    differs: h' (the residual after attention), the router logits (the sum
+    of the K parts), the pooled rows and the summed experts (S)."""
+    phases = expected["phases"]
+    errors = {}
+    hprime = state.hprime[:rows]
+    errors["hprime"] = _relative_rms(hprime, phases["hprime"])
+    words = state.logits_parts[:, :rows]
+    parts = (words & 0xFFFFFFFF).to(torch.int32).view(torch.float32).sum(0)
+    errors["logits"] = _relative_rms(parts, phases["logits"])
+    errors["combined"] = _relative_rms(state.s_rows[:rows].float(), phases["combined"])
+    return errors
 
 
 def assert_matches(key, actual, expected):

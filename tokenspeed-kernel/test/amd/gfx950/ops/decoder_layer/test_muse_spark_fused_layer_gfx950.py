@@ -73,6 +73,7 @@ from muse_layer_reference import (  # noqa: E402
     assert_matches,
     attention_reference,
     failure_records,
+    phase_errors,
     regular_reference,
     run_fused,
 )
@@ -161,7 +162,13 @@ def _worker(rank, port, record_dir, errors):
             actual = run_fused(fused, key, inputs, inputs["residual"].clone())
             if key.layer_kind == "full":
                 _check_attention_box(state, inputs)
-            assert_matches(key, actual, expected)
+            try:
+                assert_matches(key, actual, expected)
+            except AssertionError as error:
+                rows = inputs["residual"].shape[0]
+                raise AssertionError(
+                    f"{error}; phases {phase_errors(state, expected, rows)}"
+                ) from error
 
             # Deterministic: the same launch again, at the next epoch and
             # the other copy of every two-copy area, gives the same bits.
