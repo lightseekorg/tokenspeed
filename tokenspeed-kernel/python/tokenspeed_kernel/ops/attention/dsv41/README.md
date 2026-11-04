@@ -22,8 +22,8 @@ rows get distinct scheduling labels so they cannot truncate an active request's
 history bound. The runtime groups canonical decode rows and ordered prefill
 spans. Free decode windows use independent rows so reordering queries cannot
 truncate the history scored for an earlier row.
-Request IDs, tables and lengths remain unchanged while sharing
-metadata; graph replay refreshes their captured producers.
+Request IDs, tables, and lengths remain unchanged while sharing metadata;
+graph replay refreshes their captured producers.
 
 The paged selection cleaner writes its final aligned score layout directly.
 It masks invalid pages and initializes the last live tile's prefetch padding;
