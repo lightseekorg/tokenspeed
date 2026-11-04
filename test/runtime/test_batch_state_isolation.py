@@ -60,7 +60,12 @@ def test_default_matrix_covers_each_required_batch_shape():
         "four-request",
     )
     assert cases["reversed"].target_index == 1
+    assert cases["reversed"].reference_case == "equal-length"
+    assert cases["reversed"].comparison_policy == "exact"
     assert cases["shared-prefix-reversed"].target_index == 1
+    assert cases["shared-prefix-reversed"].reference_case == "shared-prefix"
+    assert cases["shared-prefix-reversed"].comparison_policy == "exact"
+    assert cases["equal-length"].comparison_policy == "allow-numeric-variance"
     assert len(cases["four-request"].request_names) == 4
     isolation.validate_cases(list(cases.values()), isolation.default_prompt_set())
 
@@ -68,7 +73,11 @@ def test_default_matrix_covers_each_required_batch_shape():
 def test_validate_cases_requires_an_earlier_reference_case():
     with pytest.raises(ValueError, match="earlier case"):
         isolation.validate_cases(
-            [isolation.BatchCase("candidate", ("target",), 0, "reference")],
+            [
+                isolation.BatchCase(
+                    "candidate", ("target",), 0, "reference", "exact"
+                )
+            ],
             isolation.default_prompt_set(),
         )
 
@@ -76,7 +85,9 @@ def test_validate_cases_requires_an_earlier_reference_case():
 def test_comparison_reports_token_and_prior_logprob_divergences_separately():
     reference = completion(ids=[4, 7, 9], logprobs=[-0.1, -0.2, -0.3])
     candidate = completion(ids=[4, 8, 9], logprobs=[-0.1, -0.25, -0.3])
-    compared = isolation.comparison_record(reference, candidate)
+    compared = isolation.comparison_record(
+        reference, candidate, comparison_policy="exact"
+    )
     assert compared["status"] == "FAIL"
     assert compared["first_token_difference"] == {
         "position": 1,
@@ -95,6 +106,7 @@ def test_comparison_keeps_finish_metadata_in_the_oracle():
     compared = isolation.comparison_record(
         completion(ids=[4], logprobs=[-0.1], reason="length"),
         completion(ids=[4], logprobs=[-0.1], reason="abort", details={"type": "abort"}),
+        comparison_policy="allow-numeric-variance",
     )
     assert compared["status"] == "FAIL"
     assert compared["tokens_equal"] and compared["logprobs_equal"]
@@ -104,7 +116,27 @@ def test_comparison_keeps_finish_metadata_in_the_oracle():
 def test_shared_prefix_batch_cases_compare_with_the_single_request_baseline():
     cases = {case.name: case for case in isolation.default_cases()}
     assert cases["shared-prefix"].reference_case == "shared-prefix-single"
-    assert cases["shared-prefix-reversed"].reference_case == "shared-prefix-single"
+    assert cases["shared-prefix-reversed"].reference_case == "shared-prefix"
+
+
+def test_auto_batch_variance_is_observed_without_failing_the_run():
+    compared = isolation.comparison_record(
+        completion(ids=[4, 7], logprobs=[-0.1, -0.2]),
+        completion(ids=[4, 8], logprobs=[-0.15, -0.25]),
+        comparison_policy="allow-numeric-variance",
+    )
+    assert compared["status"] == "NUMERIC_VARIANCE"
+    assert not compared["tokens_equal"]
+    assert not compared["logprobs_equal"]
+
+
+def test_auto_batch_variance_never_hides_finish_metadata_change():
+    compared = isolation.comparison_record(
+        completion(ids=[4], logprobs=[-0.1], reason="length"),
+        completion(ids=[4], logprobs=[-0.2], reason="abort", details={"type": "abort"}),
+        comparison_policy="allow-numeric-variance",
+    )
+    assert compared["status"] == "FAIL"
 
 
 def test_load_observation_does_not_equate_an_empty_sample_with_no_batch():
@@ -135,6 +167,8 @@ def test_first_pass_engine_arguments_disable_interfering_features(tmp_path):
         "Qwen/Qwen3-0.6B",
         "--dtype",
         "bfloat16",
+        "--numerics",
+        "auto",
         "--tensor-parallel-size",
         "1",
         "--seed",
@@ -153,3 +187,11 @@ def test_first_pass_engine_arguments_disable_interfering_features(tmp_path):
         "--gpu-memory-utilization",
         "0.55",
     ]
+
+
+def test_rl_bitwise_engine_arguments_and_case_policies_are_exact(tmp_path):
+    args = isolation.parse_args(
+        ["--output-dir", str(tmp_path), "--numerics", "rl-bitwise"]
+    )
+    assert "--numerics" in isolation.engine_args(args, prefix_caching=False)
+    assert args.numerics == "rl-bitwise"

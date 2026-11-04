@@ -103,6 +103,7 @@ class BatchCase:
     request_names: tuple[str, ...]
     target_index: int
     reference_case: str | None
+    comparison_policy: str | None
 
     @property
     def target_name(self) -> str:
@@ -142,22 +143,41 @@ def default_prompt_set() -> PromptSet:
 def default_cases() -> list[BatchCase]:
     """Cover the first-pass isolation matrix with explicit submission orders."""
     return [
-        BatchCase("single-1", ("target",), 0, None),
-        BatchCase("single-2", ("target",), 0, "single-1"),
-        BatchCase("equal-length", ("target", "equal"), 0, "single-1"),
-        BatchCase("long-short", ("target", "long", "short"), 0, "single-1"),
-        BatchCase("reversed", ("equal", "target"), 1, "single-1"),
-        BatchCase("shared-prefix-single", ("shared_target",), 0, None),
+        BatchCase("single-1", ("target",), 0, None, None),
+        BatchCase("single-2", ("target",), 0, "single-1", "exact"),
         BatchCase(
-            "shared-prefix", ("shared_target", "shared_peer"), 0, "shared-prefix-single"
+            "equal-length", ("target", "equal"), 0, "single-1", "allow-numeric-variance"
+        ),
+        BatchCase(
+            "long-short",
+            ("target", "long", "short"),
+            0,
+            "single-1",
+            "allow-numeric-variance",
+        ),
+        BatchCase("reversed", ("equal", "target"), 1, "equal-length", "exact"),
+        BatchCase("shared-prefix-single", ("shared_target",), 0, None, None),
+        BatchCase(
+            "shared-prefix",
+            ("shared_target", "shared_peer"),
+            0,
+            "shared-prefix-single",
+            "allow-numeric-variance",
         ),
         BatchCase(
             "shared-prefix-reversed",
             ("shared_peer", "shared_target"),
             1,
-            "shared-prefix-single",
+            "shared-prefix",
+            "exact",
         ),
-        BatchCase("four-request", ("target", "equal", "long", "fourth"), 0, "single-1"),
+        BatchCase(
+            "four-request",
+            ("target", "equal", "long", "fourth"),
+            0,
+            "single-1",
+            "allow-numeric-variance",
+        ),
     ]
 
 
@@ -183,10 +203,20 @@ def validate_cases(cases: list[BatchCase], prompts: PromptSet) -> None:
             raise ValueError(
                 f"Batch case {case.name!r} references unknown prompts: {missing}"
             )
+        if (case.reference_case is None) != (case.comparison_policy is None):
+            raise ValueError(
+                f"Batch case {case.name!r} must set both reference_case and "
+                "comparison_policy, or neither"
+            )
         if case.reference_case is not None and case.reference_case not in known:
             raise ValueError(
                 f"Batch case {case.name!r} must reference an earlier case, not "
                 f"{case.reference_case!r}"
+            )
+        if case.comparison_policy not in (None, "exact", "allow-numeric-variance"):
+            raise ValueError(
+                f"Batch case {case.name!r} has unsupported comparison policy "
+                f"{case.comparison_policy!r}"
             )
 
 
@@ -227,9 +257,9 @@ def first_difference(expected: list[Any], actual: list[Any]) -> dict[str, Any] |
 
 
 def comparison_record(
-    reference: dict[str, Any], candidate: dict[str, Any]
+    reference: dict[str, Any], candidate: dict[str, Any], *, comparison_policy: str
 ) -> dict[str, Any]:
-    """Compare target outputs without hiding a token or metadata mismatch."""
+    """Compare targets under an explicit exact or numeric-variance policy."""
     token_difference = first_difference(
         reference["output_ids"], candidate["output_ids"]
     )
@@ -249,12 +279,16 @@ def comparison_record(
         reference["output_token_logprobs"][:token_prefix],
         candidate["output_token_logprobs"][:token_prefix],
     )
+    values_equal = token_difference is None and logprob_difference is None
+    if values_equal and finish_equal:
+        status = "PASS"
+    elif comparison_policy == "allow-numeric-variance" and finish_equal:
+        status = "NUMERIC_VARIANCE"
+    else:
+        status = "FAIL"
     return {
-        "status": (
-            "PASS"
-            if token_difference is None and logprob_difference is None and finish_equal
-            else "FAIL"
-        ),
+        "status": status,
+        "comparison_policy": comparison_policy,
         "tokens_equal": token_difference is None,
         "logprobs_equal": logprob_difference is None,
         "finish_equal": finish_equal,
@@ -321,6 +355,12 @@ def write_json(path: Path, value: Any) -> None:
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--numerics",
+        choices=("auto", "rl-bitwise"),
+        default="auto",
+        help="engine numerical contract; rl-bitwise requires exact comparisons",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--startup-timeout", type=float, default=1200.0)
@@ -362,6 +402,8 @@ def engine_args(args: argparse.Namespace, *, prefix_caching: bool) -> list[str]:
         args.model,
         "--dtype",
         "bfloat16",
+        "--numerics",
+        args.numerics,
         "--tensor-parallel-size",
         "1",
         "--seed",
@@ -414,6 +456,7 @@ def run_cases(
     max_new_tokens: int,
     poll_interval_s: float,
     records: dict[str, Any],
+    args_numerics: str,
 ) -> None:
     """Submit each predeclared case and compare its named target with its reference."""
     from tokenspeed.runtime.entrypoints.wire_driver import generate_request
@@ -456,8 +499,14 @@ def run_cases(
                 sample_records, len(requests)
             )
             if case.reference_case is not None:
+                assert case.comparison_policy is not None
+                comparison_policy = (
+                    "exact" if args_numerics == "rl-bitwise" else case.comparison_policy
+                )
                 record["comparison"] = comparison_record(
-                    records[case.reference_case]["target_completion"], target
+                    records[case.reference_case]["target_completion"],
+                    target,
+                    comparison_policy=comparison_policy,
                 )
         except Exception as exc:
             record["error"] = f"{type(exc).__name__}: {exc}"
@@ -509,7 +558,9 @@ def run_prefix_cache_contrast(
                 ),
             }
     result["comparison"] = comparison_record(
-        result["cold"]["target_completion"], result["warm"]["target_completion"]
+        result["cold"]["target_completion"],
+        result["warm"]["target_completion"],
+        comparison_policy="exact",
     )
     result["cached_tokens"] = {
         phase: result[phase]["target_completion"]["cached_tokens"]
@@ -529,7 +580,7 @@ def run_prefix_cache_contrast(
 
 
 def run(args: argparse.Namespace, *, driver: Driver | None = None) -> dict[str, Any]:
-    """Run the first-pass matrix and return a complete PASS/FAIL/INVALID report."""
+    """Run the first-pass matrix and report exact failures separately from variance."""
     directory = args.output_dir.resolve()
     if not directory.is_dir() or any(directory.iterdir()):
         raise ValueError("output-dir must already exist and be empty")
@@ -547,7 +598,7 @@ def run(args: argparse.Namespace, *, driver: Driver | None = None) -> dict[str, 
             "prefix_caching": False,
             "chunked_prefill_size": args.max_model_len,
             "cuda_graphs": False,
-            "numerics": "auto",
+            "numerics": args.numerics,
         },
         "engine_args": engine_configuration,
         "cases": {},
@@ -592,6 +643,7 @@ def run(args: argparse.Namespace, *, driver: Driver | None = None) -> dict[str, 
                 max_new_tokens=args.max_new_tokens,
                 poll_interval_s=args.load_poll_interval,
                 records=report["cases"],
+                args_numerics=args.numerics,
             )
         if args.run_prefix_cache_contrast:
             report["prefix_cache_contrast"] = run_prefix_cache_contrast(
@@ -605,7 +657,13 @@ def run(args: argparse.Namespace, *, driver: Driver | None = None) -> dict[str, 
         if report["prefix_cache_contrast"] is not None:
             comparisons.append(report["prefix_cache_contrast"]["comparison"])
         report["status"] = (
-            "PASS" if all(item["status"] == "PASS" for item in comparisons) else "FAIL"
+            "FAIL"
+            if any(item["status"] == "FAIL" for item in comparisons)
+            else (
+                "NUMERIC_VARIANCE"
+                if any(item["status"] == "NUMERIC_VARIANCE" for item in comparisons)
+                else "PASS"
+            )
         )
     except Exception as exc:  # noqa: BLE001 - preserve the original experiment failure.
         report["error"] = f"{type(exc).__name__}: {exc}"
@@ -620,7 +678,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"BATCH_STATE_ISOLATION status=INVALID error={exc}", file=sys.stderr)
         return 2
     print(json.dumps(report, indent=2, allow_nan=False))
-    return {"PASS": 0, "FAIL": 1, "INVALID": 2}[report["status"]]
+    return {"PASS": 0, "NUMERIC_VARIANCE": 0, "FAIL": 1, "INVALID": 2}[
+        report["status"]
+    ]
 
 
 if __name__ == "__main__":

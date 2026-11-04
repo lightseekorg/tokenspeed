@@ -10,14 +10,13 @@ connection timing are not part of the comparison.
 ## First-pass single-GPU run
 
 The defaults use `Qwen/Qwen3-0.6B` with BF16, TP 1, a 4096-token context,
-greedy decoding, prefix caching disabled, CUDA graphs disabled, and a
-4096-token scheduler budget. This leaves every prompt in one scheduled prefill
-round while satisfying the scheduler's positive `max_scheduled_tokens`
-requirement. The launch enables returned output logprobs. It does
-not request `--numerics rl-bitwise`: that envelope is verified per model and
-requires its profile to advertise the contract. This experiment still reports
-exact token and logprob differences, but a passing `auto` run is evidence for
-this configuration rather than an advertised numerical contract.
+greedy decoding, prefix caching disabled, CUDA graphs disabled, a
+4096-token scheduler budget, and `--numerics auto`. This leaves every prompt
+in one scheduled prefill round while satisfying the scheduler's positive
+`max_scheduled_tokens` requirement. The launch enables returned output
+logprobs. `auto` does not promise that a request's token IDs or logprobs remain
+identical when the co-batch changes GEMM shape; it records those differences as
+`NUMERIC_VARIANCE` rather than treating them as a state-isolation failure.
 
 Run from a checkout with its development environment active and select the
 single CUDA device explicitly:
@@ -51,8 +50,11 @@ The fixed matrix compares a target request across:
 For every compared target, `report.json` records raw input/output token IDs,
 selected-token logprobs, finish reason/details, prompt/completion counts,
 cached-token count, first token mismatch, first logprob mismatch, and the
-first logprob mismatch before any token divergence. A differing finish reason
-or finish detail fails the comparison even if tokens happen to match.
+first logprob mismatch before any token divergence. Every comparison also
+records its `comparison_policy`: `exact` requires identical values, while
+`allow-numeric-variance` records changed values as `NUMERIC_VARIANCE` when
+finish metadata remains identical. A differing finish reason or finish detail
+always fails the comparison.
 
 The report preserves frontend load snapshots taken when an output from the
 current call arrives. A sample with at least two running requests and at least
@@ -61,10 +63,21 @@ concurrent scheduling. No such sample is **inconclusive**, not evidence that
 the submitted requests were not co-scheduled: scheduler load is only published
 with output batches and short requests can finish before an observable batch.
 
-Exit codes are `0` for `PASS`, `1` for a completed comparison with a mismatch,
-and `2` for an invalid run such as startup, model, tokenizer, or engine failure.
-Raw request IDs and completion evidence remain in `report.json` for both
-failure classes.
+The default cases separate numerical variation from isolation checks:
+
+| Comparison | `auto` policy | Purpose |
+| --- | --- | --- |
+| `single-2` vs `single-1` | `exact` | Same-shape independent-run stability |
+| `reversed` vs `equal-length` | `exact` | Target invariance to batch row / submission order |
+| `shared-prefix-reversed` vs `shared-prefix` | `exact` | Shared-prefix target invariance to batch row / submission order |
+| All other mixed-batch cases | `allow-numeric-variance` | Record batch-shape sensitivity without hiding it |
+
+With `--numerics rl-bitwise`, every case is automatically promoted to `exact`.
+That mode requires a model profile that explicitly supports the contract; the
+default Qwen3 model is not eligible. Exit codes are `0` for `PASS` and
+`NUMERIC_VARIANCE`, `1` for `FAIL`, and `2` for an invalid run such as startup,
+model, tokenizer, or engine failure. Raw request IDs and completion evidence
+remain in `report.json` for every result.
 
 ## Prefix-cache contrast
 
@@ -91,10 +104,10 @@ Keep one changed dimension per run:
 
 1. Set `--chunked-prefill-size` in `engine_args()` to a smaller positive explicit
    value and rerun the same matrix for full versus chunked-prefill comparison.
-2. Use a model whose profile has verified `rl-bitwise`, launch with
-   `--numerics rl-bitwise`, and treat any reported token or logprob difference
-   as a contract violation. The design contract is in
-   `docs/design/numerics.md`.
+2. Use a model whose profile has verified `rl-bitwise`, then launch with
+   `--numerics rl-bitwise`. The runner promotes every comparison to `exact`, so
+   any reported token or logprob difference is a contract violation. The design
+   contract is in `docs/design/numerics.md`.
 3. Extend the predeclared `PromptSet` and `BatchCase` list before running when
    testing another prompt family. Preserve the named target and reference case;
    do not infer target identity from completion order.
