@@ -66,7 +66,7 @@ model class's `layer_stack_cls`:
 ### Selection and agreement before capture
 
 * The stack selects the kernel through the registry
-  (`("decoder_layer", "prepare")`) during `prepare`, and the prepare compiles
+  (`("monokernel", "prepare")`) during `prepare`, and the prepare compiles
   every plan variant. Nothing compiles or checks inside a captured graph.
 * Each rank's refusals (deployment settings, a variant that does not fit one
   workgroup per compute unit, state the kernel cannot allocate) go through

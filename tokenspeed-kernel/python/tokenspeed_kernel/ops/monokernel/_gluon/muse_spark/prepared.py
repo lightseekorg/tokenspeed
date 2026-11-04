@@ -21,7 +21,7 @@
 """Host side of the fused Muse Spark layer on gfx950: the group's launch
 state, a layer's weights read in place, compile-time checks, and launches.
 
-:class:`MuseSparkFusedDecoderLayer` is the ``("decoder_layer", "prepare")``
+:class:`MuseSparkMonokernelLayer` is the ``("monokernel", "prepare")``
 leaf for the ``muse_spark`` recipe (registered in ``decoder_layer/gluon.py``).
 """
 
@@ -43,7 +43,7 @@ from tokenspeed_kernel.ops.communication._iris import (
 from tokenspeed_kernel.ops.monokernel import PlanKey
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (
     MAX_ROWS,
-    MuseNativeIrisState,
+    MuseSparkIrisState,
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (
     ATT_BLOCK_M,
@@ -66,7 +66,7 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (
     XQ_ROW_BYTES,
     XS_MBLOCK_STRIDE,
     ModelConstants,
-    gluon_decoder_layer_muse_spark_gfx950,
+    gluon_monokernel_muse_spark_gfx950,
     kernel_constexprs,
     offline_attrs,
     offline_signature,
@@ -75,7 +75,7 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (
     INTER,
     TAG_WORDS,
-    native_moe_weights,
+    moe_stream_weights,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
     ENTRY_WORDS,
@@ -85,7 +85,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.arena import UncachedBuffer
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import FailureMirror
 
-__all__ = ["MuseSparkDecoderLayerState", "MuseSparkFusedDecoderLayer"]
+__all__ = ["MuseSparkMonokernelState", "MuseSparkMonokernelLayer"]
 
 # LDS each workgroup reserves (more than half of the CU's 160 KB: one
 # workgroup per CU).
@@ -125,17 +125,17 @@ DEFAULT_PLAN_FIELDS = dict(
 )
 
 
-class MuseSparkDecoderLayerState:
+class MuseSparkMonokernelState:
     """The launch state every fused layer of one group shares.
 
     Holds the entry counters (epochs, role claims), the Iris areas and
-    error words (``MuseNativeIrisState``), the uncached exchange (ids, xq
+    error words (``MuseSparkIrisState``), the uncached exchange (ids, xq
     rows and tags), the host mirror of the failure record, and the
     launch-local scratch (attention partials and records, K-part partials,
     the MoE mids, S rows, h'). One state serves every layer: a layer's
     launch is the group's next epoch, and consecutive launches alternate
     the two-copy areas. The Iris heap must already hold
-    :meth:`heap_bytes` spare (``decoder_layer_state_heap_bytes``).
+    :meth:`heap_bytes` spare (``monokernel_state_heap_bytes``).
 
     Args:
         group: The device process group of the 8 ranks.
@@ -172,7 +172,7 @@ class MuseSparkDecoderLayerState:
         peers = IrisGroup(ctx, group, rank_in_group, device)
         if peers.world_size != WORLD_SIZE:
             raise ValueError(f"fused Muse layers need {WORLD_SIZE} ranks")
-        self.iris = MuseNativeIrisState(peers)
+        self.iris = MuseSparkIrisState(peers)
         self.epochs = torch.zeros(ENTRY_WORDS, dtype=torch.int64, device=device)
         self.claims = torch.zeros(ENTRY_WORDS, dtype=torch.int64, device=device)
         self.arena = torch.zeros(ENTRY_WORDS, dtype=torch.int64, device=device)
@@ -237,7 +237,7 @@ class MuseSparkDecoderLayerState:
         for the most rows any launch carries)."""
         if world_size != WORLD_SIZE or not 1 <= max_requests <= 2:
             return 0
-        return MuseNativeIrisState.heap_bytes()
+        return MuseSparkIrisState.heap_bytes()
 
 
 def _router_hi_lo(router: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -298,7 +298,7 @@ def _compile_problems(constexpr_items: tuple) -> tuple[str, ...]:
     resident workgroup per CU; memoized, since every layer of a model
     compiles the same variants."""
     constexprs = dict(constexpr_items)
-    fn = gluon_decoder_layer_muse_spark_gfx950
+    fn = gluon_monokernel_muse_spark_gfx950
     signature = offline_signature(constexprs)
     attrs = offline_attrs(signature)
     full = {n: signature[n] for n in fn.arg_names if n in signature}
@@ -333,7 +333,7 @@ def check_compiled(compiled) -> list[str]:
     return reasons
 
 
-class MuseSparkFusedDecoderLayer:
+class MuseSparkMonokernelLayer:
     """One Muse Spark decoder layer (and the next layer's QKV projection and
     prologue) as one persistent gfx950 launch per decode step.
 
@@ -351,7 +351,7 @@ class MuseSparkFusedDecoderLayer:
             ``routed_scaling_factor``, ``pooler`` and ``post_expert_proj``
             (replicated, with ``pooler_replicated`` / ``post_expert_replicated``),
             ``experts`` (the MoE layer), ``next_qkv_proj``.
-        state: The group's :class:`MuseSparkDecoderLayerState`.
+        state: The group's :class:`MuseSparkMonokernelState`.
     """
 
     def __init__(
@@ -359,7 +359,7 @@ class MuseSparkFusedDecoderLayer:
         *,
         plan_keys,
         weights: dict,
-        state: MuseSparkDecoderLayerState,
+        state: MuseSparkMonokernelState,
         plan_fields: dict,
         stamps: bool,
         deadline_ticks: int,
@@ -390,7 +390,7 @@ class MuseSparkFusedDecoderLayer:
         self.tensors, self.model, problems = self._read_weights(weights, state.rank)
         # The lane-major gate/up scales cost a 32 MiB copy per layer: off
         # until a benchmark shows the win is worth the memory.
-        self.moe = native_moe_weights(weights["experts"], scale_lanes=False)
+        self.moe = moe_stream_weights(weights["experts"], scale_lanes=False)
         for key in self.plan_keys:
             reasons = problems + self._compile(key)
             if reasons:
@@ -637,7 +637,7 @@ class MuseSparkFusedDecoderLayer:
             problems = signature_problems(args, constexprs)
             if problems:
                 raise ValueError(f"fused Muse layer {key}: {'; '.join(problems)}")
-        compiled = gluon_decoder_layer_muse_spark_gfx950[(GRID,)](
+        compiled = gluon_monokernel_muse_spark_gfx950[(GRID,)](
             *args,
             **constexprs,
             num_warps=NUM_WARPS,

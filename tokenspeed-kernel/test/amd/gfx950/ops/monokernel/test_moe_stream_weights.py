@@ -20,7 +20,7 @@
 
 """CPU test of the native MoE stream's host weight contract.
 
-``native_moe_weights`` must read a processed MoE layer (built with the
+``moe_stream_weights`` must read a processed MoE layer (built with the
 production weight prep) in place, with the shapes and strides the codegen
 test compiles the stream for.
 """
@@ -38,7 +38,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     unswizzle_cdna4_mxfp4_scale,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (
-    native_moe_weights,
+    moe_stream_weights,
 )
 
 EXPERTS = 4
@@ -51,7 +51,7 @@ def experts():
 
 def test_weights_are_read_in_place(experts):
     module, _ = experts
-    weights = native_moe_weights(module, scale_lanes=False)
+    weights = moe_stream_weights(module, scale_lanes=False)
     w13 = _extract_gluon_raw_w(module.w13_weight_triton_tensor)
     s13 = _extract_gluon_raw_s(module.w13_precision_config.b_mx_scale)
     w2 = _extract_gluon_raw_w(module.w2_weight_triton_tensor)
@@ -70,7 +70,7 @@ def test_weights_are_read_in_place(experts):
 
 def test_lane_scales_come_from_the_swizzled_scales(experts):
     module, w13_scale = experts
-    weights = native_moe_weights(module, scale_lanes=True)
+    weights = moe_stream_weights(module, scale_lanes=True)
     expected = pack_cdna4_mxfp4_scale_lanes(w13_scale)
     lanes = weights.s13_lanes.view(torch.uint8)[: expected.numel()]
     assert torch.equal(lanes, expected.reshape(-1))
@@ -94,4 +94,4 @@ def test_rejects_other_layouts(experts):
     narrow.w2_weight_triton_tensor = module.w2_weight_triton_tensor
     narrow.w2_precision_config = module.w2_precision_config
     with pytest.raises(ValueError, match="gate/up weights"):
-        native_moe_weights(narrow, scale_lanes=False)
+        moe_stream_weights(narrow, scale_lanes=False)

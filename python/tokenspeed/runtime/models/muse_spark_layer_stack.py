@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.monokernel import FusedDecoderLayer, PlanKey
+from tokenspeed_kernel.ops.monokernel import MonokernelLayer, PlanKey
 
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -73,7 +73,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
     def __init__(self) -> None:
         # The prepared fused layers and the layer indices they run, set by
         # ``prepare`` when the group serves any shape; empty otherwise.
-        self.fused_layers: list[FusedDecoderLayer] = []
+        self.fused_layers: list[MonokernelLayer] = []
         self.fused_indices = range(0)
         # (requests, tokens per request) decode shapes every rank serves.
         self.served_shapes: frozenset[tuple[int, int]] = frozenset()
@@ -100,12 +100,12 @@ class MuseSparkLayerStack(DecoderLayerStack):
         """Symmetric heap bytes the fused layers' state takes (0 when no
         layer can run fused); the Iris heap is created with them."""
         from tokenspeed_kernel.ops.monokernel import (
-            decoder_layer_state_heap_bytes,
+            monokernel_state_heap_bytes,
         )
 
         if not self._candidate_indices(model):
             return 0
-        return decoder_layer_state_heap_bytes(
+        return monokernel_state_heap_bytes(
             recipe=RECIPE, world_size=world_size, max_requests=max(FUSED_REQUESTS)
         )
 
@@ -115,8 +115,8 @@ class MuseSparkLayerStack(DecoderLayerStack):
         after the Iris heap exists and before the KV cache is sized or a
         graph is captured."""
         from tokenspeed_kernel.ops.monokernel import (
-            prepare_decoder_layer,
-            prepare_decoder_layer_state,
+            prepare_monokernel_layer,
+            prepare_monokernel_state,
         )
 
         candidates = self._candidate_indices(model)
@@ -131,7 +131,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
         mapping = model.mapping
         group = mapping.attn.tp_group
         rank_in_group = group.index(dist.get_rank())
-        state = prepare_decoder_layer_state(
+        state = prepare_monokernel_state(
             recipe=RECIPE,
             group=process_group_manager.get_device_process_group(group),
             rank_in_group=rank_in_group,
@@ -158,7 +158,7 @@ class MuseSparkLayerStack(DecoderLayerStack):
         for index in candidates:
             layer, next_layer = model.layers[index], model.layers[index + 1]
             next_kind = next_layer.layer_kind if index + 1 in candidates else "regular"
-            fused = prepare_decoder_layer(
+            fused = prepare_monokernel_layer(
                 recipe=RECIPE,
                 plan_keys=[
                     PlanKey(requests, layer.layer_kind, next_kind)

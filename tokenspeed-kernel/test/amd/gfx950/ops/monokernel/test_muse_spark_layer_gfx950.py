@@ -82,8 +82,8 @@ from tokenspeed_kernel.ops.layernorm.fused_norm import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
     PlanKey,
-    prepare_decoder_layer,
-    prepare_decoder_layer_state,
+    prepare_monokernel_layer,
+    prepare_monokernel_state,
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E402
     BOX_WORDS,
@@ -131,7 +131,7 @@ def _worker(rank, port, record_dir, errors):
         dist.init_process_group(
             "nccl", init_method=f"tcp://localhost:{port}", rank=rank, world_size=WORLD
         )
-        state = prepare_decoder_layer_state(
+        state = prepare_monokernel_state(
             recipe="muse_spark",
             group=dist.group.WORLD,
             rank_in_group=rank,
@@ -152,7 +152,7 @@ def _worker(rank, port, record_dir, errors):
                     continue
             else:
                 raise AssertionError(f"{key}: every seed has a routing tie")
-            fused = prepare_decoder_layer(
+            fused = prepare_monokernel_layer(
                 recipe="muse_spark", plan_keys=[key], traits=TRAITS,
                 weights=weights, state=state,
             )  # fmt: skip

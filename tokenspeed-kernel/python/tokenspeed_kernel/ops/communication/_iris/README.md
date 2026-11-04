@@ -96,7 +96,7 @@ The native fused layer (`ops/monokernel/_gluon/muse_spark/iris.py`, one persiste
 per decoder layer) calls these bodies as hop ends: the TP8 two-shot, the
 column-owned route exchange (`iris_column_routes_push_words` is the one push
 body; the MoE stream's down units push from their epilogue), the Lamport
-gather and the moetail sender. `MuseNativeIrisState` allocates every
+gather and the moetail sender. `MuseSparkIrisState` allocates every
 cross-GPU receive area from the group's heap before capture, in two copies
 chosen by `launch.copy = epoch & 1` and sized for 32 rows. Consumers never
 restore markers: at the entry of launch L the 128 reduce-scatter senders

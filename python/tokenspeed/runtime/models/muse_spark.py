@@ -65,7 +65,7 @@ from tokenspeed_kernel.ops.moe import (
     warmup_moe_sorted_prefill,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
-from tokenspeed_kernel.ops.monokernel import FusedDecoderLayer
+from tokenspeed_kernel.ops.monokernel import MonokernelLayer
 from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant, rmsnorm_nvfp4_quant
 from tokenspeed_kernel.ops.residual import (
     boundary_gathers_mailbox,
@@ -2135,7 +2135,7 @@ class MuseSparkDecoderLayer(nn.Module):
 
     def forward_fused(
         self,
-        fused: FusedDecoderLayer,
+        fused: MonokernelLayer,
         positions: torch.Tensor,
         prepared_query: tuple[torch.Tensor, torch.Tensor],
         hidden_states: torch.Tensor,

@@ -26,22 +26,22 @@ device (its plan checker runs on CPU).
 
 from __future__ import annotations
 
-from tokenspeed_kernel.ops.monokernel import DECODER_LAYER_SIGNATURE
+from tokenspeed_kernel.ops.monokernel import MONOKERNEL_SIGNATURE
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 
 
 @register_kernel(
-    "decoder_layer",
+    "monokernel",
     "prepare",
-    name="gluon_decoder_layer_muse_spark_gfx950",
+    name="gluon_monokernel_muse_spark_gfx950",
     solution="gluon",
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(9, 5),
         max_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"amd"}),
     ),
-    signatures={DECODER_LAYER_SIGNATURE},
+    signatures={MONOKERNEL_SIGNATURE},
     traits={
         "recipe": frozenset({"muse_spark"}),
         "verify_width": frozenset({8}),
@@ -51,25 +51,25 @@ from tokenspeed_kernel.registry import Priority, register_kernel
     },
     priority=Priority.SPECIALIZED,
 )
-class GluonDecoderLayerMuseSparkGfx950:
+class GluonMonokernelMuseSparkGfx950:
     """The Muse Spark fused decoder layer on gfx950 (EP1, TP 8, DFlash
     verify width 8, FP8 KV cache); see ``_gluon/muse_spark/prepared.py``."""
 
     @staticmethod
     def prepare_state(**kwargs):
         from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (
-            MuseSparkDecoderLayerState,
+            MuseSparkMonokernelState,
         )
 
-        return MuseSparkDecoderLayerState(**kwargs)
+        return MuseSparkMonokernelState(**kwargs)
 
     @staticmethod
     def heap_bytes(*, world_size: int, max_requests: int) -> int:
         from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (
-            MuseSparkDecoderLayerState,
+            MuseSparkMonokernelState,
         )
 
-        return MuseSparkDecoderLayerState.heap_bytes(
+        return MuseSparkMonokernelState.heap_bytes(
             world_size=world_size, max_requests=max_requests
         )
 
@@ -77,11 +77,11 @@ class GluonDecoderLayerMuseSparkGfx950:
         from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (
             DEADLINE_TICKS,
             DEFAULT_PLAN_FIELDS,
-            MuseSparkFusedDecoderLayer,
+            MuseSparkMonokernelLayer,
         )
 
         # Serving: the default plan fields, no stamps, the serving deadline.
-        self.layer = MuseSparkFusedDecoderLayer(
+        self.layer = MuseSparkMonokernelLayer(
             plan_keys=plan_keys,
             weights=weights,
             state=state,

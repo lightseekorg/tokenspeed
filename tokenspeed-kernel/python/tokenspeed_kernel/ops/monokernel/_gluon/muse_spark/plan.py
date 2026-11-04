@@ -21,7 +21,7 @@
 """The Muse Spark layer's role table, as layer.py composes it, as a plan.
 
 :func:`muse_plan` builds the step sequence of every workgroup ``(xcd, slot)``
-for one :class:`PlanKey`, following ``gluon_decoder_layer_muse_spark_gfx950``
+for one :class:`PlanKey`, following ``gluon_monokernel_muse_spark_gfx950``
 role for role; :func:`expected_counts` is the per-XCD role table written apart
 from the builder, so the checker compares two descriptions. Keys name the
 hand-offs (``H1.rs[n]``, ``ids[g]``, ...); cross-GPU keys are modelled on one

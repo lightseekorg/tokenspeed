@@ -76,7 +76,7 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (
     H6_WORDS,
     MAX_ROWS,
     H4SinkArgs,
-    MuseNativeView,
+    MuseSparkIrisView,
     clear_next_copies,
     fin,
     h1_rs_sink,
@@ -158,7 +158,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import (
 __all__ = [
     "NUM_WARPS",
     "PLAN_VARIANTS",
-    "gluon_decoder_layer_muse_spark_gfx950",
+    "gluon_monokernel_muse_spark_gfx950",
     "DIVISIBLE_ARGS",
     "offline_attrs",
     "offline_compile_args",
@@ -1420,7 +1420,7 @@ def _bnd2(
 @gluon.jit(
     do_not_specialize=("deadline_ticks", "label", "rank", "gate_stride", "num_slots")
 )
-def gluon_decoder_layer_muse_spark_gfx950(
+def gluon_monokernel_muse_spark_gfx950(
     # Launch state.
     epochs,
     claims,
@@ -1431,7 +1431,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     xs_ptr,
     deadline_ticks,
     label,
-    # Iris areas (iris.MuseNativeIrisState.view_args()).
+    # Iris areas (iris.MuseSparkIrisState.view_args()).
     heaps,
     rank,
     box,
@@ -1571,7 +1571,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     """One fused Muse Spark decoder layer (see the module docstring)."""
     ROWS: gl.constexpr = REQUESTS * 8
     rows = gl.to_tensor(ROWS)
-    view = MuseNativeView(
+    view = MuseSparkIrisView(
         heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
     )
     # Sliding layers: 8 splits per block; full layers: the balanced decode's
@@ -2085,7 +2085,7 @@ def offline_signature(constexprs: dict) -> dict:
     ``heaps`` a tuple of 8 int64, tensors as ``_POINTER_TYPES``, the rest
     int32 scalars."""
     signature = {}
-    for name in gluon_decoder_layer_muse_spark_gfx950.arg_names:
+    for name in gluon_monokernel_muse_spark_gfx950.arg_names:
         if name in constexprs:
             continue
         if name == "heaps":
@@ -2103,9 +2103,7 @@ def signature_problems(args: tuple, constexprs: dict) -> list[str]:
         One ``"name: launched T, offline U"`` line per mismatch.
     """
     names = [
-        n
-        for n in gluon_decoder_layer_muse_spark_gfx950.arg_names
-        if n not in constexprs
+        n for n in gluon_monokernel_muse_spark_gfx950.arg_names if n not in constexprs
     ]
     if len(names) != len(args):
         return [f"{len(args)} arguments for {len(names)} parameters"]
@@ -2142,7 +2140,7 @@ def offline_attrs(signature: dict) -> dict:
     16-byte divisible pointers within a 32-bit range (buffer operations),
     and the 16-divisible integers of :data:`DIVISIBLE_ARGS`."""
     attrs = {}
-    for index, name in enumerate(gluon_decoder_layer_muse_spark_gfx950.arg_names):
+    for index, name in enumerate(gluon_monokernel_muse_spark_gfx950.arg_names):
         kind = signature.get(name)
         if isinstance(kind, tuple):
             attrs.update(
@@ -2167,7 +2165,7 @@ def offline_compile_args(key: PlanKey, rank: int):
         :func:`offline_attrs` of the signature as the source's attributes, as
         a launch specializes them.
     """
-    fn = gluon_decoder_layer_muse_spark_gfx950
+    fn = gluon_monokernel_muse_spark_gfx950
     constexprs = kernel_constexprs(
         key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=16, quad_map=0,
         dn_order=0, dn_lines=0, addr_soffset=0, tag_poll=2, scale_lanes=0, tail_num=1, tail_den=2,

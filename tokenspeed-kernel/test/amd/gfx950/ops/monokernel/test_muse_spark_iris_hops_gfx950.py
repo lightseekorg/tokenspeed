@@ -226,7 +226,7 @@ def test_h6_push_compiles_at_8_waves():
 
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E402
     H4SinkArgs,
-    MuseNativeView,
+    MuseSparkIrisView,
     clear_next_copies,
     fin,
     h1_rs_sink,
@@ -260,7 +260,7 @@ _VIEW = {
 @gluon.jit
 def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in,h6_sums, errors,floats, words, copy, rows, ROLE: gl.constexpr):  # fmt: skip
     """Each fused-layer hop end on the view, at 8 waves, by ROLE."""
-    view = MuseNativeView(
+    view = MuseSparkIrisView(
         heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
     )
     zero = gl.program_id(0) * 0
@@ -391,7 +391,7 @@ def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, r
     MoE down units: a workgroup barrier inside would deadlock. ``LINES``:
     one call per down unit with its 4 strips (the stream's whole-line
     column map), else one call per strip."""
-    view = MuseNativeView(
+    view = MuseSparkIrisView(
         heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
     )
     zero = gl.program_id(0) * 0

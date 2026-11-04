@@ -11,19 +11,19 @@ fused layer and its regular layers is described in
 
 ## Interface
 
-The registry entry is `("decoder_layer", "prepare")`, selected by the
+The registry entry is `("monokernel", "prepare")`, selected by the
 `recipe` trait (plus shape traits such as `verify_width`, `tp_size`,
 `ep_size`, `kv_cache_dtype`). The runtime uses three functions:
 
-- `decoder_layer_state_heap_bytes(recipe=, world_size=, max_requests=)`:
+- `monokernel_state_heap_bytes(recipe=, world_size=, max_requests=)`:
   communication-heap bytes the group state will allocate (0 without a leaf),
   reserved when the heap is created.
-- `prepare_decoder_layer_state(recipe=, group=, rank_in_group=, max_requests=,
+- `prepare_monokernel_state(recipe=, group=, rank_in_group=, max_requests=,
   failure_record_path=, device=)`: the state every fused layer of a group
   shares (launch counters, communication regions, a host copy of the failure
   record), or `None` without a leaf. Every rank calls it, before capture.
-- `prepare_decoder_layer(recipe=, plan_keys=, traits=, weights=, state=)`:
-  one `FusedDecoderLayer` for one decoder layer, or `None` without a leaf.
+- `prepare_monokernel_layer(recipe=, plan_keys=, traits=, weights=, state=)`:
+  one `MonokernelLayer` for one decoder layer, or `None` without a leaf.
   It reads the layer's weights in place and compiles and checks every plan
   variant now, never on the forward path.
 
@@ -32,7 +32,7 @@ A `PlanKey` is `(requests, layer_kind, next_kind)`: the requests in the step
 layer's (`"regular"` when the next layer runs unfused; that launch ends at
 the FFN boundary).
 
-`FusedDecoderLayer`:
+`MonokernelLayer`:
 
 - `decline_reasons(requests)`: this rank's reasons not to serve `requests`
   (empty when it can). The runtime agrees on them across the group.

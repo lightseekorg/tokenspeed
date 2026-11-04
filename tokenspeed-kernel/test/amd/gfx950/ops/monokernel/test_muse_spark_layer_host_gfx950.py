@@ -39,8 +39,8 @@ from tokenspeed_kernel.numerics.torch.residual import (  # noqa: E402
 from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
     LAYER_KINDS,
     PlanKey,
-    decoder_layer_state_heap_bytes,
-    prepare_decoder_layer,
+    monokernel_state_heap_bytes,
+    prepare_monokernel_layer,
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import (  # noqa: E402
     PLAN_REQUESTS,
@@ -176,15 +176,11 @@ def test_selection_and_heap_follow_the_leafs_traits():
     width 8 and an FP8 KV cache, and reserves its Iris areas only for the
     group it serves; any other trait value gets no layer."""
     assert (
-        decoder_layer_state_heap_bytes(
-            recipe="muse_spark", world_size=8, max_requests=2
-        )
+        monokernel_state_heap_bytes(recipe="muse_spark", world_size=8, max_requests=2)
         > 0
     )
     assert (
-        decoder_layer_state_heap_bytes(
-            recipe="muse_spark", world_size=4, max_requests=2
-        )
+        monokernel_state_heap_bytes(recipe="muse_spark", world_size=4, max_requests=2)
         == 0
     )
     served = dict(verify_width=8, tp_size=8, ep_size=1, kv_cache_dtype="fp8_e4m3")
@@ -194,7 +190,7 @@ def test_selection_and_heap_follow_the_leafs_traits():
         ("ep_size", 8),
         ("kv_cache_dtype", "bf16"),
     ):
-        layer = prepare_decoder_layer(
+        layer = prepare_monokernel_layer(
             recipe="muse_spark",
             plan_keys=[PlanKey(1, "sliding", "sliding")],
             traits=dict(served, **{name: value}),

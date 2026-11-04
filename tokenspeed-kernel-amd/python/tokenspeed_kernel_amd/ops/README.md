@@ -2310,7 +2310,7 @@ store each.
 #### Contract
 
 - Inputs: the routed ids `(rows, top_k)`, the MXFP4 activations and their
-  swizzled scales, and `native_moe_weights(experts, scale_lanes=...)`: the
+  swizzled scales, and `moe_stream_weights(experts, scale_lanes=...)`: the
   processed MoE layer's gdot128 weights and swizzled scales, read in place
   (what the EP1 direct decode reads). `scale_lanes` adds a lane-major copy
   of the gate/up scales, 32 MiB per layer.

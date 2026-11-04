@@ -97,7 +97,7 @@ def _pair_word_sink(args, ys, route, cols, col0):
 
 
 def _compile(fields, sink=moe_stream.store_routes_sink):
-    fn = moe_stream.gluon_mxfp4_moe_native_stream_gfx950
+    fn = moe_stream.gluon_mxfp4_moe_stream_gfx950
     const = dict(
         SINK=sink,
         **PHYS,

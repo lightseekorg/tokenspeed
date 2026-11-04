@@ -28,13 +28,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tokenspeed.runtime.layers.monokernel import (
-    FusedLayerDeployment,
+    MonokernelDeployment,
     agree_served_shapes,
     deployment_decline_reasons,
 )
 
 # The validated recipe: no host KV store, nothing that adds kernels on the side.
-_RECIPE = FusedLayerDeployment(
+_RECIPE = MonokernelDeployment(
     host_kv_store=False,
     kvstore_io_backend="kernel",
     expert_load_recorder=None,

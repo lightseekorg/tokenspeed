@@ -53,9 +53,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (  # noqa: E402
     TAG_COPY_WORDS,
-    NativeMoeState,
-    launch_gluon_mxfp4_moe_native_stream_gfx950,
-    native_moe_weights,
+    MoeStreamState,
+    launch_gluon_mxfp4_moe_stream_gfx950,
+    moe_stream_weights,
 )
 
 EXPERTS, HIDDEN, INTER, TOPK = 256, 4096, 512, 8
@@ -112,15 +112,15 @@ def _direct_decode(xq, xs, w13, w13_scale, w2, w2_scale, ids):
     "variant", VARIANTS, ids=lambda v: "-".join(f"{k}{x}" for k, x in v.items())
 )
 @pytest.mark.parametrize("rows", [8, 16])
-def test_native_stream_is_bitwise_direct_decode(experts, variant, rows):
+def test_moe_stream_is_bitwise_direct_decode(experts, variant, rows):
     variant = dict(variant)
-    weights = native_moe_weights(experts, scale_lanes=variant.pop("lanes"))
+    weights = moe_stream_weights(experts, scale_lanes=variant.pop("lanes"))
     w13 = _extract_gluon_raw_w(experts.w13_weight_triton_tensor)
     w13_scale = _extract_gluon_raw_s(experts.w13_precision_config.b_mx_scale)
     w2 = _extract_gluon_raw_w(experts.w2_weight_triton_tensor)
     w2_scale = _extract_gluon_raw_s(experts.w2_precision_config.b_mx_scale)
     generator = torch.Generator(device="cuda").manual_seed(rows)
-    state = NativeMoeState("cuda", rows, TOPK)
+    state = MoeStreamState("cuda", rows, TOPK)
     for step, routing in enumerate(RECORDED_ROUTINGS[rows]):
         ids = torch.tensor(routing, dtype=torch.int32, device="cuda")
         x = (
@@ -131,7 +131,7 @@ def test_native_stream_is_bitwise_direct_decode(experts, variant, rows):
         out = torch.full_like(expected, float("nan"))
 
         def run():
-            launch_gluon_mxfp4_moe_native_stream_gfx950(
+            launch_gluon_mxfp4_moe_stream_gfx950(
                 xq,
                 xs,
                 weights,
@@ -177,12 +177,12 @@ def test_stale_tags_matching_the_launch_tag_are_never_seen(experts):
     each launch zeroes the copy the next one polls, so the second launch
     still waits for its producers."""
     rows = 8
-    weights = native_moe_weights(experts, scale_lanes=False)
+    weights = moe_stream_weights(experts, scale_lanes=False)
     w13 = _extract_gluon_raw_w(experts.w13_weight_triton_tensor)
     w13_scale = _extract_gluon_raw_s(experts.w13_precision_config.b_mx_scale)
     w2 = _extract_gluon_raw_w(experts.w2_weight_triton_tensor)
     w2_scale = _extract_gluon_raw_s(experts.w2_precision_config.b_mx_scale)
-    state = NativeMoeState("cuda", rows, TOPK)
+    state = MoeStreamState("cuda", rows, TOPK)
     first = torch.tensor(RECORDED_ROUTINGS[rows][3], dtype=torch.int32, device="cuda")
     ids = torch.tensor(RECORDED_ROUTINGS[rows][1], dtype=torch.int32, device="cuda")
     generator = torch.Generator(device="cuda").manual_seed(11)
@@ -192,7 +192,7 @@ def test_stale_tags_matching_the_launch_tag_are_never_seen(experts):
     out = torch.full_like(expected, float("nan"))
 
     def run(routes):
-        launch_gluon_mxfp4_moe_native_stream_gfx950(
+        launch_gluon_mxfp4_moe_stream_gfx950(
             xq, xs, weights, routes, out, state, ring=8, quad_map=0, dn_order=0,
             dn_lines=0, addr_soffset=0, tag_poll=1, tail_num=1, tail_den=2,
             deadline_ticks=DEADLINE_TICKS, **SWIGLU

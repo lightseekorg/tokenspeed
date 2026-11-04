@@ -28,10 +28,10 @@ of every area, each its 1 / 128 share, and drain the stores before their
 first push of L. A peer writes that copy again only in L + 1, which it reaches
 only after every one of this rank's L pushes.
 
-Device side: :class:`MuseNativeView` (local bases and the peers' heap bases),
+Device side: :class:`MuseSparkIrisView` (local bases and the peers' heap bases),
 :func:`clear_next_copies`, and one function per hop end, each calling the
 standalone kernels' bodies with ``copy`` as the mailbox stage and no in-body
-clears. Host side: :class:`MuseNativeIrisState` allocates the areas.
+clears. Host side: :class:`MuseSparkIrisState` allocates the areas.
 """
 
 from dataclasses import dataclass
@@ -198,7 +198,7 @@ never cleared)."""
 
 
 @aggregate
-class MuseNativeView:
+class MuseSparkIrisView:
     """This rank's view of the launch state's areas.
 
     Attributes:
@@ -256,7 +256,7 @@ class H4SinkArgs:
     launch and this rank at compile time (a tuple would turn it into a
     runtime value)."""
 
-    view: MuseNativeView
+    view: MuseSparkIrisView
     launch: Launch
     RANK: gl.constexpr
 
@@ -748,7 +748,7 @@ def iris_fail_stop(launch, site, detail):
     the detail and leaves the abort words alone, so every rank's record
     names the origin. The
     peers' addresses come from the error words' caller lines that
-    MuseNativeIrisState fills.
+    MuseSparkIrisState fills.
     """
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     lane = gl.arange(0, 64 * gl.num_warps(), layout) % 64
@@ -778,7 +778,7 @@ def iris_fail_stop(launch, site, detail):
         trap()
 
 
-class MuseNativeIrisState:
+class MuseSparkIrisState:
     """The launch state's areas for one group (allocate before capture).
 
     Symmetric areas come from the group's Iris heap at the same offset on
@@ -793,7 +793,7 @@ class MuseNativeIrisState:
     def __init__(self, peers) -> None:
         if peers.world_size != WORLD_SIZE:
             raise ValueError(
-                f"MuseNativeIrisState needs {WORLD_SIZE} ranks, got {peers.world_size}"
+                f"MuseSparkIrisState needs {WORLD_SIZE} ranks, got {peers.world_size}"
             )
         empty = LAMPORT_EMPTY_WORD - (1 << 32)
         self.peers = peers
@@ -841,7 +841,7 @@ class MuseNativeIrisState:
         )
 
     def view_args(self) -> tuple:
-        """Kernel arguments that build :class:`MuseNativeView` in order:
+        """Kernel arguments that build :class:`MuseSparkIrisView` in order:
         ``heaps`` (a tuple of 8 int64), rank, then box, h1, h1_sums, h3,
         h4_own, routes, h6, red_in, h6_sums. The Lamport areas are typed as
         the kernel reads them (BF16 halves, or 32-bit words)."""

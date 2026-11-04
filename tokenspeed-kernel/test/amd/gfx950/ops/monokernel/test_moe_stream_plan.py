@@ -20,7 +20,7 @@
 
 """CPU test of the native MoE stream's closed-form plan on recorded routings.
 
-Runs the host form of the plan (``native_moe_plan``) and a fluid timeline
+Runs the host form of the plan (``moe_stream_plan``) and a fluid timeline
 model: every CU streams its list in order; the active CUs share
 ``min(peak, active * 46 GB/s)`` (128 CUs alone stream ~5.9 TB/s); a down unit
 cannot finish before its expert's last gate/up group plus a hand-off. Checks
@@ -40,7 +40,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.moe_stream import (
     GROUPS_PER_EXPERT,
     UNIT_BYTES,
     UNITS_PER_EXPERT,
-    native_moe_plan,
+    moe_stream_plan,
 )
 
 # Recorded verify routings of Muse Spark at EP1: 4 decode steps each at 8 and 16
@@ -220,7 +220,7 @@ def _fluid(plan, peak_tbs, dt_us=0.02):
 def test_plan_covers_every_piece_once(rows, step):
     ids = RECORDED_ROUTINGS[rows][step]
     experts = {e for row in ids for e in row}
-    plan = native_moe_plan(ids)
+    plan = moe_stream_plan(ids)
     seen = Counter((kind, e, i) for items in plan for kind, e, i in items)
     expected = {("ug", e, g) for e in experts for g in range(GROUPS_PER_EXPERT)}
     expected |= {("dn", e, u) for e in experts for u in range(UNITS_PER_EXPERT)}
@@ -231,7 +231,7 @@ def test_plan_covers_every_piece_once(rows, step):
 @pytest.mark.parametrize("rows,step", CASES)
 def test_plan_keeps_whole_experts_on_one_xcd(rows, step):
     ids = RECORDED_ROUTINGS[rows][step]
-    plan = native_moe_plan(ids)
+    plan = moe_stream_plan(ids)
     xcds = {}
     for cta, items in enumerate(plan):
         for _kind, e, _ in items:
@@ -243,7 +243,7 @@ def test_plan_keeps_whole_experts_on_one_xcd(rows, step):
 
 @pytest.mark.parametrize("rows,step", CASES)
 def test_plan_balances_bytes_and_drains_tail_roles_early(rows, step):
-    plan = native_moe_plan(RECORDED_ROUTINGS[rows][step])
+    plan = moe_stream_plan(RECORDED_ROUTINGS[rows][step])
     full = [
         sum(map(_item_bytes, items))
         for c, items in enumerate(plan)

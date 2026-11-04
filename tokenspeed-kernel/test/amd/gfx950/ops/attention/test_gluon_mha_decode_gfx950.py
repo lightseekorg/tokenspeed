@@ -959,7 +959,7 @@ def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool, merge: str) 
 
 
 # The native layer's full-attention grid: one workgroup per CU.
-_NATIVE_GRID = 256
+_MONOKERNEL_GRID = 256
 
 
 @pytest.mark.parametrize(
@@ -1036,13 +1036,15 @@ def test_full_records_merge_is_bitwise_the_balanced_decode(
     records = torch.zeros(program_indices * num_warps, device="cuda", dtype=torch.int32)
     hook_loads = 8
     hook = torch.zeros(
-        hook_loads * 256 * num_warps + _NATIVE_GRID, device="cuda", dtype=torch.int32
+        hook_loads * 256 * num_warps + _MONOKERNEL_GRID,
+        device="cuda",
+        dtype=torch.int32,
     )
     errors = torch.zeros(ERROR_WORDS, device="cuda", dtype=torch.int32)
     actual = torch.empty_like(expected)
     for tag in (7, 8):  # a second use of the records with a new tag
         actual.fill_(float("nan"))
-        full_records_kernel[(_NATIVE_GRID,)](
+        full_records_kernel[(_MONOKERNEL_GRID,)](
             q,
             inputs["cache_seqlens"],
             num_requests,

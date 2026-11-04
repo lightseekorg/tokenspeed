@@ -1,6 +1,6 @@
 # Fused decoder layers on gfx950 (Gluon)
 
-`gluon_decoder_layer_muse_spark_gfx950` (`muse_spark/layer.py`) runs one Muse
+`gluon_monokernel_muse_spark_gfx950` (`muse_spark/layer.py`) runs one Muse
 Spark decoder layer as one persistent launch: 256 workgroups x 8 waves, one
 workgroup per CU (each reserves 96 KB of LDS). `muse_spark/prepared.py` holds
 the host side (state, weights read in place, checks, launch);

@@ -22,10 +22,10 @@
 
 import pytest
 from tokenspeed_kernel.ops.monokernel import (
-    DECODER_LAYER_SIGNATURE,
+    MONOKERNEL_SIGNATURE,
     PlanKey,
-    prepare_decoder_layer,
-    prepare_decoder_layer_state,
+    prepare_monokernel_layer,
+    prepare_monokernel_state,
 )
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import register_kernel
@@ -49,11 +49,11 @@ def _amd_platform(monkeypatch, mi350_platform):
 
 def _register_leaf(recipe):
     @register_kernel(
-        "decoder_layer",
+        "monokernel",
         "prepare",
-        name=f"test_decoder_layer_{recipe}",
+        name=f"test_monokernel_{recipe}",
         solution="test",
-        signatures={DECODER_LAYER_SIGNATURE},
+        signatures={MONOKERNEL_SIGNATURE},
         traits={"recipe": frozenset({recipe}), "verify_width": frozenset({8})},
     )
     class Leaf:
@@ -71,11 +71,11 @@ def _register_leaf(recipe):
 
 def test_selected_leaf_receives_every_argument():
     leaf = _register_leaf("muse_spark")
-    state = prepare_decoder_layer_state(recipe="muse_spark", **STATE_ARGS)
+    state = prepare_monokernel_state(recipe="muse_spark", **STATE_ARGS)
     assert state == ("state", STATE_ARGS)
 
     keys = [PlanKey(1, "sliding", "full"), PlanKey(2, "sliding", "full")]
-    layer = prepare_decoder_layer(
+    layer = prepare_monokernel_layer(
         recipe="muse_spark",
         plan_keys=keys,
         traits={"verify_width": 8},
@@ -88,12 +88,14 @@ def test_selected_leaf_receives_every_argument():
 
 def test_unserved_recipe_or_traits_prepare_nothing():
     _register_leaf("muse_spark")
-    assert prepare_decoder_layer_state(recipe="other", **STATE_ARGS) is None
-    state = prepare_decoder_layer_state(recipe="muse_spark", **STATE_ARGS)
+    assert prepare_monokernel_state(recipe="other", **STATE_ARGS) is None
+    state = prepare_monokernel_state(recipe="muse_spark", **STATE_ARGS)
     common = dict(plan_keys=[PlanKey(1, "full", "regular")], weights={}, state=state)
-    assert prepare_decoder_layer(recipe="other", traits={}, **common) is None
+    assert prepare_monokernel_layer(recipe="other", traits={}, **common) is None
     assert (
-        prepare_decoder_layer(recipe="muse_spark", traits={"verify_width": 4}, **common)
+        prepare_monokernel_layer(
+            recipe="muse_spark", traits={"verify_width": 4}, **common
+        )
         is None
     )
 
@@ -101,7 +103,7 @@ def test_unserved_recipe_or_traits_prepare_nothing():
 def test_no_state_prepares_no_layer():
     _register_leaf("muse_spark")
     assert (
-        prepare_decoder_layer(
+        prepare_monokernel_layer(
             recipe="muse_spark",
             plan_keys=[PlanKey(1, "full", "regular")],
             traits={"verify_width": 8},

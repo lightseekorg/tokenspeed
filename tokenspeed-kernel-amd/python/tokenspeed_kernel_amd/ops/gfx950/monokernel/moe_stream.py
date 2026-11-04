@@ -50,7 +50,7 @@ group over all XCDs, so every XCD carries the same bytes; within an XCD the
 16 tail-role workgroups (slots 0 and 16-30) get whole groups worth half a
 full workgroup's bytes and no down units, so they finish early, and the 16
 others take the remaining groups, then down units, earliest-ready expert
-first. :func:`native_moe_plan` is the same plan on the host.
+first. :func:`moe_stream_plan` is the same plan on the host.
 
 Numerics are today's direct decode (``decode_common``, ``decode_stage1``,
 ``quantize_gluon``): the same per-column MFMA chain over K, SwiGLU, 32-value
@@ -111,12 +111,12 @@ __all__ = [
     "UNITS_PER_EXPERT",
     "MOE_SINK_LAYOUT",
     "MoeBuffers",
-    "NativeMoeState",
-    "NativeMoeWeights",
-    "gluon_mxfp4_moe_native_stream_gfx950",
-    "launch_gluon_mxfp4_moe_native_stream_gfx950",
-    "native_moe_plan",
-    "native_moe_weights",
+    "MoeStreamState",
+    "MoeStreamWeights",
+    "gluon_mxfp4_moe_stream_gfx950",
+    "launch_gluon_mxfp4_moe_stream_gfx950",
+    "moe_stream_plan",
+    "moe_stream_weights",
     "prefetch_moe",
     "run_moe",
     "store_routes_sink",
@@ -241,7 +241,7 @@ def _full_units(groups, units, t, b):
     return first, end
 
 
-def native_moe_plan(topk_ids, tail_num=1, tail_den=2):
+def moe_stream_plan(topk_ids, tail_num=1, tail_den=2):
     """The closed-form plan on the host.
 
     Args:
@@ -1524,7 +1524,7 @@ def run_moe(
 
 
 @gluon.jit(do_not_specialize=["deadline_ticks"])
-def gluon_mxfp4_moe_native_stream_gfx950(
+def gluon_mxfp4_moe_stream_gfx950(
     epochs,
     claims,
     errors,
@@ -1638,7 +1638,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
     )
 
 
-class NativeMoeState:
+class MoeStreamState:
     """Launch state of the standalone stream on one device: epochs, claims and
     error words (``persistent``), the mids hand-off for up to ``rows`` tokens
     and the readiness tags. Reused across launches; the launch tag keeps them
@@ -1673,7 +1673,7 @@ def _int32_words(scale):
 
 
 @dataclasses.dataclass(frozen=True)
-class NativeMoeWeights:
+class MoeStreamWeights:
     """The experts' prepared tensors as the stream reads them, in place.
 
     ``s13`` / ``s2`` are the CDNA4-swizzled E8M0 scales as int32 words (the
@@ -1699,7 +1699,7 @@ class NativeMoeWeights:
     n_phys2: int
 
 
-def native_moe_weights(experts, *, scale_lanes: bool) -> NativeMoeWeights:
+def moe_stream_weights(experts, *, scale_lanes: bool) -> MoeStreamWeights:
     """The stream's view of a processed gfx950 MXFP4 MoE layer.
 
     Reads the tensors today's EP1 decode reads (``w13_weight_triton_tensor``
@@ -1763,7 +1763,7 @@ def native_moe_weights(experts, *, scale_lanes: bool) -> NativeMoeWeights:
     if scale_lanes:
         canonical = unswizzle_cdna4_mxfp4_scale(s13, GATE_UP, HIDDEN // 32)
         lanes = _int32_words(pack_cdna4_mxfp4_scale_lanes(canonical))
-    return NativeMoeWeights(
+    return MoeStreamWeights(
         w13=w13,
         s13=_int32_words(s13),
         s13_lanes=lanes,
@@ -1775,10 +1775,10 @@ def native_moe_weights(experts, *, scale_lanes: bool) -> NativeMoeWeights:
     )
 
 
-def launch_gluon_mxfp4_moe_native_stream_gfx950(
+def launch_gluon_mxfp4_moe_stream_gfx950(
     xq,
     xs,
-    weights: NativeMoeWeights,
+    weights: MoeStreamWeights,
     topk_ids,
     out,
     state,
@@ -1801,11 +1801,11 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
     Args:
         xq, xs: MXFP4 activation rows ``(rows, 2048)`` and their CDNA4-swizzled
             E8M0 scales (``_quantize_mxfp4_activation``).
-        weights: From :func:`native_moe_weights`; ``SCALE_LANES`` follows
+        weights: From :func:`moe_stream_weights`; ``SCALE_LANES`` follows
             whether it holds lane-major scales.
         topk_ids: ``(rows, top_k)`` int32 global expert ids (EP1: all local).
         out: ``(rows * top_k, 4096)`` bf16, written per route.
-        state: :class:`NativeMoeState`.
+        state: :class:`MoeStreamState`.
         ring, quad_map, dn_order, dn_lines, addr_soffset, tag_poll, tail_num,
             tail_den:
             Plan fields, see :func:`run_moe` and :func:`prefetch_moe`.
@@ -1823,7 +1823,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
             "native MoE stream: at most 16 rows, out is (rows * top_k, hidden)"
         )
     w = weights
-    gluon_mxfp4_moe_native_stream_gfx950[(GRID,)](
+    gluon_mxfp4_moe_stream_gfx950[(GRID,)](
         state.epochs, state.claims, state.errors, state.arena, topk_ids, xq, xs,
         w.w13, w.s13, w.s13 if w.s13_lanes is None else w.s13_lanes, w.w2, w.s2,
         state.mids, state.mids_scale, state.tags, out,

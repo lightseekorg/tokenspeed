@@ -52,7 +52,7 @@ _CU_MASK_VARIABLES = ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
 
 
 @dataclass(frozen=True)
-class FusedLayerDeployment:
+class MonokernelDeployment:
     """The server settings that decide whether a fused launch can be resident.
 
     Attributes:
@@ -75,7 +75,7 @@ class FusedLayerDeployment:
 
 def current_deployment(
     server_args: Mapping[str, object], *, forward_side_stream: bool
-) -> FusedLayerDeployment:
+) -> MonokernelDeployment:
     """This process's deployment, from the server arguments and environment.
 
     Args:
@@ -85,7 +85,7 @@ def current_deployment(
             inside its forward.
     """
     args = server_args
-    return FusedLayerDeployment(
+    return MonokernelDeployment(
         host_kv_store=bool(args["enable_kvstore"]),
         kvstore_io_backend=args["kvstore_io_backend"],
         expert_load_recorder=args["expert_distribution_recorder_mode"],
@@ -95,7 +95,7 @@ def current_deployment(
     )
 
 
-def deployment_decline_reasons(deployment: FusedLayerDeployment) -> list[str]:
+def deployment_decline_reasons(deployment: MonokernelDeployment) -> list[str]:
     """Why fused decoder layers cannot run under ``deployment``; empty if they
     can.
 

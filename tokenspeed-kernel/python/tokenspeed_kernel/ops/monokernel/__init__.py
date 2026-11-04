@@ -27,10 +27,10 @@ projection, attention prologue and KV write in one plain launch that keeps one
 workgroup on every CU. The kernel boundary between two launches orders the KV
 write before the next layer's attention.
 
-The registry entry is ``("decoder_layer", "prepare")``, traited by
+The registry entry is ``("monokernel", "prepare")``, traited by
 ``recipe``. A leaf is a class: its static ``prepare_state(...)`` allocates the
 group's shared state, and its constructor ``(plan_keys=, weights=, state=)``
-compiles every plan variant it serves and returns a :class:`FusedDecoderLayer`;
+compiles every plan variant it serves and returns a :class:`MonokernelLayer`;
 per-step calls go to that object. Vendor bodies live in private,
 solution-named packages (``_gluon/`` for gfx950).
 """
@@ -80,14 +80,14 @@ class PlanKey:
 
 # BF16 dense weights and activations, MXFP4 experts read in place from the
 # MoE banks, FP8 KV cache.
-DECODER_LAYER_SIGNATURE = format_signature(
+MONOKERNEL_SIGNATURE = format_signature(
     dense=dense_tensor_format(torch.bfloat16),
     experts=tensor_format("mxfp4", torch.uint8),
     kv_cache=dense_tensor_format(torch.float8_e4m3fn),
 )
 
 
-class FusedDecoderLayer(Protocol):
+class MonokernelLayer(Protocol):
     """A prepared fused decoder layer (one per decoder layer of a model)."""
 
     def decline_reasons(self, requests: int) -> list[str]:
@@ -125,16 +125,16 @@ class FusedDecoderLayer(Protocol):
 def _select(recipe: str, traits: dict[str, Any]):
     try:
         return select_kernel(
-            "decoder_layer",
+            "monokernel",
             "prepare",
-            DECODER_LAYER_SIGNATURE,
+            MONOKERNEL_SIGNATURE,
             traits={"recipe": recipe, **traits},
         )
     except NoKernelFoundError:
         return None
 
 
-def prepare_decoder_layer_state(
+def prepare_monokernel_state(
     *, recipe, group, rank_in_group, max_requests, failure_record_path, device
 ):
     """Allocate the per-group state the fused layers of one model share.
@@ -161,9 +161,9 @@ def prepare_decoder_layer_state(
     )
 
 
-def prepare_decoder_layer(
+def prepare_monokernel_layer(
     *, recipe, plan_keys, traits, weights, state
-) -> FusedDecoderLayer | None:
+) -> MonokernelLayer | None:
     """Prepare one fused decoder layer: compile every plan variant in
     ``plan_keys`` and check it before capture.
 
@@ -173,7 +173,7 @@ def prepare_decoder_layer(
         traits: Shape traits for selection (verify width, TP and EP sizes,
             KV cache dtype).
         weights: The layer's weights, read in place (a recipe-defined dict).
-        state: From :func:`prepare_decoder_layer_state`.
+        state: From :func:`prepare_monokernel_state`.
 
     Returns:
         The prepared layer, or ``None`` when no leaf serves the recipe.
@@ -184,8 +184,8 @@ def prepare_decoder_layer(
     return kernel.impl(plan_keys=plan_keys, weights=weights, state=state)
 
 
-def decoder_layer_state_heap_bytes(*, recipe, world_size, max_requests) -> int:
-    """Iris heap bytes :func:`prepare_decoder_layer_state` will allocate for
+def monokernel_state_heap_bytes(*, recipe, world_size, max_requests) -> int:
+    """Iris heap bytes :func:`prepare_monokernel_state` will allocate for
     ``recipe``, or 0 when no leaf serves it; reserve them when the group's
     heap is created."""
     kernel = _select(recipe, {})

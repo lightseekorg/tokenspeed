@@ -62,7 +62,7 @@ from muse_layer_reference import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
     PlanKey,
-    prepare_decoder_layer_state,
+    prepare_monokernel_state,
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.iris import (  # noqa: E402
     CLEARED_AREAS,
@@ -76,7 +76,7 @@ from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.layer import (  # noqa: 
 )
 from tokenspeed_kernel.ops.monokernel._gluon.muse_spark.prepared import (  # noqa: E402
     DEFAULT_PLAN_FIELDS,
-    MuseSparkFusedDecoderLayer,
+    MuseSparkMonokernelLayer,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent import GRID  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.persistent.mirror import (  # noqa: E402
@@ -108,7 +108,7 @@ def _epoch(state) -> int:
 
 
 def _layer(state, weights, deadline_seconds: float):
-    return MuseSparkFusedDecoderLayer(
+    return MuseSparkMonokernelLayer(
         plan_keys=[ONE, TWO], weights=weights, state=state,
         plan_fields=DEFAULT_PLAN_FIELDS, stamps=False,
         deadline_ticks=int(deadline_seconds * TICKS_PER_SECOND),
@@ -116,7 +116,7 @@ def _layer(state, weights, deadline_seconds: float):
 
 
 def _state(rank, record_dir):
-    return prepare_decoder_layer_state(
+    return prepare_monokernel_state(
         recipe="muse_spark", group=dist.group.WORLD, rank_in_group=rank,
         max_requests=2, failure_record_path=f"{record_dir}/rank{rank}.bin",
         device=torch.device("cuda", rank),
