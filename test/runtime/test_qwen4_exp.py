@@ -3998,5 +3998,7 @@ def test_hyperconnection_attention_residual_rows(
     )
     actual, actual_residuals = layer._finish_attention(output, residuals, ctx)
     torch.testing.assert_close(actual, expected)
-    for actual_value, expected_value in zip(actual_residuals, expected_residuals):
+    for actual_value, expected_value in zip(
+        actual_residuals, expected_residuals, strict=True
+    ):
         torch.testing.assert_close(actual_value, expected_value)
