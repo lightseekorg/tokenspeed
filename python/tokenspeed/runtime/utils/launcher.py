@@ -144,6 +144,27 @@ def set_rocm_tool_registration_default() -> None:
     os.environ["HSA_TOOLS_DISABLE_REGISTER"] = "1"
 
 
+def set_rocm_hw_queue_default() -> None:
+    """Default ROCm worker processes to two hardware queues per stream priority.
+
+    HIP keeps a pool of ``GPU_MAX_HW_QUEUES`` hardware queues (default 4) for
+    each stream priority and binds a stream to one at its first launch, so the
+    queue a stream gets follows the order in which the process first launches
+    on its streams. On MI350X a process's queue k and queue k+4 share a compute
+    pipe, and while a kernel runs on one of them every launch on the other
+    waits about 30 us. Kimi-K3's prefill runs its Iris side kernels on
+    high-priority streams beside the forward's GEMMs: with 4 normal and 4
+    high-priority queues, a launch whose forward queue shared a pipe with a
+    side stream's ran every prefill chunk about a third slower. With 2 per
+    priority the process has 4 queues, one per pipe. An explicit
+    ``GPU_MAX_HW_QUEUES`` is kept.
+    """
+    import torch
+
+    if torch.version.hip:
+        os.environ.setdefault("GPU_MAX_HW_QUEUES", "2")
+
+
 def _split_top_level(hostlist: str) -> list[str]:
     """Split a hostlist on commas that are outside ``[...]`` groups."""
     tokens: list[str] = []
