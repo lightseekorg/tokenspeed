@@ -1,8 +1,7 @@
 # Decode monokernels
 
-A monokernel runs one decoder layer of a model recipe, and the next layer's
-query projection, attention prologue and K/V write, as one launch per decode
-step. This directory holds the op's interface; implementations live in
+A monokernel runs one decoder layer's decode step as one persistent launch.
+This directory holds the op's interface; implementations live in
 solution-named packages (`_gluon/` for gfx950). How a model chooses between
 monokernel layers and its regular layers is in
 [docs/design/monokernel.md](../../../../../docs/design/monokernel.md).
@@ -45,4 +44,4 @@ launch then ends at the FFN boundary).
 
 | Recipe | Solution | Where | Serves |
 |---|---|---|---|
-| `muse_spark` | gluon (gfx950) | `_gluon/muse_spark/` ([README](_gluon/README.md)) | EP1, TP 8, verify width 8, FP8 KV cache; 1-2 requests |
+| `muse_spark` | gluon (gfx950) | `_gluon/muse_spark/` ([README](_gluon/README.md)) | one layer plus the next layer's query projection, prologue and K/V write; EP1, TP 8, verify width 8, FP8 KV cache; 1-2 requests |

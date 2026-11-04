@@ -87,8 +87,8 @@ streams (the host KV store's kernel copies, a platform setting that turns
 asynchronous copies into kernels), compute-unit masks, a model forward that
 forks a side stream, and settings whose state the monokernel cannot keep (the
 expert-load recorder, the memory saver). A change that adds kernels on another
-stream during decode extends that list in the same change. Declining known
-sources keeps captured graphs off the inspection path.
+stream during decode extends that list in the same change (rather than
+inspecting each captured graph).
 
 ### Fail-stop
 
@@ -131,8 +131,8 @@ rules:
   lives in two copies by epoch parity with the other copy cleared each
   launch, so no slot keeps a tag old enough to repeat.
 * A poll never waits behind loads its own wave issued for later work, unless
-  the implementation's plan states why they land first; the plan checker
-  checks every such wait.
+  the implementation's plan states why they land first, and the
+  implementation checks every such wait before launch.
 
 ### Caches and request state
 
