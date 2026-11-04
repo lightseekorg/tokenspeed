@@ -268,7 +268,7 @@ def gluon_kda_paged_prefill_prepare_gfx1250(
     )
     beta_mask = beta_row < rows_left
     # The same betas along block columns, which scale the inverse's columns.
-    beta_base = raw_beta + (begin + token0) * beta_stride + head
+    beta_base = raw_beta + (begin + token0).to(gl.int64) * beta_stride + head
     beta = cdna5.buffer_load(
         beta_base,
         gl.minimum(beta_row, rows_left - 1) * beta_stride,
