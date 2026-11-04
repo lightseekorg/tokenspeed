@@ -831,6 +831,7 @@ def test_live_logits_masks_prefetched_tail_for_selection(poison):
             table.shape[1],
             70,
             capacity,
+            output.stride(0),
             64,
             True,
             True,
@@ -1193,8 +1194,8 @@ def test_full_grouped_metadata_slices_ids_across_request_boundaries():
     packed = tuple(tensor[begin:end] for tensor in queries)
     args = (
         packed,
-        weights[begin:end],
         cache,
+        weights[begin:end],
         table[begin:end],
         lengths[begin:end],
         capacity,
