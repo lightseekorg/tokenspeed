@@ -40,8 +40,8 @@ use tracing::{debug, warn};
 use ts_wire::{
     frames::{REQUEST_ADD, REQUEST_CONTROL, REQUEST_ENCODE},
     output::{FinishDetails, PromptTopLogprobs, TopLogprobs},
-    BatchTokenIDOutSlim, ControlOutput, ControlRequest, EncodeRequest, EngineOutput, EngineRequest,
-    RequestOutput, StrOrList, TokenizedGenerateReqInput,
+    BatchTokenIDOutSlim, ControlOutput, ControlRequest, Dict, EncodeRequest, EngineOutput,
+    EngineRequest, RequestOutput, StrOrList, TokenizedGenerateReqInput, Value,
 };
 use zeromq::{PullSocket, RouterRecvHalf, RouterSendHalf, SocketRecv, SocketSend, ZmqMessage};
 
@@ -179,6 +179,34 @@ impl From<&RequestOutput<'_>> for OutputChunk {
     }
 }
 
+impl OutputChunk {
+    /// The last chunk of a request the client aborted, which the engine
+    /// finishes without output. It repeats the usage of the request's latest
+    /// output, as the counts are cumulative and a consumer keeps the last
+    /// chunk's.
+    fn client_abort(usage: Usage) -> Self {
+        Self {
+            output_ids: Vec::new(),
+            finish_reason: Some("abort".to_owned()),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_tokens: usage.cached_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            output_token_logprobs: Vec::new(),
+            output_token_cumulative_probs: Vec::new(),
+            finish_details: Some(Dict(vec![
+                ("type".to_owned(), Value::from("abort")),
+                ("message".to_owned(), Value::from("AbortReq from client")),
+            ])),
+            spec_verify_ct: usage.spec_verify_ct,
+            accept_draft_tokens: None,
+            input_token_logprobs: None,
+            input_top_logprobs: None,
+            output_top_logprobs: None,
+        }
+    }
+}
+
 /// An engine's latest scheduler load, as reported with its outputs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EngineLoad {
@@ -208,6 +236,43 @@ struct Engine {
 struct Pending {
     engine: usize,
     tx: mpsc::UnboundedSender<StreamItem>,
+    /// The usage reported with the request's latest output.
+    usage: Usage,
+}
+
+/// A request's cumulative counts, as of its latest output; zero before any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Usage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+    spec_verify_ct: Option<i64>,
+}
+
+impl From<&OutputChunk> for Usage {
+    fn from(chunk: &OutputChunk) -> Self {
+        Self {
+            prompt_tokens: chunk.prompt_tokens,
+            completion_tokens: chunk.completion_tokens,
+            cached_tokens: chunk.cached_tokens,
+            reasoning_tokens: chunk.reasoning_tokens,
+            spec_verify_ct: chunk.spec_verify_ct,
+        }
+    }
+}
+
+/// Remove `rid` only if it is still the request whose stream is `tx`: once
+/// a request finishes, its id is free, and a new request may hold it.
+fn remove_same_request(
+    requests: &mut HashMap<String, Pending>,
+    rid: &str,
+    tx: &mpsc::UnboundedSender<StreamItem>,
+) -> Option<Pending> {
+    if !requests.get(rid)?.tx.same_channel(tx) {
+        return None;
+    }
+    requests.remove(rid)
 }
 
 /// A control operation awaiting every engine's reply.
@@ -332,10 +397,22 @@ impl Shared {
     /// Stop tracking a request; returns its engine if it was in flight.
     fn forget(&self, rid: &str) -> Option<usize> {
         let pending = lock(&self.requests).remove(rid)?;
+        self.untrack(&pending);
+        Some(pending.engine)
+    }
+
+    /// Stop tracking the request whose stream is `tx`; returns it if it is
+    /// still in flight under `rid`.
+    fn take_same(&self, rid: &str, tx: &mpsc::UnboundedSender<StreamItem>) -> Option<Pending> {
+        let pending = remove_same_request(&mut lock(&self.requests), rid, tx)?;
+        self.untrack(&pending);
+        Some(pending)
+    }
+
+    fn untrack(&self, pending: &Pending) {
         self.engines[pending.engine]
             .in_flight
             .fetch_sub(1, Ordering::Relaxed);
-        Some(pending.engine)
     }
 
     fn dispatch(&self, batch: BatchTokenIDOutSlim) {
@@ -373,12 +450,13 @@ impl Shared {
         let mut discarded = Vec::new();
         let mut requests = lock(&self.requests);
         for (rid, chunk) in rows.by_ref() {
-            let Some(pending) = requests.get(&rid) else {
+            let Some(pending) = requests.get_mut(&rid) else {
                 // Cancelled while its output was in flight.
                 debug!(rid, "output for a request that is not in flight");
                 discarded.push(Ok(chunk));
                 continue;
             };
+            pending.usage = Usage::from(&chunk);
             // A closed receiver means the stream is being dropped; its drop
             // forgets the request.
             let finished = chunk.finish_reason.is_some();
@@ -387,9 +465,7 @@ impl Shared {
             }
             if finished {
                 let pending = requests.remove(&rid).expect("present above");
-                self.engines[pending.engine]
-                    .in_flight
-                    .fetch_sub(1, Ordering::Relaxed);
+                self.untrack(&pending);
             }
         }
         drop(requests);
@@ -565,7 +641,14 @@ impl EngineClient {
             if requests.contains_key(&rid) {
                 return Err(Error::DuplicateRequestId(rid));
             }
-            requests.insert(rid.clone(), Pending { engine, tx });
+            requests.insert(
+                rid.clone(),
+                Pending {
+                    engine,
+                    tx,
+                    usage: Usage::default(),
+                },
+            );
         }
         self.shared.engines[engine]
             .in_flight
@@ -636,13 +719,28 @@ impl EngineClient {
 
     /// Ask the engine to abort a request. Its stream then ends with an
     /// `"abort"` chunk. Returns `false` if the request is not in flight.
+    ///
+    /// The engine finishes a client's own abort without output, wherever the
+    /// request is (queued or running), so the stream's last chunk is made
+    /// here once the engine has the abort. An output that crosses the abort
+    /// is dropped as not in flight. The last chunk repeats the usage of the
+    /// request's latest output.
     pub async fn abort(&self, rid: &str) -> Result<bool> {
-        let engine = match lock(&self.shared.requests).get(rid) {
-            Some(pending) => pending.engine,
+        // The stream identifies this request across the send: a request
+        // that finishes meanwhile frees its id for a new one.
+        let (engine, tx) = match lock(&self.shared.requests).get(rid) {
+            Some(pending) => (pending.engine, pending.tx.clone()),
             None => return Ok(false),
         };
         let frames = EngineRequest::Abort(vec![rid.to_owned()]).to_frames();
         self.shared.send(engine, frames).await?;
+        // Absent or replaced: it finished while the abort was sent, and its
+        // own last chunk ended the stream.
+        if let Some(pending) = self.shared.take_same(rid, &tx) {
+            let _ = pending
+                .tx
+                .send(Ok(OutputChunk::client_abort(pending.usage)));
+        }
         Ok(true)
     }
 }
@@ -750,5 +848,36 @@ async fn drain_input(mut input: RouterRecvHalf) {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(tx: mpsc::UnboundedSender<StreamItem>) -> Pending {
+        Pending {
+            engine: 0,
+            tx,
+            usage: Usage::default(),
+        }
+    }
+
+    #[test]
+    fn an_abort_removes_only_the_request_it_was_sent_for() {
+        let (aborted, _aborted_rx) = mpsc::unbounded_channel();
+        let (replacement, _replacement_rx) = mpsc::unbounded_channel();
+        let mut requests = HashMap::new();
+        // The aborted request finished during the send, and a new request
+        // took its id.
+        requests.insert("r1".to_owned(), pending(replacement.clone()));
+        assert!(remove_same_request(&mut requests, "r1", &aborted).is_none());
+        assert!(requests["r1"].tx.same_channel(&replacement));
+
+        requests.insert("r1".to_owned(), pending(aborted.clone()));
+        let removed = remove_same_request(&mut requests, "r1", &aborted).unwrap();
+        assert!(removed.tx.same_channel(&aborted));
+        assert!(requests.is_empty());
+        assert!(remove_same_request(&mut requests, "r1", &aborted).is_none());
     }
 }
