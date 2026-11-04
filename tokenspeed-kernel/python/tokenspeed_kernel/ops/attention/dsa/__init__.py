@@ -115,9 +115,9 @@ def _blockscaled_signature_and_scales(
     Returns (signature, scale_kwargs) for the paged-KV-cache entry points.
     """
     if q_scale is not None:
-        assert (
-            k_scale is not None and v_scale is not None
-        ), "MXFP8 attention requires q_scale, k_scale, and v_scale together"
+        assert k_scale is not None and v_scale is not None, (
+            "MXFP8 attention requires q_scale, k_scale, and v_scale together"
+        )
         signature = _mxfp8_attention_format_signature(
             q=q, k_cache=k_cache, v_cache=v_cache
         )
@@ -1105,6 +1105,8 @@ def dsa_index_candidates(
     local_tokens: int,
     solution: str | None,
     pages: DSAIndexCandidatePages | None = None,
+    q_scales: torch.Tensor | None = None,
+    query_group_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score a query tile against owned Index-K pages and select local candidates.
 
@@ -1121,6 +1123,20 @@ def dsa_index_candidates(
     _check_index_candidate_inputs(
         q, weights, index_k_cache, local_page_table, query_requests, causal_lens
     )
+    if q_scales is not None:
+        if (
+            q.dtype != torch.float8_e4m3fn
+            or q_scales.dtype != torch.float32
+            or q_scales.shape != q.shape[:2]
+            or q_scales.device != q.device
+        ):
+            raise ValueError(
+                "FP8 candidate queries require matching FP32 per-head scales"
+            )
+    elif q.dtype == torch.float8_e4m3fn:
+        raise ValueError("FP8 candidate queries require explicit per-head scales")
+    if query_group_size < 1:
+        raise ValueError("candidate query group size must be positive")
     query_requests = query_requests.contiguous()
     causal_lens = causal_lens.contiguous()
     if initial_tokens < 0 or local_tokens < 0 or initial_tokens + local_tokens > topk:
@@ -1138,6 +1154,11 @@ def dsa_index_candidates(
         q, weights, index_k_cache, page_size=page_size, solution=solution
     )
     pages_kwargs = _index_candidate_pages_kwargs(kernel, pages)
+    query_kwargs = (
+        {"q_scales": q_scales, "query_group_size": query_group_size}
+        if q_scales is not None
+        else {}
+    )
     with kernel_scope(
         "attention", "dsa_index_candidates", q.dtype, kernel_name=kernel.name
     ):
@@ -1154,6 +1175,7 @@ def dsa_index_candidates(
             initial_tokens=initial_tokens,
             local_tokens=local_tokens,
             **pages_kwargs,
+            **query_kwargs,
         )
 
 

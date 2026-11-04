@@ -698,3 +698,112 @@ if current_platform().is_amd:
     def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
+
+    # This experimental leaf is selected only by an explicit solution. The
+    # portable candidate implementation keeps automatic/default selection.
+    from tokenspeed_kernel.ops.attention.dsa import (
+        DSAIndexCandidatePages,
+        INDEX_CANDIDATE_PAGES_FEATURE,
+    )
+
+    @register_kernel(
+        "attention",
+        "dsa_index_candidates",
+        name="gluon_dsa_index_candidates_gfx950",
+        solution="gluon",
+        features={INDEX_CANDIDATE_PAGES_FEATURE},
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            format_signature(
+                q=dense_tensor_format(torch.float8_e4m3fn),
+                weights=dense_tensor_format(dtype),
+            )
+            for dtype in (torch.bfloat16, torch.float32)
+        ),
+        traits={
+            "index_heads": frozenset({32, 64}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
+        },
+        priority=Priority.REFERENCE,
+    )
+    def gluon_dsa_index_candidates_gfx950(
+        q,
+        weights,
+        index_k_cache,
+        local_page_table,
+        query_requests,
+        causal_lens,
+        *,
+        page_size,
+        topk,
+        softmax_scale,
+        initial_tokens,
+        local_tokens,
+        pages: DSAIndexCandidatePages | None = None,
+        q_scales: torch.Tensor | None = None,
+        query_group_size: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+            compact_index_pages,
+            gather_index_candidates,
+            mask_index_scores,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (
+            launch_gluon_dsa_index_candidates_gfx950,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+            gluon_dsa_logical_topk_gfx950,
+        )
+
+        if not 0 < topk <= 2048:
+            raise ValueError("gfx950 owned-page top-k supports at most2048 candidates")
+        if q_scales is None:
+            raise ValueError("gfx950 owned-page scorer requires FP8 query scales")
+        if pages is None:
+            physical, positions, lengths = compact_index_pages(
+                local_page_table, query_requests, causal_lens, page_size
+            )
+        else:
+            physical, positions, lengths = pages.pages, pages.positions, pages.lengths
+        lengths = lengths.reshape(-1)
+        scores = launch_gluon_dsa_index_candidates_gfx950(
+            q.contiguous(),
+            q_scales.contiguous(),
+            weights.contiguous(),
+            index_k_cache,
+            physical,
+            lengths,
+            page_size=page_size,
+            softmax_scale=softmax_scale,
+            query_group_size=query_group_size,
+        )
+        mask_index_scores(
+            scores,
+            positions,
+            lengths,
+            causal_lens,
+            page_size,
+            initial_tokens,
+            local_tokens,
+            mask_tail=False,
+        )
+        select_width = next(width for width in (512, 1024, 2048) if width >= topk)
+        offsets, _ = gluon_dsa_logical_topk_gfx950(
+            scores, torch.zeros_like(lengths), lengths, topk=select_width
+        )
+        if select_width != topk:
+            # Small generic/test top-k counts refine only this bounded
+            # candidate pool, never the unwritten capacity tail.
+            selected = scores.gather(1, offsets.clamp_min(0).long())
+            selected = torch.where(offsets >= 0, selected, -float("inf"))
+            order = torch.topk(selected, topk, dim=1).indices
+            offsets = offsets.gather(1, order)
+        return gather_index_candidates(
+            offsets, scores, positions, page_size, lengths=lengths
+        )

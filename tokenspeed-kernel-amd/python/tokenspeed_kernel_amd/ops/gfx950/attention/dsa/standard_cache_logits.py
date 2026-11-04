@@ -1439,6 +1439,7 @@ def _multi_row_index_k_scores_body(
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
     CHUNK_LOOP: gl.constexpr,
+    EXPLICIT_ROW_LENS: gl.constexpr = False,
 ):
     # Program (i, j): rows i on chunk j; positive key scales apply after the head sum.
     NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
@@ -1476,9 +1477,20 @@ def _multi_row_index_k_scores_body(
         row_valid = local_rows < q_len_per_req
         m_rows = request_id * q_len_per_req + m_local
         m_valid = m_local < q_len_per_req
-        # Row j of a request sees its first seq_len - (q_len - 1) + j keys.
-        seq_len = gl.load(seq_lens + request_id).to(gl.int32)
-        ends = gl.minimum(seq_len - (q_len_per_req - 1) + local_rows, num_candidates)
+        if EXPLICIT_ROW_LENS:
+            # Compact owned contexts do not grow on a rank when the newly
+            # appended token belongs to another rank. Preserve every row's
+            # actual local end rather than subtracting global draft offsets.
+            ends = gl.amd.cdna4.buffer_load(
+                ptr=row_ends, offsets=rows, mask=row_valid, other=0
+            ).to(gl.int32)
+            ends = gl.minimum(gl.maximum(ends, 0), num_candidates)
+        else:
+            # Row j sees seq_len - (q_len - 1) + j keys in a full context.
+            seq_len = gl.load(seq_lens + request_id).to(gl.int32)
+            ends = gl.minimum(
+                seq_len - (q_len_per_req - 1) + local_rows, num_candidates
+            )
         starts = gl.zeros([ROWS], gl.int32, layout=row_layout)
     else:
         request_id = 0
@@ -1922,7 +1934,14 @@ def gluon_dsa_prefill_topk_fp8_rows_gfx950(
 
 @gluon.jit(
     launch_metadata=_fp8_index_k_launch_metadata,
-    do_not_specialize=("num_rows", "num_candidates", "q_len_per_req"),
+    do_not_specialize=(
+        "num_rows",
+        "num_candidates",
+        "q_len_per_req",
+        "block_table_stride",
+        "logits_stride",
+    ),
+    do_not_specialize_on_alignment=("seq_lens", "block_table", "explicit_row_lens"),
 )
 def gluon_dsa_decode_topk_fp8_rows_gfx950(
     q,
@@ -1960,6 +1979,7 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
     CHUNK_LOOP: gl.constexpr,
+    explicit_row_lens=None,
 ):
     """Decode scorer over an fp8_scaled paged plane and BF16 or FP8 q.
 
@@ -1980,7 +2000,7 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
         weights,
         block_table,
         seq_lens,
-        seq_lens,
+        seq_lens if explicit_row_lens is None else explicit_row_lens,
         seq_lens,
         block_table,
         logits,
@@ -2013,4 +2033,5 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
         CHUNK_LOOP,
+        explicit_row_lens is not None,
     )
