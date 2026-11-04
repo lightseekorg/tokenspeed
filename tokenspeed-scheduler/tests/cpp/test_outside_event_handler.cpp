@@ -205,7 +205,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
         cfg.decode_input_tokens = 0;
-        cfg.device_allocator.total_pages = 5;
+        cfg.device_allocator.total_pages = 7;
         cfg.host_allocator.total_pages = 32;
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.enable_l3_storage = false;
@@ -214,9 +214,10 @@ protected:
 
     // The seeds finish right after their prefill (a zero decode width plans
     // no decode step): the quiescent finish publishes the prompt pages, whose
-    // stream to Host rides the next plan. Of the four usable Device pages,
-    // r_fill's three evict r1's last page and r_fill2's one evicts r1's first,
-    // the least recently used, so r1's prompt stays on Host alone.
+    // stream to Host rides the next plan. Of the six usable Device pages,
+    // r_fill's five (four pages and the copy-in block of its prompt end at 7)
+    // evict one of r1's and r_fill2's two evict the other, the least recently
+    // used, so r1's prompt stays on Host alone.
     void SetupHostCache() {
         Submit(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
@@ -228,14 +229,14 @@ protected:
         AckWriteBacks(seed_stream);
         PlanOnce();
 
-        Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
+        Submit(RequestSpec{.request_id = "r_fill", .tokens = MakeTokens(7, 100)});
         PlanOnce();
         SendForwardDone("r_fill", {200});
         SendFinish("r_fill");
         AckWriteBacks(PlanOnce());
         PlanOnce();
 
-        Submit(MakeRequestSpec("r_fill2", /*num_pages=*/1, /*start=*/300));
+        Submit(MakeRequestSpec("r_fill2", /*num_pages=*/2, /*start=*/300));
         PlanOnce();
         SendForwardDone("r_fill2", {201});
         SendFinish("r_fill2");
@@ -275,7 +276,7 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
     EXPECT_EQ(stats.prefix_hits.device_hit_tokens, 0u);
     EXPECT_EQ(stats.prefix_hits.host_hit_tokens, 2u);
     EXPECT_EQ(stats.prefix_hits.host_gain_tokens, 2u);
-    EXPECT_EQ(stats.prefix_hits.prompt_tokens, 4u + 6u + 2u + 4u);
+    EXPECT_EQ(stats.prefix_hits.prompt_tokens, 4u + 7u + 4u + 4u);
     EXPECT_EQ(stats.prefix_loads.ops, 1u) << "r2's load-back of the one page";
     EXPECT_EQ(stats.prefix_loads.blocks, (std::vector<std::uint64_t>{1}));
 }
@@ -1307,6 +1308,81 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ExactStateHitCanFinishWithoutADecodeFor
         EXPECT_TRUE(forward == nullptr || forward->request_ids.empty());
         PlanOnce();
     }
+}
+
+// The in-forward checkpoint leaves the D role's publication as it was (a PD
+// launcher may pass it to both roles): r0 still publishes its finish past the
+// prompt end (the KV tail [42] and the state at 9), so r1, whose prompt is
+// exactly those nine tokens, claims that state and the peer omits the state
+// transfer.
+TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesItsFinishWithTheInForwardCheckpoint) {
+    config_.state_checkpoint_in_forward = true;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
+    SendBootstrapped("r0");
+    PlanOnce();
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    PlanOnce();  // first decode
+    SendForwardDone("r0", {43});
+    ExecutionEvent succeeded;
+    succeeded.With(pd::SucceededEvent{"r0"});
+    scheduler_->Advance(succeeded);
+    PlanOnce();
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+
+    RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1);
+    r1.tokens.push_back(42);
+    Submit({r1});
+    SendBootstrapped("r1");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* destination = FindRemoteAdmission(plan);
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
+    EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
+}
+
+// So is a finish at the prompt end, where the fused rule would drop a prompt
+// end its pre-tail checkpoint covers: r0 finishes on its bootstrap token at
+// its prompt end 8 and publishes the state there; r1 adds token 9, resumes at
+// 8 and finishes on its bootstrap token too, at 9, inside the page the cached
+// checkpoint 8 starts. It still publishes the tail [9] and the state at 9,
+// so r2, whose prompt is r1's, claims that state and the peer omits the
+// state transfer.
+TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesACoveredPromptEndWithTheInForwardCheckpoint) {
+    config_.state_checkpoint_in_forward = true;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    const RequestSpec r0 = MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1);
+    Submit({r0});
+    SendBootstrapped("r0");
+    PlanOnce();
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    SendFinish("r0");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->TailEntries(), 0u) << "an aligned prompt end has no tail";
+
+    RequestSpec r1 = r0;
+    r1.request_id = "r1";
+    r1.tokens.push_back(9);
+    Submit({r1});
+    SendBootstrapped("r1");
+    const ExecutionPlan admission = PlanOnce();
+    const ForwardBatch* landing = FindRemoteAdmission(admission);
+    ASSERT_NE(landing, nullptr);
+    EXPECT_EQ(landing->extend_prefix_lens, (std::vector<std::int32_t>{8}));
+    SendRemotePrefillDone("r1", /*bootstrap_token=*/43);
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+
+    RequestSpec r2 = r1;
+    r2.request_id = "r2";
+    Submit({r2});
+    SendBootstrapped("r2");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* destination = FindRemoteAdmission(plan);
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
+    EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndClaimsAPageAlignedPromptEndState) {

@@ -70,9 +70,14 @@ def _kda_recurrent_step(
 
 @triton.heuristics(
     {
+        # From eight tokens, the preloaded window spills 16-row tiles past maxnreg.
         "BV": lambda args: min(
             triton.next_power_of_2(args["V"]),
-            4 if args["BATCH"] <= 4 else 8 if args["BATCH"] <= 8 else 16,
+            (
+                4
+                if args["BATCH"] <= 4
+                else 8 if args["BATCH"] <= 8 or args["SPEC_QUERY_LEN"] >= 8 else 16
+            ),
         )
     }
 )

@@ -36,7 +36,7 @@ from typing import Protocol
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid, silu_and_mul
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.residual import mhc_post, mhc_pre
 from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.platform import pdl_enabled
@@ -66,6 +66,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     MoELayer,
@@ -391,60 +392,6 @@ class Glm53FlashIndexerOutput:
     gate: torch.Tensor
 
 
-class Glm53FlashMLP(nn.Module):
-    """GLM-5.3-Flash SwiGLU with the checkpoint's activation clamp."""
-
-    def __init__(
-        self,
-        config: Glm53FlashTextConfig,
-        intermediate_size: int,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        *,
-        is_shared_expert: bool = False,
-    ) -> None:
-        super().__init__()
-        if is_shared_expert:
-            tp_rank = mapping.moe.tp_ep_rank
-            tp_size = mapping.moe.tp_ep_size
-            tp_group = mapping.moe.tp_ep_group
-        else:
-            tp_rank = mapping.dense.tp_rank
-            tp_size = mapping.dense.tp_size
-            tp_group = mapping.dense.tp_group
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [intermediate_size, intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            config.hidden_size,
-            bias=False,
-            reduce_results=False,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.swiglu_limit = config.swiglu_limit
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        gate_up, _ = self.gate_up_proj(hidden_states)
-        activated = silu_and_mul(gate_up, limit=self.swiglu_limit)
-        output, _ = self.down_proj(activated)
-        return output
-
-
 class Glm53FlashMoE(DeepseekV3MoE):
     """DeepSeek routing with GLM-5.3-Flash's clamped SwiGLU experts."""
 
@@ -505,13 +452,17 @@ class Glm53FlashMoE(DeepseekV3MoE):
             routed_scaling_factor=config.routed_scaling_factor,
             output_format=self.experts.topk_output_format,
         )
-        self.shared_experts = Glm53FlashMLP(
-            config=config,
+        self.shared_experts = GatedMLP.tensor_parallel(
+            hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
-            mapping=mapping,
+            activation=gated_activation(config.hidden_act, config.swiglu_limit),
+            tp_rank=mapping.moe.tp_ep_rank,
+            tp_size=mapping.moe.tp_ep_size,
+            tp_group=mapping.moe.tp_ep_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
-            is_shared_expert=True,
         )
 
 
@@ -1285,10 +1236,15 @@ class Glm53FlashDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            self.mlp = Glm53FlashMLP(
-                config=config,
+            self.mlp = GatedMLP.tensor_parallel(
+                hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
-                mapping=mapping,
+                activation=gated_activation(config.hidden_act, config.swiglu_limit),
+                tp_rank=mapping.dense.tp_rank,
+                tp_size=mapping.dense.tp_size,
+                tp_group=mapping.dense.tp_group,
+                reduce_results=False,
+                fusions=(),
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )

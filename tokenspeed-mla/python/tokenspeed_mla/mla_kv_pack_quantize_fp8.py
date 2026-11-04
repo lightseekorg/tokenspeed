@@ -67,6 +67,9 @@ def _mla_kv_pack_quantize_fp8_kernel(
     pid_h = tl.program_id(1)
 
     t_idx = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)  # [BLOCK_S]
+    # The row offset t_idx * stride_t passes 2**31 elements for prefill
+    # chunks a public caller can reach (e.g. 32k tokens at 128 heads).
+    t_idx = t_idx.to(tl.int64)
     t_mask = t_idx < s_total
 
     nope_idx = tl.arange(0, QK_NOPE)

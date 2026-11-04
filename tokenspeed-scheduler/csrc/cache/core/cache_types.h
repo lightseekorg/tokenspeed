@@ -198,6 +198,24 @@ struct TailPublication {
     ContentHash hash{};
 };
 
+// What the owner of a published partial page does with its blocks of that
+// page after the publication.
+enum class OwnerTail {
+    // The frontier is final (finish, retraction): the blocks are published in
+    // place.
+    kFinal,
+    // The owner keeps writing past the point (a prompt end followed by
+    // decode): its blocks are registered without taking another request's
+    // canonical block into the table, and the admission moves off every one
+    // it registered into the copy-in block the request holds for its slot,
+    // copying the published bytes into it.
+    kCopiedIn,
+    // The owner keeps writing past a point whose KV is cached already (a
+    // chunk end cut at a junction): its blocks stay unpublished, and only the
+    // State groups publish, under the tail's hash.
+    kKept,
+};
+
 // What a request completed since the coordinator last saw it, ready to
 // publish. prefix_hashes is the request's cumulative completed prefix-page
 // history; the pages from first_new_prefix_page on are the new ones. The
@@ -212,13 +230,10 @@ struct CompletedPages {
     // The partial page at this publication point, absent when the point is
     // page-aligned (T = prefix_hashes.size() * P).
     std::optional<TailPublication> tail{};
-    // The owner keeps writing the partial page after this publication (a
-    // prompt end followed by decode, a junction-cut chunk end): the admission
-    // swaps a fresh block into the table slot and copies the published bytes
-    // into it. False at finish and retraction, where the block is final and
-    // is published in place. Only an admission may set it: the copy needs the
-    // transaction's capacity.
-    bool owner_continues{false};
+    // What the owner does with its blocks of the tail. Only an admission may
+    // publish anything but kFinal: the copy-in spends blocks the request
+    // holds (CacheCoordinator::Admit).
+    OwnerTail owner_tail{OwnerTail::kFinal};
     // This point is a natural checkpoint of the recurrent state (prompt end,
     // finish, retraction, a junction-cut chunk end): every State group
     // publishes slot 1 -- the block the forward that ended here wrote --
@@ -228,7 +243,9 @@ struct CompletedPages {
     // An in-forward State checkpoint an earlier forward wrote at the page
     // boundary prefix_hashes[state_checkpoint_pages - 1]: every State group
     // publishes its block from state_checkpoint_blocks (indexed by group, null
-    // elsewhere) under that page's chain hash. Zero pages means none.
+    // elsewhere) under that page's chain hash, and a sliding window published
+    // behind that boundary is an endpoint's regardless of boundary_kind. Zero
+    // pages means none.
     std::int32_t state_checkpoint_pages{0};
     std::span<CacheBlockRef> state_checkpoint_blocks{};
     // Which kind of boundary the publication ends on (eviction provenance).

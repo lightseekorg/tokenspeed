@@ -178,8 +178,10 @@ def make_config(
         state_checkpoint_in_forward:
             ``--enable-state-checkpoint-in-forward``: the prefill forward that
             spans a long prompt's last prefix-page boundary before its replay
-            tail also writes the State checkpoint there. Requires prefix
-            caching.
+            tail also writes the State checkpoint there, and no KV tail and no
+            State checkpoint is published at a prompt end that checkpoint
+            covers (prefill and fused roles) or at a fused finish past the
+            prompt end. Requires prefix caching.
         max_kv_page_num: Per-local-prefill-batch budget for the sum of
             ``ceil((cached prefix + current chunk) / prefix_granularity)``
             across requests. 0 leaves the budget unbounded. Derived from
