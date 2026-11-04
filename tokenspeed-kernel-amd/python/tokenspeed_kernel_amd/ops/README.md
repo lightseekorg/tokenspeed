@@ -272,7 +272,7 @@ persistent kernel calls with explicit task ids, plus a standalone launcher
   offsets (one vote per wave per retry, no barrier) and sums them in part
   order, stopping at a `Launch` deadline through the caller's `on_expiry`.
 - Results are deterministic but not bit-equal to a full-K GEMV.
-- For roles that build or hold their own operands:
+- For callers that build or hold their own operands:
   `gemv_a16w16_splitk_x_gfx950` loads a task's x slice as the B operand;
   `gemv_a16w16_splitk_wave_sums_gfx950` (one MFMA per tile) and
   `gemv_a16w16_splitk_hi_lo_sums_gfx950` (an FP32 weight and x as BF16

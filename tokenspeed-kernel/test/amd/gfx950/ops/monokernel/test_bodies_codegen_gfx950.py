@@ -155,7 +155,8 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
 
 
 def test_balanced_row_merge_issues_its_partials_before_the_fold():
-    """In the spread merge each split reads only its share of the rows: after
+    """In the ``spread`` merge (``att_merge="spread"``: one row per wave) each
+    split reads only its share of the rows: after
     the record poll, every split's partial and LSE loads for those rows
     (``sc0 nt``) issue back to back before the first wait, with no full drain
     among them and no L2 writeback or invalidate."""

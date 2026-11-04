@@ -20,10 +20,10 @@
 
 """Decode monokernels: one persistent launch per decoder layer.
 
-A monokernel runs one decoder layer of a model recipe and the next layer's
-query projection, attention prologue and K/V write in one launch that keeps
-one workgroup on every compute unit. The kernel boundary between two launches
-orders the K/V write before the next layer's attention.
+A monokernel runs one decoder layer's decode step as one persistent launch
+that keeps one workgroup on every compute unit. What a leaf's launch covers
+beyond its layer (such as the next layer's query and K/V write) is in its
+leaf's README.
 
 The registry entry is ``("monokernel", "prepare")``, selected by the
 ``recipe`` trait. A leaf is a class: its static ``prepare_state(...)``

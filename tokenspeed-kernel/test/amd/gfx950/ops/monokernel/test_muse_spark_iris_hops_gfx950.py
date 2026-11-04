@@ -18,9 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Offline gfx950 codegen of the Muse Spark monokernel's Iris hop bodies.
+"""Offline gfx950 codegen of the Muse Spark monokernel's Iris exchange bodies.
 
-The hop bodies of the standalone kernels run inside the 8-wave monokernel
+The exchange bodies of the standalone kernels run inside the 8-wave monokernel
 launch. These tests compile them at 8 waves (no device needed) and check the
 ordering contract of each: pushes are whole-line system-scope stores with no
 wait, polls stay in their loop with system-scope loads, and with the entry
@@ -264,7 +264,7 @@ _VIEW = {
 
 @gluon.jit
 def _layer_hops_kernel(heaps, rank, box, ar, ar_sums, pooled_ag, route_push_own, routes, post_ag, reducer_in,post_ag_sums, errors,floats, words, copy, rows, ROLE: gl.constexpr):  # fmt: skip
-    """Each monokernel hop end on the view, at 8 waves, by ROLE."""
+    """Each monokernel exchange end on the view, at 8 waves, by ROLE."""
     view = MuseSparkIrisView(
         heaps,
         rank,
@@ -364,7 +364,7 @@ def _layer_hops_kernel(heaps, rank, box, ar, ar_sums, pooled_ag, route_push_own,
     ],
 )
 def test_every_exchange_end_compiles_at_8_waves(role):
-    """Every hop end of the monokernel compiles at 8 waves, with no L2
+    """Every exchange end of the monokernel compiles at 8 waves, with no L2
     invalidate or write-back, no scratch, and system-scope peer stores."""
     signature = dict(
         _VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32", rows="i32"
@@ -407,7 +407,7 @@ def test_every_exchange_end_compiles_at_8_waves(role):
 
 def test_every_cleared_area_splits_into_whole_sender_shares():
     """128 senders clear equal 16-byte-multiple shares of every area copy, and
-    the area sizes follow the 32-row geometry the hop bodies index."""
+    the area sizes follow the 32-row geometry the exchange bodies index."""
     from tokenspeed_kernel.ops.monokernel._gluon.muse_spark import iris as f
 
     for area in f.CLEARED_AREAS:

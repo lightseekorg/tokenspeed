@@ -24,7 +24,7 @@ A model's forward hands its layer loop to a layer stack, chosen at
 construction through the model's ``layer_stack_cls``. The stack owns which
 implementation runs each layer for a step; the model owns everything around
 the loop (embedding, final norm, logits). The default stack runs every layer
-in order, as the model was written. A model with its own forward defines the
+in order, as ``BaseTransformerModel``'s loop does. A model with its own forward defines the
 stack its forward calls, with the boundary values its layers pass.
 
 ``prepare`` runs once at startup, after the weights are loaded and before

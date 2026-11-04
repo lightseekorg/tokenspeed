@@ -38,12 +38,11 @@ A model's forward hands its layer loop to a layer stack
   picks, in one method, the contiguous range of layers that runs as
   monokernels, from the step's padded shape and the served set alone. An
   empty range is the explicit fallback: every layer then runs as written.
-  The first monokernel layer of a range takes its query from its attention's
-  regular prologue, and the last one ends with the next layer's input norm,
-  so the layers outside the range and the model around the stack do not
-  change.
-* Each launch also prepares the next layer's query, so a range spans layers
-  and the stack, not a layer, owns the prepared monokernel layers.
+  The first and last monokernel layers of a range take and return the
+  regular layers' boundary values, so the layers outside the range and the
+  model around the stack do not change.
+* A launch may also prepare part of the next layer, so the stack, not a
+  layer, owns the prepared monokernel layers.
 
 ## Invariants
 

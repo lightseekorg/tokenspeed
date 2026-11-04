@@ -83,8 +83,8 @@ _IWC = "issue-wait-compute"
 _LANDED = "landed"
 
 # Two-copy cross-GPU receive areas and the local attention output area
-# (``att_box``): re-armed by the o_proj senders at entry. Tagged words
-# (``S``: the routed sums): never cleared.
+# (``att_box``): re-armed by the o_proj senders at entry. Tagged words (such
+# as ``routed_sum``): never cleared.
 _CLEARED = ("att_box", "AR", "POOLED_AG", "route_push_own", "routes", "POST_AG")
 _TAGGED = ("att_rec", "ar_sums", "router", "pooler", "exchange", "routed_sum", "hprime",
            "reducer_in", "post_ag_sums", "qkv")  # fmt: skip
