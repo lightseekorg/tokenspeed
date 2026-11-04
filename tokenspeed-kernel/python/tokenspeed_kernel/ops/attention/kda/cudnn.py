@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda import KdaPrefillCapacity, KdaPrefillResult
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -55,7 +55,10 @@ def cudnn_kda_supported() -> bool:
     ),
     signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
     priority=Priority.PERFORMANT,
-    traits={"recurrent_layout": frozenset({"v_major"})},
+    traits={
+        "prefill_capacity": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
 )
 def cudnn_kda_paged_prefill(
     q: torch.Tensor,
@@ -70,11 +73,13 @@ def cudnn_kda_paged_prefill(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
     lower_bound: float | None,
+    capacity: KdaPrefillCapacity | None,
 ) -> KdaPrefillResult:
     """Run the shared prefill contract with native V-major FP32 state.
 
     Arguments follow kda_paged_prefill. Its validated CPU boundary mirror
-    needs no further processing: cuDNN consumes device boundaries directly.
+    and capacity need no further processing: cuDNN plans from the full tensor
+    shapes and consumes live device boundaries directly.
     Returns the packed output and final state in a separate buffer.
     """
     return KdaPrefillResult(

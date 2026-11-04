@@ -1857,7 +1857,8 @@ host lengths and GPU boundaries still agree. Its `PrefillCapacity` validates
 the packed bounds it builds. For KDA, an explicit
 `KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
 each sequence may fill the bucket, but their combined tokens must also fit it.
-The CuTeDSL adapter alone converts this descriptor to native planning bounds.
+The CuTeDSL adapter converts this descriptor to native planning bounds;
+cuDNN plans from tensor capacities and reads live boundaries on the device.
 Convolution maps reserve `ceil(token_capacity / block_m) + sequences - 1`
 programs, bounding the sum of per-request rounded lengths without reserving
 the entire token bucket for every request. One GPU metadata refresh
@@ -1881,11 +1882,16 @@ global functions or changing scan arithmetic. Routing and workspace partition
 rules remain owned by the native host. Unsupported layouts retain the public
 wrapper's capacity preparation.
 
-The preparation copies every input with its capacity padding scrubbed: the
+The CuTeDSL preparation copies every input with its capacity padding scrubbed: the
 gate projection can produce undefined padding, and the inline path has no
 handoff copy to clean it. Per-call plan and scratch tensors belong to the
 active graph pool or eager invocation; they are not a mutable process-global
 plan shared across replay streams.
+
+The cuDNN adapter reuses FlashInfer's cached plans and workspace, warmed by the
+existing startup capture loop. Replay matches eager execution at the same
+capacity bitwise; different capacities can select different scan partitions
+and therefore differ by floating-point rounding.
 
 Changes to this capacity contract require validation of full-model overlap,
 memory use and performance in addition to kernel correctness.

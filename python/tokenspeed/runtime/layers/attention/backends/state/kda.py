@@ -195,7 +195,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         return self.kda_backend == "cudnn"
 
     def _admits_capacity_prefill(self) -> bool:
-        return self._prefill_graph_enabled and self.kda_backend == "cutedsl_kda"
+        return self._prefill_graph_enabled and self.kda_backend in (
+            "cutedsl_kda",
+            "cudnn",
+        )
 
     def _reset_replay_state(self) -> None:
         self._verify_producer_stream: torch.cuda.Stream | None = None

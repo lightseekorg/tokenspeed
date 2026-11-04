@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillCapacity, kda_paged_prefill
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry
+from utils import assert_no_cute_compile
 
 HEADS, DIM = 12, 128
 
@@ -269,13 +270,17 @@ def test_capacity_compatibility_fallback(native_cuda, monkeypatch):
 
 @pytest.mark.parametrize("sequences", [1, 2, 4, 8])
 @pytest.mark.parametrize("capacity", [256, 2048, 8192])
-def test_capacity_preparation_dynamic_replay(native_cuda, sequences, capacity):
+@pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
+def test_capacity_preparation_dynamic_replay(
+    native_cuda, sequences, capacity, backend_name
+):
     """Isolate device-plan replay with new GPU bounds and poisoned padding.
 
     The captured call does not rerun Python admission against its CPU mirror.
     Production runtime must refresh both mirrors before replay.
     """
-    assert cutedsl_op.cutedsl_kda_supports_prepared_plan()
+    if backend_name == "cutedsl_kda":
+        assert cutedsl_op.cutedsl_kda_supports_prepared_plan()
     lengths = [capacity // sequences] * sequences
     inputs, state, bounds, cpu = _inputs("cuda", lengths)
     state_before = state.clone()
@@ -289,7 +294,7 @@ def test_capacity_preparation_dynamic_replay(native_cuda, sequences, capacity):
             capacity=KdaPrefillCapacity(capacity, sequences),
             lower_bound=-5.0,
             override=None,
-            solution="cutedsl_kda",
+            solution=backend_name,
             recurrent_layout="v_major",
         )
 
@@ -310,17 +315,43 @@ def test_capacity_preparation_dynamic_replay(native_cuda, sequences, capacity):
     for lengths in partitions * 2:
         live = sum(lengths)
         new_cpu = torch.tensor([0, *lengths], dtype=torch.int64).cumsum(0)
+        cpu.copy_(new_cpu)
         bounds.copy_(new_cpu)
         for tensor in inputs[:5]:
             tensor.copy_(torch.randn_like(tensor) * 0.1)
             tensor[:, live:].fill_(float("nan"))
         exact = tuple(t[:, :live] for t in inputs[:5]) + inputs[5:]
-        expected = _actual(exact, state, bounds, new_cpu, "v_major")
-        graph.replay()
-        torch.testing.assert_close(actual.out[:, :live], expected.out, rtol=0, atol=0)
-        torch.testing.assert_close(
-            actual.final_state, expected.final_state, rtol=0, atol=0
+        expected = kda_paged_prefill(
+            *exact,
+            initial_state=state,
+            cu_seqlens=bounds,
+            cu_seqlens_cpu=new_cpu,
+            capacity=None,
+            lower_bound=-5.0,
+            solution=backend_name,
+            recurrent_layout="v_major",
         )
+        with assert_no_cute_compile():
+            padded = run()
+            graph.replay()
+        torch.testing.assert_close(
+            actual.out[:, :live], padded.out[:, :live], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            actual.final_state, padded.final_state, rtol=0, atol=0
+        )
+        # cuDNN may partition the scan differently for exact and padded shapes.
+        for result, reference in (
+            (actual.out[:, :live], expected.out),
+            (actual.final_state, expected.final_state),
+        ):
+            if backend_name == "cutedsl_kda":
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)
+            else:
+                torch.testing.assert_close(result, reference, rtol=1e-2, atol=1e-3)
+                assert (
+                    result.float() - reference.float()
+                ).norm() < 0.01 * reference.float().norm()
         torch.testing.assert_close(state, state_before, rtol=0, atol=0)
 
 
