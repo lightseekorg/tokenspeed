@@ -33,7 +33,6 @@ from tokenspeed_kernel.ops.attention.dsa import (
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
     pack_index_candidates,
 )
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
@@ -44,22 +43,6 @@ from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
 )
-from tokenspeed.runtime.utils.env import envs
-
-
-def _candidate_options(q: torch.Tensor, page_size: int) -> dict[str, str]:
-    """Keep default dispatch unless this supported FP8 path is opted in."""
-    if (
-        envs.TOKENSPEED_DSA_DCP_GFX950_INDEXER.get()
-        and current_platform().is_cdna4
-        and q.dtype == torch.float8_e4m3fn
-        and q.shape[1] in (32, 64)
-        and q.shape[2] == 128
-        and page_size == 64
-    ):
-        return {"solution": "gluon"}
-    return {}
-
 
 # Some leaves offset logits rows in int32: a tile's padded logits stay < 2**31.
 _MAX_TILE_LOGITS = 1 << 31
@@ -313,11 +296,7 @@ def _owned_columns(
     its logits by the whole table, so it keeps the table's width.
     """
     if columns is None or not dsa_index_candidates_accepts_pages(
-        q,
-        weights,
-        index_k_cache,
-        page_size=page_size,
-        **_candidate_options(q, page_size),
+        q, weights, index_k_cache, page_size=page_size
     ):
         return None
     if columns <= 0:
@@ -367,7 +346,6 @@ def build_dcp_index_metadata(
             causal_lens,
             page_size=page_size,
             columns=columns,
-            **_candidate_options(q, page_size),
         )
     return DCPIndexMetadata(
         page_table, local_table, query_requests, causal_lens, pages, placement, columns
@@ -482,7 +460,6 @@ def select_dsa_topk(
             metadata.causal_lens[start:end],
             page_size=page_size,
             columns=metadata.columns,
-            **_candidate_options(q, page_size),
         )
         if pages is None:
             raise RuntimeError(
@@ -504,7 +481,7 @@ def select_dsa_topk(
             softmax_scale=softmax_scale,
             initial_tokens=initial_tokens,
             local_tokens=local_tokens,
-            solution=_candidate_options(q, page_size).get("solution"),
+            solution=None,
             pages=tile_pages(start, end),
             **(
                 {

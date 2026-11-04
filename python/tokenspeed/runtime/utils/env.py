@@ -389,9 +389,6 @@ class Envs:
     TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH = EnvStr("auto")
     TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB = EnvInt(256)
 
-    # Opt in to the gfx950 FP8 scorer over compact owned Index-K pages.
-    TOKENSPEED_DSA_DCP_GFX950_INDEXER = EnvBool(False)
-
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
