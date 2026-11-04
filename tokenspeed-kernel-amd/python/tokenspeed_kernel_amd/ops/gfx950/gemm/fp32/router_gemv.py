@@ -315,6 +315,7 @@ def gluon_fp32_router_gemv_splitk_gfx950(
     # ".wt" writes through to memory, each wave waits for its stores to
     # complete, and the barrier orders every wave's stores before the counter
     # bump; a release atomic would also write back and invalidate the whole L2.
+    # asm: Gluon has no fence that waits for stores without an L2 write-back.
     gl.inline_asm_elementwise(
         asm="s_waitcnt vmcnt(0)",
         constraints="=v,0",

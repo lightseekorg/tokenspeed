@@ -113,6 +113,9 @@ def supports_gluon_rowcta_bf16_gemv_gfx950(m: int, n: int, k: int) -> bool:
 def _pin(values):
     """Return ``values`` through an empty side-effecting asm, which LLVM can
     neither move nor merge with the same computation of another K step."""
+    # asm: an empty template (no instruction). Gluon has no op that keeps a
+    # value at a program point, and the Iris kernels that call this link no
+    # LLVM library.
     return gl.inline_asm_elementwise(
         asm="",
         constraints="=v,0",

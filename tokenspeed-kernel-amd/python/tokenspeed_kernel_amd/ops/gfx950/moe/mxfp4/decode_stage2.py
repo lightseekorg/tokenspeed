@@ -486,6 +486,8 @@ def _issue_here(value):
     # An empty asm that uses the value keeps the compiler from sinking its
     # load below the job loop's bound check, so it overlaps the group-count
     # load instead of following it.
+    # asm: an empty template (no instruction). Gluon has no op that keeps a
+    # value at a program point.
     return gl.inline_asm("", "=s,0", [value], gl.int32, is_pure=False)
 
 

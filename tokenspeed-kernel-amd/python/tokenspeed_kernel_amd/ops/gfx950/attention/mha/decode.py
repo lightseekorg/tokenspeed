@@ -803,6 +803,8 @@ class AttentionProgram:
 def _opaque_f32(values):
     """Return ``values`` through an empty side-effecting asm, so LLVM cannot
     reuse expressions computed from them before this point."""
+    # asm: an empty template (no instruction). Gluon has no op that hides a
+    # value's origin from the optimizer.
     return gl.inline_asm_elementwise(
         asm="",
         constraints="=v,0",

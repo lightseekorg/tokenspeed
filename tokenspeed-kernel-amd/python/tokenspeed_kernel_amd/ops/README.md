@@ -46,6 +46,20 @@ they publish a generation and all consumer subgroups before they read the
 peer inbox. Removing either rendezvous can increase cross-rank
 skew and regress performance even when the generated kernel remains correct.
 
+### Inline asm
+
+Prefer Gluon ops, then LLVM intrinsics through an extern `.ll` library (such
+as `_scheduling.py`), over inline asm: the compiler inserts the wait states
+between dependent instructions and protects live registers only for
+instructions it can see, and it does not look inside an asm block. Use inline
+asm only where neither exists, say why at the site with an `# asm:` comment,
+declare every register the template writes (outputs, `~{...}` clobbers,
+including SCC and VCC), and do not read a value inside its producer's hazard
+window (an MFMA or transcendental result, or an SGPR a VALU just wrote): pass
+it through a compiler-visible op first. Do not pad with `s_nop`.
+`tokenspeed-kernel/test/amd/gfx950/ops/test_inline_asm_gfx950.py` lists the
+allowed helpers and checks these rules on the compiled kernels.
+
 ## GEMM
 
 ### gfx950 dense BF16 projections

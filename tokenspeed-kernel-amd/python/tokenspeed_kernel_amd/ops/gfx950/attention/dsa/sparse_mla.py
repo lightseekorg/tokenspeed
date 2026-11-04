@@ -438,6 +438,8 @@ def _dsa_persistent_radix_topk_kernel(
         # the whole program, and s_barrier does not wait for memory. So each
         # wave first waits until its no-return atomics reach L2 (vmcnt counts
         # them like stores).
+        # asm: Gluon has no fence that waits for stores without an L2
+        # write-back.
         gl.inline_asm_elementwise(
             asm="s_waitcnt vmcnt(0)",
             constraints="=r,~{memory}",
