@@ -145,6 +145,11 @@ def _relative_error(actual, expected):
             torch.float8_e4m3fn,
             id="draft-c16",
         ),
+        # Lengths below a page and on page boundaries, with more splits than
+        # the shortest request has pages.
+        pytest.param(
+            12, 1, [1, 63, 64, 65, 4097], torch.float8_e4m3fn, id="draft-short"
+        ),
         pytest.param(32, 1, [4097, 129], torch.float8_e4m3fn, id="draft-head-blocks"),
     ],
 )
