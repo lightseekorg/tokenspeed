@@ -398,6 +398,12 @@ def poll_until(word_ptr, expected, launch, LOAD: gl.constexpr):
       weights in flight. Only for words written on this XCD or in uncached
       memory.
 
+    Wave independence: the waves that poll (lane 0's wave, or every wave
+    with ``"smem"``) loop on their own reads with no barrier or LDS in the
+    loop, so they need not agree on a trip count; the closing workgroup
+    barrier is the one point that joins them, and loads after it see the
+    word for the whole workgroup.
+
     Returns:
         Whether the word was seen; ``False`` only in the wave that stopped
         (every wave with ``"smem"``). After one workgroup barrier.
@@ -505,6 +511,12 @@ def poll_tags16(word_ptr, tag, launch, GLC: gl.constexpr, BARRIER: gl.constexpr)
     (other waves use what the tags guard), or only with a per-wave acquire
     (this wave alone polls and reads, as in per-wave work loops). Returns
     whether the tags were seen, per wave.
+
+    Wave independence (``BARRIER`` False): each wave polls with its own
+    scalar loads and goes on alone, so per-wave loops with different trip
+    counts may call it. That is safe only when the waiting wave itself reads
+    what the tags guard; its ``wave_acquire`` keeps those reads after the
+    poll. Data shared across waves needs ``BARRIER`` True.
     """
     start = gl.to_tensor(0).to(gl.int64)
     retries = 0

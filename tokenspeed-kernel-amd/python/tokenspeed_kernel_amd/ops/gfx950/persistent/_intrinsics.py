@@ -124,6 +124,9 @@ def first_lane_scalar(x):
     The read is the LLVM intrinsic, so the compiler sees a VALU write of the
     SGPR and inserts the wait states its memory consumers need; the asm
     only moves the (already scalar) value into Gluon's scalar type."""
+    # asm: Gluon has no op that turns a wave-uniform tensor into a scalar.
+    # The value is already in an SGPR (the readfirstlane intrinsic); the asm
+    # only moves it into Gluon's scalar type.
     return gl.inline_asm(
         _scalar_move_asm, ("=s", "s"), [wave_uniform_i32(x)], gl.int32, is_pure=True
     )
@@ -171,6 +174,10 @@ def scalar_load_glc(word_ptr):
     written on another XCD to coarse memory are unmeasured. The result never
     shares registers with the address (early clobber), so the load cannot
     overwrite its own base while it is in flight."""
+    # asm: no scalar load with glc and memory semantics exists: a volatile
+    # constant-space load is an s_load without glc (it reads the scalar
+    # cache), and llvm.amdgcn.s.buffer.load is readnone (hoisted out of a
+    # poll loop). The wait is the load's own result.
     return gl.inline_asm(
         "s_load_dword $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=&s,s,~{memory}",
         [word_ptr], gl.int32, is_pure=False,
@@ -183,6 +190,7 @@ def scalar_load_glc_i64(word_ptr):
 
     Counts in ``lgkmcnt``, like :func:`scalar_load_glc` (and likewise never
     shares registers with its address)."""
+    # asm: as scalar_load_glc.
     return gl.inline_asm(
         "s_load_dwordx2 $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=&s,s,~{memory}",
         [word_ptr], gl.int64, is_pure=False,
@@ -207,6 +215,8 @@ def scalar_tags16_differ(word_ptr, tag, GLC: gl.constexpr):
     so it never straddles a line); returns the OR of ``tag_i ^ tag`` (0: all
     16 match). ``GLC``: past the scalar cache (``glc``), or through it after
     ``s_dcache_inv``. Clobbers s[64:80]."""
+    # asm: as scalar_load_glc, for 16 tags in one s_load_dwordx16 compared
+    # in scalar registers.
     if GLC:
         return gl.inline_asm(
             _TAGS16_GLC, _TAGS16_CONSTRAINTS, [word_ptr, tag], gl.int32, is_pure=False
