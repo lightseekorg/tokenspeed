@@ -28,7 +28,7 @@ as `prepare_qwen4_exp_*` and `qwen4_exp_*_decode`.
   conv and SSM pages, the PLE pages, the paged KV cache, and the QSA indexer
   caches.
 - A verify writes TokenSpeed's verify buffers and no state page: the GDN and
-  PLE verify scratch rows, the ReplaySSM payload and `QSAVerifyState`.
+  PLE verify scratch rows, the ReplaySSM payload, and `QSAVerifyState`.
   TokenSpeed's post-verify commit then writes the accepted state.
 - An MTP draft step (one row per request, `draft` operand) writes the
   speculative index keys to the QSA indexer's draft scratch, not to the
@@ -44,16 +44,18 @@ as `prepare_qwen4_exp_*` and `qwen4_exp_*_decode`.
 ### Serving
 
 `python/tokenspeed/runtime/models/qwen4_exp_monokernel.py` is the runtime
-seam. The switch `--decode-monokernel` enables it.
+seam. With `--decode-monokernel`, `Qwen4ExpModel` builds its layers from the
+monokernel classes `Qwen4ExpMonokernelLinearDecoderLayer` and
+`Qwen4ExpMonokernelAttentionDecoderLayer`.
 
-- A layer is eligible when it has a sparse MoE with a shared expert, and no
-  attention TP or expert parallelism. The seam decides this once, at load,
-  and logs every other layer with its reasons. Startup fails when no layer
-  of the target model is eligible.
-- The seam packs each eligible layer after the weights load.
-- A forward uses the kernels when it is a decode step of at most 4 rows,
-  padded graph rows included. Each request has one token, or `k + 1` tokens of
-  a target verify with ReplaySSM. Other forwards use the regular path.
+- A layer can be packed when it has a sparse MoE with a shared expert, and
+  no attention TP or expert parallelism. The seam packs every layer once,
+  after the weights load. Startup fails when a layer cannot be packed, and
+  the error names each such layer with its reasons.
+- A layer runs its launch when the forward is a decode step of at most 4
+  rows, padded graph rows included. Each request has one token, or `k + 1`
+  tokens of a target verify with ReplaySSM. Other forwards run the regular
+  layer's code.
 - The MTP draft model's one QSA layer, with its final mixer, uses the same
   kernel for every draft step: the first step as a chain over one request's
   verified rows (a first step of several requests uses the regular path),
@@ -74,10 +76,10 @@ live row.
 | Stage | Module | Tasks | Base | Work |
 |---|---|---|---|---|
 | `p1` | `ple.py` | 200 | 0 | Hashes the token's n-gram ids, gathers the embedding row, and projects the PLE key and value (BF16 `kv_proj`). |
-| `p2` | `ple.py` | 40 per row | 96 | The gate, the Gemma norms and the dilated depthwise conv of 256 channels of one stream, in two passes. Writes the next conv state. |
+| `p2` | `ple.py` | 40 per row | 96 | The gate, the Gemma norms, and the dilated depthwise conv of 256 channels of one stream, in two passes. Writes the next conv state. |
 | `a1`, `m1`, `f1` | `hc.py` | 80 + 8 per row | 0, 0 (28 with `w1`), 57 | Mixer reduce: the per-stream Gemma norm and the low-rank down projection of 16 low-rank columns of one stream, for every row; or one row's inject logit of one stream half. |
 | `a2`, `m2`, `f2` | `hc.py` | 80 | 176, 176, 0 | Mixer mix: the up projection of 32 columns of each stream. Publishes the mixed row as BF16 (`m2` also as MXFP4, the experts' input). |
-| `b1` | `gdn.py` | 256 | 28 | 64 rows of `in_proj_qkvzba`. Tasks 0 to 159 also run the causal conv. Tasks 160 to 255 also compute one `in_proj_b` / `in_proj_a` logit each. |
+| `b1` | `gdn.py` | 256 | 0 | 64 rows of `in_proj_qkvzba`. Tasks 0 to 159 also run the causal conv. Tasks 160 to 255 also compute one `in_proj_b` / `in_proj_a` logit each. |
 | `b3` | `gdn.py` | 48 per row | 28 | The gated delta rule of one value head, then the gated RMS norm. Publishes the result as BF16. |
 | `q1` | `qsa.py` | 218 | 28 | 64 rows of `qkv_proj` or `index_qk_proj`. |
 | `q2` | `qsa.py` | 31 per row | 200 | Q and K norm and MRoPE, the KV cache write, the index q heads, and the index key with its block compression. |
@@ -108,8 +110,12 @@ it polls. Thus the weights of a stage stream while earlier stages compute, but
 only on CTAs that finished their earlier tasks. The bases follow from the
 timeline:
 
-- `b1` and `q1` start at CTA 28, on CTAs without a mixer task at one row.
-  Their weights stream from the start of the launch.
+- `q1` starts at CTA 28, on CTAs without a mixer task at one row. Its
+  weights stream from the start of the launch.
+- `b1` starts at CTA 0. Its z tasks, which also compute the `in_proj_b` /
+  `in_proj_a` logits and are the slowest, run in slots 80 to 175
+  (`Z_FIRST`), on the CTAs before A2's (base 176). So they start at the
+  launch or after A1, not after A2.
 - The CTAs without a mixer task wait for `HEAD_SLEEP` units at the start.
   Without this wait, their weight streams compete with the mixer's.
 - `m1` uses the CTAs of `a1`. The `a1` tasks end long before the MLP half
@@ -177,7 +183,7 @@ timeline:
   is about the same for one tile, and the merge polled 64 KiB a task
   (QSA layer 2 to 5 us slower at 4 rows).
 - `b3` runs the work of the tokens that does not need the state before the
-  token loop, for every token at once: the q and k norms, the gates and the
+  token loop, for every token at once: the q and k norms, the gates, and the
   replay payload stores. In the loop, each of the 8 waves repeated it for
   every token. The state layout has 8 lanes along K, so a token's two
   reductions over K take 3 cross-lane steps for 2 rows a thread (16 lanes:
@@ -258,7 +264,7 @@ dataclasses that the stages read (`DeltaLayerWeights`, `QsaLayerWeights`).
 
 | File | Contents |
 |---|---|
-| `layer.py` | The plans, the two layer kernels and their launchers. |
+| `layer.py` | The plans, the two layer kernels, and their launchers. |
 | `dims.py` | The dimensions that several modules use. |
 | `hc.py` | The hyper-connection mixer stages. |
 | `ple.py` | The PLE stages. |

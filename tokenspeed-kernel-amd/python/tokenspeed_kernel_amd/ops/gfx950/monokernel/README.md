@@ -144,7 +144,7 @@ earlier launch has a different tag.
 The launch's tag is `launch_tag(step, layer) = step * 64 + layer + 1`, modulo 2^32
 (`plan.py`), from a device step counter. The counter moves on once per
 forward, inside the CUDA graph: the forward's last launch moves it as its
-last CTA ends, and otherwise the runtime seam moves it after the layers.
+last CTA ends, and otherwise the last layer moves it after its launch.
 
 Memory rules on gfx950 (coarse-grained VRAM):
 

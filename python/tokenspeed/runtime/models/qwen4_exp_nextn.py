@@ -54,7 +54,10 @@ from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpModel,
     load_qwen4_exp_weights,
 )
-from tokenspeed.runtime.models.qwen4_exp_monokernel import enable_decode_monokernels
+from tokenspeed.runtime.models.qwen4_exp_monokernel import (
+    QSAMonokernelLayer,
+    enable_decode_monokernels,
+)
 from tokenspeed.runtime.utils import add_prefix
 
 
@@ -163,8 +166,23 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         return self._run_mlp(mixed, residuals, ctx)
 
 
+class Qwen4ExpMonokernelDraftAttentionDecoderLayer(
+    QSAMonokernelLayer, Qwen4ExpDraftAttentionDecoderLayer
+):
+    """The MTP draft's QSA layer whose decode steps run as one monokernel
+    launch."""
+
+
 class Qwen4ExpDraftModel(Qwen4ExpModel):
     ATTENTION_LAYER_CLS = Qwen4ExpDraftAttentionDecoderLayer
+    MONOKERNEL_ATTENTION_LAYER_CLS = Qwen4ExpMonokernelDraftAttentionDecoderLayer
+
+    def _decode_monokernel(self) -> bool:
+        # Draft steps that reuse the first step's top-k keep the regular
+        # layer: the monokernel selects its own top-k.
+        return super()._decode_monokernel() and not _mtp_index_sharing_enabled(
+            self.config
+        )
 
     def __init__(self, config, mapping, quant_config=None, prefix: str = ""):
         if config.num_hidden_layers != 1:
@@ -244,12 +262,9 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         return None
 
     def post_quant_warmup(self) -> None:
-        # The draft steps after the first are one-row decode steps of the
-        # draft layer, which the QSA monokernel serves. Steps that reuse the
-        # first step's top-k keep the regular path: the monokernel selects
-        # its own.
-        if not self.index_share_for_mtp_iteration:
-            enable_decode_monokernels(self.model, required=False)
+        # The draft layer is a monokernel layer unless the draft steps reuse
+        # the first step's top-k (Qwen4ExpDraftModel._decode_monokernel).
+        enable_decode_monokernels(self.model)
         if self.model.monokernels is not None and self._front_fusable():
             self.front_kernel = select_qwen4_exp_mtp_front(MTP_FRONT_ROWS)
 

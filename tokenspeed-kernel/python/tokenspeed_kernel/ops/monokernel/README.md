@@ -42,30 +42,26 @@ step's rows in one launch instead of six.
 
 ## How a model uses the ops
 
-A model calls the ops from its runtime seam,
-`python/tokenspeed/runtime/models/<model>_monokernel.py` (see
-`qwen4_exp_monokernel.py`). The decoder layer classes stay unchanged.
+A model calls the ops from its monokernel layer classes in its runtime
+seam, `python/tokenspeed/runtime/models/<model>_monokernel.py` (see
+`qwen4_exp_monokernel.py`).
 
-- **After loading.** With `--decode-monokernel`, the seam calls `prepare_*`
-  for each layer once the weights load and the quantization post-processing
-  gives their final layout (the model's `post_quant_warmup` hook, which the
-  model loader calls once). It also allocates the scratch buffer and the step
-  counter. It keeps the reasons of each layer that no kernel serves and logs
-  them at startup. Startup fails when no layer of the target model
-  qualifies, so the switch never serves silently without kernels. A
-  speculative draft model without such a layer keeps the regular path. The
+- **Building the layers.** With `--decode-monokernel`, the model's
+  `decoder_layer_cls` gives `get_layer` the monokernel class of each layer
+  type: a subclass of the regular layer class with the same parameters. The
   checkpoint architecture must be in `DECODE_MONOKERNEL_ARCHITECTURES` in
   `server_args.py`.
-- **Each forward.** The model asks the seam once for a step
-  (`plan(rows, ctx)`). The step is `None` when no kernel serves the forward
-  (prefill, or a row count or chain length past the kernels' plans). The
-  forward then runs the regular path.
-- **Each layer.** In the model's layer loop, `step.layer(i)` gives the launch
-  that replaces layer `i`, or `None`. With `None`, the loop runs the regular
-  layer. A launch takes and returns the same tensors as the regular layer, so
-  fused and regular layers mix in one step.
-- **After the layers.** If no launch moved the step counter on,
-  `step.finish()` does.
+- **After loading.** The seam calls `prepare_*` for each layer once the
+  weights load and the quantization post-processing gives their final layout
+  (the model's `post_quant_warmup` hook, which the model loader calls once).
+  It also allocates the scratch buffer and the step counter, which all the
+  layers share. Startup fails when a layer cannot be packed, and the error
+  names each such layer with its reasons.
+- **Each layer.** A monokernel layer's `forward` runs a decode step that the
+  kernels' plans serve as one launch. Every other forward (prefill, or a row
+  count or chain length past the kernels' plans) runs the regular layer's
+  code. A launch takes and returns the same tensors as the regular layer.
+- **After the layers.** The last layer's launch moves the step counter on.
 
 ## Adding a model
 
@@ -81,8 +77,8 @@ A model calls the ops from its runtime seam,
    model's README.
 3. **Register the ops** in this package. `gluon.py` registers the gfx950
    kernels, and `__init__.py` holds the public functions.
-4. **Add the runtime seam** as in "How a model uses the ops". Pass the
-   per-step operands by name.
+4. **Add the monokernel layer classes** as in "How a model uses the ops".
+   Pass the per-step operands by name.
 
 ## Tests
 

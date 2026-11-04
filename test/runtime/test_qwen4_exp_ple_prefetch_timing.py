@@ -46,6 +46,9 @@ class _RecordingLayer(torch.nn.Module):
         self.events = events
         self.comm_manager = SimpleNamespace(needs_final_all_gather=lambda: False)
 
+    def prefetches_ple(self, rows: int, ctx: object) -> bool:
+        return self.ple is not None
+
     def forward(self, positions, hidden_states, residual, ctx, input_ids):
         self.events.append(("layer", self.layer_id, ctx))
         return hidden_states, residual

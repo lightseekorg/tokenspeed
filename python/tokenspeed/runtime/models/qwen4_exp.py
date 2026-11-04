@@ -76,13 +76,15 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (
-    MonokernelStep,
+    DeltaMonokernelLayer,
+    QSAMonokernelLayer,
     Qwen4ExpMonokernels,
     enable_decode_monokernels,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +181,11 @@ class _Qwen4ExpDecoderMixin:
     @staticmethod
     def _uses_attention_output_gate(config: Qwen4ExpTextConfig) -> bool:
         return True
+
+    def prefetches_ple(self, rows: int, ctx: ForwardContext) -> bool:
+        """Whether the model starts this layer's PLE lookup before the layer
+        runs: whenever the layer has a PLE block."""
+        return self.ple is not None
 
     def _init_qwen4_exp_extensions(
         self,
@@ -511,11 +518,38 @@ class Qwen4ExpAttentionDecoderLayer(
         return self._run_mlp(mixed, residuals, ctx)
 
 
+class Qwen4ExpMonokernelLinearDecoderLayer(
+    DeltaMonokernelLayer, Qwen4ExpLinearDecoderLayer
+):
+    """Qwen4-Exp GDN layer whose decode steps run as one monokernel launch."""
+
+
+class Qwen4ExpMonokernelAttentionDecoderLayer(
+    QSAMonokernelLayer, Qwen4ExpAttentionDecoderLayer
+):
+    """Qwen4-Exp QSA layer whose decode steps run as one monokernel launch."""
+
+
 class Qwen4ExpModel(Qwen3_5ForCausalLM):
     """Qwen4-Exp decoder backbone returning logits-width and HC-width states."""
 
     ATTENTION_LAYER_CLS = Qwen4ExpAttentionDecoderLayer
     LINEAR_LAYER_CLS = Qwen4ExpLinearDecoderLayer
+    # The layer classes with --decode-monokernel.
+    MONOKERNEL_ATTENTION_LAYER_CLS = Qwen4ExpMonokernelAttentionDecoderLayer
+    MONOKERNEL_LINEAR_LAYER_CLS = Qwen4ExpMonokernelLinearDecoderLayer
+
+    def decoder_layer_cls(self, layer_type: str) -> type:
+        if not self._decode_monokernel():
+            return super().decoder_layer_cls(layer_type)
+        return {
+            "attention": self.MONOKERNEL_ATTENTION_LAYER_CLS,
+            "linear_attention": self.MONOKERNEL_LINEAR_LAYER_CLS,
+        }[layer_type]
+
+    def _decode_monokernel(self) -> bool:
+        """Whether the layers are the monokernel classes."""
+        return global_server_args_dict["decode_monokernel"]
 
     def __init__(
         self,
@@ -535,21 +569,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
-        # The decode monokernels (--decode-monokernel), packed after loading
-        # by enable_decode_monokernels. None runs every step on the regular
-        # path.
+        # The packed monokernels of the monokernel layers, set after loading
+        # by enable_decode_monokernels. None with the regular layers.
         self.monokernels: Qwen4ExpMonokernels | None = None
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
             if getattr(layer, "indexer", None) is not None
         )
-
-    @staticmethod
-    def _prefetches_ple(layer, layer_id: int, step: MonokernelStep | None) -> bool:
-        """Whether ``layer`` has a PLE block whose lookup TokenSpeed runs; a
-        decode monokernel does its own lookup."""
-        return layer.ple is not None and (step is None or step.layer(layer_id) is None)
 
     def _start_ple_prefetch(
         self, ple: Qwen4ExpPLELayer, input_ids: torch.Tensor, ctx: ForwardContext
@@ -574,23 +601,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
-        # Decode monokernels: a plan for this forward, or None for the
-        # regular path. A planned layer runs as one launch (step.layer).
-        step = (
-            None
-            if self.monokernels is None
-            else self.monokernels.plan(hidden_states.shape[0], ctx)
-        )
-        if self.layers and self._prefetches_ple(self.layers[0], 0, step):
+        rows = hidden_states.shape[0]
+        if self.layers and self.layers[0].prefetches_ple(rows, ctx):
             self._start_ple_prefetch(self.layers[0].ple, input_ids, ctx)
         residual = None
         for layer_id, layer in enumerate(self.layers):
             if layer_id + 1 < len(self.layers):
                 next_layer = self.layers[layer_id + 1]
-                if self._prefetches_ple(next_layer, layer_id + 1, step):
+                if next_layer.prefetches_ple(rows, ctx):
                     self._start_ple_prefetch(next_layer.ple, input_ids, ctx)
-            launch = None if step is None else step.layer(layer_id)
-            hidden_states, residual = (launch or layer)(
+            hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
@@ -613,11 +633,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ].repeat(1, self.config.hc_count)
                 hidden_states.add_(deepstack)
 
-        if step is not None:
-            if step.lm_head_input is not None:
+        if self.monokernels is not None:
+            lm_head_input = self.monokernels.take_lm_head_input()
+            if lm_head_input is not None:
                 # The last layer's launch also ran the final mixer.
-                return step.lm_head_input, [hidden_states]
-            step.finish()
+                return lm_head_input, [hidden_states]
         if self.layers and self.layers[-1].comm_manager.needs_final_all_gather():
             if residual is not None:
                 hidden_states = self.layers[-1].mlp_hyper_connection.combine(
@@ -837,7 +857,7 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
         )
 
     def post_quant_warmup(self) -> None:
-        enable_decode_monokernels(self.model, required=True)
+        enable_decode_monokernels(self.model)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -886,7 +906,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         )
 
     def post_quant_warmup(self) -> None:
-        enable_decode_monokernels(self.model, required=True)
+        enable_decode_monokernels(self.model)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

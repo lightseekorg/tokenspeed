@@ -14,7 +14,7 @@ while earlier stages still compute.
 |---|---|---|
 | Kernel boundary | [`tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/`](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md) | The ops that a model calls: `prepare_*` and `*_decode`, through `select_kernel`. `prepare_*` packs a layer once after loading and returns `None` when no kernel serves the layer. The README gives the API, the steps to add a model and links to each vendor's README. |
 | Vendor kernels | The vendor's kernel package, under `ops/<arch>/monokernel/` | The building blocks that every model's kernels share (plans, mailboxes, GEMVs, trace), and one directory for each model's stages and layer kernels. Its README describes the files, the rules for writing a stage and the performance workflow. |
-| Runtime seam | `python/tokenspeed/runtime/models/<model>_monokernel.py` | Eligibility with reasons, packing from the model's modules, the step counter, and one plan for each forward. |
+| Runtime seam | `python/tokenspeed/runtime/models/<model>_monokernel.py` | The monokernel layer classes (subclasses of the regular layers), packing from the model's modules with the reasons of a layer that cannot be packed, and the step counter. |
 
 ## Invariants
 
@@ -40,15 +40,17 @@ split boundaries of a split softmax, so results are not bitwise equal. Tests
 compare each stage with a torch reference of TokenSpeed's math, with tight
 tolerances per stage and looser ones per layer.
 
-**One switch, one plan per forward.** `--decode-monokernel` is the one
-switch for every model. Startup fails when the checkpoint's architecture has
+**One switch, monokernel layer classes.** `--decode-monokernel` is the one
+switch for every model. With it, the model's `get_layer` builds each decoder
+layer from its monokernel class (`decoder_layer_cls`), a subclass of the
+regular layer class with the same parameters, so weight loading and cache
+planning do not change. A monokernel layer runs a decode step that its plans
+serve as one launch, and every other forward (prefill, larger steps) with the
+regular layer's code. Startup fails when the checkpoint's architecture has
 no monokernel (`DECODE_MONOKERNEL_ARCHITECTURES` in `server_args.py`), or
-when no layer of the target model qualifies. A layer that does not qualify
-keeps the regular path, and startup logs it with the reasons. The switch
-never serves silently without kernels. The model asks the seam once per
-forward for a step plan, or None for the regular path. Its layer loop then
-runs the step's fused layer `i` in place of layer `i` where the step has one.
-The decoder layer classes have no monokernel code.
+when a layer cannot be packed after loading. The switch never serves a layer
+without its kernel. The model's layer loop is the same with and without the
+switch.
 
 **Deadlock freedom comes from the plan.** Each stage reads only regions that
 an earlier stage writes, and the plan checks this when it is constructed.
