@@ -22,9 +22,10 @@
 
 Wraps NCCL and optional low-latency GPU backends. CUDA IPC and symmetric-memory
 backends are only selected for node-local groups; groups spanning nodes fall
-back to NCCL, except for the Iris all-reduce on gfx1250, which maps a world in
-one fabric domain. ``AutoBackend.route`` is the one place that decides which
-implementation serves a collective; every public method asks it first.
+back to NCCL, except for the Iris all-reduce and hidden-dimension gather on
+gfx1250, which maps a world in one fabric domain. ``AutoBackend.route`` is the
+one place that decides which implementation serves a collective; every public
+method asks it first.
 """
 
 import enum
@@ -110,8 +111,9 @@ class Route(enum.Enum):
     # Symmetric-memory multicast: multicast stores for the gathers, the
     # in-switch reduction for the token reduce-scatter (performance only).
     MULTIMEM = "multimem"
-    # The all-reduce's performance tiers (trtllm / Iris / NCCL), outside
-    # any numerics contract.
+    # Performance tiers outside any numerics contract: the all-reduce's
+    # (trtllm / Iris / NCCL), and the hidden-dimension gather's (Iris / NCCL)
+    # over hosts Iris maps but multicast cannot reach.
     TIERED = "tiered"
 
 
@@ -317,6 +319,9 @@ class AutoBackend(CommBackend):
            reduce-scatter take the multicast kernels where multicast reaches
            (the RSAG backend itself falls back to NCCL past its capacity),
            the plain reduce-scatter NCCL, the all-reduce its tiered dispatch.
+           A gather over gfx1250 hosts that one Iris heap maps, where
+           multicast cannot reach, takes the tiered route: Iris's
+           hidden-dimension gather where it serves the shape, NCCL otherwise.
 
         Gathers are pure data movement, so the envelope leaves them to the
         performance default.
@@ -329,7 +334,15 @@ class AutoBackend(CommBackend):
             return Route.TIERED
         if collective is Collective.REDUCE_SCATTER:
             return Route.NCCL
-        return Route.MULTIMEM if self._multicast_reachable(group) else Route.NCCL
+        if self._multicast_reachable(group):
+            return Route.MULTIMEM
+        if (
+            collective is Collective.ALL_GATHER
+            and self._group_spans_nodes(group)
+            and self._iris_reaches(group)
+        ):
+            return Route.TIERED
+        return Route.NCCL
 
     # ---- Token-aware ops ----
 
@@ -361,14 +374,11 @@ class AutoBackend(CommBackend):
     # ---- Public CommBackend interface ----
 
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
-        # Unlike the all-reduce gates, gathers keep spanning groups on NCCL even
-        # where Iris maps other nodes: the column gather is unvalidated across
-        # the gfx1250 fabric.
         if (
             not (current_platform().is_cdna4 or current_platform().is_cdna5)
             or len(group) not in (4, 8)
             or self._force_deterministic_rsag()
-            or self._group_spans_nodes(group)
+            or not self._iris_reaches(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return None
@@ -591,24 +601,24 @@ class AutoBackend(CommBackend):
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:
+        route = self.route(Collective.ALL_GATHER, tensor, group)
         if (
-            self.route(Collective.ALL_GATHER, tensor, group) is Route.MULTIMEM
+            route is not Route.NCCL
             and tensor.dim() == 2
             and dim in (-1, tensor.dim() - 1)
         ):
-            # Spanning groups stay off Iris here too; see get_prepared_all_gather.
             if (
                 (current_platform().is_cdna4 or current_platform().is_cdna5)
-                and not self._group_spans_nodes(group)
                 and self._iris_reaches(group)
                 and not self._trtllm_ar.has_trtllm_ar(group)
             ):
                 return self._iris.all_gather(tensor, group, dim)
-            # Small rows ride the all-reduce workspace's barrier-free exchange.
-            gathered = self._trtllm_ar.lamport_all_gather(tensor, group)
-            if gathered is not None:
-                return gathered
-            return self._rsag.all_gather(tensor, group, dim)
+            if route is Route.MULTIMEM:
+                # Small rows ride the all-reduce workspace's barrier-free exchange.
+                gathered = self._trtllm_ar.lamport_all_gather(tensor, group)
+                if gathered is not None:
+                    return gathered
+                return self._rsag.all_gather(tensor, group, dim)
         return self._nccl.all_gather(tensor, group, dim)
 
     def all_gather_single(

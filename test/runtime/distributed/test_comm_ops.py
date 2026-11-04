@@ -313,6 +313,53 @@ class TestAutoBackendTopology:
             backend.acquire_all_reduce_outputs(((1,),), like, group) == "iris"
         ) is acquires
 
+    @pytest.mark.parametrize(
+        ("cdna5", "maps_world", "group", "route"),
+        [
+            (True, True, tuple(range(8)), "tiered"),
+            (True, False, tuple(range(8)), "nccl"),
+            (False, True, tuple(range(8)), "nccl"),
+            (True, True, (0, 1, 2, 3), "multimem"),
+        ],
+        ids=[
+            "gfx1250-mapped-world",
+            "gfx1250-unmapped-world",
+            "gfx950-across-nodes",
+            "node-local",
+        ],
+    )
+    def test_hidden_gathers_take_iris_where_the_heap_maps_the_group(
+        self, backend, monkeypatch, cdna5, maps_world, group, route
+    ):
+        """Iris serves only the hidden-dimension gather over hosts multicast
+        cannot reach; every other gather there stays on NCCL."""
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto
+
+        monkeypatch.setattr(
+            auto,
+            "current_platform",
+            lambda: SimpleNamespace(is_amd=True, is_cdna4=not cdna5, is_cdna5=cdna5),
+        )
+        # The verdict needs a process group spanning real hosts.
+        monkeypatch.setattr(backend, "_iris_maps_world", lambda: maps_world)
+        self._set_fabric(monkeypatch, False)
+        backend._iris.all_gather.return_value = "iris"
+        backend._nccl.all_gather.return_value = "nccl"
+        rows = torch.empty(4, 32, dtype=torch.bfloat16)
+        iris = route in ("tiered", "multimem")
+
+        assert backend.route(auto.Collective.ALL_GATHER, rows, group).value == route
+        assert backend.all_gather(rows, group, -1) == ("iris" if iris else "nccl")
+        prepared = backend.get_prepared_all_gather(group, torch.bfloat16)
+        assert (prepared is backend._iris.get_prepared_all_gather.return_value) is iris
+        if route != "multimem":
+            assert backend.all_gather(rows, group, 0) == "nccl"
+            assert (
+                backend.route(auto.Collective.TOKEN_ALL_GATHER, rows, group)
+                is auto.Route.NCCL
+            )
+            backend._rsag.all_gather.assert_not_called()
+
     def test_routing_off_amd_leaves_the_iris_module_unloaded(
         self, backend, monkeypatch
     ):
