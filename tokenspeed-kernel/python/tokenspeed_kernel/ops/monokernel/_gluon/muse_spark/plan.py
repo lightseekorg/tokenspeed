@@ -85,9 +85,9 @@ _LANDED = "landed"
 # Two-copy cross-GPU receive areas and the local attention output area
 # (``att_box``): re-armed by the o_proj senders at entry. Tagged words
 # (``S``: the routed sums): never cleared.
-_CLEARED = ("att_box", "AR", "POOLED_AG", "ROUTE_PUSH_own", "routes", "POST_AG")
+_CLEARED = ("att_box", "AR", "POOLED_AG", "route_push_own", "routes", "POST_AG")
 _TAGGED = ("att_rec", "ar_sums", "router", "pooler", "exchange", "routed_sum", "hprime",
-           "reducer_in", "POST_AG_sums", "qkv")  # fmt: skip
+           "reducer_in", "post_ag_sums", "qkv")  # fmt: skip
 REGIONS = tuple(Region(name, 2, REGION_ROWS) for name in _CLEARED) + tuple(
     Region(name, 1, REGION_ROWS) for name in _TAGGED
 )
@@ -131,7 +131,7 @@ def expected_counts(key: PlanKey) -> dict[str, tuple[int, ...]]:
     return counts
 
 
-def _front(key: PlanKey, xcd: int, slot: int) -> list:
+def _pre_moe(key: PlanKey, xcd: int, slot: int) -> list:
     requests = key.requests
     rows = requests * ROWS_PER_REQUEST
     full = key.layer_kind == "full"
@@ -249,7 +249,7 @@ def _moe(key: PlanKey, xcd: int, slot: int) -> list:
     ]
 
 
-def _tail(key: PlanKey, xcd: int, slot: int) -> list:
+def _post_moe(key: PlanKey, xcd: int, slot: int) -> list:
     requests = key.requests
     rows = requests * ROWS_PER_REQUEST
     regular = key.next_kind == "regular"
@@ -343,7 +343,9 @@ def muse_plan(key: PlanKey) -> LayerPlan:
     for xcd in range(XCDS):
         for slot in range(SLOTS):
             steps = (
-                _front(key, xcd, slot) + _moe(key, xcd, slot) + _tail(key, xcd, slot)
+                _pre_moe(key, xcd, slot)
+                + _moe(key, xcd, slot)
+                + _post_moe(key, xcd, slot)
             )
             programs[(xcd, slot)] = tuple(steps)
     return LayerPlan(
