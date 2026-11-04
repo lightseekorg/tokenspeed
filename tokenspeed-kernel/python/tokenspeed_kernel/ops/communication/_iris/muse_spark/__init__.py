@@ -456,7 +456,7 @@ class MuseIrisState:
         self.attntail_sums_peers = None
         self.attention_box = None
         self.attntail_epochs = None
-        self.attntail_counters = None
+        self.attntail_records = None
         if self._attntail_supported(self.world_size, enable_lamport):
             region_shape, sums_shape = (
                 shape for shape, _ in self._attntail_buffers(self.world_size)
@@ -486,9 +486,11 @@ class MuseIrisState:
             self.attntail_epochs = torch.zeros(
                 _MUSE_ATTNTAIL_PROGRAMS, dtype=torch.int32, device=peers.device
             )
-            # Split arrival counters, reset by each row block's merging split.
-            self.attntail_counters = torch.zeros(
-                _MUSE_ATTNTAIL_MAX_ROWS // 8 * 2, dtype=torch.int32, device=peers.device
+            # One record per attention split (at most one per workgroup),
+            # tagged with the launch's epoch + 1; zero, as the epochs start,
+            # matches no launch's tag.
+            self.attntail_records = torch.zeros(
+                _MUSE_ATTNTAIL_PROGRAMS, dtype=torch.int32, device=peers.device
             )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1518,7 +1520,7 @@ class MuseIrisState:
             cache_seqlens,
             mid_o,
             mid_lse,
-            self.attntail_counters,
+            self.attntail_records,
             gate,
             gate.stride(0),
             weight,
