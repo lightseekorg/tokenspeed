@@ -43,6 +43,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
     ERROR_RECORD,
     ERROR_WORDS,
     Launch,
+    persistent_compile_options,
 )
 
 _ABORT = gl.constexpr(ERROR_ABORT)
@@ -132,6 +133,7 @@ def _reduce(region, epochs, row, deadline_ticks, release):
         MAX_ELEMENTS=_MAX,
         RELEASE=release,
         num_warps=16,
+        **persistent_compile_options(),
     )
     torch.cuda.synchronize()
     return out, int(error[ERROR_RECORD].item())

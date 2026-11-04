@@ -38,6 +38,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (  # noqa: E4
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
     ERROR_ABORT,
     Launch,
+    persistent_compile_options,
 )
 
 _ABORT = gl.constexpr(ERROR_ABORT)
@@ -92,7 +93,16 @@ def _read(partials, rows, n, tag, deadline_ticks):
     y = torch.empty(rows, n, dtype=torch.bfloat16, device="cuda")
     error = torch.zeros(64, dtype=torch.int32, device="cuda")
     _reader_kernel[(rows, (n + 1023) // 1024)](
-        partials, y, error, rows, tag, deadline_ticks, N=n, BLOCK=1024, num_warps=8
+        partials,
+        y,
+        error,
+        rows,
+        tag,
+        deadline_ticks,
+        N=n,
+        BLOCK=1024,
+        num_warps=8,
+        **persistent_compile_options(),
     )
     torch.cuda.synchronize()
     return y, int(error[8])
