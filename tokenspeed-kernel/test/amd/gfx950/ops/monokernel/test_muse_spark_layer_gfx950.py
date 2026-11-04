@@ -201,7 +201,7 @@ def _worker(rank, port, record_dir, errors):
             dist.destroy_process_group()
 
 
-def test_fused_layer_matches_the_regular_layer(tmp_path):
+def test_monokernel_matches_the_regular_layer(tmp_path):
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]

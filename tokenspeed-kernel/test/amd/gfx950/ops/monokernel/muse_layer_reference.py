@@ -120,7 +120,7 @@ def run_fused(fused, key, inputs, residual):
 
 
 def attention_reference(inputs):
-    """Today's decode of the step's rows over the FP8 cache (the registered
+    """The regular decode of the step's rows over the FP8 cache (the registered
     kernel the MHA backend calls, with the forward's split schedule on full
     layers): [rows, Q_WIDTH] BF16."""
     q, _ = inputs["prepared_query"]
@@ -137,7 +137,7 @@ def attention_reference(inputs):
 
 
 def _direct_decode(xq, xs, experts, ids):
-    """Today's MXFP4 decode stages on this rank's expert slices."""
+    """The regular MXFP4 decode stages on this rank's expert slices."""
     rows = ids.shape[0]
     w13 = _extract_gluon_raw_w(experts.w13_weight_triton_tensor)
     w13_scale = _extract_gluon_raw_s(experts.w13_precision_config.b_mx_scale)

@@ -154,7 +154,7 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
     ), "every split's partial load is issued before the first wait"
 
 
-def test_spread_merge_issues_its_rows_partials_before_the_fold():
+def test_balanced_row_merge_issues_its_partials_before_the_fold():
     """In the spread merge each split reads only its share of the rows: after
     the record poll, every split's partial and LSE loads for those rows
     (``sc0 nt``) issue back to back before the first wait, with no full drain

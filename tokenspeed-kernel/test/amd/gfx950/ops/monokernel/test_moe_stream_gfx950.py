@@ -35,7 +35,7 @@ from test_moe_stream_plan import RECORDED_ROUTINGS
 from utils import is_cdna4
 
 if not is_cdna4():
-    pytest.skip("The native MoE stream targets gfx950", allow_module_level=True)
+    pytest.skip("The monokernel MoE stream targets gfx950", allow_module_level=True)
 
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (  # noqa: E402
     invoke_stage1_mxfp4_mfma_decode_gluon,

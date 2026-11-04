@@ -86,7 +86,7 @@ def test_a_merge_task_on_a_weight_holding_slot_is_rejected():
         check_plan(plan)
 
 
-def test_the_v01_role_map_with_56_route_owner_is_rejected():
+def test_seven_route_owners_per_xcd_are_rejected():
     """The role table needs route owners on 8 slots per XCD; a plan with
     only 7 per XCD (56 in all) leaves routes without an owner."""
     plan = muse_plan(_KEY)
@@ -150,7 +150,7 @@ def test_router_weights_at_entry_would_queue_the_owner_poll():
         check_plan(_edit(plan, (3, 0), router_at_entry))
 
 
-def test_tail_workgroups_push_every_route_ag_before_waiting_on_one():
+def test_post_moe_workgroups_push_every_completed_route_before_waiting():
     """At 16 rows a post-MoE workgroup completes two routes: it pushes both
     completed routes to every rank before it waits on either, so the second
     push does not wait for the first route's whole exchange."""

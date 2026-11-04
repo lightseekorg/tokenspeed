@@ -363,7 +363,7 @@ def _layer_hops_kernel(heaps, rank, box, ar, ar_sums, pooled_ag, route_push_own,
         "reducer",
     ],
 )
-def test_fused_layer_hop_compiles_at_8_waves(role):
+def test_every_exchange_end_compiles_at_8_waves(role):
     """Every hop end of the monokernel compiles at 8 waves, with no L2
     invalidate or write-back, no scratch, and system-scope peer stores."""
     signature = dict(
