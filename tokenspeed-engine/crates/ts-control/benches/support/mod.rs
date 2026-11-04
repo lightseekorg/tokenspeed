@@ -238,7 +238,8 @@ pub fn admit_one(
     processor: &mut OutputProcessor,
 ) -> RequestSpec {
     match ingress::admit(request, &limits(config)).expect("request has a rid") {
-        Admitted::Run(admission) => {
+        Admitted::Run(mut admission) => {
+            processor.assign_admission(&mut admission.state);
             processor.register(admission.rid, admission.state);
             admission.spec
         }

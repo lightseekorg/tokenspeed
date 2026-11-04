@@ -20,6 +20,29 @@ path nothing exercised routinely.
 
 ## Invariants
 
+### Slot state belongs to an admission
+
+Persistent request-pool rows are reused across requests. Before a forward,
+outside graph capture/replay, the executor binds stop criteria and prepares
+sampling with the admission identities carried by `PlannedForward`. A new
+admission initializes its rows even when the external request ID and pool
+index equal a previous request's. Later steps of the same admission preserve
+sampling counts and RNG state; the identity never changes the request's seed.
+The host record fixes stop criteria for the lifetime of an admission, so
+stop binding uses that identity without a second key containing the criteria.
+A later request reusing the public RID still receives a new identity.
+
+A retraction keeps the admission identity. A sampler snapshot records whether
+that admission prepared the slot: an image taken before the first local
+prepare contains no previous occupant's payload. Restoring a prepared image
+claims the destination for that admission, preserving its next sampling step;
+an unprepared image requires initialization on first use. RuntimeStates
+restores its running rows but invalidates its stop-binding owner. The next
+forward rebinds the host's canonical stop criteria without clearing restored
+cache lengths, candidates or stop flags. This also covers a remote landing
+imaged before its first stop binding. Stores, restores and binding retain the
+existing execution-stream dependencies; identity checks do not replace fences.
+
 ### One decode metadata path
 
 `AttentionBackend.refresh_decode_metadata(bs, actual_bs, req_pool_indices,

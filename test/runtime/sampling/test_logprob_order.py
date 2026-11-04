@@ -147,7 +147,7 @@ def test_flashinfer_backend_reports_blockwise_logprobs(monkeypatch, order, block
         sp.resolve_seed(rid)
         sp.normalize(None)
         params.append(sp)
-    backend.prepare_step(["a", "b"], [1, 2], params)
+    backend.prepare_step([1, 2], [1, 2], params)
     logits = _logits(2)
     output = LogitsProcessorOutput(next_token_logits=logits)
     sampled, _ = backend.sample(

@@ -115,7 +115,7 @@ def _sp(rid: str, vocab: int = VOCAB, **overrides) -> SamplingParams:
 def _prepare(backend: SonicSamplingBackend, sps: list[SamplingParams]) -> torch.Tensor:
     slots = list(range(1, len(sps) + 1))
     backend.prepare_step(
-        request_ids=[f"rid_{sp.seed}_{i}" for i, sp in enumerate(sps)],
+        admission_ids=list(range(1, len(sps) + 1)),
         request_pool_indices=slots,
         sampling_params_list=sps,
         num_tokens_per_req=N,

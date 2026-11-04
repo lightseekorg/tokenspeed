@@ -78,38 +78,36 @@ def test_route_tracks_membership_changes():
     top_k_10 = SamplingParams(top_k=10, seed=0)
 
     # Steady batch: nothing filtering -> no-filter route, whole-vocab pad.
-    backend.prepare_step(["a"], [1], [no_filter])
+    backend.prepare_step([1], [1], [no_filter])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER
     assert backend._top_k_top_p_pad == _TOP_K_TOP_P_PAD
 
     # Same membership again: the cache still serves the same route.
-    backend.prepare_step(["a"], [1], [no_filter])
+    backend.prepare_step([1], [1], [no_filter])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER
     assert backend._route_cache_epoch == backend._batch_composition_epoch
 
     # A finite top_k joins (a flip): the mix is no longer uniform, and the
     # pad tightens to the 64 bucket.
-    backend.prepare_step(["a", "b"], [1, 2], [no_filter, top_k_10])
+    backend.prepare_step([1, 2], [1, 2], [no_filter, top_k_10])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_GENERIC
     assert backend._top_k_top_p_pad == 64
 
     # The top_k request retracts: no slot flips, only the size changed, and
     # the route must not keep what the departed request forced.
-    backend.prepare_step(["a"], [1], [no_filter])
+    backend.prepare_step([1], [1], [no_filter])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER
     assert backend._top_k_top_p_pad == _TOP_K_TOP_P_PAD
 
     # An all-finite batch of small top_ks routes to top_k.
-    backend.prepare_step(
-        ["b", "c"], [2, 3], [top_k_10, SamplingParams(top_k=20, seed=0)]
-    )
+    backend.prepare_step([2, 3], [2, 3], [top_k_10, SamplingParams(top_k=20, seed=0)])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_K
     assert backend._top_k_top_p_pad == 64
 
 
 def test_prepare_step_wins_over_the_capture_route():
     backend = _backend()
-    backend.prepare_step(["a"], [1], [SamplingParams(seed=0)])
+    backend.prepare_step([1], [1], [SamplingParams(seed=0)])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER
 
     # Capture resets the route directly (outside prepare_step).
@@ -118,5 +116,5 @@ def test_prepare_step_wins_over_the_capture_route():
 
     # The next real step restores the batch's route even though membership
     # did not move: capture must not leak past the cache restore.
-    backend.prepare_step(["a"], [1], [SamplingParams(seed=0)])
+    backend.prepare_step([1], [1], [SamplingParams(seed=0)])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER

@@ -578,9 +578,7 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
         and the tokens the round keeps."""
         nonlocal consumed
         slot = batch.request_pool_indices[0]
-        runtime.bind_stop_criteria(
-            batch.request_ids, batch.request_pool_indices, [criteria]
-        )
+        runtime.bind_stop_criteria([1], batch.request_pool_indices, [criteria])
         if overlap:
             tables = _masked_tables(runtime, tables, slot)
         actual.metadata(

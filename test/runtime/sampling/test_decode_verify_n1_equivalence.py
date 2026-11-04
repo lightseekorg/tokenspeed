@@ -80,7 +80,7 @@ def _sp(rid: str, greedy: bool) -> SamplingParams:
 def _prepare(backend, bs: int, greedy: bool):
     rids = [f"n1_{i}" for i in range(bs)]
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=list(range(1, len(rids) + 1)),
         request_pool_indices=list(range(bs)),
         sampling_params_list=[_sp(r, greedy) for r in rids],
         num_tokens_per_req=1,

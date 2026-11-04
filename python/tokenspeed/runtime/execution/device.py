@@ -673,6 +673,7 @@ class DeviceHandle:
                 input_logprob_plan=planned.input_logprob_plan,
                 sampled_top_k=planned.sampled_top_k,
                 stop_criteria=planned.stop_criteria,
+                admission_ids=planned.admission_ids,
             )
 
     def poll_cache_results(self) -> list:

@@ -115,7 +115,10 @@ def _backend() -> TritonSamplingBackend:
     return TritonSamplingBackend(_config())
 
 
-def _prepare(backend, top_k, top_p, num_tokens_per_req, rid="r") -> torch.Tensor:
+def _prepare(
+    backend, top_k, top_p, num_tokens_per_req, rid="r", *, admission_start: int
+) -> torch.Tensor:
+    admission_ids = list(range(admission_start, admission_start + BS))
     rids = [f"{rid}{i}" for i in range(BS)]
     params = []
     for rid, k, p in zip(rids, top_k, top_p):
@@ -125,7 +128,7 @@ def _prepare(backend, top_k, top_p, num_tokens_per_req, rid="r") -> torch.Tensor
         params.append(sp)
     pool_indices = [2, 5, 7]
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=admission_ids,
         request_pool_indices=pool_indices,
         sampling_params_list=params,
         num_tokens_per_req=num_tokens_per_req,
@@ -247,7 +250,7 @@ def test_verify_on_shards_matches_whole_rows(
         LogitsProcessorOutput(next_token_logits=None, vocab_shard=group.shard(5)),
     ):
         backend = _backend()
-        req_pool_indices = _prepare(backend, top_k, top_p, N)
+        req_pool_indices = _prepare(backend, top_k, top_p, N, admission_start=1)
         q = _draft_q(group, req_pool_indices) if with_q else None
         candidates = _candidates(_draft_q(group, req_pool_indices), req_pool_indices)
         predict, accept_length = backend.verify(
@@ -275,7 +278,9 @@ def test_sample_on_shards_matches_whole_rows(monkeypatch, masked) -> None:
         LogitsProcessorOutput(next_token_logits=None, vocab_shard=group.shard(2)),
     ):
         backend = _backend()
-        req_pool_indices = _prepare(backend, [64, 7, 128], [1.0, 0.9, 1.0], 1)
+        req_pool_indices = _prepare(
+            backend, [64, 7, 128], [1.0, 0.9, 1.0], 1, admission_start=1
+        )
         sampled, _ = backend.sample(
             logits_output, _info(req_pool_indices, group.mask, None)
         )
@@ -295,7 +300,7 @@ def test_other_routes_gather_whole_rows(monkeypatch) -> None:
 
     shard = dataclasses.replace(group.shard(0), gather_full=gather_full)
     backend = _backend()
-    req_pool_indices = _prepare(backend, [-1] * BS, [1.0] * BS, 1)
+    req_pool_indices = _prepare(backend, [-1] * BS, [1.0] * BS, 1, admission_start=1)
     sampled, _ = backend.sample(
         LogitsProcessorOutput(next_token_logits=None, vocab_shard=shard),
         _info(req_pool_indices, None, None),
@@ -387,7 +392,15 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
             for masked in (False, True):
                 # New requests each time, so the backend picks the count again.
                 rid = f"s{step}m{int(masked)}r"
-                req_pool_indices = _prepare(backend, top_k, [0.9, 1.0, 1.0], 1, rid)
+                admission_start = 1 + (2 * step + int(masked)) * BS
+                req_pool_indices = _prepare(
+                    backend,
+                    top_k,
+                    [0.9, 1.0, 1.0],
+                    1,
+                    rid,
+                    admission_start=admission_start,
+                )
                 info = _info(req_pool_indices, mask[:BS] if masked else None, None)
                 info.vocab_size = vocab
                 sampled, _ = backend.sample(
@@ -397,7 +410,14 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
                     info,
                 )
                 assert bool(((sampled >= 0) & (sampled < vocab)).all())
-                req_pool_indices = _prepare(backend, top_k, [0.9, 1.0, 1.0], N, rid)
+                req_pool_indices = _prepare(
+                    backend,
+                    top_k,
+                    [0.9, 1.0, 1.0],
+                    N,
+                    rid,
+                    admission_start=admission_start,
+                )
                 info = _info(req_pool_indices, mask if masked else None, q)
                 info.vocab_size = vocab
                 _, accept_length = backend.verify(

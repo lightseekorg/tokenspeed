@@ -95,7 +95,12 @@ def prepare(backend, slots, *, seed, top_k):
         sp.resolve_seed(rid)
         sp.normalize(None)
         params.append(sp)
-    backend.prepare_step(rids, slots, params, num_tokens_per_req=1)
+    backend.prepare_step(
+        [(seed * (VOCAB + 2) + top_k + 1) * POOL + slot + 1 for slot in slots],
+        slots,
+        params,
+        num_tokens_per_req=1,
+    )
 
 
 def draw(backend, logits, info, *, decode):
@@ -270,7 +275,7 @@ def test_single_verify_publishes_one_token_and_updates_counts_once(backend):
         sp.resolve_seed(rid)
         sp.normalize(None)
         params.append(sp)
-    backend.prepare_step(["pack-a", "pack-b"], [1, 3], params, num_tokens_per_req=1)
+    backend.prepare_step([26, 27], [1, 3], params, num_tokens_per_req=1)
     info = SamplingBatchInfo(
         req_pool_indices=slots,
         valid_cache_lengths=torch.full(

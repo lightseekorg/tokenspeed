@@ -407,12 +407,12 @@ def test_snapshot_restore_reseeds_engram_before_commit(buffers, destination):
     runtime.valid_cache_lengths[source] = 5
     runtime.future_input_map[source, 0] = 15
     image = torch.empty(runtime.slot_state_bytes(), dtype=torch.uint8, device=ib.device)
-    runtime.export_slot_state(source, image, None, request_id="a")
+    runtime.export_slot_state(source, image, None, admission_id=1)
     runtime.ngram_request_ids[destination] = "a"
     runtime.ngram_accepted_tokens[destination].fill_(99)
     runtime.ngram_needs_seed[destination] = False
     runtime.valid_cache_lengths[destination] = 0
-    runtime.import_slot_state(destination, image, None, request_id="a")
+    runtime.import_slot_state(destination, image, None, admission_id=1)
 
     # The restored request receives an explicit decode token even when its
     # pool slot did not change. This must override any stale accepted tail.
@@ -1199,6 +1199,7 @@ def test_the_forward_reads_a_snapshot_that_does_not_alias_request_state():
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
     handle._launch_forward(planned, capture_next_input_ids=False)
     # Later edits to the request's state cannot reach what the forward read.
