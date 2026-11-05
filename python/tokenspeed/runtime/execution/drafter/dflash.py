@@ -185,13 +185,13 @@ class DFlash(BaseDrafter):
 
     @override
     def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
-        """Refuse --enable-speculative-sampling unless the drafter samples its block.
+        """Refuse --enable-speculative-sampling for greedy DFLASH, else bind.
 
-        A block drafter records no dense draft distribution, so the base
-        ``draft_probs`` gate never fires for it; the verifier's config says
-        whether the flag is on. Only DFlash2 (the candidate selector)
-        samples its walk and overrides this; base DFLASH proposes the
-        argmax of every block row.
+        Base DFLASH proposes the argmax of every block row and records no
+        draft distribution, so the base ``draft_probs`` gate never fires for
+        it; the verifier's config says whether the flag is on. DFlash2 samples
+        its walk (sparse q, see its override) and DSpark its Markov steps
+        (dense q through the base sampler).
 
         Args:
             sampling_backend: The executor's verifier.
@@ -199,8 +199,6 @@ class DFlash(BaseDrafter):
         Raises:
             ValueError: The flag is on and this drafter proposes greedily.
         """
-        # No super(): the base binds a per-step DraftProposalSampler and dense
-        # draft_probs, which a block drafter never uses.
         if (
             sampling_backend.config.enable_speculative_sampling
             and not self.supports_speculative_sampling
@@ -211,6 +209,8 @@ class DFlash(BaseDrafter):
                 f"its own distribution; {type(self).__name__} proposes a whole "
                 "block greedily"
             )
+        # A no-op unless the executor allocated draft_probs (DSpark).
+        super().bind_sampling_backend(sampling_backend)
 
     @override
     def idle_forward_global_num_tokens(
