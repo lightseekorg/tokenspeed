@@ -44,6 +44,9 @@ pub struct IngressLimits {
     pub vocab_size: i64,
     /// The model's EOS ids, which end every request not ignoring EOS.
     pub eos_token_ids: Vec<i32>,
+    /// The selected sampler's exclusive finite top-k bound; `None` when
+    /// that backend normalizes all positive finite values on admission.
+    pub top_k_exclusive_max: Option<i64>,
     /// The longest request the engine admits, prompt and output.
     pub max_model_len: i64,
     /// The longest prompt.
@@ -252,7 +255,14 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
                     )
                 })
         })
-        .or_else(|| refusal(&view, &params, limits));
+        .or_else(|| {
+            refusal(
+                &view,
+                request.input_ids.as_deref().unwrap_or_default(),
+                &params,
+                limits,
+            )
+        });
 
     let prompt_len = request.input_ids.as_ref().map_or(0, Vec::len) as i64;
     let stop_token_ids: BTreeSet<i32> = if params.ignore_eos {
@@ -279,6 +289,10 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         request.return_logprob,
     );
     state.created_time = request.created_time;
+    state.session_id = request
+        .session_params
+        .as_ref()
+        .and_then(|session| session.id.clone());
 
     if invalid.is_none() && request.return_logprob {
         state.set_logprobs(LogprobRequest {
@@ -403,8 +417,6 @@ fn bootstrap_info(request: &TokenizedGenerateReqInput) -> Option<BootstrapInfo> 
 /// move out.
 struct RequestView {
     input_len: Option<usize>,
-    /// The prompt's smallest and largest token ids.
-    input_id_range: Option<(i32, i32)>,
     has_multimodal_inputs: bool,
     return_logprob: bool,
     top_logprobs_num: i64,
@@ -427,15 +439,8 @@ fn request_view(request: &TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     } else {
         None
     };
-    let input_ids = request.input_ids.as_deref().unwrap_or_default();
-    let input_id_range = input_ids
-        .iter()
-        .min()
-        .zip(input_ids.iter().max())
-        .map(|(&min, &max)| (min, max));
     RequestView {
         input_len: request.input_ids.as_ref().map(Vec::len),
-        input_id_range,
         has_multimodal_inputs: request.multimodal_inputs.is_some(),
         return_logprob: request.return_logprob,
         top_logprobs_num: request.top_logprobs_num,
@@ -452,6 +457,7 @@ fn request_view(request: &TokenizedGenerateReqInput, limits: &IngressLimits) -> 
 /// Why a request cannot run, or `None`.
 fn refusal(
     request: &RequestView,
+    input_ids: &[i32],
     params: &SamplingParams,
     limits: &IngressLimits,
 ) -> Option<String> {
@@ -505,9 +511,10 @@ fn refusal(
             ));
         }
         if start >= 0 && start < input_len - 1 {
-            let (min, max) = request.input_id_range.unwrap_or((0, 0));
+            // Only prompt logprobs need every id inside the vocabulary, so
+            // the ids are walked here and not on admission's common path.
             if let Some(reason) = limits.logprobs.prompt_logprobs_refusal(
-                &[min, max],
+                input_ids,
                 request.has_multimodal_inputs,
                 limits.vocab_size,
             ) {
@@ -537,7 +544,7 @@ fn refusal(
                 .to_owned(),
         );
     }
-    sampling::verify(params, limits.vocab_size).err()
+    sampling::verify_with_top_k_limit(params, limits.vocab_size, limits.top_k_exclusive_max).err()
 }
 
 /// More stop tokens than the sampler's stop table holds.
@@ -571,6 +578,7 @@ mod tests {
         IngressLimits {
             vocab_size: 1000,
             eos_token_ids: vec![2],
+            top_k_exclusive_max: Some(sampling::TOP_K_FUSED_MAX),
             max_model_len: 100,
             max_req_input_len: 90,
             enable_output_logprobs: false,
@@ -616,6 +624,49 @@ mod tests {
                 other => panic!("expected an abort, got {other:?}"),
             },
             Admitted::Run(admission) => panic!("expected a refusal, admitted {}", admission.rid),
+        }
+    }
+
+    #[test]
+    fn finite_top_k_admission_uses_the_selected_sampler_bound() {
+        let backend_normalizes = IngressLimits {
+            top_k_exclusive_max: None,
+            ..limits()
+        };
+        for top_k in [1, 127, 128, 4095, 4096, 4097, 163840, 1_i64 << 40, -1] {
+            let params = SamplingParams {
+                temperature: 1.0,
+                top_k,
+                ..Default::default()
+            };
+            let Some(Admitted::Run(admission)) =
+                admit(request("npu", vec![1], params.clone()), &backend_normalizes)
+            else {
+                panic!("backend must receive top_k={top_k}");
+            };
+            // Only the selected sampling backend clamps its device pool.
+            assert_eq!(
+                admission.sampling_params.top_k,
+                if top_k == -1 {
+                    sampling::TOP_K_DISABLED
+                } else {
+                    top_k
+                }
+            );
+            let gpu = admit(request("gpu", vec![1], params), &limits()).unwrap();
+            if top_k != -1 && top_k >= sampling::TOP_K_FUSED_MAX {
+                assert!(refused_message(gpu).contains("top_k must be < 128"));
+            } else {
+                assert!(matches!(gpu, Admitted::Run(_)));
+            }
+        }
+        for top_k in [0, -2] {
+            let params = SamplingParams {
+                top_k,
+                ..Default::default()
+            };
+            let refusal = admit(request("invalid", vec![1], params), &backend_normalizes).unwrap();
+            assert!(refused_message(refusal).contains("top_k must be -1 (disable), or at least 1"));
         }
     }
 
@@ -952,6 +1003,11 @@ mod tests {
         };
         assert!(
             refused_message(admit(prompt("d", vec![1, 5000]), &limits).unwrap())
+                .contains("inside the vocabulary")
+        );
+        // An id outside the vocabulary with both prompt ends inside it.
+        assert!(
+            refused_message(admit(prompt("d2", vec![1, 5000, 2]), &limits).unwrap())
                 .contains("inside the vocabulary")
         );
         let narrowing = IngressLimits {

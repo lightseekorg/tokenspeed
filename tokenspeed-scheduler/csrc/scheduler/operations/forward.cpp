@@ -78,17 +78,23 @@ bool holdsHeadOfLine(const Request& request) {
 template <typename Operation>
 void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
-    operation.block_tables = BuildBlockTables(coordinator, request.BlockTablesRef(), group_ids);
+    const auto& tables = request.BlockTablesRef();
+    _assert(tables.size() == group_ids.size(), "forward tables/group_ids size mismatch");
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
+            "forward tables/coordinator size mismatch");
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        operation.block_tables.emplace(
+            group_ids[i], ForwardBlockTable{coordinator.Allocator(static_cast<std::int32_t>(i)), tables[i]});
+    }
 }
 
-void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
-                                 const std::vector<std::span<const std::int32_t>>& prefix_pages,
+void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes, const Request& request,
                                  std::int32_t filled_prefix_pages) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(prefix_hashes.size());
     _assert(filled_prefix_pages > first_new_prefix_page, "caller must pre-check page-hash progress");
     const std::string previous_hash = prefix_hashes.empty() ? std::string{} : prefix_hashes.back();
     std::vector<std::string> new_hashes =
-        AdvancePrefixHashes(prefix_pages, first_new_prefix_page, previous_hash, filled_prefix_pages);
+        ComputePrefixHashes(request.PrefixPages(first_new_prefix_page, filled_prefix_pages), previous_hash);
     prefix_hashes.insert(prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                          std::make_move_iterator(new_hashes.end()));
 }
@@ -143,6 +149,26 @@ std::int32_t chunkTowardInForwardCheckpoint(std::int32_t checkpoint, std::int32_
     return (checkpoint - first_pos) % prefix_granularity == 0 ? tokens : checkpoint - first_pos;
 }
 
+// Adds the copy-in blocks an admission reserved (AdmissionResult::
+// copy_in_blocks: null for the slots it allocated no block for) to the ones
+// the request holds, slot by slot.
+void holdCopyInBlocks(std::vector<std::vector<CacheBlockRef>>& held, std::vector<std::vector<CacheBlockRef>> reserved) {
+    if (held.empty()) {
+        held = std::move(reserved);
+        return;
+    }
+    _assert(reserved.empty() || reserved.size() == held.size(), "copy-in blocks are held per cache group");
+    for (std::size_t i = 0; i < reserved.size(); ++i) {
+        _assert(reserved[i].size() == held[i].size(), "copy-in blocks of one point are held per slot");
+        for (std::size_t slot = 0; slot < reserved[i].size(); ++slot) {
+            if (reserved[i][slot]) {
+                _assert(!held[i][slot], "a copy-in slot is reserved once");
+                held[i][slot] = std::move(reserved[i][slot]);
+            }
+        }
+    }
+}
+
 bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::span<const BlockTable> tables,
                                      std::int32_t num_tokens, std::int32_t num_computed_tokens) {
     for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
@@ -157,6 +183,33 @@ bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::s
 
 }  // namespace
 
+// Whether a request's first decode publishes its prompt end and keeps writing
+// past it (PublicationPoint::kOwnerContinues): the fused role with prefix
+// caching, except at a prompt end the in-forward checkpoint makes dead
+// (promptEndCheckpoint), which the first decode skips. The P role publishes
+// its prompt end at finish, and the D role's prompt end arrived by transfer
+// or was claimed. It reads only the prompt and where the request resumed, so
+// every admission of the prompt decides as its first decode will.
+bool Scheduler::firstDecodePublishesPromptEnd(const Request& request, std::int32_t resume_tokens) const {
+    return config_.role == Role::kFused && !config_.disable_prefix_cache &&
+           promptEndCheckpoint(request, resume_tokens) == 0;
+}
+
+// The point every admission of a request's prompt -- each chunk and a restore
+// before the first decode -- reserves copy-in blocks for: the prompt end its
+// first decode publishes and keeps writing past. Each admission reserves those
+// of the slots whose blocks it allocates (CacheCoordinator::Admit), so the
+// first admission, which prepays the prompt in full-history groups, holds
+// them for those groups from then on. A dead prompt end has none: its first
+// decode publishes no tail to move off, so no admission holds a block for it.
+std::optional<CacheCoordinator::CopyInPoint> Scheduler::promptEndCopyInPoint(const Request& request,
+                                                                             std::int32_t resume_tokens) const {
+    if (!firstDecodePublishesPromptEnd(request, resume_tokens)) {
+        return std::nullopt;
+    }
+    return CacheCoordinator::CopyInPoint{.tokens = request.PrefillSize()};
+}
+
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
                                        bool stream_completed_to_host, PublicationPoint point,
@@ -164,7 +217,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
-        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
+        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request, filled_prefix_pages);
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
     std::optional<TailPublication> tail;
@@ -198,10 +251,13 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) || tail || state_only ||
         state_checkpoint_pages > 0) {
         progress.completed_pages = CompletedPages{
+            .tokens = request.TokenSlice(0, num_computed_tokens),
             .prefix_hashes = cache_progress.prefix_hashes,
             .first_new_prefix_page = first_new_prefix_page,
             .tail = tail,
-            .owner_continues = point == PublicationPoint::kOwnerContinues,
+            .owner_tail = point == PublicationPoint::kOwnerContinues    ? OwnerTail::kCopiedIn
+                          : point == PublicationPoint::kStateCheckpoint ? OwnerTail::kKept
+                                                                        : OwnerTail::kFinal,
             .publish_state = publish_state,
             .state_checkpoint_pages = state_checkpoint_pages,
             .state_checkpoint_blocks = cache_progress.published_state_checkpoint_blocks,
@@ -240,8 +296,8 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
         operation.extend_state_checkpoint_len = checkpoint - info.already_scheduled_len;
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
             if (const CacheBlockRef& block = cache_progress.state_checkpoint_blocks[i]) {
-                operation.block_tables[group_ids[i]].push_back(
-                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block));
+                operation.block_tables.at(group_ids[i]).checkpoint_page_id =
+                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block);
             }
         }
     }
@@ -375,14 +431,14 @@ void Scheduler::recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator:
     }
 }
 
-std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
-                                                                  CacheCoordinator::PrefixProbe&& prefix,
-                                                                  std::span<const GroupDemand> demands,
-                                                                  const RequestProgress& progress,
-                                                                  std::optional<std::uint64_t> request_access_epoch,
-                                                                  bool evict_blocks_past_segments) {
-    std::optional<CacheCoordinator::AdmissionResult> result = coordinator_.Admit(
-        std::move(prefix), demands, progress, request_access_epoch, evict_blocks_past_segments, /*session_id=*/{});
+std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(
+    ExecutionPlan& plan, AdmissionFeedback& feedback, CacheCoordinator::PrefixProbe&& prefix,
+    std::span<const GroupDemand> demands, const RequestProgress& progress,
+    std::span<std::vector<CacheBlockRef>> copy_in_blocks, std::optional<CacheCoordinator::CopyInPoint> copy_in_point,
+    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments) {
+    std::optional<CacheCoordinator::AdmissionResult> result =
+        coordinator_.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point, request_access_epoch,
+                           evict_blocks_past_segments, /*session_id=*/{});
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;
@@ -392,8 +448,10 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
 }
 
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTracking(
-    ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
-    std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments) {
+    ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, std::span<const GroupDemand> demands,
+    const RequestProgress& progress, std::optional<CacheCoordinator::CopyInPoint> copy_in_point,
+    bool evict_blocks_past_segments) {
+    fsm::CacheProgress& cache_progress = request.CacheProgressRef();
     if (progress.completed_pages) {
         registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
     } else {
@@ -407,9 +465,16 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
     const bool others_hold_pages = std::ranges::any_of(requests_, [&request](const std::unique_ptr<Request>& other) {
         return other.get() != &request && other->HoldsPages();
     });
+    // The publication of a prompt end the owner keeps writing past spends the
+    // copy-in blocks the request holds for it; no other admission does.
+    const bool copies_in = progress.completed_pages && progress.completed_pages->tail &&
+                           progress.completed_pages->owner_tail == OwnerTail::kCopiedIn;
+    const std::span<std::vector<CacheBlockRef>> copy_in_blocks =
+        copies_in ? std::span<std::vector<CacheBlockRef>>(request.CopyInBlocksRef())
+                  : std::span<std::vector<CacheBlockRef>>{};
     const auto attempt = [&]() {
         return admit(plan, feedback, coordinator_.ProbePrefix(std::span<const std::string>{}), demands, progress,
-                     cache_progress.access_epoch,
+                     copy_in_blocks, copy_in_point, cache_progress.access_epoch,
                      /*evict_blocks_past_segments=*/evict_blocks_past_segments && !others_hold_pages);
     };
     auto admission = attempt();
@@ -417,7 +482,6 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
         // Keeping an input for a later turn is optional. It must not stop
         // this request from obtaining the blocks its next forward needs.
         cache_progress.retained_input_checkpoint.clear();
-        request.CacheProgressRef().retained_input_checkpoint.clear();
         feedback.admission_failed = false;
         admission = attempt();
     }
@@ -444,7 +508,6 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const fsm::PrefillSource source =
         config_.role == Role::kD ? fsm::PrefillSource::kRemote : fsm::PrefillSource::kLocal;
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
-    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
 
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     // KV coverage beyond the state checkpoint the hit resumes from is the
@@ -549,11 +612,16 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // chunk's admission publishes its live slot there, at the cost of a
     // round (a cache this full keeps no spare block). That optional block
     // never makes blocks leave one by one (docs/design/scheduler.md §1.4).
+    // A local prompt reserves the copy-in blocks of its prompt end with the
+    // blocks they serve, unless the prompt end is dead for a request resuming
+    // at the hit; a remote landing computes no prompt here.
+    const std::optional<CacheCoordinator::CopyInPoint> copy_in_point =
+        source == fsm::PrefillSource::kLocal ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
         admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
                                        chunk_demands(tokens_this_round, true), RequestProgress{},
-                                       /*request_access_epoch=*/std::nullopt,
+                                       /*copy_in_blocks=*/{}, copy_in_point, /*request_access_epoch=*/std::nullopt,
                                        /*evict_blocks_past_segments=*/false, request->SessionId());
         if (!admission) {
             writes_checkpoint = false;
@@ -562,14 +630,16 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     }
     if (!admission) {
         admission = coordinator_.Admit(std::move(match.probe), chunk_demands(tokens_this_round, false),
-                                       RequestProgress{}, /*request_access_epoch=*/std::nullopt,
+                                       RequestProgress{}, /*copy_in_blocks=*/{}, copy_in_point,
+                                       /*request_access_epoch=*/std::nullopt,
                                        /*evict_blocks_past_segments=*/!others_hold_pages, request->SessionId());
     }
     if (!admission) {
         feedback.admission_failed = true;
         return FirstChunkOutcome{};
     }
-    request->SetSessionEpoch(admission->access_epoch);
+    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
+    request->HoldSessionAccess(std::move(admission->session_access));
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
     // Every Host hit is an entry the admission acquired in the same step, so
@@ -608,6 +678,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
         .resumed_tail_hash = std::move(admission->resumed_tail_hash),
+        .resume_tokens = hit_tokens,
     };
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
@@ -627,6 +698,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                  std::move(tables),
                                  hit_tokens,
                                  std::move(cache_progress),
+                                 std::move(admission->copy_in_blocks),
                                  std::move(admission->load_pairs),
                                  // The P role holds a completed prompt until its result lands: the
                                  // remote decode that hands it off carries the bootstrap token.
@@ -641,7 +713,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     remaining = static_cast<std::int32_t>(
         std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - first_pos)));
-    fsm::CacheProgress cache_progress = request->CacheProgress();
+    fsm::CacheProgress& cache_progress = request->CacheProgressRef();
     std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
                                                      remaining, cache_progress.junction_tokens);
     if (prefill_tokens == 0) {
@@ -654,18 +726,20 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     bool writes_checkpoint =
         writesInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, coordinator_.PrefixGranularity());
     // The chunk that ended at the junction publishes its natural checkpoint
-    // (KV tail and state) and moves off the published blocks, and so does one
+    // there: its state, under the tail's hash, but not the KV the junction
+    // has cached already (PublicationPoint::kStateCheckpoint). So does one
     // that happened to end at the in-forward checkpoint's boundary; every
     // other chunk end publishes only its completed full pages.
     const bool ends_at_junction = cache_progress.junction_tokens > 0 && first_pos == cache_progress.junction_tokens;
     const bool ends_at_state_checkpoint = state_checkpoint > 0 && first_pos == state_checkpoint;
+    StagedCacheProgress staged{cache_progress};
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;
     }
     const RequestProgress progress = AdvanceRequestProgress(
         *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
         config_.StreamsDeviceCacheToHost(),
-        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
+        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kStateCheckpoint : PublicationPoint::kChunk,
         /*allow_state_checkpoint=*/true);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
@@ -684,27 +758,30 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                               });
         return demands;
     };
+    // The prompt end's copy-in blocks of the slots this chunk allocates.
+    const std::optional<CacheCoordinator::CopyInPoint> copy_in_point =
+        promptEndCopyInPoint(*request, cache_progress.resume_tokens);
     // As for a first chunk: without room for the in-forward checkpoint's
     // block the chunk ends at the boundary instead.
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
         AdmissionFeedback checkpoint_feedback;
-        admission = admitWithKvEventTracking(plan, checkpoint_feedback, *request, cache_progress,
-                                             chunk_demands(prefill_tokens, true), progress,
-                                             /*evict_blocks_past_segments=*/false);
+        admission = admitWithKvEventTracking(plan, checkpoint_feedback, *request, chunk_demands(prefill_tokens, true),
+                                             progress, copy_in_point, /*evict_blocks_past_segments=*/false);
         if (!admission) {
             writes_checkpoint = false;
             prefill_tokens = state_checkpoint - first_pos;
         }
     }
     if (!admission) {
-        admission = admitWithKvEventTracking(plan, feedback, *request, cache_progress,
-                                             chunk_demands(prefill_tokens, false), progress,
-                                             /*evict_blocks_past_segments=*/true);
+        admission = admitWithKvEventTracking(plan, feedback, *request, chunk_demands(prefill_tokens, false), progress,
+                                             copy_in_point, /*evict_blocks_past_segments=*/true);
     }
     if (!admission) {
         return std::nullopt;
     }
+    staged.Commit();
+    holdCopyInBlocks(request->CopyInBlocksRef(), std::move(admission->copy_in_blocks));
     const bool completes_prefill = prefill_tokens == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
     if (writes_checkpoint) {
@@ -716,8 +793,6 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         cache_progress.retained_input_checkpoint =
             coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
     }
-
-    request->CacheProgressRef() = std::move(cache_progress);
     return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
 }
 
@@ -762,30 +837,36 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // claimed. This delivers the preceding prefill's checkpoints; decode
     // never creates an in-forward checkpoint. Every later decode writes slot
     // 1 in place and lets slot 0 go. Restricted groups cannot publish that
-    // decode-produced live state at finish or retraction either.
+    // decode-produced live state at finish or retraction either. With the
+    // in-forward checkpoint, a fused prompt end its pre-tail State checkpoint
+    // makes dead (promptEndCheckpoint) is such a later decode instead: no
+    // tail and no prompt-end state are published, the partial page stays the
+    // owner's and the state is written in place. Its admissions reserved no
+    // copy-in block for it, so it is skipped even if that checkpoint has left
+    // the cache since.
     const bool first_decode = request->Is<fsm::PrefillDone>();
-    const bool prompt_end = first_decode && config_.role == Role::kFused && !config_.disable_prefix_cache;
+    fsm::CacheProgress& cache_progress = request->CacheProgressRef();
+    const bool prompt_end = first_decode && firstDecodePublishesPromptEnd(*request, cache_progress.resume_tokens);
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
                                                                           : StateStep::Kind::kRelease};
-    fsm::CacheProgress& current_progress = request->CacheProgressRef();
     const bool completed_page = num_computed_tokens / coordinator_.PrefixGranularity() >
-                                static_cast<std::int32_t>(current_progress.prefix_hashes.size());
+                                static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const bool completed_checkpoint =
-        current_progress.state_checkpoint_tokens > 0 && num_computed_tokens >= current_progress.state_checkpoint_tokens;
+        cache_progress.state_checkpoint_tokens > 0 && num_computed_tokens >= cache_progress.state_checkpoint_tokens;
     // Between publication points, consuming an existing reserve cannot fail
-    // and does not change the hash chain. Keep the rollback copy for admission.
+    // and does not change the hash chain, so it needs no admission.
     if (!completed_page && !completed_checkpoint && state_step.kind != StateStep::Kind::kRotate &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
         if (state_step.kind == StateStep::Kind::kRelease) {
             coordinator_.ReleaseStateInputs(tables);
         }
-        current_progress.published_state_checkpoint_blocks.clear();
+        cache_progress.published_state_checkpoint_blocks.clear();
         return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
     }
 
-    fsm::CacheProgress cache_progress = current_progress;
+    StagedCacheProgress staged{cache_progress};
     const RequestProgress progress =
         AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                config_.StreamsDeviceCacheToHost() && first_decode,
@@ -794,10 +875,13 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
 
     std::vector<GroupDemand> demands =
         MakeGroupDemands(tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{reserve_tokens}}, state_step);
-    if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress,
+    // The first decode spends the prompt end's copy-in blocks; a decode
+    // reserves none.
+    if (!admitWithKvEventTracking(plan, feedback, *request, demands, progress, /*copy_in_point=*/std::nullopt,
                                   /*evict_blocks_past_segments=*/true)) {
         return std::nullopt;
     }
+    staged.Commit();
 
     if (first_decode && cache_progress.retained_input_checkpoint.empty()) {
         const std::int32_t checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
@@ -806,22 +890,19 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                 coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, checkpoint);
         }
     }
-    request->CacheProgressRef() = std::move(cache_progress);
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                         std::vector<LoadBackOperation>& load_back_operations) {
-    const auto* admission = request->AdmissionResourcesPtr();
-    const auto storage_id = admission->storage_hold ? admission->storage_hold->operation_id : 0;
+    // The event consumes the Submitted state and with it any L3 Ready hold:
+    // the admission's load pairs, and then the ordinary H2D ticket, own the
+    // Host sources.
     PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
     if (!load_pairs.empty()) {
         load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
     }
-    // Admission and the ordinary H2D ticket now own the Host sources. The
-    // Submitted state was consumed above, so retire its saved Ready hold here.
-    if (storage_id) storage_transfers_->Detach(storage_id);
     return operation;
 }
 
@@ -1075,7 +1156,7 @@ std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuil
     build.snapshot_stores.push_back(std::move(stores->snapshot_store));
     victim.Apply(fsm::SnapshotRetractEvent{&coordinator_, next_retraction_epoch_++, victim.HasGeneratedOutput(),
                                            std::move(stores->image), std::move(blob_slot),
-                                           std::move(stores->pending_store_ops)});
+                                           std::move(stores->image_stores)});
     spdlog::info("[Scheduler] retract: suspended request {} ({} tokens) with its image", victim.Id(),
                  victim.TokenSize());
     return std::nullopt;
@@ -1484,8 +1565,16 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
         tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{0}}, StateStep{StateStep::Kind::kKeep});
     ReservePrefillDemands(demands, config_.cache_groups, reserve);
 
+    // A victim taken before its first decode resumes its prompt: the restore
+    // reserves the prompt end's copy-in blocks for the slots it rebuilds or
+    // grows, the retraction having released the ones it held (none for a
+    // dead prompt end, as at its first admission).
+    const std::optional<CacheCoordinator::CopyInPoint> copy_in_point =
+        std::holds_alternative<fsm::ResumeDecoding>(retracted->shape)
+            ? std::nullopt
+            : promptEndCopyInPoint(*request, retracted->cache_progress.resume_tokens);
     std::optional<CacheCoordinator::AdmissionResult> result =
-        coordinator_.Restore(retracted->image, demands, retracted->cache_progress.access_epoch);
+        coordinator_.Restore(retracted->image, demands, copy_in_point, retracted->cache_progress.access_epoch);
     if (!result) {
         feedback.admission_failed = true;
         return false;
@@ -1499,7 +1588,8 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
         std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
     const std::uint32_t restore_op = op.op_id;
     build.snapshot_restores.push_back(std::move(op));
-    request->Apply(fsm::ScheduleRestoreEvent{&coordinator_, std::move(tables), restore_op});
+    request->Apply(
+        fsm::ScheduleRestoreEvent{&coordinator_, std::move(tables), std::move(result->copy_in_blocks), restore_op});
     build.scheduled.insert(request);
     spdlog::info("[Scheduler] restore: request {} ({} tokens) copies its image back", request->Id(),
                  request->TokenSize());

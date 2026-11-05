@@ -380,18 +380,23 @@ class TestV4SlidingWindowGroupsSmoke:
         )
 
         # Each request retains its 7-token window plus the decode token at any
-        # page alignment, and with the prefix cache on hands its partial page
-        # to the cache at the prompt end while continuing on a fresh one (one
-        # more block per request, ceil((P - 1) / g), within the lookback); one
-        # chunk in flight -- capped by the total -- adds its rows behind the
-        # resumable-boundary lookback, which spans the most blocks a window can
-        # cover at any alignment: ceil((W - 1 + g - 1) / g).
+        # page alignment, and with the prefix cache on holds a hitter's copy
+        # of a published tail and the copy-in block its prompt end moves to
+        # (ceil((P - 1) / g) blocks each per request, within the lookback);
+        # one chunk in flight -- capped by the total -- adds its rows behind
+        # the resumable-boundary lookback, which spans the most blocks a
+        # window can cover at any alignment: ceil((W - 1 + g - 1) / g).
         resident_pages = 10 * math.ceil((7 + 1 + 3) / 4)
         lookback_pages = math.ceil((7 + 3) / 4)
         handover_pages = 10 * min(math.ceil((4 - 1) / 4), lookback_pages)
+        copy_in_pages = handover_pages
         scheduled_pages = math.ceil(20 / 4)
         assert (pages["sliding"]) == (
-            resident_pages + handover_pages + lookback_pages + scheduled_pages
+            resident_pages
+            + handover_pages
+            + copy_in_pages
+            + lookback_pages
+            + scheduled_pages
         )
 
 

@@ -25,13 +25,13 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include "cache/core/cache_types.h"
+#include "cache/tier/storage_lease.h"
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/request_spec.h"
@@ -41,6 +41,9 @@ namespace tokenspeed::fsm {
 
 enum class PrefillSource { kLocal, kRemote };
 
+// A scheduling attempt advances this in place and StagedCacheProgress
+// (scheduler/operations/progress.h) undoes the advance when the attempt
+// fails: a field an attempt changes must be restored there.
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.
@@ -72,6 +75,12 @@ struct CacheProgress {
     // frontier to replace it. Admission may release this optional hold for
     // capacity, and retraction drops it before imaging the request.
     std::vector<CacheBlockRef> retained_input_checkpoint;
+    // The boundary the first admission resumed from (its prefix hit; zero for
+    // none). The pre-tail State checkpoint makes the prompt end dead
+    // (SchedulerConfig::state_checkpoint_in_forward) only for a request that
+    // resumed at or below it, which every admission of the prompt and its
+    // first decode read alike (Scheduler::promptEndCheckpoint).
+    std::int32_t resume_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -91,9 +100,10 @@ inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* to
 }
 
 // Ready data stays charged to its storage ticket until normal admission has
-// acquired the Host sources, or this hold expires. It is not an I/O deadline.
+// acquired the Host sources -- admission consumes the state holding the
+// lease -- or this hold expires. It is not an I/O deadline.
 struct StorageReadyHold {
-    std::uint64_t operation_id;
+    StorageLease lease;
     std::int64_t deadline_us;
 };
 
@@ -131,6 +141,14 @@ struct ForwardResources {
     std::int32_t prefix_granularity{};
     ReqPoolIndex req_pool_index;
     std::vector<BlockTable> block_tables;
+    // Per cache group, the copy-in blocks the request holds for its prompt
+    // end, which its first decode publishes and keeps writing past: aligned
+    // to CacheCoordinator::CopyInSlots, each reserved by the admission that
+    // allocated the block of its slot, null until then. The first decode
+    // spends them (CacheCoordinator::Admit); they go with the tables, so a
+    // retraction releases them and a restore reserves them again. Empty
+    // when the request reserves none.
+    std::vector<std::vector<CacheBlockRef>> copy_in_blocks;
     CacheProgress cache_progress;
     // Forwards scheduled for this request whose results have not come back.
     // More than one is normal under the overlap schedule, which plans the
@@ -283,23 +301,19 @@ struct Retracted {
     // The store ops the image waits for: the L2 leg's write-back(s) -- its
     // own and any earlier in-flight store carrying one of its keys -- and
     // the tail leg's snapshot store. A restore is issued only once every one
-    // has been acknowledged.
-    std::vector<std::uint32_t> pending_store_ops;
+    // has landed: each wait expires when its op's ACK drops the op's record.
+    std::vector<StoreWait> image_stores;
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
     std::int32_t PrefixGranularity() const { return prefix_granularity; }
     std::int64_t RetractionEpoch() const { return retraction_epoch; }
     bool ResumesGeneration() const { return resumes_generation; }
-    bool ImageLanded() const { return pending_store_ops.empty(); }
+    bool ImageLanded() const { return std::ranges::all_of(image_stores, &StoreWait::Landed); }
+    // Whether the op's publications concern the image: its L2 slots follow
+    // them (RetractionImage::FollowPublished), since an L3 prefetch of the
+    // same key may have published first, leaving the ticket's block unindexed.
     bool WaitsForStore(std::uint32_t op_id) const {
-        return std::find(pending_store_ops.begin(), pending_store_ops.end(), op_id) != pending_store_ops.end();
-    }
-    // The store landed; its publications say which Host block is canonical
-    // for each key, and the image's L2 slots follow (an L3 prefetch of the
-    // same key may have published first, leaving the ticket's block unindexed).
-    void NoteStoreLanded(std::uint32_t op_id, std::span<const HostPublication> published) {
-        std::erase(pending_store_ops, op_id);
-        image.FollowPublished(published);
+        return std::ranges::find(image_stores, op_id, &StoreWait::op_id) != image_stores.end();
     }
 };
 

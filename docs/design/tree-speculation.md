@@ -116,9 +116,26 @@ never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
 the chunked form of the delta rule, every node at once with the ancestor mask
 in place of the causal one, and keeps no node states; it also writes each
 node's replay payload row (`[k | v | a | b]`) as it reads them, so that verify
-skips the q/k/v split. In other
-trees the state of every branch point (a node with a child other than the next
-node) goes to one workspace shared by all layers
+skips the q/k/v split.
+On supported NVIDIA geometry, the kernel registry prefers the CuTe DSL WY leaf
+for short chains and 8–16-node output-only trees. Head dimensions, token count,
+output-only execution and tree support are selection traits shared by runtime
+capability queries and the actual verify call; the runtime does not choose a
+WY-specific solution. It computes the same operation with native TF32 MMA and
+can fill the same replay payload; state ownership and replay commit stay the
+same. Chains and trees enter through `gdn_decode_mtp`; the runtime passes no
+ancestor mask for a chain. The kernel package owns selection between CuTe WY,
+the Triton chunked chain and general MTP, including any one-path mask used
+internally by the fallback. Capability queries use that same selection
+contract, including the pool's state dtype. Selected implementations prepare
+their finite compilation variants during the normal startup forward under
+`kernel_warmup`; the runtime neither dispatches a vendor solution nor builds
+special warmup launches. Unsupported geometry or platforms use normal registry
+fallback. Automatic BF16 state writes require the kernel package's
+`padding_safe` capability; read-only verify leaves the
+null page untouched and ignores padded outputs. In other trees the state of
+every branch point (a node with a child other than the next node) goes to one
+workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
 and a branch reloads its parent from there. Mamba2 has no such workspace: its
 elementwise update lets a branch replay the parent's ancestors over the read

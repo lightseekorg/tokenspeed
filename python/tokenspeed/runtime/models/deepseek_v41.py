@@ -89,7 +89,6 @@ from tokenspeed_kernel.ops.gemm import (
     grouped_bf16_projection,
     grouped_bf16_projection_quantize_fp8,
     mm,
-    prepare_mxfp8_weight_scales,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
@@ -143,6 +142,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -165,7 +165,7 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     is_engram_embed_checkpoint_name,
     resolve_engram_host_layout,
 )
-from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP, DeepseekV4MoE
+from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
@@ -254,9 +254,6 @@ class _V41Fp8Config(Mxfp8Config):
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config: Mxfp8Config):
         super().__init__(quant_config)
-        # 1x32 weight scales in the native GEMM's layout, or None for the
-        # canonical path; see prepare_weight_scales.
-        self.prepared_weight_scales: torch.Tensor | None = None
         # Hopper has no tensor-core kernel for 32-wide FP8 blocks; its FP8 GEMMs
         # rescale on CUDA cores every 32 K and trail the plain BF16 GEMM at
         # every shape. So load the codes straight into a BF16 weight and fold
@@ -333,25 +330,6 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         layer.quant_method = UnquantizedLinearMethod()
         # Plans the batch-invariant GEMM under a bitwise envelope.
         layer.quant_method.process_weights_after_loading(layer)
-
-    @torch.no_grad()
-    def prepare_weight_scales(self, layer: nn.Module) -> None:
-        """Derive this layer's prepacked weight scales from the loaded ones.
-
-        Preparation swizzles the scales once instead of on every forward. The
-        first call keeps the result; a call after a weight update copies into
-        that buffer, so captured CUDA graphs keep reading the same address.
-        """
-        if self.load_as_bf16:
-            return
-        prepared = prepare_mxfp8_weight_scales(layer.weight, layer.weight_scale_inv)
-        cached = self.prepared_weight_scales
-        if cached is None:
-            self.prepared_weight_scales = prepared
-            return
-        if prepared is None or prepared.shape != cached.shape:
-            raise ValueError("V4.1 prepacked FP8 scales changed layout")
-        cached.copy_(prepared)
 
     def apply(
         self,
@@ -1471,16 +1449,18 @@ class DeepseekV41MoE(DeepseekV4MoE):
             self.config = config
             self.n_shared_experts = config.n_shared_experts
             if config.n_shared_experts is not None:
-                self.shared_experts = DeepseekV4MLP(
-                    config.hidden_size,
-                    config.moe_intermediate_size * config.n_shared_experts,
-                    config.hidden_act,
-                    mapping,
-                    quant_config,
-                    add_prefix("shared_experts", prefix),
-                    swiglu_limit=config.swiglu_limit,
+                self.shared_experts = GatedMLP.tensor_parallel(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size
+                    * config.n_shared_experts,
+                    activation=gated_activation(config.hidden_act, config.swiglu_limit),
+                    tp_rank=mapping.dense.tp_rank,
+                    tp_size=mapping.dense.tp_size,
+                    tp_group=mapping.dense.tp_group,
                     reduce_results=False,
-                    is_shared_expert=False,
+                    fusions=(),
+                    quant_config=quant_config,
+                    prefix=add_prefix("shared_experts", prefix),
                 )
 
     def _renormalize_routing_weights(self) -> bool:

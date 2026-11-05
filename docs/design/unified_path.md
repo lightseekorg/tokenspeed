@@ -78,6 +78,13 @@ FlashInfer receives host CSR metadata derived from those mirrors, with fresh
 pinned sources for asynchronous uploads. Planning does not download device
 lengths or indptrs; mixed batches apply the same rule to their extend rows.
 
+Prefill token inputs arrive as the scheduler's read-only, one-dimensional
+int32 NumPy views. Input fill copies them directly into fresh pinned storage
+for the round, then uploads that storage asynchronously. It neither wraps
+the read-only source in a writable tensor nor creates an intermediate token
+copy. The pinned allocation must remain per-round: overlap can prepare the
+next round while the previous upload is still reading its source.
+
 NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
@@ -136,6 +143,12 @@ before capture or task update and maps authoritative router slots once before
 the first Prolog. Its normalized FP32 partials use the same direct LSE merge as
 DSA, with empty-shard masking and layout conversion fused at that boundary.
 
+Layer-shared Ascend metadata compares retained Tensor storage views when reusing
+prepared results. Equivalent views reuse the result; replacement storage or an
+in-place storage rebind invalidates it. The retained views share allocations
+without copying data and are cleared at the forward boundary. Prefill keeps
+the same storage-view contract for each layer's prepared cache planes.
+
 DSA CP prepares its metadata before the first fused Prolog. One device launch
 expands request lengths into causal query rows, compacts owned pages, counts
 visible/initial/window tokens, writes the Indexer's grouped layout, and maps
@@ -168,6 +181,9 @@ additional storage for sanitization/layout conversion, TopK and LSE. At 16K
 rows and 64 heads these are 1.125 GiB for Q and 2 GiB per partial buffer.
 Plan the prefill chunk against this transient peak as well as resident weights
 and cache; the native fused bucket's memory plan does not bound this path.
+The persistent gather workspace also reserves the retained current rows used
+by attention after exchange, and budgets every transport and slot view with
+the workspace pool's 256-byte alignment.
 
 Single-rank decode uses the same preparation with identity page ownership:
 verify still needs one causal length and page-table row per candidate. Its
@@ -431,6 +447,11 @@ by a single per-bs builder shared by capture and refresh, cached per bs. A bs
 never captured (above-ladder decode, enforce-eager) builds its views lazily
 on first refresh — no new storage, one-time cost. Views must be
 pointer-stable: a captured graph holds their addresses forever.
+
+Kernel page tables and router write-slot buffers retain int32. Cache binding
+bounds local and virtual token slots to the int32 range, including sharded
+groups. Ascend adapters accept int32 router slots and prepare
+int64 buffers only for native consumers that require them.
 
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,
@@ -946,6 +967,17 @@ pool-indexed sampling route serves them, which is exactly what the captured
 graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
+
+Admission uses the selected sampling backend's finite top-k bound. GPU
+backends retain the exclusive 128 bound. `ascend_full` accepts positive
+finite values and caps them at 4096 when populating its per-request scalar
+pool, before the int32 write. The normalized disabled sentinel (`top_k=-1`)
+keeps whole-vocabulary sampling. The captured graph reads that same pool
+for single-step sampling and chain verification.
+Ascend sampling consumes the logits already audited and sanitized by the
+executor's `NanGuard`; it does not repeat a host-side NaN truth test inside
+the captured graph. Per-request numerical error flags keep their existing
+executor and output-processor path.
 
 Synthetic acceptance length shares executor scheduling, logit processing,
 persistent output buffers and downstream state updates with ordinary
@@ -1692,9 +1724,15 @@ builder. Decode-only refresh/capture remains unchanged and carries no
 prefill convolution schedule. Breakable prefill graphs consume the live
 metadata in the eager attention break, as ordinary eager forwards do.
 
+Prefill convolution returns `[channels, tokens]` with contiguous channels per
+token, independent of the input strides. Transposing to `[tokens, channels]`
+and splitting the packed channels can therefore remain views.
+
 Prefill state staging fuses resumed conv-window copying, recurrent-state
-gather/zero, and history flags in one kernel. It preserves scheduler-owned
-block ids and arbitrary cache strides. Fresh rows never read null or stale
+gather/zero, and history flags in one kernel. KDA gathers directly into FP32
+scan state, including from BF16 cache storage; final writeback casts to the
+cache dtype. It preserves scheduler-owned block ids and arbitrary cache strides.
+Fresh rows never read null or stale
 recurrent state; their conv working windows remain unchanged. Shared input
 snapshots are read-only, output blocks are unique, and a private in-place
 source/destination is legal. This changes neither scan arithmetic nor cache
@@ -1826,7 +1864,8 @@ host lengths and GPU boundaries still agree. Its `PrefillCapacity` validates
 the packed bounds it builds. For KDA, an explicit
 `KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
 each sequence may fill the bucket, but their combined tokens must also fit it.
-The CuTeDSL adapter alone converts this descriptor to native planning bounds.
+The CuTeDSL adapter converts this descriptor to native planning bounds;
+cuDNN plans from tensor capacities and reads live boundaries on the device.
 Convolution maps reserve `ceil(token_capacity / block_m) + sequences - 1`
 programs, bounding the sum of per-request rounded lengths without reserving
 the entire token bucket for every request. One GPU metadata refresh
@@ -1850,11 +1889,16 @@ global functions or changing scan arithmetic. Routing and workspace partition
 rules remain owned by the native host. Unsupported layouts retain the public
 wrapper's capacity preparation.
 
-The preparation copies every input with its capacity padding scrubbed: the
+The CuTeDSL preparation copies every input with its capacity padding scrubbed: the
 gate projection can produce undefined padding, and the inline path has no
 handoff copy to clean it. Per-call plan and scratch tensors belong to the
 active graph pool or eager invocation; they are not a mutable process-global
 plan shared across replay streams.
+
+The cuDNN adapter reuses FlashInfer's cached plans and workspace, warmed by the
+existing startup capture loop. Replay matches eager execution at the same
+capacity bitwise; different capacities can select different scan partitions
+and therefore differ by floating-point rounding.
 
 Changes to this capacity contract require validation of full-model overlap,
 memory use and performance in addition to kernel correctness.
@@ -1875,8 +1919,8 @@ and the same slice of every per-row input; per-request inputs keep the whole
 batch with `RequestTokenHistoryView.row_offset = start`; a pipeline stage's
 boundary bundle carries shard rows. `ctx.input_num_tokens` and
 `global_num_tokens` keep the scheduler's full-chunk meaning: only collective
-sizing (`CommManager`, `models/base/comm_ops.py`) reads them, a model reads
-its rows from its tensors or `ctx.query_shard`.
+sizing (`CommManager`) reads them, a model reads its rows from its tensors or
+`ctx.query_shard`.
 
 The contract a model (in tree or a plugin) implements:
 
@@ -2107,13 +2151,18 @@ head TP: only the absorbed sparse prefill can take the exchange. The
 alternative to this fork — sharding the drafter's decode rows by a plan too,
 so every forward exchanges — needs a sharded DSA decode arm (history gathers
 for decode rows) that does not exist; the fork is the contained form until
-it does. The decode-only gates of the attention-DP
-layout (`disaggregation_mode == "decode"`, the decode-shaped autotune; a
-retracted request restores rather than recomputes, so no admission rule is
-needed) key on
-`mapping.attn.head_tp_serves_decode_only`, which is False over the query
-shards; the prefill role's own rules (`validate_qcp`) and the mapping (`head
-TP == qcp`) gate this layout.
+it does. `mapping.attn.head_tp_serves_decode_only`, which is False over the
+query shards, requires the Decode role for head TP without QCP. The prefill
+role's own rules (`validate_qcp`) and the mapping (`head TP == qcp`) gate
+the sharded Prefill layout.
+
+Startup chooses its forward from the engine role. Every disaggregated Decode
+worker warms the existing Decode path at its maximum Decode batch, including
+ordinary TP and TP1 attention DP. It reserves no Prefill graph buckets and never
+captures an extend-shaped graph, even if a Prefill graph limit was supplied.
+Remote admission and snapshot restore do not execute local Prefill. Prefill
+workers and aggregated engines retain their extend warmup; disabling autotune
+disables tactic profiling, not the role's warmup traversal.
 
 Eager only: the history gather runs in the attention break, so the GPU DSA
 backend declares `CudaGraphSupport(prefill_graph=False)` under a query shard

@@ -68,8 +68,8 @@ public:
     std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
     // Device -> Device whole-block copies, per cache group id, as (source,
     // destination) scheduler virtual block ids: a hitter's private copy of
-    // the shared block containing its boundary, or an owner's fresh block at
-    // a publication point it keeps writing past. Fire-and-forget like
+    // the shared block containing its boundary, or an owner's copy-in block
+    // at a publication point it keeps writing past. Fire-and-forget like
     // pages_to_zero: no op id, no ACK. The runtime enqueues them on the
     // forward thread's default stream after the execution stream's in-flight
     // forwards and BEFORE this plan's zeroing, so a source re-granted in the

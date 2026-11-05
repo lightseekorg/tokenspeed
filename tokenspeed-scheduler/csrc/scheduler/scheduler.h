@@ -63,10 +63,13 @@ struct PrefixHitStats {
 };
 
 // Host L2 counters, and the Device evictions they are read against:
-// cumulative since start and never reset. Accounting only, for tests and
-// inspection: no scheduling decision reads them and the runtime exports none.
+// cumulative since start and never reset. Accounting only: no scheduling
+// decision reads them. The runtime exports the prefix hits and L3 query
+// tokens (`PrefixHitView`); the rest stay for tests and inspection.
 struct HostCacheStats {
     PrefixHitStats prefix_hits;
+    // Cumulative token spans of successful storage keys, counted per cache group.
+    std::uint64_t storage_query_hit_tokens{0};
     TierTransferManager::WriteBackStats publication_stores;
     TierTransferManager::WriteBackStats finish_stores;
     TierTransferManager::WriteBackStats retraction_stores;
@@ -80,6 +83,9 @@ struct HostCacheStats {
     // never written back).
     std::uint64_t dead_entries_not_written_back{0};
     CacheCoordinator::DeviceEvictionStats device_evictions;
+    // CacheCoordinator::CheckpointResumeGaps, the gaps an admission resumed
+    // a State checkpoint after, on either tier.
+    std::vector<std::uint64_t> checkpoint_resume_gaps;
 };
 
 class Scheduler {
@@ -196,10 +202,6 @@ private:
         std::span<const std::string> prefix_hashes;
     };
 
-    struct KvEventHashProgress {
-        std::vector<std::uint64_t> block_hashes;
-    };
-
     // What the per-request admission layer reports back to the role
     // grammars. Together with the output ExecutionPlan (where admit()
     // records fresh pages to zero) this is ALL that layer sees of a
@@ -265,21 +267,28 @@ private:
     AdmissionMatch matchPrefixAtAdmission(Request* request);
     // Records an admission's fresh pages (to zero) and copies on the plan.
     void recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result);
+    // copy_in_blocks and copy_in_point as for CacheCoordinator::Admit.
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,
                                                            const RequestProgress& progress,
+                                                           std::span<std::vector<CacheBlockRef>> copy_in_blocks,
+                                                           std::optional<CacheCoordinator::CopyInPoint> copy_in_point,
                                                            std::optional<std::uint64_t> request_access_epoch,
                                                            bool evict_blocks_past_segments);
+    // Admits a scheduled request's next step against its live cache progress,
+    // which the caller has advanced for the step (StagedCacheProgress). The
+    // publication of a prompt end spends the copy-in blocks the request holds.
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
-        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
-        std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments);
-    void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, std::span<const GroupDemand> demands,
+        const RequestProgress& progress, std::optional<CacheCoordinator::CopyInPoint> copy_in_point,
+        bool evict_blocks_past_segments);
+    void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its newly hashed full pages and,
     // at a tail, the partial page under its tail hash (token_ids = the rows
     // below T, parent = the last full page).
-    void registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+    void registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                     const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);
     // Finished requests whose forwards have all landed: publish the frontier
@@ -289,6 +298,25 @@ private:
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+    // The dead checkpoints SchedulerConfig::state_checkpoint_in_forward skips
+    // (outside_event_handler.cpp): the pre-tail State checkpoint that makes a
+    // request's prompt end dead, from the prompt and where the request
+    // resumed (zero for none); whether that checkpoint exists, so a
+    // publication in place at the prompt end publishes no tail and no state
+    // there; and whether a finishing request publishes its frontier like a
+    // chunk end.
+    std::int32_t promptEndCheckpoint(const Request& request, std::int32_t resume_tokens) const;
+    bool promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const;
+    bool finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const;
+    // Whether the first decode of a request that resumed at resume_tokens
+    // publishes its prompt end and keeps writing past it, and the copy-in
+    // point every admission of its prompt reserves for that publication
+    // (operations/forward.cpp). Both read promptEndCheckpoint, so the
+    // admissions reserve copy-in blocks exactly for a prompt end the first
+    // decode publishes.
+    bool firstDecodePublishesPromptEnd(const Request& request, std::int32_t resume_tokens) const;
+    std::optional<CacheCoordinator::CopyInPoint> promptEndCopyInPoint(const Request& request,
+                                                                      std::int32_t resume_tokens) const;
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
@@ -525,7 +553,6 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
-    std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).

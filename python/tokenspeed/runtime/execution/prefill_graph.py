@@ -1194,7 +1194,9 @@ class PrefillGraph:
             # Route the dummy tables through the same bridge packer live
             # batches use: one packed device storage, contract order and
             # bounds validated (the router's packed unpack and V4's
-            # packed-storage checks both key on that layout).
+            # packed-storage checks both key on that layout). These tables
+            # are built here, not by the scheduler, so their page IDs are
+            # always scanned; capture runs once, at startup.
             arrays = {
                 group_id: table.cpu().numpy()
                 for group_id, table in group_tables.items()
@@ -1205,6 +1207,7 @@ class PrefillGraph:
                 device=self.config.device,
                 contract=self.token_to_kv_pool.arena.runtime_contract,
                 num_requests=bs,
+                validate_page_ids=True,
             )
             group_tables = dict(
                 cache_metadata.tables(active_forward_op=dummy_forward_op)

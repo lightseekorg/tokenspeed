@@ -1442,6 +1442,51 @@ def add_rmsnorm(
     )
 
 
+@register_kernel(
+    "layernorm",
+    "gemma_rmsnorm",
+    name="triton_gemma_rmsnorm",
+    solution="triton",
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Triton kernel of :func:`tokenspeed_kernel.ops.layernorm.gemma_rmsnorm`:
+    ``grouped_gemma_rmsnorm`` with one group per row, or ``add_rmsnorm(gemma=True)``
+    writing the norm into ``x`` and the sum into ``residual``."""
+    if residual is None:
+        return grouped_gemma_rmsnorm(x, weight, int(x.shape[-1]), eps, out=None)
+    # [M, N] rows with dense columns stay as they are (a column slice of a fused
+    # projection stays a view); other layouts become a [rows, N] view or copy.
+    x_rows = x if x.ndim == 2 and x.stride(-1) == 1 else x.reshape(-1, x.shape[-1])
+    residual_rows = (
+        residual
+        if residual.ndim == 2 and residual.stride(-1) == 1
+        else residual.reshape(-1, residual.shape[-1])
+    )
+    add_rmsnorm(
+        x_rows,
+        residual_rows,
+        weight,
+        eps,
+        x2=None,
+        out=x_rows,
+        out_fp8=None,
+        fp8_scale=None,
+        out_fp4=None,
+        fp4_scale=None,
+        gemma=True,
+    )
+    return x_rows.view(x.shape), residual_rows.view(residual.shape)
+
+
 # Rows each gated RMSNorm program normalizes when one warp covers a row.
 GATED_RMSNORM_ROWS_PER_PROGRAM = 4
 
