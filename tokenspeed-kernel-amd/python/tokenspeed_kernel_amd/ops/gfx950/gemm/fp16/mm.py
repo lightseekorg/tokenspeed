@@ -1613,8 +1613,8 @@ _DECODE_CONFIGS: dict[
     # eight ways with 32-row tiles from 17 rows; past 64 rows the extra row
     # tiles fill the CUs, so K splits four ways again. The 128 and 256 buckets
     # serve speculative verify batches of up to 21 requests (172 rows). The 256
-    # bucket is break-even (+1-2%) at 129-136 rows, of which verify sends only
-    # 136 (17 requests of 8 rows), and 18-25% faster from 144 rows.
+    # bucket only breaks even at 129-136 rows, of which verify sends only 136
+    # (17 requests of 8 rows), and is faster from 144 rows.
     (512, 8192): {
         4: (16, 16, 512, 2, 2, 4, 4, 8),
         8: (16, 16, 512, 2, 2, 4, 4, 8),
