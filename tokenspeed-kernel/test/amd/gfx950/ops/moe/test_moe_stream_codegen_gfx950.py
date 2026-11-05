@@ -189,7 +189,7 @@ def test_item_loops_keep_the_ring(variant):
         assert min(n for n, before in waits if n < before) >= floor, (mfma, waits)
         body = [s for s, _ in ins[start:end]]
         # Weight chunks are read once: every dwordx4 load in an item loop is
-        # nontemporal except the device-scope mids reads of the down units.
+        # nontemporal except the system-scope mids reads of the down units.
         wide = [
             s
             for s in body
@@ -229,3 +229,21 @@ def test_readiness_waits_use_scalar_loads_past_the_cache():
     ins = [s for s, _ in _instructions(_compile(8, moe_stream.TAIL_SHARE))]
     polls = [s for s in ins if s.startswith("s_load_dwordx16")]
     assert polls and all(s.endswith(" glc") for s in polls), polls
+
+
+@pytest.mark.parametrize(
+    "variant",
+    VARIANTS,
+    ids=lambda v: f"rows{v['ROWS']}-tail{v['TAIL'][0]}of{v['TAIL'][1]}",
+)
+def test_shared_buffer_stores_use_system_scope(variant):
+    """The mids, their scales and the tags (including the clear of the next
+    launch's tag copy) are read by waves on other XCDs, so every buffer store
+    to them is system scope (SC0 SC1); only the route rows, read after the
+    launch, carry no scope bits. No buffer store is device scope alone."""
+    ins = [s for s, _ in _instructions(_compile(variant["ROWS"], variant["TAIL"]))]
+    stores = [s for s in ins if s.startswith("buffer_store")]
+    assert stores
+    assert not [s for s in stores if s.endswith(" sc1") and " sc0 " not in s], stores
+    plain = [s for s in stores if not s.endswith((" sc1", " nt"))]
+    assert plain and all(s.startswith("buffer_store_dwordx2") for s in plain), plain
