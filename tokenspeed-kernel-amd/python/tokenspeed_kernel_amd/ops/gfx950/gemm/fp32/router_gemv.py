@@ -131,16 +131,15 @@ def gluon_fp32_router_gemv_gfx950(
 
 # Measured split-K tiles per (N, K), keyed by the largest row count each
 # serves, as (BLOCK_M, BLOCK_N, SPLIT_K, waves, chunks); None keeps the GEMV
-# (or torch.addmm above MAX_ROWS). From cold-weight CUDA-graph sweeps on
-# MI355X (64 rotating weight copies, capture_session): each entry beat the
-# path it replaces by at least 4% at the row counts it serves; above the last
-# bucket hipBLASLt is as fast or faster.
+# (or torch.addmm above MAX_ROWS). Swept on MI355X in HIP-graph replays with
+# cold weights (rotating over 64 weight copies): each entry beat the path it
+# replaces by at least 4% at the row counts it serves; above the last bucket
+# hipBLASLt is as fast or faster.
 _PREFERRED_SPLITK_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int] | None]
 ] = {
-    # 8192-wide router over 256 experts (Muse Spark), us per call:
-    # 9-16 rows 8.5-8.8 (GEMV) -> 7.3; 17-64 rows 12.1 (hipBLASLt) -> 7.4-8.8;
-    # 80-96 rows 12.6-14.3 -> 10.5.
+    # 8192-wide router over 256 experts (Muse Spark): the split-K GEMM replaces
+    # the GEMV at 9-16 rows and hipBLASLt at 17-96 rows.
     (256, 8192): {
         8: None,
         64: (16, 16, 8, 4, 1),
