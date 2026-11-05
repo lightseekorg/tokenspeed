@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
 from utils import assert_no_triton_compile, is_cdna4
@@ -220,3 +222,69 @@ def test_splitk_router_compiles_once_per_bucket() -> None:
     with assert_no_triton_compile(gluon_fp32_router_gemv_splitk_gfx950):
         for rows in range(min(SPLITK_ROWS), max(SPLITK_ROWS) + 1):
             _launch(x[:rows].contiguous(), prepared, MULTIPLIER)
+
+
+def _compile_splitk(**config):
+    """Compile the split-K kernel for gfx950 without launching it.
+
+    ``config`` overrides the 8192 x 256 router's 64-row bucket.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+
+    fn = gluon_fp32_router_gemv_splitk_gfx950
+    pointers = ("x_ptr", "weight_ptr", "out_ptr", "partial_ptr", "counter_ptr")
+    constexprs = {
+        "K": 8192,
+        "N": 256,
+        "BLOCK_M": 16,
+        "BLOCK_N": 16,
+        "SPLIT_K": 8,
+        "CHUNKS": 1,
+        "MULTIPLIER": 1.0,
+        **config,
+    }
+    signature = {name: "*fp32" for name in pointers}
+    signature.update(counter_ptr="*i32", M="i32")
+    signature.update({name: "constexpr" for name in constexprs})
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    return triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn,
+            {name: signature[name] for name in fn.arg_names},
+            constexprs=constexprs,
+            attrs=attrs,
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 4},
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        dict(BLOCK_M=16, BLOCK_N=16, SPLIT_K=8, CHUNKS=1),
+        dict(BLOCK_M=32, BLOCK_N=16, SPLIT_K=16, CHUNKS=2),
+    ],
+)
+def test_splitk_partials_bypass_l2_and_weights_stream(config) -> None:
+    # The programs of a tile can run on different XCDs, so every partial store
+    # and load must be system scope (SC0 SC1). Each weight element is read
+    # once, so its loads are non-temporal (NT); x loads keep the defaults.
+    lines = _compile_splitk(**config).asm["amdgcn"].splitlines()
+
+    def cache_bits(op):
+        return [
+            frozenset(b for b in ("sc0", "sc1", "nt") if re.search(rf"\b{b}\b", line))
+            for line in lines
+            if re.match(rf"\s+{op}_dword", line)
+        ]
+
+    system, stream, default = frozenset({"sc0", "sc1"}), frozenset({"nt"}), frozenset()
+    loads, stores = cache_bits("buffer_load"), cache_bits("buffer_store")
+    assert set(loads) == {system, stream, default}, loads
+    assert loads.count(system) % config["SPLIT_K"] == 0
+    assert system in stores, stores
