@@ -18,6 +18,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_config import _apply_block_spec_widths
+from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
@@ -533,11 +534,20 @@ def test_taps_shift_by_one_and_sort_for_positional_concat() -> None:
 
 
 class _TapLayer(nn.Module):
-    """Taps the residual stream entering it, then adds ``layer_id + 1``."""
+    """Taps the residual stream entering it, then adds ``layer_id + 1``; its
+    CommManager runs the stack's final norm, as every stack layer's does."""
 
     def __init__(self, config, layer_id, mapping, quant_config, prefix) -> None:
         super().__init__()
         self.increment = float(layer_id + 1)
+        self.comm_manager = CommManager(
+            mapping=mapping,
+            layer_id=layer_id,
+            is_moe=False,
+            prev_is_moe=False,
+            dense_batch_invariant=False,
+            query_sharded=False,
+        )
 
     def forward(self, positions, hidden_states, ctx, residual, aux_hidden_states):
         stream = hidden_states if residual is None else hidden_states + residual
