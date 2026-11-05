@@ -1074,7 +1074,7 @@ predicts position 2049 whether computed as `1024 + 1024 + 1`,
 `130 cached + 1024 + 895`, or 2048 cached tokens plus one decode input.
 Constructing the base position does not implement MTP acceptance/residual RNG
 or domain separation; multi-token FlashInfer still uses its existing coins.
-The triton chain verify under `--enable-speculative-sampling` (DFLASH with a
+The Triton chain verify under `--enable-speculative-sampling` (DFLASH with a
 DFlash2 draft) keys its accept coins and draft noise by salted offsets
 disjoint from these positions. A row with a recorded draft q then emits an
 exact sample of the same distribution, not the position-keyed draw. Greedy

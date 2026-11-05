@@ -777,7 +777,7 @@ three records a proposal. The walk records `q` and the candidate ids per step,
 which is `K` entries instead of a vocabulary row. Verify accepts draft `x` with
 probability `min(1, p'(x) / q(x))` and on rejection samples from
 `norm(max(p' - q, 0))`, where `p'` is the target distribution after the
-request's temperature, top-k and top-p, the one the triton backend serves.
+request's temperature, top-k and top-p, the one the Triton backend serves.
 
 - Memory: `q` reuses the draft-tree q tables (`RuntimeStates.future_draft_q`),
   `(max_num_seqs + 2) x (num_draft_tokens - 1) x K x 8` bytes plus two int32
@@ -790,7 +790,7 @@ request's temperature, top-k and top-p, the one the triton backend serves.
   position. So a landed request's first verify can still accept drafts,
   unlike the step drafters' sentinel, which always rejects.
   `--spec-reject-draft-prob-threshold` has no effect here.
-- Routes: the triton backend picks one sampling route per batch. The
+- Routes: the Triton backend picks one sampling route per batch. The
   rejection rule runs on batches with no filter (top-k disabled, `top_p = 1`)
   and on batches where every request has a finite top-k, with any `top_p`.
   Under the flag those top-k batches always use the two-stage top-k kernel,
