@@ -55,12 +55,29 @@ pub struct UsrBioConfig {
     /// Independent read lanes; each serializes its own native ring.
     pub read_rings: usize,
 }
+#[derive(Debug, PartialEq, Eq)]
 struct Location {
     segment: String,
     offset: usize,
     size: usize,
 }
 impl Location {
+    fn read(path: &Path) -> Result<Option<Self>, StoreError> {
+        let mut f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(failed(e)),
+        };
+        if f.metadata().map_err(failed)?.len() != 56 {
+            return Ok(None);
+        }
+        let mut bytes = [0; 56];
+        match f.read_exact(&mut bytes) {
+            Ok(()) => Ok(Self::decode(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(failed(e)),
+        }
+    }
     fn encode(&self) -> Vec<u8> {
         let mut out = b"TS3FS01\0".to_vec();
         out.extend(self.segment.as_bytes());
@@ -88,6 +105,42 @@ impl Location {
 fn failed(e: std::io::Error) -> StoreError {
     StoreError(format!("3FS index: {e}"))
 }
+fn publish_index(path: &Path, location: &Location) -> Result<(), StoreError> {
+    let parent = path.parent().expect("bucket");
+    fs::create_dir_all(parent).map_err(failed)?;
+    let temporary = parent.join(format!(".index-{}", unique()?));
+    let mut f = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(failed)?;
+    let result = (|| {
+        f.write_all(&location.encode())?;
+        f.sync_all()?;
+        match fs::hard_link(&temporary, &path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if Location::read(path)
+                    .map_err(std::io::Error::other)?
+                    .is_some()
+                {
+                    Ok(())
+                } else {
+                    // Repair undecodable metadata. Concurrent repairs may
+                    // publish either complete copy of this immutable key.
+                    fs::rename(&temporary, path)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    })();
+    if let Err(e) = fs::remove_file(&temporary) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %temporary.display(), error = %e, "3FS index temporary cleanup failed");
+        }
+    }
+    result.map_err(failed)
+}
 fn unique() -> Result<String, StoreError> {
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")
@@ -105,6 +158,8 @@ struct Writer {
     ring: Ring,
     segment: Option<Segment>,
 }
+const READER_FILE_CACHE_CAPACITY: usize = 32;
+
 struct Reader {
     ring: Ring,
     files: VecDeque<(PathBuf, Arc<RegisteredFile>)>,
@@ -175,20 +230,7 @@ impl UsrBioStore {
         })
     }
     fn location(&self, key: &str) -> Result<Option<Location>, StoreError> {
-        let mut f = match File::open(self.index.path(key)?) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(failed(e)),
-        };
-        if f.metadata().map_err(failed)?.len() != 56 {
-            return Ok(None);
-        }
-        let mut bytes = [0; 56];
-        match f.read_exact(&mut bytes) {
-            Ok(()) => Ok(Location::decode(&bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-            Err(e) => Err(failed(e)),
-        }
+        Location::read(&self.index.path(key)?)
     }
     fn namespace(&self, key: &str) -> Result<PathBuf, StoreError> {
         let path = self.index.path(key)?;
@@ -200,27 +242,7 @@ impl UsrBioStore {
             .to_owned())
     }
     fn publish(&self, key: &str, location: &Location) -> Result<(), StoreError> {
-        let path = self.index.path(key)?;
-        let parent = path.parent().expect("bucket");
-        fs::create_dir_all(parent).map_err(failed)?;
-        let temporary = parent.join(format!(".index-{}", unique()?));
-        let mut f = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(failed)?;
-        let result = (|| {
-            f.write_all(&location.encode())?;
-            f.sync_all()?;
-            match fs::hard_link(&temporary, &path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-                Err(e) => Err(e),
-            }
-        })();
-        let cleanup = fs::remove_file(temporary);
-        result.map_err(failed)?;
-        cleanup.map_err(failed)
+        publish_index(&self.index.path(key)?, location)
     }
 }
 impl Store for UsrBioStore {
@@ -230,7 +252,9 @@ impl Store for UsrBioStore {
         true
     }
     fn batch_exists(&self, keys: &[String]) -> Result<Vec<bool>, StoreError> {
-        self.index.batch_exists(keys)
+        keys.iter()
+            .map(|key| self.location(key).map(|location| location.is_some()))
+            .collect()
     }
     fn batch_put_from(
         &self,
@@ -257,6 +281,8 @@ impl Store for UsrBioStore {
                 return Err(StoreError("3FS object exceeds USRBIO buffer_bytes".into()));
             }
             let namespace = self.namespace(key)?;
+            // An executor normally serves one namespace. Switching namespaces
+            // seals the current segment; no shared cross-namespace append state.
             if writer.segment.as_ref().is_none_or(|s| {
                 s.namespace != namespace || s.used + range.size > self.config.segment_bytes
             }) {
@@ -352,7 +378,7 @@ impl Store for UsrBioStore {
                     Err(e) => return Err(failed(e)),
                 };
                 let f = self.api.file(f)?;
-                if reader.files.len() == 32 {
+                if reader.files.len() == READER_FILE_CACHE_CAPACITY {
                     reader.files.pop_front();
                 }
                 reader.files.push_back((path, f.clone()));
@@ -393,4 +419,63 @@ impl Store for UsrBioStore {
         self.index.remove_by_prefix(prefix)
     }
     fn close(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn location() -> Location {
+        Location {
+            segment: "0123456789abcdef0123456789abcdef".into(),
+            offset: 4096,
+            size: 8192,
+        }
+    }
+
+    #[test]
+    fn location_codec_validates_metadata() {
+        let expected = location();
+        let bytes = expected.encode();
+        assert_eq!(Location::decode(&bytes), Some(expected));
+        assert!(Location::decode(&bytes[..55]).is_none());
+        let mut invalid = bytes.clone();
+        invalid[0] = b'X';
+        assert!(Location::decode(&invalid).is_none());
+        let mut invalid = bytes.clone();
+        invalid[8] = b'/';
+        assert!(Location::decode(&invalid).is_none());
+        let mut invalid = bytes;
+        invalid[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Location::decode(&invalid).is_none());
+    }
+
+    #[test]
+    fn index_publish_preserves_valid_objects_and_repairs_invalid_metadata() {
+        let root = std::env::temp_dir().join(format!("ts-l3-index-{}", unique().unwrap()));
+        let path = root.join("object");
+        assert_eq!(Location::read(&path).unwrap(), None);
+        let first = location();
+        publish_index(&path, &first).unwrap();
+        let second = Location {
+            offset: 32768,
+            ..location()
+        };
+        publish_index(&path, &second).unwrap();
+        assert_eq!(Location::read(&path).unwrap(), Some(first));
+        for invalid in [b"partial".to_vec(), vec![0; 56]] {
+            fs::write(&path, invalid).unwrap();
+            assert_eq!(Location::read(&path).unwrap(), None);
+            publish_index(&path, &second).unwrap();
+            assert_eq!(
+                Location::read(&path).unwrap(),
+                Some(Location {
+                    offset: 32768,
+                    ..location()
+                })
+            );
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

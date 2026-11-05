@@ -421,4 +421,4 @@ class L3Settings:
     tp_rank: int
     backend: str
     mooncake: MooncakeStoreSettings | None
-    hf3fs: Hf3fsStoreSettings | None = None
+    hf3fs: Hf3fsStoreSettings | None

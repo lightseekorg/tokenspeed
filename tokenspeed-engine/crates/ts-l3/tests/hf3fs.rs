@@ -20,8 +20,10 @@
 
 //! Requires a real USRBIO-enabled 3FS mount and native library.
 
+use sha2::{Digest, Sha256};
 use std::{
-    env,
+    env, fs,
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 use ts_l3::{
@@ -76,6 +78,11 @@ fn usrbio_objects_survive_reconnect_and_preserve_owner_shards() {
     )
     .unwrap();
     assert_eq!(store.batch_exists(&object_keys).unwrap(), [false, false]);
+    // Native prep rejects an empty transfer before queueing any I/O. A
+    // subsequent valid write must still work on the same client.
+    let empty_key = keys::object_key(&prefix, "empty", 0, 0, 0);
+    let rejected = store.batch_put_from(&[empty_key], host, &[Range { offset: 0, size: 0 }]);
+    assert!(rejected.unwrap_err().to_string().contains("prep_io"));
     let written = store.batch_put_from(&object_keys, host, &ranges).unwrap();
     assert_eq!(written.success, [true, true]);
     assert!(written.retired);
@@ -101,6 +108,46 @@ fn usrbio_objects_survive_reconnect_and_preserve_owner_shards() {
     assert_eq!(read.success, [true, true]);
     assert!(read.retired);
     assert_eq!(bytes, expected);
+    // Exercise review regressions against actual 3FS, only in this test's
+    // unique namespace: invalid metadata can be rewritten, and one unreadable
+    // location must not hide a healthy object's completion in the same batch.
+    let first_index = Path::new(&directory)
+        .join("usrbio-v1")
+        .join(&prefix)
+        .join(format!(
+            "{:02x}",
+            Sha256::digest(object_keys[0].as_bytes())[0]
+        ))
+        .join(&object_keys[0]);
+    fs::write(&first_index, b"invalid index").unwrap();
+    assert_eq!(store.batch_exists(&object_keys).unwrap(), [false, true]);
+    let repaired = store.batch_put_from(&object_keys, host, &ranges).unwrap();
+    assert_eq!(repaired.success, [true, true]);
+    bytes.fill(0);
+    assert_eq!(
+        store
+            .batch_get_into(&object_keys, host, &ranges)
+            .unwrap()
+            .success,
+        [true, true]
+    );
+    assert_eq!(bytes, expected);
+
+    let index = fs::read(&first_index).unwrap();
+    let mut invalid_location = index.clone();
+    // This location is outside the segment, independently of the backend's
+    // treatment of holes inside a pre-sized file.
+    invalid_location[40..48].copy_from_slice(&(64u64 * 1024 * 1024).to_le_bytes());
+    fs::write(&first_index, &invalid_location).unwrap();
+    bytes.fill(0x7e);
+    let read = store.batch_get_into(&object_keys, host, &ranges).unwrap();
+    assert!(read.retired);
+    assert_eq!(read.success, [false, true]);
+    assert_eq!(read.object_failures, [true, false]);
+    assert!(bytes[..65536].iter().all(|&byte| byte == 0x7e));
+    assert_eq!(bytes[65536..], expected[65536..]);
+    fs::write(&first_index, index).unwrap();
+
     let other_model = keys::object_key(
         &keys::key_prefix(&deployment, "weights-v2", ""),
         "aabb",

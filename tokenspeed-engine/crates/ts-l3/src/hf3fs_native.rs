@@ -31,6 +31,13 @@ use std::{
     sync::Arc,
 };
 
+// C ABI: deepseek-ai/3FS src/lib/api/hf3fs_usrbio.h at
+// 6c856acb4baad524e6def1d3381aeded4e491b5a.
+const HF3FS_IOR_FORBID_READ_HOLES: u64 = 2;
+const IO_DEPTH_ASAP: c_int = 0;
+const RING_TIMEOUT_UNUSED: c_int = 0; // Only used with positive io_depth.
+const NUMA_ANY: c_int = -1;
+
 #[repr(C)]
 struct Iov {
     base: *mut u8,
@@ -178,6 +185,37 @@ pub(crate) struct Request {
     pub(crate) range: Range,
 }
 
+fn batch_len(
+    sizes: impl Iterator<Item = usize>,
+    entries: usize,
+    capacity: usize,
+) -> Result<usize, StoreError> {
+    let mut count = 0;
+    let mut bytes = 0;
+    for size in sizes.take(entries) {
+        if size > capacity {
+            return Err(StoreError(
+                "3FS object exceeds configured USRBIO buffer_bytes".into(),
+            ));
+        }
+        if size > capacity - bytes {
+            break;
+        }
+        bytes += size;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn completion_success(read: bool, result: i64, size: usize) -> Result<bool, StoreError> {
+    if result < 0 && !read {
+        return Err(error("completion", result as i32));
+    }
+    // All completions have retired before this is called. Failed reads carry
+    // object evidence to the executor without discarding healthy batch peers.
+    Ok(result >= 0 && result as u64 == size as u64)
+}
+
 /// One serialized native ring, owned by a Store worker lane.
 pub(crate) struct Ring {
     api: Arc<Api>,
@@ -217,7 +255,8 @@ impl Ring {
             poisoned: false,
             pending: Vec::new(),
         };
-        let rc = unsafe { (ring.api.iov_create)(&mut *ring.iov, mount.as_ptr(), bytes, 0, -1) };
+        let rc =
+            unsafe { (ring.api.iov_create)(&mut *ring.iov, mount.as_ptr(), bytes, 0, NUMA_ANY) };
         if rc < 0 {
             return Err(error("iovcreate", rc));
         }
@@ -229,10 +268,11 @@ impl Ring {
                 mount.as_ptr(),
                 entries as i32,
                 read,
-                0,
-                1,
-                -1,
-                if read { 2 } else { 0 },
+                IO_DEPTH_ASAP,
+                RING_TIMEOUT_UNUSED,
+                NUMA_ANY,
+                // Request hole errors from 3FS; this is not a payload checksum.
+                if read { HF3FS_IOR_FORBID_READ_HOLES } else { 0 },
             )
         };
         if rc < 0 {
@@ -254,27 +294,28 @@ impl Ring {
         let mut output = Vec::with_capacity(requests.len());
         let mut start = 0;
         while start < requests.len() {
-            let mut end = start;
-            let mut bytes = 0usize;
-            while end < requests.len() && end - start < self.entries {
-                let size = requests[end].range.size;
-                if size > self.bytes {
-                    return Err(StoreError(
-                        "3FS object exceeds configured USRBIO buffer_bytes".into(),
-                    ));
-                }
-                if bytes + size > self.bytes {
-                    break;
-                }
-                bytes += size;
-                end += 1;
-            }
+            let count = batch_len(
+                requests[start..].iter().map(|r| r.range.size),
+                self.entries,
+                self.bytes,
+            )?;
+            let end = start + count;
             output.extend(self.batch(host, &requests[start..end])?);
             start = end;
         }
         Ok(output)
     }
     fn batch(&mut self, host: HostBuffer, requests: &[Request]) -> Result<Vec<bool>, StoreError> {
+        let mut deadline: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut deadline) } != 0 {
+            return Err(StoreError("3FS USRBIO clock_gettime failed".into()));
+        }
+        deadline.tv_sec += (self.timeout_ms / 1000) as libc::time_t;
+        deadline.tv_nsec += ((self.timeout_ms % 1000) * 1_000_000) as libc::c_long;
+        if deadline.tv_nsec >= 1_000_000_000 {
+            deadline.tv_nsec -= 1_000_000_000;
+            deadline.tv_sec += 1;
+        }
         let mut offsets = Vec::with_capacity(requests.len());
         let mut cursor = 0;
         for request in requests {
@@ -310,6 +351,12 @@ impl Ring {
                 )
             };
             if rc < 0 {
+                // A rejected first prep has exposed no I/O. Once any prep
+                // succeeds, FUSE may already be using the staging memory.
+                if indexes.is_empty() {
+                    self.poisoned = false;
+                    self.pending.clear();
+                }
                 return Err(error("prep_io", rc));
             }
             indexes.push(rc);
@@ -317,16 +364,6 @@ impl Ring {
         let rc = unsafe { (self.api.submit)(&*self.ior) };
         if rc < 0 {
             return Err(error("submit_ios", rc));
-        }
-        let mut deadline: libc::timespec = unsafe { std::mem::zeroed() };
-        if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut deadline) } != 0 {
-            return Err(StoreError("3FS USRBIO clock_gettime failed".into()));
-        }
-        deadline.tv_sec += (self.timeout_ms / 1000) as libc::time_t;
-        deadline.tv_nsec += ((self.timeout_ms % 1000) * 1_000_000) as libc::c_long;
-        if deadline.tv_nsec >= 1_000_000_000 {
-            deadline.tv_nsec -= 1_000_000_000;
-            deadline.tv_sec += 1;
         }
         let mut cqes = vec![
             Completion {
@@ -380,10 +417,14 @@ impl Ring {
         let mut success = Vec::with_capacity(requests.len());
         for (i, result) in completed.into_iter().enumerate() {
             let result = result.expect("all native completions received");
-            if result < 0 {
-                return Err(error("completion", result as i32));
+            let ok = completion_success(self.read, result, requests[i].range.size)?;
+            if !ok {
+                tracing::warn!(
+                    read = self.read,
+                    result,
+                    "3FS object I/O failed after retirement"
+                );
             }
-            let ok = result as usize == requests[i].range.size;
             if ok && self.read {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -425,5 +466,31 @@ impl Drop for Ring {
                 (self.api.iov_destroy)(&mut *self.iov);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batches_respect_entry_and_staging_limits() {
+        assert_eq!(batch_len([4, 4, 4].into_iter(), 2, 16).unwrap(), 2);
+        assert_eq!(batch_len([4, 4, 4].into_iter(), 8, 8).unwrap(), 2);
+        assert_eq!(batch_len([8].into_iter(), 1, 8).unwrap(), 1);
+        assert_eq!(batch_len([].into_iter(), 1, 8).unwrap(), 0);
+        assert!(batch_len([9].into_iter(), 1, 8).is_err());
+    }
+
+    #[test]
+    fn retired_read_errors_do_not_fail_healthy_peers() {
+        let success = [64, -(libc::EIO as i64), 32, 64]
+            .into_iter()
+            .map(|result| completion_success(true, result, 64))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(success, [true, false, false, true]);
+        assert!(completion_success(false, -(libc::EIO as i64), 64).is_err());
+        assert!(!completion_success(false, 32, 64).unwrap());
     }
 }

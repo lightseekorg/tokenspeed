@@ -87,6 +87,7 @@ def start_l3_executor(
             tp_rank=tp_rank,
             backend="memory" if mooncake is None else "mooncake",
             mooncake=mooncake,
+            hf3fs=None,
         )
     )
 
