@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -85,6 +86,10 @@ def _op(states, rids, slots, lengths, prefixes, replays, overrides):
         ids.extend(
             (state.prompt_input_ids + state.output_ids)[prefix : prefix + length]
         )
+    input_ids = np.array(ids, dtype=np.int32)
+    shifted_ids = np.array(ids[1:] + [-1] if ids else [], dtype=np.int32)
+    input_ids.flags.writeable = False
+    shifted_ids.flags.writeable = False
     return SimpleNamespace(
         request_ids=rids,
         request_pool_indices=slots,
@@ -92,8 +97,8 @@ def _op(states, rids, slots, lengths, prefixes, replays, overrides):
         prefill_lengths=[
             len(states[r].prompt_input_ids) + len(states[r].output_ids) for r in rids
         ],
-        input_ids=ids,
-        shifted_input_ids=ids[1:] + [-1] if ids else [],
+        input_ids=input_ids,
+        shifted_input_ids=shifted_ids,
         extend_prefix_lens=prefixes,
         extend_replay_lens=replays,
         decode_input_ids=overrides,
