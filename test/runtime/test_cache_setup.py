@@ -157,7 +157,7 @@ def test_verify_preparation_calls_root_with_existing_budget_gate(
     draft_backend = Mock(spec=AttentionBackend)
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=3),
-        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        config=SimpleNamespace(max_bs=4, qcp_size=1, kvp_size=1),
         backend=backend,
         draft_backend=draft_backend,
         uses_paged_state_verify=uses_paged_state_verify,

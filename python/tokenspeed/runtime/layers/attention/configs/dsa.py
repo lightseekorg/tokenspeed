@@ -27,11 +27,13 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -140,6 +142,27 @@ def dsa_history_gather_workspace_bytes(
     return rows * (
         kv_bytes + index_k_row_bytes(spec.index_head_dim, spec.index_k_format)
     )
+
+
+def dsa_kvp_history_prefill(config: AttnConfig) -> bool:
+    """Whether the target DSA leaf runs its KVP prefill over gathered
+    histories, and so needs the history gather workspace: each rank gathers
+    the chunk's history pages from their owners and scores and attends them
+    with its own attention-TP heads, as an unsharded cache would, in place of
+    the sharded arm's query gather and partials exchange.
+
+    The target over KVP pages without query context parallelism (which has
+    its own sharded arm) on AMD GPUs, where it is validated; NVIDIA and the
+    Ascend leaf keep their KVP prefill. A bitwise envelope keeps the sharded
+    arm too: this one attends each row in one pass where the sharded arm
+    merges per-owner partials, so it rounds differently."""
+    if config.qcp_size > 1 or config.kvp_size == 1:
+        return False
+    if config.component(DSAConfig) is None or config.is_draft:
+        return False
+    if not current_platform().is_amd:
+        return False
+    return global_server_args_dict["numerics"] not in BITWISE_ENVELOPES
 
 
 def dsa_padded_prefill_replay(

@@ -1094,7 +1094,20 @@ class GlmDsaSparseAttentionMixin:
         max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
         placement = ctx.attn_backend.cache_placement(self.attn_mqa)
         owned_index = None
-        if placement is not None:
+        if placement is not None and ctx.attn_backend.takes_history_prefill_topk():
+            kv_workspace_slots = ctx.attn_backend.require_history_prefill().slots
+            workspace_indices, topk_lens = self._select_history_prefill_topk_rows(
+                ctx,
+                q=q,
+                weights=weights,
+                row_starts=row_starts,
+                row_ends=row_ends,
+                candidate_lens_cpu=candidate_lens_cpu,
+                max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+                topk=topk,
+                query_proj=indexer_output.query_proj,
+            )
+        elif placement is not None:
             if indexer_output.query_proj is not None:
                 q = indexer_output.query_proj(q)
             q, q_scales = self._scorer_index_query(q, index_k_cache)
@@ -1170,6 +1183,57 @@ class GlmDsaSparseAttentionMixin:
             candidate_lens_cpu=candidate_lens_cpu,
             dcp_index=owned_index,
         )
+
+    def _select_history_prefill_topk_rows(
+        self,
+        ctx: ForwardContext,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        candidate_lens_cpu: torch.Tensor,
+        max_logits_bytes: int,
+        topk: int,
+        query_proj: Callable[[torch.Tensor], torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prefill top-k over KVP pages from gathered histories
+        (``dsa_kvp_history_prefill``): per request group, the
+        index-K pages gathered from their owners, scored as an unsharded
+        cache's plane through the plan's slot map
+        (:meth:`_select_prefill_topk_rows`, rows split over TP). Returns
+        workspace rows and per-row lengths, as that selection does; the plan's
+        slots map the rows to gathered latent slots."""
+        backend = ctx.attn_backend
+        pool = ctx.token_to_kv_pool
+        plan = backend.require_history_prefill()
+        row_starts = row_starts.to(torch.int32).contiguous()
+        row_ends = row_ends.to(torch.int32).contiguous()
+        indices, lens = [], []
+        for group in plan.groups:
+            # Every rank joins every group's gather.
+            plane = backend.gather_history_index_k_pages(
+                self.attn_mqa.layer_id, pool, group
+            )
+            rows = group.query
+            selected, selected_lens = self._select_prefill_topk_rows(
+                q=q[rows],
+                weights=weights[rows],
+                kv_workspace_slots=plan.slots,
+                row_starts=row_starts[rows],
+                row_ends=row_ends[rows],
+                candidate_lens_cpu=candidate_lens_cpu[rows],
+                index_k_cache=plane,
+                page_size=pool.index_k_page_size,
+                max_logits_bytes=max_logits_bytes,
+                topk=topk,
+                query_proj=query_proj,
+            )
+            indices.append(selected)
+            lens.append(selected_lens)
+        if len(indices) == 1:
+            return indices[0], lens[0]
+        return torch.cat(indices), torch.cat(lens)
 
     def _owned_width_dcp_index(
         self,
