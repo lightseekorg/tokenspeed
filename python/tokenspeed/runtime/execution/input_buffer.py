@@ -23,6 +23,7 @@ from __future__ import annotations
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 from tokenspeed_kernel.ops.metadata.ngram import NGramHashParams, prepare_ngram_inputs
@@ -410,23 +411,23 @@ class InputBuffers:
         and writes none of them (see ``load_round_inputs``)."""
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
+        # Every forward_op attribute read re-boxes the whole C++ vector into a
+        # fresh Python list (the plan's def_ro value semantics), so a vector
+        # read more than once per round goes through one local list — the
+        # per-element all() below would cast 3*B whole vectors otherwise.
+        req_pool_indices = forward_op.request_pool_indices
+        input_lengths = forward_op.input_lengths
 
         # CPU-side fast path: when the scheduler always emits a decode_input_ids
         # list (even though every entry is -1, meaning "no override").
         decode_input_ids = forward_op.decode_input_ids
         if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
             decode_input_ids = None
-        n_req = len(forward_op.request_pool_indices)
-        n_len = len(forward_op.input_lengths)
         req_pool_indices_cpu, input_lengths_cpu = self._bulk_pinned(
-            (n_req, torch.int64), (n_len, torch.int32)
+            (len(req_pool_indices), torch.int64), (len(input_lengths), torch.int32)
         )
-        req_pool_indices_cpu.copy_(
-            torch.as_tensor(forward_op.request_pool_indices, dtype=torch.int64)
-        )
-        input_lengths_cpu.copy_(
-            torch.as_tensor(forward_op.input_lengths, dtype=torch.int32)
-        )
+        req_pool_indices_cpu.copy_(torch.as_tensor(req_pool_indices, dtype=torch.int64))
+        input_lengths_cpu.copy_(torch.as_tensor(input_lengths, dtype=torch.int32))
         self.req_pool_indices_buf[:batch_size].copy_(
             req_pool_indices_cpu,
             non_blocking=True,
@@ -447,12 +448,13 @@ class InputBuffers:
                 decode_width=runtime_states.future_input_map.shape[1],
             )
 
+        extend_prefix_lens = forward_op.extend_prefix_lens
+        prefill_lengths = forward_op.prefill_lengths
         self.all_extends_mid_chunk = (
             num_extends > 0
             and num_extends == batch_size
             and all(
-                forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
-                < forward_op.prefill_lengths[i]
+                extend_prefix_lens[i] + input_lengths[i] < prefill_lengths[i]
                 for i in range(num_extends)
             )
         )
@@ -460,16 +462,16 @@ class InputBuffers:
         if num_extends > 0:
             # Fresh bulk pinned per step (see _bulk_pinned: persistent staging races overlap scheduling).
             self.extend_prefix_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.extend_prefix_lens, dtype=torch.int32
+                extend_prefix_lens, dtype=torch.int32
             )
             self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.input_lengths[:num_extends], dtype=torch.int32
+                input_lengths[:num_extends], dtype=torch.int32
             )
             self.extend_replay_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.extend_replay_lens, dtype=torch.int32
             )
             self.extend_prompt_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.prefill_lengths[:num_extends], dtype=torch.int32
+                prefill_lengths[:num_extends], dtype=torch.int32
             )
             if self.reads_state_checkpoints:
                 self.extend_state_checkpoint_lens_cpu[:num_extends] = torch.as_tensor(
@@ -536,21 +538,28 @@ class InputBuffers:
 
         # Determine input_ids and forward_mode
         if num_extends > 0:
-            prefill_token_count = sum(forward_op.input_lengths[:num_extends])
-            n_ids = len(forward_op.input_ids)
-            (input_ids_cpu,) = self._bulk_pinned((n_ids, torch.int32))
-            input_ids_cpu.copy_(
-                torch.as_tensor(forward_op.input_ids, dtype=torch.int32)
+            prefill_token_count = sum(input_lengths[:num_extends])
+            # One cast per field, through numpy: as_tensor(list) boxes every
+            # token as a Python int while np.asarray stores int32 directly,
+            # and the staging sizes come from the converted tensors instead
+            # of extra len() casts of the same lists. The [:prefill_token_count]
+            # copies still enforce len(input_ids) == sum(input_lengths
+            # [:num_extends]) (pinned by the scheduler's FSM tests) by shape
+            # mismatch.
+            input_ids_t = torch.from_numpy(
+                np.asarray(forward_op.input_ids, dtype=np.int32)
             )
+            (input_ids_cpu,) = self._bulk_pinned((input_ids_t.numel(), torch.int32))
+            input_ids_cpu.copy_(input_ids_t)
             self.input_ids_buf[:prefill_token_count].copy_(
                 input_ids_cpu,
                 non_blocking=True,
             )
-            n_sh = len(forward_op.shifted_input_ids)
-            (shifted_ids_cpu,) = self._bulk_pinned((n_sh, torch.int32))
-            shifted_ids_cpu.copy_(
-                torch.as_tensor(forward_op.shifted_input_ids, dtype=torch.int32)
+            shifted_ids_t = torch.from_numpy(
+                np.asarray(forward_op.shifted_input_ids, dtype=np.int32)
             )
+            (shifted_ids_cpu,) = self._bulk_pinned((shifted_ids_t.numel(), torch.int32))
+            shifted_ids_cpu.copy_(shifted_ids_t)
             self.shifted_prefill_ids_buf[:prefill_token_count].copy_(
                 shifted_ids_cpu,
                 non_blocking=True,
