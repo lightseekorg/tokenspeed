@@ -10,6 +10,7 @@ recurrent KDA state still gets committed after a DSpark verify.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -325,10 +326,69 @@ def test_the_block_projection_matches_projecting_each_position() -> None:
         assert torch.allclose(block[k], expected, atol=1e-5), f"position {k}"
 
 
-def test_the_block_projection_stands_down_without_a_sharded_head() -> None:
-    """Drafters whose head carries no shard metadata keep the per-step path."""
+def test_the_block_projection_stands_down_without_a_head_or_shard() -> None:
+    """Without a head, or with an empty vocab shard, the walk keeps the
+    per-step path."""
     drafter = _drafter(spec_num_tokens=4)
     assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
 
     drafter.lm_head = _ShardedHead(torch.randn(0, HIDDEN))
     assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
+
+
+def _replicated_head_drafter(positions: int) -> DSpark:
+    """Attention DP without LM-head TP: the target's head is replicated."""
+    from tokenspeed.runtime.layers.linear import ReplicatedLinear
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+
+    drafter = _drafter(spec_num_tokens=positions)
+    head = ReplicatedLinear(
+        HIDDEN, VOCAB, bias=False, quant_config=None, prefix="lm_head"
+    )
+    torch.manual_seed(5)
+    head.weight.data.copy_(torch.randn(VOCAB, HIDDEN))
+    drafter.lm_head = head
+    drafter.logits_processor = LogitsProcessor(
+        SimpleNamespace(model_type="test", vocab_size=VOCAB), dp_lm_head_tp=False
+    )
+    return drafter
+
+
+def test_a_replicated_head_projects_the_block_in_one_call() -> None:
+    """The whole block goes through the logits path once instead of once
+    per position, with each position's logits unchanged."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+
+    rows, positions = 3, 6
+    drafter = _replicated_head_drafter(positions)
+    draft_hidden = torch.randn(rows, positions, HIDDEN)
+
+    block = drafter._block_base_logits(draft_hidden)
+
+    assert block is not None and block.shape == (positions, rows, VOCAB)
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    for k in range(positions):
+        expected = drafter.logits_processor._get_logits(
+            draft_hidden[:, k, :], drafter.lm_head, metadata, require_full_vocab=False
+        )
+        torch.testing.assert_close(block[k], expected)
+
+
+def test_a_replicated_head_walk_proposes_what_projecting_each_round_does() -> None:
+    rows, positions = 4, 6
+    drafter = _replicated_head_drafter(positions)
+    torch.manual_seed(9)
+    hidden = torch.randn(rows, positions, HIDDEN)
+    block = torch.randint(0, VOCAB, (rows, positions))
+
+    hoisted = drafter._sample_block(
+        hidden, block, torch.zeros(rows, positions, dtype=torch.long)
+    ).clone()
+    # Force the per-round projection the walk used before hoisting.
+    drafter._block_base_logits = lambda draft_hidden: None
+    per_round = drafter._sample_block(
+        hidden, block, torch.zeros(rows, positions, dtype=torch.long)
+    ).clone()
+
+    assert torch.equal(hoisted, per_round)

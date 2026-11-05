@@ -26,6 +26,8 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -84,22 +86,29 @@ class DSpark(DFlash):
     def _block_base_logits(self, draft_hidden: torch.Tensor):
         """Project every block position's hidden state in one GEMM.
 
-        Returns ``[positions, rows, org_vocab_shard]``, or None when the head
-        has no shard metadata and the caller must take its own path.
+        Returns ``[positions, rows, vocab]``: the org-vocab shard of a
+        vocab-parallel head, or the whole vocabulary of a replicated head
+        (attention DP without LM-head TP). None when there is no head or its
+        shard is empty, and the caller must take its own path.
         """
         head = getattr(self, "lm_head", None)
-        if head is None:
-            return None
-        if not hasattr(head, "weight") or not hasattr(head, "shard_indices"):
-            return None
-        num_org = int(head.shard_indices.num_org_elements)
-        if num_org <= 0:
+        if head is None or not hasattr(head, "weight"):
             return None
         positions = int(draft_hidden.shape[1])
         rows = int(draft_hidden.shape[0])
+        flat = draft_hidden.reshape(rows * positions, -1)
+        if not hasattr(head, "shard_indices"):
+            # The same logits path the per-position walk would take.
+            metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+            logits = self.logits_processor._get_logits(
+                flat, head, metadata, require_full_vocab=False
+            )
+            return logits.view(rows, positions, -1).transpose(0, 1).contiguous()
+        num_org = int(head.shard_indices.num_org_elements)
+        if num_org <= 0:
+            return None
         weight = head.weight
-        flat = draft_hidden.reshape(rows * positions, -1).to(weight.dtype)
-        logits = torch.matmul(flat, weight[:num_org].T)
+        logits = torch.matmul(flat.to(weight.dtype), weight[:num_org].T)
         # draft_hidden is [rows, positions, H]; the walk indexes by position.
         # The walk slices one position at a time; transpose alone would hand
         # each slice a positions-strided row layout, which the distributed

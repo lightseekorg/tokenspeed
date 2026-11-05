@@ -394,10 +394,14 @@ class DFlash(BaseDrafter):
             self.lm_head, "shard_indices"
         ):
             # Replicated draft rows: no query shard.
-            metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
-            logits = self.logits_processor._get_logits(
-                hidden_states, self.lm_head, metadata, require_full_vocab=False
-            )
+            if base_logits is None:
+                metadata = LogitsMetadata(
+                    forward_mode=ForwardMode.DECODE, query_shard=None
+                )
+                base_logits = self.logits_processor._get_logits(
+                    hidden_states, self.lm_head, metadata, require_full_vocab=False
+                )
+            logits = base_logits
             if bias_fn is not None:
                 logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
             argmax = torch.argmax(logits, dim=-1)
