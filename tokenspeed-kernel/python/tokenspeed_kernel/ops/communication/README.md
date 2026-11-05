@@ -89,13 +89,14 @@ synchronization domains). Each hand-off:
   counter atomic, the last CTA's `st.release.sys` of its arrival: base
   causality order is transitive, which makes the release cumulative over
   every payload store (PTX ISA memory consistency model). Each reader's
-  kernel `ld.acquire.sys`'s every arrival before it ends. Stores, fences, flags,
-  and acquires all run inside these kernels, in the remote domain on every
-  GPU, at system scope, so the rows are at system scope before the reader's
-  kernel ends. The consumer is a later kernel in the default domain, ordered
-  by an event; kernel end, event record, and event wait synchronize and
-  preserve proxies, which orders the multicast alias of the rows before the
-  consumer's unicast reads. The kernels themselves never read the rows.
+  kernel acquires every arrival with `ld.acquire.sys` before it ends. Stores,
+  fences, flags, and acquires all run inside these kernels, in the remote
+  domain on every GPU, at system scope, so the rows are at system scope before
+  the reader's kernel ends. The consumer is a later kernel in the default
+  domain, ordered by an event; kernel end, event record, and event wait
+  synchronize and preserve proxies, which orders the multicast alias of the
+  rows before the consumer's unicast reads. The kernels themselves never read
+  the rows.
 - The consumer of epoch `e - 2` to the stores of epoch `e` into the same slot.
   The reads are done when the consumer kernel ends; an event orders that
   before this kernel's `st.release.sys` of its credit, which every peer

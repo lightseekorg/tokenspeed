@@ -1983,8 +1983,8 @@ copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. On GB300 a KVP
 group may gather the same raw rows with a fused paged-row all-gather on a
-stream of its own instead (`tokenspeed-kernel`'s
-`ops/communication/README.md`), still one window ahead: each owner reads its
+stream of its own instead (`ops/communication/README.md` in
+`tokenspeed-kernel`), still one window ahead: each owner reads its
 rows in place and stores them into every rank's receive slot. GPU DSA sparse
 prefill instead combines local sparse-attention partials.
 Ascend's generic MLA prefill gathers each layer's complete cache plane into
