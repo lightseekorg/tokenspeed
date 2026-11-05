@@ -327,7 +327,7 @@ class InputBuffers:
             self.ngram_prefix_buf[:bs],
             self.ngram_hash_ids_buf[:refresh_tokens],
             total_tokens,
-            runtime_states.vocab_size,
+            runtime_states.input_vocab_size,
             uniform_length,
             self.ngram_hash_params,
         )
@@ -385,7 +385,7 @@ class InputBuffers:
 
         Args:
             substitute_ids: in-vocab token id per media modality.
-            vocab_size: target vocabulary size, for validation.
+            vocab_size: target input vocabulary size, for validation.
         """
         invalid = {
             modality: token_id
@@ -730,7 +730,7 @@ class InputBuffers:
         # final chunk's last row (patched by the drafter with the round's
         # sampled token), and every id the drafters consume is sampled or
         # substituted in-vocab by construction.
-        vocab_size = runtime_states.vocab_size
+        vocab_size = runtime_states.input_vocab_size
         self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 

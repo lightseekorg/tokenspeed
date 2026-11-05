@@ -237,7 +237,7 @@ def test_wire_drafter_sets_pad_ids_only_when_supported():
         drafter,
         SimpleNamespace(
             hf_config=SimpleNamespace(),
-            vocab_size=32000,
+            input_vocab_size=32000,
             is_multimodal_active=False,
         ),
     )

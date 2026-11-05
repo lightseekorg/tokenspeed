@@ -191,7 +191,8 @@ class TestIdleReplayScrubTest:
             ),
             runtime_states=SimpleNamespace(
                 valid_cache_lengths=torch.zeros(8, dtype=torch.int32),
-                vocab_size=32,
+                input_vocab_size=32,
+                output_vocab_size=32,
             ),
             device="cpu",
             device_module=torch.cpu,

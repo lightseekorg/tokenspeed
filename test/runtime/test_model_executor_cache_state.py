@@ -187,7 +187,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
         mark_spec_candidates_drafted=lambda _rows: events.append("candidates-real"),
-        vocab_size=32,
+        output_vocab_size=32,
     )
     executor.nan_guard = SimpleNamespace(
         audit_logits=lambda *_args: None,

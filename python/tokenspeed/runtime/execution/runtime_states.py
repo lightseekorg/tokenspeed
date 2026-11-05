@@ -65,12 +65,14 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
-        vocab_size: int,
+        input_vocab_size: int,
+        output_vocab_size: int,
         output_length: int,
         device: str = "cuda",
     ):
         self.device = device
-        self.vocab_size = vocab_size
+        self.input_vocab_size = input_vocab_size
+        self.output_vocab_size = output_vocab_size
         self.ngram_accepted_tokens: torch.Tensor | None = None
         self.ngram_needs_seed: torch.Tensor | None = None
         self.ngram_request_ids: list[str | None] = []
@@ -150,7 +152,7 @@ class RuntimeStates:
         pool_size = self.valid_cache_lengths.shape[0]
         self.draft_probs_sentinel = float(reject_threshold) + 1.0
         self.draft_probs = torch.full(
-            (pool_size, spec_num_tokens, self.vocab_size),
+            (pool_size, spec_num_tokens, self.output_vocab_size),
             self.draft_probs_sentinel,
             dtype=torch.float32,
             device=self.device,

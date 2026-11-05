@@ -261,6 +261,10 @@ storage the cache layer allocated. The scheduler owns allocation, so its output 
 Consumers outside the cache layer treat the ids as opaque.
 Export preserves every logical slot, including holes in a released prefix.
 Export and active-parent accounting skip reading those released references.
+Installing a fresh transfer destination into a leading null slot moves the
+released-prefix frontier back to that slot. A decode-side partial prefix hit
+leaves this hole until admission allocates it; the new block must then appear
+in both the exported table and active-parent accounting.
 
 A table resolves a block's id once, when the block enters a slot, and keeps
 it beside the reference (`BlockTable::PageIds`): a forward batch exports

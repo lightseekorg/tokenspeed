@@ -284,7 +284,7 @@ class ForwardStepRunner:
         # Physical extent: capture tables must cover the spec-verify overshoot
         # of a finished request lingering one overlap step.
         self.context_len = config.physical_context_len
-        self.vocab_size = config.vocab_size
+        self.vocab_size = config.output_vocab_size
         self.grammar_backend = config.grammar_backend
         self.capture_bs = get_batch_sizes_to_capture(config)
         # Two distinct maxima: graphs exist only for the capture ladder

@@ -236,6 +236,10 @@ public:
         }
         FatalCheck(fresh.size() == 1, "admission plan no longer fits the block pool");
         CacheBlockRef replaced = table.exchange(group_id_, static_cast<std::size_t>(slot), std::move(fresh.front()));
+        // A remote prefix hit leaves its partial block null until admission
+        // allocates the transfer destination. That slot is live again, even
+        // when ClaimHitBlocks counted it among the leading holes.
+        table.reclaimed_prefix_blocks_ = std::min(table.reclaimed_prefix_blocks_, slot);
         table.available_tokens_ = available_tokens;
         return replaced;
     }

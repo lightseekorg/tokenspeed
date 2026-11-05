@@ -71,6 +71,7 @@ def vocab_parallel_logprobs(
     target_ids: torch.Tensor,
     *,
     vocab_block: int,
+    negative_nll: bool,
     solution: str | None = None,
     override: str | None = None,
 ) -> torch.Tensor:
@@ -83,6 +84,9 @@ def vocab_parallel_logprobs(
         target_ids: ``[rows]`` integer token ids.
         vocab_block: Width of the trainer's ``sum(exp)`` shards; the fold
             across blocks is a fp32 left fold in vocabulary order.
+        negative_nll: Compute ``-(log(sum_exp) - target)`` when true,
+            otherwise ``target - log(sum_exp)``. The former retains the
+            negative zero from negating a zero cross-entropy loss.
         solution: Optional kernel solution for the block ``sum(exp)`` leaf;
             only leaves declaring the ``batch_invariant`` feature are eligible.
             None takes the highest-priority eligible leaf (a vendor leaf
@@ -90,7 +94,7 @@ def vocab_parallel_logprobs(
         override: Optional exact kernel-name or solution override.
 
     Returns:
-        ``[rows]`` fp32 log-probabilities, ``target - log(sum_exp)`` with
+        ``[rows]`` fp32 log-probabilities in the selected subtraction order, with
         ``target = logits[row, id] - max`` and ``sum_exp`` the fp32 left fold
         of the leaf's ``[rows, vocab // vocab_block]`` block partials.
     """
@@ -135,6 +139,7 @@ def vocab_parallel_logprobs(
     sum_exp = partials[:, 0]
     for block in range(1, partials.shape[1]):
         sum_exp = sum_exp + partials[:, block]
-    # Preserve the trainer's positive zero when target and log(sum_exp) are
-    # both zero. Negating an NLL would instead produce a negative zero.
+    if negative_nll:
+        return -(torch.log(sum_exp) - target)
+    # Preserve the established positive-zero convention when requested.
     return target - torch.log(sum_exp)
