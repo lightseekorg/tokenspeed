@@ -30,6 +30,9 @@ Covers:
   - advance with output tokens appended to token container
 """
 
+import gc
+
+import numpy as np
 import pytest
 from tokenspeed_scheduler import (
     PD,
@@ -575,8 +578,8 @@ class TestPrefillInputIds:
         op = plan.forward[0]
         assert op.num_extends() > 0
         assert op.input_lengths == [len(tokens)]
-        assert op.input_ids == tokens
-        assert op.shifted_input_ids == tokens[1:] + [-1]
+        assert op.input_ids.tolist() == tokens
+        assert op.shifted_input_ids.tolist() == tokens[1:] + [-1]
         assert op.extend_prefix_lens == [0]
 
     def test_chunked_prefill_input_ids_split_correctly(self):
@@ -588,22 +591,22 @@ class TestPrefillInputIds:
         # chunk 1: tokens[0:5], extend_prefix_len=0
         plan1 = s.next_execution_plan()
         assert plan1.forward[0].input_lengths == [5]
-        assert plan1.forward[0].input_ids == tokens[0:5]
-        assert plan1.forward[0].shifted_input_ids == tokens[1:6]
+        assert plan1.forward[0].input_ids.tolist() == tokens[0:5]
+        assert plan1.forward[0].shifted_input_ids.tolist() == tokens[1:6]
         assert plan1.forward[0].extend_prefix_lens == [0]
 
         # chunk 2: tokens[5:10], extend_prefix_len=5
         plan2 = s.next_execution_plan()
         assert plan2.forward[0].input_lengths == [5]
-        assert plan2.forward[0].input_ids == tokens[5:10]
-        assert plan2.forward[0].shifted_input_ids == tokens[6:11]
+        assert plan2.forward[0].input_ids.tolist() == tokens[5:10]
+        assert plan2.forward[0].shifted_input_ids.tolist() == tokens[6:11]
         assert plan2.forward[0].extend_prefix_lens == [5]
 
         # chunk 3: tokens[10:15], extend_prefix_len=10
         plan3 = s.next_execution_plan()
         assert plan3.forward[0].input_lengths == [5]
-        assert plan3.forward[0].input_ids == tokens[10:15]
-        assert plan3.forward[0].shifted_input_ids == tokens[11:15] + [-1]
+        assert plan3.forward[0].input_ids.tolist() == tokens[10:15]
+        assert plan3.forward[0].shifted_input_ids.tolist() == tokens[11:15] + [-1]
         assert plan3.forward[0].extend_prefix_lens == [10]
 
     def test_multi_request_prefill_input_ids_concatenated(self):
@@ -619,7 +622,7 @@ class TestPrefillInputIds:
         assert set(op.request_ids) == {"r0", "r1"}
         assert op.input_lengths == [len(tokens_by_id[rid]) for rid in op.request_ids]
         expected_ids = [t for rid in op.request_ids for t in tokens_by_id[rid]]
-        assert op.input_ids == expected_ids
+        assert op.input_ids.tolist() == expected_ids
         assert op.extend_prefix_lens == [0, 0]
 
     def test_extend_prefix_lens_nonzero_on_second_chunk(self):
@@ -631,17 +634,59 @@ class TestPrefillInputIds:
         plan1 = s.next_execution_plan()
         assert plan1.forward[0].input_lengths == [8]
         assert plan1.forward[0].extend_prefix_lens == [0]
-        assert plan1.forward[0].input_ids == tokens[0:8]
+        assert plan1.forward[0].input_ids.tolist() == tokens[0:8]
 
         plan2 = s.next_execution_plan()
         assert plan2.forward[0].input_lengths == [8]
         assert plan2.forward[0].extend_prefix_lens == [8]
-        assert plan2.forward[0].input_ids == tokens[8:16]
+        assert plan2.forward[0].input_ids.tolist() == tokens[8:16]
 
         plan3 = s.next_execution_plan()
         assert plan3.forward[0].input_lengths == [4]
         assert plan3.forward[0].extend_prefix_lens == [16]
-        assert plan3.forward[0].input_ids == tokens[16:20]
+        assert plan3.forward[0].input_ids.tolist() == tokens[16:20]
+
+    def test_input_ids_are_zero_copy_readonly_views(self):
+        """input_ids / shifted_input_ids are read-only int32 ndarrays over
+        the plan's own memory: the runtime's fill path reads them every
+        round, and a per-read list cast would box every token."""
+        tokens = list(range(300, 356))  # values outside the small-int cache
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", tokens)
+        op = s.next_execution_plan().forward[0]
+        assert isinstance(op.input_ids, np.ndarray)
+        assert op.input_ids.dtype == np.int32
+        assert not op.input_ids.flags.writeable
+        assert op.input_ids.tolist() == tokens
+        assert op.shifted_input_ids.tolist() == tokens[1:] + [-1]
+
+    def test_views_keep_the_batch_alive_after_the_plan_is_dropped(self):
+        """The runtime stages the view into pinned memory after the round's
+        plan may already be gone; each view owns a reference to the backing
+        batch (block_tables_arrays' ownership pattern)."""
+        tokens = list(range(300, 356))
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", tokens)
+        op = s.next_execution_plan().forward[0]
+        view = op.shifted_input_ids
+        expected = view.tolist()
+        del op, s
+        gc.collect()
+        assert view.tolist() == expected
+
+    def test_decode_only_batch_gives_empty_views(self):
+        """The repr and idle paths read the views on decode-only rounds too,
+        where both token vectors are empty."""
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", list(range(4)))
+        s.next_execution_plan()  # -> Prefilling
+        plan = s.next_execution_plan()  # -> Decoding
+        op = plan.forward[0]
+        assert op.num_extends() == 0
+        assert isinstance(op.input_ids, np.ndarray)
+        assert op.input_ids.shape == (0,)
+        assert op.input_ids.tolist() == []
+        repr(op)  # the package repr lists both vectors on every batch
 
 
 # ---------------------------------------------------------------------------

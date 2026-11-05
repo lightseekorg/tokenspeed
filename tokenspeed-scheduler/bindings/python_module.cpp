@@ -439,8 +439,24 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     auto forward_batch = nb::class_<tokenspeed::ForwardBatch>(forward, "Batch");
     BindForwardCommonFields<tokenspeed::ForwardBatch>(forward_batch);
-    forward_batch.def_ro("input_ids", &tokenspeed::ForwardBatch::input_ids)
-        .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
+    // The O(num_tokens) token vectors ride as zero-copy read-only int32
+    // views (block_tables_arrays' ownership pattern: `self` keeps the
+    // backing ForwardBatch alive for each view's lifetime); a def_ro list
+    // cast would box every token on every read, which the runtime's
+    // per-round fill path pays. Tests compare via .tolist().
+    forward_batch
+        .def_prop_ro("input_ids",
+                     [](nb::handle self) {
+                         auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                         return nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(op.input_ids.data(),
+                                                                                        {op.input_ids.size()}, self);
+                     })
+        .def_prop_ro("shifted_input_ids",
+                     [](nb::handle self) {
+                         auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                         return nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(
+                             op.shifted_input_ids.data(), {op.shifted_input_ids.size()}, self);
+                     })
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
         .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
         // Per extend row (the D role's remote admission only): every State
