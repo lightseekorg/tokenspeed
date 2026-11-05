@@ -31,6 +31,10 @@ real step must win over what capture left behind.
 
 from __future__ import annotations
 
+import os
+import sys
+
+import pytest
 import torch
 
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
@@ -43,6 +47,16 @@ from tokenspeed.runtime.sampling.backends.triton import (
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
+sys.path.insert(
+    0,
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
 
 def _backend() -> TritonSamplingBackend:
     config = SamplingBackendConfig(
@@ -53,15 +67,15 @@ def _backend() -> TritonSamplingBackend:
         max_bs=8,
         max_req_pool_size=4,
         vocab_size=128,
-        device=torch.device("cpu"),
+        device=torch.device("cuda"),
     )
     return TritonSamplingBackend(config)
 
 
 def test_route_tracks_membership_changes():
     backend = _backend()
-    no_filter = SamplingParams()  # top_k disabled, top_p 1.0
-    top_k_10 = SamplingParams(top_k=10)
+    no_filter = SamplingParams(seed=0)  # top_k disabled, top_p 1.0
+    top_k_10 = SamplingParams(top_k=10, seed=0)
 
     # Steady batch: nothing filtering -> no-filter route, whole-vocab pad.
     backend.prepare_step(["a"], [1], [no_filter])
@@ -86,14 +100,16 @@ def test_route_tracks_membership_changes():
     assert backend._top_k_top_p_pad == _TOP_K_TOP_P_PAD
 
     # An all-finite batch of small top_ks routes to top_k.
-    backend.prepare_step(["b", "c"], [2, 3], [top_k_10, SamplingParams(top_k=20)])
+    backend.prepare_step(
+        ["b", "c"], [2, 3], [top_k_10, SamplingParams(top_k=20, seed=0)]
+    )
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_K
     assert backend._top_k_top_p_pad == 64
 
 
 def test_prepare_step_wins_over_the_capture_route():
     backend = _backend()
-    backend.prepare_step(["a"], [1], [SamplingParams()])
+    backend.prepare_step(["a"], [1], [SamplingParams(seed=0)])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER
 
     # Capture resets the route directly (outside prepare_step).
@@ -102,5 +118,5 @@ def test_prepare_step_wins_over_the_capture_route():
 
     # The next real step restores the batch's route even though membership
     # did not move: capture must not leak past the cache restore.
-    backend.prepare_step(["a"], [1], [SamplingParams()])
+    backend.prepare_step(["a"], [1], [SamplingParams(seed=0)])
     assert backend._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER
