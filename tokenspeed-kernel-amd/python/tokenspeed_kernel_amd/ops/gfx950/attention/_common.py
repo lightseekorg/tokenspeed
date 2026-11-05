@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from tokenspeed_kernel_amd._scheduling import wave_all_equal
 from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin, tl
 
 _INV_LN2_VALUE = 1.4426950408889634
@@ -190,21 +191,9 @@ def _join_columns(lo, hi):
 def _wave_maxima_unchanged(m_old, m_new):
     # Returns 1 when no row of the wave moved its maximum, else 0, as one
     # wave-uniform SGPR value, so a branch on it is a scalar branch that skips
-    # the rescale for the whole wave:
-    #   v_cmp_eq_f32  VCC bit set for each lane whose maximum is unchanged
-    #   s_cmp_eq_u64  SCC = every active lane set its bit (VCC == EXEC)
-    #   s_cselect     SGPR result = SCC ? 1 : 0
-    # "=s" asks for an SGPR result; VCC and SCC are declared clobbered.
-    return gl.inline_asm_elementwise(
-        asm="v_cmp_eq_f32_e64 vcc, $1, $2\n"
-        "s_cmp_eq_u64 vcc, exec\n"
-        "s_cselect_b32 $0, 1, 0",
-        constraints="=s,v,v,~{vcc},~{scc}",
-        args=[m_old, m_new],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    # the rescale for the whole wave (v_cmp_eq_f32 into a lane mask, compared
+    # with EXEC). Kernels calling it launch with sched_compile_options().
+    return wave_all_equal(m_old, m_new)
 
 
 @gluon.constexpr_function
