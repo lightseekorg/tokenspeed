@@ -42,7 +42,7 @@ if is_amd():
     pytest.skip(
         "Packed-kernel row cap (256) and the grouped fallback "
         "(triton_minimax_sigmoid_bias_topk) pinned here are NVIDIA-tuned; "
-        "AMD/CDNA dispatch (row cap 1, gluon fallback) is covered by "
+        "AMD/CDNA dispatch (gfx950 and gfx1250 row caps) is covered by "
         "test_kimi3_sigmoid_topk_amd.py",
         allow_module_level=True,
     )
