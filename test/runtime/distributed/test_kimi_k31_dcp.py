@@ -123,6 +123,8 @@ def _dense_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
 def _selection_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
     """History past index_topk: the group selects what one rank holding the
     whole history selects, and attends it to the same output."""
+    from tokenspeed_kernel.platform import current_platform
+
     from test.runtime.test_kimi_k31 import (
         _assert_close_to_reference,
         _k31_attention_stack,
@@ -162,10 +164,12 @@ def _selection_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float)
     )
     assert torch.equal(counts, expected_counts)
     assert (counts == 512).all()
-    for row in range(spec_width):
-        assert sorted(slots[row, :512].tolist()) == sorted(
-            expected_slots[row, :512].tolist()
-        )
+    # On gfx950, sharded scoring order and unordered ties can swap keys at the cut.
+    if not current_platform().is_amd:
+        for row in range(spec_width):
+            assert sorted(slots[row, :512].tolist()) == sorted(
+                expected_slots[row, :512].tolist()
+            )
     for got, reference in zip(outputs, expected, strict=True):
         _assert_close_to_reference(got, reference.float(), fraction)
 
@@ -192,7 +196,7 @@ def _prefix_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
         generator=torch.Generator(device="cuda").manual_seed(7),
     )
     resumed, expected = _extend_over_a_cached_prefix(
-        *stacks, hidden, blocks=[9, 2, 7, 4, 11, 6, 1, 8, 3, 10]
+        *stacks, hidden, prefix=640, blocks=[9, 2, 7, 4, 11, 6, 1, 8, 3, 10]
     )
     _assert_close_to_reference(resumed, expected.float(), fraction)
 
