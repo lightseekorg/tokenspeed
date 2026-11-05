@@ -249,9 +249,8 @@ def _routed_sum_single_pass(num_tokens: int, block: int, has_map: bool) -> bool:
         # MI355X, route width 4096, top-8, graph replay: gathered routes (a
         # permute map with about 1/8 of the routes present) are faster in one
         # launch at every count from 1 to 8192 tokens. With complete routes
-        # each program reads all of its token's routes: one launch is about
-        # 10-26% slower from 8 to 128 tokens, about even at 136-144 and 2-45%
-        # faster from 152.
+        # each program reads all of its token's routes: one launch is slower
+        # from 8 to 128 tokens, about even at 136-144 and faster from 152.
         return has_map or num_tokens >= ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4
     return False
 
