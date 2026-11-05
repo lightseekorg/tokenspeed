@@ -613,6 +613,104 @@ TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
   --disable-kvstore --disable-autotune
 ```
 
+## Kimi K3.1 Pro {#kimi-k3-1-pro}
+
+Kimi-K3.1 (`KimiK31ForConditionalGeneration`) is Kimi-K3 plus a DSA lightning
+indexer on every MLA layer: each MLA layer attends only the `index_topk`
+history rows its own indexer selects. Everything else, including the cache
+family, the KDA state groups and the launch flags, is Kimi-K3's.
+
+Notes:
+
+- The MLA layers run the `dsa` sparse-MLA backend inside the KDA hybrid
+  wrapper. Leave `--attention-backend` unset (or pass `dsa`); `mla` serves
+  dense MLA only and does not accept the DSA layers.
+- The indexer's keys live in one index-K plane per MLA layer, beside its latent
+  plane in the full-attention cache group, so they are prefix-matched,
+  transferred and freed with the latent rows. The plane stores the keys as
+  FP8 with one FP32 scale per key (`fp8_scaled`, 132 bytes per token per
+  layer); on gfx950 the indexer also scores with an FP8 query.
+  The indexer's projection weights stay BF16. The cache writer applies LayerNorm to the keys, then quantizes them
+  to FP8 with per-128 scales. Prefill and decode reuse the DeepSeek-V3.2 /
+  GLM DSA top-k kernels. The main MLA KV-cache dtype is a separate choice
+  controlled by `--kv-cache-dtype`.
+- The checkpoint ships no modeling code. TokenSpeed follows the DeepSeek-V3.2
+  indexer without RoPE or a Hadamard rotation: index queries from the
+  normalized MLA q latent, LayerNorm keys, and per-head ReLU scores weighted
+  by `weights_proj`, causal, top-k shared by all heads.
+- Target decode accepts up to 8 query rows per request on NVIDIA Blackwell
+  and up to 6 on gfx950, whose index scorers and sparse-MLA decode stop at
+  six rows (speculative verify included). The DSA layers run with attention
+  TP; the QKV/output projection TP subgroups are refused.
+- Loading fails if a checkpoint `indexer` tensor has no parameter, or an
+  indexer parameter is never loaded.
+- A checkpoint with a Python XTML encoder and no Jinja chat template needs
+  its tokenizer's `apply_chat_template` to encode messages. Pass the token
+  IDs as `input_ids` to the native `/generate` endpoint.
+
+### NVIDIA
+
+The launch follows [Kimi K3](#kimi-k3): install `flash-linear-attention` for
+the KDA layers, then serve with expert parallelism on 8x B300. The DSA kernels
+cover NVIDIA Blackwell; the command leaves `--attention-backend` unset, so the
+MLA layers run on `dsa`.
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+  --served-model-name kimi-k3.1 \
+  --trust-remote-code \
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --ep-size 8 \
+  --moe-backend flashinfer_trtllm \
+  --max-num-seqs 32 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+### AMD
+
+On 8x gfx950 with EAGLE3, K3.1 serves with Kimi-K3's EAGLE-3.1 draft
+(`lightseekorg/kimi-k3-eagle3.1-mla`). It takes the EAGLE3 draft's flags
+unchanged and accepts slightly more draft tokens per step. The index-K plane
+makes a K3.1 cache block about 22% larger than K3's, so at the default
+`--gpu-memory-utilization` (0.95) 15 requests of 50K input and 500 output
+tokens run at once and the rest queue. This launch was validated on 8x MI350X
+with text-only requests.
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+  --served-model-name kimi-k3.1 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --ep-size 1 \
+  --moe-backend auto \
+  --kv-cache-dtype fp8 \
+  --mm-encoder-tp-mode data \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lightseekorg/kimi-k3-eagle3.1-mla \
+  --speculative-draft-model-quantization unquant \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-eagle-topk 1 \
+  --eagle3-layers-to-capture 2,46,90 \
+  --drafter-attention-backend gluon \
+  --max-model-len 65536 \
+  --max-num-seqs 16 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --max-cudagraph-capture-size 16 \
+  --cudagraph-capture-sizes 1 2 4 8 16 \
+  --disable-prefill-graph \
+  --disable-kvstore \
+  --disable-prefix-caching \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
 ## GLM5 / GLM5.2
 
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
