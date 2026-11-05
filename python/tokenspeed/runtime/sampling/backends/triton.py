@@ -107,6 +107,11 @@ class TritonSamplingBackend(SamplingBackend):
         self._init_triton_buffers(config)
         self._sample_route = _SAMPLE_ROUTE_GUMBEL_GENERIC
         self._top_k_top_p_pad = _TOP_K_TOP_P_PAD
+        # Route/pad aggregate only the batch's sampling-params mix, so they
+        # cache against the batch-composition epoch and recompute only when
+        # membership moves; a steady decode batch pays nothing here.
+        self._route_cache: tuple[int, int] | None = None
+        self._route_cache_epoch: int | None = None
 
     def _init_triton_pool_state(self, config: SamplingBackendConfig) -> None:
         pool_rows = config.max_req_pool_size + 1
@@ -321,8 +326,15 @@ class TritonSamplingBackend(SamplingBackend):
             sampling_params_list=sampling_params_list,
             num_tokens_per_req=num_tokens_per_req,
         )
-        self._sample_route = self._select_sample_route(sampling_params_list)
-        self._top_k_top_p_pad = self._select_top_k_top_p_pad(sampling_params_list)
+        if self._route_cache_epoch != self._batch_composition_epoch:
+            self._route_cache = (
+                self._select_sample_route(sampling_params_list),
+                self._select_top_k_top_p_pad(sampling_params_list),
+            )
+            self._route_cache_epoch = self._batch_composition_epoch
+        # Restore from cache rather than skip: capture variants set the route
+        # directly, and the next real step must win over what capture left.
+        self._sample_route, self._top_k_top_p_pad = self._route_cache
 
     @staticmethod
     def _select_top_k_top_p_pad(sampling_params_list: list[SamplingParams]) -> int:
