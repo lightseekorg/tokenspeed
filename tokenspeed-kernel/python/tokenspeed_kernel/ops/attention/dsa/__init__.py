@@ -733,6 +733,169 @@ def dsa_prefill(
         )
 
 
+def dsa_decode_dcp_records_supported(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether :func:`dsa_decode_dcp_records` serves a decode of this size.
+
+    Host values only, so every rank of a KVP group decides alike before the
+    query gather. The op has one leaf, gfx950's dense matrix core, whose
+    reduction over split keys writes the records: sizes it runs unsplit, and
+    other platforms, are refused.
+
+    Args:
+        tokens: Query rows.
+        heads: Gathered query heads, every rank's.
+        topk: Selected-slot width.
+        q_dtype: The query's dtype.
+        kv_dtype: The KV cache's dtype.
+        kv_lora_rank: MLA latent rank.
+        qk_rope_head_dim: RoPE q/k dimension.
+    """
+    if not current_platform().is_amd:
+        return False
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+        gluon_dsa_decode_dcp_records_supported_gfx950,
+    )
+
+    return gluon_dsa_decode_dcp_records_supported_gfx950(
+        tokens=tokens,
+        heads=heads,
+        topk=topk,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+
+
+def dsa_decode_dcp_records(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    solution: str | None = None,
+    *,
+    slot_order: str,
+) -> torch.Tensor:
+    """Sparse DSA decode of KVP-gathered query heads, written as DCP records.
+
+    :func:`dsa_prefill_dcp_records` for decode: the query read rank-major as
+    an all-gather lands it, the partials written as the records the
+    exchange sends, so neither a relayout before the core nor a repack after
+    it runs.
+
+    Args:
+        q: Absorbed MLA query ``[ranks, tokens, local_heads, R + D_rope]``:
+            rank ``r``'s TP heads at ``q[r]`` (``gather_query_heads_rank_major``),
+            BF16 or FP8.
+        kv_cache: Dense compressed MLA KV cache, flat ``[slots, dim]`` or
+            paged; this rank's pages.
+        topk_slots: Local KV slots ``[tokens, topk]``, ``-1`` where invalid.
+        topk_lens: Live selected-slot count per token (int32 ``[tokens]``).
+        qk_nope_head_dim: Original non-RoPE q/k dimension.
+        kv_lora_rank: MLA latent rank and output head dimension.
+        qk_rope_head_dim: RoPE q/k dimension.
+        softmax_scale: Scale applied to attention logits.
+        page_size: KV cache page size.
+        q_len_per_req: Query rows per request.
+        logit_cap: Optional logit cap (no leaf supports one).
+        k_scale: KV scale multiplier for FP8 caches.
+        solution: Optional kernel solution to force through normal selection.
+        slot_order: As for :func:`dsa_decode`. Required keyword.
+
+    Returns:
+        Contiguous int32 ``[ranks, tokens, local_heads, kv_lora_rank / 2 + 1]``:
+        bit for bit the records ``dispatch_dcp_attention_partials(out, lse,
+        degree=ranks)`` packs from ``dsa_decode(..., return_lse=True)`` on the
+        token-major gather (head ``r * local_heads + h``). Raises
+        ``ValueError`` for a size :func:`dsa_decode_dcp_records_supported`
+        refuses.
+    """
+    if q.dim() != 4:
+        raise ValueError(
+            "dsa_decode_dcp_records takes a rank-major query "
+            f"[ranks, tokens, local_heads, head_dim], got {tuple(q.shape)}"
+        )
+    degree, tokens, local_heads, head_dim = q.shape
+    if topk_slots.dim() != 2 or topk_slots.shape[0] != tokens:
+        raise ValueError(
+            f"DSA records selection {tuple(topk_slots.shape)} does not match "
+            f"{tokens} query rows"
+        )
+    if topk_lens.shape != (tokens,):
+        raise ValueError(
+            f"DSA records lengths {tuple(topk_lens.shape)} do not match "
+            f"{tokens} query rows"
+        )
+    traits = {
+        "q_len": int(q_len_per_req),
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "page_size": int(page_size),
+        "topk": int(topk_slots.shape[-1]),
+        "logit_cap": logit_cap != 0.0,
+        "topk_layout": "global_slots",
+        "slot_order": slot_order,
+    }
+    kernel = select_kernel(
+        "attention",
+        "dsa_decode_dcp_records",
+        _attention_format_signature(q=q),
+        traits=traits,
+        solution=solution,
+    )
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
+    shape_params = {
+        "degree": degree,
+        "tokens": tokens,
+        "local_heads": local_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_decode_dcp_records", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_decode_dcp_records",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            **slot_order_kwargs,
+        )
+
+
 def dsa_prefill_dcp_records_supported(*, tokens: int, heads: int, topk: int) -> bool:
     """Whether :func:`dsa_prefill_dcp_records` serves a prefill of this size.
 
@@ -1938,6 +2101,8 @@ __all__ = [
     "DSAResources",
     "prepare_dsa_resources",
     "dsa_decode",
+    "dsa_decode_dcp_records",
+    "dsa_decode_dcp_records_supported",
     "dsa_index_candidates_accepts_pages",
     "dsa_interleave_rope",
     "dsa_prefill",

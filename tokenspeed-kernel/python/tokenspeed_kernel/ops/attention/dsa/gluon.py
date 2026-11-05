@@ -37,6 +37,9 @@ if current_platform().is_amd:
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+        launch_gluon_dsa_decode_dcp_records_gfx950 as _dsa_decode_records_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         launch_gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
@@ -388,6 +391,40 @@ if current_platform().is_amd:
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
         return _dsa_decode_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsa_decode_dcp_records",
+        name="gluon_dsa_decode_dcp_records_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(q=dense_tensor_format(torch.bfloat16)),
+                format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
+                format_signature(q=dense_tensor_format(torch.float8_e5m2)),
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "qk_nope_head_dim": frozenset({128, 192, 256}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({0, 64}),
+            "page_size": frozenset({64}),
+            "topk": _DSA_FULL_TOPK_WIDTHS,
+            "logit_cap": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
+        },
+    )
+    def gluon_dsa_decode_dcp_records_gfx950(**kwargs):
+        """``gluon_dsa_decode_gfx950``'s dense core on a rank-major query,
+        its split reduction writing the DCP records."""
+        return _dsa_decode_records_impl(**kwargs)
 
     @register_kernel(
         "attention",

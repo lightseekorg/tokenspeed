@@ -477,6 +477,22 @@ accepts a size only when `dsa_prefill` would not split the keys either: the
 launch needs at least about one program per SM. Any other size raises.
 Callers check this from host sizes before they gather the query.
 
+`dsa_decode_dcp_records` is the decode counterpart, with the same layouts and
+bit-identity to `dispatch_dcp_attention_partials` over
+`dsa_decode(..., return_lse=True)`. Only gfx950's dense matrix core
+(`gluon_dsa_decode_gfx950`) registers it. Its key-split programs read the
+rank-major query, and its split reduction stores each head's output and LSE
+straight into the head owner's record. The kernels are the ones `dsa_decode`
+runs, with the heads per rank as a compile-time constant: 0 compiles the
+token-major indexing unchanged, and a model's local head count gives the
+records layout one more binary. The rank stride stays a specialized runtime
+argument, because the query's direct-to-LDS copy needs its 16-element
+alignment. `dsa_decode_dcp_records_supported` accepts a
+size only when that core splits the keys, since only the reduction writes
+records. The core splits while one program per row and 16-head block stays
+under two waves (512 programs on 256 CUs), so up to 85 rows at 96 heads. A
+BF16 query with RoPE never splits, and other platforms are refused.
+
 ### Persistent CUDA top-k dependencies
 
 `ragged_decode_topk` needs no workspace and requires an explicit `enable_pdl`.

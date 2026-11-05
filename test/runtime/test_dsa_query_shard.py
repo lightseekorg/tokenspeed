@@ -478,6 +478,8 @@ def _decode_arm_backend(*, num_attention_heads: int, attn_tp_size: int):
     backend.max_context_len = 512
     backend.num_attention_heads = num_attention_heads
     backend.num_local_heads = num_attention_heads // attn_tp_size
+    # configure_runtime's probe verdict on a BF16 cache.
+    backend._dcp_decode_records_core = False
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128
