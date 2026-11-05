@@ -744,7 +744,11 @@ the largest prompt whose worst-case working set — dense or sliding history
 with its decode reserve and overlap-depth protection, the blocks a tail
 handover holds for one admission, two slots per State group — fits the pool.
 It is not a live check against currently free capacity; a prompt within the
-bound can still fail admission right now and waits. The bound counts
+bound can still fail admission right now and waits. What it does promise,
+with the five exceptions at the end of this section, is that such a
+request completes once no other request holds pages beside it: alone and
+quiescent, every step of it is funded in the end, by the means below in
+this order. The bound counts
 no sliding-window prepay (§1), and a request with no other request holding
 pages prepays nothing, so the prepay never makes a request the bound accepts
 inadmissible on its own. Beside other requests the prepay can ask for up to
@@ -763,11 +767,8 @@ another page holder no block leaves one by one: the request waits for that
 holder's release (on the P role, until its PD transfer is acknowledged),
 where write-through, which evicts block by block, could fund it at once.
 The block-by-block pass lifts only the segment rule. Under either policy the
-blocks the admission's own prefix hit keeps never leave, and the
-tail-handover charge (below) is bucket-blind, so on a KV-sharded pool of a
-few pages a request alone can still wait for good, when its hit holds the
-only cache left and its copy of the tail needs a page in a bucket that is
-full.
+blocks the admission's own prefix hit keeps never leave; at a first
+admission alone they move instead (below).
 
 A request's expired slots and released State input are different from live
 pins: `Admit` releases their table references before evicting those blocks. Once the plan
@@ -781,6 +782,143 @@ and minimization keeps or restores the combined set whole. This lets a P
 request rotate past a junction and evict its unpinned
 canonical KV duplicates in the same admission. Another reader's reference,
 or a prefix hit this admission keeps, still prevents reclaim.
+
+Eviction alone does not always keep the promise. The bound counts a packed
+group's blocks densely — `ceil(h / K)` parents for `h` blocks at `K` per
+parent — while placement fills holes first (`cache-concepts.md`, `BlockPool`):
+a request admitted alone beside cached pages can hold one block per parent, a
+parent stays bound to its group while any occupant remains, and evicting the
+pages beside its blocks frees holes for that group alone, never a parent for
+another. Nothing else moves a block, and a lone blocker is never retracted
+(§2). So when the block-by-block pass leaves the step unfunded, the request's
+own blocks are what stands in the way, and the last means is **lone-request
+compaction** (`CacheCoordinator::CompactLoneRequest`; from
+`admitWithKvEventTracking` after the retained-checkpoint retry, so for every
+later chunk and decode, and from the first admission): the request's blocks of
+every packed, token-spanned group — at a first admission, the Device pages and
+tail blocks its prefix hit takes — are gathered into fewer parents, the
+parents they leave return to the empty FIFO, and the admission is retried once
+in the same plan build. It runs only when all of these hold: the admission
+failed in its last variant, no other request holds pages, no forward result or
+PD transfer of the request is out, no load-back or pinned store is in flight
+(a retraction's two global gates, §2), and a dense layout of the blocks plus
+the demand fits the pool bucket by bucket (`DenseLayoutParents`:
+`ParentsNeededForBucketsAndPairs`, the demand's copy-in pairs counted) —
+otherwise the shortfall is the bound's own and compacting would only churn.
+Per group every parent holding a block that cannot move is kept — a page this
+very admission publishes (the runtime stores it before the plan's copies
+land), a block another holder pins, a hit another request pins — then the
+densest, of equally dense ones the one holding more bucket-bound blocks,
+until as many are kept as a dense layout of the request's blocks alone needs
+(`ParentsNeededForBuckets`, the demand not counted; the fixed parents count
+toward it). The rest are vacated in the reverse order — sparsest first, and
+of equally sparse ones a parent of free blocks alone before one holding a
+bound block, since free blocks re-place with no copy and no displacement —
+a parent whole or not at all, and only one whose other occupants the
+retry can take (a slot it reclaims as the request's own, or cache the
+block-by-block pass may evict): a held page keeps a parent bound whatever
+leaves it. Vacating stops as soon as the retry plans. An unwritten reserve
+block re-places into any kept parent and is zeroed, so it may change bucket,
+unless the request holds a copy-in block for its slot: the two share a bucket,
+so each re-places within it, the copy-in block swapped in the request's hold
+and not zeroed (the copy-in fills it whole, in this very plan when the retry
+spends it, and the runtime copies before it zeroes); a written block moves by
+a Device copy into a slot of its own bucket (`pages_to_copy`, the owner's
+copy-in contract). With no slot of its bucket left in the kept parents, it
+takes the one a free unwritten block of the request there gives up, which
+re-places first, in its own parent before any other: it leaves before the
+written block arrives, and a parent left empty in between would be released
+by the pool, unbound from the group. The keep order rules that out: no
+parent holding a bound block ranks after a kept parent whose one block of the
+request is free, so that block never gives its slot up, and any other kept
+parent keeps a block of the request until the written block arrives.
+Re-placing within its own parent, whose free or clearable slot is in another
+bucket, keeps the free block there as well, whatever the order. A published
+block's index entry moves onto the copy
+(`PrefixCacheIndex::Relocate`) with its key, epochs, boundary kind, session
+and boundary-tree hold, so no hash, KV event or tree node changes. A page or
+tail block the probe hit moves the same way, and the retry's private copy of a
+moved tail block reads where the block was: the plan's copies compose (§5). At
+most one tail block moves per compaction — two whose copies land on each
+other's old places would need their bytes swapped — so a tail spread over
+several parents leaves them over several plans, and a parent holding two of
+its blocks is never vacated. A slot a cache entry holds in a kept parent is
+cleared first, block by block as the planner's last pass would take it (under
+write-back recorded as a segment of this plan's drain,
+`DeviceEvictionStats::compaction`), never a slot that pass keeps (a page, tail
+block or State checkpoint the probe hit). Such an eviction takes along what
+any eviction of its entry does — a tail's blocks in the other groups, a
+page's State checkpoints — without consulting the planner, and the slot may
+be one the probe leaves a hole: on the D role a tail's partial block, or the
+prompt's last page, past the probe's bound while the prompt-end checkpoint is
+claimed. So every Device block the probe hit, in every group (on the D role
+each State group's prompt-end checkpoint too), is held through the
+compaction, and the retry still finds it. The cache in the vacated parents is
+left to the retry's own eviction, which can now take whole parents. A group's
+parents never increase, at most one compaction runs per plan, and each is
+counted by the coordinator (`HostCacheStats::lone_compactions`,
+`lone_compaction_moves`) and logged. The plan a compaction ran in admits
+nothing more in its prefill phases, on any role (a chunk that gives way, §1.1,
+carries no whole prompt in it), and its capacity retraction takes no request
+whose blocks the plan's copies or zeroing still fill: the
+runtime runs a plan's stores — an eviction's write-back, a retraction image —
+before its copies, so a later admission evicting a moved block nothing holds
+(the probe's tail once the retry copied it, a hit page of a retry that
+failed), or an image or an abort taking the request's moved blocks, would
+store or hand out bytes the copies have not written yet (§5). A grant behind
+that retraction can still admit one request in the plan, but only when the
+compaction left no moved block nothing holds: a resident's compaction moves
+only its own blocks, which then fill its table, and a copy-in block it
+re-places stays held. When the step still does not fit —
+nothing could move, or not enough, as when the scattered written blocks are
+the very pages this admission publishes — and it has completed pages left
+unpublished, they are published first, by a zero-growth admission
+(`publishCompletedPagesFirst`), and the step waits for the next plan, where
+they are published blocks that move.
+
+A retracted request has no block to move. What can scatter instead are the
+cached pages its restore claims (§4), which sit wherever their keys are
+cached, not necessarily where the victim held them: one per parent beside
+cached pages, they can bind more parents than a dense layout of the image.
+Alone, a restore whose claims leave no plan plans again claiming nothing:
+every slot is copied back from its Host copy into a fresh block, which fits
+whenever the image and its reserve fit the pool bucket by bucket and no
+transfer in flight pins the cache it would evict.
+
+Five shapes stay outside. On the P role every page-holding state is pinned
+until the PD ACK (§3.1), so past its first admission a request there waits as
+before: its pin counts as a transfer in flight, so no stall is counted for it
+either (§2). A written block keeps its bucket (so do a copy-in block and the
+block it is held for, each slot a restore rebuilds, and a page or tail block a
+first admission's probe hits, with the tail's copy), so when one bucket's
+bucket-bound blocks alone need more parents than the dense layout and no free
+block can give its slot up, the layout does not fit and the request waits.
+Compaction's dense-layout check may not see it: it counts the groups
+compaction gathers and the demand, not the parents the probe holds in the
+others (a hit page or tail block of a group of one block per parent, a State
+checkpoint). Under KV parallelism a first admission whose probe hits a Device
+tail can pass it and still never fit: the tail's block, its copy and the
+copy-in block take one bucket, and the tail-handover charge (below) is
+bucket-blind. An ordinary continuation prompt (a cached prompt plus new
+tokens) that needs nearly the whole pool can reach this, and it would fit if
+admitted without its cached tail; no admission retries without it. Two of
+the probe's tail blocks in one parent never leave it
+(above), so when that parent is not among the densest kept, the request's
+blocks hold one parent more than a dense layout of them. A
+State group with packing above 1 is not compacted: its two slots can sit in
+two parents beside cached checkpoints. Under write-back a lone request can
+hold private copies of pages whose keys stay cached on the Device under
+other blocks: when the key of a slot a restore copies back is published on
+the Device while the copy is in flight (in randomized runs, by another
+request), the republish at its ACK leaves the copy unindexed (§4), and
+every later image records that slot without a key, so later restores copy
+it back from the snapshot pool and never republish it. Those cached blocks
+are boundary-tree ancestors of
+the request's own pages in use, so neither eviction pass takes them, and
+compaction does not merge a copy with its cached block: a step short of
+exactly those parents is never funded (randomized runs reached this only
+under forced retraction, §2). Such a request waits as before,
+under the stall diagnostic's warning (§2).
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
@@ -862,13 +1000,15 @@ before retraction runs, so waiting for it would last as long as its reserve
 does while every request blocked beside it holds idle pages; nor can its pages
 free in this round, which is what an abort is for. A request armed by the
 debug knob (below) sits its round out: marked scheduled with nothing
-dispatched, it stays offered. When every offered resident still has an
-outstanding forward or PD transfer — an earlier round's result still landing —
-capacity retraction waits before ranking or planning images: no possible
-choice can quiesce in that round. Otherwise the normal rank and Host-fit order
-applies among the offered residents, including waiting for a better-ranked one
-whose earlier forward is still landing. Decode release counts are computed once
-per candidate for each ranking pass, before sorting.
+dispatched, it stays offered. In the plan of a lone-request compaction, nor is
+one whose blocks the plan's copies or zeroing still fill: its image would
+store, or an abort hand out, bytes not yet written (§1.4). When every offered
+resident still has an outstanding forward or PD transfer — an earlier round's
+result still landing — capacity retraction waits before ranking or planning
+images: no possible choice can quiesce in that round. Otherwise the normal
+rank and Host-fit order applies among the offered residents, including waiting
+for a better-ranked one whose earlier forward is still landing. Decode release
+counts are computed once per candidate for each ranking pass, before sorting.
 
 **A retracted request loses no work.** It is *suspended*: its block tables are
 imaged to Host byte-for-byte, its Device pages are released, and the restore
@@ -1254,7 +1394,10 @@ of what the Device holds.
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a
-prompt whose KV is mid-transfer would strand the decode side.
+prompt whose KV is mid-transfer would strand the decode side. Lone-request
+compaction (§1.4) is gated on the same pin, so past its first admission a
+request here waits as before; the pin counts as a transfer in flight, so the
+stall diagnostic (§2) counts no stall for it either.
 
 While P holds a request, prefix publication uses a copy of its block table.
 Deduplication may redirect that copy to canonical cache blocks, but the real
@@ -1318,7 +1461,9 @@ phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
    pages; a queue's worth in one round would drain the pool before any KV
    arrives. Head-of-line (1.1) does not apply — there is no mid-way. A restore
    that failed for capacity in phase 1 **seals** this phase: a newcomer taking
-   the pages it waits for would starve it.
+   the pages it waits for would starve it. So does a lone-request compaction
+   in phase 2: evicting a block it moved, an admission would store bytes the
+   plan's copies have not written yet (§1.4).
    Remote admission therefore bypasses local prefill chunking and prefix
    promotion boundaries; the destination tables must cover the entire
    unmatched suffix and each replayable group's complete retained window
@@ -1382,7 +1527,9 @@ leaves `pending_prefill_reserve` untouched when a local prefill is pending:
 the budget a hit chunk needs to re-feed its replay window and still advance
 (`MinPrefillChunkTokens`, §1.3; zero without replayable groups). A restore
 that failed for capacity seals new-prompt admission for the round
-(`new_prompts_sealed`), as on the D role.
+(`new_prompts_sealed`), as on the D role, and a lone-request compaction ends
+the round's prefill work, resident chunks included (`scheduleLocalPrefillWork`,
+so on the P role too; §1.4).
 
 **Phases, non-mixed:** after the restore, the prefill phases run first and
 alone; decodes get the round only when no prefill scheduled. No prefill
@@ -1512,12 +1659,14 @@ pages:
   restore's own copies: the plan's stores run before its loads.
 - An L2 slot whose key still has a Device-cached canonical block is
   **claimed** instead of copied (the same bytes by construction — the victim's
-  own block, cache-only since it was freed — and protected from the planner's
-  eviction like a prefix hit). Every other slot becomes one row of a single
+  own block, cache-only since it was freed, or any block published under the
+  key since — and protected from the planner's eviction like a prefix hit).
+  Every other slot becomes one row of a single
   `SnapshotRestoreOperation`, tagged with its source tier (`HostTier::kL2`
-  rows carry their key, `kSnapshotPool` rows none). Under segment eviction a
-  restore whose claims leave no plan plans again claiming nothing, so every
-  slot is a row (`cache-concepts.md`, `AdmissionPlanner`). A copy fills its
+  rows carry their key, `kSnapshotPool` rows none). Under segment eviction,
+  or when no other request holds pages (§1.4), a restore whose claims leave
+  no plan plans again claiming nothing, so every slot is a row
+  (`cache-concepts.md`, `AdmissionPlanner`). A copy fills its
   destination block whole, so — as for a Host hit's load-back — only the
   reserve pages appended beyond the imaged shape are listed in
   `plan.pages_to_zero`. The op also names the blob slot and the request's
@@ -1737,14 +1886,15 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   (2). The chosen victim must be quiescent — no forward of its own in flight,
   no PD transfer against its pages (§3.1) — and, in both tiers, is chosen only
   among the residents the same round has dispatched no work for (an armed
-  debug victim sitting the round out stays offered); an in-flight load-back
-  or an in-flight pinned store defers all retraction; stream-ordered stores
-  and in-flight restores defer nothing. A victim that would serve nobody is
-  not retracted, and a round with no room left for the grant retracts
-  nobody. A victim whose image does not fit is aborted through
-  `onImageDoesNotFit` and nowhere else; the debug knob aborts only a victim
-  whose image is refused after its publication, and leaves one its probe
-  refuses running with nothing published.
+  debug victim sitting the round out stays offered), and in a lone-request
+  compaction's plan not one whose blocks the plan's copies or zeroing still
+  fill (1.4); an in-flight load-back or an in-flight pinned store defers all
+  retraction; stream-ordered stores and in-flight restores defer nothing. A
+  victim that would serve nobody is not retracted, and a round with no room
+  left for the grant retracts nobody. A victim whose image does not fit is
+  aborted through `onImageDoesNotFit` and nowhere else; the debug knob aborts
+  only a victim whose image is refused after its publication, and leaves one
+  its probe refuses running with nothing published.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant, except that the
   empty-round retraction offers it to the round's decodes first (2); the
@@ -1753,14 +1903,29 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   on the forward thread's stream is what makes the immediate release safe --
   a tail hit's copy source may be evicted and re-granted by a later admission
   of the same round, as a fresh page or as another copy's destination -- and
-  changing `DeviceHandle.execute`'s ordering breaks it. Within the copies,
+  changing `DeviceHandle.execute`'s ordering breaks it. The execution stream
+  waits for the copies, so a later plan's stream-ordered store reads what
+  they wrote even when no forward ran between. Within the copies,
   the arena reads each source byte range before any pair overwrites it
   (`CacheArena.copy_blocks` orders waves across all groups by their field
   byte ranges). This includes a sliding-window block whose LCM parent is
   re-granted to another group with different packing. Disjoint child ranges
   remain independent, so parent reuse alone does not form a copy cycle.
   Every source is read as it was when the plan was built. A copy destination
-  is never zeroed.
+  is never zeroed: the zero would wipe the copy. A copy recorded after one
+  that writes its source reads that copy's source instead
+  (`Scheduler::recordAdmittedPages`, which asserts as it records that no
+  destination is zeroed or written twice), and one composed back onto its
+  own source is dropped, so no copy reads a block an earlier copy of the
+  plan writes and each destination is written once;
+  with at most one tail block moved per compaction (1.4), the copies form
+  no cycle. A destination's storage stays with its group for the rest of
+  the plan, so composing per group rules out cycles across groups too. No
+  stream-ordered store of a plan reads a block its copies or zeroing fill:
+  no prefill phase admits after a compaction in its plan, and no retraction
+  images, nor abort frees, a request whose blocks they fill, so a grant
+  behind such a retraction admits only beside a compaction that left no
+  moved block unheld (1.4).
 - A published block is never written again: a tail's blocks are copied into
   the hitter's table (or loaded from Host into private pages), an owner that
   keeps writing past its published prompt end moves to copies of the blocks
@@ -1768,7 +1933,27 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   another request published into its table (a dead prompt end, 1.2,
   publishes no tail, and the owner keeps writing its private block), a chunk
   end cut at a junction publishes no KV block, and a restore copies the
-  imaged tail blocks instead of claiming them (1, cache-concepts.md).
+  imaged tail blocks instead of claiming them (1, cache-concepts.md). A
+  compaction moves one the same way: a copy that takes its entry over.
+- An allocated block moves only in lone-request compaction (1.4): the
+  request's own block of a packed group, or a page or tail block its first
+  admission hits, when no other request holds pages, nothing of the request's
+  is in flight, no load-back or pinned store is out, and a dense layout of its
+  blocks fits. A written block moves by a Device copy within its bucket on
+  `pages_to_copy`, under the same copy → zero → load → forward order as a tail
+  copy-in, into a slot nothing else in the plan writes; an unwritten block is
+  re-placed and zeroed where it ends; a copy-in block the request holds is
+  re-placed within its bucket and left to the copy-in that fills it whole, in
+  the same plan when the retry spends it; a published block's entry, or a
+  probe hit's, moves onto the copy unchanged, its boundary-tree node with it.
+  Compaction evicts only the slots it moves into, recorded under write-back
+  like any eviction of the plan, holds every Device block the probe hit
+  through it, empties no parent it keeps, vacates only a parent the retry can
+  then empty, never increases a group's parents, and runs at most once per
+  plan. A request the single-request bound accepts therefore completes once
+  it is alone, except where a block's bucket, two of the probe's tail blocks
+  in one parent, a State group's packing, a restored copy of a page another
+  block keeps cached or the P role's pin leaves its step unfunded (1.4).
 - A request whose admission prepaid its generation never needs a block it did
   not reserve: the decode slot is reserved on the completing chunk, a State
   group's rotation swaps a released block for a fresh one, and each copy-in

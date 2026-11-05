@@ -2329,7 +2329,10 @@ class ModelExecutor:
         ``execution_stream`` -- the source may have been written by the
         previous forward -- and ahead of this plan's zeroing: a source may be
         re-granted and zeroed in the same plan, and the next forward's prologue
-        waits on the default stream.
+        waits on the default stream. The execution stream waits for the
+        copies too: a later plan's stream-ordered stores order behind it, and
+        a plan whose only Device work is its copies (a lone request's
+        compaction whose retry failed) runs no forward that would.
 
         Args:
             pairs: Scheduler (virtual) ``(source, destination)`` block ids per
@@ -2349,6 +2352,7 @@ class ModelExecutor:
         self.default_stream.wait_stream(self.execution_stream)
         with nvtx_range("copy_cache_pages", color="purple"):
             self.token_to_kv_pool.arena.copy_blocks(local_pairs)
+        self.execution_stream.wait_stream(self.default_stream)
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.
