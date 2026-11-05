@@ -16,6 +16,6 @@ ut:
   commands:
     - python3 -m pytest test/runtime/test_gluon_mla_dcp.py test/runtime/test_dcp_page_metadata.py test/runtime/test_flashmla_dcp.py test/runtime/test_cache_setup.py -v
     - python3 -m pytest test/runtime/distributed/test_dcp_exchange_nccl.py -v
-    - python3 -m torch.distributed.run --standalone --nproc-per-node=8 test/runtime/distributed/run_gluon_mla_dcp.py --kvp-size 8 --contexts 512 65536 200000 900000
+    - PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 test/runtime/distributed/run_gluon_mla_dcp.py --kvp-size 8 --contexts 512 65536 200000 900000
 report:
   github_step_summary: true
