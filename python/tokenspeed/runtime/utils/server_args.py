@@ -610,7 +610,7 @@ class ServerArgs:
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
-    # Run each eligible decoder layer's decode step as one persistent
+    # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
 
@@ -3626,8 +3626,8 @@ class ServerArgs:
                 "verify of up to 4 token rows). Models: "
                 f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950, "
                 "without attention or expert parallelism. Startup fails when "
-                "the model has no monokernel layer. Larger steps keep the "
-                "regular path."
+                "a layer cannot be packed for its monokernel. Larger steps "
+                "keep the regular path."
             ),
         )
         parser.add_argument(

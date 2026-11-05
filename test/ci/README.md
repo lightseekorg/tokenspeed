@@ -96,8 +96,9 @@ one request, so the decode monokernel serves every step. The batched GSM8K
 eval runs more than four token rows per step, so it keeps the regular path.
 One server start gates two things. The benchmark exits with status 1 when
 accuracy is below 0.88. `perf_reference` gates the per-request decode rate,
-which leaves out time to first token. The reference is provisional and the
-task is optional until runs on the runner set the reference. The benchmark
+which leaves out time to first token. The reference is the median of three
+runs on that runner, rounded down. The task stays optional until later runs
+confirm it. The benchmark
 writes per-request records under
 `.ci-artifacts/published/gsm8k-single-request`.
 

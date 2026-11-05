@@ -15,8 +15,9 @@ through `select_kernel("monokernel", ...)` with the trait `rows`:
 
 - `prepare_<model>_<layer>(max_rows=, tensors=, dense_tiled=)` packs one
   layer once, after the weights load, into a `FusedDecodeLayer`. It returns
-  `None` when no kernel serves the layer on this platform. The caller then
-  keeps the regular path for that layer.
+  `None` when no kernel serves the layer on this platform. The runtime seam
+  then names the layer in its startup error: the switch never serves a layer
+  without its kernel.
 - `<model>_<layer>_decode(layer, h, h_out, *, chain=, ...)` runs one step.
 
 The caller owns two values that every layer of a step shares:

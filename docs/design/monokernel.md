@@ -12,8 +12,8 @@ while earlier stages still compute.
 
 | Layer | Path | Holds |
 |---|---|---|
-| Kernel boundary | [`tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/`](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md) | The ops that a model calls: `prepare_*` and `*_decode`, through `select_kernel`. `prepare_*` packs a layer once after loading and returns `None` when no kernel serves the layer. The README gives the API, the steps to add a model and links to each vendor's README. |
-| Vendor kernels | The vendor's kernel package, under `ops/<arch>/monokernel/` | The building blocks that every model's kernels share (plans, mailboxes, GEMVs, trace), and one directory for each model's stages and layer kernels. Its README describes the files, the rules for writing a stage and the performance workflow. |
+| Kernel boundary | `tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/` (see its `README.md`) | The ops that a model calls: `prepare_*` and `*_decode`, through `select_kernel`. `prepare_*` packs a layer once after loading and returns `None` when no kernel serves the layer. The README gives the API, the steps to add a model, and links to each vendor's README. |
+| Vendor kernels | The vendor's kernel package, under `ops/<arch>/monokernel/` | The building blocks that every model's kernels share (plans, mailboxes, GEMVs, trace), and one directory for each model's stages and layer kernels. Its README describes the files, the rules for writing a stage, and the performance workflow. |
 | Runtime seam | `python/tokenspeed/runtime/models/monokernel.py`, and `<model>_monokernel.py` next to it | The shared part: the layer mixin that selects the launch or the regular layer's code, the state that all launches share (the scratch and the step counter), and the startup error. For each model: its monokernel layer classes (subclasses of the regular layers), the packing from the model's modules with the reasons of a layer that cannot be packed, and the launches. |
 
 ## Invariants
@@ -29,8 +29,8 @@ shared caches (next rule). Each model's kernel README gives its boundary
 tensors.
 
 **Same caches, same layouts.** A monokernel reads and writes the KV cache,
-the recurrent state pages and the other per-request caches exactly as the
-regular decode path does. Prefill, the regular decode path and the monokernel
+the recurrent state pages, and the other per-request caches exactly as the
+regular decode path does. Prefill, the regular decode path, and the monokernel
 can follow each other on one request. The current token's own values (such as
 its k and v) reach later stages through mailboxes, not through the cache.
 A cache write by another CTA in the same launch need not be visible yet (the
@@ -82,7 +82,7 @@ none of this: its layers pass values in their return values and through
 kernel boundaries.
 
 **Polls throttle their loads.** Many threads spinning on poll loads can starve
-the producers' stores. A poll issues all its loads, waits once and retries
+the producers' stores. A poll issues all its loads, waits once, and retries
 after a short sleep. A retry loads only the pairs whose tag differs, so a wide
 poll sees its last pairs one round trip after they land.
 
@@ -115,7 +115,7 @@ alone does (tests compare them bit for bit):
   Where each row needs other weights (an expert per row), each row's chain
   runs as a one-row GEMV into its own rows of one accumulator. Such a stage
   keeps the rows as the leading dimension of its tensors (`[rows, ...]`). So
-  a reduction, a layout conversion, an epilogue or a put happens once for all
+  a reduction, a layout conversion, an epilogue, or a put happens once for all
   rows, not once per row.
 - A stage whose work is a request's own state (a recurrence, attention,
   a conv) runs one task per (row, task). Its code is the one-row code on that
@@ -140,7 +140,7 @@ same stages and regions, and the mailbox view of that row. The row is a
 runtime value.
 
 A request's operands are passed once a request, not once a row: its
-lengths, page tables and state pages. A bundle's per-row view points at the
+lengths, page tables, and state pages. A bundle's per-row view points at the
 request of the row and adds the token's offset to the length. So a verify
 needs no kernels to expand its operands to rows.
 
@@ -158,7 +158,7 @@ have that order. Each vendor README lists the layouts.
 ## Placement
 
 Placement (each stage's first CTA) is the main tuning knob. A trace records
-when each stage starts, has its inputs, has computed and ends on each CTA.
+when each stage starts, has its inputs, has computed, and ends on each CTA.
 Judge a placement change on that timeline and on CUDA-graph timings, not on
 intuition. The general rule: a task issues the loads that need no mailbox
 input before it polls. So put a stage that streams weights on CTAs that are
@@ -167,9 +167,8 @@ tuning workflow.
 
 ## Adding a model
 
-The kernel boundary's
-[README](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md)
-gives the ops, how a model's runtime seam calls them, the steps and the
-tests. It links to each vendor's README, which gives the building blocks, the
-rules for writing a stage, the smallest complete kernel and the performance
+The kernel boundary's README
+(`tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md`) gives
+the ops, how a model's runtime seam calls them, the steps, and the tests. It links to each vendor's README, which gives the building blocks, the
+rules for writing a stage, the smallest complete kernel, and the performance
 workflow. Each model directory there has a README for its layer kernels.

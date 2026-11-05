@@ -108,8 +108,9 @@ change.
   attention path (trtllm-gen prefix plus window cascade), and position-keyed
   sampled verify.
 * `docs/design/monokernel.md` — decode monokernels: one persistent launch
-  per decoder layer, stages handing off through tagged mailboxes, the
-  stream boundary, shared cache layouts and the deadlock rule.
+  per decoder layer, stages handing off through tagged mailboxes, every
+  layer of a forward launching or none, the per-step state, shared cache
+  layouts, and the deadlock rule.
 
 ## Public pull requests
 
