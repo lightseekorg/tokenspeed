@@ -31,6 +31,9 @@ class AscendDSAPrefill:
     History and current rows each use one collective. DSA packs both cache
     planes into the same packet; MLA supplies only KV. The synchronous HCCL
     API orders its internal stream before consumers on the execution stream.
+    Gather, patch and attention rely on that execution stream's queue order;
+    the transport does not insert dependencies between caller streams.
+    record_stream protects allocation lifetime, not cross-stream ordering.
     Buffers are owned until finish and registered with the allocator before
     references are released. No transport workspace is kept between layers.
     """
@@ -103,6 +106,16 @@ class AscendDSAPrefill:
                 raise ValueError("Prefill needs matching contiguous BF16 cache planes")
 
     def _stream(self, *, warmup):
+        """Check the active layer before applying the serving-stream policy.
+
+        _layer_stream records the caller's current stream from prefetch to
+        finish, in either phase; it does not create a stream per model layer.
+        An active layer must keep both its stream and phase. Between layers,
+        warmup leaves compute_stream unbound; the first serving call binds it
+        for the transport's remaining serving calls, including after finish.
+        Startup synchronizes warmup before that handoff. finish only releases
+        references, and record_stream is not a cross-stream dependency.
+        """
         stream = torch.npu.current_stream(self.device)
         if self.layer_id is not None:
             if stream != self._layer_stream:
