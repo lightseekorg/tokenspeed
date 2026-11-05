@@ -45,6 +45,5 @@ def test_dotted_probe_short_circuits_at_a_missing_parent():
 
 def test_blocked_name_counts_as_missing(monkeypatch):
     # test_optional_imports blocks packages this way in a fresh interpreter.
-    monkeypatch.setitem(sys.modules, _MISSING, None)
     monkeypatch.setitem(sys.modules, "torch", None)
     assert not has_optional_package("torch")

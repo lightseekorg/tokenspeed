@@ -27,7 +27,7 @@ for _compat_name in ("ThrMma", "ThrCopy"):
 if not hasattr(cute, "make_fragment"):
     cute.make_fragment = cute.make_rmem_tensor
 
-if not has_optional_package("flash_attn.cute"):
+if not has_optional_package("flash_attn", "flash_attn.cute"):
     raise ImportError("tokenspeed-fa4 is required for the rel_mha kernels")
 
 from flash_attn.cute import blackwell_helpers as sm100_utils
