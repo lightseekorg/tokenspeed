@@ -210,9 +210,10 @@ bytes of all its slots first, then their FP32 scales.
 
 The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes. A
 leaf scoring the checkpoint's bf16 keys registers `index_k_format={"bf16"}`
-and `index_k_layout={"packed"}`, so a bf16 plane selects it and nothing else;
-the one in the RL trainer's order also declares the `batch_invariant` and
-`forced_initial_local` features, the gfx950 ones below do not. A plane of any other dtype is a `TypeError`.
+and `index_k_layout={"packed"}`, so a bf16 plane selects it and nothing else.
+A leaf that must reproduce an RL trainer's selection order also declares the
+`batch_invariant` and `forced_initial_local` features; the gfx950 ones below
+do not. A plane of any other dtype is a `TypeError`.
 
 On gfx950, `gluon_dsa_decode_topk_bf16_gfx950` and
 `gluon_dsa_prefill_topk_bf16_gfx950` score a bf16 plane with BF16 queries
@@ -375,7 +376,8 @@ them, and two all-gathers return every row's positions and counts. A row's
 merge input is unchanged, so its selection is too, up to the order of equal
 scores. This exchange holds `topk * 24` bytes per row whatever the degree.
 DCP decode keeps the all-gather. Owned-width tiles (see above) are held to
-the rows one exchange of the same kind fits, so with both levers a 16K chunk
+the rows one exchange of the same kind fits, so with both the row-owner merge
+and owned-width tiles a 16K chunk
 after 200K cached tokens at KVP 8 and a 512 MiB budget scores 4 tiles in 2
 exchanges, against 27 tiles in 7 exchanges at the table's width.
 

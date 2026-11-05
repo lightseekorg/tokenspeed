@@ -67,9 +67,8 @@ pure extend; `None` otherwise). The one leaf that attends a shard — GPU DSA
 `supports_mla_dcp` hands it to `_prepare_prefix_history`, which splits the
 prefix-chunk gathers by page owner the same way. On a pure KVP extend the
 GPU DSA leaf also bounds the index pages any rank owns from it
-(`max_owned_index_pages`), so its indexer tiles span that owned width
-with the same plan on every rank. No
-default values: the runner
+(`max_owned_index_pages`), so its indexer tiles span that owned width with the
+same plan on every rank. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
 idle replay passes the empty `[:0]` slices), so a node that reads a field
 can never see a silently-defaulted one. This is deliberate — a `= False`
@@ -646,7 +645,8 @@ capture/refresh signatures are pinned by
 A backend's graph capability is a class attribute,
 `cuda_graph_support: CudaGraphSupport(decode_graph, prefill_graph)`, which an
 instance may only narrow or widen from its construction arguments (the DSA
-leaf below), never a scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
+leaf below), never a scattered executor-side arch check.
+`ModelExecutor.__init__` AND-composes it
 over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
