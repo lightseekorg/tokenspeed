@@ -11,7 +11,7 @@ handle different input lengths: the graph keeps the same addresses and launch
 shapes, while metadata supplies the live request boundaries and state pages.
 
 The feature is on by default for supported prefill batches on the
-`cutedsl_kda` backend when prefill graphs are on. It uses the existing
+`cutedsl_kda` and `cudnn` backends when prefill graphs are on. It uses the existing
 prefill computation and the scheduler-owned two-slot state table.
 
 ## How it works
@@ -72,8 +72,10 @@ boundary can cost more than padding only the request dimension.
 For example, two requests that add 868 and 869 tokens use the
 `(2048 tokens, BS 2)` capture; so does a batch of one request adding 1737
 tokens, whose unused slot scans one padding row. The live tokens keep the
-packing of an unpadded forward, so the captured replay and the eager forward
-agree bit for bit.
+packing of an unpadded forward. Captured replay and eager execution at the same
+capacity agree bit for bit. cuDNN may select different scan partitions for
+different token or request capacities, so padded and unpadded execution can
+differ by floating-point rounding.
 
 An unused request slot has zero convolution length, negative input/output
 state-block indices, and one zero-input padding row in the scan. No padding
@@ -91,7 +93,7 @@ model's other options, such as tensor parallelism and quantization, as usual:
 
 ```bash
 tokenspeed serve /path/to/model \
-  --kda-backend cutedsl_kda \
+  --kda-backend cudnn \
   --chunked-prefill-size 4096 \
   --prefill-graph-max-tokens 4096 \
   --prefill-graph-capture-token-sizes 128 256 512 1024 2048 4096 \

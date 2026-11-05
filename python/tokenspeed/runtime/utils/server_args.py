@@ -3300,7 +3300,7 @@ class ServerArgs:
         parser.add_argument(
             "--kda-backend",
             type=str,
-            choices=["auto", "fla", "flashkda", "cutedsl_kda"],
+            choices=["auto", "fla", "flashkda", "cutedsl_kda", "cudnn"],
             default=ServerArgs.kda_backend,
             help="KDA (Kimi Delta Attention) prefill kernel policy. On AMD, "
             "this setting is ignored and compatible kernels are selected using "
@@ -3309,7 +3309,8 @@ class ServerArgs:
             "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
             "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
             "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
-            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
+            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). 'cudnn' uses FlashInfer's "
+            "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
