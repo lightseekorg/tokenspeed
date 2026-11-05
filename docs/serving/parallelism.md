@@ -305,9 +305,12 @@ the subgroup's largest physical token count. The runtime prepares communication
 buffers before CUDA-graph capture and reuses them across layers. Shared
 experts use separate buffers. Shared AllGather finishes before routed
 dispatch, shared GEMMs finish before routed BMM, and shared ReduceScatter
-runs after dispatch and before combine. The runtime selects optimized
-collectives for supported shapes and topologies, with generic collective
-fallbacks otherwise. Place each subgroup
+runs after dispatch and before combine. MegaMoE performs dispatch, BMM and
+combine in one kernel that polls its peers, so there the shared ReduceScatter
+starts after MegaMoE and overlaps the routed latent up-projection. The runtime
+selects optimized collectives for supported shapes and topologies, sized for
+every decode step (the per-rank batch bound times the decode tokens per
+request), with generic collective fallbacks otherwise. Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
 
 TP4 reduces the selected weights to approximately one quarter per GPU, not

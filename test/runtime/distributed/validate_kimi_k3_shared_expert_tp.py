@@ -136,7 +136,7 @@ def main():
     parallel = candidate.shared_parallel
     initialize_shared_expert_group(parallel)
     candidate.shared_communication = SharedExpertCommunication(
-        parallel, 129, hidden, torch.device("cuda")
+        parallel, 129, hidden, torch.device("cuda"), 128
     )
     shard = weights[0].shape[0] // args.tp_size
     start = parallel.tp_rank * shard
@@ -156,7 +156,7 @@ def main():
     # subdivision above the native limit, and an unaligned NCCL fallback.
     for width in (128, 2304, 7200):
         communication = SharedExpertCommunication(
-            parallel, 1, width, torch.device("cuda")
+            parallel, 1, width, torch.device("cuda"), 1
         )
         inputs = torch.full((1, width), rank + 1, dtype=torch.bfloat16, device="cuda")
         expected = torch.cat(

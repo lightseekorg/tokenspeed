@@ -619,6 +619,14 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         side_effect=lambda *args, **kwargs: (events.append("experts"), latent)[1]
     )
     up = mock.Mock(return_value=hidden + prefix)
+    monkeypatch.setattr(
+        kimi_k3,
+        "kimi3_latent_projection",
+        lambda *args: (events.append("project"), torch.zeros_like(hidden))[1],
+    )
+    monkeypatch.setattr(
+        kimi_k3, "add3", lambda a, b, c: (events.append("add3"), a + b + c)[1]
+    )
     layer = SimpleNamespace(
         execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=True),
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
@@ -632,7 +640,9 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         moe_alltoall=None,
         _routed_experts=routed,
         routed_expert_norm=None,
-        routed_expert_up_proj=SimpleNamespace(forward_add3=up),
+        routed_expert_up_proj=SimpleNamespace(
+            forward_add3=up, narrowed=False, weight=torch.zeros(8, 4)
+        ),
         shared_experts=mock.Mock(return_value=hidden),
         routed_hidden=4,
         top_k=2,
@@ -654,16 +664,16 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
     )
     result = KimiLinearMoE._forward_attn_dp(layer, hidden, prefix, ctx)
     if shared_tp:
+        # The fused kernel polls its peers, so the shared RS follows it and
+        # overlaps the latent projection; the residual add comes after.
         assert events == [
             "gather",
             "record_gather",
             "join_gather",
             "join",
-            "reduce",
-            "join",
             "experts",
-            "join",
-        ]
+            "reduce",
+        ] + (["project", "add3"] if rows else [])
     else:
         assert events == ["experts"]
     routed.assert_called_once()

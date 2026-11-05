@@ -63,6 +63,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.activation.triton import (
+    add3,
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
@@ -80,6 +81,7 @@ from tokenspeed_kernel.ops.communication.peer_weights import (
     create_peer_weight_store,
 )
 from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
     kimi3_router_projection,
@@ -2743,14 +2745,11 @@ class KimiLinearMoE(nn.Module):
                 # then let only shared reduction overlap the finite routed
                 # work. Empty owners obey the same event/collective ordering.
                 fork.join()
-                with fork.branch_after_main():
-                    shared_output = shared_communication.reduce_outputs(
-                        shared_output, num_tokens
-                    )
-                if self.execution_plan.owns_ep_communication:
-                    # MegaMoE owns dispatch/combine inside the expert call;
-                    # its communication cannot overlap the shared collective.
-                    fork.join()
+                if not self.execution_plan.owns_ep_communication:
+                    with fork.branch_after_main():
+                        shared_output = shared_communication.reduce_outputs(
+                            shared_output, num_tokens
+                        )
 
             routing = StandardTopKOutput(
                 topk_weights=topk_weights,
@@ -2767,9 +2766,17 @@ class KimiLinearMoE(nn.Module):
             )
 
             if shared_communication is not None:
-                # Do not allow two peer-polling collectives to occupy the GPU
-                # concurrently: combine starts only after shared RS completes.
-                fork.join()
+                if self.execution_plan.owns_ep_communication:
+                    # MegaMoE polls its peers inside the expert call, so the
+                    # shared RS starts after it and overlaps the routed tail.
+                    with fork.branch_after_main():
+                        shared_output = shared_communication.reduce_outputs(
+                            shared_output, num_tokens
+                        )
+                else:
+                    # Do not allow two peer-polling collectives to occupy the GPU
+                    # concurrently: combine starts only after shared RS completes.
+                    fork.join()
 
             if self.execution_plan.owns_ep_communication:
                 pass
@@ -2785,6 +2792,19 @@ class KimiLinearMoE(nn.Module):
             if num_tokens > 0 and self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
 
+            # With the shared RS after MegaMoE, project the routed latent while
+            # it runs; the residual add follows the join.
+            projected = None
+            if (
+                shared_communication is not None
+                and self.execution_plan.owns_ep_communication
+                and num_tokens > 0
+                and not self.routed_expert_up_proj.narrowed
+            ):
+                projected = kimi3_latent_projection(
+                    routed_output, self.routed_expert_up_proj.weight
+                )
+
             if shared_communication is None:
                 with fork.branch():
                     if num_tokens > 0:
@@ -2799,6 +2819,8 @@ class KimiLinearMoE(nn.Module):
 
         if num_tokens == 0:
             return prefix_sum
+        if projected is not None:
+            return add3(prefix_sum, projected, shared_output)
         return self.routed_expert_up_proj.forward_add3(
             routed_output,
             prefix_sum,
@@ -3985,11 +4007,23 @@ class KimiLinearForCausalLM(BaseCausalLM):
             if weight.dtype != torch.bfloat16:
                 raise ValueError("Shared-expert TP currently requires BF16 weights")
             if communication is None:
+                # Native collectives cover every decode step: the scheduler's
+                # per-rank batch bound times the tokens each step feeds per request.
+                args = global_server_args_dict
+                decode_tokens = (
+                    args["speculative_num_draft_tokens"]
+                    if args["speculative_algorithm"] is not None
+                    else 1
+                )
+                decode_rows = (
+                    args["max_num_seqs"] // self.mapping.attn.dp_size * decode_tokens
+                )
                 communication = SharedExpertCommunication(
                     shared_mlps[0].shared_parallel,
                     max_num_tokens,
                     self.config.hidden_size,
                     weight.device,
+                    min(max_num_tokens, max(128, decode_rows)),
                 )
             elif max_num_tokens > communication.capacity:
                 raise RuntimeError("Cannot grow a prepared shared-expert workspace")

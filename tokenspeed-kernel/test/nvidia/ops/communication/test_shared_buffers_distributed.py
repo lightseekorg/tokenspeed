@@ -53,10 +53,11 @@ def test_shared_collectives_survive_graph_replay_and_reallocation():
         group = dist.group.WORLD
         rank, size = group.rank(), group.size()
         for generation in range(2):
-            gather = TrtllmAllGatherState(group, 128, 7168, device, True)
-            reduction = TrtllmReduceScatterState(group, 128, 7168, device)
+            # Above 128 rows, as a decode step with draft tokens can carry.
+            gather = TrtllmAllGatherState(group, 256, 7168, device, True)
+            reduction = TrtllmReduceScatterState(group, 256, 7168, device)
             try:
-                for rows in (1, 31, 128, 64, 1):
+                for rows in (1, 31, 128, 256, 64, 1):
                     inputs = torch.empty(
                         (rows, 7168), device=device, dtype=torch.bfloat16
                     )

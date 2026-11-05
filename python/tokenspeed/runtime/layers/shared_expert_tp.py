@@ -99,10 +99,19 @@ class SharedExpertCommunication:
 
     Allocate before memory profiling/capture; never alias main-stream attention
     buffers. Physical subgroup counts select the same path on every peer.
+
+    Args:
+        parallel: Shared-expert TP mapping.
+        capacity: Largest physical rows per rank (scratch and NCCL path).
+        hidden: Row width.
+        device: Current rank's CUDA device.
+        fused_rows: Rows per rank the native collectives are prepared for;
+            larger batches use NCCL.
     """
 
-    def __init__(self, parallel, capacity, hidden, device):
+    def __init__(self, parallel, capacity, hidden, device, fused_rows):
         self.parallel, self.capacity, self.hidden = parallel, capacity, hidden
+        self.fused_rows = fused_rows
         self.send = torch.empty(capacity, hidden, dtype=torch.bfloat16, device=device)
         self.received = torch.empty(
             parallel.tp_size * capacity, hidden, dtype=torch.bfloat16, device=device
@@ -124,12 +133,8 @@ class SharedExpertCommunication:
             and peer_access
         ):
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
-            self.gather = TrtllmAllGatherState(
-                group, min(capacity, 128), hidden, device, True
-            )
-            self.reduction = TrtllmReduceScatterState(
-                group, min(capacity, 128), hidden, device
-            )
+            self.gather = TrtllmAllGatherState(group, fused_rows, hidden, device, True)
+            self.reduction = TrtllmReduceScatterState(group, fused_rows, hidden, device)
             probe = self.reduction.input_buffer(1)
             probe.zero_()
             trtllm_reduce_scatter(self.reduction, probe, 1)
@@ -158,7 +163,7 @@ class SharedExpertCommunication:
         if rows == 0:
             return inputs.new_empty((0, self.hidden))
         send = prepare_padded_rows(inputs, rows, self.send, alignment_bytes=1)
-        if self.gather is not None and rows <= 128:
+        if self.gather is not None and rows <= self.fused_rows:
             gathered = trtllm_allgather(self.gather, send)
         else:
             gathered = self.received[: p.tp_size * rows]
@@ -170,7 +175,9 @@ class SharedExpertCommunication:
 
         partial is BF16 [TP*padded_rows,H]; local_rows is this owner's valid
         count. Empty subgroups skip the collective; empty owners still join.
-        Reduction may overlap finite routed BMM, but must finish before combine.
+        Reduction may overlap finite routed BMM, but must finish before combine;
+        beside a fused expert kernel that polls its peers (MegaMoE), it starts
+        after that kernel.
         """
         rows = partial.shape[0] // self.parallel.tp_size
         if (
@@ -180,7 +187,7 @@ class SharedExpertCommunication:
             raise ValueError("Shared-expert partials must match padded subgroup rows")
         if rows == 0:
             return partial.new_empty((0, self.hidden))
-        if self.reduction is not None and rows <= 128:
+        if self.reduction is not None and rows <= self.fused_rows:
             owned = trtllm_reduce_scatter(self.reduction, partial, rows)
         else:
             owned = reduce_scatter(partial, self.parallel.tp_group, backend=None)
