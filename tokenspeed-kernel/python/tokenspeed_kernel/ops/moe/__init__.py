@@ -68,6 +68,8 @@ __all__ = [
     "moe_sorted_gate_up",
     "prepare_moe_sorted_down_weight",
     "warmup_moe_sorted_prefill",
+    "MoeStreamDecode",
+    "prepare_moe_stream_decode",
 ]
 
 
@@ -1023,6 +1025,10 @@ from tokenspeed_kernel.ops.moe.sorted_prefill import (  # noqa: E402
     moe_sorted_gate_up,
     prepare_moe_sorted_down_weight,
     warmup_moe_sorted_prefill,
+)
+from tokenspeed_kernel.ops.moe.stream_decode import (  # noqa: E402
+    MoeStreamDecode,
+    prepare_moe_stream_decode,
 )
 
 
