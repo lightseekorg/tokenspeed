@@ -82,6 +82,69 @@ with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
 The kernels accumulate in FP32 and return BF16; reduction order can change
 rounding relative to the original GEMM.
 
+## Decode GEMMs on small weights
+
+On SM100 and SM103, `mm` runs a BF16 GEMM on one pinned FlashInfer TGV tile
+instead of cuBLASLt when all of these hold:
+
+- no bias, BF16 output, and no plan, `solution`, override, scales or `alpha`;
+- `BF16_GEMM_MAX_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows,
+  `mm` takes FlashInfer's joint BF16 GEMM (`flashinfer_bf16_gemm`) instead, in
+  which FlashInfer's tuner chooses among its TGV and CuTe DSL tactics;
+- this rank's weight takes at most `TGV_DECODE_MAX_WEIGHT_BYTES` (16 MiB);
+- one of the pinned tiles covers the GEMM in one wave (below);
+- PDL is enabled (`pdl_enabled()`, which the server's `--disable-pdl` turns
+  off);
+- the operands meet the joint BF16 contract (`flashinfer_joint_bf16_supported`):
+  contiguous, 32-byte aligned, K a multiple of 8;
+- serving has not started (`is_serving()`).
+
+Under PDL, TGV loads weight tiles while the producer kernel still runs and
+waits only before loading activations; cuBLASLt starts loading after the
+producer finishes. FlashInfer's tactic profiling times each GEMM alone and
+cannot see that overlap, so `select_tgv_decode_tile` chooses the tile itself:
+of the 2-CTA tiles of 128 weight rows by 16, 32 or 64 activation rows, each
+with the most stages that fit in shared memory, the first whose grid has at
+most one CTA per SM. A GEMM for which none fits keeps cuBLASLt, and so does
+every GEMM without PDL, which has no overlap to gain. The choice depends only
+on M, N, the weight size, the SM count and the PDL setting.
+
+The weight limit is a size per rank, not a list of layers. On a quantized
+checkpoint, the BF16 GEMMs that reach it are the small projections the
+checkpoint leaves unquantized; the route was measured only in such a model's
+decode graphs. On a BF16 checkpoint it also admits dense projection shards
+under tensor parallelism, which have not been measured: at TP4, a model with
+hidden size 4096 and 8 KV heads of 128 has a 12 MiB fused QKV shard, routed up
+to M = 384 on 148 SMs, and an 8 MiB output projection shard, routed up to
+M = 128.
+
+The serving gate has a different reason than the joint path's, which
+compiles once per row count. TGV compiles once per tile, but the route was
+measured only inside CUDA graphs. So graphs captured at startup, decode graphs
+and prefill graphs of 33 to 512 tokens alike, keep the TGV launches they
+recorded, and eager calls while serving keep cuBLASLt. The gate also keeps
+TGV compilation out of serving when startup compiled no tile, as under
+pipeline parallelism without CUDA graphs.
+
+A TGV tactic id is a position in FlashInfer's tactic table, so
+`resolve_tgv_tactics` finds the tiles by shape. If the installed FlashInfer
+lacks one of them or its TGV launcher, a warning is logged once and these
+GEMMs keep cuBLASLt. TGV compiles once per tile, PDL setting and operand
+layout, never per shape. `kernel_warmup` compiles the three tiles at startup.
+Pipeline parallelism skips kernel warmup; there, the eager passes before each
+graph capture compile the tiles that graph uses. Either way, no tile compiles
+per row count, during capture, or while serving.
+
+Like the joint path, the route is a shortcut in `mm` ahead of registry
+selection, not a registered kernel: for the GEMMs it routes, it precedes every
+registered BF16 `gemm.mm` kernel, plugins included.
+
+TGV accumulates in FP32 and rounds once to BF16. Its reduction order differs
+from cuBLASLt's, so its results are not bitwise identical to cuBLASLt's: a
+decode batch replayed from a captured graph and an eager call of the same
+shape after serving starts can differ in the last bits. Repeated TGV calls on
+the same inputs, eager or replayed, agree bit for bit.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
