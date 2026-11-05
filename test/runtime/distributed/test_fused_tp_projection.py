@@ -119,13 +119,17 @@ def _worker(rank, world_size, rendezvous, kind):
         scale_fmt=None,
     )
     try:
-        check = {"column": _check_column_projection, "row": _check_row_projection}[kind]
-        check(rank, world_size, device, parallel, config)
+        if kind == "row":
+            _check_row_projection(rank, world_size, device, parallel, config)
+        else:
+            # K3 KDA QKV and gates, or MLA QKV-A with the output gate.
+            width = {"column": 49376, "mla_column": 14400}[kind]
+            _check_column_projection(rank, world_size, device, parallel, config, width)
     finally:
         dist.destroy_process_group()
 
 
-def _check_column_projection(rank, world_size, device, parallel, config):
+def _check_column_projection(rank, world_size, device, parallel, config, width):
     from tokenspeed_kernel.ops.communication.cute_dsl import (
         create_fused_tp_column_projection_state,
         cute_dsl_fused_fp8_dp_column_linear,
@@ -147,9 +151,9 @@ def _check_column_projection(rank, world_size, device, parallel, config):
                 [
                     DPColumnParallelLinear(
                         7168,
-                        49376,
+                        width,
                         padded_output_size=(
-                            (49376 + world_size * 128 - 1) // (world_size * 128)
+                            (width + world_size * 128 - 1) // (world_size * 128)
                         )
                         * world_size
                         * 128,
@@ -804,7 +808,15 @@ def _check_row_projection(rank, world_size, device, parallel, config):
 
 @pytest.mark.parametrize(
     ("kind", "world_size"),
-    (("column", 2), ("column", 4), ("column", 8), ("row", 2), ("row", 4)),
+    (
+        ("column", 2),
+        ("column", 4),
+        ("column", 8),
+        ("mla_column", 2),
+        ("mla_column", 4),
+        ("row", 2),
+        ("row", 4),
+    ),
 )
 def test_registered_tp_projection(tmp_path, kind, world_size):
     if torch.cuda.device_count() < world_size or torch.cuda.get_device_capability() != (

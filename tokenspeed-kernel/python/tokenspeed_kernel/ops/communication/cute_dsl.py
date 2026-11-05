@@ -102,6 +102,12 @@ def create_fused_tp_row_projection_state(
     )
 
 
+# Logical output widths of the K3 column projections with a fixed schedule:
+# KDA QKV and gates (4 x 96 x 128 + 128 + 96) and MLA QKV-A with the output
+# gate (1536 + 512 + 64 + 96 x 128). The layout pads them to group x 128.
+_FUSED_COLUMN_OUTPUT_SIZES = (49376, 14400)
+
+
 def fused_tp_column_projection_supported(
     group_size: int,
     input_size: int,
@@ -129,8 +135,11 @@ def fused_tp_column_projection_supported(
         and device.type == "cuda"
         and group_size in (2, 4, 8)
         and input_size == 7168
-        and output_size
-        == ((49376 + group_size * 128 - 1) // (group_size * 128)) * group_size * 128
+        and any(
+            output_size
+            == (size + group_size * 128 - 1) // (group_size * 128) * group_size * 128
+            for size in _FUSED_COLUMN_OUTPUT_SIZES
+        )
         and max_rows >= 1
         and dtype == torch.bfloat16
         and torch.cuda.get_device_capability(device) == (10, 3)
