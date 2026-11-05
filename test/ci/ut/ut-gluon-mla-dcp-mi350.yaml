@@ -1,0 +1,21 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-gluon-mla-dcp-mi350
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi350-8gpu-bench
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+ut:
+  commands:
+    - python3 -m pytest test/runtime/test_gluon_mla_dcp.py test/runtime/test_dcp_page_metadata.py test/runtime/test_flashmla_dcp.py test/runtime/test_cache_setup.py -v
+    - python3 -m pytest test/runtime/distributed/test_dcp_exchange_nccl.py -v
+    - PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 test/runtime/distributed/run_gluon_mla_dcp.py --kvp-size 8 --contexts 512 65536 200000 900000
+report:
+  github_step_summary: true

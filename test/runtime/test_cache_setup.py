@@ -1773,6 +1773,9 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         ("trtllm_mla", None, "does not support MLA DCP"),
         (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
         (None, "flashmla", None),
+        ("gluon", None, None),
+        (None, "gluon", None),
+        ("gluon", "gluon", None),
     ],
 )
 def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
@@ -1831,9 +1834,11 @@ def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
 
     def profile(**kwargs):
         config = kwargs["attn_config"]
-        assert config.component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        assert config.component(SoftmaxAttnConfig).backend_name == (
+            target_backend or "tokenspeed_mla"
+        )
         assert built_draft[0].component(SoftmaxAttnConfig).backend_name == (
-            draft_backend or "tokenspeed_mla"
+            draft_backend or target_backend or "tokenspeed_mla"
         )
         raise ReadyForAllocation
 

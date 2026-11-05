@@ -22,6 +22,14 @@ path nothing exercised routinely.
 
 ### One decode metadata path
 
+MLA leaves share the pool-bound `DCPDecodeState` in `attention/dcp/decode.py`.
+It derives per-query local visibility from global endpoints and the cache's
+compact page layout. Leaves retain per-batch views of its persistent buffers;
+full refresh and draft length-only updates write those buffers in place.
+Rebinding the cache drops the owner, and initializing decode storage builds a
+new owner layout before capture. This state has no dependency on a vendor's
+attention kernels.
+
 `AttentionBackend.refresh_decode_metadata(bs, actual_bs, req_pool_indices,
 seq_lens, *, forward_mode, block_tables, num_extends, for_graph_replay,
 **cache_kwargs)` is the ONLY way decode metadata is prepared:
