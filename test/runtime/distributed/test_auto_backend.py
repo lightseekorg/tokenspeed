@@ -288,6 +288,49 @@ def test_nccl_collection_uses_single_tensor_path():
     assert all(output is tensor for output, tensor in zip(outputs, tensors))
 
 
+def _bytes(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.view(torch.uint8)
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, dim",
+    [
+        ((5, 3, 576), torch.float8_e4m3fn, 1),  # 8-byte words
+        ((5, 3, 576), torch.float8_e4m3fn, -1),
+        ((3, 4, 2), torch.int32, 1),
+        ((6, 7), torch.uint8, -1),  # runs of 7 bytes
+        ((4, 3, 5), torch.bfloat16, 2),
+        ((1, 6), torch.bfloat16, -1),  # one outer index: no relayout
+        ((2, 3), torch.float32, 0),
+    ],
+)
+def test_nccl_all_gather_concatenates_the_ranks_inputs_along_dim(shape, dtype, dim):
+    group = (0, 1, 2, 3)
+    backend = NcclBackend()
+    backend._resources[group] = {
+        "pynccl_comm": None,
+        "device_group": None,
+        "world_size": len(group),
+    }
+    inputs = [
+        (
+            torch.randint(0, 256, shape, dtype=torch.uint8).view(dtype)
+            if dtype.itemsize == 1
+            else torch.randint(-(2**15), 2**15, shape, dtype=torch.int32).to(dtype)
+        )
+        for _ in group
+    ]
+
+    def land_rank_major(output, tensor, _group):
+        _bytes(output).copy_(torch.cat([_bytes(x) for x in inputs]))
+
+    backend.all_gather_single = land_rank_major
+    out = backend.all_gather(inputs[0], group, dim)
+
+    assert out.dtype == dtype
+    assert torch.equal(_bytes(out), torch.cat([_bytes(x) for x in inputs], dim))
+
+
 def test_trtllm_collection_uses_fallback_single_tensor_path():
     fallback = Mock()
     fallback.all_reduce.side_effect = lambda tensor, _group, op: tensor
