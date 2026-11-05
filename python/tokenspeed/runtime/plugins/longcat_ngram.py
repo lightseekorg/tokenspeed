@@ -492,14 +492,27 @@ class NgramEmbedding(nn.Module):
         else:
             x = self.word_embeddings(input_ids).clone()
 
-        local_partial = self._ngram_local_partial(input_ids, predecessor_window)
-
-        # TP feature-column sharding: the local table slice contributes only
-        # this rank's feature columns; all-reduce sums the full contribution.
+        # Eager baseline (tp_size=1): accumulate each slot's contribution
+        # directly into the base embedding ``x``, bit-identical to the
+        # checkpoint reference ``NgramEmbedding.forward`` (sequential bf16
+        # accumulation ``x = x + x_proj``).  Accumulating the slots into a
+        # separate ``local_partial`` first and adding it to ``x`` at the end
+        # reorders the bf16 additions, which drifts the forward output by up
+        # to ~1e-1 away from the reference (V5 numeric criterion regression).
         if self.tp_size > 1:
+            local_partial = self._ngram_local_partial(
+                input_ids, predecessor_window
+            )
+            # TP feature-column sharding: the local table slice contributes
+            # only this rank's feature columns; all-reduce sums the full
+            # contribution.
             assert self.tp_group is not None
             local_partial = all_reduce(local_partial, self.tp_group)
-        x = x + local_partial
+            x = x + local_partial
+        else:
+            x = self._ngram_local_partial(
+                input_ids, predecessor_window, out=x
+            )
         x = x / (1 + self.k * (self.n - 1))
         return x
 
@@ -507,8 +520,18 @@ class NgramEmbedding(nn.Module):
         self,
         input_ids: torch.Tensor,
         predecessor_window: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sum of the n-gram table contribution branches (pre all-reduce).
+
+        When ``out`` is provided the slot projections are accumulated into
+        it (``out = out + x_proj`` in index order) and ``out`` is returned —
+        used by the tp_size=1 eager baseline to fold the contributions into
+        the base embedding directly, matching the checkpoint reference's
+        sequential accumulation bit-for-bit.  When ``out`` is None a fresh
+        ``local_partial`` tensor is accumulated and returned, which the
+        caller all-reduces across TP ranks before adding to the base.
 
         Computes the polynomial hash ids from the per-token predecessor
         window (via the shared ``_compute_new_ids``) and accumulates the 12
@@ -529,7 +552,7 @@ class NgramEmbedding(nn.Module):
         Under TP feature-column sharding this is the local partial; the
         caller all-reduces it.
         """
-        local_partial = None
+        local_partial = out
         for index in range(self.k * (self.n - 1)):
             new_ids = self._compute_new_ids(input_ids, predecessor_window, index)
             if not self.use_staging:
