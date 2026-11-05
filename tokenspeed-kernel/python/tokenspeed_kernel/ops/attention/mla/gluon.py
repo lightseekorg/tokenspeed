@@ -34,6 +34,7 @@ from tokenspeed_kernel.signature import (
     format_signature,
     format_signatures,
 )
+from tokenspeed_kernel.workspace import zeroed_state
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
@@ -74,6 +75,15 @@ if current_platform().is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.project_value import (
         launch_gluon_mla_project_value_gfx950 as _mla_project_value_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        gluon_grouped_mm_a16w16_decode_num_counters_gfx950 as _grouped_decode_counters,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_grouped_mm_a16w16_decode_gfx950 as _grouped_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_grouped_mm_a16w16_decode_gfx950 as _supports_grouped_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
         launch_gluon_mla_decode_gfx1250 as _mla_decode_gfx1250_impl,
@@ -352,6 +362,77 @@ if current_platform().is_amd:
     )
     def gluon_mla_project_value_gfx950(*args, **kwargs):
         return _mla_project_value_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_project_value",
+        name="gluon_grouped_mla_project_value_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    attention=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "num_q_heads": frozenset({12}),
+            "value_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
+            "gate_kind": frozenset({"none", "sigmoid"}),
+            "weight_k_major": frozenset({True}),
+        },
+    )
+    def gluon_grouped_mla_project_value_gfx950(
+        *,
+        attention: torch.Tensor,
+        weight: torch.Tensor,
+        gate: torch.Tensor | None,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """One grouped decode GEMM over the heads, the gate in its epilogue.
+
+        Fall back to torch.bmm then sigmoid_mul for row counts without a
+        measured config and for unaligned attention rows.
+        """
+        batch, heads, latent = attention.shape
+        value = weight.shape[2]
+        out_view = out.view(batch, heads, value)
+        if (
+            _supports_grouped_decode(batch, heads, value, latent)
+            and attention.stride(2) == 1
+            and attention.stride(0) % 8 == 0
+            and attention.stride(1) % 8 == 0
+            and attention.data_ptr() % 16 == 0
+        ):
+            counters = zeroed_state(
+                _grouped_decode_counters(batch, heads, value, latent),
+                dtype=torch.int32,
+                device=attention.device,
+            )
+            _grouped_decode_impl(
+                attention,
+                weight.transpose(1, 2),
+                counters,
+                False,
+                out=out_view,
+                gate=None if gate is None else gate.view(batch, heads, value),
+            )
+            return out
+        torch.bmm(attention.transpose(0, 1), weight, out=out_view.transpose(0, 1))
+        if gate is not None:
+            from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+
+            sigmoid_mul(out, gate)
+        return out
 
     @register_kernel(
         "attention",
