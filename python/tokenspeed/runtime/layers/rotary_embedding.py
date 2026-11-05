@@ -303,7 +303,6 @@ def _yarn_find_correction_dim(
     )
 
 
-# Find dim range bounds based on rotations
 def yarn_find_correction_range(
     low_rot: int,
     high_rot: int,
@@ -311,6 +310,29 @@ def yarn_find_correction_range(
     base: float = 10000,
     max_position_embeddings: int = 2048,
 ) -> tuple[int, int]:
+    """The YaRN correction range: rotary-dimension bounds for the ramp mask.
+
+    Inverts the RoPE frequency formula to find, for each rotation count, the
+    rotary dimension whose period over ``max_position_embeddings`` positions
+    completes that many rotations. Dimensions below the low bound rotate more
+    than ``low_rot`` times (high frequency, left unscaled by YaRN); dimensions
+    above the high bound rotate fewer than ``high_rot`` times (low frequency,
+    fully interpolated); the ramp from ``yarn_linear_ramp_mask`` blends between
+    the two across ``[low, high]``.
+
+    Args:
+        low_rot: Rotation count marking the end of the unscaled region
+            (YaRN's ``beta_fast``).
+        high_rot: Rotation count marking the start of the fully interpolated
+            region (YaRN's ``beta_slow``).
+        dim: Rotary dimension of the embedding.
+        base: RoPE frequency base.
+        max_position_embeddings: Original (pre-scaling) maximum position.
+
+    Returns:
+        ``(low, high)`` rotary-dimension indices, floor/ceil-rounded and
+        clamped to ``[0, dim - 1]``.
+    """
     low = math.floor(
         _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
     )
@@ -351,6 +373,22 @@ def yarn_linear_ramp_mask(
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    """The YaRN attention magnitude correction ``0.1 * mscale * ln(scale) + 1``.
+
+    YaRN scales attention logits up slightly as the context is extended to
+    compensate for the entropy drop of interpolated rotary embeddings; the
+    cos/sin cache is multiplied by this factor.
+
+    Args:
+        scale: Context extension factor (``rope_scaling["factor"]``); no
+            correction is applied at or below 1.
+        mscale: Model-specific multiplier on the log term (DeepSeek's
+            ``mscale`` / ``mscale_all_dim``); 1 gives the original YaRN
+            formula.
+
+    Returns:
+        The magnitude correction factor, 1.0 when ``scale <= 1``.
+    """
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
