@@ -803,7 +803,9 @@ def dsa_decode_dcp_records(
     Args:
         q: Absorbed MLA query ``[ranks, tokens, local_heads, R + D_rope]``:
             rank ``r``'s TP heads at ``q[r]`` (``gather_query_heads_rank_major``),
-            BF16 or FP8.
+            BF16 or FP8. Each rank's rows are read in place when contiguous,
+            however far apart the ranks lie, as a query gathered inside a
+            larger chunk.
         kv_cache: Dense compressed MLA KV cache, flat ``[slots, dim]`` or
             paged; this rank's pages.
         topk_slots: Local KV slots ``[tokens, topk]``, ``-1`` where invalid.

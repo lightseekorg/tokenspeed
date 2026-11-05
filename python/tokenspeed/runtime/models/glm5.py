@@ -58,6 +58,7 @@ from tokenspeed.runtime.layers.attention.dcp.indexer import (
     owned_dsa_topk_fits,
     select_dsa_topk,
     select_owned_dsa_topk,
+    select_owned_dsa_topk_with_rider,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
@@ -179,6 +180,11 @@ class GlmDsaDecodeTopK:
     # placement. ``topk_indices`` then holds this rank's local cache slots,
     # its share first, and ``topk_lens`` their counts.
     owned_placement: Any = None
+    # The selecting layer's decode query rows of every rank, uint8 [ranks,
+    # rows, bytes], where they rode that share's score gather
+    # (select_owned_dsa_topk_with_rider). Only that layer's core reads them;
+    # it takes them off before publishing the top-k.
+    gathered_query: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -576,7 +582,12 @@ class GlmDsaSparseAttentionMixin:
         ctx: ForwardContext,
         *,
         logical_num_tokens: int | None = None,
+        query_rider: torch.Tensor | None = None,
     ) -> GlmDsaDecodeTopK | None:
+        """The decode rows' top-k. ``query_rider`` (the backend's
+        ``dcp_decode_query_rider``) rides an owned top-k's score gather,
+        every rank's rows coming back as ``gathered_query``; a top-k
+        selected otherwise leaves the query to its core's own gather."""
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         if metadata is None or metadata.page_table is None:
             return None
@@ -616,6 +627,7 @@ class GlmDsaSparseAttentionMixin:
             num_tokens=num_tokens,
             num_decode_tokens=decode_window.num_tokens,
             topk=topk,
+            query_rider=query_rider,
         )
 
     def _compute_decode_topk_indices_portable(
@@ -630,6 +642,7 @@ class GlmDsaSparseAttentionMixin:
         num_tokens: int,
         num_decode_tokens: int,
         topk: int,
+        query_rider: torch.Tensor | None = None,
     ) -> GlmDsaDecodeTopK:
         q = indexer_output.query_rows(decode_start, decode_start + num_decode_tokens)
         weights = indexer_output.weights[
@@ -667,6 +680,7 @@ class GlmDsaSparseAttentionMixin:
         dcp_index = None
         capturing = False
         owned_placement = None
+        gathered_query = None
         if placement is not None:
             q, q_scales = self._scorer_index_query(q, index_k_cache)
             softmax_scale = self.indexer.weights_softmax_scale
@@ -711,10 +725,7 @@ class GlmDsaSparseAttentionMixin:
                     max_logits_bytes=None,
                 )
             ):
-                select_owned_dsa_topk(
-                    q,
-                    weights,
-                    index_k_cache,
+                owned = dict(
                     metadata=dcp_index,
                     page_size=page_size,
                     topk=topk,
@@ -726,6 +737,12 @@ class GlmDsaSparseAttentionMixin:
                     out=topk_slice,
                     lens_out=topk_lens_slice,
                 )
+                if query_rider is None:
+                    select_owned_dsa_topk(q, weights, index_k_cache, **owned)
+                else:
+                    _, _, gathered_query = select_owned_dsa_topk_with_rider(
+                        q, weights, index_k_cache, rider=query_rider, **owned
+                    )
                 owned_placement = placement
             else:
                 offsets, _ = select_dsa_topk(
@@ -784,6 +801,7 @@ class GlmDsaSparseAttentionMixin:
             dcp_q_len=q_len_per_req,
             dcp_capturing=capturing,
             owned_placement=owned_placement,
+            gathered_query=gathered_query,
         )
 
     @staticmethod
@@ -1311,6 +1329,35 @@ class GlmDsaSparseAttentionMixin:
                 or (num_decode_tokens > 0 and shared_topk.decode is None)
             )
         )
+        decode_ctx = None
+        if num_decode_tokens > 0:
+            decode_ctx = replace(
+                ctx,
+                bs=decode_window.num_reqs,
+                num_extends=0,
+                input_num_tokens=num_decode_tokens,
+                forward_mode=ForwardMode.DECODE,
+            )
+        # An owned decode top-k's score gather can carry the decode rows'
+        # query heads to a records core, which then skips its own gather:
+        # the query is absorbed before the indexer for it.
+        q = decode_query = query_rider = gathered_query = None
+        if (
+            should_compute_indexer
+            and num_prefill_tokens == 0
+            and decode_ctx is not None
+            and self.owned_decode_topk
+            and backend.takes_owned_decode_topk(self.attn_mqa)
+        ):
+            q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
+            decode_query = self.forward_absorb_qkv_proj(
+                q[decode_start:decode_end],
+                latent_cache[decode_start:decode_end],
+                positions[decode_start:decode_end],
+                decode_ctx,
+                decode_locs,
+            )
+            query_rider = backend.dcp_decode_query_rider(self.attn_mqa, decode_query)
         if should_compute_indexer:
             hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
             if valid_rows is not None:
@@ -1337,12 +1384,18 @@ class GlmDsaSparseAttentionMixin:
                     num_prefill_tokens,
                 )
             if ctx.num_extends < ctx.bs:
-                shared_topk.decode = self._compute_decode_topk_indices(
+                decode_topk = self._compute_decode_topk_indices(
                     indexer_output,
                     ctx,
+                    **({} if query_rider is None else {"query_rider": query_rider}),
                 )
+                if decode_topk is not None and decode_topk.gathered_query is not None:
+                    gathered_query = decode_topk.gathered_query
+                    decode_topk = replace(decode_topk, gathered_query=None)
+                shared_topk.decode = decode_topk
 
-        q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
+        if q is None:
+            q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -1372,13 +1425,6 @@ class GlmDsaSparseAttentionMixin:
             )
 
         if num_decode_tokens > 0:
-            decode_ctx = replace(
-                ctx,
-                bs=decode_window.num_reqs,
-                num_extends=0,
-                input_num_tokens=num_decode_tokens,
-                forward_mode=ForwardMode.DECODE,
-            )
             if shared_topk.decode is None:
                 raise RuntimeError(
                     "GLM DSA sparse decode requires computed top-k indices."
@@ -1394,22 +1440,33 @@ class GlmDsaSparseAttentionMixin:
                     else None
                 ),
             )
-            self.forward_absorb(
-                positions[decode_start:decode_end],
-                q[decode_start:decode_end],
-                latent_cache[decode_start:decode_end],
-                decode_ctx,
-                decode_locs,
-                attn_output[decode_start:decode_end],
-                topk_indices=topk_indices,
-                topk_lens=topk_lens,
-                output_gate=(
-                    None
-                    if output_gate is None
-                    else output_gate[decode_start:decode_end]
-                ),
-                topk_owned=topk_owned,
+            decode_gate = (
+                None if output_gate is None else output_gate[decode_start:decode_end]
             )
+            if decode_query is None:
+                self.forward_absorb(
+                    positions[decode_start:decode_end],
+                    q[decode_start:decode_end],
+                    latent_cache[decode_start:decode_end],
+                    decode_ctx,
+                    decode_locs,
+                    attn_output[decode_start:decode_end],
+                    topk_indices=topk_indices,
+                    topk_lens=topk_lens,
+                    output_gate=decode_gate,
+                    topk_owned=topk_owned,
+                )
+            else:
+                self.forward_absorb_attn_v_proj(
+                    decode_query,
+                    decode_ctx,
+                    attn_output[decode_start:decode_end],
+                    topk_indices=topk_indices,
+                    topk_lens=topk_lens,
+                    output_gate=decode_gate,
+                    topk_owned=topk_owned,
+                    gathered_query=gathered_query,
+                )
 
         return attn_output
 
@@ -1487,9 +1544,14 @@ class GlmDsaSparseAttentionMixin:
         topk_lens: torch.Tensor | None = None,
         output_gate: torch.Tensor | None = None,
         topk_owned: bool = False,
+        gathered_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Only an owned top-k's backend (takes_owned_decode_topk) gets the
-        # flag; other backends keep their signature.
+        # flag and a query its gather carried; other backends keep their
+        # signature.
+        owned = {"topk_owned": True} if topk_owned else {}
+        if gathered_query is not None:
+            owned["gathered_query"] = gathered_query
         attn_output = self.attn_mqa(
             Q,
             k=None,
@@ -1498,7 +1560,7 @@ class GlmDsaSparseAttentionMixin:
             ctx=ctx,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
-            **({"topk_owned": True} if topk_owned else {}),
+            **owned,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         self.project_latent_values(attn_output, output, output_gate)

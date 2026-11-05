@@ -856,61 +856,12 @@ def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
 def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     monkeypatch, rank, query_width, arm
 ):
-    from types import SimpleNamespace
-
     from tokenspeed.runtime.layers.attention.backends.paged import dsa
 
-    backend = object.__new__(dsa.DSABackend)
-    backend.kernel_page_size = 64
-    backend.kernel_solution = None
-    backend.prefill_kernel_plan = None
-    backend.decode_kernel_plan = None
-    backend.slot_order = "selection"
-    backend.data_type = torch.bfloat16
-    backend.kv_lora_rank = 128
-    backend.qk_nope_head_dim = 128
-    backend.qk_rope_head_dim = 0
-    backend.index_topk = 512
-    backend.max_context_len = 512
-    backend.kvp_group = (0, 1, 2, 3)
-    backend.kvp_rank = rank
-    backend.kvp_block_granularity = 64
-    backend.kvp_virtual_block_count = 5
-    backend.qcp_group = (0,)
-    # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
-    # combine form.
-    backend.num_attention_heads = 8
-    backend.num_local_heads = 2
-    # A target verify publishing no causal lengths: _k_row_causal_lengths derives them.
-    backend.is_draft = False
-    backend.spec_num_tokens = query_width
-    # configure_runtime's probe verdict, set directly: the probe admits only
-    # gfx950's dense core on an FP8 cache
-    # (test_dcp_decode_records_core_follows_every_decode_selection), and the
-    # forward reads only this flag, whatever the query dtype.
-    backend._dcp_decode_records_core = arm != "unprobed"
-    backend._dense_backend = SimpleNamespace(
-        forward_decode_metadata=SimpleNamespace(
-            num_extends=0,
-            seq_lens_k=torch.tensor([128]),
-            max_seq_len_k=128,
-            _dsa_kv_seq_lens=None,
-        )
-    )
+    backend, layer, pool = _sharded_decode_backend(rank, query_width, arm)
     query = torch.zeros(query_width, 2, 128, dtype=torch.bfloat16)
     slots = torch.full((query_width, 512), -1, dtype=torch.int32)
     slots[:, :4] = torch.tensor([64, 128, 192, 256])
-    pool = SimpleNamespace(
-        quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
-    )
-    layer = SimpleNamespace(
-        layer_id=0,
-        tp_q_head_num=2,
-        head_dim=128,
-        v_head_dim=128,
-        scaling=0.1,
-        logit_cap=0.0,
-    )
 
     calls = []
     sizes = []
@@ -1003,6 +954,131 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
         if arm == "records"
         else ["gather", "decode", "combine"]
     )
+
+
+@pytest.mark.parametrize("arm", ["unprobed", "split_size", "records"])
+def test_dsa_decode_reads_a_query_its_owned_topk_gather_carried(monkeypatch, arm):
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+
+    query_width = 4
+    backend, layer, pool = _sharded_decode_backend(1, query_width, arm)
+    query = torch.randn(query_width, 2, 128).to(torch.bfloat16)
+    records = arm == "records"
+    monkeypatch.setattr(
+        dsa,
+        "dsa_decode_dcp_records_supported",
+        lambda **kwargs: records,
+    )
+    rider = backend.dcp_decode_query_rider(layer, query)
+    if not records:
+        assert rider is None
+        return
+    # The bytes the core's own gather would send.
+    assert rider.dtype == torch.uint8 and rider.is_contiguous()
+    assert torch.equal(rider.view(torch.bfloat16).view(query.shape), query)
+
+    gathered = torch.stack([rider + r for r in range(4)])
+    calls = []
+
+    def records_core(**kwargs):
+        calls.append("records_core")
+        assert torch.equal(
+            kwargs["q"].view(torch.uint8).reshape(4, query_width, -1), gathered
+        )
+        return torch.zeros((4, query_width, 2, 65), dtype=torch.int32)
+
+    monkeypatch.setattr(
+        dsa,
+        "gather_query_heads_rank_major",
+        lambda q, group: pytest.fail("the query was gathered again"),
+    )
+    monkeypatch.setattr(dsa, "dsa_decode_dcp_records", records_core)
+    monkeypatch.setattr(
+        dsa,
+        "combine_attention_records",
+        lambda records, **kwargs: torch.full((query_width, 2, 128), 7.0),
+    )
+    owned = dict(
+        q=query,
+        layer=layer,
+        token_to_kv_pool=pool,
+        bs=1,
+        topk_indices=torch.zeros(query_width, 512, dtype=torch.int32),
+        topk_lens=torch.ones(query_width, dtype=torch.int32),
+        gathered_query=gathered,
+    )
+    out = backend.forward_sparse_decode(topk_owned=True, **owned)
+    assert calls == ["records_core"] and (out == 7).all()
+    # A gathered query rides an owned top-k's gather into the records core.
+    with pytest.raises(ValueError, match="rides an owned top-k"):
+        backend.forward_sparse_decode(**owned)
+    with pytest.raises(ValueError, match="does not hold"):
+        backend.forward_sparse_decode(
+            topk_owned=True, **{**owned, "gathered_query": gathered[:3]}
+        )
+    monkeypatch.setattr(dsa, "dsa_decode_dcp_records_supported", lambda **kw: False)
+    with pytest.raises(ValueError, match="does not take it"):
+        backend.forward_sparse_decode(topk_owned=True, **owned)
+
+
+def _sharded_decode_backend(rank, query_width, arm):
+    """A DSA leaf of a 4-rank KVP group holding the attention-TP slice (2 of
+    8 heads) of a BF16 cache, its decode metadata one 128-token request of
+    ``query_width`` verify rows; the records probe passed unless ``arm`` is
+    ``"unprobed"``. Returns the backend, the layer and the pool."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+
+    backend = object.__new__(dsa.DSABackend)
+    backend.kernel_page_size = 64
+    backend.kernel_solution = None
+    backend.prefill_kernel_plan = None
+    backend.decode_kernel_plan = None
+    backend.slot_order = "selection"
+    backend.data_type = torch.bfloat16
+    backend.kv_lora_rank = 128
+    backend.qk_nope_head_dim = 128
+    backend.qk_rope_head_dim = 0
+    backend.index_topk = 512
+    backend.max_context_len = 512
+    backend.kvp_group = (0, 1, 2, 3)
+    backend.kvp_rank = rank
+    backend.kvp_block_granularity = 64
+    backend.kvp_virtual_block_count = 5
+    backend.qcp_group = (0,)
+    # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
+    # combine form.
+    backend.num_attention_heads = 8
+    backend.num_local_heads = 2
+    # A target verify publishing no causal lengths: _k_row_causal_lengths derives them.
+    backend.is_draft = False
+    backend.spec_num_tokens = query_width
+    # configure_runtime's probe verdict, set directly: the probe admits only
+    # gfx950's dense core on an FP8 cache
+    # (test_dcp_decode_records_core_follows_every_decode_selection), and the
+    # forward reads only this flag, whatever the query dtype.
+    backend._dcp_decode_records_core = arm != "unprobed"
+    backend._dense_backend = SimpleNamespace(
+        forward_decode_metadata=SimpleNamespace(
+            num_extends=0,
+            seq_lens_k=torch.tensor([128]),
+            max_seq_len_k=128,
+            _dsa_kv_seq_lens=None,
+        )
+    )
+    pool = SimpleNamespace(
+        quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        head_dim=128,
+        v_head_dim=128,
+        scaling=0.1,
+        logit_cap=0.0,
+    )
+    return backend, layer, pool
 
 
 @pytest.mark.parametrize("rank", range(4))

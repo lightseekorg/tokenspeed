@@ -1004,6 +1004,11 @@ class CacheGroupRouter(AttentionBackend):
             return False
         return self._leaf_for(layer).takes_owned_decode_topk(layer)
 
+    def dcp_decode_query_rider(self, layer, q):
+        if not self.takes_owned_decode_topk(layer):
+            return None
+        return self._leaf_for(layer).dcp_decode_query_rider(layer, q)
+
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
 

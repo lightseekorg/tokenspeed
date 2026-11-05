@@ -31,10 +31,13 @@ rank (:func:`select_dsa_topk`) as scheduler slots compacted to the rank's
 local slots, for a BF16 index query and, where a candidate scorer takes
 one, an FP8 query with its scales. Rows compare as sets: a scorer's
 candidate order is unspecified, and the gfx950 one's follows its atomics.
-The ranks' counts must add up to the selection's. A forward's captured
-metadata build and owned selection, replayed after the lengths and the
-table change in place, must select what the eager merge selects for the
-new batch.
+The ranks' counts must add up to the selection's. Rider bytes riding the
+score gather (:func:`select_owned_dsa_topk_with_rider`, as a records
+decode's query rides it) must leave the selection as it was and land as an
+all-gather of every rank's rider lands. A forward's captured metadata build
+and owned selection with its rider, replayed after the lengths, the table
+and the rider change in place, must select what the eager merge selects
+for the new batch and gather the new riders.
 """
 
 import sys
@@ -53,6 +56,8 @@ register_cuda_ci(est_time=120, suite="runtime-2gpu")
 
 _HEADS, _DIM, _TOPK, _PAGE, _BLOCK, _Q_LEN = 32, 128, 2048, 64, 128, 4
 _COLUMNS = 512
+# A rank's FP8 decode query row at KVP8: 12 heads of 576 bytes.
+_RIDER = 12 * 576
 # Spare tokens past each request's length, so in-place length edits stay
 # inside the request's allocated blocks.
 _GROWTH = _BLOCK
@@ -203,6 +208,7 @@ def _worker(rank, degree, rendezvous):
         owned_dsa_topk_fits,
         select_dsa_topk,
         select_owned_dsa_topk,
+        select_owned_dsa_topk_with_rider,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import (
         CachePlacement,
@@ -274,6 +280,16 @@ def _worker(rank, degree, rendezvous):
             )
             return compact_owned_cache_slots(slots, lens, placement), lens
 
+        def rider_of(rows):
+            """This rank's rider bytes, distinct per rank and row."""
+            pattern = torch.arange(rows * _RIDER, device=device) * (2 * rank + 3)
+            return pattern.to(torch.uint8).view(rows, _RIDER)
+
+        def gathered_riders(rider):
+            riders = rider.new_empty((degree, *rider.shape))
+            dist.all_gather_into_tensor(riders, rider)
+            return riders
+
         for bs in (1, 7, 16):
             # Every rank derives the same batch from the seed.
             generator = torch.Generator().manual_seed(6100 + 13 * bs)
@@ -329,6 +345,38 @@ def _worker(rank, degree, rendezvous):
                 total = counts.clone()
                 dist.all_reduce(total)
                 torch.testing.assert_close(total, lens, rtol=0, atol=0)
+
+                # Bytes riding the score gather land as an all-gather would
+                # land them, and leave the selection as it was.
+                rider = rider_of(rows)
+                ridden, ridden_counts, gathered = select_owned_dsa_topk_with_rider(
+                    query,
+                    weights,
+                    plane,
+                    metadata=metadata,
+                    q_scales=scales,
+                    rider=rider,
+                    **kwargs,
+                )
+                _assert_same_rows(ridden, expected)
+                torch.testing.assert_close(ridden_counts, counts, rtol=0, atol=0)
+                assert torch.equal(gathered, gathered_riders(rider))
+            for bad in (
+                torch.zeros((rows, _RIDER), dtype=torch.int32, device=device),
+                torch.zeros((rows, _RIDER + 2), dtype=torch.uint8, device=device),
+                torch.zeros((rows + 1, _RIDER), dtype=torch.uint8, device=device),
+                torch.zeros((_RIDER, rows), dtype=torch.uint8, device=device).t(),
+            ):
+                with pytest.raises(ValueError, match="a rider is a contiguous"):
+                    select_owned_dsa_topk_with_rider(
+                        query,
+                        weights,
+                        plane,
+                        metadata=metadata,
+                        q_scales=scales,
+                        rider=bad,
+                        **kwargs,
+                    )
             print(
                 f"rank {rank}/{degree}: bs={bs} owned selections of "
                 f"{len(queries)} query types matched the merge",
@@ -336,22 +384,25 @@ def _worker(rank, degree, rendezvous):
             )
 
         # Capture a forward's build and owned selection at bs 16, as a
-        # decode graph holds them, and replay it for other batches.
+        # decode graph holds them, its rider riding along, and replay it
+        # for other batches and riders.
         query, scales = queries[-1]
         out = torch.empty((rows, _TOPK), dtype=torch.int32, device=device)
         lens_out = torch.empty(rows, dtype=torch.int32, device=device)
+        rider = rider_of(rows)
 
         def step():
-            select_owned_dsa_topk(
+            return select_owned_dsa_topk_with_rider(
                 query,
                 weights,
                 plane,
                 metadata=metadata_of(query, weights, plane, table, seq_lens, placement),
                 q_scales=scales,
+                rider=rider,
                 out=out,
                 lens_out=lens_out,
                 **kwargs,
-            )
+            )[2]
 
         for _ in range(2):
             step()
@@ -359,7 +410,7 @@ def _worker(rank, degree, rendezvous):
         dist.barrier(group=coordination)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
-            step()
+            gathered = step()
         original = seq_lens.clone()
         for edit in ("lengths", "rows"):
             delta = torch.randint(
@@ -370,6 +421,7 @@ def _worker(rank, degree, rendezvous):
                 # Rows now pair with other requests' pages and lengths.
                 table.copy_(table.roll(1, 0))
                 seq_lens.copy_(seq_lens.roll(1, 0))
+            rider.copy_(rider.roll(1, 0))
             torch.cuda.synchronize()
             dist.barrier(group=coordination)
             graph.replay()
@@ -378,6 +430,7 @@ def _worker(rank, degree, rendezvous):
             )
             _assert_same_rows(out, expected)
             torch.testing.assert_close(lens_out, expected_counts, rtol=0, atol=0)
+            assert torch.equal(gathered, gathered_riders(rider))
         print(f"rank {rank}/{degree}: graph replay matched the merge", flush=True)
         graph.reset()
         graph = None

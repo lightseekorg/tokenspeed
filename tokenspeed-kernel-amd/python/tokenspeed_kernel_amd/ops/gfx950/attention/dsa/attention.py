@@ -2337,7 +2337,10 @@ def launch_gluon_dsa_decode_dcp_records_gfx950(
     KVP gather's rank-major query ``[ranks, tokens, local_heads, dim]``,
     returning the DCP records ``[ranks, tokens, local_heads, kv_lora_rank /
     2 + 1]`` (int32) that ``dispatch_dcp_attention_partials`` packs from its
-    output and LSE, bit for bit. Raises ``ValueError`` for a size
+    output and LSE, bit for bit. The ranks may lie further apart than their
+    contiguous rows, as when the query rides in a larger gathered chunk;
+    other layouts, and rank strides or bases the query's copy to LDS cannot
+    take, are copied first. Raises ``ValueError`` for a size
     :func:`gluon_dsa_decode_dcp_records_supported_gfx950` refuses."""
     if logit_cap != 0.0:
         raise ValueError("Gluon DSA does not support logit_cap")
@@ -2380,8 +2383,17 @@ def launch_gluon_dsa_decode_dcp_records_gfx950(
         dtype=torch.int32,
         device=q.device,
     )
+    dim = q.shape[3]
+    # The query's direct-to-LDS copy needs a 16-byte-aligned base and
+    # 16-element-aligned row offsets.
+    if (
+        q.stride()[1:] != (local_heads * dim, dim, 1)
+        or q.stride(0) % 16
+        or q.data_ptr() % 16
+    ):
+        q = q.contiguous()
     return _run_dense_kv(
-        q.contiguous(),
+        q,
         dense_kv,
         topk_slots.contiguous(),
         topk_lens.contiguous(),
