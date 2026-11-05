@@ -20,12 +20,14 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 from tokenspeed_kernel.platform import current_platform, prepare_cuda_toolkit_env
 
 _IS_HOPPER_PLUS = current_platform().is_hopper_plus
 
-if _IS_HOPPER_PLUS:
+if _IS_HOPPER_PLUS and importlib.util.find_spec("deep_gemm") is not None:
     prepare_cuda_toolkit_env()
     import deep_gemm
 
@@ -59,6 +61,7 @@ def _warmup_fp8_fp4_mqa_logits(
     index_head_dim: int,
     device: torch.device,
     max_kv_len: int,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Pre-compile the ragged prefill sparse-indexer kernel."""
     head_dim_bytes = index_head_dim // 2
@@ -83,7 +86,7 @@ def _warmup_fp8_fp4_mqa_logits(
             cu_seq_len_k_end=cu_end,
             clean_logits=False,
             max_seqlen_k=max_kv_len,
-            logits_dtype=torch.float32,
+            logits_dtype=logits_dtype,
         )
 
 
@@ -94,6 +97,7 @@ def _warmup_fp8_fp4_paged_mqa_logits(
     cache_block_size: int,
     max_decode_tokens: int,
     device: torch.device,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Pre-compile paged decode indexer and schedule-metadata kernels."""
     head_dim_bytes = index_head_dim // 2
@@ -134,7 +138,7 @@ def _warmup_fp8_fp4_paged_mqa_logits(
             schedule_meta=schedule_meta,
             max_context_len=cache_block_size,
             clean_logits=False,
-            logits_dtype=torch.float32,
+            logits_dtype=logits_dtype,
         )
     torch.cuda.synchronize()
 
@@ -146,6 +150,7 @@ def warmup_mqa_logits(
     cache_block_size: int,
     max_decode_tokens: int,
     device: torch.device,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Compile packed MQA scoring and paged metadata kernels before capture."""
     _warmup_fp8_fp4_mqa_logits(
@@ -153,6 +158,7 @@ def warmup_mqa_logits(
         index_head_dim=index_head_dim,
         device=device,
         max_kv_len=4096,
+        logits_dtype=logits_dtype,
     )
     _warmup_fp8_fp4_paged_mqa_logits(
         num_heads=num_heads,
@@ -160,4 +166,5 @@ def warmup_mqa_logits(
         cache_block_size=cache_block_size,
         max_decode_tokens=max_decode_tokens,
         device=device,
+        logits_dtype=logits_dtype,
     )

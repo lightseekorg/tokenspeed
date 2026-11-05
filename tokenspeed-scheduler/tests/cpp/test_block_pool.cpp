@@ -635,6 +635,42 @@ TEST(BlockPoolBucketAcquireTest, ParentsNeededSharesOpenedParentsAcrossBuckets) 
     EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 1>{0}, std::array<std::int64_t, 1>{1}, 5, 2), 2);
 }
 
+// A pair of blocks that must share a bucket, either bucket: each pair takes
+// the bucket with the most holes its demand leaves, and that choice needs no
+// more parents than any other.
+TEST(BlockPoolBucketAcquireTest, APairTakesTheBucketWithTheMostHolesLeft) {
+    using Buckets = std::vector<std::int32_t>;
+    EXPECT_EQ(AssignPairBuckets(std::array<std::int64_t, 2>{2, 0}, std::array<std::int64_t, 2>{3, 2}, 1), Buckets{1})
+        << "bucket 0 has more holes but fewer left after its demand";
+    EXPECT_EQ(AssignPairBuckets(std::array<std::int64_t, 2>{0, 0}, std::array<std::int64_t, 2>{2, 2}, 2),
+              (Buckets{0, 1}))
+        << "the lower bucket on a tie, then the one the first pair left emptier";
+    EXPECT_EQ(AssignPairBuckets(std::array<std::int64_t, 2>{0, 0}, std::array<std::int64_t, 2>{5, 0}, 2),
+              (Buckets{0, 0}));
+    EXPECT_EQ(AssignPairBuckets(std::array<std::int64_t, 1>{3}, std::array<std::int64_t, 1>{0}, 2), (Buckets{0, 0}))
+        << "one bucket takes every pair";
+
+    // packing 4, two buckets. The pair fits bucket 1's two holes; bucket 0
+    // would open a parent for it.
+    std::array<std::int64_t, 2> scratch{};
+    EXPECT_EQ(ParentsNeededForBucketsAndPairs(std::array<std::int64_t, 2>{2, 0}, std::array<std::int64_t, 2>{3, 2},
+                                              /*dense_need=*/0, /*pairs=*/1, /*packing=*/4, scratch),
+              0);
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{4, 0}, std::array<std::int64_t, 2>{3, 2}, 0, 4), 1);
+    // A pair needs two slots of one bucket: with one slot per bucket in a
+    // parent (packing 2), two parents.
+    EXPECT_EQ(ParentsNeededForBucketsAndPairs(std::array<std::int64_t, 2>{0, 0}, std::array<std::int64_t, 2>{0, 0},
+                                              /*dense_need=*/0, /*pairs=*/1, /*packing=*/2, scratch),
+              2);
+    // Dense blocks take the holes the pairs leave.
+    EXPECT_EQ(ParentsNeededForBucketsAndPairs(std::array<std::int64_t, 2>{0, 0}, std::array<std::int64_t, 2>{0, 0},
+                                              /*dense_need=*/2, /*pairs=*/1, /*packing=*/4, scratch),
+              1);
+    EXPECT_EQ(ParentsNeededForBucketsAndPairs(std::array<std::int64_t, 2>{0, 0}, std::array<std::int64_t, 2>{0, 0},
+                                              /*dense_need=*/3, /*pairs=*/1, /*packing=*/4, scratch),
+              2);
+}
+
 TEST(BlockPoolBucketAcquireTest, PlacementIsDeterministicAndOpensOneParentForBothBuckets) {
     BlockPool pool(2, {4});
     pool.RegisterGroup(/*group_id=*/0, /*packing=*/4, /*shard_count=*/2);

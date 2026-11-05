@@ -324,6 +324,7 @@ def test_the_boot_floor_reads_both_knobs(
     ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected
 ) -> None:
     server_args = SimpleNamespace(
+        disaggregation_mode="null",
         all2all_backend="none",
         prefill_graph_max_tokens=ceiling,
         chunked_prefill_size=8192,

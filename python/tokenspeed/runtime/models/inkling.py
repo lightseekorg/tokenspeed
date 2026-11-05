@@ -112,6 +112,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.layers.mlp import GatedMLP
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK
 from tokenspeed.runtime.layers.paged_attention import (
@@ -631,7 +632,7 @@ class InklingAttention(nn.Module):
         return output
 
 
-class InklingDenseMLP(nn.Module):
+class InklingDenseMLP(GatedMLP):
     """Dense SwiGLU MLP for the first ``dense_mlp_idx`` layers."""
 
     def __init__(
@@ -641,11 +642,10 @@ class InklingDenseMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
-        super().__init__()
         tp_rank = mapping.attn.tp_rank
         tp_size = mapping.attn.tp_size
         tp_group = mapping.attn.tp_group
-        self.gate_up_proj = MergedColumnParallelLinear(
+        gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [config.dense_intermediate_size] * 2,
             bias=False,
@@ -655,7 +655,7 @@ class InklingDenseMLP(nn.Module):
             tp_group=tp_group,
             prefix=add_prefix("gate_up_proj", prefix),
         )
-        self.down_proj = RowParallelLinear(
+        down_proj = RowParallelLinear(
             config.dense_intermediate_size,
             config.hidden_size,
             bias=False,
@@ -666,17 +666,15 @@ class InklingDenseMLP(nn.Module):
             reduce_results=True,
             prefix=add_prefix("down_proj", prefix),
         )
+        super().__init__(gate_up_proj, down_proj, SiluAndMul(), fusions=())
         self.global_scale = (
             nn.Parameter(torch.empty(1), requires_grad=False)
             if config.use_global_scale
             else None
         )
-        self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x = super().forward(x)
         if self.global_scale is not None:
             x = x * self.global_scale
         return x

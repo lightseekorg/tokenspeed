@@ -44,6 +44,7 @@ from tokenspeed_kernel.signature import (
 _HAS_TRTLLM_KERNEL = (
     current_platform().is_nvidia
     and importlib.util.find_spec("trtllm_kernel") is not None
+    and importlib.util.find_spec("deep_ep") is not None
 )
 if _HAS_TRTLLM_KERNEL:
     # DeepEP must initialize before TRT-LLM's static CUDA runtime.
@@ -59,7 +60,9 @@ if _HAS_TRTLLM_KERNEL:
 def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
     """Run TRT-LLM's shape-specialized DeepSeek V3 fused-A projection."""
     if not _HAS_TRTLLM_KERNEL:
-        raise RuntimeError("Fused-A GEMM requires a compatible trtllm_kernel package")
+        raise RuntimeError(
+            "Fused-A GEMM requires a compatible trtllm_kernel package and deep_ep"
+        )
     return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
 
 

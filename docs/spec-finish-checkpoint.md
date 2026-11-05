@@ -38,7 +38,7 @@ state 只在"自然检查点"处发布:prompt 结束、落在 junction 上的 ch
 
 | 时机 | 插入的内容 | 用的位置 T |
 |---|---|---|
-| prefill 的下一个 chunk 准入时(或 fused 的第一次 decode 准入时) | 填满的整页。chunk 正好结束在 junction 上,或这是 prompt 结束时,还会插入尾页和 state | 调度器排定的 chunk 结束位置(数据面是 FIFO,命中者的 forward 一定排在写入者后面) |
+| prefill 的下一个 chunk 准入时(或 fused 的第一次 decode 准入时) | 填满的整页。这是 prompt 结束时还会插入尾页和 state;chunk 正好结束在 junction 上时只插入 state(junction 处的 KV 已在缓存中,不再插入尾页) | 调度器排定的 chunk 结束位置(数据面是 FIFO,命中者的 forward 一定排在写入者后面) |
 | 每次 decode 准入时 | 只插新填满的整页,不插尾页,也不插 state | 已落地结果对应的 `TokenSize − 1` |
 | finish 结算(`Finishing` 状态,且在飞计数归零) | 整页、尾页、state 全部插入 | `TokenSize − 1` |
 | retraction(只挑没有 forward 在飞的请求) | 同 finish | 同 finish |

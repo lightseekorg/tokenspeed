@@ -159,6 +159,9 @@ pub struct StopCriteria {
     pub token_limit: i64,
 }
 
+/// Cache ownership IDs have the same UTF-8 byte limit at ingress and demotion.
+pub(crate) const MAX_CACHE_SESSION_ID_BYTES: usize = 4096;
+
 /// The device's per-request stop table width (`MAX_STOP_TOKEN_IDS`).
 pub const MAX_STOP_TOKEN_IDS: usize = 16;
 
@@ -210,8 +213,14 @@ pub struct RequestState {
     pub input_logprobs_sent: bool,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// The continual-prompting session the request belongs to, when it
+    /// names one; traces group a session's requests under it.
+    pub session_id: Option<String>,
     /// Speculative verify rounds this request took part in.
     pub spec_verify_ct: i64,
+    /// The decode reservation last sent to the scheduler
+    /// (`UpdateReserveNumTokens`), which keeps it until it is sent another.
+    pub decode_reserve: Option<i32>,
     /// Once it finished with speculative decoding, its accepted tokens per
     /// verify round.
     pub accept_draft_tokens: Option<f64>,
@@ -232,6 +241,10 @@ pub struct RequestState {
     /// When the frontend received it (wall-clock seconds), 0 if it did not
     /// say.
     pub created_time: f64,
+    /// When its first output token existed (wall-clock seconds), 0 until
+    /// then. Unlike `timings`, this is collected whenever the rank reports
+    /// engine metrics.
+    pub first_token_time: f64,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
     /// The matcher of its grammar, once compiled.
@@ -298,7 +311,9 @@ impl RequestState {
             input_logprobs: None,
             input_logprobs_sent: false,
             cached_tokens: 0,
+            session_id: None,
             spec_verify_ct: 0,
+            decode_reserve: None,
             accept_draft_tokens: None,
             numerical_error_detected: false,
             finished_reason: None,
@@ -306,6 +321,7 @@ impl RequestState {
             abort_notify_client: false,
             submitted_at: None,
             created_time: 0.0,
+            first_token_time: 0.0,
             timings: None,
             grammar: None,
             admission: 0,

@@ -59,10 +59,9 @@ from tokenspeed_kernel.ops.quantization import (
     silu_and_mul_quantize_fp8,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
 
-from tokenspeed.runtime.configs.model_config import beam_default_platform
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -78,6 +77,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
@@ -111,7 +111,6 @@ from tokenspeed.runtime.models.beam_quant import (
     beam_quant_policy,
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MoE
-from tokenspeed.runtime.models.llama import LlamaMLP
 from tokenspeed.runtime.models.qwen3 import Qwen3Attention
 from tokenspeed.runtime.utils import add_prefix, make_layers, set_weight_attrs
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -133,10 +132,13 @@ BEAM_MOE_FP8_POLICY = "fp8ch_vendor_fp32_route"
 
 
 def beam_kernels() -> bool:
-    """Whether Beam's Triton kernels serve its calls: NVIDIA SM100 to SM103, where
-    each was checked byte for byte against the Torch statements it replaces
-    (``beam_default_platform``). Elsewhere Beam runs the statements."""
-    return not beam_default_platform()
+    """Whether Beam's Triton kernels serve its calls: NVIDIA SM90 to SM103, where
+    each was checked byte for byte against the Torch statements it replaces.
+    Elsewhere Beam runs the statements. Beam's vendor defaults
+    (``beam_default_platform``) keep their own SM100 to SM103 range."""
+    platform = current_platform()
+    in_range = ArchVersion(9, 0) <= platform.arch_version <= ArchVersion(10, 3)
+    return platform.is_nvidia and in_range
 
 
 # The hidden size the residual boundary's one-launch kernel was checked at.
@@ -815,7 +817,7 @@ class BeamRouter(ReplicatedLinear):
         # Keep the exact parameter already referenced by TopK and MoELayer.
         self.e_score_correction_bias = correction_bias
         # BF16 pieces of the FP32 weight, made once after loading where a
-        # registered mv kernel takes them (SM100 to SM103).
+        # registered mv kernel takes them (SM90 to SM103).
         self.register_buffer("weight_split", None, persistent=False)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
@@ -921,6 +923,8 @@ class BeamVendorMoE(BeamMoE):
     precision policy and registry selection, with precomputed FP32 routes.
     Explicit backend selection is passed through to the registry. Routing
     applies the routed scale once; experts use their standard default arithmetic.
+    NVIDIA SM90 has no vendor kernel for these experts; its FP8 per-channel
+    experts take the same default-policy path (the Triton FP8 per-channel MoE).
     """
 
     def __init__(
@@ -936,10 +940,18 @@ class BeamVendorMoE(BeamMoE):
             raise NotImplementedError("Beam's vendor MoE requires normalized routes")
         fmt = None if quant_config is None else beam_checkpoint_format(quant_config)
         platform = current_platform()
-        amd_default = platform.is_cdna4
         if platform.is_amd and fmt == "nvfp4":
             raise ValueError("Beam NVFP4 experts require NVIDIA vendor MoE")
-        if amd_default:
+        if platform.is_hopper and fmt in (None, "nvfp4"):
+            raise ValueError(
+                f"Beam has no vendor MoE for {fmt or 'BF16'} experts on NVIDIA "
+                "SM90: BF16 experts run on BeamMoE (--moe-backend auto or "
+                "triton) and NVFP4 experts need NVIDIA SM100 to SM103"
+            )
+        default_policy = platform.is_cdna4 or (
+            platform.is_hopper and fmt == "fp8_channel"
+        )
+        if default_policy:
             policy = "default"
         elif fmt == "mxfp4":
             raise ValueError("Beam MXFP4 experts require AMD gfx950")
@@ -951,25 +963,25 @@ class BeamVendorMoE(BeamMoE):
             }[fmt]
         adapted = copy(config)
         adapted.moe_precision_policy = policy
-        if amd_default:
+        if default_policy:
             # Beam owns grouped selection and folds the routed scale into its
             # FP32 coefficients once, independent of the selected expert backend.
             adapted.moe_routing_mode = "precomputed_topk"
         adapted.moe_output_scale = 1.0
         self._init_moe(adapted, mapping, layer_id, prefix, quant_config)
         experts = self.experts
-        if amd_default:
+        if default_policy:
             # Beam consumes finalized output, even when the selected kernel
             # also supports separate routes for other models' combiners.
             experts.plan["supports_deferred_finalize"] = False
         self.kernel_routing = experts.support_routing
         if (
-            (not amd_default and experts.plan.get("precision_policy") != policy)
+            (not default_policy and experts.plan.get("precision_policy") != policy)
             or experts.plan.get("output_scale", 1.0) != adapted.moe_output_scale
             or experts.supports_deferred_finalize
             or self.kernel_routing != self.topk.topk_config.output_format.is_bypassed()
             or (
-                amd_default
+                default_policy
                 and (self.kernel_routing or not experts.supports_precomputed_topk)
             )
         ):
@@ -1062,19 +1074,21 @@ def beam_moe_class(quantized_experts: bool = False) -> type[BeamMoE]:
     ``--moe-backend flashinfer_trtllm`` (Beam's model default on NVIDIA SM100 to
     SM103 where the policy starts) selects :class:`BeamVendorMoE`; every other
     backend keeps BeamMoE. AMD gfx950 uses the finalized default-policy path
-    for BF16, FP8 and MXFP4 experts, with backend selection left to the registry.
+    for BF16, FP8 and MXFP4 experts, with backend selection left to the registry;
+    NVIDIA SM90 uses it for quantized (FP8 per-channel) experts.
     Unsupported quantized backends fail before loading.
     """
     if get_moe_backend().value == "flashinfer_trtllm":
         return BeamVendorMoE
     platform = current_platform()
-    if platform.is_cdna4:
+    if platform.is_cdna4 or (quantized_experts and platform.is_hopper):
         return BeamVendorMoE
     if quantized_experts:
         raise ValueError(
             "Beam runs FP8 experts on AMD gfx950 with --moe-backend auto, triton "
-            "or gluon (BF16 projection operands); "
-            "NVFP4 and NVIDIA FP8 experts use the vendor MoE, which needs "
+            "or gluon (BF16 projection operands) and on NVIDIA SM90 with "
+            "--moe-backend auto or triton; NVFP4 experts, and FP8 experts on "
+            "NVIDIA SM100 to SM103, use the vendor MoE, which needs "
             "--moe-backend flashinfer_trtllm (Beam's default on NVIDIA SM100 "
             f"to SM103 where it applies), not {get_moe_backend().value}"
         )
@@ -1098,7 +1112,7 @@ def beam_moe_agreement(mapping: Any, decision: tuple) -> None:
         raise RuntimeError(f"Beam's MoE differs across ranks: {decisions}")
 
 
-class BeamMLP(LlamaMLP):
+class BeamMLP(GatedMLP):
     """A dense MLP layer; FP8 W8A8 decode rows run gate/up unscaled.
 
     Where gate/up and down are compressed-tensors FP8 W8A8 linears with
@@ -1109,7 +1123,7 @@ class BeamMLP(LlamaMLP):
     GEMM with unit scales (``fp8_unscaled_linear``), one launch that applies
     its scales, the SwiGLU and the down projection's per-token quantization
     (``silu_and_mul_quantize_fp8``), and the scaled FP8 down GEMM. Everything
-    else (BF16 checkpoints, other rows) runs ``LlamaMLP.forward``.
+    else (BF16 checkpoints, other rows) runs ``GatedMLP.forward``.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -1303,11 +1317,15 @@ class BeamDecoderLayer(BaseDecoderLayer):
 
     def resolve_mlp(self, prefix: str):
         if not self.is_moe_layer:
-            return BeamMLP(
+            return BeamMLP.tensor_parallel(
                 hidden_size=self.config.hidden_size,
                 intermediate_size=self.config.intermediate_size,
-                hidden_act=self.config.hidden_act,
-                mapping=self.mapping,
+                activation=gated_activation(self.config.hidden_act, swiglu_limit=None),
+                tp_rank=self.mapping.dense.tp_rank,
+                tp_size=self.mapping.dense.tp_size,
+                tp_group=self.mapping.dense.tp_group,
+                reduce_results=False,
+                fusions=(),
                 quant_config=self.quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
@@ -1390,10 +1408,8 @@ class BeamModel(BaseTransformerModel):
         super().__init__(
             config=config, mapping=mapping, quant_config=quant_config, prefix=prefix
         )
-        # The final norm consumes the last layer's raw MLP pair; the shared
-        # constructor built a plain norm and its final-norm op, both re-resolved.
+        # The final norm consumes the last layer's raw MLP pair.
         self.norm = self.resolve_final_norm(config)
-        self._final_norm_op = self._build_final_norm_op()
         # Under --enable-allreduce-fusion every boundary runs through the
         # sandwich norm helper (fused where the MNNVL workspace serves it).
         from tokenspeed.runtime.models.beam_sandwich_fusion import (

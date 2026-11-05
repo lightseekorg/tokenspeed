@@ -27,6 +27,8 @@ from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as impl
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _block_maxima_kernel,
     block_maxima,
+    clean_logits,
+    clean_logits_for_selection,
 )
 from utils import assert_no_triton_compile
 
@@ -45,9 +47,10 @@ requires_hopper_selector = pytest.mark.skipif(
 
 @pytest.mark.parametrize("width", [1, 7, 8, 9, 1023, 1024, 1025, 16384, 65537])
 @pytest.mark.parametrize("strided", [False, True])
-def test_block_maxima(width, strided):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_block_maxima(width, strided, dtype):
     torch.manual_seed(37)
-    x = torch.randn((9, width * (2 if strided else 1)), device="cuda")
+    x = torch.randn((9, width * (2 if strided else 1)), device="cuda", dtype=dtype)
     if strided:
         x = x[:, ::2]
     visible = torch.tensor(
@@ -59,8 +62,8 @@ def test_block_maxima(width, strided):
     x[3, -1] = float("nan")
     x[4].fill_(-float("inf"))
     torch.testing.assert_close(
-        block_maxima(x, visible),
-        torch_dsv41_block_maxima(x, visible),
+        block_maxima(x, visible).float(),
+        torch_dsv41_block_maxima(x.float(), visible).float(),
         atol=0,
         rtol=0,
         equal_nan=True,
@@ -178,7 +181,9 @@ def test_bounded_selection_graph_refresh():
 
 def assert_cleaned_prefixes(scores, visible, table, num_pages, actual):
     expected = impl.clean_logits(scores, visible, table, num_pages, scores.shape[1], 64)
-    maxima, ends = impl.block_maxima_with_lengths(expected, visible)
+    maxima, ends = impl.block_maxima_with_lengths(expected.float(), visible)
+    assert actual[0].dtype == scores.dtype
+    assert actual[1].dtype == torch.float32
     torch.testing.assert_close(actual[2], ends, atol=0, rtol=0)
     for row, length in enumerate(visible.cpu().tolist()):
         length = max(0, min(length, scores.shape[1]))
@@ -187,16 +192,21 @@ def assert_cleaned_prefixes(scores, visible, table, num_pages, actual):
             (maxima, actual[1], (length + 7) // 8),
         ):
             torch.testing.assert_close(
-                old[row, :count], new[row, :count], atol=0, rtol=0, equal_nan=True
+                old[row, :count].float(),
+                new[row, :count].float(),
+                atol=0,
+                rtol=0,
+                equal_nan=True,
             )
     return expected
 
 
 @pytest.mark.parametrize("table_layout", ["contiguous", "strided", "broadcast"])
-def test_clean_block_prefixes(table_layout):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_clean_block_prefixes(table_layout, dtype):
     width = 4103
     torch.manual_seed(37)
-    scores = torch.randn((8, width + 13), device="cuda")[:, :width]
+    scores = torch.randn((8, width + 13), device="cuda", dtype=dtype)[:, :width]
     visible = torch.tensor(
         [-1, 0, 1, 7, 8, 9, 1330, width + 64], device="cuda", dtype=torch.int32
     ).repeat_interleave(2)[::2]
@@ -213,6 +223,73 @@ def test_clean_block_prefixes(table_layout):
     scores[6, 8] = float("inf")
     actual = impl.clean_block_maxima(scores, visible, table, pages)
     assert_cleaned_prefixes(scores, visible, table, pages, actual)
+
+
+@pytest.mark.parametrize("cleaner", [clean_logits, clean_logits_for_selection])
+def test_clean_logits_bf16_prefixes(cleaner):
+    width = 2053
+    torch.manual_seed(37)
+    values = torch.randn((4, width), device="cuda", dtype=torch.bfloat16)
+    lengths = torch.tensor([0, 1, 1330, width], device="cuda", dtype=torch.int32)
+    pages = (width + 63) // 64
+    table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(4, 1)
+    table[:, 2] = -1
+    table[:, 4] = pages
+
+    actual = cleaner(values, lengths, table, pages, width, 64)
+    assert actual.dtype == values.dtype
+
+    expected = values.float().clone()
+    for row, length in enumerate(lengths.cpu().tolist()):
+        length = max(0, min(length, width))
+        expected[row, length:] = -float("inf")
+        for page in range((length + 63) // 64):
+            page_id = table[row, page].item()
+            if page_id < 0 or page_id >= pages:
+                start = page * 64
+                end = min(start + 64, length)
+                expected[row, start:end] = -float("inf")
+        initialized = width
+        if cleaner is clean_logits_for_selection:
+            initialized = min(width, ((length + 1023) // 1024) * 1024)
+        torch.testing.assert_close(
+            actual[row, :length].float(),
+            expected[row, :length],
+            atol=0,
+            rtol=0,
+            equal_nan=True,
+        )
+        torch.testing.assert_close(
+            actual[row, length:initialized].float(),
+            expected[row, length:initialized],
+            atol=0,
+            rtol=0,
+            equal_nan=True,
+        )
+
+
+def test_clean_block_bf16_tied_maxima():
+    # These distinct FP32 values round to the same BF16 score and tie across blocks.
+    scores = torch.full((1, 24), -float("inf"), device="cuda", dtype=torch.bfloat16)
+    scores[0, 0] = 1.0
+    scores[0, 8] = 1.003
+    visible = torch.tensor([17], device="cuda", dtype=torch.int32)
+    table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+
+    cleaned, maxima, ends = impl.clean_block_maxima(scores, visible, table, 1)
+
+    assert cleaned.dtype == torch.bfloat16
+    assert maxima.dtype == torch.float32
+    torch.testing.assert_close(
+        ends, torch.tensor([3], device="cuda", dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        maxima[0],
+        torch.tensor([1.0, 1.0, -float("inf")], device="cuda", dtype=torch.float32),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(cleaned[0, :17].float(), scores[0, :17].float())
 
 
 def native_selection(scores, visible, block_stats):

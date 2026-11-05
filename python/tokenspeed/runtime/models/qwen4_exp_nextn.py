@@ -81,7 +81,7 @@ def _mtp_index_sharing_enabled(config) -> bool:
 
 
 def _build_mtp_lm_head(config, mapping: Mapping, quant_config, prefix: str):
-    if mapping.attn.has_dp:
+    if mapping.attn.has_dp and not mapping.lm_head.has_tp:
         return ReplicatedLinear(
             config.hidden_size,
             config.vocab_size,
@@ -94,9 +94,9 @@ def _build_mtp_lm_head(config, mapping: Mapping, quant_config, prefix: str):
         config.hidden_size,
         quant_config=quant_config,
         prefix=add_prefix("model.shared_head.head", prefix),
-        tp_rank=mapping.attn.tp_rank,
-        tp_size=mapping.attn.tp_size,
-        tp_group=mapping.attn.tp_group,
+        tp_rank=mapping.lm_head.tp_rank,
+        tp_size=mapping.lm_head.tp_size,
+        tp_group=mapping.lm_head.tp_group,
     )
 
 
@@ -223,11 +223,11 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=mapping.attn.has_dp,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+            tp_rank=mapping.lm_head.tp_rank,
+            tp_size=mapping.lm_head.tp_size,
+            tp_group=mapping.lm_head.tp_group,
             do_argmax=True,
-            dp_lm_head_tp=False,
+            dp_lm_head_tp=mapping.attn.has_dp and mapping.lm_head.has_tp,
         )
 
     def get_hot_token_id(self):
@@ -235,6 +235,16 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        """Share the target head's weights, quantization method and scales together."""
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head = lm_head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight

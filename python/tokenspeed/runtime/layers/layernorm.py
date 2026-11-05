@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 )
 from tokenspeed_kernel.ops.layernorm import (
     add_rmsnorm,
+    gemma_rmsnorm,
     nvfp4_copy_supported,
     rmsnorm,
 )
@@ -88,11 +89,7 @@ if _is_amd:
     _allreduce_residual_rmsnorm = iris_allreduce_residual_rmsnorm
 elif _platform.is_nvidia:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
-    from tokenspeed_kernel.ops.layernorm.flashinfer import (
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        layernorm,
-    )
+    from tokenspeed_kernel.ops.layernorm.flashinfer import layernorm
 
     _allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
 else:
@@ -284,38 +281,7 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
-            if x.shape[0] == 0:
-                if residual is not None:
-                    return x, residual
-                else:
-                    return x
-            orig_dtype = x.dtype
-            if residual is not None:
-                x = x + residual
-                residual = x
-
-            x = x.float()
-            variance = x.pow(2).mean(dim=-1, keepdim=True)
-            x = x * torch.rsqrt(variance + self.variance_epsilon)
-            x = x * (1.0 + self.weight.float())
-            x = x.to(orig_dtype)
-            return x if residual is None else (x, residual)
-        else:
-            if residual is not None:
-                gemma_fused_add_rmsnorm(
-                    x,
-                    residual,
-                    self.weight.data,
-                    self.variance_epsilon,
-                )
-                return x, residual
-            out = gemma_rmsnorm(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-            )
-            return out
+        return gemma_rmsnorm(x, self.weight.data, self.variance_epsilon, residual)
 
     def add_norm_with_fp8(
         self,

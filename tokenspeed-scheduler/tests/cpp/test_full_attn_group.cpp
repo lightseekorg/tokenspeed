@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <span>
 #include <string>
 #include <vector>
@@ -211,6 +212,54 @@ TEST(FullAttnManagerTest, AcquireSpillsAcrossMultiplePages) {
     EXPECT_EQ(table.NumBlocks(), 3);
     // over = 7 - 2 = 5; used_in_tail = 5 % 4 = 1; tail_avail = 4 - 1 = 3.
     EXPECT_EQ(table.AvailableTokens(), 3);
+}
+
+TEST(FullAttnManagerTest, SmallAppendsGrowBlockTableAmortized) {
+    constexpr std::int32_t num_appends = 1024;
+    constexpr std::int32_t pool_blocks = 2 * num_appends;
+    BlockPool pool(pool_blocks, {1});
+    FullAttnManager mgr(4);
+    BlockTable table;
+
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));
+    CacheBlockRef first_block = table.Blocks().front();
+    const std::int32_t first_page_id = mgr.BlockTablePageIds(table).front();
+    std::uintptr_t data_address = reinterpret_cast<std::uintptr_t>(table.Blocks().data());
+    std::int32_t relocations = 0;
+
+    for (std::int32_t i = 1; i < num_appends; ++i) {
+        ASSERT_TRUE(mgr.Acquire(pool, table, 4));
+        EXPECT_EQ(table.NumBlocks(), i + 1);
+        EXPECT_EQ(table.AvailableTokens(), 0);
+        EXPECT_EQ(table.Blocks().front(), first_block);
+        const std::uintptr_t new_data_address = reinterpret_cast<std::uintptr_t>(table.Blocks().data());
+        if (new_data_address != data_address) {
+            ++relocations;
+            data_address = new_data_address;
+        }
+    }
+
+    EXPECT_LE(relocations, 16);
+    const std::vector<std::int32_t> page_ids = mgr.BlockTablePageIds(table);
+    ASSERT_EQ(page_ids.size(), static_cast<std::size_t>(num_appends));
+    EXPECT_EQ(page_ids.front(), first_page_id);
+    for (std::size_t i = 0; i < page_ids.size(); ++i) {
+        EXPECT_EQ(page_ids[i], table.Blocks()[i]->Location().lcm_block_id);
+    }
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), pool_blocks - num_appends);
+
+    first_block.reset();
+    mgr.Free(table);
+    EXPECT_TRUE(table.Blocks().empty());
+    EXPECT_EQ(table.AvailableTokens(), 0);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), pool_blocks);
+
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(table.Blocks().data()), data_address);
+    EXPECT_EQ(table.NumBlocks(), 1);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), pool_blocks - 1);
+    mgr.Free(table);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), pool_blocks);
 }
 
 TEST(FullAttnManagerTest, AcquireZeroTokensIsNoOp) {
@@ -555,6 +604,25 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
     EXPECT_EQ(pool.NumOccupiedSlots(), 2);
 }
 
+TEST(FullAttnManagerLcmTest, ADedupedSlotExportsTheCanonicalBlocksPageId) {
+    BlockPool pool(2, {2});
+    FullAttnManager mgr(4, 2, 0);
+    BlockTable first;
+    BlockTable duplicate;
+    ASSERT_TRUE(mgr.Acquire(pool, first, 4));
+    ASSERT_TRUE(mgr.Acquire(pool, duplicate, 8));
+    const CacheKey key = RealKey({1, 2, 3, 4}, 0);
+    mgr.CacheFullBlocks(pool, first, std::vector<CacheKey>{key});
+    const std::int32_t canonical = mgr.BlockTablePageIds(first)[0];
+    const std::vector<std::int32_t> before = mgr.BlockTablePageIds(duplicate);
+    ASSERT_NE(before[0], canonical);
+
+    mgr.CacheFullBlocks(pool, duplicate, std::vector<CacheKey>{key});
+
+    EXPECT_EQ(duplicate.Blocks()[0], first.Blocks()[0]) << "publishing swapped in the canonical block";
+    EXPECT_EQ(mgr.BlockTablePageIds(duplicate), (std::vector<std::int32_t>{canonical, before[1]}));
+}
+
 TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {
     BlockPool pool(2, {1});
     FullAttnManager mgr(4, 1, 0);
@@ -585,10 +653,10 @@ TEST(FullAttnManagerLcmTest, LocationBasedEvictionIsScopedToItsPool) {
     std::uint64_t next_access_epoch = 0;
     mgr.Index().Register(device_pool, device, device_key, ++next_access_epoch, /*logical_block_index=*/-1,
                          CacheBoundaryKind::kChunk,
-                         /*newly_cached=*/nullptr);
+                         /*newly_cached=*/nullptr, /*session=*/nullptr);
     mgr.Index().Register(host_pool, host, host_key, ++next_access_epoch, /*logical_block_index=*/-1,
                          CacheBoundaryKind::kChunk,
-                         /*newly_cached=*/nullptr);
+                         /*newly_cached=*/nullptr, /*session=*/nullptr);
     device.reset();
     host.reset();
 

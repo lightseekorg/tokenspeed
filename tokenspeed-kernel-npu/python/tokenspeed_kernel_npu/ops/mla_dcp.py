@@ -192,16 +192,10 @@ def mla_partial(query, cache, table, binding, scale):
 
 
 def merge_dcp_partials(output, lse):
-    """Existing NPU merge ABI, with defined all-empty padding semantics."""
-    import flash_ops  # noqa: F401
+    """Merge framework-gathered partials with explicit empty-shard semantics."""
+    from tokenspeed_kernel_npu.ops.dcp_tensors import merge_normalized_partials
 
-    empty = torch.isneginf(lse).all(0)
-    # O for every empty shard was zeroed before the exchange. Equal finite
-    # weights on an all-empty row avoid -inf - -inf in the native kernel.
-    lse = torch.where(empty[None, :], 0, lse)
-    # SFAD already emits FP32 partials; packed FIA emits BF16. The shared
-    # native merge consumes FP32 O/LSE and returns the model's BF16 output.
-    return torch.ops.custom.npu_kvp_attention_merge(output.float(), lse)
+    return merge_normalized_partials(output, lse)
 
 
 @triton.jit(do_not_specialize=["rows"])

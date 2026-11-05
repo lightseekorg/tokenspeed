@@ -271,7 +271,7 @@ class HostCacheExecutor:
         self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
         arena_bytes = (self.max_retracted_requests + 1) * self.blob_bytes
-        share_bytes = host_memory_share(
+        share_bytes, share_source = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
         )
         # Size each buffer using the effective pinned allocator configuration.
@@ -300,7 +300,7 @@ class HostCacheExecutor:
                 f"{nprocs_per_node} ranks of a node pin Host memory together, "
                 "under the pinned allocator settings; this rank's share "
                 f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
-                "memory over its ranks, less "
+                f"memory, from {share_source}, over its ranks, less "
                 f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
             )
             host_lcm_blocks = fitting_l2_blocks
@@ -339,6 +339,7 @@ class HostCacheExecutor:
         check_host_memory(
             l2_pinned_bytes + pool_pinned_bytes,
             share_bytes=share_bytes,
+            share_source=share_source,
             purpose="the compact Host cache",
         )
         logger.info(
@@ -510,6 +511,38 @@ class HostCacheExecutor:
                         )
         self.write_stream.synchronize()
         self.load_stream.synchronize()
+
+        if snapshot_lcm_blocks and io_backend == "kernel":
+            self._warmup_restore_transfers()
+
+    def _warmup_restore_transfers(self) -> None:
+        """Warm each Host tier's unflagged H2D restore, preserving Device bytes."""
+        # Host blocks must still be unassigned for this scratch round trip.
+        # Use one group so compact Host-parent writes cannot overlap.
+        group_index = next(
+            i for i, group in enumerate(self.layout.groups) if group.fields
+        )
+        for storage, geometry, lane in (
+            (self.host_storage, self._transfer_geometry, self._restore_l2_lane),
+            (
+                self.snapshot_storage,
+                self._snapshot_geometry,
+                self._restore_pool_lane,
+            ),
+        ):
+            if storage is None:
+                continue
+            launch = dict(
+                device_buffers=self.layout.buffers,
+                host_buffer=storage.host_buffer,
+                geometry=geometry,
+                stream=self.load_stream,
+                prerequisite_stream=device_module.current_stream(),
+                backend=self.transfer_backend,
+            )
+            lane.start_d2h([(group_index, 1, 1)], **launch)
+            lane.start_h2d([(group_index, 1, 1)], **launch)
+            self.load_stream.synchronize()
 
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream

@@ -177,6 +177,10 @@ class SamplingBackend(ABC):
     import suppresses the rid-flip reset for the restored slot.
     """
 
+    # Admission checks this exclusive bound. None means the backend handles
+    # every positive finite top_k itself, before writing device scalars.
+    top_k_exclusive_max: int | None = 128
+
     # Subclasses that hold per-pool-idx state (scalars like temperature /
     # top_k, plus large rows like _counts / _logit_bias) flip this to True
     # so prepare_step() performs flip detection + _reset_slot. False skips

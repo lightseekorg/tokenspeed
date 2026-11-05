@@ -100,10 +100,8 @@ class BaseTransformerModel(nn.Module):
 
         self._compile_decoder_stack()
 
-        # Build the final norm op that handles cross-layer communication
-        # after the last decoder layer (fused allreduce + norm, or separate
-        # norm + all-gather for RSAG mode).
-        self._final_norm_op = self._build_final_norm_op()
+        # Only a compiled last layer needs this; CommManager runs other final norms.
+        self._final_norm_op: FinalNormOp | None = self._build_final_norm_op()
 
     def _compile_decoder_stack(self) -> None:
         """Compile only ``CompiledDecoderLayer`` instances."""
@@ -132,17 +130,18 @@ class BaseTransformerModel(nn.Module):
             else:
                 prev_output_group = None
 
-    def _build_final_norm_op(self) -> FinalNormOp:
-        """Create a FinalNormOp for the post-last-layer norm + comm."""
+    def _build_final_norm_op(self) -> FinalNormOp | None:
+        """Create a FinalNormOp for a compiled last layer's norm + comm."""
         last_layer = self.layers[-1] if len(self.layers) > 0 else None
+        if not isinstance(last_layer, CompiledDecoderLayer):
+            return None
 
         use_ar = True
         group_type = ParallelGroup.ATTN_TP
-        if isinstance(last_layer, CompiledDecoderLayer):
-            compiled = getattr(last_layer, "_compiled", None)
-            if compiled is not None and compiled.final_placement is not None:
-                use_ar = compiled.final_placement.type != PlacementType.SHARD
-                group_type = compiled.final_placement.group
+        compiled = getattr(last_layer, "_compiled", None)
+        if compiled is not None and compiled.final_placement is not None:
+            use_ar = compiled.final_placement.type != PlacementType.SHARD
+            group_type = compiled.final_placement.group
 
         return FinalNormOp(
             mapping=self.mapping,
@@ -241,13 +240,13 @@ class BaseTransformerModel(nn.Module):
             if residual is None:
                 raise RuntimeError("residual is required for non-idle forward mode.")
 
-            if isinstance(layer, BaseDecoderLayer):
-                hidden_states, final_residual = layer.comm_manager.final_norm(
-                    hidden_states, residual, ctx, self.norm
-                )
-            else:
+            if isinstance(layer, CompiledDecoderLayer):
                 hidden_states, final_residual = self._final_norm_op(
                     hidden_states, residual, ctx
+                )
+            else:
+                hidden_states, final_residual = layer.comm_manager.final_norm(
+                    hidden_states, residual, ctx, self.norm
                 )
 
             # Capture index num_layers + 1 (EAGLE3's id num_layers, DFLASH's
