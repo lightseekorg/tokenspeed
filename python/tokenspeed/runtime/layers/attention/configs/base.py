@@ -67,6 +67,21 @@ def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
     return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
 
 
+def block_draft_is_causal(hf_config) -> bool:
+    """Whether a block draft's queries attend causally within their block.
+
+    Only an explicit declaration makes a block causal: ``is_causal``, else
+    ``dflash_config.causal`` (Kimi-K3.1's DSpark draft). A draft declaring
+    neither (Kimi-K3 DSpark) attends the whole block; ``sliding_attention``
+    layers only bound how far back a query reads.
+    """
+    is_causal = getattr(hf_config, "is_causal", None)
+    if is_causal is not None:
+        return bool(is_causal)
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    return bool(dflash_config.get("causal", False))
+
+
 def resolve_cache_layer_types(
     hf_config,
     *,
@@ -195,6 +210,8 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # Causal within a block draft; otherwise every query sees the whole block.
+    draft_block_causal: bool = False
     # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
     # of attention TP): one topology for target and continuation/MTP views;
     # KVP does not add ranks. Decode attends the owned pages and merges the
@@ -303,6 +320,7 @@ def model_wide_kwargs(
     kv_cache_dtype: torch.dtype,
     kv_cache_mxfp8: bool = False,
     draft_block_decode: bool = False,
+    draft_block_causal: bool = False,
     speculative_num_draft_tokens: int | None = None,
 ) -> dict:
     """The AttnConfig fields shared by every family's generate().
@@ -323,6 +341,7 @@ def model_wide_kwargs(
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
+        draft_block_causal=draft_block_causal,
     )
     attn_mapping = server_args.mapping.attn
     kwargs.update(

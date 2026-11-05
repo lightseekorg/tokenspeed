@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.communication.multimem import (
     multimem_prealloc,
     multimem_stage,
 )
+from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
     K3_SHARED_RS_MAX_TOKENS,
     KimiK3LatentTailOp,
@@ -72,7 +73,8 @@ _MULTIMEM_AR_MIN_TOKENS = 1024
 
 _IRIS_MAX_TOKENS = 8192
 _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS = 16
-_IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 56
+# Through 64 rows the replicated mix and gather tail beat row sharding (8x MI350X).
+_IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 72
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
@@ -108,6 +110,20 @@ def _unified_tail_applicable(
         and top_k == 16
         and has_routed_norm
     )
+
+
+def project_attention_partial(
+    activation: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``o_proj`` into storage from ``K3AttnComm.acquire_projection_output``.
+
+    At prefill widths an Iris state publishes the finished row tiles for
+    ``K3AttnComm.take_published``; either GEMM gives ``mm``'s bits.
+    """
+    for state in K3AttnComm.iris_states.values():
+        if state.project_attention(activation, weight, out):
+            return out
+    return mm(activation, weight, bias=None, out=out)
 
 
 class K3AttnComm:
@@ -215,9 +231,23 @@ class K3AttnComm:
             shapes, like, group, backend=None, op=dist.ReduceOp.SUM
         ):
             return None
-        return acquire_all_reduce_outputs(
+        out = acquire_all_reduce_outputs(
             shapes, like, group, backend=None, op=dist.ReduceOp.SUM
         )[0]
+        if self.iris_state is not None:
+            # A new producer forgets an earlier projection's publication.
+            self.iris_state.take_published(out)
+        return out
+
+    def take_published(self, partial: torch.Tensor):
+        """The record of ``project_attention_partial`` publishing ``partial``, or None.
+
+        Pass it to ``mix_for_moe``, whose scatter then reduces each owned row tile
+        while the GEMM is still computing later ones.
+        """
+        if self.iris_state is None:
+            return None
+        return self.iris_state.take_published(partial)
 
     def reduce_for_attnres(
         self,
@@ -227,12 +257,19 @@ class K3AttnComm:
         producer_direct: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the residual and optional delta consumed by the AttnRes mixer."""
-        if producer_direct:
-            # Prepared Iris inputs reduce into owned storage, which remains
-            # valid as a residual after the next producer reuses its input.
-            reduced = all_reduce((partial,), self.mapping.attn.tp_group)[0]
-        else:
-            reduced = all_reduce(partial, self.mapping.attn.tp_group)
+        # The reduce lands in owned storage, which outlives the producer's input reuse.
+        reduced = (
+            self.iris_state.reduce_attention(partial)
+            if self.iris_state is not None
+            and not global_server_args_dict.get("force_deterministic_rsag", False)
+            and not global_server_args_dict.get("batch_invariant_collectives", False)
+            else None
+        )
+        if reduced is None:
+            if producer_direct:
+                reduced = all_reduce((partial,), self.mapping.attn.tp_group)[0]
+            else:
+                reduced = all_reduce(partial, self.mapping.attn.tp_group)
         return (reduced, None) if prefix is None else (prefix, reduced)
 
     def mix_for_moe(
@@ -247,8 +284,17 @@ class K3AttnComm:
         out_norm_weight: torch.Tensor,
         out_norm_eps: float,
         num_valid_blocks: int,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Mix a prepared projection, retaining the MoE's local residual rows."""
+        residual_is_sharded: bool,
+        published,
+        defer_gather: bool,
+    ) -> tuple | None:
+        """Mix a prepared projection, retaining the MoE's local residual rows.
+
+        A sharded ``prefix`` holds only this rank's consecutive rows;
+        ``published`` is ``take_published``'s record of ``partial``, or None.
+        With ``defer_gather`` the activation still gathers on a side stream and
+        a third value is the pending gather, for the MoE to join.
+        """
         if (
             not current_platform().is_cdna4
             or partial.ndim != 2
@@ -270,6 +316,9 @@ class K3AttnComm:
             out_norm_weight=out_norm_weight,
             out_norm_eps=out_norm_eps,
             num_valid_blocks=num_valid_blocks,
+            residual_is_sharded=residual_is_sharded,
+            published=published,
+            defer_gather=defer_gather,
         )
 
     def fused_attnres_reduce_available(
