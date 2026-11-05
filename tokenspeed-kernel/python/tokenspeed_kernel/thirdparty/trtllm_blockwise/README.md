@@ -52,7 +52,10 @@ kernel for every query.
 Outside the tuning context, calls use FlashInfer's cached choice. If the M bucket
 is missing, the default serving path searches cached buckets for the closest M
 with the same N/K, scale contract and device; ties use the smaller M. If no
-compatible entry exists, the previous fixed-tile rule applies. `--disable-autotune`
+compatible entry exists, the previous fixed-tile rule applies. For an M above
+every cached bucket, that search ends on the largest one. Serving does not
+change the cache, so the first serving call with each N/K and device records
+that bucket, and later calls with a larger M query it directly. `--disable-autotune`
 skips new searches; an existing loaded cache can still be used. The fallback
 uses the same compile-on-first-use path as tuned tactics. Run each selected
 tactic eagerly before using it in a CUDA graph.

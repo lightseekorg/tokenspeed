@@ -69,6 +69,9 @@ _CACHE_EXTRAS = ("e4m3_fp32_128x128_bf16_v1", "profile_l2_buffers")
 _OP = "trtllm_cutedsl_fp8_blockscale"
 # (N, K, device) whose servable tactics startup warmup compiled.
 _warmed_shapes = set()
+# (N, K, device) -> the largest token bucket with a cached tactic (0 for none),
+# found at the first serving call. Serving does not change the cache.
+_top_buckets = {}
 
 
 def _bucket_shapes(shapes, bucket):
@@ -212,6 +215,44 @@ def run(a, b, a_scales, b_scales, out):
     inputs = [a, b, a_scales, b_scales, out]
     tuner = AutoTuner.get()
     op = _OP
+    special = (
+        tuner.is_tuning_mode
+        or op in tuner._effective_skip_ops
+        or tuner._get_override_stack()
+        or tuner._in_v2_context
+        or tuner._effective_measure_policy is not None
+        or tuner._active_managed_store is not None
+    )
+    if not special and not is_warming_up():
+        shape_key = (*b.shape, a.device.index)
+        top = _top_buckets.get(shape_key)
+        if top is None:
+            shapes = tuple(tuple(tensor.shape) for tensor in inputs)
+            top = 0
+            for bucket in get_hybrid_num_tokens_buckets(1 << 30):
+                hit, _, _, _ = tuner.search_cache(
+                    op,
+                    [_runner],
+                    _bucket_shapes(shapes, bucket),
+                    _runner.tuning_config,
+                    inputs=inputs,
+                )
+                if hit:
+                    top = bucket
+            _top_buckets[shape_key] = top
+        if 0 < top < a.shape[0]:
+            # Every cached bucket is below M, so choose_one misses and the
+            # nearest-bucket search below ends on top's entry.
+            shapes = tuple(tuple(tensor.shape) for tensor in inputs)
+            hit, _, tactic, _ = tuner.search_cache(
+                op,
+                [_runner],
+                _bucket_shapes(shapes, top),
+                _runner.tuning_config,
+                inputs=inputs,
+            )
+            if hit:
+                return _runner(inputs, tactic=tactic)
     if tuner.is_tuning_mode and op not in tuner._effective_skip_ops:
         original_repeat = tuner.repeat
         _runner._profile_base_repeat = original_repeat
@@ -229,14 +270,7 @@ def run(a, b, a_scales, b_scales, out):
     else:
         runner, tactic = tuner.choose_one(op, [_runner], _runner.tuning_config, inputs)
 
-    if tactic == -1 and not (
-        tuner.is_tuning_mode
-        or op in tuner._effective_skip_ops
-        or tuner._get_override_stack()
-        or tuner._in_v2_context
-        or tuner._effective_measure_policy is not None
-        or tuner._active_managed_store is not None
-    ):
+    if tactic == -1 and not special:
         # Avoid probing every bucket when this operation has no tuned entries.
         b_shape = tuple(b.shape)
         extras = (*_CACHE_EXTRAS, a.device.index)

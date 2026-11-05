@@ -223,6 +223,7 @@ def test_loaded_tactics_compile_lazily_and_match_hybrid_buckets(tmp_path, monkey
     tuner.clear_cache()
     monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
     monkeypatch.setattr(launcher, "_compiled", {})
+    monkeypatch.setattr(runner_module, "_top_buckets", {})
     extras = (*runner_module._CACHE_EXTRAS, torch.cuda.current_device())
     lower = (False, (64, 128), (1, 1))
     upper = (True, (128, 128), (2, 1))
@@ -293,6 +294,7 @@ def test_startup_warmup_compiles_every_servable_tactic(tmp_path, monkeypatch):
     monkeypatch.setattr(launcher, "_compiled", {})
     monkeypatch.setattr(launcher, "_max_active_clusters", {})
     monkeypatch.setattr(runner_module, "_warmed_shapes", set())
+    monkeypatch.setattr(runner_module, "_top_buckets", {})
     device = torch.cuda.current_device()
     extras = (*runner_module._CACHE_EXTRAS, device)
     # A loaded cache whose tactics startup's own token counts never launch.
@@ -340,6 +342,7 @@ def test_nearest_tactic_from_in_memory_cache(monkeypatch):
     tuner = AutoTuner.get()
     tuner.clear_cache()
     monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    monkeypatch.setattr(runner_module, "_top_buckets", {})
     lower = (False, (64, 128), (1, 1))
     upper = (True, (128, 128), (2, 1))
     extras = (*runner_module._CACHE_EXTRAS, torch.cuda.current_device())
@@ -375,6 +378,139 @@ def test_nearest_tactic_from_in_memory_cache(monkeypatch):
     ):
         _mm(_inputs(800, 384, 256))
     assert selected[-1] == -1
+    tuner.clear_cache()
+
+
+@torch.inference_mode()
+def test_serving_above_largest_cached_bucket_takes_its_tactic(tmp_path, monkeypatch):
+    """The first serving call with each N/K records the largest cached M
+    bucket, where the full lookup ends for any larger M: later calls above it
+    launch that bucket's tactic after one cache query, without choose_one.
+    Other M, including buckets above the startup token budget, keep the full
+    lookup, as does a call whose recorded bucket has lost its entry. Warmup,
+    skip and tuning contexts neither record nor take the shortcut."""
+    from collections import Counter
+    from contextlib import nullcontext
+    from functools import partial
+
+    from flashinfer.autotuner import autotune as flashinfer_autotune
+    from tokenspeed_kernel.ops import tuning
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    # The "above" cache holds buckets above this budget, as after attention
+    # DP gathers rows or from a run with a larger prefill budget.
+    monkeypatch.setattr(tuning, "_autotune_max_num_tokens", 8192)
+    monkeypatch.setattr(runner_module, "_warmed_shapes", set())
+    monkeypatch.setattr(runner_module, "_top_buckets", {})
+    device = torch.cuda.current_device()
+    extras = (*runner_module._CACHE_EXTRAS, device)
+    lower = (False, (64, 128), (1, 1))
+    upper = (True, (128, 128), (2, 1))
+    caches = {
+        "tuned": {4096: lower, 8192: upper},
+        "above": {8192: upper, 32768: lower},
+        "fallback_top": {4096: lower, 8192: -1},
+    }
+    paths = {}
+    for name, tuned in caches.items():
+        configs = {}
+        for bucket, tactic in tuned.items():
+            shapes = ((bucket, 256), (384, 256), (bucket, 2), (3, 2), (bucket, 384))
+            key = str(
+                ("trtllm_cutedsl_fp8_blockscale", "BlockwiseGemmRunner", shapes, extras)
+            )
+            configs[key] = ["BlockwiseGemmRunner", tactic]
+            if bucket == 8192:
+                key_8192 = key
+        paths[name] = tmp_path / f"{name}.json"
+        paths[name].write_text(json.dumps(configs))
+
+    selected = []
+    calls = Counter()
+    original_run = runner_module._run
+    original_search = AutoTuner.search_cache
+    original_choose = AutoTuner.choose_one
+
+    def record_run(*args):
+        selected.append(args[-1])
+        return original_run(*args)
+
+    def count_search(self, *args, **kwargs):
+        calls["search_cache"] += 1
+        return original_search(self, *args, **kwargs)
+
+    def count_choose(self, *args, **kwargs):
+        calls["choose_one"] += 1
+        return original_choose(self, *args, **kwargs)
+
+    def unexpected_profile(*args, **kwargs):
+        pytest.fail("Cached FP8 tactics must not be profiled again")
+
+    monkeypatch.setattr(runner_module, "_run", record_run)
+    # Count on the class, under the tuning context's own lookup wrappers.
+    monkeypatch.setattr(AutoTuner, "search_cache", count_search)
+    monkeypatch.setattr(AutoTuner, "choose_one", count_choose)
+    monkeypatch.setattr(tuner, "_profile_single_kernel", unexpected_profile)
+    serve = nullcontext
+    warmup = partial(tuning.kernel_warmup, enabled=True)
+    skip = partial(
+        flashinfer_autotune, tune_mode=False, skip_ops={"trtllm_cutedsl_fp8_blockscale"}
+    )
+    # Tunes M=32768 as the cached 8192 bucket, so nothing is profiled.
+    tune = partial(autotune, tune_mode=True, tuning_buckets=(8192,), round_up=False)
+    loaded = None
+    # Cache, context, N, M, launched tactic, choose_one calls, search_cache
+    # calls where the full lookup's own count is not under test (None), and
+    # the bucket recorded for N (None before its first serving call).
+    for cache, context, n, m, tactic, chosen, searched, top in (
+        ("tuned", warmup, 384, 32768, upper, 1, None, None),
+        ("tuned", skip, 384, 32768, -1, 1, 0, None),
+        ("tuned", tune, 384, 32768, upper, 1, None, None),
+        ("tuned", serve, 384, 3000, lower, 1, None, 8192),
+        ("tuned", serve, 384, 8193, upper, 0, 1, 8192),
+        ("tuned", serve, 384, 32768, upper, 0, 1, 8192),
+        ("tuned", serve, 384, 8192, upper, 1, 1, 8192),
+        ("tuned", warmup, 384, 32768, upper, 1, None, 8192),
+        ("tuned", skip, 384, 32768, -1, 1, 0, 8192),
+        ("tuned", tune, 384, 32768, upper, 1, None, 8192),
+        # Nothing cached for this N: the fixed-tile rule.
+        ("tuned", serve, 512, 32768, -1, 1, None, 0),
+        ("tuned", serve, 512, 32768, -1, 1, 1, 0),
+        ("above", serve, 384, 12000, upper, 1, None, 32768),
+        ("above", serve, 384, 20000, lower, 1, 1, 32768),
+        ("above", serve, 384, 32768, lower, 1, 1, 32768),
+        ("above", serve, 384, 40000, lower, 0, 1, 32768),
+        # A cached fallback tactic is an entry too.
+        ("fallback_top", serve, 384, 3000, lower, 1, None, 8192),
+        ("fallback_top", serve, 384, 32768, -1, 0, 1, 8192),
+    ):
+        if cache != loaded:
+            # A restarted server: nothing is recorded yet.
+            assert load_autotune_cache(str(paths[cache]), None, 0)
+            runner_module._top_buckets.clear()
+            loaded = cache
+        inputs = _inputs(m, n, 256)
+        calls.clear()
+        with context():
+            actual = _mm(inputs)
+        torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+        assert selected[-1] == tactic, (cache, n, m)
+        assert calls["choose_one"] == chosen, (cache, n, m)
+        assert searched is None or calls["search_cache"] == searched, (cache, n, m)
+        assert runner_module._top_buckets.get((n, 256, device)) == top, (cache, n, m)
+
+    # The recorded bucket loses its entry: the full lookup runs.
+    del tuner._file_configs[key_8192]
+    inputs = _inputs(32768, 384, 256)
+    calls.clear()
+    actual = _mm(inputs)
+    torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+    assert selected[-1] == lower
+    assert calls["choose_one"] == 1
+    assert (384, 256, device) in runner_module._warmed_shapes
     tuner.clear_cache()
 
 
