@@ -34,8 +34,6 @@ from tokenspeed_kernel.workspace import retain_for_capture
 @dataclass
 class _SparsePlan:
     wrapper: BatchSparseMLADecodePagedTSWrapper
-    batch_capacity: int
-    query_width: int
     offsets: dict[int, torch.Tensor] = field(default_factory=dict)
     full_lengths: dict[int, torch.Tensor] = field(default_factory=dict)
 
@@ -97,7 +95,7 @@ def _get_plan(
             return_lse=return_lse,
             assume_valid_prefix=False,
         )
-        plan = _SparsePlan(wrapper, batch_capacity, query_width)
+        plan = _SparsePlan(wrapper)
         _plans[key] = plan
         if len(_plans) > _MAX_EAGER_PLANS:
             _plans.popitem(last=False)
