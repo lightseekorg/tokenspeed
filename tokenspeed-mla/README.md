@@ -11,6 +11,7 @@ Speed-of-light TokenSpeed MLA kernels for `SM100/SM103/SM107` with:
   - Split-KV + workspace path with runtime auto-sizing and compile caching
 - `MLA K/V pack + FP8 quantize`:
   - Fused Triton kernel replacing `cat + cast + cast` in chunked prefill
+  - Groups adjacent token/head rows, preserving FP32 scaling and FP8 rounding
   - Supports strided views and optional pre-allocated output buffers
 
 This package includes performance-oriented optimizations for latency-sensitive

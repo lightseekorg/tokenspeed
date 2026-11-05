@@ -63,7 +63,7 @@ use ts_scheduler::{
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
-    ControlOutput, ControlRequest, EngineRequest,
+    ControlOutput, ControlRequest, EngineRequest, StrOrList,
 };
 
 use crate::{
@@ -985,7 +985,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 Some(_) => admitted.push(submission),
             }
         }
-        self.submit(admitted)
+        self.submit(admitted, outputs, released)
     }
 
     /// Give a request its grammar's matcher, or fail it if the grammar
@@ -1234,7 +1234,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.withheld.extend(submissions);
             return Ok(());
         }
-        self.submit(submissions)
+        self.submit(submissions, outputs, released)
     }
 
     /// EPD: admit the staged requests whose embeddings landed on every rank
@@ -1320,28 +1320,46 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.withheld.extend(admitted);
             return Ok(());
         }
-        self.submit(admitted)
+        self.submit(admitted, outputs, released)
     }
 
     /// Hand admitted requests to the scheduler: a disaggregated request's
     /// transfer starts only now, as it must not finish before the scheduler
     /// knows the request.
-    fn submit(&mut self, submissions: Vec<Submission>) -> Result<(), LoopError> {
+    fn submit(
+        &mut self,
+        submissions: Vec<Submission>,
+        outputs: &mut Vec<StreamedOutput>,
+        released: &mut Vec<String>,
+    ) -> Result<(), LoopError> {
         if submissions.is_empty() {
             return Ok(());
         }
-        let mut specs = Vec::with_capacity(submissions.len());
-        let now = std::time::Instant::now();
-        for submission in submissions {
-            self.outputs.mark_submitted(&submission.rid, now);
-            if let (Some(transfer), Some(bootstrap)) =
-                (self.transfer.as_mut(), &submission.bootstrap)
-            {
-                transfer.register(&submission.rid, bootstrap)?;
+        let (specs, requests): (Vec<_>, Vec<_>) = submissions
+            .into_iter()
+            .map(|submission| (submission.spec, (submission.rid, submission.bootstrap)))
+            .unzip();
+        if let Err(error) = self.scheduler.submit_requests(&specs) {
+            // SubmitRequests validates the whole batch before inserting it.
+            // No transfer may start for requests the scheduler rejected.
+            let reason = format!("Scheduler submission failed: {}", error.what());
+            for (rid, bootstrap) in requests {
+                if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), bootstrap) {
+                    transfer.abort_room(&rid, bootstrap.room);
+                }
+                let failed = self.outputs.fail_unscheduled(&rid, &reason, Some(400));
+                outputs.extend(failed.outputs);
+                released.extend(failed.released);
             }
-            specs.push(submission.spec);
+            return Ok(());
         }
-        self.scheduler.submit_requests(&specs);
+        let now = std::time::Instant::now();
+        for (rid, bootstrap) in requests {
+            self.outputs.mark_submitted(&rid, now);
+            if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), &bootstrap) {
+                transfer.register(&rid, bootstrap)?;
+            }
+        }
         Ok(())
     }
 
@@ -2168,6 +2186,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
         let mut admissions = Vec::new();
+        let mut seen = HashSet::new();
         for message in received {
             match message {
                 EngineRequest::Abort(rids) => {
@@ -2189,8 +2208,37 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     }
                 }
                 EngineRequest::Add(request) => {
+                    if let Some(StrOrList::One(rid)) = &request.rid {
+                        // The wire routes outputs by rid alone: an error for a
+                        // duplicate would terminate the original stream too.
+                        // Check before ingress, which can itself emit errors.
+                        if !seen.insert(rid.clone()) || self.outputs.state(rid).is_some() {
+                            tracing::warn!(
+                                rid,
+                                "dropping duplicate request id; original request retained"
+                            );
+                            continue;
+                        }
+                    }
                     match ingress::admit(*request, &self.config.limits) {
-                        Some(Admitted::Run(admission)) => admissions.push(*admission),
+                        Some(Admitted::Run(mut admission)) => {
+                            if self.scheduler.request_token_size(&admission.rid) >= 0 {
+                                // Final output precedes scheduler retirement.
+                                // No old output state remains, so this refusal
+                                // can safely answer the new request.
+                                admission.state.abort(
+                                    "Request id is still retiring; retry with a new request id",
+                                    true,
+                                    Some(409),
+                                );
+                                outputs.extend(self.outputs.publish_finished_at_admission(
+                                    &admission.rid,
+                                    admission.state,
+                                ));
+                            } else {
+                                admissions.push(*admission);
+                            }
+                        }
                         Some(Admitted::Refused { rid, state }) => {
                             outputs
                                 .extend(self.outputs.publish_finished_at_admission(&rid, *state));
