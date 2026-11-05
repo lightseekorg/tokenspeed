@@ -101,8 +101,8 @@ class _RouteTileConfig(NamedTuple):
 
 _DECODE_STAGE1 = _RouteTileStage(64, 128, 0, 4)
 _WIDE_STAGE1 = _RouteTileStage(128, 256, 1, 4)
-# At EP1, overlapping the next K tile's loads did not help (pipelined time
-# 1.00-1.01x unpipelined on average at 17-128 rows), so pipelining is off.
+# At EP1, overlapping the next K tile's loads did not help at 17-128 rows,
+# so pipelining is off.
 _EP1_STAGE = _RouteTileStage(128, 256, 0, 4)
 _EP1_STAGE2 = _RouteTileStage(128, 256, 0, 1)
 # Grouping routes in the GEMMs leaves one program per expert and 64-column
@@ -125,21 +125,19 @@ _ID_GROUPS_STAGE = _RouteTileStage(64, 128, 8, 4)
 # recorded in serving (speculative verify and plain decode, busiest EP8 rank)
 # and uniform routing, three samples each.
 #
-# EP8 (32 local experts), 4-16 rows: 0.84-0.92x the time of the route-descriptor
-# kernel plus route tiles it replaces (43.4 -> 38.6 us at 8 verify rows, 55.8 ->
-# 51.1 at 16; 57.3 -> 51.0 and 73.6 -> 63.5 with plain decode routing). The
+# EP8 (32 local experts), 4-16 rows: faster than the route-descriptor kernel
+# plus route tiles it replaces, with verify and with plain decode routing. The
 # EP4 4-16 row entries were not re-measured.
 _ID_ROUTE_TILES = ((4, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),)
 _DECODE_ROUTE_TILES = _ID_ROUTE_TILES + (
     (17, 48, _RouteTileConfig(64, _DECODE_STAGE1, _RouteTileStage(16, 128, 0, 1))),
 )
-# EP8 (32 local experts), 49-256 rows: 0.77-0.84x the staged package's time
-# with uniform routing (201 -> 156 us at 128 rows) and 0.67-0.91x with Zipf,
-# except one very skewed 224-row sample at 1.03x. Zipf samples are slower from
-# 384 rows, so the bound is 256. EP8 17-64 rows: 0.83-0.96x the time of the
-# _DECODE_ROUTE_TILES schedule over four samples (146 -> 124 us at 48 rows,
-# uniform routing); in the down projection (stage 2), a 256-wide K tile is
-# within ~2% of a 128-wide one at 49-64 rows.
+# EP8 (32 local experts), 49-256 rows: faster than the staged package with
+# uniform and Zipf routing, except one very skewed 224-row sample. Zipf
+# samples are slower from 384 rows, so the bound is 256. EP8 17-64 rows:
+# faster than the _DECODE_ROUTE_TILES schedule over four samples; in the down
+# projection (stage 2), a 256-wide K tile is about as fast as a 128-wide one
+# at 49-64 rows.
 _EP8_ROUTE_TILES = _ID_ROUTE_TILES + (
     (17, 64, _RouteTileConfig(64, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1))),
     (65, 128, _RouteTileConfig(128, _WIDE_STAGE1, _RouteTileStage(64, 128, 1, 1))),
@@ -149,14 +147,12 @@ _EP8_ROUTE_TILES = _ID_ROUTE_TILES + (
 _ROUTE_TILE_CONFIGS = {
     (4096, 4096, 32, 256, 8): _EP8_ROUTE_TILES,
     (4096, 4096, 64, 256, 8): _DECODE_ROUTE_TILES,
-    # EP1 (TP8 intermediate shard), 14-16 rows: 0.78-0.87x the direct decode's
-    # time with recorded routing (59.9 -> 46.3 us at 16 verify rows, 66.7 ->
-    # 55.3 with plain decode routing), 1.01x with uniform routing. Below 14
-    # rows grouping won on average but lost up to 3.5 us on samples with few
-    # repeated experts, and at 8 rows it only broke even, so direct decode
-    # keeps them. 17-128 rows: 0.92-0.99x the staged package's time (113 -> 107
-    # us at 32 rows); with both uniform and Zipf routing it breaks even at 160
-    # rows.
+    # EP1 (TP8 intermediate shard), 14-16 rows: faster than the direct decode
+    # with recorded verify and plain decode routing, and even with uniform
+    # routing. Below 14 rows grouping won on average but lost on samples with
+    # few repeated experts, and at 8 rows it only broke even, so direct decode
+    # keeps them. 17-128 rows: faster than the staged package; with both
+    # uniform and Zipf routing it breaks even at 160 rows.
     (4096, 512, 256, 256, 8): (
         (14, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),
         (17, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2)),
