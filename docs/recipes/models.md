@@ -701,7 +701,7 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --speculative-algorithm EAGLE3 \
   --speculative-draft-model-path lightseekorg/kimi-k3-eagle3.1-mla \
   --drafter-attention-backend gluon \
-  --max-num-seqs 16 \
+  --max-num-seqs 64 \
   --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
