@@ -24,9 +24,12 @@
 //! incarnation, so a stale handle fails instead of silently copying bytes.
 
 use std::{
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 static NEXT_LIBRARY: AtomicU64 = AtomicU64::new(0);
@@ -45,9 +48,16 @@ impl NativeLibrary {
             std::process::id()
         ));
         std::fs::create_dir(&directory).expect("create native test directory");
+        std::fs::write(directory.join("owner-alive"), b"").expect("mark native test owner alive");
         let source = directory.join("native.c");
         let path = directory.join("libnative.so");
-        std::fs::write(&source, NATIVE).expect("write native test library");
+        let native = format!(
+            "#define WRITE_BLOCK_PATH {}\n#define WRITE_ENTERED_PATH {}\n#define WRITE_OWNER_PATH {}\n{NATIVE}",
+            c_path(&directory.join("write-blocked")),
+            c_path(&directory.join("write-entered")),
+            c_path(&directory.join("owner-alive")),
+        );
+        std::fs::write(&source, native).expect("write native test library");
         let output = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
             .args(["-shared", "-fPIC", "-pthread", "-O0"])
             .arg(&source)
@@ -66,12 +76,62 @@ impl NativeLibrary {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Hold native writes before they inspect or copy registered memory.
+    /// Dropping this library fails held writes without copying after a panic.
+    #[allow(dead_code)] // Shared by lifecycle tests that do not all hold native writes.
+    pub(crate) fn block_writes(&self) {
+        let _ = std::fs::remove_file(self.directory.join("write-entered"));
+        std::fs::write(self.directory.join("write-blocked"), b"")
+            .expect("block native test writes");
+    }
+
+    /// Wait until at least one write entered the native library's barrier.
+    #[allow(dead_code)]
+    pub(crate) fn wait_write_entered(&self, timeout: Duration) -> bool {
+        let entered = self.directory.join("write-entered");
+        let deadline = Instant::now() + timeout;
+        loop {
+            if entered.exists() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Let blocked writes finish; subsequent writes proceed normally.
+    #[allow(dead_code)]
+    pub(crate) fn release_writes(&self) {
+        match std::fs::remove_file(self.directory.join("write-blocked")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("release native test writes: {error}"),
+        }
+    }
 }
 
 impl Drop for NativeLibrary {
     fn drop(&mut self) {
+        // Buffers may already have unwound. Fail any held write before
+        // unblocking it so cleanup never copies into their freed memory.
+        let _ = std::fs::remove_file(self.directory.join("owner-alive"));
+        let _ = std::fs::remove_file(self.directory.join("write-blocked"));
         let _ = std::fs::remove_dir_all(&self.directory);
     }
+}
+
+/// Encode an arbitrary Unix path without interpreting its bytes as C syntax.
+fn c_path(path: &Path) -> String {
+    let bytes: String = path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect();
+    format!("\"{bytes}\"")
 }
 
 const NATIVE: &str = r#"
@@ -80,6 +140,8 @@ const NATIVE: &str = r#"
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #define ENGINES 4
 #define REGIONS 8
@@ -96,6 +158,16 @@ typedef struct {
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static Engine *engines[ENGINES];
 static uint64_t next_incarnation = 1;
+
+/* The barrier is private to this library and never holds the engine mutex. */
+static int wait_for_write_release(void) {
+    if (access(WRITE_BLOCK_PATH, F_OK) == 0) {
+        FILE *entered = fopen(WRITE_ENTERED_PATH, "w");
+        if (entered) fclose(entered);
+        while (access(WRITE_BLOCK_PATH, F_OK) == 0) usleep(1000);
+    }
+    return access(WRITE_OWNER_PATH, F_OK) == 0;
+}
 
 int ts_mooncake_abi_version(void) { return 1; }
 
@@ -189,6 +261,7 @@ static int copy(Engine *sender, Engine *receiver,
 int ts_mooncake_write(void *raw, const char *session, const uint64_t *sources,
                       const uint64_t *destinations, const uint64_t *lengths, size_t count) {
     Engine *sender = raw;
+    if (!wait_for_write_release()) return -4;
     pthread_mutex_lock(&mutex);
     Engine *receiver = target(sender, session);
     int result = receiver ? 0 : -2;
@@ -202,6 +275,7 @@ int ts_mooncake_write_pages(void *raw, const char *session, const int64_t *sourc
                             const int64_t *destinations, size_t count, const int64_t *fields,
                             size_t field_count, size_t max_batch) {
     Engine *sender = raw;
+    if (!wait_for_write_release()) return -4;
     pthread_mutex_lock(&mutex);
     Engine *receiver = target(sender, session);
     int result = receiver ? 0 : -2;

@@ -219,6 +219,12 @@ struct State {
     tracked: HashSet<u64>,
     // Queued and executing jobs that can still read source pages.
     pending_chunks: HashMap<u64, usize>,
+    /// Cancelled room ids, retained until their associated cache identities
+    /// retire. An empty set has not received a manifest yet: no TTL proves
+    /// that a delayed manifest can no longer arrive.
+    cancelled: HashMap<u64, HashSet<String>>,
+    /// Reply only after this room's queued and executing jobs have retired.
+    cancellation_replies: HashMap<(u64, String), (String, u16)>,
     /// The tracked requests' rooms, by request.
     rooms_by_rid: HashMap<String, u64>,
     /// Rooms no request here has claimed, since when: a Decode rank
@@ -248,7 +254,23 @@ impl State {
     }
 
     fn ended(&self, room: u64) -> bool {
-        matches!(self.rooms.get(room), None | Some(TransferPoll::Failed))
+        self.cancelled.contains_key(&room)
+            || matches!(self.rooms.get(room), None | Some(TransferPoll::Failed))
+    }
+
+    fn cancel_room(&mut self, room: u64, cache_id: Option<&str>) {
+        let identities: Vec<_> = self
+            .destinations
+            .get(&room)
+            .into_iter()
+            .flatten()
+            .map(|destination| destination.cache_id.clone())
+            .collect();
+        let cancelled = self.cancelled.entry(room).or_default();
+        cancelled.extend(identities);
+        if let Some(cache_id) = cache_id {
+            cancelled.insert(cache_id.to_owned());
+        }
     }
 
     /// `room` gained state: start its unclaimed clock unless a request here
@@ -405,8 +427,70 @@ impl Shared {
     fn handle(&self, frames: &[Bytes]) {
         if wire::is_registration(frames) {
             self.handle_registration(frames);
+        } else if wire::is_cancellation(frames) {
+            self.handle_cancellation(frames);
         } else {
             self.handle_preallocation(frames);
+        }
+    }
+
+    fn handle_cancellation(&self, frames: &[Bytes]) {
+        let (room, cache_id) = match wire::cancellation_route(frames) {
+            Ok(route) => route,
+            Err(error) => {
+                tracing::error!(%error, "rejecting a malformed CachePD cancellation");
+                return;
+            }
+        };
+        let active = {
+            let mut state = self.state();
+            let Some(route) = state.route_of(&cache_id) else {
+                tracing::error!(room, cache_id, "cancellation names an unregistered cache");
+                return;
+            };
+            let active = state.registrations.contains_key(&cache_id);
+            if active {
+                state.cancel_room(room, Some(&cache_id));
+            }
+            state.cancellation_replies.insert((room, cache_id), route);
+            active
+        };
+        // A superseded cache has already passed the registration write gate.
+        // Its delayed cancellation must not cancel a newer cache's request.
+        if active {
+            self.abort_room(room, "Decode cancelled the KV receive");
+        }
+        self.flush_cancellations();
+    }
+
+    /// This also runs without any registered Prefill request: an unclaimed
+    /// room's cancellation must not wait for the bootstrap TTL or a forward.
+    fn flush_cancellations(&self) {
+        let replies = {
+            let mut state = self.state();
+            let ready: Vec<_> = state
+                .cancellation_replies
+                .keys()
+                .filter(|(room, _)| !state.pending_chunks.contains_key(room))
+                .cloned()
+                .collect();
+            ready
+                .into_iter()
+                .map(|key| {
+                    let route = state
+                        .cancellation_replies
+                        .remove(&key)
+                        .expect("pending reply");
+                    (key, route)
+                })
+                .collect::<Vec<_>>()
+        };
+        for ((room, cache_id), (endpoint, port)) in replies {
+            self.transport.sockets.send(
+                &endpoint,
+                port,
+                wire::cancellation_ack_frames(room, &cache_id, self.status_rank),
+            );
         }
     }
 
@@ -508,6 +592,12 @@ impl Shared {
         let mut state = self.state();
         state.registrations.remove(cache_id);
         state.rejected.insert(cache_id.to_owned(), (endpoint, port));
+        state.cancelled.retain(|_, identities| {
+            // Unbound cancellations have no cache lifetime to retire yet.
+            let bound = !identities.is_empty();
+            identities.remove(cache_id);
+            !bound || !identities.is_empty()
+        });
     }
 
     fn handle_preallocation(&self, frames: &[Bytes]) {
@@ -541,7 +631,14 @@ impl Shared {
             .cloned()
             .ok_or("CachePD request references an unregistered Decode session")?;
         let route = (registration.endpoint.clone(), registration.port);
-        if self.state().rooms.get(room) == Some(TransferPoll::Failed) {
+        if {
+            let mut state = self.state();
+            if state.cancelled.contains_key(&room) {
+                state.cancel_room(room, Some(cache_id));
+            }
+            state.cancelled.contains_key(&room)
+                || state.rooms.get(room) == Some(TransferPoll::Failed)
+        } {
             self.notify_failed(route, room);
             return Ok(());
         }
@@ -574,7 +671,9 @@ impl Shared {
             state.validate_fanout(&destinations)?;
         }
         // A transfer worker may have failed the room since the check above.
-        if state.rooms.get(room) == Some(TransferPoll::Failed) {
+        if state.cancelled.contains_key(&room)
+            || state.rooms.get(room) == Some(TransferPoll::Failed)
+        {
             drop(state);
             self.notify_failed(route, room);
             return Ok(());
@@ -708,7 +807,12 @@ impl Shared {
             .collect()
     }
 
-    fn write_copies(&self, registration: &Registration, copies: &[Copy]) -> Result<(), String> {
+    fn write_copies(
+        &self,
+        room: u64,
+        registration: &Registration,
+        copies: &[Copy],
+    ) -> Result<(), String> {
         let _gate = self
             .registration_gate
             .read()
@@ -722,6 +826,9 @@ impl Shared {
             .contains_key(&registration.cache_id)
         {
             return Err("CachePD transfer references a retired cache instance".to_owned());
+        }
+        if self.state().ended(room) {
+            return Err("CachePD transfer room was cancelled or ended".to_owned());
         }
         let started = Instant::now();
         if let Err(error) =
@@ -857,7 +964,7 @@ impl Shared {
                     .get(interval)
                     .ok_or("a layerwise plan has fewer intervals than the chunk")?;
                 if !copies.is_empty() {
-                    self.write_copies(registration, copies)?;
+                    self.write_copies(room, registration, copies)?;
                 }
             }
         }
@@ -928,7 +1035,7 @@ impl Shared {
             prepared.push((registration, copies));
         }
         for (registration, copies) in &prepared {
-            self.write_copies(registration, copies)?;
+            self.write_copies(room, registration, copies)?;
         }
         let registrations: Vec<Registration> = prepared
             .into_iter()
@@ -1374,6 +1481,7 @@ impl PrefillPeer {
                             swept = Instant::now();
                             shared.drop_unclaimed(unclaimed_ttl);
                         }
+                        shared.flush_cancellations();
                     }
                 })?;
         }
@@ -1488,6 +1596,9 @@ impl TransferPeer for PrefillPeer {
             state.cached_tokens.remove(&room);
             state.bootstrap_logprobs.remove(&room);
             state.rooms.update(room, TransferPoll::Bootstrapping);
+            if state.cancelled.contains_key(&room) {
+                state.rooms.update(room, TransferPoll::Failed);
+            }
             // Claimed: its pre-allocations, or its failure, are this
             // request's now.
             state.unclaimed.remove(&room);
@@ -1639,6 +1750,15 @@ impl TransferPeer for PrefillPeer {
 
     fn has_in_flight(&self) -> bool {
         !self.order.is_empty()
+    }
+
+    fn cancel(&mut self, rid: &str) {
+        if let Some(sender) = self.senders.get_mut(rid) {
+            sender.concluded = Some(TransferPoll::Failed);
+            self.shared.state().cancel_room(sender.room, None);
+            self.shared
+                .abort_room(sender.room, "Prefill request cancelled");
+        }
     }
 
     fn abort_room(&mut self, rid: &str, room: u64) {

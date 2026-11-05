@@ -765,6 +765,28 @@ synchronous transport call before retiring. Client cancellation keeps the
 request's source ownership until that terminal event. The retirement agreement
 is needed only in rounds with a terminal status.
 
+**PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
+transfer as well as marking the request's output. A decode receiver sends a
+cancellation to every prefill target that could write its landing pages.
+Each target stops accepting work for the room and acknowledges only after
+its queued and executing writes retire. The receiver waits for every target,
+then agrees retirement across its replica before reporting failure to the
+scheduler. Failure notifications and receive timeouts use the same fence:
+neither proves that remote writes stopped. A receiver that never advertised
+landing pages can retire locally. Cancelled rooms reject delayed registration
+and manifests; repeated cancellation is safe.
+
+The prefill control receiver handles cancellation even when no native request
+claimed the room or its scheduler is paused. Unclaimed rooms therefore need
+not wait for the bootstrap timeout after the decode request is cancelled.
+P and D must run versions supporting this cancellation protocol. If a target
+cannot acknowledge retirement, the receiver retains its pages and the drain
+remains pending; a transport failure alone cannot make those pages safe to
+reuse. Cancellation tombstones are retired with their destination cache
+identities. A prefill cancellation that never learns a destination identity
+must retain its room tombstone until that peer exits, since an arbitrarily
+late manifest must not revive the transfer.
+
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
 admission, and every round the replica agrees on which transfers changed
 state; their scheduler events join the round's tail feedback, and a failed

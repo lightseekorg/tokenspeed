@@ -148,7 +148,7 @@ fn waking_at_a_new_address_retires_the_old_cache_at_the_same_control_socket() {
     assert_eq!(preallocate(&peer, "cache-b", 2), Ok(()));
     // A worker that planned its copies before retirement must not execute them.
     assert!(peer
-        .write_copies(&planned, &[])
+        .write_copies(1, &planned, &[])
         .unwrap_err()
         .contains("retired"));
 }
@@ -169,4 +169,63 @@ fn conflicting_metadata_for_the_same_cache_identity_is_still_rejected() {
     assert!(preallocate(&peer, "cache-a", 2)
         .unwrap_err()
         .contains("unregistered"));
+}
+
+#[test]
+fn cancellation_survives_the_unclaimed_ttl_until_its_cache_is_retired() {
+    let native = NativeLibrary::new();
+    let peer = shared(&native);
+    register(&peer, "cache-a", "127.0.0.1:41001", 42001);
+    assert_eq!(preallocate(&peer, "cache-a", 1), Ok(()));
+    peer.handle_cancellation(&wire::cancellation_frames(1, "cache-a"));
+    peer.drop_unclaimed(Duration::ZERO);
+    assert_eq!(peer.state().rooms.get(1), None);
+    assert_eq!(preallocate(&peer, "cache-a", 1), Ok(()));
+    assert!(!peer.state().destinations.contains_key(&1));
+    assert!(peer.state().cancelled.contains_key(&1));
+    register(&peer, "cache-b", "127.0.0.1:41001", 42001);
+    assert!(peer.state().cancelled.is_empty());
+    assert!(preallocate(&peer, "cache-a", 1).is_err());
+    assert_eq!(preallocate(&peer, "cache-b", 2), Ok(()));
+}
+
+#[test]
+fn a_cancel_before_any_manifest_binds_to_a_late_cache_identity() {
+    let native = NativeLibrary::new();
+    let peer = shared(&native);
+    peer.state().cancel_room(1, None);
+    peer.drop_unclaimed(Duration::ZERO);
+    register(&peer, "cache-a", "127.0.0.1:41001", 42001);
+    assert_eq!(preallocate(&peer, "cache-a", 1), Ok(()));
+    assert!(!peer.state().destinations.contains_key(&1));
+    register(&peer, "cache-b", "127.0.0.1:41001", 42001);
+    assert!(peer.state().cancelled.is_empty());
+}
+
+#[test]
+fn a_cancelled_room_stays_closed_until_every_decode_cache_retires() {
+    let native = NativeLibrary::new();
+    let peer = shared(&native);
+    let register_rank = |cache, session, port, rank| {
+        let mut frames = registration(cache, session, port);
+        frames[6] = Bytes::from("2");
+        frames[7] = Bytes::from(format!("{rank}"));
+        peer.plan_registration(&frames)
+            .expect("valid TP registration");
+        peer.handle_registration(&frames);
+    };
+    register_rank("cache-a", "127.0.0.1:41001", 42001, 0);
+    register_rank("cache-b", "127.0.0.1:41002", 42002, 1);
+    assert_eq!(preallocate(&peer, "cache-a", 1), Ok(()));
+    assert_eq!(preallocate(&peer, "cache-b", 1), Ok(()));
+    peer.handle_cancellation(&wire::cancellation_frames(1, "cache-a"));
+    peer.drop_unclaimed(Duration::ZERO);
+    register_rank("next-a", "127.0.0.1:41001", 42001, 0);
+    assert!(peer.state().cancelled.contains_key(&1));
+    assert_eq!(preallocate(&peer, "cache-b", 1), Ok(()));
+    assert!(!peer.state().destinations.contains_key(&1));
+    register_rank("next-b", "127.0.0.1:41002", 42002, 1);
+    assert!(peer.state().cancelled.is_empty());
+    assert!(preallocate(&peer, "cache-a", 1).is_err());
+    assert!(preallocate(&peer, "cache-b", 1).is_err());
 }

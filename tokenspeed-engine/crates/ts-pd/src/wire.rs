@@ -126,6 +126,62 @@ pub fn preallocation_route(frames: &[Bytes]) -> Result<(u64, String), WireError>
     Ok((room, cache_id))
 }
 
+/// Explicit cancellation is distinct from a failure report: only its ACK
+/// proves that this Prefill rank can no longer write the room's pages.
+pub fn cancellation_frames(room: u64, cache_id: &str) -> Vec<Bytes> {
+    vec![Bytes::from_static(b"Cancel"), ascii(room), ascii(cache_id)]
+}
+
+pub fn is_cancellation(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|frame| frame.as_ref() == b"Cancel")
+}
+
+pub fn cancellation_route(frames: &[Bytes]) -> Result<(u64, String), WireError> {
+    if frames.len() != 3 || !is_cancellation(frames) {
+        return Err(error("CachePD cancellation requires exactly 3 frames"));
+    }
+    let room = parse_uint(&frames[1], MAX_ROOM)
+        .ok_or_else(|| error("CachePD room must be canonical unsigned ASCII"))?;
+    let cache_id = text(&frames[2], "CachePD cache identity")?;
+    if cache_id.is_empty() || cache_id.len() > 512 {
+        return Err(error(
+            "CachePD cancellation requires a Decode cache identity",
+        ));
+    }
+    Ok((room, cache_id))
+}
+
+pub fn cancellation_ack_frames(room: u64, cache_id: &str, rank: i64) -> Vec<Bytes> {
+    vec![
+        Bytes::from_static(b"CancelAck"),
+        ascii(room),
+        ascii(cache_id),
+        ascii(rank),
+    ]
+}
+
+pub fn is_cancellation_ack(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|frame| frame.as_ref() == b"CancelAck")
+}
+
+pub fn cancellation_ack(frames: &[Bytes]) -> Result<(u64, String, i64), WireError> {
+    if frames.len() != 4 || !is_cancellation_ack(frames) {
+        return Err(error(
+            "CachePD cancellation acknowledgment requires exactly 4 frames",
+        ));
+    }
+    let mut request = frames[..3].to_vec();
+    request[0] = Bytes::from_static(b"Cancel");
+    let (room, cache_id) = cancellation_route(&request)?;
+    let rank = parse_uint(&frames[3], i64::MAX as u64)
+        .ok_or_else(|| error("CachePD cancellation rank is invalid"))?;
+    Ok((room, cache_id, rank as i64))
+}
+
 /// A Prefill rank's report on one room.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusMessage {
@@ -253,6 +309,27 @@ pub fn session_port(session_id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_and_its_retirement_ack_have_distinct_strict_formats() {
+        let request = cancellation_frames(7, "cache-a");
+        assert_eq!(
+            cancellation_route(&request).unwrap(),
+            (7, "cache-a".to_owned())
+        );
+        let ack = cancellation_ack_frames(7, "cache-a", 2);
+        assert_eq!(
+            cancellation_ack(&ack).unwrap(),
+            (7, "cache-a".to_owned(), 2)
+        );
+        assert!(cancellation_route(&ack).is_err());
+        assert!(cancellation_ack(&request).is_err());
+        assert!(cancellation_route(&cancellation_frames(7, "")).is_err());
+        assert!(cancellation_ack(&cancellation_ack_frames(7, "cache-a", -1)).is_err());
+        let mut invalid = request.clone();
+        invalid[1] = Bytes::from_static(b"07");
+        assert!(cancellation_route(&invalid).is_err());
+    }
 
     #[test]
     fn a_status_message_round_trips() {
