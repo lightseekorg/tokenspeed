@@ -151,9 +151,9 @@ def triton_causal_conv1d_prefill(
         Read-only program mapping built once with this forward's sequence
         boundaries and shared by all recurrent-attention layers.
 
-    out: same shape as `x`
+    out: same shape as `x`, with contiguous channels in each token row
     """
-    out = torch.empty_like(x)
+    out = torch.empty((x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device).T
     _launch_causal_conv1d_prefill(
         x,
         weight,

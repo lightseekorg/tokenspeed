@@ -290,7 +290,8 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
-def test_outer_graph_replays_lengths_pages_and_states(batch_size):
+@pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
+def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
@@ -325,7 +326,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),
-        kda_backend="cutedsl_kda",
+        kda_backend=backend_name,
         kda_recurrent_layout="v_major",
     )
     backend._layer_state = lambda layer_id: (
@@ -385,6 +386,16 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     def reset():
         conv.copy_(initial_conv)
         states.copy_(initial_states)
+
+    def assert_scan_close(actual, expected):
+        if backend_name == "cutedsl_kda":
+            assert torch.equal(actual, expected)
+        else:
+            # The cuDNN plan can change with token capacity or padded request count.
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-4)
+            assert (
+                actual.float() - expected.float()
+            ).norm() < 0.01 * expected.float().norm()
 
     def live_metadata(lengths, prefixes, page_shift):
         lengths = torch.tensor(lengths)
@@ -510,9 +521,9 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
         )
         reset()
         fresh_eager = forward(compact=False)[: sum(lengths)].clone()
-        assert torch.equal(fresh_eager.view(torch.uint8), expected.view(torch.uint8))
+        assert_scan_close(fresh_eager, expected)
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
-        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
+        assert_scan_close(states, expected_states)
         # The ordinary capture hands the eager break views of the projection
         # its graph just wrote, on that transient metadata (an uncaptured
         # request count) or on the plain one (forwards the capacity layout
@@ -521,14 +532,9 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
             backend.forward_metadata = metadata
             reset()
             ordinary.replay(valid_rows=sum(lengths))
-            assert torch.equal(
-                ordinary_output[: sum(lengths)].view(torch.uint8),
-                expected.view(torch.uint8),
-            )
+            assert_scan_close(ordinary_output[: sum(lengths)], expected)
             assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
-            assert torch.equal(
-                states.view(torch.uint8), expected_states.view(torch.uint8)
-            )
+            assert_scan_close(states, expected_states)
             assert torch.count_nonzero(ordinary_output[sum(lengths) :]) == 0
         backend.forward_metadata = source
         backend.prepare_prefill_metadata(
@@ -536,19 +542,23 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
         )
         reset()
         eager = forward(compact=False)[: sum(lengths)].clone()
-        assert torch.equal(eager.view(torch.uint8), expected.view(torch.uint8))
+        assert_scan_close(eager, expected)
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
-        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
+        assert_scan_close(states, expected_states)
+        untouched = torch.ones(states.shape[0], dtype=torch.bool, device=states.device)
+        untouched[source.state_out_blocks_by_group["state"].long()] = False
+        assert torch.equal(states[untouched], initial_states[untouched])
+        eager_states = states.clone()
         reset()
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {
             name: tensor.data_ptr() for name, tensor in retained.items()
         }
         assert torch.equal(
-            output[: sum(lengths)].view(torch.uint8), expected.view(torch.uint8)
+            output[: sum(lengths)].view(torch.uint8), eager.view(torch.uint8)
         )
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
-        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), eager_states.view(torch.uint8))
         assert torch.count_nonzero(output[sum(lengths) :]) == 0
 
 

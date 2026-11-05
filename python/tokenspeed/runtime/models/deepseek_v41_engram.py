@@ -34,6 +34,7 @@ Integration contract:
   reduce-scatters the table contributions back to local query rows.
   GPU-resident tables are row-sharded across attention TP and all-reduced.
   Host tables stay in anonymous or shared host memory and gather through UVA.
+  Their GPU registrations are released before their backing memory is freed.
   ``shared`` keeps one full copy per node and skips the lookup all-reduce.
   ``sharded`` keeps a host shard per attention-TP rank and retains the all-reduce.
   ``auto`` selects sharded when attention TP > 1. Output matches the GPU path.
@@ -58,6 +59,7 @@ import os
 import shutil
 import sys
 import tempfile
+import weakref
 from dataclasses import dataclass
 
 import numpy as np
@@ -598,11 +600,14 @@ class RowShardedEngramEmbedding(nn.Module):
             self._host_gpu_registered = True
             return
         platform = current_platform()
-        weight_bytes = self.weight.view(torch.uint8)
-        if not weight_bytes.is_pinned():
-            platform.register_host_tensor_for_gpu_access(weight_bytes)
-        if not self.scale.is_pinned():
-            platform.register_host_tensor_for_gpu_access(self.scale)
+        for param in (self.weight, self.scale):
+            # Keep storage alive without retaining the parameter's bound loader.
+            tensor = param.detach()
+            if not tensor.is_pinned():
+                platform.register_host_tensor_for_gpu_access(tensor)
+                weakref.finalize(
+                    self, platform.unregister_host_tensor_for_gpu_access, tensor
+                )
         self._host_gpu_registered = True
 
     def _apply(self, fn, recurse=True):
