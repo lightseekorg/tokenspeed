@@ -126,14 +126,15 @@ void StorageLease::reset() noexcept {
     }
 }
 
-StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys) {
+StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens) {
     if (keys.empty() || !CanStart() || availableHostCredits() == 0 ||
         keys.size() > static_cast<std::size_t>(config_.max_keys_per_operation)) {
         return {};
     }
+    _assert(keys.size() == key_tokens.size(), "Each storage query key needs a token span");
     StorageQueryOperation op{nextId(), std::move(keys)};
     const auto id = op.op_id;
-    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, {}, {}});
+    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, std::move(key_tokens), {}, {}});
     commands_.push_back(std::move(op));
     return StorageLease{*this, id};
 }
@@ -148,11 +149,13 @@ bool StorageTransferManager::IsQuery(std::uint64_t id) const {
     return it != operations_.end() && it->second.kind == StorageKind::kQuery;
 }
 
-std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) const {
-    const Ticket& ticket = operations_.at(id);
+std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
+    Ticket& ticket = operations_.at(id);
     std::vector<CacheKey> keys;
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
-        if (ticket.success[i] && !IsNegative(ticket.keys[i])) keys.push_back(ticket.keys[i]);
+        if (!ticket.success[i] || IsNegative(ticket.keys[i])) continue;
+        keys.push_back(ticket.keys[i]);
+        query_hit_tokens_ += std::exchange(ticket.key_tokens[i], 0);
     }
     return keys;
 }
@@ -170,6 +173,7 @@ StorageLease StorageTransferManager::StartRead(const CacheCoordinator::PromptPre
     const auto id = op.op_id;
     operations_.emplace(id, Ticket{decltype(op)::kKind,
                                    op.keys,
+                                   {},
                                    std::move(reservation.blocks),
                                    {},
                                    std::move(reservation.tail_prior),
@@ -304,7 +308,7 @@ void StorageTransferManager::StartBackups() {
     }
     if (refs.empty()) return;
     op.op_id = nextId();
-    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, std::move(refs), {}});
+    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, {}, std::move(refs), {}});
     commands_.push_back(std::move(op));
 }
 
