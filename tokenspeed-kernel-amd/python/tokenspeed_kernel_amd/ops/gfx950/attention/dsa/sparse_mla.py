@@ -2291,7 +2291,10 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             candidate_end = candidate_end - (q_len_per_req - 1) + q_offset
     else:
         req = row
-        candidate_start = gl.load(row_starts + row).to(gl.int32)
+        if row_starts is None:
+            candidate_start = gl.full([], 0, gl.int32)
+        else:
+            candidate_start = gl.load(row_starts + row).to(gl.int32)
         candidate_end = gl.load(row_ends + row).to(gl.int32)
 
     candidate_len = gl.maximum(candidate_end - candidate_start, 0)
@@ -3436,7 +3439,7 @@ def gluon_dsa_logical_topk_gfx950(
 
 def gluon_dsa_row_bounded_logical_topk_gfx950(
     logits: torch.Tensor,
-    row_starts: torch.Tensor,
+    row_starts: torch.Tensor | None,
     row_ends: torch.Tensor,
     *,
     topk: int,
@@ -3453,11 +3456,18 @@ def gluon_dsa_row_bounded_logical_topk_gfx950(
     rows against 86 us, 78 against 99 at 128K). Past about 200K-token rows
     the persistent kernel's split rows are faster.
 
-    Args and returns as :func:`gluon_dsa_logical_topk_gfx950`.
+    Args and returns as :func:`gluon_dsa_logical_topk_gfx950`, except that
+    ``row_starts`` may be None: every row then starts at column 0, without
+    a launch filling zeros to say so.
     """
     topk = int(topk)
     out, lens_out = _check_logical_topk_args(
-        logits, row_starts, row_ends, topk=topk, out=out, lens_out=lens_out
+        logits,
+        row_ends if row_starts is None else row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
     )
     rows, cols = logits.shape
     if rows == 0:
@@ -3465,7 +3475,7 @@ def gluon_dsa_row_bounded_logical_topk_gfx950(
     if cols <= topk:
         return _dsa_topk_indices(
             logits,
-            row_starts,
+            torch.zeros_like(row_ends) if row_starts is None else row_starts,
             row_ends,
             topk=topk,
             out=out,
@@ -3473,7 +3483,8 @@ def gluon_dsa_row_bounded_logical_topk_gfx950(
         )
     return _dsa_oneblock_topk_indices(
         logits,
-        row_starts,
+        # No block table outside decode; any int32 pointer stands in.
+        row_ends,
         row_starts,
         row_ends,
         block_table_cols=0,

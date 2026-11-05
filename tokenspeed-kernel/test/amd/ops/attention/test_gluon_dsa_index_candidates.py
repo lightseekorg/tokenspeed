@@ -201,13 +201,38 @@ def test_gluon_owned_page_scorer_grouped_rows_match_single_rows(heads, device):
     grouped = dsa_index_candidates(
         q, weights, cache, table, requests, lens, query_group_size=4, **kwargs
     )
-    # Candidate order within a row is unspecified; -1 padding scores -inf.
-    for offsets, scores in (single, grouped):
-        order = offsets.argsort(dim=1, stable=True)
-        offsets.copy_(offsets.gather(1, order))
-        scores.copy_(scores.gather(1, order))
-    for actual, expected in zip(grouped, single, strict=True):
+    for actual, expected in zip(_by_offset(*grouped), _by_offset(*single), strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _by_offset(offsets, scores):
+    """Candidates ordered by offset: order within a row is unspecified, and
+    -1 padding scores -inf."""
+    order = offsets.argsort(dim=1, stable=True)
+    return offsets.gather(1, order), scores.gather(1, order)
+
+
+def test_gluon_owned_page_scorer_takes_strided_head_weight_rows(device):
+    # The head weights as a slice of a fused key and head-weight projection.
+    table, requests, lens, q, q_scales, weights, cache, _ = _inputs(32, 4, device)
+    fused = torch.randn(weights.shape[0], HEAD_DIM + 32, device=device)
+    fused[:, HEAD_DIM:] = weights
+    strided = fused[:, HEAD_DIM:]
+    assert not strided.is_contiguous()
+    kwargs = dict(
+        page_size=PAGE_SIZE,
+        topk=256,
+        softmax_scale=0.1,
+        initial_tokens=0,
+        local_tokens=0,
+        solution=None,
+        q_scales=q_scales,
+        query_group_size=4,
+    )
+    expected = dsa_index_candidates(q, weights, cache, table, requests, lens, **kwargs)
+    actual = dsa_index_candidates(q, strided, cache, table, requests, lens, **kwargs)
+    for got, want in zip(_by_offset(*actual), _by_offset(*expected), strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 def test_gluon_owned_page_scorer_writes_scores_into_a_send_buffer(device):
@@ -236,6 +261,8 @@ def test_gluon_owned_page_scorer_writes_scores_into_a_send_buffer(device):
 
     assert written.data_ptr() == scores_out.data_ptr()
     assert positions.is_contiguous()
-    torch.testing.assert_close(positions, offsets, rtol=0, atol=0)
-    torch.testing.assert_close(written, scores, rtol=0, atol=0)
+    for got, want in zip(
+        _by_offset(positions, written), _by_offset(offsets, scores), strict=True
+    ):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert buffer[rows * topk :].isnan().all()
