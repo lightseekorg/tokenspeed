@@ -41,7 +41,10 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
+from tokenspeed.runtime.layers.attention.backends.base import (
+    DecodeKVView,
+    reject_query_shard,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -197,6 +200,33 @@ class MHAAttnBackend(PagedAttentionBackend):
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         # Both reads hand them to the kernel (_fp8_scale_kwargs).
         return True
+
+    def decode_kv_view(
+        self, layer: PagedAttention, token_to_kv_pool
+    ) -> DecodeKVView | None:
+        # A sliding window reads the cache through the page table alone; full
+        # layers' verify decode takes a split schedule, and scaled caches more.
+        # A bound draft tree attends through its mask (forward_decode's tree
+        # cascade), which the view does not carry.
+        metadata = self.forward_decode_metadata
+        if (
+            metadata is None
+            or not self.is_fp8
+            or layer.fp8_kv_scales is not None
+            or layer.sliding_window_size < 0
+            or self.draft_block_decode
+            or self.tree_verify is not None
+            or self.tree_lane_step_active
+        ):
+            return None
+        k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        return DecodeKVView(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=metadata.page_table,
+            seq_lens=metadata.seq_lens,
+            max_seqlen_k=self.max_context_len,
+        )
 
     def query_dtype(
         self, layer: PagedAttention, forward_mode: ForwardMode, activation: torch.dtype
