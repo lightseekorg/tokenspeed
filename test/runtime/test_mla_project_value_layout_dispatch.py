@@ -126,6 +126,30 @@ def test_weight_layout_matches_what_the_kernel_wants():
     )
 
 
+@pytest.mark.parametrize("heads", [12, 16])
+def test_k_major_absorbed_weights_keep_values(heads):
+    from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
+
+    class _Attn:
+        qk_nope_head_dim = 128
+        v_head_dim = 128
+        w_kc = None
+        w_vc = None
+
+    class _KMajorAttn(_Attn):
+        absorbed_weights_k_major = True
+
+    w = torch.randn(heads * 256, LATENT, device="cuda", dtype=torch.bfloat16)
+    w_kc, w_vc = _prepare_mla_kv_b_proj_weights(w, _Attn())
+    k_major_kc, k_major_vc = _prepare_mla_kv_b_proj_weights(w, _KMajorAttn())
+
+    # Both bmm operands (w_kc and w_vc transposed) keep the reduction dim innermost.
+    assert k_major_kc.transpose(1, 2).is_contiguous()
+    assert k_major_vc.transpose(1, 2).is_contiguous()
+    assert torch.equal(k_major_kc, w_kc)
+    assert torch.equal(k_major_vc, w_vc)
+
+
 def test_model_has_no_vendor_branches_left():
     import pathlib
 
