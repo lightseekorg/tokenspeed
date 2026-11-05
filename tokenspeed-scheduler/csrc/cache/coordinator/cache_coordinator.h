@@ -800,6 +800,9 @@ public:
     };
     struct StorageQuery {
         std::vector<CacheKey> keys;
+        // Tokens each key covers, parallel to `keys`; the scheduler counts a
+        // found key's tokens as an L3 hit.
+        std::vector<std::int32_t> key_tokens;
         std::int32_t max_tokens{0};
     };
     StorageQuery MissingStorageKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
