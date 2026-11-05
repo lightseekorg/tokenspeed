@@ -152,8 +152,8 @@ from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.rotary_embedding import (
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
+    yarn_find_correction_range,
+    yarn_linear_ramp_mask,
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -496,10 +496,10 @@ class DeepseekV41RotaryEmbedding(nn.Module):
             scaling = config.rope_scaling
             original = scaling["original_max_position_embeddings"]
             factor = scaling["factor"]
-            low, high = _yarn_find_correction_range(
+            low, high = yarn_find_correction_range(
                 scaling["beta_fast"], scaling["beta_slow"], self.dim, base, original
             )
-            ramp = _yarn_linear_ramp_mask(
+            ramp = yarn_linear_ramp_mask(
                 low, high, self.dim // 2, dtype=torch.float32, device=None
             )
             smooth = 1 - ramp

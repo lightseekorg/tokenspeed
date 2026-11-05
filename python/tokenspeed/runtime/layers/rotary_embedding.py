@@ -304,7 +304,7 @@ def _yarn_find_correction_dim(
 
 
 # Find dim range bounds based on rotations
-def _yarn_find_correction_range(
+def yarn_find_correction_range(
     low_rot: int,
     high_rot: int,
     dim: int,
@@ -320,7 +320,7 @@ def _yarn_find_correction_range(
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
-def _yarn_linear_ramp_mask(
+def yarn_linear_ramp_mask(
     low: float,
     high: float,
     dim: int,
@@ -395,7 +395,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-        low, high = _yarn_find_correction_range(
+        low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,
@@ -405,7 +405,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(
+            - yarn_linear_ramp_mask(
                 low, high, self.rotary_dim // 2, dtype=torch.float, device=None
             )
         ) * self.extrapolation_factor
@@ -591,7 +591,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-        low, high = _yarn_find_correction_range(
+        low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,
@@ -601,7 +601,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(
+            - yarn_linear_ramp_mask(
                 low,
                 high,
                 self.rotary_dim // 2,
