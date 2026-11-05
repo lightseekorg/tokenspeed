@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.comm_backend import auto as auto_module
 from tokenspeed.runtime.distributed.comm_backend import iris as iris_module
 from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
@@ -168,7 +169,15 @@ def test_unprepared_group_keeps_default_producer_dispatch_limit(monkeypatch):
     )
 
 
-def test_prepared_group_uses_its_producer_capacity(monkeypatch):
+@pytest.mark.parametrize(
+    "platform",
+    (
+        SimpleNamespace(is_cdna4=True, is_cdna5=False),
+        SimpleNamespace(is_cdna4=False, is_cdna5=True),
+    ),
+    ids=("cdna4", "cdna5"),
+)
+def test_prepared_group_uses_its_producer_capacity(monkeypatch, platform):
     backend = IrisBackend(Mock(), producer_direct_max_bytes=1024)
     group = (0, 1)
     max_tokens = 8192
@@ -177,11 +186,7 @@ def test_prepared_group_uses_its_producer_capacity(monkeypatch):
         producer_direct_max_numel=max_tokens * (3584 + 7168), dtype=torch.bfloat16
     )
     backend._instances[group, torch.bfloat16] = state
-    monkeypatch.setattr(
-        iris_module,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
+    monkeypatch.setattr(iris_module, "current_platform", lambda: platform)
     like = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
 
     assert backend.can_acquire_outputs(shapes, like, group)
@@ -200,7 +205,7 @@ def test_iris_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatch)
     monkeypatch.setattr(
         iris_module,
         "current_platform",
-        lambda: SimpleNamespace(is_cdna4=False),
+        lambda: SimpleNamespace(is_cdna4=False, is_cdna5=False),
     )
 
     outputs = backend.acquire_all_reduce_outputs(((2, 4),), torch.empty(2, 4), (0, 1))
@@ -495,6 +500,29 @@ def test_all_gather_takes_the_workspace_exchange_where_it_serves(routing, monkey
     routing._trtllm_ar.lamport_all_gather.return_value = None
     assert routing.all_gather(ROWS, GROUP, -1) is routing._rsag.all_gather.return_value
     routing._rsag.all_gather.assert_called_once_with(ROWS, GROUP, -1)
+
+
+@pytest.mark.parametrize(
+    "platform",
+    (
+        SimpleNamespace(is_amd=True, is_cdna4=True, is_cdna5=False),
+        SimpleNamespace(is_amd=True, is_cdna4=False, is_cdna5=True),
+    ),
+    ids=("cdna4", "cdna5"),
+)
+def test_hidden_gathers_take_iris_on_cdna(routing, monkeypatch, platform):
+    _switches(monkeypatch, force=False, invariant=False)
+    monkeypatch.setattr(auto_module, "current_platform", lambda: platform)
+    # The verdict needs a process group spanning real hosts.
+    monkeypatch.setattr(routing, "_iris_maps_world", lambda: True)
+    routing._trtllm_ar.has_trtllm_ar.return_value = False
+    group = tuple(range(8))
+    assert routing.all_gather(ROWS, group, -1) is routing._iris.all_gather.return_value
+    assert (
+        routing.get_prepared_all_gather(group, torch.bfloat16)
+        is routing._iris.get_prepared_all_gather.return_value
+    )
+    routing._trtllm_ar.lamport_all_gather.assert_not_called()
 
 
 def test_route_never_reads_the_row_count(routing, monkeypatch):

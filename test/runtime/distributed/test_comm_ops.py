@@ -304,9 +304,9 @@ class TestAutoBackendTopology:
             expected == "iris"
         )
         assert backend.all_reduce(torch.empty(1), group) == expected
-        # Producer-direct outputs create the heap on first use, and stay
-        # node-local even where Iris reduces across nodes.
-        acquires = expected == "iris" and group == (0, 1, 2, 3)
+        # Producer-direct outputs reach exactly the groups the reduction does,
+        # so K3's fusions span gfx1250 trays in one mapped world.
+        acquires = expected == "iris"
         like = torch.empty(1)
         assert backend.can_acquire_all_reduce_outputs(((1,),), like, group) is acquires
         assert (
