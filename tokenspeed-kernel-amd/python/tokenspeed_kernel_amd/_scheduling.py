@@ -121,3 +121,23 @@ def sched_group(mask, size, _semantic):
         is_pure=False,
         _semantic=_semantic,
     )
+
+
+@tl.core.extern
+def release_drain(_semantic):
+    """Wait for this wave's vector memory operations (``s_waitcnt vmcnt(0)``),
+    keeping its earlier stores above the wait; no L2 write-back.
+
+    Only this wave's operations are waited for: follow it with
+    ``gl.barrier()`` when every wave's stores must land before one thread
+    publishes. Loads the wave issued earlier are waited for too (one
+    in-order counter). Launch with :func:`sched_compile_options`.
+    """
+    return tl.core.extern_elementwise(
+        _SCHED_LIBRARY_NAME,
+        _SCHED_LIBRARY_PATH,
+        [],
+        {(): ("__tokenspeed_sched_release_drain", tl.int32)},
+        is_pure=False,
+        _semantic=_semantic,
+    )
