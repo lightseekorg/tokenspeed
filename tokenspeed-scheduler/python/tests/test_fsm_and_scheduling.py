@@ -646,47 +646,63 @@ class TestPrefillInputIds:
         assert plan3.forward[0].extend_prefix_lens == [16]
         assert plan3.forward[0].input_ids.tolist() == tokens[16:20]
 
-    def test_input_ids_are_zero_copy_readonly_views(self):
-        """input_ids / shifted_input_ids are read-only int32 ndarrays over
-        the plan's own memory: the runtime's fill path reads them every
-        round, and a per-read list cast would box every token."""
-        tokens = list(range(300, 356))  # values outside the small-int cache
-        s = Scheduler(make_config(max_scheduled_tokens=512))
-        submit(s, "r0", tokens)
-        op = s.next_execution_plan().forward[0]
-        assert isinstance(op.input_ids, np.ndarray)
-        assert op.input_ids.dtype == np.int32
-        assert not op.input_ids.flags.writeable
-        assert op.input_ids.tolist() == tokens
-        assert op.shifted_input_ids.tolist() == tokens[1:] + [-1]
-
-    def test_views_keep_the_batch_alive_after_the_plan_is_dropped(self):
-        """The runtime stages the view into pinned memory after the round's
-        plan may already be gone; each view owns a reference to the backing
-        batch (block_tables_arrays' ownership pattern)."""
+    @pytest.mark.parametrize("shifted", [False, True])
+    def test_input_ids_are_zero_copy_readonly_views(self, shifted):
+        """Repeated reads share the batch's immutable token storage."""
         tokens = list(range(300, 356))
         s = Scheduler(make_config(max_scheduled_tokens=512))
         submit(s, "r0", tokens)
         op = s.next_execution_plan().forward[0]
-        view = op.shifted_input_ids
-        expected = view.tolist()
-        del op, s
+        view = op.shifted_input_ids if shifted else op.input_ids
+        second_view = op.shifted_input_ids if shifted else op.input_ids
+        expected = tokens[1:] + [-1] if shifted else tokens
+        assert isinstance(view, np.ndarray)
+        assert view.dtype == np.int32
+        assert view.shape == (len(tokens),)
+        assert not view.flags.writeable
+        assert np.shares_memory(view, second_view)
+        with pytest.raises(ValueError, match="read-only"):
+            view[0] = 0
+        assert view.tolist() == expected
+
+    @pytest.mark.parametrize("shifted", [False, True])
+    def test_views_keep_the_batch_alive_after_the_plan_is_dropped(self, shifted):
+        """Either view alone keeps its token storage alive."""
+        tokens = list(range(300, 356))
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", tokens)
+        plan = s.next_execution_plan()
+        op = plan.forward[0]
+        view = op.shifted_input_ids if shifted else op.input_ids
+        expected = tokens[1:] + [-1] if shifted else tokens
+        del op, plan, s
         gc.collect()
         assert view.tolist() == expected
 
-    def test_decode_only_batch_gives_empty_views(self):
-        """The repr and idle paths read the views on decode-only rounds too,
-        where both token vectors are empty."""
+    @pytest.mark.parametrize("shifted", [False, True])
+    def test_decode_only_batch_gives_empty_views(self, shifted):
+        """Decode-only rounds expose empty, read-only int32 token arrays."""
         s = Scheduler(make_config(max_scheduled_tokens=512))
         submit(s, "r0", list(range(4)))
         s.next_execution_plan()  # -> Prefilling
         plan = s.next_execution_plan()  # -> Decoding
         op = plan.forward[0]
         assert op.num_extends() == 0
-        assert isinstance(op.input_ids, np.ndarray)
-        assert op.input_ids.shape == (0,)
-        assert op.input_ids.tolist() == []
-        repr(op)  # the package repr lists both vectors on every batch
+        view = op.shifted_input_ids if shifted else op.input_ids
+        assert isinstance(view, np.ndarray)
+        assert view.dtype == np.int32
+        assert view.shape == (0,)
+        assert not view.flags.writeable
+        assert view.tolist() == []
+        assert "input_ids=[], shifted_input_ids=[], " in repr(op)
+
+    def test_batch_repr_shows_plain_token_integers(self):
+        tokens = [300, 301, 302, 303]
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", tokens)
+        op = s.next_execution_plan().forward[0]
+        assert f"input_ids={tokens}, " in repr(op)
+        assert f"shifted_input_ids={tokens[1:] + [-1]}, " in repr(op)
 
 
 # ---------------------------------------------------------------------------
