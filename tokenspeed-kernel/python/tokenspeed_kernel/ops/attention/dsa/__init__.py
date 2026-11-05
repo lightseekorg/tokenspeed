@@ -860,9 +860,10 @@ def dsa_decode_dcp_records(
         degree=ranks)`` packs from ``dsa_decode(..., return_lse=True)`` on the
         token-major gather (head ``r * local_heads + h``), leading
         ``workspace`` when given. A row splits its keys by its own live
-        length, so a short one, as one near its rank's share of the selection
-        in a small launch, may split less than that decode and round
-        differently; a longer row matches it bit for bit. Raises
+        length and the launch's size, so a short one, as one near its rank's
+        share of the selection, may split less than that decode and round
+        differently; a row long enough for all its splits matches it bit for
+        bit. Raises
         ``ValueError`` for a size :func:`dsa_decode_dcp_records_supported`
         refuses.
     """
