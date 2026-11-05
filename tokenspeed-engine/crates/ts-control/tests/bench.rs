@@ -92,7 +92,15 @@ fn result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
 fn bench_commit_decode() {
     let bs = 256;
     let run = Duration::from_secs(2);
-    let mut p = OutputProcessor::new(None, 1, Some(1 << 24), Role::Plain, NO_FINISH_LOG);
+    let mut p = OutputProcessor::new(
+        None,
+        1,
+        Some(1 << 24),
+        Role::Plain,
+        NO_FINISH_LOG,
+        false,
+        None,
+    );
     let mut rids: Vec<String> = Vec::with_capacity(bs);
     for i in 0..bs {
         let rid = format!("r{i}");
@@ -410,6 +418,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             },
         },
         kv_total_pages: pages as i64,
+        kv_token_capacity: (pages * shape.page) as i64,
         ngram_context_len: 0,
         request_token_history: false,
         controls: ControlConfig {
@@ -451,6 +460,8 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             Some(1 << 24),
             Role::Plain,
             NO_FINISH_LOG,
+            false,
+            None,
         ),
         config,
         ranks,

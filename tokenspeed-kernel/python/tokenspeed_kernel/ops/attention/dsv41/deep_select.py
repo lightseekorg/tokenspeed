@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Optional FP32 DeepSelect selection, with fused CSA2 masking and metadata."""
+"""Optional FP32/BF16 DeepSelect selection, with CSA2 masking and metadata."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def eligible(logits, topk, block_size, candidates):
     """Metadata-only optional dispatch gate; unsupported cases keep Torch."""
     return (
         logits.is_cuda
-        and logits.dtype == torch.float32
+        and logits.dtype in (torch.float32, torch.bfloat16)
         and logits.ndim == 2
         and logits.shape[1] < 2**23
         and 0 < topk <= 4096
@@ -58,7 +58,7 @@ def eligible(logits, topk, block_size, candidates):
 def _validate(logits, lengths, topk, block_size, candidates):
     if not eligible(logits, topk, block_size, candidates):
         raise ValueError(
-            "DeepSelect CSA2 requires CUDA FP32 scores, topk<=4096 and supported geometry"
+            "DeepSelect CSA2 requires CUDA FP32/BF16 scores, topk<=4096 and supported geometry"
         )
     if (
         lengths.shape != logits.shape[:1]
@@ -110,7 +110,10 @@ def _select_topk_prepared(logits, ends, topk):
     "dsv41_select_candidates",
     name="deepselect_dsv41_select_candidates",
     solution="deepselect",
-    signatures=[format_signature(logits=dense_tensor_format(torch.float32))],
+    signatures=[
+        format_signature(logits=dense_tensor_format(dtype))
+        for dtype in (torch.float32, torch.bfloat16)
+    ],
     traits={"deepselect_eligible": frozenset({True})},
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -141,7 +144,10 @@ def select_candidates(logits, valid_lengths, topk_blocks, block_size):
     "dsv41_select_topk",
     name="deepselect_dsv41_select_topk",
     solution="deepselect",
-    signatures=[format_signature(logits=dense_tensor_format(torch.float32))],
+    signatures=[
+        format_signature(logits=dense_tensor_format(dtype))
+        for dtype in (torch.float32, torch.bfloat16)
+    ],
     traits={"deepselect_eligible": frozenset({True})},
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -163,12 +169,16 @@ def select_topk(logits, valid_lengths, candidate_blocks, topk, block_size):
     input_alignment, _ = deep_select_alignment()
     if candidate_blocks is None:
         scores, ends = prepare_native_dense_scores(
-            logits, valid_lengths, input_alignment // 4
+            logits, valid_lengths, input_alignment // logits.element_size()
         )
         normalized = None
     else:
         scores, ends, normalized = prepare_candidate_scores(
-            logits, valid_lengths, candidate_blocks, block_size, input_alignment // 4
+            logits,
+            valid_lengths,
+            candidate_blocks,
+            block_size,
+            input_alignment // logits.element_size(),
         )
     indices = _native_indices(scores, ends, topk)
     return finish_selection(
