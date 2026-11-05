@@ -21,6 +21,7 @@
 import os
 import sys
 from dataclasses import replace
+from functools import partial
 
 import pytest
 import torch
@@ -30,6 +31,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention.dcp.decode import DCPDecodeState
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
     CompactDCPMetadata,
@@ -38,6 +40,125 @@ from tokenspeed.runtime.layers.attention.dcp.metadata import (
     PositionPreservingDCPMetadata,
     refresh_dcp_page_table_metadata,
 )
+from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+
+def _check_decode_visibility(
+    metadata, blocks, lengths, *, rank, degree, queries, causal
+):
+    expected = []
+    for row, length in zip(blocks, lengths):
+        owned = [
+            block > 0 and (block - 1) % degree == rank
+            for block in row
+            for _ in range(128)
+        ]
+        ends = (
+            [max(0, length - queries + q + 1) for q in range(queries)]
+            if causal
+            else [length] * queries
+        )
+        expected.append([sum(owned[:end]) for end in ends])
+    assert metadata.local_visible_lens.tolist() == expected
+    assert metadata.local_seq_lens.tolist() == [row[-1] for row in expected]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("degree", [2, 4, 8])
+@pytest.mark.parametrize("queries", [1, 4, 8])
+@pytest.mark.parametrize("causal", [False, True])
+def test_shared_decode_state_refresh_and_draft_frontier(
+    device, degree, queries, causal
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    blocks = [[5, 2, 8, 1], [2, 5, 1, 8], [0, 0, 0, 0]]
+    table = torch.tensor(
+        [[2 * b + sub for b in row for sub in range(2)] for row in blocks],
+        dtype=torch.int32,
+        device=device,
+    )
+    lengths = torch.tensor([127, 255, 0], dtype=torch.int32, device=device)
+    for rank in range(degree):
+        state = DCPDecodeState(CachePlacement(128, 33, tuple(range(degree)), rank))
+        state.initialize(
+            table, lengths, page_size=64, query_count=queries, causal=causal
+        )
+        metadata = state.metadata
+        buffers = (
+            metadata.local_page_table,
+            metadata.page_prefix,
+            metadata.local_visible_lens,
+            metadata.local_seq_lens,
+        )
+        pointers = tuple(t.data_ptr() for t in buffers)
+        _check_decode_visibility(
+            metadata,
+            blocks,
+            lengths.tolist(),
+            rank=rank,
+            degree=degree,
+            queries=queries,
+            causal=causal,
+        )
+        original_table = metadata.local_page_table.clone()
+        # Both advances and accepted-prefix reanchors cross ownership boundaries.
+        for ends in ([129, 257, 0], [126, 254, 0]):
+            changed = torch.tensor(ends, dtype=torch.int32, device=device)
+            state.refresh_lengths(metadata, changed)
+            _check_decode_visibility(
+                metadata,
+                blocks,
+                ends,
+                rank=rank,
+                degree=degree,
+                queries=queries,
+                causal=causal,
+            )
+            torch.testing.assert_close(metadata.local_page_table, original_table)
+        # A smaller live batch refreshes views of the same capacity buffers.
+        live = metadata.slice_requests(0, 2)
+        new_lengths = torch.tensor([130, 258], dtype=torch.int32, device=device)
+
+        refresh = partial(state.refresh, live, new_lengths)
+
+        if device == "cuda":
+            refresh()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                refresh()
+            new_lengths.add_(1)
+            graph.replay()
+        else:
+            refresh()
+        _check_decode_visibility(
+            live,
+            blocks[:2],
+            new_lengths.tolist(),
+            rank=rank,
+            degree=degree,
+            queries=queries,
+            causal=causal,
+        )
+        assert tuple(t.data_ptr() for t in buffers) == pointers
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_shared_decode_state_zero_initialization_and_reinitialization(causal):
+    state = DCPDecodeState(CachePlacement(128, 33, (0, 1), 0))
+    table = torch.tensor([[2, 3, 4, 5]], dtype=torch.int32)
+    lengths = torch.zeros(1, dtype=torch.int32)
+    state.initialize(table, lengths, page_size=64, query_count=4, causal=causal)
+    previous = state.metadata
+    assert previous.local_visible_lens.tolist() == [[0, 0, 0, 0]]
+    assert previous.local_seq_lens.tolist() == [0]
+    lengths.fill_(129)
+    state.initialize(table, lengths, page_size=64, query_count=1, causal=causal)
+    assert state.metadata.local_visible_lens.tolist() == [[128]]
+    assert (
+        state.metadata.local_page_table.data_ptr()
+        != previous.local_page_table.data_ptr()
+    )
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

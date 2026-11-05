@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
 from tokenspeed_kernel.ops.attention.mla import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
@@ -49,6 +50,13 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.dcp.comm import (
+    combine_attention_partials,
+    gather_query_heads,
+)
+from tokenspeed.runtime.layers.attention.dcp.decode import DCPDecodeState
+from tokenspeed.runtime.layers.attention.dcp.metadata import CompactDCPMetadata
+from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     MLA_PAGE_SIZE,
 )
@@ -99,6 +107,8 @@ class MLADecodeMetadata:
     # per layer.
     block_page_table: torch.Tensor | None = None
     block_seq_lens: torch.Tensor | None = None
+    # Sharded read metadata; page_table retains global virtual addresses.
+    dcp: CompactDCPMetadata | None = None
     # DSA wrapper's per-token indexer rows (``[bs * spec_num_tokens, 1]``
     # context lengths) and their opaque ``dsa_plan`` (None when the selected
     # kernel needs none); the dense leaf itself never reads them.
@@ -764,5 +774,280 @@ class MLAAttnBackend(PagedAttentionBackend):
         return result
 
 
-for _backend_name in ("mla", "gluon"):
-    register_backend(_backend_name, {AttentionArch.MLA}, MLAAttnBackend)
+class GluonMLAAttnBackend(MLAAttnBackend):
+    """Gluon MLA with the shared cache placement, DCP metadata and LSE merge."""
+
+    supports_mla_dcp = True
+
+    def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
+        self.kvp_group = config.kvp_group
+        self.kvp_rank = config.kvp_rank
+        self._dcp: DCPDecodeState | None = None
+        if len(self.kvp_group) > 1:
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+                raise ValueError("Gluon MLA DCP does not support bitwise numerics")
+            if config.kv_cache_dtype != torch.float8_e4m3fn or kernel_page_size != 64:
+                raise ValueError("Gluon MLA DCP requires E4M3 KV and 64-token pages")
+            if config.kv_cache_quant_method not in (None, "none"):
+                raise ValueError("Gluon MLA DCP requires plain E4M3 cache rows")
+            if (spec.kv_lora_rank, spec.qk_rope_head_dim) != (512, 64):
+                raise ValueError("Gluon MLA DCP requires latent512 + RoPE64")
+            if spec.sliding_window_tokens is not None:
+                raise ValueError("Gluon MLA DCP requires full-history attention")
+        super().__init__(config, spec, kernel_page_size=kernel_page_size)
+        if len(self.kvp_group) > 1:
+            # Value projection and its gate consume the globally merged latent.
+            self.supports_mla_projected_value_decode = False
+            self.supports_layer_sliding_window = False
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self._dcp = None
+
+    def configure_runtime(
+        self,
+        *,
+        block_granularity: int,
+        virtual_block_count: int,
+        shard_count: int,
+        **kwargs,
+    ) -> None:
+        super().configure_runtime(**kwargs)
+        if shard_count != len(self.kvp_group):
+            raise ValueError("MLA cache and KVP topology disagree")
+        self._dcp = (
+            DCPDecodeState(
+                CachePlacement(
+                    block_granularity,
+                    virtual_block_count,
+                    self.kvp_group,
+                    self.kvp_rank,
+                )
+            )
+            if shard_count > 1
+            else None
+        )
+
+    def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
+        return self._dcp.placement if self._dcp is not None else None
+
+    def init_cuda_graph_state(self, max_bs: int) -> None:
+        super().init_cuda_graph_state(max_bs)
+        self._block_page_table_buf = None
+        self._block_seq_lens_buf = None
+        if self._dcp is not None:
+            if self.block_decode_active:
+                self._ensure_block_row_buffers(max_bs)
+                table, lengths = self._block_page_table_buf, self._block_seq_lens_buf
+            else:
+                table, lengths = self.page_table_buf, self.seq_lens_buf
+            self._dcp.initialize(
+                table,
+                lengths,
+                page_size=self.kernel_page_size,
+                query_count=self.spec_num_tokens,
+                causal=not self.block_decode_active,
+            )
+
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        super().advance_draft_forward_metadata(seq_lens)
+        if self._dcp is not None:
+            self._dcp.refresh_lengths(
+                self._decode_views(seq_lens.shape[0]).dcp, seq_lens
+            )
+
+    def _should_use_absorbed_cached_extend(
+        self, *, max_extend_seq_len: int, max_extend_prefix_len: int
+    ) -> bool:
+        if len(self.kvp_group) > 1:
+            return False
+        return super()._should_use_absorbed_cached_extend(
+            max_extend_seq_len=max_extend_seq_len,
+            max_extend_prefix_len=max_extend_prefix_len,
+        )
+
+    def init_forward_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
+        **kwargs,
+    ) -> None:
+        super().init_forward_metadata(
+            bs,
+            num_extends,
+            seq_lens,
+            page_table,
+            forward_mode,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_with_prefix=extend_with_prefix,
+            query_shard=query_shard,
+            page_table_cpu=page_table_cpu,
+            **kwargs,
+        )
+        if forward_mode.is_extend_or_mixed():
+            metadata = self.chunked_prefill_metadata
+            self._prepare_prefix_history(
+                metadata.chunk_kv_indices_list,
+                page_table_cpu=page_table_cpu,
+                prefix_lens_cpu=metadata.extend_prefix_lens_cpu,
+            )
+
+    def _decode_views(self, bs: int) -> MLADecodeMetadata:
+        metadata = super()._decode_views(bs)
+        if self._dcp is not None and metadata.dcp is None:
+            metadata.dcp = self._dcp.metadata.slice_requests(0, bs)
+        return metadata
+
+    def refresh_decode_metadata(
+        self,
+        bs: int,
+        actual_bs: int,
+        seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        *,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
+    ) -> None:
+        super().refresh_decode_metadata(
+            bs,
+            actual_bs,
+            seq_lens,
+            page_table,
+            num_extends=num_extends,
+            for_graph_replay=for_graph_replay,
+        )
+        if self._dcp is not None:
+            metadata = self.forward_decode_metadata
+            lengths = (
+                metadata.block_seq_lens
+                if self.block_decode_active
+                else metadata.seq_lens
+            )
+            self._dcp.refresh(metadata.dcp, lengths)
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        super().fill_block_decode_seq_lens(bs, block_seq_lens)
+        if self._dcp is not None:
+            self._dcp.refresh_lengths(
+                self._decode_views(bs).dcp, self._block_seq_lens_buf[:bs]
+            )
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self._dcp is None:
+            return super().forward_decode(
+                q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
+            )
+        if any(
+            kwargs.get(name) is not None
+            for name in ("value_weight", "output_gate", "projected_output")
+        ):
+            raise ValueError(
+                "Gluon MLA DCP requires value projection after the LSE merge"
+            )
+        if bs == 0:
+            return torch.empty(
+                (0, layer.tp_q_head_num * layer.v_head_dim),
+                dtype=self.dtype,
+                device=q.device,
+            )
+        return self._forward_dcp_decode(q, layer, token_to_kv_pool, bs)
+
+    def _forward_dcp_decode(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        bs: int,
+    ) -> torch.Tensor:
+        """Attend local pages using single-query/head chunks, then merge by LSE.
+
+        This initial implementation deliberately rereads KV for each query and
+        16-head chunk. Per-query local lengths preserve causal boundaries even
+        when successive global positions belong to different page owners.
+        """
+        if layer.sliding_window_size >= 0:
+            raise ValueError("Gluon MLA DCP requires full-history attention")
+        metadata = self.forward_decode_metadata
+        start = 0 if self.block_decode_active else metadata.num_extends
+        local = metadata.dcp.slice_requests(start, start + bs)
+        width = q.shape[0] // bs
+        if width not in (1, self.spec_num_tokens):
+            raise ValueError(
+                "Gluon MLA DCP requires one query or the full verify window"
+            )
+        lengths = (
+            local.local_seq_lens[:, None] if width == 1 else local.local_visible_lens
+        ).reshape(-1)
+        table = local.local_page_table.repeat_interleave(width, dim=0)
+        query = gather_query_heads(
+            q.reshape(-1, layer.tp_q_head_num, layer.head_dim), self.kvp_group
+        )
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # FP8 probability rounding depends on each shard's local maximum.
+            # Preserve the quantized query values exactly while using the
+            # existing BF16-query kernel for this correctness-first composition.
+            query = query.to(torch.bfloat16)
+        cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if cache.dtype != self.data_type:
+            cache = cache.to(self.data_type)
+        cache = cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
+        partials, lses = [], []
+        for head in range(0, query.shape[1], 16):
+            output, lse = mla_decode_with_kvcache(
+                q=query[:, None, head : head + 16].contiguous(),
+                kv_cache=cache,
+                page_table=table,
+                cache_seqlens=lengths,
+                max_seqlen_k=self.max_context_len,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                return_lse=True,
+                solution=self.kernel_solution,
+            )
+            partials.append(
+                output.reshape(-1, min(16, query.shape[1] - head), self.kv_lora_rank)
+            )
+            lses.append(lse.reshape(-1, min(16, query.shape[1] - head)))
+        partial, lse = normalize_dcp_partials(
+            torch.cat(partials, dim=1), torch.cat(lses, dim=1), lengths, None
+        )
+        output = combine_attention_partials(
+            partial,
+            lse,
+            group=self.kvp_group,
+            rank=self.kvp_rank,
+            sink=None,
+            keep_all_heads=False,
+        )
+        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
+register_backend("mla", {AttentionArch.MLA}, MLAAttnBackend)
+register_backend("gluon", {AttentionArch.MLA}, GluonMLAAttnBackend)

@@ -682,11 +682,19 @@ backends, including MLA/DSA. MLA decode remains absorbed; MLA/KDA hybrids
 shard only MLA history. Ordinary TP with KVP = DCP = 1 is unaffected.
 
 Speculative decoding runs on a sharded cache with the backends whose DCP
-decode takes a verify window (FlashMLA, CuTe MLA, GPU DSA); the draft group
+decode takes a verify window (FlashMLA, CuTe MLA, Gluon MLA, GPU DSA); the draft group
 shards like the target's. A FlashMLA verify under KVP runs one kernel row per
 query against that query's local causal length, so a width-`w` window reads
 each request's owned pages `w` times instead of once. The full rule set is in
 `docs/configuration/server.md`.
+
+The initial Gluon MLA DCP implementation uses E4M3 KV, latent512 + RoPE64,
+64-token kernel pages and full-history attention. It runs one query at a time
+in chunks of at most 16 gathered heads, then merges natural-log LSE partials.
+This prioritizes correctness and rereads local KV; it does not imply a speedup
+over ordinary TP. Cached-prefix prefill uses the shared bounded history gather,
+and value projection follows the global attention merge. Bitwise numerics and
+sliding-window attention are rejected for this configuration.
 
 ## Query context parallelism on the prefill role
 
