@@ -28,6 +28,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
+    block_draft_is_causal,
     is_block_drafter,
     model_wide_kwargs,
     resolve_cache_layer_types,
@@ -106,6 +107,9 @@ class MLAConfig(SoftmaxAttnConfig):
         draft_block_decode = is_block_drafter(
             server_args.speculative_algorithm, is_draft
         )
+        draft_block_causal = draft_block_decode and block_draft_is_causal(
+            model_config.hf_config
+        )
         spec = cls(**cls._spec_kwargs(server_args, model_config, is_draft))
         return AttnConfig(
             components=(spec,),
@@ -117,6 +121,7 @@ class MLAConfig(SoftmaxAttnConfig):
                     server_args, model_config, is_draft
                 ),
                 draft_block_decode=draft_block_decode,
+                draft_block_causal=draft_block_causal,
             ),
         )
 
