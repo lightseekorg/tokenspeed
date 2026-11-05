@@ -139,8 +139,9 @@ def select_rows_torch(logits, candidates, live_widths, topk, row_out, row_lens):
     """Write each row's top-``topk`` finite logits as position-sorted ids.
 
     Column c maps to logical row c, or ``candidates[q, c // 8] * 8 + c % 8``.
-    ``live_widths`` (None or [Q]) bounds the columns that may be finite; the
-    rest are -inf, so this reference may scan whole rows and ignore it.
+    ``live_widths`` (None or [Q]) bounds the columns a selector may read; the
+    rest may be unwritten. This reference scans whole rows, so its callers
+    fill the rest with -inf.
     Row q of ``row_out`` gets the ids ascending, then -1; ``row_lens`` the
     count. Equal-score boundary ties may pick any equivalent subset.
     """
@@ -284,7 +285,8 @@ def run_dsv41_csa2_index_topk(
                 logits,
                 tile_candidates,
                 # Full selection scores only each query's visible rows; the
-                # rest of its page-table-capacity row stays -inf.
+                # rest of its page-table-capacity row is unwritten and must
+                # not be read.
                 tile_visible if tile_candidates is None else None,
                 int(topk),
                 row_out[output_begin:output_end],
@@ -329,8 +331,6 @@ def launch_gfx1250_logits(
         dsv41_index_logits_gfx1250,
     )
 
-    # The gfx1250 scorer writes scored columns only.
-    logits.fill_(-float("inf"))
     dsv41_index_logits_gfx1250(
         values,
         scales,
