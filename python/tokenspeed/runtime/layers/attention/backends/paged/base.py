@@ -339,12 +339,13 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
                 :func:`reject_query_shard`.
             page_table_cpu: Host mirror of ``page_table``'s extend rows
                 (``[num_extends, cols]`` int32 kernel pages, unpadded) when the
-                forward is sharded, or when it extends a prefix and this leaf's
-                group is KVP page-sharded; else ``None``. The only host-side
-                table a leaf sees: the sharded extend arm and the KVP
-                prefix-chunk gather count how many history rows each page owner
-                holds from it, so the gather's per-rank split never waits on the
-                device.
+                forward is sharded, or when this leaf's group is KVP
+                page-sharded and the forward extends a prefix or is a pure
+                extend; else ``None``. The only host-side table a leaf sees:
+                the sharded extend arm and the KVP prefix-chunk gather count
+                how many history rows each page owner holds from it, so the
+                gather's per-rank split never waits on the device, and the DSA
+                leaf bounds the index pages each rank owns from it.
         """
 
     @abstractmethod
