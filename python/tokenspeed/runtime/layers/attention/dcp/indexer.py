@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
 )
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_exchange_input,
     all_gather,
     all_gather_single,
     all_to_all_single,
@@ -699,13 +700,15 @@ def select_owned_dsa_topk_with_rider(
             return out, lens_out, None
         return out, lens_out, rider.new_empty((len(group), 0, rider.shape[1]))
     score_bytes = rows * topk * 4
-    if rider is not None and len(group) > 1:
-        # Every rank's chunk is its scores, then its rider rows.
-        send = torch.empty(
-            (score_bytes + rider.numel(),), device=q.device, dtype=torch.uint8
+    if len(group) > 1:
+        # Every rank's chunk is its scores, then its rider rows, written
+        # where an exchange that pulls in place reads them.
+        send = acquire_exchange_input(
+            score_bytes + (0 if rider is None else rider.numel()), q, group
         )
         local = send[:score_bytes].view(torch.float32).view(rows, topk)
-        send[score_bytes:].view(rows, -1).copy_(rider)
+        if rider is not None:
+            send[score_bytes:].view(rows, -1).copy_(rider)
     else:
         local = torch.empty((rows, topk), device=q.device, dtype=torch.float32)
     positions, _ = _score_rows(
@@ -725,7 +728,7 @@ def select_owned_dsa_topk_with_rider(
         scores_out=local,
     )
     gathered_rider = None
-    if len(group) > 1 and rider is not None:
+    if len(group) > 1:
         gathered = torch.empty(
             (len(group), send.numel()), device=q.device, dtype=torch.uint8
         )
@@ -733,12 +736,8 @@ def select_owned_dsa_topk_with_rider(
         scores = (
             gathered[:, :score_bytes].view(torch.float32).view(len(group), rows, topk)
         )
-        gathered_rider = gathered[:, score_bytes:].view(len(group), rows, -1)
-    elif len(group) > 1:
-        scores = torch.empty(
-            (len(group), rows, topk), device=q.device, dtype=torch.float32
-        )
-        all_gather_single(scores.flatten(), local.flatten(), group)
+        if rider is not None:
+            gathered_rider = gathered[:, score_bytes:].view(len(group), rows, -1)
     else:
         scores = local.unsqueeze(0)
         if rider is not None:

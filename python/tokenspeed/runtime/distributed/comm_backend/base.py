@@ -305,6 +305,25 @@ class CommBackend(ABC):
             raise ValueError("all-reduce requires at least one output")
         return tuple(like.new_empty(shape) for shape in shapes)
 
+    def acquire_exchange_input(
+        self, nbytes: int, like: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        """Acquire ``nbytes`` (uint8) for a producer to fill and a later
+        ``all_gather_single``, or even ``all_to_all_single``, over ``group``
+        to send.
+
+        A backend whose exchange pulls each rank's input in place returns its
+        storage, which the next such exchange's producer may overwrite.
+        Collective like the exchange: every rank of ``group`` asks for the
+        same size.
+
+        Args:
+            nbytes: Size of the input.
+            like: Tensor providing the device for ordinary allocations.
+            group: Global ranks of the exchange.
+        """
+        return torch.empty((nbytes,), dtype=torch.uint8, device=like.device)
+
     @abstractmethod
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

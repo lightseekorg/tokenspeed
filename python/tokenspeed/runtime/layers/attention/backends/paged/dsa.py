@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_decode_dcp_records,
     dsa_decode_dcp_records_supported,
+    dsa_decode_dcp_records_workspace_bytes,
     dsa_plan,
     dsa_prefill,
     dsa_prefill_dcp_records,
@@ -46,6 +47,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.distributed.comm_ops import acquire_exchange_input
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
@@ -2075,6 +2077,17 @@ class DSABackend(PagedAttentionBackend):
                     f"hold {len(self.kvp_group)} ranks' {tuple(q_view.shape)} heads"
                 )
             q = gathered_query.view(q_view.dtype).view(-1, tokens, heads, dim)
+        # The records lead the workspace, where an exchange that pulls in
+        # place reads them.
+        workspace_bytes = dsa_decode_dcp_records_workspace_bytes(
+            tokens=q.shape[1],
+            heads=q.shape[0] * q.shape[2],
+            topk=topk_slots.shape[1],
+            q_dtype=q.dtype,
+            kv_dtype=kv_cache.dtype,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
         records = dsa_decode_dcp_records(
             q=q,
             kv_cache=kv_cache,
@@ -2090,6 +2103,9 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             solution=self.kernel_solution,
             slot_order=self.slot_order,
+            workspace=acquire_exchange_input(workspace_bytes, q, self.kvp_group).view(
+                torch.int32
+            ),
         )
         # The core writes BF16 partials for its FP8 query, and the combine
         # keeps their dtype: the BF16 output the other arm casts to.

@@ -38,6 +38,9 @@ if TYPE_CHECKING:
         ProducerAllReduce,
     )
     from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
@@ -57,6 +60,7 @@ class IrisBackend(CommBackend):
         self._gathers: dict[tuple[Group, torch.dtype], IrisAllGather] = {}
         self._broadcasts: dict[Group, IrisBroadcast] = {}
         self._ordinary_all_reduces: dict[Group, ProducerAllReduce] = {}
+        self._pull_exchanges: dict[Group, IrisPullExchange] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
             min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
@@ -118,6 +122,23 @@ class IrisBackend(CommBackend):
         ):
             return None
         return reduction
+
+    def install_pull_exchange(self, group: Group, state: "IrisPullExchange") -> None:
+        """Bind a prepared pull exchange without replacing captured storage."""
+        previous = self._pull_exchanges.get(group)
+        if previous is not None and previous is not state:
+            raise RuntimeError("cannot replace a prepared Iris pull exchange")
+        self._pull_exchanges[group] = state
+
+    def acquire_exchange_input(
+        self, nbytes: int, like: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        """Borrow the group's pull exchange input when it holds ``nbytes``."""
+        state = self._pull_exchanges.get(group)
+        borrowed = None if state is None else state.input(nbytes)
+        if borrowed is None:
+            return super().acquire_exchange_input(nbytes, like, group)
+        return borrowed
 
     def get_prepared_all_gather(
         self, group: Group, dtype: torch.dtype
@@ -370,6 +391,10 @@ class IrisBackend(CommBackend):
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
+        # An input borrowed from the group's pull exchange is pulled in place.
+        state = self._pull_exchanges.get(group)
+        if state is not None and state.can_all_gather(output, input):
+            return state.all_gather(output, input)
         return self._fallback.all_gather_single(output, input, group)
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
@@ -383,6 +408,14 @@ class IrisBackend(CommBackend):
         output_split_sizes: list[int] | None = None,
         input_split_sizes: list[int] | None = None,
     ) -> None:
+        state = self._pull_exchanges.get(group)
+        if (
+            output_split_sizes is None
+            and input_split_sizes is None
+            and state is not None
+            and state.can_all_to_all(output, input)
+        ):
+            return state.all_to_all(output, input)
         return self._fallback.all_to_all_single(
             output,
             input,

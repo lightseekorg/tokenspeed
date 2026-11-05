@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import functools
+import math
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
@@ -30,6 +31,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
 
 __all__ = [
     "gluon_dsa_decode_dcp_records_supported_gfx950",
+    "gluon_dsa_decode_dcp_records_workspace_bytes_gfx950",
     "launch_gluon_dsa_decode_dcp_records_gfx950",
     "launch_gluon_dsa_decode_gfx950",
     "launch_gluon_dsa_prefill_gfx950",
@@ -1875,12 +1877,13 @@ def _run_dense_kv(
     warm_split_variants: bool = False,
     lse: torch.Tensor | None = None,
     records: bool = False,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``q`` is ``[tokens, heads, dim]``; with ``records`` it is a KVP
     gather's rank-major ``[ranks, tokens, local_heads, dim]``, and each head's
     output and LSE land in its DCP record (int32 ``[ranks, tokens,
     local_heads, kv_lora_rank / 2 + 1]``, returned) instead of ``out`` and
-    ``lse``."""
+    ``lse``. The records then lead ``workspace`` (flat int32) when given."""
     if not records:
         tokens, heads = q.shape[0], q.shape[1]
     else:
@@ -1934,6 +1937,7 @@ def _run_dense_kv(
         num_kv_splits=_select_num_kv_splits(num_tokens=tokens, **schedule),
         lse=lse,
         records=records,
+        workspace=workspace,
     )
 
 
@@ -1962,6 +1966,7 @@ def _launch_dense_kv(
     is_prefill: bool,
     lse: torch.Tensor | None = None,
     records: bool = False,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not records:
         tokens, heads = q.shape[0], q.shape[1]
@@ -1981,11 +1986,11 @@ def _launch_dense_kv(
         split_tiles = _RECORDS_MIN_SPLIT_TILES
         # One record-shaped plane per split; split 0 is the records, which a
         # one-split row writes directly and the reduction overwrites.
-        workspace = torch.empty(
-            (num_kv_splits, ranks, tokens, q_local_heads, kv_lora_rank // 2 + 1),
-            dtype=torch.int32,
-            device=q.device,
-        )
+        planes = (num_kv_splits, ranks, tokens, q_local_heads, kv_lora_rank // 2 + 1)
+        if workspace is None:
+            workspace = torch.empty(planes, dtype=torch.int32, device=q.device)
+        else:
+            workspace = workspace[: math.prod(planes)].view(planes)
         # A record is the head's output bits, then its LSE word.
         stage_out = workspace.view(_output_dtype(q))
         partial_lse = workspace.view(torch.float32)[..., -1]
@@ -2400,6 +2405,33 @@ def gluon_dsa_decode_dcp_records_supported_gfx950(
     )
 
 
+def gluon_dsa_decode_dcp_records_workspace_bytes_gfx950(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> int:
+    """Bytes of the int32 workspace a
+    :func:`launch_gluon_dsa_decode_dcp_records_gfx950` decode of this size
+    writes: one record-shaped plane per key split, the records first. Host
+    values only."""
+    splits = _select_num_kv_splits(
+        num_tokens=tokens,
+        num_heads=heads,
+        topk_width=topk,
+        max_seqlen_k=topk,
+        is_fp8=q_dtype in _FP8_DTYPES,
+        native_fp8=q_dtype == kv_dtype and q_dtype in _FP8_DTYPES,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=False,
+    )
+    return splits * tokens * heads * (kv_lora_rank // 2 + 1) * 4
+
+
 def launch_gluon_dsa_decode_dcp_records_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -2412,6 +2444,7 @@ def launch_gluon_dsa_decode_dcp_records_gfx950(
     page_size: int,
     logit_cap: float = 0.0,
     k_scale: float = 1.0,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """:func:`launch_gluon_dsa_decode_gfx950` with ``return_lse`` over a
     KVP gather's rank-major query ``[ranks, tokens, local_heads, dim]``,
@@ -2423,7 +2456,10 @@ def launch_gluon_dsa_decode_dcp_records_gfx950(
     round differently), a longer one the same splits, bit for bit. The ranks
     may lie further apart than their contiguous rows, as when the query
     rides in a larger gathered chunk; other layouts, and rank strides or
-    bases the query's copy to LDS cannot take, are copied first. Raises
+    bases the query's copy to LDS cannot take, are copied first. A flat
+    contiguous int32 ``workspace`` of at least
+    :func:`gluon_dsa_decode_dcp_records_workspace_bytes_gfx950` bytes holds
+    the splits, and the records returned are its leading view. Raises
     ``ValueError`` for a size
     :func:`gluon_dsa_decode_dcp_records_supported_gfx950` refuses."""
     if logit_cap != 0.0:
@@ -2462,6 +2498,26 @@ def launch_gluon_dsa_decode_dcp_records_gfx950(
             "DSA decode records need the dense matrix core "
             "(check gluon_dsa_decode_dcp_records_supported_gfx950 first)"
         )
+    if workspace is not None:
+        needed = gluon_dsa_decode_dcp_records_workspace_bytes_gfx950(
+            tokens=tokens,
+            heads=ranks * local_heads,
+            topk=topk_slots.shape[1],
+            q_dtype=q.dtype,
+            kv_dtype=dense_kv.dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        if (
+            workspace.dtype != torch.int32
+            or workspace.dim() != 1
+            or not workspace.is_contiguous()
+            or workspace.nbytes < needed
+        ):
+            raise ValueError(
+                f"DSA records need a flat contiguous int32 workspace of {needed} "
+                f"bytes, got {workspace.dtype} {tuple(workspace.shape)}"
+            )
     dim = q.shape[3]
     # The query's direct-to-LDS copy needs a 16-byte-aligned base and
     # 16-element-aligned row offsets.
@@ -2481,6 +2537,7 @@ def launch_gluon_dsa_decode_dcp_records_gfx950(
         qk_rope_head_dim=qk_rope_head_dim,
         is_prefill=False,
         records=True,
+        workspace=workspace,
     )
 
 

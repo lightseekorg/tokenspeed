@@ -484,6 +484,25 @@ def acquire_all_reduce_outputs(
     return backend.acquire_all_reduce_outputs(shapes, like, group, op=op)
 
 
+def acquire_exchange_input(
+    nbytes: int,
+    like: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Acquire ``nbytes`` (uint8) for a producer to fill, then send with
+    :func:`all_gather_single` or an even :func:`all_to_all_single`.
+
+    This function does not launch a collective. A backend whose exchange
+    pulls inputs in place lends its storage, which the next such exchange's
+    producer may overwrite: fill it, then exchange it, before acquiring
+    again. Every rank of ``group`` asks for the same size.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.acquire_exchange_input(nbytes, like, group)
+
+
 def all_gather(
     tensor: torch.Tensor,
     group: Group,
