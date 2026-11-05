@@ -412,7 +412,7 @@ mod ffi {
         #[namespace = "tokenspeed"]
         type ExecutionPlan;
 
-        fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]);
+        fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]) -> Result<()>;
         fn next_execution_plan(scheduler: Pin<&mut Scheduler>) -> UniquePtr<ExecutionPlan>;
         fn advance(scheduler: Pin<&mut Scheduler>, events: &[ForwardEvent]) -> Result<()>;
         fn advance_head(
@@ -558,9 +558,10 @@ impl Scheduler {
         unsafe { self.raw.as_ref() }
     }
 
-    /// Queue requests for admission.
-    pub fn submit_requests(&mut self, specs: &[RequestSpec]) {
-        ffi::submit_requests(self.pinned(), specs);
+    /// Queue requests for admission. Validation errors reject the entire
+    /// batch without inserting any request.
+    pub fn submit_requests(&mut self, specs: &[RequestSpec]) -> Result<(), cxx::Exception> {
+        ffi::submit_requests(self.pinned(), specs)
     }
 
     /// Plan the next round.

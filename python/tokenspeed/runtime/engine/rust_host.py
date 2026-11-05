@@ -135,6 +135,10 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
+from tokenspeed.runtime.plugins.registry import (
+    TraceProvider,
+    get_trace_provider,
+)
 from tokenspeed.runtime.sampling.registry import get_sampling_backend_class
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
@@ -445,6 +449,11 @@ class HostConfig:
         kv_events_publisher: Where this rank publishes them (the ZMQ
             publisher's fields), on the attention-TP group's first rank; else
             None.
+        otlp_traces_endpoint: ``--otlp-traces-endpoint``, the OTLP/HTTP
+            receiver finished requests trace to.
+        trace_provider: Optional registered provider of custom span context.
+        trace_sample_ratio: ``--trace-sample-ratio``, the share of requests
+            it keeps.
         l3: With the L3 storage tier, what the host starts its executor
             from; else None.
         l3_metrics: This rank reports the L3 tier's metrics: with the tier
@@ -503,6 +512,9 @@ class HostConfig:
     log_request_stats: bool
     kv_events: bool
     kv_events_publisher: KVEventsConfig | None
+    otlp_traces_endpoint: str | None
+    trace_sample_ratio: float
+    trace_provider: TraceProvider | None
     l3: L3Settings | None
     l3_metrics: bool
     attn_tp_rank: int
@@ -1378,6 +1390,13 @@ class HostBootstrap:
                     if kv_events
                     and attn_tp_rank == 0
                     and kv_events_config.publisher in (None, "zmq")
+                    else None
+                ),
+                otlp_traces_endpoint=server_args.otlp_traces_endpoint,
+                trace_sample_ratio=server_args.trace_sample_ratio,
+                trace_provider=(
+                    get_trace_provider(server_args.trace_provider)
+                    if server_args.trace_provider is not None
                     else None
                 ),
                 epd_receive_enabled=(

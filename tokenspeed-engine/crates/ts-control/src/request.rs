@@ -213,6 +213,9 @@ pub struct RequestState {
     pub input_logprobs_sent: bool,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// The continual-prompting session the request belongs to, when it
+    /// names one; traces group a session's requests under it.
+    pub session_id: Option<String>,
     /// Speculative verify rounds this request took part in.
     pub spec_verify_ct: i64,
     /// The decode reservation last sent to the scheduler
@@ -308,6 +311,7 @@ impl RequestState {
             input_logprobs: None,
             input_logprobs_sent: false,
             cached_tokens: 0,
+            session_id: None,
             spec_verify_ct: 0,
             decode_reserve: None,
             accept_draft_tokens: None,

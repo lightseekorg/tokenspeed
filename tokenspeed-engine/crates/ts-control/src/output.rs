@@ -21,6 +21,7 @@
 //! Committing a forward's results: request state, the scheduler's feedback
 //! events and the frontend's outputs.
 
+use std::sync::Arc;
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},
@@ -492,6 +493,9 @@ pub struct OutputProcessor {
     decode_seconds: Vec<f64>,
     tpot_seconds: Vec<f64>,
     completion_tokens: u64,
+    /// The OTLP trace exporter, when tracing is on. Presence also widens
+    /// the request-stats clock: the trace needs the same timestamps.
+    trace: Option<Arc<crate::trace::TracePublisher>>,
 }
 
 impl OutputProcessor {
@@ -505,6 +509,7 @@ impl OutputProcessor {
         role: Role,
         finish_log: FinishLog,
         metrics_enabled: bool,
+        trace: Option<Arc<crate::trace::TracePublisher>>,
     ) -> Self {
         Self {
             states: HashMap::new(),
@@ -517,6 +522,7 @@ impl OutputProcessor {
             last_commit_at: 0.0,
             admissions: 0,
             metrics_enabled,
+            trace,
             generated_tokens: 0,
             prompt_tokens: 0,
             cache_hit_tokens: 0,
@@ -562,7 +568,7 @@ impl OutputProcessor {
 
     /// Stamp the first dispatch of `rids`, for the request stats.
     pub fn mark_scheduled(&mut self, rids: &[String]) {
-        if !self.finish_log.request_stats {
+        if !(self.finish_log.request_stats || self.trace.is_some()) {
             return;
         }
         let now = wall_seconds();
@@ -628,6 +634,40 @@ impl OutputProcessor {
         }
     }
 
+    /// Trace one released request: the span the request's own timestamps
+    /// assemble, handed to the export thread when the sample keeps it.
+    fn trace_end(&self, rid: &str, state: &RequestState) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        if !trace.sampled(rid) {
+            return;
+        }
+        let (scheduled, prefill_done, first_token, preempt_count, preempt_seconds) = state
+            .timings
+            .as_ref()
+            .map_or((0.0, 0.0, 0.0, 0, 0.0), |timings| timings.trace_points());
+        trace.emit(crate::trace::TraceRecord {
+            rid: rid.to_owned(),
+            role: self.role,
+            session: state.session_id.clone(),
+            created: state.created_time,
+            scheduled,
+            prefill_done,
+            first_token,
+            finish: crate::request_stats::wall_seconds(),
+            prompt_tokens: state.prompt_len,
+            cached_tokens: state.cached_tokens,
+            output_tokens: state.output_ids.len() as i64,
+            finish_reason: state
+                .finished_reason
+                .as_ref()
+                .map_or("unknown", FinishReason::wire_type),
+            preempt_count,
+            preempt_seconds,
+        });
+    }
+
     /// The engine's role.
     pub fn role(&self) -> Role {
         self.role
@@ -674,7 +714,7 @@ impl OutputProcessor {
             // The prompt was computed on the prefill node.
             state.computed_length = state.prompt_len;
         }
-        if self.finish_log.request_stats {
+        if self.finish_log.request_stats || self.trace.is_some() {
             state.timings = Some(RequestTimings::default());
         }
         self.states.insert(rid, state);
@@ -699,6 +739,7 @@ impl OutputProcessor {
                     .collect();
         }
         self.log_end(rid, &state);
+        self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -722,6 +763,7 @@ impl OutputProcessor {
             // decode role's first-token boundary.
             state.first_token_time = wall_seconds();
             if let Some(timings) = state.timings.as_mut() {
+                timings.mark_prefill_done(state.first_token_time);
                 timings.mark_first_token(state.first_token_time);
             }
         }
@@ -771,14 +813,8 @@ impl OutputProcessor {
             ForwardEventKind::Finish
         };
         committed.events.push(event(kind, rid, Vec::new(), 0));
-        if let Some(timings) = state.timings.as_mut() {
-            let now = wall_seconds();
-            timings.mark_prefill_done(now);
-            if !state.output_ids.is_empty() {
-                timings.mark_first_token(now);
-            }
-        }
         self.log_end(rid, &state);
+        self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -805,6 +841,7 @@ impl OutputProcessor {
                     .into_iter()
                     .collect();
         }
+        self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -898,6 +935,7 @@ impl OutputProcessor {
                     .collect();
         }
         self.log_end(rid, &state);
+        self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -931,6 +969,7 @@ impl OutputProcessor {
                 ));
             }
             self.log_end(&abort.request_id, &state);
+            self.trace_end(&abort.request_id, &state);
             committed.released.push(abort.request_id.clone());
         }
         committed
@@ -1115,18 +1154,19 @@ impl OutputProcessor {
 
         // The request stats' clock: a decode step lasts from the previous
         // commit, and a round with prefill rows interrupts the decodes in it.
-        let (stats_now, step, prefilling_others) = if self.finish_log.request_stats {
-            let now = wall_seconds();
-            let step = if self.last_commit_at > 0.0 {
-                now - self.last_commit_at
+        let (stats_now, step, prefilling_others) =
+            if self.finish_log.request_stats || self.trace.is_some() {
+                let now = wall_seconds();
+                let step = if self.last_commit_at > 0.0 {
+                    now - self.last_commit_at
+                } else {
+                    0.0
+                };
+                self.last_commit_at = now;
+                (now, step, batch.num_extends > 0)
             } else {
-                0.0
+                (0.0, 0.0, false)
             };
-            self.last_commit_at = now;
-            (now, step, batch.num_extends > 0)
-        } else {
-            (0.0, 0.0, false)
-        };
 
         if let Some(plan) = input_logprobs {
             self.record_input_logprobs(batch, plan, result)?;
@@ -1431,6 +1471,7 @@ impl OutputProcessor {
     fn release(&mut self, rid: &str, committed: &mut Committed) {
         if let Some(state) = self.states.remove(rid) {
             self.log_end(rid, &state);
+            self.trace_end(rid, &state);
             committed.released.push(rid.to_owned());
         }
     }
@@ -1522,6 +1563,7 @@ impl OutputProcessor {
             if state.finished() {
                 let (_, state) = self.states.remove_entry(rid).expect("present above");
                 self.log_end(rid, &state);
+                self.trace_end(rid, &state);
                 released.push(rid.to_owned());
             }
         }
@@ -1577,6 +1619,7 @@ mod tests {
             Role::Plain,
             NO_FINISH_LOG,
             true,
+            None,
         )
     }
 
@@ -1677,7 +1720,15 @@ mod tests {
 
     #[test]
     fn request_latency_samples_use_the_prefill_boundaries() {
-        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Prefill, NO_FINISH_LOG, true);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            Some(4096),
+            Role::Prefill,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register(&mut p, "a", 4, 8, &[]);
         let mut state = p.states.remove("a").expect("registered above");
         state.created_time = 100.0;
@@ -1696,7 +1747,8 @@ mod tests {
 
     #[test]
     fn a_decode_landing_sets_the_first_token_boundary() {
-        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true);
+        let mut p =
+            OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true, None);
         register(&mut p, "a", 4, 8, &[]);
         p.remote_prefill_done("a", 7, 0, None);
         let state = p.state("a").expect("still registered");
@@ -1716,6 +1768,7 @@ mod tests {
                 request_stats: true,
             },
             false,
+            None,
         );
         register(&mut p, "r", 3, 8, &[]);
         p.remote_prefill_done("r", 9, 0, None);
@@ -1737,7 +1790,8 @@ mod tests {
 
     #[test]
     fn disabled_metrics_do_not_retain_finished_requests() {
-        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Plain, NO_FINISH_LOG, false);
+        let mut p =
+            OutputProcessor::new(None, 1, Some(4096), Role::Plain, NO_FINISH_LOG, false, None);
         let mut state = RequestState::new(vec![1], 4, BTreeSet::new(), true, None, false);
         state.created_time = 100.0;
         state.first_token_time = 101.0;
@@ -1957,7 +2011,7 @@ mod tests {
 
     #[test]
     fn the_decode_role_ships_no_prompt_logprobs() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         assert!(!p.state("r").unwrap().wants_input_logprobs());
         p.remote_prefill_done("r", 9, 0, Some(-0.25));
@@ -1977,7 +2031,7 @@ mod tests {
 
     #[test]
     fn a_bootstrap_token_without_a_cumulative_probability_keeps_the_column_aligned() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         // The prefill node sends the first token's logprob, but no cumulative
         // probability.
@@ -2016,7 +2070,7 @@ mod tests {
 
     #[test]
     fn the_prefill_role_ships_its_prompt_logprobs_with_its_final_output() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, true);
         let prompt = batch(&[("r", 3, 0, 3)], 1);
         let plan = p.logprob_plan(&prompt).input.unwrap();
@@ -2034,7 +2088,7 @@ mod tests {
 
     #[test]
     fn ngram_windows_follow_the_committed_tokens() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true, None);
         p.register(
             "r".to_owned(),
             RequestState::new(vec![10, 11, 12, 13], 8, BTreeSet::new(), true, None, false),
@@ -2079,6 +2133,186 @@ mod tests {
             assert_eq!(ForwardResult::from_bytes(&bytes).as_ref(), Some(&result));
             assert_eq!(ForwardResult::from_bytes(&bytes[..bytes.len() - 1]), None);
         }
+    }
+
+    #[test]
+    fn a_finished_request_traces_its_lifecycle() {
+        // The span one request becomes: its own tokens, its finish reason,
+        // and the timestamps its timings kept — which tracing alone, without
+        // the stats log, is enough to switch on.
+        let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            Some(4096),
+            Role::Plain,
+            NO_FINISH_LOG,
+            false,
+            Some(trace),
+        );
+        register(&mut p, "r", 4, 10, &[2]);
+        p.states.get_mut("r").unwrap().session_id = Some("sess-7".to_owned());
+        p.mark_scheduled(&["r".to_owned()]);
+        let c = p
+            .commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        assert!(c.outputs[0].finish_reason.is_none());
+        let c = p
+            .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[2], &[1]))
+            .unwrap();
+        assert_eq!(c.released, ["r"]);
+        let record = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the finished request traced");
+        assert_eq!(
+            (
+                record.rid.as_str(),
+                record.prompt_tokens,
+                record.output_tokens
+            ),
+            ("r", 4, 2)
+        );
+        assert_eq!(record.finish_reason, "stop");
+        assert_eq!(record.session.as_deref(), Some("sess-7"));
+        assert!(record.scheduled > 0.0, "tracing stamps the schedule point");
+        assert!(record.first_token >= record.scheduled);
+        assert!(record.finish >= record.first_token);
+        // Unsampled requests build no record at all.
+        let (trace, received) = crate::trace::TracePublisher::for_tests(0.0);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            Some(4096),
+            Role::Plain,
+            NO_FINISH_LOG,
+            false,
+            Some(trace),
+        );
+        register(&mut p, "r", 4, 10, &[2]);
+        p.commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[2], &[1]))
+            .unwrap();
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+    }
+
+    #[test]
+    fn decode_trace_starts_at_the_remote_token_before_local_dispatch() {
+        for (max_new, metrics_enabled) in [(1, false), (1, true), (2, false), (2, true)] {
+            let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
+            let mut p = OutputProcessor::new(
+                None,
+                1,
+                Some(4096),
+                Role::Decode,
+                NO_FINISH_LOG,
+                metrics_enabled,
+                Some(trace),
+            );
+            register(&mut p, "r", 4, max_new, &[]);
+            p.states.get_mut("r").unwrap().created_time = wall_seconds();
+            p.remote_prefill_done("r", 7, 2, None);
+            let (_, prefill_done, first_token, _, _) = p
+                .state("r")
+                .unwrap()
+                .timings
+                .as_ref()
+                .unwrap()
+                .trace_points();
+            assert!(first_token > 0.0, "stamp arrival before any local decode");
+            assert_eq!(prefill_done, first_token);
+            if max_new == 1 {
+                assert_eq!(p.finish_remote_prefill_only("r").released, ["r"]);
+            } else {
+                assert!(p.finish_remote_prefill_only("r").released.is_empty());
+                p.mark_scheduled(&["r".to_owned()]);
+                let c = p
+                    .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[8], &[1]))
+                    .unwrap();
+                assert_eq!(c.released, ["r"]);
+            }
+            let record = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(record.role, Role::Decode);
+            assert_eq!(record.first_token, first_token);
+            assert_eq!(record.prefill_done, prefill_done);
+            assert_eq!(record.output_tokens, max_new);
+            if max_new == 1 {
+                assert_eq!(record.scheduled, 0.0);
+            } else {
+                assert!(record.scheduled >= first_token);
+            }
+            let metrics = p.take_request_metrics();
+            if metrics_enabled {
+                assert_eq!(metrics.ttft_seconds, [first_token - record.created]);
+                assert_eq!(metrics.request_seconds.len(), 1);
+                assert_eq!(metrics.decode_seconds.len(), 1);
+                assert_eq!(metrics.tpot_seconds.len(), usize::from(max_new > 1));
+                assert_eq!(metrics.completion_tokens, max_new as u64);
+                assert_eq!(p.take_request_tokens(), (4, 2));
+            } else {
+                assert!(metrics.ttft_seconds.is_empty());
+                assert!(metrics.request_seconds.is_empty());
+                assert!(metrics.decode_seconds.is_empty());
+                assert!(metrics.tpot_seconds.is_empty());
+                assert_eq!(metrics.completion_tokens, 0);
+                assert_eq!(p.take_request_tokens(), (0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn remote_prefill_abort_does_not_invent_completion_boundaries() {
+        let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            NO_FINISH_LOG,
+            false,
+            Some(trace),
+        );
+        register(&mut p, "r", 4, 2, &[]);
+        p.mark_abort("r", true);
+        assert_eq!(p.finish_remote_prefill_only("r").released, ["r"]);
+        let record = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(record.finish_reason, "abort");
+        assert_eq!(record.first_token, 0.0);
+        assert_eq!(record.prefill_done, 0.0);
+        assert_eq!(record.output_tokens, 0);
+    }
+
+    #[test]
+    fn prefill_trace_keeps_its_role_through_transfer_completion() {
+        let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            Some(4096),
+            Role::Prefill,
+            NO_FINISH_LOG,
+            false,
+            Some(trace),
+        );
+        register(&mut p, "r", 4, 2, &[]);
+        p.mark_scheduled(&["r".to_owned()]);
+        let c = p
+            .commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        assert!(c.released.is_empty());
+        let (_, _, first_token, _, _) = p
+            .state("r")
+            .unwrap()
+            .timings
+            .as_ref()
+            .unwrap()
+            .trace_points();
+        assert_eq!(p.finish_prefill("r").released, ["r"]);
+        let record = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(record.role, Role::Prefill);
+        assert_eq!(record.first_token, first_token);
+        assert!(record.prefill_done >= record.scheduled);
+        assert!(record.finish >= first_token);
     }
 
     #[test]
@@ -2322,7 +2556,8 @@ mod tests {
     fn a_verify_step_past_the_physical_extent_is_an_engine_error() {
         // A 4-token verify window over buffers holding 8 tokens: a request
         // at 4 committed tokens fits one more window exactly, not two.
-        let mut p = OutputProcessor::new(Some(4), 1, Some(8), Role::Plain, NO_FINISH_LOG, true);
+        let mut p =
+            OutputProcessor::new(Some(4), 1, Some(8), Role::Plain, NO_FINISH_LOG, true, None);
         register(&mut p, "r", 3, 100, &[]);
         p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[1], &[1]))
             .unwrap();
