@@ -149,11 +149,17 @@ def _prepare_mla_kv_b_proj_weights(
     When ``self_attn`` already holds a pair of the same geometry (a live
     weight update re-running ``post_load_weights``), the new values are
     copied into it so captured CUDA graphs keep valid addresses.
+
+    An attention with ``absorbed_weights_k_major`` set runs both absorbed
+    products as plain GEMMs and keeps their reduction dim contiguous
+    regardless of the fused value-projection kernel's preference.
     """
     w_kc, w_vc = w.unflatten(
         0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
     ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-    if mla_project_value_prefers_contiguous_weight(
+    if not getattr(
+        self_attn, "absorbed_weights_k_major", False
+    ) and mla_project_value_prefers_contiguous_weight(
         dtype=w.dtype,
         heads=w_vc.shape[0],
         latent_dim=w_vc.shape[2],
