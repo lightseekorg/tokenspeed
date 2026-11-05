@@ -996,6 +996,14 @@ class CacheGroupRouter(AttentionBackend):
     def cache_placement(self, layer):
         return self._leaf_for(layer).cache_placement(layer)
 
+    def takes_owned_decode_topk(self, layer):
+        # Offloaded layers read prepared hot rows of the scheduler slots.
+        if self._offload_adapter is not None and self._offload_adapter.offloads_layer(
+            layer.layer_id
+        ):
+            return False
+        return self._leaf_for(layer).takes_owned_decode_topk(layer)
+
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
 

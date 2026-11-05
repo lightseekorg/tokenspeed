@@ -32,15 +32,27 @@ if not is_cdna4():
         "AMD GFX950 is required for the Gluon DCP top-k", allow_module_level=True
     )
 
-from tokenspeed_kernel.ops.attention.dsa import dsa_merge_candidates  # isort: skip
+from tokenspeed_kernel.ops.attention.dsa import (  # isort: skip
+    dsa_merge_candidates,
+    dsa_select_owned_candidates,
+)
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (  # isort: skip
     _extract_rank_major_scores,
+    _rank_major_planar_scores,
+    _select_owned_through_threshold,
     _select_source_through_threshold,
     _select_through_threshold,
     rank_major_scores,
     rank_major_scores_with_bounds,
     select_through_threshold,
     select_through_threshold_by_source,
+)
+from tokenspeed_kernel.ops.attention.dsa.triton import (  # isort: skip
+    local_topk_to_global_slots,
+)
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (  # isort: skip
+    compact_owned_slots,
+    virtual_slots_to_local,
 )
 from tokenspeed_kernel.selection import select_kernel  # isort: skip
 from tokenspeed_kernel.signature import (  # isort: skip
@@ -293,3 +305,192 @@ def test_gluon_merge_launches_one_specialization_across_batch_rows():
             dsa_merge_candidates(
                 _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
             )
+
+
+# K3.1's cache geometry: 64-token index pages inside 128-token cache blocks,
+# block ``b`` on rank ``(b - 1) % degree``.
+_PAGE, _BLOCK = 64, 128
+
+
+def _owned_candidates(degree: int, rows: int, q_len: int, topk: int, seed: int):
+    """A virtual index-page table and every rank's candidates, all on pages
+    the rank owns: positions ``[degree, rows, topk]`` (``-1`` invalid) and
+    their scores (``-inf`` invalid), with mandatory, signed-zero, short and
+    empty rows."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    requests = rows // q_len
+    blocks_per_request = 24 * degree
+    virtual_blocks = requests * blocks_per_request + 1
+    blocks = 1 + torch.randperm(
+        virtual_blocks - 1, device="cuda", generator=generator
+    ).view(requests, blocks_per_request)
+    pages_per_block = _BLOCK // _PAGE
+    table = blocks.unsqueeze(-1) * pages_per_block + torch.arange(
+        pages_per_block, device="cuda"
+    )
+    table = table.view(requests, -1).int()
+    owner = (table // pages_per_block - 1) % degree
+    positions = torch.full((degree, rows, topk), -1, device="cuda", dtype=torch.int32)
+    for source in range(degree):
+        for row in range(rows):
+            pages = (owner[row // q_len] == source).nonzero().flatten()
+            tokens = pages.unsqueeze(1) * _PAGE + torch.arange(_PAGE, device="cuda")
+            tokens = tokens.flatten()
+            pick = torch.randperm(tokens.numel(), device="cuda", generator=generator)
+            pick = tokens[pick[:topk]]
+            positions[source, row, : pick.numel()] = pick.int()
+    scores = torch.rand((degree, rows, topk), device="cuda", generator=generator)
+    scores[:, 0, 3:6] = torch.tensor([torch.inf, torch.inf, -0.0], device="cuda")
+    scores[:, 0, 6] = 0.0
+    if rows > 2:
+        # A short history: fewer valid candidates in all than topk.
+        positions[:, 1, topk // (2 * degree) :] = -1
+        # A request step whose history no rank owns.
+        positions[:, 2] = -1
+    scores[positions < 0] = -torch.inf
+    return table, virtual_blocks, positions, scores
+
+
+def _local_pages(table, virtual_blocks: int, degree: int, rank: int):
+    slots, owned = virtual_slots_to_local(
+        table.long() * _PAGE,
+        rows_per_page=_BLOCK,
+        virtual_block_count=virtual_blocks,
+        degree=degree,
+        rank=rank,
+    )
+    return torch.where(owned, slots // _PAGE, -1).int()
+
+
+def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk):
+    """Every rank's local slots through the full exchange: the merge's
+    selection by source, its scheduler slots, then each rank's owned share."""
+    degree = positions.shape[0]
+    records = torch.stack((positions, scores.view(torch.int32)), dim=-1)
+    merged = rank_major_scores(records)
+    order = torch.topk(merged, topk, dim=-1).indices
+    selected, counts = select_through_threshold_by_source(
+        records, merged, order, topk=topk
+    )
+    slots, lens = local_topk_to_global_slots(
+        local_topk_offsets=selected,
+        block_table=table,
+        block_size=_PAGE,
+        q_len_per_req=q_len,
+    )
+    torch.testing.assert_close(lens, counts, atol=0, rtol=0)
+    return [
+        compact_owned_slots(
+            slots,
+            lens,
+            rows_per_page=_BLOCK,
+            virtual_block_count=virtual_blocks,
+            degree=degree,
+            rank=rank,
+        )
+        for rank in range(degree)
+    ]
+
+
+@pytest.mark.parametrize("solution", ["gluon", "triton"])
+@pytest.mark.parametrize("degree", [2, 4, 8])
+@pytest.mark.parametrize("rows,q_len", [(1, 1), (7, 1), (64, 4)])
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("tied", [False, True])
+def test_owned_selection_is_each_ranks_share_of_the_merge(
+    solution, degree, rows, q_len, topk, tied
+):
+    table, virtual_blocks, positions, scores = _owned_candidates(
+        degree, rows, q_len, topk, seed=degree * 1000 + rows + topk
+    )
+    if tied:
+        # The cutoff falls inside a tied group that spans the ranks.
+        generator = torch.Generator(device="cuda").manual_seed(rows + topk)
+        ties = torch.randint(
+            0, 8, scores.shape, device="cuda", generator=generator
+        ).float()
+        scores = torch.where(positions < 0, scores, ties)
+    expected = _merged_then_compacted(
+        table, virtual_blocks, positions, scores, q_len, topk
+    )
+    # Each rank's shard of a send buffer wider than the scores.
+    gathered = torch.full(
+        (degree, rows * topk + 32), torch.nan, device="cuda", dtype=torch.float32
+    )
+    gathered[:, : rows * topk] = scores.view(degree, -1)
+    gathered = gathered[:, : rows * topk].view(degree, rows, topk)
+    requests = (torch.arange(rows, device="cuda") // q_len).int()
+
+    for rank, (slots, counts) in enumerate(expected):
+        local_slots, local_counts = dsa_select_owned_candidates(
+            gathered,
+            positions[rank].contiguous(),
+            _local_pages(table, virtual_blocks, degree, rank),
+            requests,
+            rank=rank,
+            topk=topk,
+            page_size=_PAGE,
+            solution=solution,
+        )
+
+        torch.testing.assert_close(local_slots, slots, atol=0, rtol=0)
+        torch.testing.assert_close(local_counts, counts, atol=0, rtol=0)
+    total = sum(counts for _, counts in expected)
+    assert (total <= topk).all()
+    if rows > 2:
+        assert (total[2] == 0).all()
+
+
+def test_owned_selection_writes_into_the_callers_rows():
+    degree, rows, topk = 4, 7, 512
+    table, virtual_blocks, positions, scores = _owned_candidates(
+        degree, rows, 1, topk, seed=5
+    )
+    (slots, counts), *_ = _merged_then_compacted(
+        table, virtual_blocks, positions, scores, 1, topk
+    )
+    out = torch.full((rows + 2, topk), 7, device="cuda", dtype=torch.int32)
+    lens_out = torch.full((rows + 2,), 7, device="cuda", dtype=torch.int32)
+
+    local_slots, local_counts = dsa_select_owned_candidates(
+        scores,
+        positions[0].contiguous(),
+        _local_pages(table, virtual_blocks, degree, 0),
+        torch.arange(rows, device="cuda", dtype=torch.int32),
+        rank=0,
+        topk=topk,
+        page_size=_PAGE,
+        solution="gluon",
+        out=out[1 : rows + 1],
+        lens_out=lens_out[1 : rows + 1],
+    )
+
+    assert local_slots.data_ptr() == out[1].data_ptr()
+    torch.testing.assert_close(out[1 : rows + 1], slots, atol=0, rtol=0)
+    torch.testing.assert_close(lens_out[1 : rows + 1], counts, atol=0, rtol=0)
+    assert (out[0] == 7).all() and (out[rows + 1] == 7).all()
+    assert int(lens_out[0]) == 7 and int(lens_out[rows + 1]) == 7
+
+
+def test_owned_selection_launches_one_specialization_across_batch_rows():
+    def select(rows):
+        table, virtual_blocks, positions, scores = _owned_candidates(
+            2, rows, 1, 2048, seed=rows
+        )
+        dsa_select_owned_candidates(
+            scores,
+            positions[1].contiguous(),
+            _local_pages(table, virtual_blocks, 2, 1),
+            torch.arange(rows, device="cuda", dtype=torch.int32),
+            rank=1,
+            topk=2048,
+            page_size=_PAGE,
+            solution="gluon",
+        )
+
+    select(1)
+    with assert_no_triton_compile(
+        _rank_major_planar_scores, _select_owned_through_threshold
+    ):
+        for rows in (3, 8, 37, 64):
+            select(rows)

@@ -550,6 +550,74 @@ def test_the_dcp_combine_form_follows_the_querys_heads(
     assert gathered == ([] if keep_all_heads else [(1, layer_heads, 128)])
 
 
+@pytest.mark.parametrize("owned", [False, True])
+def test_the_decode_arm_compacts_only_a_whole_selection(monkeypatch, owned):
+    """A whole selection of scheduler slots is compacted to this rank's
+    local slots before the core reads it; an owned top-k, this rank's share
+    as local slots already, is read as given."""
+    backend = _decode_arm_backend(num_attention_heads=8, attn_tp_size=4)
+    layer = _decode_layer(8)
+    query = torch.zeros(1, 8, 128, dtype=torch.bfloat16)
+    slots = torch.full((1, 512), -1, dtype=torch.int32)
+    slots[0, :3] = torch.tensor([64, 128, 192])
+    lens = torch.tensor([3], dtype=torch.int32)
+    pool = SimpleNamespace(
+        quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
+    )
+    compacted, read = [], []
+
+    def compact(slots, lengths, placement):
+        compacted.append(placement)
+        return torch.full_like(slots, 9), torch.ones_like(lengths)
+
+    def decode(**kwargs):
+        read.append((kwargs["topk_slots"], kwargs["topk_lens"]))
+        heads = kwargs["q"].shape[1]
+        return torch.zeros(1, heads, 128), torch.zeros(1, heads)
+
+    monkeypatch.setattr(dsa, "compact_owned_cache_slots", compact)
+    monkeypatch.setattr(dsa, "dsa_decode", decode)
+    monkeypatch.setattr(dsa, "combine_attention_partials", lambda out, lse, **kw: out)
+    backend.forward_sparse_decode(
+        q=query,
+        layer=layer,
+        token_to_kv_pool=pool,
+        bs=1,
+        topk_indices=slots,
+        topk_lens=lens,
+        topk_owned=owned,
+    )
+
+    [(topk_slots, topk_lens)] = read
+    if owned:
+        assert not compacted
+        assert torch.equal(topk_slots, slots) and torch.equal(topk_lens, lens)
+    else:
+        assert compacted == [backend.cache_placement(layer)]
+        assert (topk_slots == 9).all() and torch.equal(topk_lens, torch.ones(1))
+
+
+def test_an_owned_decode_topk_needs_a_sharded_cache_and_its_counts():
+    backend = _decode_arm_backend(num_attention_heads=8, attn_tp_size=4)
+    arguments = dict(
+        q=torch.zeros(1, 8, 128, dtype=torch.bfloat16),
+        layer=_decode_layer(8),
+        token_to_kv_pool=None,
+        bs=1,
+        topk_indices=torch.zeros(1, 512, dtype=torch.int32),
+        topk_owned=True,
+    )
+    assert backend.takes_owned_decode_topk(arguments["layer"])
+    with pytest.raises(ValueError, match="with its counts"):
+        backend.forward_sparse_decode(topk_lens=None, **arguments)
+    backend.kvp_group, backend.kvp_rank = (1,), 0
+    assert not backend.takes_owned_decode_topk(arguments["layer"])
+    with pytest.raises(ValueError, match="sharded cache"):
+        backend.forward_sparse_decode(
+            topk_lens=torch.ones(1, dtype=torch.int32), **arguments
+        )
+
+
 def test_a_query_with_neither_head_layout_is_refused():
     backend = _decode_arm_backend(num_attention_heads=8, attn_tp_size=4)
     layer = _decode_layer(8)

@@ -55,7 +55,9 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dcp.indexer import (
     DCPIndexMetadata,
     build_dcp_index_metadata,
+    owned_dsa_topk_fits,
     select_dsa_topk,
+    select_owned_dsa_topk,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
@@ -173,6 +175,10 @@ class GlmDsaDecodeTopK:
     dcp_source: Any = None
     dcp_q_len: int = 0
     dcp_capturing: bool = False
+    # Under a cache placement whose ranks each selected their own share: that
+    # placement. ``topk_indices`` then holds this rank's local cache slots,
+    # its share first, and ``topk_lens`` their counts.
+    owned_placement: Any = None
 
 
 @dataclass(frozen=True)
@@ -352,9 +358,16 @@ class GlmDsaSparseAttentionMixin:
     ``fp8_scaled`` plane take FP8 E4M3 index queries with per-(token, head)
     scales (:meth:`_scorer_index_query`); a host sets it only where the
     platform registers such scorers.
+
+    ``owned_decode_topk`` (default off) lets decode over a sharded cache
+    select every rank's share of the top-k as its local cache slots
+    (:func:`select_owned_dsa_topk`) where the layer's backend takes them; a
+    host sets it only when no other model, such as an MTP head reusing the
+    target's top-k, reads its decode top-k.
     """
 
     index_query_fp8: bool = False
+    owned_decode_topk: bool = False
 
     def _scorer_index_query(
         self, q: torch.Tensor, index_k_cache: torch.Tensor
@@ -530,7 +543,19 @@ class GlmDsaSparseAttentionMixin:
         decode_topk: GlmDsaDecodeTopK,
         start: int,
         end: int,
+        *,
+        owned_placement: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rows ``[start, end)`` of the decode top-k. An owned top-k holds one
+        placement's local slots: only a reader of that ``owned_placement``
+        may take it."""
+        if (
+            decode_topk.owned_placement is not None
+            and decode_topk.owned_placement != owned_placement
+        ):
+            raise RuntimeError(
+                "the decode top-k holds local cache slots of another placement"
+            )
         return decode_topk.topk_indices[start:end], decode_topk.topk_lens[start:end]
 
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
@@ -641,6 +666,7 @@ class GlmDsaSparseAttentionMixin:
         placement = ctx.attn_backend.cache_placement(self.attn_mqa)
         dcp_index = None
         capturing = False
+        owned_placement = None
         if placement is not None:
             q, q_scales = self._scorer_index_query(q, index_k_cache)
             softmax_scale = self.indexer.weights_softmax_scale
@@ -675,34 +701,61 @@ class GlmDsaSparseAttentionMixin:
                     placement=placement,
                     page_size=page_size,
                 )
-            offsets, _ = select_dsa_topk(
-                q,
-                weights,
-                index_k_cache,
-                page_table,
-                dcp_index.query_requests,
-                dcp_index.causal_lens,
-                placement=placement,
-                page_size=page_size,
-                topk=topk,
-                softmax_scale=softmax_scale,
-                initial_tokens=0,
-                local_tokens=0,
-                max_logits_bytes=None,
-                metadata=dcp_index,
-                q_scales=q_scales,
-                query_group_size=q_len_per_req,
-            )
-            local_topk_to_global_slots(
-                local_topk_offsets=offsets,
-                block_table=page_table,
-                block_size=page_size,
-                seq_lens=None,
-                q_len_per_req=q_len_per_req,
-                topk_layout="global_slots",
-                out=topk_slice,
-                lens_out=topk_lens_slice,
-            )
+            if (
+                self.owned_decode_topk
+                and ctx.attn_backend.takes_owned_decode_topk(self.attn_mqa)
+                and owned_dsa_topk_fits(
+                    q.shape[0],
+                    dcp_index,
+                    page_size=page_size,
+                    max_logits_bytes=None,
+                )
+            ):
+                select_owned_dsa_topk(
+                    q,
+                    weights,
+                    index_k_cache,
+                    metadata=dcp_index,
+                    page_size=page_size,
+                    topk=topk,
+                    softmax_scale=softmax_scale,
+                    initial_tokens=0,
+                    local_tokens=0,
+                    q_scales=q_scales,
+                    query_group_size=q_len_per_req,
+                    out=topk_slice,
+                    lens_out=topk_lens_slice,
+                )
+                owned_placement = placement
+            else:
+                offsets, _ = select_dsa_topk(
+                    q,
+                    weights,
+                    index_k_cache,
+                    page_table,
+                    dcp_index.query_requests,
+                    dcp_index.causal_lens,
+                    placement=placement,
+                    page_size=page_size,
+                    topk=topk,
+                    softmax_scale=softmax_scale,
+                    initial_tokens=0,
+                    local_tokens=0,
+                    max_logits_bytes=None,
+                    metadata=dcp_index,
+                    q_scales=q_scales,
+                    query_group_size=q_len_per_req,
+                )
+                local_topk_to_global_slots(
+                    local_topk_offsets=offsets,
+                    block_table=page_table,
+                    block_size=page_size,
+                    seq_lens=None,
+                    q_len_per_req=q_len_per_req,
+                    topk_layout="global_slots",
+                    out=topk_slice,
+                    lens_out=topk_lens_slice,
+                )
         else:
             q, q_scales = self._scorer_index_query(q, index_k_cache)
             dsa_decode_topk(
@@ -730,6 +783,7 @@ class GlmDsaSparseAttentionMixin:
             dcp_source=None if dcp_index is None else metadata,
             dcp_q_len=q_len_per_req,
             dcp_capturing=capturing,
+            owned_placement=owned_placement,
         )
 
     @staticmethod
@@ -1329,10 +1383,16 @@ class GlmDsaSparseAttentionMixin:
                 raise RuntimeError(
                     "GLM DSA sparse decode requires computed top-k indices."
                 )
+            topk_owned = shared_topk.decode.owned_placement is not None
             topk_indices, topk_lens = self._slice_decode_topk(
                 shared_topk.decode,
                 decode_start,
                 decode_end,
+                owned_placement=(
+                    backend.cache_placement(self.attn_mqa)
+                    if topk_owned and backend.takes_owned_decode_topk(self.attn_mqa)
+                    else None
+                ),
             )
             self.forward_absorb(
                 positions[decode_start:decode_end],
@@ -1348,6 +1408,7 @@ class GlmDsaSparseAttentionMixin:
                     if output_gate is None
                     else output_gate[decode_start:decode_end]
                 ),
+                topk_owned=topk_owned,
             )
 
         return attn_output
@@ -1398,6 +1459,7 @@ class GlmDsaSparseAttentionMixin:
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
         output_gate: torch.Tensor | None = None,
+        topk_owned: bool = False,
     ) -> torch.Tensor:
         Q = self.forward_absorb_qkv_proj(
             q,
@@ -1413,6 +1475,7 @@ class GlmDsaSparseAttentionMixin:
             topk_indices=topk_indices,
             topk_lens=topk_lens,
             output_gate=output_gate,
+            topk_owned=topk_owned,
         )
 
     def forward_absorb_attn_v_proj(
@@ -1423,7 +1486,10 @@ class GlmDsaSparseAttentionMixin:
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
         output_gate: torch.Tensor | None = None,
+        topk_owned: bool = False,
     ) -> torch.Tensor:
+        # Only an owned top-k's backend (takes_owned_decode_topk) gets the
+        # flag; other backends keep their signature.
         attn_output = self.attn_mqa(
             Q,
             k=None,
@@ -1432,6 +1498,7 @@ class GlmDsaSparseAttentionMixin:
             ctx=ctx,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
+            **({"topk_owned": True} if topk_owned else {}),
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         self.project_latent_values(attn_output, output, output_gate)

@@ -155,6 +155,12 @@ class CachePoolBinding:
         """Return logical-slot ownership, or None for local/replicated storage."""
         return None
 
+    def takes_owned_decode_topk(self, layer: PagedAttention) -> bool:
+        """Whether ``layer``'s sparse decode takes this rank's share of the
+        top-k as local cache slots (``topk_owned``) instead of the whole
+        selection as scheduler slots."""
+        return False
+
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         """Whether ``layer``'s reads apply the per-tensor scales its FP8 cache
         was written at (``PagedAttention.fp8_kv_scales``)."""

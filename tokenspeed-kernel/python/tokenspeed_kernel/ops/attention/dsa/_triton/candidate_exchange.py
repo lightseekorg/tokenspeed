@@ -231,6 +231,218 @@ def _select_source_through_threshold(
         tl.store(counts + row, count)
 
 
+@triton.jit(do_not_specialize=["rows", "source_stride"])
+def _rank_major_planar_scores(
+    gathered,
+    scores,
+    starts,
+    ends,
+    rows,
+    source_stride,
+    WIDTH: tl.constexpr,
+    DEGREE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    if tl.program_id(1) == 0:
+        tl.store(starts + row, 0)
+        tl.store(ends + row, DEGREE * WIDTH)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    source, local = col // WIDTH, col % WIDTH
+    score = tl.load(
+        gathered + source.to(tl.int64) * source_stride + row * WIDTH + local,
+        col < DEGREE * WIDTH,
+    )
+    tl.store(
+        scores + row * DEGREE * WIDTH + col,
+        tl.where(score == score, score, -float("inf")),
+        col < DEGREE * WIDTH,
+    )
+
+
+@triton.jit(do_not_specialize=["source", "POSITION_STRIDE", "TABLE_STRIDE"])
+def _select_owned_through_threshold(
+    scores,
+    order,
+    positions,
+    local_page_table,
+    query_requests,
+    slots,
+    counts,
+    source,
+    # The page-table width follows the batch; runtime so every batch shares
+    # one binary.
+    POSITION_STRIDE,
+    TABLE_STRIDE,
+    WIDTH: tl.constexpr,
+    DEGREE: tl.constexpr,
+    TOPK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    # _select_source_through_threshold's selection of one source's
+    # candidates, written from slot 0 as local cache slots.
+    row = tl.program_id(0).to(tl.int64)
+    COLUMNS: tl.constexpr = DEGREE * WIDTH
+    threshold = tl.full((), float("inf"), tl.float32)
+    for start in range(0, TOPK, TOPK_BLOCK):
+        col = start + tl.arange(0, TOPK_BLOCK)
+        selected = tl.load(order + row * TOPK + col, col < TOPK, other=-1)
+        score = tl.load(
+            scores + row * COLUMNS + selected,
+            (col < TOPK) & (selected >= 0),
+            other=float("inf"),
+        )
+        threshold = tl.minimum(threshold, tl.min(score, axis=0))
+    local = tl.arange(0, WIDTH)
+    above = tl.full((), 0, tl.int32)
+    tied_before = tl.full((), 0, tl.int32)
+    for other in tl.static_range(DEGREE):
+        score = tl.load(scores + row * COLUMNS + other * WIDTH + local)
+        above += tl.sum((score > threshold).to(tl.int32), axis=0)
+        if other < source:
+            tie = (score == threshold) & (score > -float("inf"))
+            tied_before += tl.sum(tie.to(tl.int32), axis=0)
+    quota = TOPK - above
+    score = tl.load(scores + row * COLUMNS + source * WIDTH + local)
+    live = score > -float("inf")
+    tie = (score == threshold) & live
+    tie_rank = tied_before + tl.cumsum(tie.to(tl.int32), axis=0) - 1
+    keep = ((score > threshold) | (tie & (tie_rank < quota))) & live
+    position = tl.load(positions + row * POSITION_STRIDE + local, keep, other=0)
+    request = tl.load(query_requests + row).to(tl.int64)
+    page = tl.load(
+        local_page_table + request * TABLE_STRIDE + position // PAGE,
+        keep,
+        other=-1,
+    )
+    # A kept candidate on a page this rank does not own is dropped, as
+    # compacting the whole selection's owned slots would drop it.
+    keep = keep & (page >= 0)
+    slot = tl.cumsum(keep.to(tl.int32), axis=0) - 1
+    tl.store(slots + row * TOPK + slot, page * PAGE + position % PAGE, keep)
+    count = tl.sum(keep.to(tl.int32), axis=0)
+    for start in range(0, TOPK, TOPK_BLOCK):
+        col = start + tl.arange(0, TOPK_BLOCK)
+        tl.store(slots + row * TOPK + col, -1, (col >= count) & (col < TOPK))
+    tl.store(counts + row, count)
+
+
+def rank_major_planar_scores(
+    gathered: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FP32 ``[rows, shards * candidates]`` scores of every shard's gathered
+    FP32 ``[rows, candidates]`` candidate scores, rank-major (NaN as
+    ``-inf``), and int32 ``[rows]`` row bounds over all of them (zero
+    starts, full-width ends), written by one launch.
+
+    ``gathered`` is ``[shards, rows, candidates]`` with contiguous rows; its
+    shard stride may exceed ``rows * candidates``, as when each shard's
+    scores lead a larger gathered chunk.
+    """
+    degree, rows, width = gathered.shape
+    if gathered.dtype != torch.float32 or gathered.stride()[1:] != (width, 1):
+        raise ValueError("gathered candidate scores must be FP32 with contiguous rows")
+    scores = torch.empty(
+        (rows, degree * width), device=gathered.device, dtype=torch.float32
+    )
+    starts = torch.empty((rows,), device=gathered.device, dtype=torch.int32)
+    ends = torch.empty((rows,), device=gathered.device, dtype=torch.int32)
+    if rows:
+        _rank_major_planar_scores[
+            (rows, triton.cdiv(degree * width, _SCORE_BLOCK_SIZE))
+        ](
+            gathered,
+            scores,
+            starts,
+            ends,
+            rows,
+            gathered.stride(0),
+            WIDTH=width,
+            DEGREE=degree,
+            BLOCK=_SCORE_BLOCK_SIZE,
+        )
+    return scores, starts, ends
+
+
+def select_owned_through_threshold(
+    scores: torch.Tensor,
+    order: torch.Tensor,
+    positions: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    *,
+    source: int,
+    topk: int,
+    page_size: int,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shard ``source``'s share of :func:`select_through_threshold`, as local
+    cache slots.
+
+    ``scores`` are every shard's candidate scores (FP32 ``[rows, shards *
+    candidates]``, rank-major) and ``order`` any exact top-k of them, as for
+    :func:`select_through_threshold`. Of the candidates that selection keeps,
+    shard ``source``'s, whose int32 logical ``positions`` (``[rows,
+    candidates]``) this rank holds, become local cache slots through
+    ``local_page_table`` (int32 ``[requests, pages]`` local pages, ``-1``
+    where not owned) and the int32 ``query_requests`` of every row. Returns
+    int32 ``[rows, topk]`` slots, the kept ones first in candidate order and
+    ``-1`` after, and int32 ``[rows]`` counts: what compacting the whole
+    selection's slots to this rank's owned ones gives, bit for bit.
+    """
+    rows, columns = scores.shape
+    width = positions.shape[1]
+    if width & (width - 1) or columns % width or positions.shape[0] != rows:
+        raise ValueError(
+            "owned selection needs a power-of-two candidate width dividing "
+            "the rank-major scores"
+        )
+    degree = columns // width
+    if not 0 <= source < degree:
+        raise ValueError(f"shard {source} is outside {degree} shards")
+    if any(
+        value.dtype != torch.int32
+        for value in (positions, local_page_table, query_requests)
+    ):
+        raise TypeError("candidate positions, local pages and requests must be int32")
+    if positions.stride(1) != 1 or local_page_table.stride(1) != 1:
+        raise ValueError("candidate positions and local pages need contiguous rows")
+    if query_requests.shape != (rows,) or not query_requests.is_contiguous():
+        raise ValueError("every row needs its request")
+    if order.shape != (rows, topk) or not order.is_contiguous():
+        raise ValueError("the top-k order must be a contiguous [rows, topk] matrix")
+    if out is None:
+        out = torch.empty((rows, topk), device=scores.device, dtype=torch.int32)
+    if lens_out is None:
+        lens_out = torch.empty((rows,), device=scores.device, dtype=torch.int32)
+    if out.shape != (rows, topk) or not out.is_contiguous():
+        raise ValueError("owned slots need a contiguous [rows, topk] output")
+    if lens_out.shape != (rows,) or not lens_out.is_contiguous():
+        raise ValueError("owned counts need a contiguous [rows] output")
+    if rows:
+        _select_owned_through_threshold[(rows,)](
+            scores,
+            order,
+            positions,
+            local_page_table,
+            query_requests,
+            out,
+            lens_out,
+            source,
+            positions.stride(0),
+            local_page_table.stride(0),
+            WIDTH=width,
+            DEGREE=degree,
+            TOPK=topk,
+            TOPK_BLOCK=triton.next_power_of_2(min(topk, _MAX_GATHER_BLOCK_SIZE)),
+            PAGE=page_size,
+            num_warps=4,
+        )
+    return out, lens_out
+
+
 def rank_major_scores(records: torch.Tensor) -> torch.Tensor:
     """FP32 [rows, shards * candidates] scores of int32 [shards, rows,
     candidates, 2] records, rank-major; invalid candidates score ``-inf``."""

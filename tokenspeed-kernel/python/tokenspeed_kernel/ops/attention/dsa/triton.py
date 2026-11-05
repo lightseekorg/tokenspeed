@@ -24,6 +24,8 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
     merge_packed_index_candidates,
+    rank_major_planar_scores,
+    select_owned_through_threshold,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -1247,6 +1249,43 @@ def triton_dsa_merge_candidates(
     records: torch.Tensor, *, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return merge_packed_index_candidates(records, topk=topk)
+
+
+@register_kernel(
+    "attention",
+    "dsa_select_owned_candidates",
+    name="triton_dsa_select_owned_candidates",
+    solution="triton",
+    signatures=frozenset({format_signature(scores=dense_tensor_format(torch.float32))}),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def triton_dsa_select_owned_candidates(
+    scores: torch.Tensor,
+    positions: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    *,
+    rank: int,
+    topk: int,
+    page_size: int,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    merged, _, _ = rank_major_planar_scores(scores)
+    order = torch.topk(merged, topk, dim=-1).indices
+    return select_owned_through_threshold(
+        merged,
+        order,
+        positions,
+        local_page_table,
+        query_requests,
+        source=rank,
+        topk=topk,
+        page_size=page_size,
+        out=out,
+        lens_out=lens_out,
+    )
 
 
 @register_kernel(
