@@ -1626,7 +1626,15 @@ class DeepseekV3AttentionMLA(nn.Module):
             chunk_meta.chunk_kv_indices_list,
             dst_dtype=read_dtype,
         )
-        for loop_idx, (kv_a_normed, k_pe) in enumerate(history):
+        # Each loop's KV lengths, as views taken once per layer: indexing the
+        # [loops, requests] tables inside the loop dispatches two ops per loop.
+        for (kv_a_normed, k_pe), cum_seq_lens_kv, seq_lens, max_kv_len in zip(
+            history,
+            chunk_meta.cu_chunked_seq_len.unbind(0),
+            chunk_meta.chunked_seq_len.unbind(0),
+            chunk_meta.max_chunk_len_per_loop,
+            strict=True,
+        ):
             kv_a_normed = kv_a_normed.squeeze(1)
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
@@ -1651,10 +1659,10 @@ class DeepseekV3AttentionMLA(nn.Module):
                 scaling,
                 self.attn_mha.logit_cap,
                 cum_seq_lens_q=chunk_meta.cum_extend_seq_lens,
-                cum_seq_lens_kv=chunk_meta.cu_chunked_seq_len[loop_idx],
+                cum_seq_lens_kv=cum_seq_lens_kv,
                 max_q_len=chunk_meta.max_extend_seq_len,
-                max_kv_len=chunk_meta.max_chunk_len_per_loop[loop_idx],
-                seq_lens=chunk_meta.chunked_seq_len[loop_idx],
+                max_kv_len=max_kv_len,
+                seq_lens=seq_lens,
                 batch_size=num_extends,
                 causal=False,
             )
