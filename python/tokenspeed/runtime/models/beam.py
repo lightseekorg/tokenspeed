@@ -1408,10 +1408,8 @@ class BeamModel(BaseTransformerModel):
         super().__init__(
             config=config, mapping=mapping, quant_config=quant_config, prefix=prefix
         )
-        # The final norm consumes the last layer's raw MLP pair; the shared
-        # constructor built a plain norm and its final-norm op, both re-resolved.
+        # The final norm consumes the last layer's raw MLP pair.
         self.norm = self.resolve_final_norm(config)
-        self._final_norm_op = self._build_final_norm_op()
         # Under --enable-allreduce-fusion every boundary runs through the
         # sandwich norm helper (fused where the MNNVL workspace serves it).
         from tokenspeed.runtime.models.beam_sandwich_fusion import (
