@@ -380,3 +380,28 @@ def test_the_cache_capacity_knobs(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_npu_encode_lands_rows_on_selected_device():
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("needs an NPU")
+    tower = _Tower()
+    device = torch.device("npu", torch.npu.current_device())
+    ring = SendRing(slots=1, slot_bytes=1024, deepstack=False, device=device)
+    plane = EncodeDataPlane(
+        model=tower,
+        cache=EmbeddingCache(1 << 20),
+        ring=ring,
+        device=device,
+        tp_cpu_group=None,
+    )
+    plane.enter_forward_thread()
+    item = _item(7, 3)
+    item.feature = item.feature.to(device)
+    plane._items[1] = item
+    plane.encode([(1, 0)])
+    torch.npu.synchronize()
+    assert plane.encoded()[0][:3] == (1, None, 3)
+    assert plane.encoded() == []
+    assert torch.equal(_slot(ring, 0, 3).cpu(), torch.full((3, HIDDEN), 7.0))
