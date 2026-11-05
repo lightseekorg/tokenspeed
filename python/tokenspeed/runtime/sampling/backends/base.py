@@ -385,6 +385,17 @@ class SamplingBackend(ABC):
         tree verify, as agreed across TP ranks."""
         return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
 
+    def vocab_shard_top_k(self) -> int | None:
+        """Most candidates per row this backend selects from vocabulary shards.
+
+        A backend returning a count reads a ``LogitsProcessorOutput`` whose
+        sampled rows stayed vocab-sharded (``vocab_shard``): it selects each
+        row's best candidates per shard where its route needs no more, and
+        gathers whole rows otherwise. None (the default) reads whole rows
+        only, so the processor gathers them.
+        """
+        return None
+
     def reads_only_argmax(self) -> bool:
         """Whether ``sample`` and ``verify`` need nothing of the target logits
         but each row's argmax, which they then take from
