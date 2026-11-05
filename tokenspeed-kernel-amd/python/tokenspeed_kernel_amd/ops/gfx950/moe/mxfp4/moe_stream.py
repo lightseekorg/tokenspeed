@@ -614,10 +614,10 @@ def _strip_offsets(
 def _load_chunk(desc, base, pair, odd, kt: gl.constexpr, live):
     """One 1 KB weight chunk (the MFMA B operand of step ``kt``), nontemporal:
     each weight byte is read once per launch."""
-    policy: gl.constexpr = gl.amd.cdna3.CachePolicy(nontemporal=True)
+    policy: gl.constexpr = gl.amd.cdna4.CachePolicy(nontemporal=True)
     step = (kt // 2) * pair + (kt % 2) * odd
     mask = None if live is None else (base == base) & live
-    return gl.amd.cdna3.buffer.load(desc, base + step, mask=mask, cache_policy=policy)
+    return gl.amd.cdna4.buffer.load(desc, base + step, mask=mask, cache_policy=policy)
 
 
 @gluon.jit
@@ -626,7 +626,7 @@ def _load_scale_dword(desc, base, pair, p: gl.constexpr, live):
     Cached normally: the two strips of a 32-column block read the same
     lines."""
     mask = None if live is None else (base == base) & live
-    return gl.amd.cdna3.buffer.load(desc, (base + p * pair) // 4, mask=mask)
+    return gl.amd.cdna4.buffer.load(desc, (base + p * pair) // 4, mask=mask)
 
 
 @gluon.jit
@@ -664,7 +664,7 @@ def _store_mids(desc, value, offsets, mask):
     Writing through here and reading with SC0 SC1 (:func:`_load_a`) bypasses
     every L2 coherently (CDNA4 ISA 9.1.10.2), whichever XCD reads.
     """
-    gl.amd.cdna3.buffer.store(value, desc, offsets, mask=mask, scope="sys")
+    gl.amd.cdna4.buffer.store(value, desc, offsets, mask=mask, scope="sys")
 
 
 @gluon.jit
@@ -680,7 +680,7 @@ def _publish_tags(tags_d, word, tag, live, dep):
         gl.full([16, 128], 0, gl.int32, mfma) + tag, dep.to(gl.int32, bitcast=True)
     )
     # The tags are uncached memory, so the store reaches every XCD's readers.
-    gl.amd.cdna3.buffer.store(
+    gl.amd.cdna4.buffer.store(
         value,
         tags_d,
         word + r * 0 + c * 0,
@@ -760,7 +760,7 @@ def _load_a(mids_d, route_a, kt: gl.constexpr, live):
     lane; rows are tokens, masked where the token does not pick the expert."""
     la: gl.constexpr = _layouts()[1]
     ak = gl.arange(0, 64, layout=gl.SliceLayout(0, la))[None, :]
-    return gl.amd.cdna3.buffer.load(
+    return gl.amd.cdna4.buffer.load(
         mids_d,
         route_a * _MID_ROW + kt * 64 + ak,
         mask=live & (route_a >= 0),
@@ -774,7 +774,7 @@ def _load_a_scale(mids_sd, route_s, kt: gl.constexpr, live):
     group g = 4 kt + K slice, so one dword holds a step's 4 slices."""
     lsa: gl.constexpr = _layouts()[3]
     ask = gl.arange(0, 4, layout=gl.SliceLayout(0, lsa))[None, :]
-    return gl.amd.cdna3.buffer.load(
+    return gl.amd.cdna4.buffer.load(
         mids_sd,
         route_s * (_MID_SCALES // 4) + kt + ask * 0,
         mask=live & (route_s >= 0),
@@ -805,13 +805,14 @@ def _wait_ready(tags, rank, tag):
 
 
 @gluon.jit
-def _store_routes(out, y, route, cols):
+def _store_routes(out_d, y, route, cols):
     """``out[route, cols] = bf16(y)`` for one strip's ``[16, 128]`` result
     (wave w's 16 columns, 4 consecutive per lane); rows with ``route < 0``
-    are skipped."""
-    gl.amd.cdna4.buffer_store(
+    are skipped. The rows are read after the launch ends, so the store needs
+    no scope."""
+    gl.amd.cdna4.buffer.store(
         y.to(gl.bfloat16),
-        out,
+        out_d,
         (route * _HIDDEN + cols).to(gl.int32),
         mask=(route >= 0) & (cols >= 0),
     )
@@ -914,9 +915,9 @@ def gluon_mxfp4_moe_stream_gfx950(
         bufs.stride_s13nb,
         N_PHYS1,
     )
-    w13d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.w13, 0x7FFFFFF0)
+    w13d = gl.amd.cdna4.buffer.make_buffer_descriptor(bufs.w13, 0x7FFFFFF0)
     # The E8M0 scales are read a dword at a time.
-    s13d = gl.amd.cdna3.buffer.make_buffer_descriptor(
+    s13d = gl.amd.cdna4.buffer.make_buffer_descriptor(
         bufs.s13.to(gl.pointer_type(gl.int32), bitcast=True), 0x7FFFFFF0
     )
     live = plan.n_ug > 0
@@ -998,28 +999,30 @@ def gluon_mxfp4_moe_stream_gfx950(
     # land before any wave's first increment.
     gl.barrier()
 
-    w2d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.w2, 0x7FFFFFF0)
-    s2d = gl.amd.cdna3.buffer.make_buffer_descriptor(
+    w2d = gl.amd.cdna4.buffer.make_buffer_descriptor(bufs.w2, 0x7FFFFFF0)
+    s2d = gl.amd.cdna4.buffer.make_buffer_descriptor(
         bufs.s2.to(gl.pointer_type(gl.int32), bitcast=True), 0x7FFFFFF0
     )
-    mids_d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.mids, 0x7FFFFFF0)
+    mids_d = gl.amd.cdna4.buffer.make_buffer_descriptor(bufs.mids, 0x7FFFFFF0)
     # The mids' E8M0 bytes: stored a byte per (route, group), read back as
     # int32 words (one per K step), so two views of the same buffer.
-    mids_sd = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.mids_s, 0x7FFFFFF0)
-    mids_sb = gl.amd.cdna3.buffer.make_buffer_descriptor(
+    mids_sd = gl.amd.cdna4.buffer.make_buffer_descriptor(bufs.mids_s, 0x7FFFFFF0)
+    mids_sb = gl.amd.cdna4.buffer.make_buffer_descriptor(
         bufs.mids_s.to(gl.pointer_type(gl.uint8), bitcast=True), 0x7FFFFFF0
     )
-    tags_d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.tags, 0x7FFFFFF0)
+    tags_d = gl.amd.cdna4.buffer.make_buffer_descriptor(bufs.tags, 0x7FFFFFF0)
+    out_d = gl.amd.cdna4.buffer.make_buffer_descriptor(out, 0x7FFFFFF0)
     lanes = gl.arange(0, 64 * 8, layout=lane)
     # This launch's tag copy; zero this workgroup's share of the other one
-    # (32 words, one line) for the next launch.
+    # (32 words, one line) for the next launch. Waves on other XCDs read the
+    # tags, so the clear uses system scope like every other tag access.
     tag_base = copy * _TAG_COPY_WORDS
-    gl.amd.cdna3.buffer.store(
+    gl.amd.cdna4.buffer.store(
         gl.zeros_like(lanes),
         tags_d,
         (1 - copy) * _TAG_COPY_WORDS + cta * 32 + lanes,
         mask=lanes < 32,
-        scope="gpu",
+        scope="sys",
     )
 
     # ---- gate/up strips
@@ -1222,7 +1225,7 @@ def gluon_mxfp4_moe_stream_gfx950(
         pos = gl.arange(0, 128, layout=gl.SliceLayout(0, rowl))[None, :] % 16
         for st in gl.static_range(4):
             y = gl.convert_layout(accs[st], rowl, assert_trivial=True)
-            _store_routes(out, y, route, dunit * 64 + st * 16 + pos)
+            _store_routes(out_d, y, route, dunit * 64 + st * 16 + pos)
         dexpert, drank, dunit = nexpert, nrank, nunit
         wb, dw_pair, dw_odd, sb, ds_pair = nwb, nw_pair, nw_odd, nsb, ns_pair
         route_a, route_s = nroute_a, nroute_s
