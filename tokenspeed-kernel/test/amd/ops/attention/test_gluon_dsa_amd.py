@@ -2361,12 +2361,8 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
             )
 
 
-@pytest.mark.skipif(
-    not is_cdna4(),
-    reason="the split dense kernel is specific to gfx950",
-)
-def test_dsa_dense_split_count_changes_reuse_one_binary() -> None:
-    # Off the tuned 16-head schedule, each batch size here gets a different split count.
+def _twelve_head_fp8_split_runs():
+    """Runs a 12-head native-FP8 decode, as Kimi-K3.1 at TP8 does, at any batch size."""
     device = "cuda"
     num_heads = 12
     num_slots = 4096
@@ -2382,7 +2378,9 @@ def test_dsa_dense_split_count_changes_reuse_one_binary() -> None:
     ).to(torch.float8_e4m3fn)
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
 
-    def run(tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def run(
+        tokens: int, *, warm_split_variants: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q = _randn_bf16(
             (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
             device=device,
@@ -2407,6 +2405,7 @@ def test_dsa_dense_split_count_changes_reuse_one_binary() -> None:
             qk_rope_head_dim=qk_rope_head_dim,
             softmax_scale=softmax_scale,
             page_size=64,
+            warm_split_variants=warm_split_variants,
         )
         ref = torch_dsa_sparse_attention(
             q,
@@ -2418,6 +2417,7 @@ def test_dsa_dense_split_count_changes_reuse_one_binary() -> None:
         )
         return out, ref
 
+    # Off the tuned 16-head schedule, each batch size here gets a different split count.
     split_counts = {
         tokens: gfx950_dsa_backend._select_num_kv_splits(
             num_tokens=tokens,
@@ -2433,7 +2433,30 @@ def test_dsa_dense_split_count_changes_reuse_one_binary() -> None:
     assert len(set(split_counts.values())) == len(split_counts)
     assert min(split_counts.values()) > 1
 
+    return run
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="the split dense kernel is specific to gfx950",
+)
+def test_dsa_dense_split_count_changes_reuse_one_kv_binary() -> None:
+    run = _twelve_head_fp8_split_runs()
     run(1)
+    # The reduce kernel compiles once per power-of-two split bucket instead.
+    with assert_no_triton_compile(gfx950_dsa_backend._dsa_dense_mfma_kv_kernel):
+        for tokens in (20, 32, 64, 128, 1):
+            out, ref = run(tokens)
+            torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="the split dense kernel is specific to gfx950",
+)
+def test_dsa_dense_split_variants_compile_during_warmup() -> None:
+    run = _twelve_head_fp8_split_runs()
+    run(128, warm_split_variants=True)
     with assert_no_triton_compile(
         gfx950_dsa_backend._dsa_dense_mfma_kv_kernel,
         gfx950_dsa_backend._dsa_dense_mfma_reduce_kernel,

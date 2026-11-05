@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -386,7 +387,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_decode_impl(*args, **kwargs)
+        return _dsa_decode_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
 
     @register_kernel(
         "attention",
@@ -420,7 +421,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_prefill_impl(*args, **kwargs)
+        return _dsa_prefill_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
 
     @register_kernel(
         "attention",
@@ -455,7 +456,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_prefill_impl(*args, **kwargs)
+        return _dsa_prefill_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
 
     @register_kernel(
         "attention",

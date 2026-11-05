@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
@@ -1280,7 +1282,6 @@ def _dsa_sparse_prefill_fp8_kernel(
     do_not_specialize=(
         "stride_lse_t",
         "stride_lse_h",
-        "stride_lse_s",
         "num_kv_splits",
     )
 )
@@ -1298,6 +1299,7 @@ def _dsa_dense_mfma_reduce_kernel(
     stride_o_h,
     num_kv_splits,
     D_V: tl.constexpr,
+    MAX_SPLITS: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -1306,20 +1308,31 @@ def _dsa_dense_mfma_reduce_kernel(
     partial_base = token_idx * stride_po_t + head_idx * stride_po_h
 
     max_lse = -float("inf")
-    for split_idx in range(num_kv_splits):
-        split_lse = tl.load(partial_lse + lse_base + split_idx * stride_lse_s)
+    for split_idx in tl.static_range(MAX_SPLITS):
+        split_lse = tl.load(
+            partial_lse + lse_base + split_idx * stride_lse_s,
+            mask=split_idx < num_kv_splits,
+            other=-float("inf"),
+        )
         max_lse = tl.maximum(max_lse, split_lse)
 
     denom = 0.0
     acc = tl.zeros([D_V], dtype=tl.float32)
     safe_max_lse = tl.where(max_lse > -float("inf"), max_lse, 0.0)
-    for split_idx in range(num_kv_splits):
-        split_lse = tl.load(partial_lse + lse_base + split_idx * stride_lse_s)
+    for split_idx in tl.static_range(MAX_SPLITS):
+        live = split_idx < num_kv_splits
+        split_lse = tl.load(
+            partial_lse + lse_base + split_idx * stride_lse_s,
+            mask=live,
+            other=-float("inf"),
+        )
         split_valid = split_lse > -float("inf")
         safe_split_lse = tl.where(split_valid, split_lse, 0.0)
         weight = tl.where(split_valid, tl.exp(safe_split_lse - safe_max_lse), 0.0)
         partial = tl.load(
-            partial_out + partial_base + split_idx * stride_po_s + offs_v
+            partial_out + partial_base + split_idx * D_V + offs_v,
+            mask=live,
+            other=0.0,
         ).to(tl.float32)
         acc += weight * partial
         denom += weight
@@ -1717,6 +1730,7 @@ def _run_dense_kv(
     qk_rope_head_dim: int,
     is_prefill: bool,
     out: torch.Tensor | None = None,
+    warm_split_variants: bool = False,
 ) -> torch.Tensor:
     if out is None:
         out = torch.empty(
@@ -1724,16 +1738,12 @@ def _run_dense_kv(
             dtype=_output_dtype(q),
             device=q.device,
         )
-    # Direct-to-shared copies preserve the source bits. Mixed inputs must
-    # convert to the common BF16 compute format before their shared store.
-    convert_inputs = q.dtype != kv_cache.dtype
     native_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
     # Use the configured selected-key capacity for scheduling.
     # Per-row live/causal lengths stay in topk_lens and are loaded by the
     # kernel. This keeps graph replay on one compiled object when those
     # runtime lengths change.
-    num_kv_splits = _select_num_kv_splits(
-        num_tokens=q.shape[0],
+    schedule = dict(
         num_heads=q.shape[1],
         topk_width=topk_slots.shape[1],
         max_seqlen_k=int(topk_slots.shape[1]),
@@ -1742,6 +1752,63 @@ def _run_dense_kv(
         qk_rope_head_dim=qk_rope_head_dim,
         is_prefill=is_prefill,
     )
+    launch = functools.partial(
+        _launch_dense_kv,
+        softmax_scale=softmax_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=is_prefill,
+    )
+    if warm_split_variants and q.shape[0] > 0:
+        # One row per reduce bucket compiles every split variant serving can reach.
+        for num_kv_splits in _warmup_split_counts(q.shape[0], **schedule):
+            launch(
+                q[:1],
+                kv_cache,
+                topk_slots[:1],
+                topk_lens[:1],
+                out[:1],
+                num_kv_splits=num_kv_splits,
+            )
+    launch(
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens,
+        out,
+        num_kv_splits=_select_num_kv_splits(num_tokens=q.shape[0], **schedule),
+    )
+    return out
+
+
+@functools.cache
+def _warmup_split_counts(max_tokens: int, **schedule) -> tuple[int, ...]:
+    """One split count per reduce bucket that up to ``max_tokens`` rows select."""
+    by_bucket: dict[int, int] = {}
+    for num_tokens in range(1, max_tokens + 1):
+        num_kv_splits = _select_num_kv_splits(num_tokens=num_tokens, **schedule)
+        if num_kv_splits > 1:
+            by_bucket.setdefault(triton.next_power_of_2(num_kv_splits), num_kv_splits)
+    return tuple(by_bucket.values())
+
+
+def _launch_dense_kv(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    num_kv_splits: int,
+    softmax_scale: float,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    is_prefill: bool,
+) -> None:
+    # Direct-to-shared copies preserve the source bits. Mixed inputs must
+    # convert to the common BF16 compute format before their shared store.
+    convert_inputs = q.dtype != kv_cache.dtype
+    native_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
     if num_kv_splits == 1:
         stage_out = out
         partial_lse = out
@@ -1838,9 +1905,9 @@ def _run_dense_kv(
             out.stride(1),
             num_kv_splits,
             D_V=kv_lora_rank,
+            MAX_SPLITS=triton.next_power_of_2(num_kv_splits),
             num_warps=4,
         )
-    return out
 
 
 def _run_dense_kv_scalar(
@@ -1933,6 +2000,7 @@ def _run_dsa(
     out: torch.Tensor | None,
     max_seqlen_k: int,
     is_prefill: bool,
+    warm_split_variants: bool,
 ) -> torch.Tensor:
     _check_inputs(
         q,
@@ -2008,6 +2076,7 @@ def _run_dsa(
                 qk_rope_head_dim=qk_rope_head_dim,
                 is_prefill=is_prefill,
                 out=out_view,
+                warm_split_variants=warm_split_variants,
             )
         else:
             result = _run_dense_kv_scalar(
@@ -2045,6 +2114,7 @@ def launch_gluon_dsa_decode_gfx950(
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    warm_split_variants: bool = False,
 ) -> torch.Tensor:
     del q_len_per_req
     if logit_cap != 0.0 or return_lse:
@@ -2064,6 +2134,7 @@ def launch_gluon_dsa_decode_gfx950(
         out=out,
         max_seqlen_k=max_seqlen_k,
         is_prefill=False,
+        warm_split_variants=warm_split_variants,
     )
 
 
@@ -2084,6 +2155,7 @@ def launch_gluon_dsa_prefill_gfx950(
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    warm_split_variants: bool = False,
 ) -> torch.Tensor:
     del q_len_per_req
     if logit_cap != 0.0 or return_lse:
@@ -2103,4 +2175,5 @@ def launch_gluon_dsa_prefill_gfx950(
         out=out,
         max_seqlen_k=max_seqlen_k,
         is_prefill=True,
+        warm_split_variants=warm_split_variants,
     )
