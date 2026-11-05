@@ -221,14 +221,20 @@ public:
     // (any bucket when the slot was a hole), and sets the table's unconsumed
     // tail capacity. Returns the replaced block: a hitter's shared partial
     // block, which the caller copies into the fresh block; empty for a hole,
-    // which the caller zeroes instead.
-    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
-                                   std::int32_t available_tokens) {
+    // which the caller zeroes instead. With a destination the fresh block is
+    // that free slot of a parent bound to this group (a lone request's
+    // compaction moving its own block; the caller keeps a copied block's
+    // bucket, and may change an unwritten block's); without one the pool
+    // places it.
+    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot, std::int32_t available_tokens,
+                                   std::optional<CacheBlockLocation> destination) {
         _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
         _assert(available_tokens >= 0, "tail capacity must be non-negative");
         const CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
         std::vector<CacheBlockRef> fresh;
-        if (current) {
+        if (destination) {
+            fresh.push_back(pool.AcquireBlockAt(group_id_, *destination));
+        } else if (current) {
             const std::array<std::int32_t, 1> bucket{BucketOf(current->Location())};
             fresh = pool.AcquireBlocksInBuckets(group_id_, bucket);
         } else {

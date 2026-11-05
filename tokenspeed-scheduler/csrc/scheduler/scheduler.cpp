@@ -433,6 +433,8 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
+        .lone_compactions = coordinator_.LoneCompactions(),
+        .lone_compaction_moves = coordinator_.LoneCompactionMoves(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };
 }
