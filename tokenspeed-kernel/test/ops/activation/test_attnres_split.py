@@ -7,12 +7,14 @@ The split factors the online-softmax candidate mix into a blocks-side partial
 import pytest
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
+    _attnres_partial_dual_kernel,
+    _attnres_partial_kernel,
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
 )
 from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -103,3 +105,37 @@ def test_partial_dual_probes_are_independent(T, KB):
     for got, ref, side in ((ba_b, ab_a, "A->B"), (ba_a, ab_b, "B->A")):
         for x, y in zip(got, ref):
             assert torch.equal(x, y), f"probe {side} changed when slots swapped"
+
+
+def _row_kernel_args(blocks, eps):
+    return dict(
+        n_blocks=blocks.shape[0],
+        n_cols=H,
+        stride_bk=blocks.stride(0),
+        stride_bt=blocks.stride(1),
+        eps=eps,
+        BLOCK=4096,
+        ENABLE_PDL=False,
+        num_warps=8,
+    )
+
+
+@pytest.mark.skipif(not current_platform().is_amd, reason="64-lane waves only")
+@pytest.mark.parametrize("T,KB", [(1, 1), (4, 6), (16, 11), (32, 3)])
+def test_pair_tiles_match_row_kernels_bitwise(T, KB):
+    """The AMD [2, 4096] tiles keep each half's summation tree."""
+    torch.manual_seed(T * 7 + KB)
+    blocks = torch.randn(KB, T, H, dtype=torch.bfloat16, device="cuda") * 2
+    wp_a = torch.randn(H, dtype=torch.bfloat16, device="cuda") * 0.05
+    wp_b = torch.randn(H, dtype=torch.bfloat16, device="cuda") * 0.05
+    eps = 1e-6
+    args = _row_kernel_args(blocks, eps)
+
+    got, ref = _scratch(T), _scratch(T)
+    attnres_partial(blocks, wp_a, eps, got)
+    _attnres_partial_kernel[(T,)](blocks, wp_a, *ref, **args)
+    got_a, got_b, ref_a, ref_b = _scratch(T), _scratch(T), _scratch(T), _scratch(T)
+    attnres_partial_dual(blocks, wp_a, wp_b, eps, got_a, got_b)
+    _attnres_partial_dual_kernel[(T,)](blocks, wp_a, wp_b, *ref_a, *ref_b, **args)
+    for x, y in zip(got + got_a + got_b, ref + ref_a + ref_b):
+        assert torch.equal(x.view(torch.int32), y.view(torch.int32))

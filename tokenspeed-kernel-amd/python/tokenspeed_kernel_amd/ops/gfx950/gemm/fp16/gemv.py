@@ -21,8 +21,9 @@
 """Dense16 decode GEMV ``y = x @ w.T`` (M <= 16) for gfx950.
 
 One program computes ``rows`` consecutive output columns over the full K, so
-a launch has one program per CU (``rows = cdiv(N, CUs)``) and every program
-issues its whole weight share without split-K or cross-CU reductions:
+a launch has one program per CU (``rows = cdiv(N, CUs)``; two for the shapes
+in ``_HALF_TILE_MAX_M``) and every program issues its whole weight share
+without split-K or cross-CU reductions:
 
 * M = 1, ``BLOCK_M == 1``: FMA tile. Waves split the rows, lanes split each
   K chunk with 16-byte loads (one load instruction reads a 1 KB contiguous
@@ -83,6 +84,8 @@ _MFMA_BLOCK_M = 16
 _MFMA_MIN_BLOCK_N = 16
 _MFMA_LONG_K = 8192
 _MFMA_LONG_K_WARPS = 8
+# (N, K) -> largest M where two 16-row programs per CU beat one 28-row program.
+_HALF_TILE_MAX_M = {(7168, 768): 16, (7168, 1536): 4, (7168, 3584): 8}
 
 
 def _gemv_launch_metadata(grid, kernel, args):
@@ -495,6 +498,8 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, 
     # Long K splits over eight waves, doubling the weight bytes in flight per CU.
     num_warps = _MFMA_LONG_K_WARPS if k >= _MFMA_LONG_K else NUM_WARPS
     block_k = 128 if k >= 128 * num_warps else 64
+    if rows > _MFMA_MIN_BLOCK_N and m <= _HALF_TILE_MAX_M.get((n, k), 0):
+        rows = _MFMA_MIN_BLOCK_N
     block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
     return rows, _MFMA_BLOCK_M, block_n, block_k, 0, num_warps
 

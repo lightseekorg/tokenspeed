@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3Config,
     KimiK3VisionConfig,
+    KimiK31Config,
     KimiLinearConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
@@ -64,6 +65,16 @@ class TestKimiK3ConfigTests:
         assert isinstance((cfg.vision_config), (KimiK3VisionConfig))
         assert (cfg.text_config.hidden_size) == (4096)
         assert (cfg.vision_config.vt_hidden_size) == (512)
+
+    def test_k31_materializes_its_subconfigs_through_from_dict(self):
+        # from_pretrained's path; a subclass without __init__ left text_config a dict.
+        cfg = KimiK31Config.from_dict(
+            {"model_type": "kimi_k31", "text_config": {"hidden_size": 4096}}
+        )
+        assert cfg.model_type == "kimi_k31"
+        assert isinstance(cfg.text_config, KimiLinearConfig)
+        assert isinstance(cfg.vision_config, KimiK3VisionConfig)
+        assert cfg.text_config.hidden_size == 4096
 
     def test_vision_text_hidden_forced_to_text_hidden(self):
         # The projector must emit the text hidden size, overriding any value
@@ -315,6 +326,63 @@ class TestKimiK3RegistrationTests:
         ) is not None, (
             "the packed weight must still be set, or the guard proves nothing"
         )
+
+    @pytest.mark.parametrize(
+        "apply_kernel, quantized",
+        (
+            ("gluon_mxfp4_a8w4_situ_precomputed_moe_apply", True),
+            ("triton_bf16_precomputed_moe_apply", False),
+        ),
+    )
+    def test_the_latent_gather_quantizes_only_for_the_a8w4_moe(
+        self, apply_kernel, quantized
+    ):
+        """The gathered latent's FP8 copy reaches the experts that read it."""
+        from tokenspeed.runtime.models import kimi_k3
+
+        built = self._build_moe_block(
+            kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
+                owns_ep_communication=False,
+                use_native=True,
+                use_trtllm=False,
+                overlap_shared_experts=False,
+                joint_moe_reduce=False,
+                decode_chain=False,
+            )
+        )
+        moe = built.layer
+        moe.packed_input_projection_weight = torch.zeros(1)
+        moe.routed_expert_down_proj.narrowed = False
+        moe.experts.plan["apply_kernel_name"] = apply_kernel
+        moe.experts._situ_input_fp8 = "stale"
+        moe.shared_experts.act_fn = SimpleNamespace(beta=25.0, linear_beta=25.0)
+        hidden = torch.zeros(4, 8)
+        fp8 = (torch.zeros(4, 8, dtype=torch.float8_e4m3fn), torch.ones(1))
+        requested = []
+
+        def latent_input_gather(hidden_states, weight, *, quantize, **kwargs):
+            requested.append(quantize)
+            outputs = (torch.zeros(4, 2), torch.zeros(4, 8), torch.zeros(4, 2))
+            return (*outputs, fp8) if quantize else outputs
+
+        moe.iris_state = SimpleNamespace(
+            can_latent_input_gather=lambda *args: True,
+            latent_input_gather=latent_input_gather,
+        )
+        with mock.patch.object(
+            kimi_k3, "kimi3_shared_down_projection", lambda x, w, out=None: x
+        ):
+            outputs = moe._latent_input_projections(hidden, rows_replicated=True)
+        assert len(outputs) == 3
+        assert requested == [quantized]
+        assert moe.experts._situ_input_fp8 is (fp8 if quantized else None)
+
+        # The replicated projection leaves no stale copy behind.
+        moe.experts._situ_input_fp8 = "stale"
+        moe.routed_expert_down_proj.narrowed = True
+        assert moe._latent_input_projections(hidden, rows_replicated=True) is None
+        assert moe.experts._situ_input_fp8 is None
 
     @_NVIDIA_ONLY
     def test_the_shard_is_wired_on_the_plan_that_absorbs_it(self):
