@@ -117,10 +117,11 @@ _UNROLL = 8
 # Multicast: a GPU's stores leave at about 40 GB/s per CTA, and each GPU
 # receives a share from every rank, saturating near 600 GB/s, so the fewest
 # CTAs that saturate the receive side follow from the group size alone. A
-# window's rows, the row width and the reader's queries change how much
-# moves, not which side limits it: on the GB300 sweeps (the communication
-# README) no other count shortens a window by more than 3 us, and more CTAs
-# slow the compute a window overlaps. Other hardware needs measuring again.
+# window's rows and the row width change how much moves, and the reader's
+# queries the compute it overlaps; neither changes which side limits it: on
+# the GB300 sweeps (the communication README) no other count measured
+# shortens a window by more than 3 us, and more CTAs slow the compute a
+# window overlaps. Other hardware needs measuring again.
 # Peer stores keep 24 CTAs at every group size, not measured per size.
 _NUM_CTAS = {"multicast": {2: 8, 4: 4, 8: 2}, "peer": {2: 24, 4: 24, 8: 24}}
 
