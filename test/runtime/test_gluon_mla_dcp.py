@@ -266,3 +266,89 @@ def test_gluon_without_dcp_keeps_existing_metadata(make_leaf):
     assert leaf.forward_decode_metadata.dcp is None
     torch.testing.assert_close(leaf.forward_decode_metadata.seq_lens, lengths)
     assert leaf.supports_mla_projected_value_decode
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("degree,rank", [(2, 0), (8, 7)])
+def test_gluon_prefix_history_uses_ragged_chunk_boundaries(
+    make_leaf, monkeypatch, device, degree, rank
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention import chunk
+    from tokenspeed.runtime.layers.attention.dcp.cache import PrefixHistoryGather
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 192)
+    monkeypatch.setitem(global_server_args_dict, "mla_chunk_multiplier", 1)
+    if device == "cpu":
+        # Only the GPU slot-index builder is absent on CPU. Keep the host
+        # planner, leaf lifecycle and history-gather ownership planning real.
+        def cpu_chunks(prefix_lens, prefix_lens_cpu, page_table, page_size):
+            planned = chunk.plan_prefix_chunks(
+                prefix_lens_cpu, chunk.get_max_chunk_capacity()
+            )
+            loops = []
+            for starts, ends in zip(planned.starts, planned.ends, strict=True):
+                rows = []
+                for request, (start, end) in enumerate(zip(starts, ends, strict=True)):
+                    positions = torch.arange(int(start), max(int(start), int(end)))
+                    rows.append(
+                        page_table[request, positions // page_size] * page_size
+                        + positions % page_size
+                    )
+                loops.append(torch.cat(rows).to(torch.int32))
+            return planned, loops, planned
+
+        monkeypatch.setattr(chunk, "get_chunks_paged", cpu_chunks)
+
+    leaf = make_leaf(
+        degree=degree, rank=rank, queries=4, draft=False, block=False, device=device
+    )
+    leaf._prefix_history = PrefixHistoryGather(
+        leaf.cache_placement(None), page_size=64, comm=NcclBackend()
+    )
+    blocks = [[5, 2, 8, 1], [2, 5, 1, 8], [0, 0, 0, 0]]
+    table_cpu = torch.tensor(
+        [[2 * block + sub for block in row for sub in range(2)] for row in blocks],
+        dtype=torch.int32,
+    )
+    prefixes_cpu = torch.tensor([257, 193, 0], dtype=torch.int32)
+    extends_cpu = torch.tensor([1, 2, 1], dtype=torch.int32)
+    leaf.init_forward_metadata(
+        3,
+        3,
+        (prefixes_cpu + extends_cpu).to(device),
+        table_cpu.to(device),
+        ForwardMode.EXTEND,
+        extend_seq_lens=extends_cpu.to(device),
+        extend_seq_lens_cpu=extends_cpu,
+        extend_prefix_lens=prefixes_cpu.to(device),
+        extend_prefix_lens_cpu=prefixes_cpu,
+        extend_with_prefix=True,
+        query_shard=None,
+        page_table_cpu=table_cpu,
+    )
+    metadata = leaf.chunked_prefill_metadata
+    assert not metadata.use_absorbed_cached_extend
+    torch.testing.assert_close(
+        metadata.chunk_bounds_cpu,
+        torch.tensor(
+            [
+                [0, 0, 0],
+                [64, 64, 0],
+                [128, 128, 0],
+                [192, 192, 0],
+                [256, 193, 0],
+                [257, 193, 0],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    windows = leaf._prefix_history.windows
+    assert tuple(
+        sum(window.owned_rows_per_rank[owner] for window in windows)
+        for owner in range(degree)
+    ) == ((193, 257) if degree == 2 else (0, 256, 0, 0, 193, 0, 0, 1))

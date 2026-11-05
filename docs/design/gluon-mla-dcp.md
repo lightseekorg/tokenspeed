@@ -37,7 +37,10 @@ configured full verify/block window.
 The absorbed cached-extend kernel reads a complete page table and cannot read
 the sharded pool directly. Under KVP the Gluon leaf uses ordinary chunked
 prefix replay and prepares the shared `PrefixHistoryGather` with the host
-mirror of the page table. The model reads each bounded prefix chunk through
+mirror of the page table and the planner's exact per-request chunk boundaries.
+Those boundaries stay with the prefill metadata so ragged prefix loops and
+their owner gathers use the same partition. The model reads each bounded
+prefix chunk through
 `read_prefix_history`; cache layout stays outside the model. KVP=1 retains the
 existing absorbed-extend selection.
 
