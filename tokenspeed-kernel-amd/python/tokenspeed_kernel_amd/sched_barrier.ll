@@ -87,6 +87,18 @@ entry:
   ret i32 0
 }
 
+; An f32 value LLVM must treat as new: llvm.arithmetic.fence emits no
+; instruction, but no optimization looks through it, so arithmetic on the
+; result is neither merged with the same arithmetic on the input (CSE) nor
+; reassociated across it.
+declare float @llvm.arithmetic.fence.f32(float)
+
+define float @__tokenspeed_sched_arithmetic_fence_f32(float %x) alwaysinline {
+entry:
+  %r = call float @llvm.arithmetic.fence.f32(float %x)
+  ret float %r
+}
+
 ; 1 when %a == %b (ordered, as v_cmp_eq_f32) in every active lane of the wave,
 ; else 0; the same in every lane, in an SGPR: one compare into a lane mask
 ; (llvm.amdgcn.ballot) tested against the active lanes (EXEC).
