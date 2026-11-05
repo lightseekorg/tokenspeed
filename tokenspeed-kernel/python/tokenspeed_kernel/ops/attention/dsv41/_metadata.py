@@ -39,13 +39,25 @@ class IndexGeometry:
             if stream != self.stream:
                 stream.wait_event(self.ready)
                 for tensor in self.tensors:
-                    tensor.record_stream(stream)
+                    if tensor is not None:
+                        tensor.record_stream(stream)
         return self.tensors
 
 
 class IndexMetadata:
-    def __init__(self, table, lengths):
-        self.source = IndexGeometry((table, lengths))
+    def __init__(self, table, lengths, request_indices):
+        if request_indices is not None and (
+            request_indices.shape != lengths.shape
+            or request_indices.dtype != torch.int32
+            or request_indices.device != table.device
+            or not request_indices.is_contiguous()
+            or request_indices.numel() >= 2**31
+        ):
+            raise ValueError(
+                "request_indices must be contiguous int32 [queries] "
+                "on the table device, with fewer than 2**31 rows"
+            )
+        self.source = IndexGeometry((table, lengths, request_indices))
         self.paged = {}
         self.sparse = {}
 
