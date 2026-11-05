@@ -788,20 +788,19 @@ def process_sliding_kv_tile(
 
 
 @gluon.jit
-def process_sliding_attention_tile(
+def process_short_window_attention_tile(
     program: AttentionProgram,
     k_smem: gl.shared_memory_descriptor,
     v_smem: gl.shared_memory_descriptor,
+    MAX_KV_TILES: gl.constexpr,
 ):
+    # A short window is unrolled, so the compiler can overlap its tiles.
     cfg = program.cfg
     q = program.load_q()
     m_i, l_i, acc = program.init_attention_state()
 
     kv_start = program.q_start - cfg.WINDOW_LEFT
     kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
-    max_kv_tiles: gl.constexpr = (
-        cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
-    ) // cfg.BLOCK_N
     offs_m = program.q_start + gl.arange(
         0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
     )
@@ -810,29 +809,55 @@ def process_sliding_attention_tile(
     )
     mask_diff = offs_m[:, None] - mask_n[None, :]
 
-    if max_kv_tiles <= 8:
-        # A short window is unrolled, so the compiler can overlap its tiles.
-        for _ in gl.static_range(max_kv_tiles):
-            m_i, l_i, acc = process_sliding_kv_tile(
-                program, k_smem, v_smem, q, kv_start, mask_n, mask_diff, m_i, l_i, acc
-            )
-            kv_start = kv_start + cfg.BLOCK_N
-            mask_n = mask_n + cfg.BLOCK_N
-            mask_diff = mask_diff - cfg.BLOCK_N
-    else:
-        # A long window (such as 4096) loops over only the tiles that both the
-        # window and the request reach: unrolling it compiles slowly and makes
-        # a short request pay for the whole window.
-        kv_end = program.q_start + cfg.BLOCK_M
-        kv_end = gl.where(kv_end < program.seq_len, kv_end, program.seq_len)
-        num_kv_tiles = (kv_end - kv_start + cfg.BLOCK_N - 1) // cfg.BLOCK_N
-        for _ in range(0, num_kv_tiles):
-            m_i, l_i, acc = process_sliding_kv_tile(
-                program, k_smem, v_smem, q, kv_start, mask_n, mask_diff, m_i, l_i, acc
-            )
-            kv_start = kv_start + cfg.BLOCK_N
-            mask_n = mask_n + cfg.BLOCK_N
-            mask_diff = mask_diff - cfg.BLOCK_N
+    for _ in gl.static_range(MAX_KV_TILES):
+        m_i, l_i, acc = process_sliding_kv_tile(
+            program, k_smem, v_smem, q, kv_start, mask_n, mask_diff, m_i, l_i, acc
+        )
+        kv_start = kv_start + cfg.BLOCK_N
+        mask_n = mask_n + cfg.BLOCK_N
+        mask_diff = mask_diff - cfg.BLOCK_N
+
+    program.store_lse(l_i, m_i)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    recip_denom = 1.0 / denom
+    output = acc * recip_denom[:, None]
+    output = gl.convert_layout(output, cfg.store_layout)
+    program.store_output(output)
+
+
+@gluon.jit
+def process_long_window_attention_tile(
+    program: AttentionProgram,
+    k_smem: gl.shared_memory_descriptor,
+    v_smem: gl.shared_memory_descriptor,
+):
+    # A long window (such as 4096) loops over only the tiles that both the
+    # window and the request reach: unrolling it compiles slowly and makes
+    # a short request pay for the whole window.
+    cfg = program.cfg
+    q = program.load_q()
+    m_i, l_i, acc = program.init_attention_state()
+
+    kv_start = program.q_start - cfg.WINDOW_LEFT
+    kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
+    offs_m = program.q_start + gl.arange(
+        0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
+    )
+    mask_n = kv_start + gl.arange(
+        0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
+    )
+    mask_diff = offs_m[:, None] - mask_n[None, :]
+
+    kv_end = program.q_start + cfg.BLOCK_M
+    kv_end = gl.where(kv_end < program.seq_len, kv_end, program.seq_len)
+    num_kv_tiles = (kv_end - kv_start + cfg.BLOCK_N - 1) // cfg.BLOCK_N
+    for _ in range(0, num_kv_tiles):
+        m_i, l_i, acc = process_sliding_kv_tile(
+            program, k_smem, v_smem, q, kv_start, mask_n, mask_diff, m_i, l_i, acc
+        )
+        kv_start = kv_start + cfg.BLOCK_N
+        mask_n = mask_n + cfg.BLOCK_N
+        mask_diff = mask_diff - cfg.BLOCK_N
 
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
@@ -1006,6 +1031,10 @@ def gluon_rel_mha_prefill_sliding_gfx950(
         cfg.v_smem_layout,
     )
 
+    # Number of KV tiles a BLOCK_M query tile can see through the window.
+    MAX_KV_TILES: gl.constexpr = (
+        cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
+    ) // cfg.BLOCK_N
     scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, False)
     while scheduler.has_work():
         program, active = scheduler.get_program(
@@ -1022,7 +1051,12 @@ def gluon_rel_mha_prefill_sliding_gfx950(
         # the spill slot of a loop-invariant buffer descriptor, so the next
         # tile on the same workgroup read K from the wrong tensor.
         if active:
-            process_sliding_attention_tile(program, k_smem, v_smem)
+            if MAX_KV_TILES <= 8:
+                process_short_window_attention_tile(
+                    program, k_smem, v_smem, MAX_KV_TILES
+                )
+            else:
+                process_long_window_attention_tile(program, k_smem, v_smem)
         scheduler = scheduler.advance()
 
 
