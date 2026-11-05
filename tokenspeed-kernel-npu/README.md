@@ -178,14 +178,28 @@ records its peak owned buffer bytes; serving acceptance also measures device
 allocation/reservation peaks. `chunk_prefill_kv_size` only controls scheduler
 admission and never enables transport or fixes its buffer size.
 
-The NPU backends pass the existing kernel-startup warmup flag to Prefill.
-Warmup uses the current stream without binding the persistent serving stream;
-the startup owner synchronizes warmup before serving begins. The first
-non-warmup call binds the serving stream, which cannot change after `finish`.
-Warmup and serving may use the same stream. Within an active layer, the stream
-and warmup flag must stay unchanged through `finish`; its temporary stream
-reference is then cleared. Buffer recording always uses that layer's current
-stream, including while no serving stream is bound.
+Prefill relies on one caller execution stream to order gather, patch and
+attention consumers. HCCL establishes dependencies with its internal stream;
+the transport does not establish dependencies between different caller
+streams. `record_stream` protects allocation lifetime, but does not order a
+producer on one stream before a consumer on another. `finish` releases
+references after queueing consumers; it does not synchronize the device.
+
+`_stream(warmup=...)` therefore enforces two lifetimes. `_layer_stream` records
+the existing caller stream from `prefetch` through `finish`, rejecting stream
+or phase changes during that active layer. It is cleared at `finish` and
+does not create a separate stream per model layer. `compute_stream` records
+the first serving stream and remains bound across layers and batches.
+
+The NPU backends pass the existing kernel-startup warmup flag to distinguish
+phases. Warmup uses `_layer_stream` but leaves `compute_stream` unbound.
+`ModelExecutor.autotune()` synchronizes the device before serving begins, so
+the first serving call can bind its own stream safely. Warmup and serving
+can also use the same stream; phase is explicit rather than inferred from
+stream identity. Later serving stream changes remain errors after `finish`.
+Binding during warmup would incorrectly reject a different serving stream
+when the same transport survives startup. Rebuilding the cache pool closes
+the old transport, so that startup path may avoid the failure.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It covers compact shared history pages, empty/uneven owners, both
