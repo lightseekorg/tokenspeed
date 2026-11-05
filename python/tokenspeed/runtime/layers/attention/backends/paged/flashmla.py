@@ -187,6 +187,12 @@ class FlashMLABackend(PagedAttentionBackend):
         # captured decode graph seeds block-end lengths via
         # ``fill_block_decode_seq_lens`` (see the drafter's is_capturing path).
         self.draft_block_decode = bool(config.draft_block_decode)
+        if config.draft_block_causal:
+            raise NotImplementedError(
+                f"{type(self).__name__} attends a draft block as a whole; a causal "
+                "block draft (Kimi-K3.1 DSpark) needs --drafter-attention-backend "
+                "tokenspeed_mla"
+            )
 
         if self.kv_cache_quant_method == "per_token_head":
             raise NotImplementedError(

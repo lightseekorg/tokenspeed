@@ -340,6 +340,70 @@ def test_kimi_topk_prefill_scales_beyond_8k(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
+@pytest.mark.parametrize("stride", [1, 32, 64, 128])
+@pytest.mark.parametrize("tokens", [1024, 8192])
+def test_kimi_topk_prefill_selects_evenly_strided_winners(
+    stride: int, tokens: int
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(stride)
+    logits = torch.randn(tokens, 896, device="cuda", generator=generator)
+    bias = torch.randn(896, device="cuda", generator=generator) * 0.01
+    winners = torch.arange(16, device="cuda") * stride % 896
+    bias[winners] += torch.linspace(4.0, 2.0, 16, device="cuda")
+    scores = logits.sigmoid()
+    _, expected_ids = torch.topk(scores + bias, 16, dim=-1, sorted=True)
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+
+    actual_weights, actual_ids = moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        16,
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=True,
+    )
+    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-6, atol=2e-7)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("experts", [64, 128, 256, 288, 384])
+def test_sigmoid_topk_prefill_exhausts_a_lane_of_few_experts(
+    experts: int, dtype: torch.dtype
+) -> None:
+    # The top experts are all 0 mod 64, so one lane runs out before top-8 completes.
+    tokens = 600
+    generator = torch.Generator(device="cuda").manual_seed(experts)
+    logits = torch.randn(tokens, experts, device="cuda", generator=generator)
+    logits = logits.to(dtype)
+    bias = torch.randn(experts, device="cuda", generator=generator) * 0.01
+    bias[::64] += 2.0
+    scores = logits.float().sigmoid().to(dtype)
+    # A stable sort orders equal choices by expert id, as the kernel does.
+    expected_ids = torch.sort(
+        scores.float() + bias, dim=-1, descending=True, stable=True
+    ).indices[:, :8]
+    expected_weights = scores.gather(1, expected_ids).float()
+    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+
+    actual_weights, actual_ids = moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        8,
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=True,
+    )
+    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_weights,
+        expected_weights,
+        rtol=2e-6 if dtype == torch.float32 else 5e-3,
+        atol=2e-7 if dtype == torch.float32 else 5e-4,
+    )
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
 def test_kimi_topk_prefill_ties_choose_smaller_expert_id() -> None:
     logits = torch.zeros(3, 896, device="cuda")
     bias = torch.zeros(896, device="cuda")
