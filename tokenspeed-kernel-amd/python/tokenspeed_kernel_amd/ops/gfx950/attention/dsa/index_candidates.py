@@ -40,7 +40,8 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import
 
 
 def _owned_query_group_metadata(q, pages, lengths, query_group_size):
-    """Validate the dense plan before forming its strided per-request view."""
+    """Validate the dense plan before forming its strided per-request view:
+    every request's page list, its last row's."""
     if query_group_size not in (1, 2, 3, 4, 5, 6):
         raise ValueError("owned-page query groups must contain one to six verify rows")
     if q.shape[0] % query_group_size:
@@ -48,9 +49,7 @@ def _owned_query_group_metadata(q, pages, lengths, query_group_size):
     if pages.shape[0] != q.shape[0] or lengths.numel() != q.shape[0]:
         raise ValueError("owned-page metadata must cover every query row")
     _check_standard_decode_metadata(q, lengths, pages, 1)
-    table = pages[query_group_size - 1 :: query_group_size]
-    seq_lens = lengths[query_group_size - 1 :: query_group_size].contiguous()
-    return table, seq_lens
+    return pages[query_group_size - 1 :: query_group_size]
 
 
 def launch_gluon_dsa_index_candidates_gfx950(
@@ -81,7 +80,8 @@ def launch_gluon_dsa_index_candidates_gfx950(
         raise TypeError(
             "owned-page native scorer requires FP8 queries and explicit scales"
         )
-    table, seq_lens = _owned_query_group_metadata(q, pages, lengths, query_group_size)
+    table = _owned_query_group_metadata(q, pages, lengths, query_group_size)
+    requests = table.shape[0]
     if any(value.nbytes >= 2**31 for value in (q, q_scales, weights, lengths)):
         raise ValueError("owned-page query buffers must fit int32 offsets")
     width = pages.shape[1] * page_size
@@ -98,14 +98,15 @@ def launch_gluon_dsa_index_candidates_gfx950(
     if q.shape[1] == 32 and rows <= 4:
         waves = _FP8_ROWS_DECODE_WAVES_PER_EU
     chunks = triton.cdiv(width, _BF16_DECODE_CHUNK_N)
-    splits = _fp8_rows_decode_splits(seq_lens.numel(), chunks, waves, q.device)
-    gluon_dsa_decode_topk_fp8_rows_gfx950[(seq_lens.numel(), splits)](
+    splits = _fp8_rows_decode_splits(requests, chunks, waves, q.device)
+    gluon_dsa_decode_topk_fp8_rows_gfx950[(requests, splits)](
         q,
         q_scales,
         index_k_cache.view(torch.float8_e4m3fn),
         index_k_cache.view(torch.float32),
         weights,
-        seq_lens,
+        # Request lengths, unread: explicit_row_lens bounds every row.
+        lengths,
         table,
         logits,
         q.shape[0],

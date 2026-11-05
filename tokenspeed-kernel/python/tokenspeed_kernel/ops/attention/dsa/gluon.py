@@ -775,7 +775,9 @@ if current_platform().is_amd:
         scores = launch_gluon_dsa_index_candidates_gfx950(
             q.contiguous(),
             q_scales.contiguous(),
-            weights.contiguous(),
+            # The scorer takes strided rows, such as a slice of a fused
+            # key and head-weight projection.
+            weights if weights.stride(-1) == 1 else weights.contiguous(),
             index_k_cache,
             physical,
             lengths,
@@ -796,7 +798,7 @@ if current_platform().is_amd:
         select_width = next(width for width in (512, 1024, 2048) if width >= topk)
         # Owned rows are a fraction of the table-wide scores buffer.
         offsets, _ = gluon_dsa_row_bounded_logical_topk_gfx950(
-            scores, torch.zeros_like(lengths), lengths, topk=select_width
+            scores, None, lengths, topk=select_width
         )
         if select_width != topk:
             # Small generic/test top-k counts refine only this bounded

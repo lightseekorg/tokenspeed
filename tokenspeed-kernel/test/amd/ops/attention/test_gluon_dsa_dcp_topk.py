@@ -108,6 +108,29 @@ def test_row_bounded_topk_selects_each_rows_largest_owned_scores(rows, topk):
             )
 
 
+@pytest.mark.parametrize("width", [256, 1 << 16])
+def test_row_bounded_topk_without_starts_begins_every_row_at_column_zero(width):
+    # Narrower and wider than the top-k: the sort and the radix paths.
+    rows, topk = 16, 512
+    generator = torch.Generator(device="cuda").manual_seed(width)
+    logits = torch.rand((rows, width), device="cuda", generator=generator)
+    lengths = torch.randint(
+        0, width + 1, (rows,), device="cuda", generator=generator
+    ).int()
+    offsets, counts = gluon_dsa_row_bounded_logical_topk_gfx950(
+        logits, None, lengths, topk=topk
+    )
+    expected, expected_counts = gluon_dsa_row_bounded_logical_topk_gfx950(
+        logits, torch.zeros_like(lengths), lengths, topk=topk
+    )
+
+    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
+    # Equal-score order is unspecified; the selected sets must agree.
+    torch.testing.assert_close(
+        offsets.sort(dim=1).values, expected.sort(dim=1).values, atol=0, rtol=0
+    )
+
+
 @pytest.mark.parametrize("rows", [1, 64])
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_live_topk_keeps_every_live_score_of_rows_holding_at_most_topk(rows, topk):
