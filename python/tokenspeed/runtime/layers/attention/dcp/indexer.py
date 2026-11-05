@@ -625,17 +625,89 @@ def select_owned_dsa_topk(
         :func:`select_dsa_topk`'s selection, as scheduler slots, to this
         rank's owned slots gives.
     """
+    out, lens_out, _ = select_owned_dsa_topk_with_rider(
+        q,
+        weights,
+        index_k_cache,
+        metadata=metadata,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        initial_tokens=initial_tokens,
+        local_tokens=local_tokens,
+        rider=None,
+        q_scales=q_scales,
+        query_group_size=query_group_size,
+        out=out,
+        lens_out=lens_out,
+    )
+    return out, lens_out
+
+
+def select_owned_dsa_topk_with_rider(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    *,
+    metadata: DCPIndexMetadata,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    initial_tokens: int,
+    local_tokens: int,
+    rider: torch.Tensor | None,
+    q_scales: torch.Tensor | None = None,
+    query_group_size: int = 1,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """:func:`select_owned_dsa_topk`, with ``rider`` bytes of every row
+    gathered in the scores' all-gather: one collective where a later
+    gather of the same rows (the attention query's heads) would be a
+    second.
+
+    Args:
+        rider: Contiguous uint8 ``[rows, width]`` of this rank, ``width`` a
+            multiple of 4, or None.
+
+    Returns:
+        :func:`select_owned_dsa_topk`'s slots and counts, and every rank's
+        rider rows ``[ranks, rows, width]`` (a view of the gathered buffer,
+        rank ``r``'s at ``[r]``; None without a rider).
+    """
     rows = q.shape[0]
     if metadata.query_requests.shape != (rows,):
         raise ValueError("DCP index metadata was built for other rows")
+    if rider is not None and (
+        rider.dtype != torch.uint8
+        or rider.dim() != 2
+        or rider.shape[0] != rows
+        or rider.shape[1] % 4
+        or not rider.is_contiguous()
+    ):
+        raise ValueError(
+            "a rider is a contiguous uint8 [rows, width] matrix, width a "
+            "multiple of 4"
+        )
     if out is None:
         out = torch.empty((rows, topk), device=q.device, dtype=torch.int32)
     if lens_out is None:
         lens_out = torch.empty((rows,), device=q.device, dtype=torch.int32)
-    if rows == 0:
-        return out, lens_out
     group = metadata.placement.group
-    local = torch.empty((rows, topk), device=q.device, dtype=torch.float32)
+    if rows == 0:
+        if rider is None:
+            return out, lens_out, None
+        return out, lens_out, rider.new_empty((len(group), 0, rider.shape[1]))
+    score_bytes = rows * topk * 4
+    if rider is not None and len(group) > 1:
+        # Every rank's chunk is its scores, then its rider rows.
+        send = torch.empty(
+            (score_bytes + rider.numel(),), device=q.device, dtype=torch.uint8
+        )
+        local = send[:score_bytes].view(torch.float32).view(rows, topk)
+        send[score_bytes:].view(rows, -1).copy_(rider)
+    else:
+        local = torch.empty((rows, topk), device=q.device, dtype=torch.float32)
     positions, _ = _score_rows(
         q,
         weights,
@@ -652,14 +724,26 @@ def select_owned_dsa_topk(
         query_group_size=query_group_size,
         scores_out=local,
     )
-    if len(group) > 1:
+    gathered_rider = None
+    if len(group) > 1 and rider is not None:
+        gathered = torch.empty(
+            (len(group), send.numel()), device=q.device, dtype=torch.uint8
+        )
+        all_gather_single(gathered.flatten(), send, group)
+        scores = (
+            gathered[:, :score_bytes].view(torch.float32).view(len(group), rows, topk)
+        )
+        gathered_rider = gathered[:, score_bytes:].view(len(group), rows, -1)
+    elif len(group) > 1:
         scores = torch.empty(
             (len(group), rows, topk), device=q.device, dtype=torch.float32
         )
         all_gather_single(scores.flatten(), local.flatten(), group)
     else:
         scores = local.unsqueeze(0)
-    return dsa_select_owned_candidates(
+        if rider is not None:
+            gathered_rider = rider.unsqueeze(0)
+    out, lens_out = dsa_select_owned_candidates(
         scores,
         positions,
         metadata.local_page_table,
@@ -671,6 +755,7 @@ def select_owned_dsa_topk(
         out=out,
         lens_out=lens_out,
     )
+    return out, lens_out, gathered_rider
 
 
 def _join_tiles(

@@ -169,6 +169,39 @@ def test_decode_records_match_the_dispatched_decode(tokens, degree, local_heads)
     assert (empty[..., 256] == neg_inf_bits).all()
 
 
+@pytest.mark.parametrize("tokens", [4, 48, 64])
+def test_decode_records_read_a_query_riding_in_a_gathered_chunk(tokens):
+    # One all-gather of every rank's index scores and query lands rank r's
+    # query after its scores: each rank's rows contiguous, the ranks one
+    # whole chunk apart.
+    degree, local_heads = 8, 12
+    q, cache, slots, lengths = _inputs(tokens, degree, local_heads, seed=tokens + 3)
+    kwargs = _kwargs(cache, slots, lengths)
+    expected = dsa_decode_dcp_records(q=q, **kwargs)
+    scores = tokens * TOPK * 4
+    chunks = torch.full(
+        (degree, scores + tokens * local_heads * 576),
+        0x7F,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    rider = chunks[:, scores:].view(q.dtype).view(q.shape)
+    rider.view(torch.uint8).copy_(q.view(torch.uint8))
+    assert not rider.is_contiguous()
+    with assert_no_triton_compile(
+        gfx950_attention._dsa_dense_mfma_kv_kernel,
+        gfx950_attention._dsa_dense_mfma_reduce_kernel,
+    ):
+        assert torch.equal(dsa_decode_dcp_records(q=rider, **kwargs), expected)
+    # A rank stride the query's copy to LDS cannot take is copied first.
+    odd = torch.zeros(
+        (degree, tokens * local_heads * 576 + 8), device="cuda", dtype=torch.uint8
+    )
+    shifted = odd[:, : tokens * local_heads * 576].view(q.dtype).view(q.shape)
+    shifted.view(torch.uint8).copy_(q.view(torch.uint8))
+    assert torch.equal(dsa_decode_dcp_records(q=shifted, **kwargs), expected)
+
+
 def test_decode_records_refuse_unsplit_launches():
     # Past 512 programs (two waves of 256 CUs) the core runs one split and
     # writes its output itself, not through the reduction.

@@ -838,6 +838,63 @@ class DSABackend(PagedAttentionBackend):
     def takes_owned_decode_topk(self, layer) -> bool:
         return len(self.kvp_group) > 1
 
+    def dcp_decode_query_rider(self, layer, q: torch.Tensor) -> torch.Tensor | None:
+        """This rank's decode query heads as the bytes an owned top-k's
+        score gather can carry (``select_owned_dsa_topk_with_rider``), when
+        the sparse decode of ``q`` over that top-k takes the DCP records
+        core: ``forward_sparse_decode`` then reads every rank's heads where
+        that gather lands them (``gathered_query``) instead of gathering
+        them itself. None otherwise. Decided from host sizes and boot
+        configuration, the same on every rank."""
+        if not self.takes_owned_decode_topk(layer):
+            return None
+        heads = self._query_heads(q, layer)
+        q_view = self._decode_query_view(q, layer, heads)
+        if not self._takes_dcp_records_decode(
+            tokens=q.shape[0],
+            heads=heads,
+            topk=self.index_topk,
+            q_dtype=q_view.dtype,
+            kv_dtype=self.data_type,
+        ):
+            return None
+        return q_view.reshape(q.shape[0], -1).contiguous().view(torch.uint8)
+
+    def _decode_query_view(self, q: torch.Tensor, layer, heads: int) -> torch.Tensor:
+        """``q`` as the sparse decode cores read it: ``[rows, heads,
+        head_dim]``, FP8 over an FP8 cache."""
+        q_view = q.view(q.shape[0], heads, layer.head_dim)
+        if self.data_type == torch.float8_e4m3fn:
+            q_view = q_view.to(self.data_type)
+        return q_view
+
+    def _takes_dcp_records_decode(
+        self,
+        *,
+        tokens: int,
+        heads: int,
+        topk: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+    ) -> bool:
+        """Whether a head-sharded decode of ``tokens`` rows of ``heads``
+        query heads over ``topk`` compacted slots takes the records core
+        (``_forward_dcp_records_decode``)."""
+        return (
+            len(self.kvp_group) > 1
+            and not self._query_holds_every_head(heads)
+            and self._dcp_decode_records_core
+            and dsa_decode_dcp_records_supported(
+                tokens=tokens,
+                heads=heads * len(self.kvp_group),
+                topk=topk,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            )
+        )
+
     def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
         # KPool's tail state is indexed by request-pool slot, and its
         # per-forward plan must not outlive the metadata build that
@@ -1496,6 +1553,7 @@ class DSABackend(PagedAttentionBackend):
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
         topk_owned: bool = False,
+        gathered_query: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
@@ -1508,8 +1566,9 @@ class DSABackend(PagedAttentionBackend):
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
                 topk_owned=topk_owned,
+                gathered_query=gathered_query,
             )
-        if topk_owned:
+        if topk_owned or gathered_query is not None:
             raise ValueError("an owned decode top-k needs its slots")
         if len(self.kvp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
@@ -1855,16 +1914,23 @@ class DSABackend(PagedAttentionBackend):
         topk_indices: torch.Tensor,
         topk_lens: torch.Tensor | None,
         topk_owned: bool = False,
+        gathered_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sparse decode over ``topk_indices``: the whole selection as
         scheduler slots, or with ``topk_owned`` (a sharded cache only) this
         rank's share of it as local cache slots, ``topk_lens`` counting them.
+
+        ``gathered_query`` is every rank's ``q`` as the owned top-k's score
+        gather landed it, uint8 ``[ranks, rows, bytes]``: the rider
+        :meth:`dcp_decode_query_rider` gave for ``q``.
         """
         if topk_owned and (len(self.kvp_group) == 1 or topk_lens is None):
             raise ValueError(
                 "an owned decode top-k is one rank's share of a sharded "
                 "cache's selection, with its counts"
             )
+        if gathered_query is not None and not topk_owned:
+            raise ValueError("a gathered query rides an owned top-k's gather")
         if self.kernel_page_size != DSA_SPARSE_PAGE_SIZE:
             raise RuntimeError(
                 f"DSA sparse decode requires kernel_page_size="
@@ -1952,9 +2018,7 @@ class DSABackend(PagedAttentionBackend):
                 kv_seq_lens = _k_row_causal_lengths(seq_lens, q_len_per_req)
 
         heads = self._query_heads(q, layer)
-        q_view = q.view(num_tokens, heads, layer.head_dim)
-        if self.data_type == torch.float8_e4m3fn:
-            q_view = q_view.to(self.data_type)
+        q_view = self._decode_query_view(q, layer, heads)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         max_seqlen_k = int(
@@ -1979,19 +2043,19 @@ class DSABackend(PagedAttentionBackend):
                 )
             # Decided before the query gather, from boot configuration and
             # host sizes every rank of the group shares.
-            if (
-                not keep_all_heads
-                and self._dcp_decode_records_core
-                and dsa_decode_dcp_records_supported(
-                    tokens=num_tokens,
-                    heads=heads * len(self.kvp_group),
-                    topk=topk_slots.shape[1],
-                    q_dtype=q_view.dtype,
-                    kv_dtype=kv_cache.dtype,
-                    kv_lora_rank=self.kv_lora_rank,
-                    qk_rope_head_dim=self.qk_rope_head_dim,
+            records = self._takes_dcp_records_decode(
+                tokens=num_tokens,
+                heads=heads,
+                topk=topk_slots.shape[1],
+                q_dtype=q_view.dtype,
+                kv_dtype=kv_cache.dtype,
+            )
+            if gathered_query is not None and not records:
+                raise ValueError(
+                    "a gathered query is the records core's; this decode "
+                    "does not take it"
                 )
-            ):
+            if records:
                 out = self._forward_dcp_records_decode(
                     q_view=q_view,
                     layer=layer,
@@ -1999,6 +2063,7 @@ class DSABackend(PagedAttentionBackend):
                     topk_slots=topk_slots,
                     topk_lens=topk_lens,
                     q_len_per_req=q_len_per_req,
+                    gathered_query=gathered_query,
                 )
                 return out.reshape(-1, heads * layer.v_head_dim)
             if not keep_all_heads:
@@ -2047,13 +2112,27 @@ class DSABackend(PagedAttentionBackend):
         topk_slots: torch.Tensor,
         topk_lens: torch.Tensor,
         q_len_per_req: int,
+        gathered_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The head-sharded KVP decode as :meth:`_forward_dcp_records_prefill`
         runs the prefill: the same core and exchange as ``dsa_decode`` plus
         ``combine_attention_partials``, bit for bit, without the relayout of
-        the gathered heads or the repack of the partials."""
+        the gathered heads or the repack of the partials. A
+        ``gathered_query`` (``forward_sparse_decode``) stands in for the
+        query gather."""
+        if gathered_query is None:
+            q = gather_query_heads_rank_major(q_view, self.kvp_group)
+        else:
+            tokens, heads, dim = q_view.shape
+            row_bytes = heads * dim * q_view.element_size()
+            if gathered_query.shape != (len(self.kvp_group), tokens, row_bytes):
+                raise ValueError(
+                    f"gathered query {tuple(gathered_query.shape)} does not "
+                    f"hold {len(self.kvp_group)} ranks' {tuple(q_view.shape)} heads"
+                )
+            q = gathered_query.view(q_view.dtype).view(-1, tokens, heads, dim)
         records = dsa_decode_dcp_records(
-            q=gather_query_heads_rank_major(q_view, self.kvp_group),
+            q=q,
             kv_cache=kv_cache,
             topk_slots=topk_slots,
             topk_lens=topk_lens,

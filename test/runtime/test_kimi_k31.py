@@ -2529,6 +2529,177 @@ def test_dsa_core_refuses_a_padded_replay_it_cannot_narrow(case, match) -> None:
     assert calls == []
 
 
+def _run_decode_dsa_core(monkeypatch, calls: list, *, owned: bool, rider: bool):
+    """One verify round of 2 requests x 4 rows through the DSA break, its
+    collaborators recording into ``calls``. The backend takes an owned
+    decode top-k when ``owned``, and gives the query a rider when
+    ``rider``. Returns the output and the published decode top-k."""
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.models import glm5
+    from tokenspeed.runtime.models.glm5 import (
+        GlmDsaDecodeTopK,
+        GlmDsaIndexerOutput,
+        GlmDsaSparseAttentionMixin,
+    )
+
+    requests, q_len = 2, 4
+    rows = requests * q_len
+    placement = object()
+    riders = torch.arange(rows * 16, dtype=torch.int32).to(torch.uint8).view(rows, 16)
+    gathered = torch.ones(8, rows, 16, dtype=torch.uint8)
+    queries = torch.randn(rows, 2, 6)
+
+    def q_b_proj(q_norm):
+        calls.append(("q_b_proj",))
+        return q_norm * 3, None
+
+    def absorb(q, latent_cache, positions, ctx, locs):
+        calls.append(("absorb", ctx.forward_mode, ctx.input_num_tokens))
+        return queries
+
+    def dcp_decode_query_rider(layer, q):
+        calls.append(("rider", q is queries))
+        return riders if rider else None
+
+    def indexer(hidden_states, q_norm, positions):
+        calls.append(("indexer",))
+        return GlmDsaIndexerOutput(
+            query=q_norm, key=hidden_states, weights=positions[:, None].float()
+        )
+
+    def decode_topk(indexer_output, ctx, **kwargs):
+        calls.append(("decode_topk", kwargs.get("query_rider")))
+        return GlmDsaDecodeTopK(
+            topk_indices=torch.zeros(rows, 16, dtype=torch.int32),
+            topk_lens=torch.ones(rows, dtype=torch.int32),
+            owned_placement=placement if owned else None,
+            gathered_query=gathered if "query_rider" in kwargs else None,
+        )
+
+    def attend(Q, ctx, output, **kwargs):
+        calls.append(("attend", Q is queries, kwargs.get("gathered_query")))
+        output.fill_(1.0)
+        return output
+
+    def absorb_and_attend(positions, q, latent, ctx, locs, output, **kwargs):
+        calls.append(("absorb_and_attend", kwargs["topk_owned"]))
+        output.fill_(2.0)
+        return output
+
+    core = object.__new__(GlmDsaSparseAttentionMixin)
+    core.attn_mqa = SimpleNamespace(layer_id=3)
+    core.skip_indexer_topk = False
+    core.is_nextn = False
+    core.owned_decode_topk = True
+    core.num_local_heads = 2
+    core.v_head_dim = 4
+    core.indexer = indexer
+    core.q_b_proj = q_b_proj
+    core.forward_absorb_qkv_proj = absorb
+    core._compute_decode_topk_indices = decode_topk
+    core.forward_absorb_attn_v_proj = attend
+    core.forward_absorb = absorb_and_attend
+    backend = SimpleNamespace(
+        sparse_topk=SimpleNamespace(prefill=None, decode=None),
+        forward_decode_metadata=SimpleNamespace(
+            num_extends=0,
+            seq_lens_k=torch.full((requests,), 300, dtype=torch.int32),
+            page_table=torch.zeros(requests, 5, dtype=torch.int32),
+        ),
+        spec_num_tokens=q_len,
+        write_locations=lambda layer, mode: torch.arange(rows),
+        cache_placement=lambda layer: placement if owned else None,
+        takes_owned_decode_topk=lambda layer: owned,
+        dcp_decode_query_rider=dcp_decode_query_rider,
+    )
+    pool = SimpleNamespace(
+        set_index_k_buffer=lambda *args, **kwargs: calls.append(("index_k_write",))
+    )
+    comm = SimpleNamespace(
+        pre_attn_comm=lambda hidden_states, ctx: hidden_states,
+        needs_pre_attn_all_gather=lambda: False,
+    )
+    ctx = ForwardContext(
+        attn_backend=backend,
+        token_to_kv_pool=pool,
+        bs=requests,
+        num_extends=0,
+        input_num_tokens=rows,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, requests, q_len),
+    )
+    monkeypatch.setattr(
+        glm5, "resolve_write_slots", lambda locs, placement, shared: (locs, None)
+    )
+    out = core.forward_dsa_core(
+        torch.arange(rows),
+        torch.randn(rows, 8),
+        torch.randn(rows, 6),
+        torch.randn(rows, 10),
+        ctx,
+        comm,
+    )
+    return out, backend.sparse_topk.decode, riders, gathered
+
+
+def test_decode_query_rides_the_owned_topk_score_gather(monkeypatch) -> None:
+    """Under an owned decode top-k whose backend gives the query a rider,
+    the decode query is absorbed before the indexer, its rider goes to the
+    top-k selection, and the core gets the gathered query, which the
+    published top-k does not keep."""
+    calls = []
+    out, published, riders, gathered = _run_decode_dsa_core(
+        monkeypatch, calls, owned=True, rider=True
+    )
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    assert calls == [
+        ("q_b_proj",),
+        ("absorb", ForwardMode.DECODE, 8),
+        ("rider", True),
+        ("indexer",),
+        ("index_k_write",),
+        ("decode_topk", riders),
+        ("attend", True, gathered),
+    ]
+    assert published.gathered_query is None
+    assert (out == 1.0).all()
+
+
+def test_decode_query_without_a_rider_keeps_its_own_gather(monkeypatch) -> None:
+    calls = []
+    _, published, _, _ = _run_decode_dsa_core(
+        monkeypatch, calls, owned=True, rider=False
+    )
+    assert [call[0] for call in calls] == [
+        "q_b_proj",
+        "absorb",
+        "rider",
+        "indexer",
+        "index_k_write",
+        "decode_topk",
+        "attend",
+    ]
+    assert calls[-2] == ("decode_topk", None)
+    assert calls[-1] == ("attend", True, None)
+    assert published.gathered_query is None
+
+
+def test_decode_query_outside_an_owned_topk_keeps_the_order(monkeypatch) -> None:
+    calls = []
+    out, _, _, _ = _run_decode_dsa_core(monkeypatch, calls, owned=False, rider=True)
+    assert calls == [
+        ("indexer",),
+        ("index_k_write",),
+        ("decode_topk", None),
+        ("q_b_proj",),
+        ("absorb_and_attend", False),
+    ]
+    assert (out == 2.0).all()
+
+
 _PADDED_BUCKET = 128
 # (slots, prefix lens, new lens, blocks); buckets end over a page past the live rows.
 _PADDED_CASES = {

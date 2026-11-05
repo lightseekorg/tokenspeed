@@ -792,6 +792,9 @@ def _decode_records_worker(rank, degree, rendezvous, use_pynccl):
         process_group_manager,
     )
     from tokenspeed.runtime.layers.attention.backends.paged import dsa
+    from tokenspeed.runtime.layers.attention.dcp.placement import (
+        compact_owned_cache_slots,
+    )
 
     device = torch.device("cuda", rank)
     dist.init_process_group(
@@ -869,6 +872,31 @@ def _decode_records_worker(rank, degree, rendezvous, use_pynccl):
                 # Bit for bit, signed zeros included.
                 assert torch.equal(off.view(torch.int16), on.view(torch.int16))
                 assert not off[0].any()
+
+                # The records core reads the query where an owned top-k's
+                # score gather landed its rider, bit for bit.
+                rider = leaf.dcp_decode_query_rider(layer, q)
+                assert (rider is not None) == records_arm
+                if rider is None:
+                    continue
+                gathered = rider.new_empty((degree, *rider.shape))
+                dist.all_gather_into_tensor(gathered, rider)
+                owned_slots, owned_lens = compact_owned_cache_slots(
+                    slots, lengths, leaf.cache_placement(layer)
+                )
+                launches.clear()
+                ridden = leaf.forward_sparse_decode(
+                    q=q,
+                    layer=layer,
+                    token_to_kv_pool=pool,
+                    bs=requests,
+                    topk_indices=owned_slots,
+                    topk_lens=owned_lens,
+                    topk_owned=True,
+                    gathered_query=gathered,
+                )
+                assert launches == [shape]
+                assert torch.equal(on.view(torch.int16), ridden.view(torch.int16))
         torch.cuda.synchronize()
         dist.barrier(group=coordination)
     finally:

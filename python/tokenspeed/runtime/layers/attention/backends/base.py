@@ -184,6 +184,14 @@ class CachePoolBinding:
         selection as scheduler slots."""
         return False
 
+    def dcp_decode_query_rider(
+        self, layer: PagedAttention, q: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Bytes of ``q`` for an owned decode top-k's score gather to carry
+        to ``layer``'s sparse decode (``gathered_query``), or None where
+        that decode gathers its query itself."""
+        return None
+
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         """Whether ``layer``'s reads apply the per-tensor scales its FP8 cache
         was written at (``PagedAttention.fp8_kv_scales``)."""

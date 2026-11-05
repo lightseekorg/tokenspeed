@@ -331,6 +331,113 @@ def test_owned_decode_topk_needs_the_host_and_the_backend(
     assert record.owned_placement is None
 
 
+@pytest.mark.parametrize("takes", [True, False])
+def test_a_query_rider_rides_only_an_owned_selection(
+    recorded, owned_selects, monkeypatch, takes
+):
+    _, selects = recorded
+    riders = []
+    gathered = torch.ones(4, 3 * 8, 16, dtype=torch.uint8)
+
+    def select_owned_with_rider(q, weights, index_k_cache, *, rider, **kw):
+        riders.append(rider)
+        kw["out"].fill_(5)
+        kw["lens_out"].fill_(1)
+        return kw["out"], kw["lens_out"], gathered
+
+    monkeypatch.setattr(
+        glm5, "select_owned_dsa_topk_with_rider", select_owned_with_rider
+    )
+    seq_lens, page_table, q_len = _batch()
+    rows = seq_lens.numel() * q_len
+    rider = torch.zeros(rows, 16, dtype=torch.uint8)
+    output = SimpleNamespace(
+        query_rows=lambda start, end: torch.zeros(end - start, 4, 128),
+        weights=torch.zeros(rows, 4),
+    )
+    record = _owned_layer()._compute_decode_topk_indices_portable(
+        indexer_output=output,
+        ctx=_owned_ctx(seq_lens, q_len, takes=takes),
+        seq_lens=seq_lens,
+        page_table=page_table,
+        q_len_per_req=q_len,
+        decode_start=0,
+        num_tokens=rows,
+        num_decode_tokens=rows,
+        topk=_TOPK,
+        query_rider=rider,
+    )
+
+    # The rider replaces the plain owned selection; a top-k selected
+    # otherwise leaves the query to its core's own gather.
+    assert not owned_selects
+    if takes:
+        assert riders == [rider] and not selects
+        assert record.gathered_query is gathered
+        assert (record.topk_indices == 5).all()
+    else:
+        assert riders == [] and len(selects) == 1
+        assert record.gathered_query is None
+
+
+@pytest.mark.parametrize("offloaded", [False, True])
+def test_the_router_and_hybrid_hand_the_query_rider_to_the_dsa_leaf(offloaded):
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
+        CacheGroupRouter,
+    )
+
+    rider = torch.zeros(4, 16, dtype=torch.uint8)
+    leaf = SimpleNamespace(
+        takes_owned_decode_topk=lambda layer: True,
+        dcp_decode_query_rider=lambda layer, q: rider,
+    )
+    router = object.__new__(CacheGroupRouter)
+    router.leaves = {"full": leaf}
+    router._offload_adapter = (
+        SimpleNamespace(offloads_layer=lambda layer_id: True) if offloaded else None
+    )
+    hybrid = object.__new__(HybridLinearAttnBackend)
+    hybrid.full_attn_layers = {3}
+    hybrid.full_attn_backend = router
+    hybrid.linear_attn_backend = SimpleNamespace(
+        dcp_decode_query_rider=lambda layer, q: pytest.fail("not a DSA layer")
+    )
+    layer = SimpleNamespace(layer_id=3, group_id="full")
+
+    # An offloaded layer reads scheduler slots: no owned top-k to ride.
+    expected = None if offloaded else rider
+    assert hybrid.dcp_decode_query_rider(layer, torch.zeros(4, 2)) is expected
+
+
+@pytest.mark.parametrize("gathered", [False, True])
+def test_a_gathered_query_reaches_attention_only_when_given(gathered):
+    calls = []
+    layer = _layer()
+    layer.num_local_heads, layer.kv_lora_rank, layer.v_head_dim = 1, 2, 2
+    layer.attn_mqa = lambda Q, **kw: calls.append(kw) or torch.zeros(1, 2)
+    layer.project_latent_values = lambda attn_output, output, gate: None
+    query = torch.zeros(4, 1, 8, dtype=torch.uint8)
+
+    layer.forward_absorb_attn_v_proj(
+        torch.zeros(1, 2),
+        None,
+        torch.zeros(1, 2),
+        topk_indices=torch.zeros(1, _TOPK, dtype=torch.int32),
+        topk_lens=torch.ones(1, dtype=torch.int32),
+        topk_owned=True,
+        gathered_query=query if gathered else None,
+    )
+
+    [kwargs] = calls
+    assert kwargs["topk_owned"] is True
+    assert ("gathered_query" in kwargs) is gathered
+    if gathered:
+        assert kwargs["gathered_query"] is query
+
+
 def test_an_owned_decode_topk_is_read_under_its_placement_only():
     record = glm5.GlmDsaDecodeTopK(
         topk_indices=torch.arange(8, dtype=torch.int32).view(4, 2),
