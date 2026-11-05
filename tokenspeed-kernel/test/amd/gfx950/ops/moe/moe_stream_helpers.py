@@ -24,6 +24,11 @@
 from types import SimpleNamespace
 
 import torch
+from tokenspeed_kernel_amd._triton import gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_stream
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._stream_sync import (
+    stream_sync_compile_options,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
     preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
@@ -43,6 +48,51 @@ DIVISIBLE = {
     "stride_s2nb",
     "stride_xsnb",
 }
+
+
+def compile_moe_stream(rows, tail):
+    """Compile the stream kernel for gfx950 without a GPU, as a launch with
+    ``rows`` rows and tail share ``tail`` (numerator, denominator) does."""
+    fn = moe_stream.gluon_mxfp4_moe_stream_gfx950
+    const = dict(
+        ROWS=rows,
+        TOPK=8,
+        TAIL_NUM=tail[0],
+        TAIL_DEN=tail[1],
+        SWIGLU_ALPHA=1.0,
+        SWIGLU_LIMIT=0.0,
+        SWIGLU_BETA=0.0,
+        **PHYS,
+    )
+    types = dict(
+        epochs="*i64",
+        claims="*i64",
+        ids="*i32",
+        xq="*u8",
+        xs="*u8",
+        w13="*u8",
+        s13="*u8",
+        w2="*u8",
+        s2="*u8",
+        mids="*u8",
+        mids_s="*i32",
+        tags="*i32",
+        out="*bf16",
+    )
+    signature = {n: types.get(n, "i32") for n in fn.arg_names if n not in const}
+    attrs = {
+        (i,): [["tt.divisibility", 16]]
+        for i, n in enumerate(fn.arg_names)
+        if signature.get(n, "").startswith("*") or n in DIVISIBLE
+    }
+    source = gluon._runtime.GluonASTSource(fn, signature, constexprs=const, attrs=attrs)
+    target = triton.backends.compiler.GPUTarget("hip", "gfx950", 64)
+    return triton.compile(
+        source,
+        target=target,
+        options={"num_warps": 8, **stream_sync_compile_options()},
+    )
+
 
 # Recorded verify routings of an expert-TP8 decode: 4 decode steps each at 8
 # and 16 rows (top-8 expert ids per row).
