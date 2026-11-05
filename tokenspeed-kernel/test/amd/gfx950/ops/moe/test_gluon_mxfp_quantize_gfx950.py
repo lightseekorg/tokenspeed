@@ -365,9 +365,8 @@ def test_swiglu_quantize_layout_specialization_is_bit_exact_gfx950(
     # HSA_STATUS_ERROR_OUT_OF_RESOURCES, because the scale was reduced by a
     # single workgroup materialising next_power_of_2(numel) elements; 32 and 48
     # survived only by spilling, at up to 50x the cost of the small widths.
-    # 18 and 19 straddle the single-pass bound at hidden 3584 (padded 65,536
-    # against 131,072), so both quantizer strategies are covered.
-    [1, 8, 16, 18, 19, 32, 48, 49, 64, 128, 1024],
+    # 4 and 5 straddle the single-pass bound at hidden 3584 (16,384 vs 32,768 padded).
+    [1, 4, 5, 8, 16, 18, 19, 32, 48, 49, 64, 128, 1024],
 )
 def test_dynamic_fp8_quantize_scales_past_one_workgroup_gfx950(
     num_tokens: int,
@@ -412,10 +411,11 @@ def test_dynamic_fp8_quantize_scales_past_one_workgroup_gfx950(
 def test_dynamic_fp8_quantize_single_pass_bound_matches_spill_cliff() -> None:
     """Pin which strategy each size takes.
 
-    The bound is a measured property of the one-workgroup form, not a tuning
-    knob: it must keep the Kimi-K3 decode widths that fit on the single-launch
-    path (that path is ~7 us/call cheaper there, over 92 MoE layers a forward)
-    while pushing anything past the spill cliff onto the grid reduction.
+    The bound is a measured property of the one-workgroup form under graph
+    replay, not a tuning knob: it keeps the Kimi-K3 one-request verify window
+    (M=4) on the single launch, 0.9 us cheaper there, and moves every wider
+    window onto the grid reduction, which is already ahead at M=5 and 1.9x
+    ahead at M=9-18.
     """
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.quantize import (
         _DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS,
@@ -424,10 +424,11 @@ def test_dynamic_fp8_quantize_single_pass_bound_matches_spill_cliff() -> None:
 
     routed_hidden = 3584
 
-    # Small decode widths keep the one-launch form, where it is ~3x cheaper.
-    assert _dynamic_fp8_use_single_pass(16 * routed_hidden)
-    # Kimi-K3 decode at concurrency 8 with EAGLE3 is M=32, which already pads to
-    # 131,072 -- a size where one workgroup costs more than the grid reduction.
+    # One request's EAGLE3 verify window keeps the one-launch form.
+    assert _dynamic_fp8_use_single_pass(4 * routed_hidden)
+    # 2-4 requests pad to 32,768-65,536, where one workgroup loses to two launches.
+    assert not _dynamic_fp8_use_single_pass(5 * routed_hidden)
+    assert not _dynamic_fp8_use_single_pass(16 * routed_hidden)
     assert not _dynamic_fp8_use_single_pass(32 * routed_hidden)
     # Concurrency 16 is M=64, where the one-workgroup form used to abort the
     # dispatch outright.

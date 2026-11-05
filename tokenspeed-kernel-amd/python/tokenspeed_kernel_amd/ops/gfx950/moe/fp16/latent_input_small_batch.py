@@ -81,6 +81,12 @@ def gluon_latent_input_small_batch_gfx950(
     SPLIT_K: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     WARPS_M: gl.constexpr,
+    REGION0_START: gl.constexpr = 0,
+    REGION0_TILES: gl.constexpr = -1,
+    REGION1_START: gl.constexpr = 0,
+    REGION1_TILES: gl.constexpr = 0,
+    REGION2_START: gl.constexpr = 0,
+    REGION2_TILES: gl.constexpr = 0,
 ):
     """Project one token tile against one column tile of the packed weight.
 
@@ -90,12 +96,31 @@ def gluon_latent_input_small_batch_gfx950(
     handful of compute units. Each split owns its own partial rather than
     accumulating in place, because every split of a tile targets the same
     columns and would otherwise serialize on those cache lines.
+
+    By default the tiles cover all TOTAL_N columns. Otherwise REGIONi_TILES
+    tiles start at column REGIONi_START of each of up to three regions; a
+    column's value does not depend on where its tile starts.
     """
     pid = gl.program_id(axis=0)
-    num_pid_n: gl.constexpr = TOTAL_N // BLOCK_N
+    ALL_TILES: gl.constexpr = REGION0_TILES < 0
+    num_pid_n: gl.constexpr = (
+        TOTAL_N // BLOCK_N
+        if ALL_TILES
+        else REGION0_TILES + REGION1_TILES + REGION2_TILES
+    )
     pid_n = pid % num_pid_n
     split_id = (pid // num_pid_n) % SPLIT_K
     pid_m = pid // (num_pid_n * SPLIT_K)
+    if ALL_TILES:
+        first_column = pid_n * BLOCK_N
+    else:
+        first_column = REGION0_START + pid_n * BLOCK_N
+        if pid_n >= REGION0_TILES:
+            first_column = REGION1_START + (pid_n - REGION0_TILES) * BLOCK_N
+        if pid_n >= REGION0_TILES + REGION1_TILES:
+            first_column = (
+                REGION2_START + (pid_n - REGION0_TILES - REGION1_TILES) * BLOCK_N
+            )
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -138,7 +163,7 @@ def gluon_latent_input_small_batch_gfx950(
     bk_layout: gl.constexpr = gl.SliceLayout(1, gload_b)
     bn_layout: gl.constexpr = gl.SliceLayout(0, gload_b)
     offs_bk = gl.arange(0, BLOCK_K, layout=bk_layout)
-    offs_bn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=bn_layout)
+    offs_bn = first_column + gl.arange(0, BLOCK_N, layout=bn_layout)
     b_offsets = (offs_bn[None, :] * HIDDEN + offs_bk[:, None]).to(gl.int32)
 
     k_start = split_id * (HIDDEN // SPLIT_K)
@@ -177,7 +202,7 @@ def gluon_latent_input_small_batch_gfx950(
     cm_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
     cn_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
     offs_cm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=cm_layout)
-    offs_cn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=cn_layout)
+    offs_cn = first_column + gl.arange(0, BLOCK_N, layout=cn_layout)
     offsets = (
         split_id * split_stride + offs_cm[:, None] * TOTAL_N + offs_cn[None, :]
     ).to(gl.int32)
