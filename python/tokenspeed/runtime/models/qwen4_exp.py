@@ -246,8 +246,13 @@ class _Qwen4ExpDecoderMixin:
         ctx: ForwardContext,
     ):
         if not ctx.forward_mode.is_idle():
+            residual = residuals[0]
+            if self.comm_manager.needs_pre_attn_all_gather():
+                # mix() ran on the gathered rows, but post_attn_comm expects
+                # the residual in the previous layer's scattered layout.
+                residual = self.comm_manager.slice_scattered_rows(residual, ctx)
             attention_output, residual = self.comm_manager.post_attn_comm(
-                attention_output, residuals[0], ctx
+                attention_output, residual, ctx
             )
             residuals = self.attn_hyper_connection.norm_for(residual, residuals)
         # The MLP consumes this updated residual immediately, so inject the
