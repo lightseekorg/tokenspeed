@@ -70,3 +70,19 @@ entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 256, i32 1, i32 0)
   ret i32 0
 }
+
+; Release drain: wait until this wave's vector memory operations completed
+; (s_waitcnt vmcnt(0); 3952 = 0x0F70 leaves expcnt and lgkmcnt untouched), so
+; its stores reached the L2 before a later arrival or flag store. The
+; workgroup-scope release fence keeps earlier stores above the wait in the IR
+; (llvm.amdgcn.s.waitcnt is declared not to touch memory, so on its own a
+; store could move across it) and adds no cache maintenance on gfx950. An
+; agent-scope release would also write back the whole L2 (buffer_wbl2).
+declare void @llvm.amdgcn.s.waitcnt(i32 immarg)
+
+define i32 @__tokenspeed_sched_release_drain() alwaysinline {
+entry:
+  fence syncscope("workgroup") release
+  call void @llvm.amdgcn.s.waitcnt(i32 3952)
+  ret i32 0
+}
