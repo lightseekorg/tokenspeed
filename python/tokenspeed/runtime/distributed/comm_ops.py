@@ -491,7 +491,8 @@ def acquire_exchange_input(
     backend: CommBackend | None = None,
 ) -> torch.Tensor:
     """Acquire ``nbytes`` (uint8) for a producer to fill, then send with
-    :func:`all_gather_single` or an even :func:`all_to_all_single`.
+    :func:`all_gather_single`, an even :func:`all_to_all_single` or
+    :func:`try_combine_records`.
 
     This function does not launch a collective. A backend whose exchange
     pulls inputs in place lends its storage, which the next such exchange's
@@ -501,6 +502,32 @@ def acquire_exchange_input(
     if backend is None:
         backend = get_global_backend()
     return backend.acquire_exchange_input(nbytes, like, group)
+
+
+def try_combine_records(
+    records: torch.Tensor,
+    group: Group,
+    *,
+    head_dim: int,
+    partial_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    backend: CommBackend | None = None,
+) -> torch.Tensor | None:
+    """Exchange DCP attention ``records`` (int32 ``[len(group), tokens,
+    local_heads, words + 1]``, row ``r`` for group rank ``r``) and combine
+    this rank's without a sink in one step, bit for bit what an even
+    :func:`all_to_all_single` and ``combine_dcp_attention_partials`` give;
+    None where the backend has no such step. Every rank of ``group``
+    decides alike."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.try_combine_records(
+        records,
+        group,
+        head_dim=head_dim,
+        partial_dtype=partial_dtype,
+        output_dtype=output_dtype,
+    )
 
 
 def all_gather(

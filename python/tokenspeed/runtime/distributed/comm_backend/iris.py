@@ -140,6 +140,26 @@ class IrisBackend(CommBackend):
             return super().acquire_exchange_input(nbytes, like, group)
         return borrowed
 
+    def try_combine_records(
+        self,
+        records: torch.Tensor,
+        group: Group,
+        *,
+        head_dim: int,
+        partial_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Pull and combine records borrowed from the group's pull exchange."""
+        state = self._pull_exchanges.get(group)
+        if state is None or not state.can_combine_records(
+            records,
+            head_dim=head_dim,
+            partial_dtype=partial_dtype,
+            output_dtype=output_dtype,
+        ):
+            return None
+        return state.combine_records(records, head_dim=head_dim)
+
     def get_prepared_all_gather(
         self, group: Group, dtype: torch.dtype
     ) -> "IrisAllGather | None":

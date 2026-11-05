@@ -540,6 +540,75 @@ def test_iris_pull_exchange_serves_the_inputs_it_lends():
     assert exchange.all_gather.call_count == exchange.all_to_all.call_count == 1
 
 
+_RECORDS_COMBINE = {
+    "head_dim": 8,
+    "partial_dtype": torch.bfloat16,
+    "output_dtype": torch.bfloat16,
+}
+
+
+def test_iris_pull_exchange_combines_only_the_records_it_lends():
+    fallback = Mock()
+    backend = IrisBackend(fallback)
+    group = (0, 1)
+    lent = torch.empty((2, 1, 1, 5), dtype=torch.int32)
+    combined = torch.empty(1)
+    exchange = Mock()
+    exchange.can_combine_records.side_effect = (
+        lambda records, **_: records.data_ptr() == lent.data_ptr()
+    )
+    exchange.combine_records.return_value = combined
+    backend.install_pull_exchange(group, exchange)
+
+    assert backend.try_combine_records(lent, group, **_RECORDS_COMBINE) is combined
+    exchange.can_combine_records.assert_called_once_with(lent, **_RECORDS_COMBINE)
+    exchange.combine_records.assert_called_once_with(lent, head_dim=8)
+    # Records it did not lend, or a group without an exchange: the caller's
+    # all-to-all and combine.
+    assert backend.try_combine_records(lent.clone(), group, **_RECORDS_COMBINE) is None
+    assert backend.try_combine_records(lent, (0, 2), **_RECORDS_COMBINE) is None
+    exchange.combine_records.assert_called_once()
+    assert not fallback.method_calls
+
+
+def test_dcp_records_combine_asks_the_backend_first(monkeypatch):
+    from tokenspeed.runtime.distributed import comm_ops
+    from tokenspeed.runtime.layers.attention.dcp import comm as dcp_comm
+
+    backend = Mock()
+    monkeypatch.setattr(comm_ops, "get_global_backend", lambda: backend)
+    combine = Mock()
+    monkeypatch.setattr(dcp_comm, "combine_dcp_attention_partials", combine)
+    records = torch.zeros((2, 3, 1, 5), dtype=torch.int32)
+    fused = torch.empty(1)
+    backend.try_combine_records.return_value = fused
+
+    assert (
+        dcp_comm.combine_attention_records(
+            records, group=(0, 1), sink=None, **_RECORDS_COMBINE
+        )
+        is fused
+    )
+    backend.try_combine_records.assert_called_once_with(
+        records, (0, 1), **_RECORDS_COMBINE
+    )
+    backend.all_to_all_single.assert_not_called()
+    combine.assert_not_called()
+    # Declined, or with a sink: the all-to-all, then the combine.
+    backend.try_combine_records.return_value = None
+    dcp_comm.combine_attention_records(
+        records, group=(0, 1), sink=None, **_RECORDS_COMBINE
+    )
+    backend.try_combine_records.reset_mock()
+    sink = torch.zeros(1)
+    dcp_comm.combine_attention_records(
+        records, group=(0, 1), sink=sink, **_RECORDS_COMBINE
+    )
+    backend.try_combine_records.assert_not_called()
+    assert backend.all_to_all_single.call_count == combine.call_count == 2
+    assert combine.call_args.kwargs["sink"] is sink
+
+
 def test_exchanges_route_through_iris_only_where_it_reaches(backend, monkeypatch):
     monkeypatch.setattr(backend, "_iris_reaches", lambda group: group == (0, 1))
     out, input, like = torch.empty(8), torch.empty(4), torch.empty(1)
@@ -559,6 +628,13 @@ def test_exchanges_route_through_iris_only_where_it_reaches(backend, monkeypatch
     ordinary = backend.acquire_exchange_input(4, like, (0, 2))
     assert ordinary.dtype == torch.uint8 and ordinary.numel() == 4
     backend._iris.acquire_exchange_input.assert_called_once_with(4, like, (0, 1))
+    combined = torch.empty(1)
+    backend._iris.try_combine_records.return_value = combined
+    assert backend.try_combine_records(input, (0, 1), **_RECORDS_COMBINE) is combined
+    assert backend.try_combine_records(input, (0, 2), **_RECORDS_COMBINE) is None
+    backend._iris.try_combine_records.assert_called_once_with(
+        input, (0, 1), **_RECORDS_COMBINE
+    )
 
 
 # ---- The one routing decision ----------------------------------------------
