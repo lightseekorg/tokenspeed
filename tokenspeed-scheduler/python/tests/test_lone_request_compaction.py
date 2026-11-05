@@ -237,3 +237,39 @@ def test_unwritten_blocks_re_place_across_buckets_under_kv_parallelism() -> None
     assert stats.device_evictions.compaction.blocks == 2
     _step(scheduler, shards=2)
     assert scheduler.request_token_size("R") == -1
+
+
+# Under KV parallelism a lone first admission whose probe hits a Device tail
+# can fail every plan with nothing to move (docs/design/scheduler.md §1.4):
+# three parents of one block of each of two buckets, the history group alone.
+# X (17 tokens) leaves its two pages in bucket 1 and its one-token tail in
+# bucket 0. R, X plus 14 tokens, needs the tail's private copy beside the
+# tail and its prompt end's block with that block's copy-in block in one
+# bucket, which neither bucket has room for. On the fused role R is aborted
+# with AbortReason.NoProgress at the 4096th consecutive empty plan
+# (Scheduler::kNoProgressAbortPlans), and the runtime fails it toward its
+# client.
+def test_lone_first_admission_that_can_never_fit_is_aborted() -> None:
+    cfg = _config(parents=3, chunk=16, packing=2, shards=2)
+    cfg.cache_groups = cfg.cache_groups[:1]
+    scheduler = ts.Scheduler(cfg)
+    assert scheduler.max_single_request_tokens() == 32
+    prompt = list(range(20000, 20017))
+    _submit(scheduler, "X", prompt)
+    for _ in range(4):
+        _step(scheduler, shards=2)
+    assert scheduler.request_token_size("X") == -1
+
+    _submit(scheduler, "R", prompt + list(range(50000, 50014)))
+    aborts = []
+    for plan_number in range(1, 4097):
+        plan = _step(scheduler, shards=2)
+        assert not any(op.request_ids for op in plan.forward)
+        aborts += [(plan_number, abort) for abort in plan.aborts]
+    assert [(n, abort.request_id, abort.reason) for n, abort in aborts] == [
+        (4096, "R", ts.AbortReason.NoProgress)
+    ]
+    assert "no progress for 4096 consecutive plans" in aborts[0][1].detail
+    assert scheduler.host_cache_stats().lone_compactions == 0
+    _step(scheduler, shards=2)
+    assert scheduler.request_token_size("R") == -1

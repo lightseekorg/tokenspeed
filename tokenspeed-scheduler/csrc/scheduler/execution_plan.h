@@ -38,6 +38,13 @@ enum class AbortReason : std::uint8_t {
     // by aborting it instead of imaging it (Scheduler::onImageDoesNotFit); or
     // the debug knob's retraction was refused after publishing its pages.
     kImageDoesNotFit = 0,
+    // On the fused role, alone (or beside requests holding no pages) and
+    // quiescent, it made no progress for Scheduler::kNoProgressAbortPlans
+    // consecutive plans while lone-request compaction had nothing left to
+    // move (a restore: while it did not fit even claiming no cached page):
+    // its admission (or restore) can never be funded, so it is aborted
+    // instead of waiting for good (docs/design/scheduler.md §1.4).
+    kNoProgress = 1,
 };
 
 // A request the scheduler finished this round: already Finished on every
