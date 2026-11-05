@@ -100,6 +100,121 @@ def _gather_selected_candidates(
     tl.store(counts + row, count)
 
 
+@triton.jit(do_not_specialize=["rows"])
+def _select_through_threshold(
+    records,
+    scores,
+    order,
+    positions,
+    counts,
+    rows,
+    COLUMNS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    TOPK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Any exact top-k has the k-th largest score as minimum and keeps all above it.
+    row = tl.program_id(0).to(tl.int64)
+    threshold = tl.full((), float("inf"), tl.float32)
+    for start in range(0, TOPK, TOPK_BLOCK):
+        col = start + tl.arange(0, TOPK_BLOCK)
+        selected = tl.load(order + row * TOPK + col, col < TOPK, other=-1)
+        score = tl.load(
+            scores + row * COLUMNS + selected,
+            (col < TOPK) & (selected >= 0),
+            other=float("inf"),
+        )
+        threshold = tl.minimum(threshold, tl.min(score, axis=0))
+    above = tl.full((), 0, tl.int32)
+    for start in range(0, TOPK, TOPK_BLOCK):
+        col = start + tl.arange(0, TOPK_BLOCK)
+        selected = tl.load(order + row * TOPK + col, col < TOPK, other=-1)
+        score = tl.load(
+            scores + row * COLUMNS + selected,
+            (col < TOPK) & (selected >= 0),
+            other=-float("inf"),
+        )
+        above += tl.sum((score > threshold).to(tl.int32))
+    # Keep scores above it plus the first ties, in candidate order, so all ranks agree.
+    count = tl.full((), 0, tl.int32)
+    tied = tl.full((), 0, tl.int32)
+    for start in range(0, COLUMNS, BLOCK):
+        col = start + tl.arange(0, BLOCK)
+        score = tl.load(
+            scores + row * COLUMNS + col, col < COLUMNS, other=-float("inf")
+        )
+        tie = (col < COLUMNS) & (score == threshold)
+        tie_rank = tied + tl.cumsum(tie.to(tl.int32), axis=0) - 1
+        keep = ((score > threshold) | (tie & (tie_rank < TOPK - above))) & (
+            score > -float("inf")
+        )
+        source, local = col // WIDTH, col % WIDTH
+        position = tl.load(
+            records + ((source * rows + row) * WIDTH + local) * 2, keep, other=-1
+        )
+        slot = count + tl.cumsum(keep.to(tl.int32), axis=0) - 1
+        tl.store(positions + row * TOPK + slot, position, keep)
+        count += tl.sum(keep.to(tl.int32))
+        tied += tl.sum(tie.to(tl.int32))
+    for start in range(0, TOPK, TOPK_BLOCK):
+        col = start + tl.arange(0, TOPK_BLOCK)
+        tl.store(positions + row * TOPK + col, -1, (col >= count) & (col < TOPK))
+    tl.store(counts + row, count)
+
+
+def rank_major_scores(records: torch.Tensor) -> torch.Tensor:
+    """FP32 [rows, shards * candidates] scores of int32 [shards, rows,
+    candidates, 2] records, rank-major; invalid candidates score ``-inf``."""
+    degree, rows, width, _ = records.shape
+    scores = torch.empty(
+        (rows, degree * width), device=records.device, dtype=torch.float32
+    )
+    if rows:
+        _extract_rank_major_scores[
+            (rows, triton.cdiv(degree * width, _SCORE_BLOCK_SIZE))
+        ](
+            records,
+            scores,
+            rows,
+            WIDTH=width,
+            DEGREE=degree,
+            BLOCK=_SCORE_BLOCK_SIZE,
+        )
+    return scores
+
+
+def select_through_threshold(
+    records: torch.Tensor, scores: torch.Tensor, order: torch.Tensor, *, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic top-k positions from any exact top-k ``order`` of
+    ``scores`` (:func:`rank_major_scores` of ``records``).
+
+    Keeps every candidate scoring above the k-th largest score and, among the
+    candidates tied at it, the first ones in candidate order. Returns int32
+    [rows, topk] positions in candidate order with -1 after the valid ones,
+    and int32 [rows] counts of valid positions.
+    """
+    _, rows, width, _ = records.shape
+    positions = torch.empty((rows, topk), device=records.device, dtype=torch.int32)
+    counts = torch.empty((rows,), device=records.device, dtype=torch.int32)
+    if rows:
+        _select_through_threshold[(rows,)](
+            records,
+            scores,
+            order,
+            positions,
+            counts,
+            rows,
+            COLUMNS=scores.shape[1],
+            WIDTH=width,
+            TOPK=topk,
+            TOPK_BLOCK=triton.next_power_of_2(min(topk, _MAX_GATHER_BLOCK_SIZE)),
+            BLOCK=_MAX_GATHER_BLOCK_SIZE,
+        )
+    return positions, counts
+
+
 def merge_packed_index_candidates(
     records: torch.Tensor, *, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -109,23 +224,12 @@ def merge_packed_index_candidates(
     and selection use the same rank/candidate order as a row-major exchange.
     Returns int32 [rows, topk] positions and [rows] counts; padding is -1.
     """
-    degree, rows, width, _ = records.shape
-    scores = torch.empty(
-        (rows, degree * width), device=records.device, dtype=torch.float32
-    )
+    _, rows, width, _ = records.shape
     positions = torch.empty((rows, topk), device=records.device, dtype=torch.int32)
     counts = torch.empty((rows,), device=records.device, dtype=torch.int32)
     if rows == 0:
         return positions, counts
-    _extract_rank_major_scores[(rows, triton.cdiv(degree * width, _SCORE_BLOCK_SIZE))](
-        records,
-        scores,
-        rows,
-        WIDTH=width,
-        DEGREE=degree,
-        BLOCK=_SCORE_BLOCK_SIZE,
-    )
-    values, order = torch.topk(scores, topk, dim=-1)
+    values, order = torch.topk(rank_major_scores(records), topk, dim=-1)
     _gather_selected_candidates[(rows,)](
         records,
         order,
