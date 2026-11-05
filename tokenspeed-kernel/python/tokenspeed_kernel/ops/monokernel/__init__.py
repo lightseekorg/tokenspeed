@@ -45,8 +45,8 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "FusedDecodeLayer",
-    "qwen4_exp_mtp_front",
-    "select_qwen4_exp_mtp_front",
+    "qwen4_exp_mtp_fuse_inputs",
+    "select_qwen4_exp_mtp_fuse_inputs_kernel",
     "prepare_qwen4_exp_delta_layer",
     "prepare_qwen4_exp_qsa_layer",
     "qwen4_exp_delta_layer_decode",
@@ -325,14 +325,16 @@ def qwen4_exp_qsa_layer_decode(
     )
 
 
-def select_qwen4_exp_mtp_front(max_rows: int, override: str | None = None) -> Any:
-    """The kernel of :func:`qwen4_exp_mtp_front` for up to ``max_rows``
+def select_qwen4_exp_mtp_fuse_inputs_kernel(
+    max_rows: int, override: str | None = None
+) -> Any:
+    """The kernel of :func:`qwen4_exp_mtp_fuse_inputs` for up to ``max_rows``
     rows, or None when no kernel serves them here."""
     signature = format_signature(hidden=dense_tensor_format(torch.bfloat16))
     try:
         return select_kernel(
             "monokernel",
-            "qwen4_exp_mtp_front",
+            "qwen4_exp_mtp_fuse_inputs",
             signature,
             traits={"rows": max_rows},
             override=override,
@@ -343,7 +345,7 @@ def select_qwen4_exp_mtp_front(max_rows: int, override: str | None = None) -> An
         return None
 
 
-def qwen4_exp_mtp_front(
+def qwen4_exp_mtp_fuse_inputs(
     kernel: Any,
     input_ids: torch.Tensor,
     embedding: torch.Tensor,
@@ -360,7 +362,7 @@ def qwen4_exp_mtp_front(
     for each of the 4 hyper-connection streams.
 
     Args:
-        kernel: From :func:`select_qwen4_exp_mtp_front`.
+        kernel: From :func:`select_qwen4_exp_mtp_fuse_inputs_kernel`.
         input_ids: int ``[rows]`` tokens (``rows`` at most the selected
             ``max_rows``).
         embedding: BF16 ``[vocab, H]`` token embedding (unsharded).

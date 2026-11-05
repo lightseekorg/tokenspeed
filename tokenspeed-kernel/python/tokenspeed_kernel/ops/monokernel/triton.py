@@ -27,13 +27,13 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-# Rows of one launch of the MTP draft front: a decode step's rows.
-MTP_FRONT_ROWS = 4
+# Rows of one launch of the fused MTP draft input: a decode step's rows.
+MTP_FUSE_INPUTS_MAX_ROWS = 4
 _STREAMS = 4  # hyper-connection streams of the hidden row
 
 
 @triton.jit
-def _qwen4_exp_mtp_front_kernel(
+def _qwen4_exp_mtp_fuse_inputs_kernel(
     ids,
     emb,
     emb_stride,
@@ -110,14 +110,14 @@ def _qwen4_exp_mtp_front_kernel(
 
 @register_kernel(
     "monokernel",
-    "qwen4_exp_mtp_front",
-    name="triton_qwen4_exp_mtp_front",
+    "qwen4_exp_mtp_fuse_inputs",
+    name="triton_qwen4_exp_mtp_fuse_inputs",
     solution="triton",
     signatures=format_signatures("hidden", "dense", {torch.bfloat16}),
     priority=Priority.PORTABLE,
-    traits={"rows": frozenset(range(1, MTP_FRONT_ROWS + 1))},
+    traits={"rows": frozenset(range(1, MTP_FUSE_INPUTS_MAX_ROWS + 1))},
 )
-def triton_qwen4_exp_mtp_front(
+def triton_qwen4_exp_mtp_fuse_inputs(
     input_ids: torch.Tensor,
     embedding: torch.Tensor,
     hidden: torch.Tensor,
@@ -128,10 +128,10 @@ def triton_qwen4_exp_mtp_front(
     eps: float,
     out: torch.Tensor,
 ) -> None:
-    """See :func:`tokenspeed_kernel.ops.monokernel.qwen4_exp_mtp_front`."""
+    """See :func:`tokenspeed_kernel.ops.monokernel.qwen4_exp_mtp_fuse_inputs`."""
     size = embedding.shape[1]
     rows = input_ids.shape[0]
-    _qwen4_exp_mtp_front_kernel[(size // 16,)](
+    _qwen4_exp_mtp_fuse_inputs_kernel[(size // 16,)](
         input_ids,
         embedding,
         embedding.stride(0),
@@ -153,4 +153,4 @@ def triton_qwen4_exp_mtp_front(
     )
 
 
-__all__ = ["MTP_FRONT_ROWS", "triton_qwen4_exp_mtp_front"]
+__all__ = ["MTP_FUSE_INPUTS_MAX_ROWS", "triton_qwen4_exp_mtp_fuse_inputs"]

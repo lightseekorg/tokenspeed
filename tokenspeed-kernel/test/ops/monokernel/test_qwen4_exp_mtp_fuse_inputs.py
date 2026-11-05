@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The Qwen3.8-Flash-Next MTP draft front (norms, linears and the stream add
+"""The Qwen3.8-Flash-Next MTP draft input fusion (norms, linears and the stream add
 in one launch) against the model's eager math."""
 
 from __future__ import annotations
@@ -26,10 +26,10 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.monokernel import (
-    qwen4_exp_mtp_front,
-    select_qwen4_exp_mtp_front,
+    qwen4_exp_mtp_fuse_inputs,
+    select_qwen4_exp_mtp_fuse_inputs_kernel,
 )
-from tokenspeed_kernel.ops.monokernel.triton import _qwen4_exp_mtp_front_kernel
+from tokenspeed_kernel.ops.monokernel.triton import _qwen4_exp_mtp_fuse_inputs_kernel
 from utils import assert_no_triton_compile
 
 H, VOCAB, EPS = 2560, 1000, 1e-6
@@ -76,13 +76,13 @@ def _reference(ops) -> torch.Tensor:
 
 def _run(kernel, ops) -> torch.Tensor:
     out = torch.empty_like(ops["hidden"])
-    qwen4_exp_mtp_front(kernel, **ops, eps=EPS, out=out)
+    qwen4_exp_mtp_fuse_inputs(kernel, **ops, eps=EPS, out=out)
     return out
 
 
 @pytest.mark.parametrize("rows", [1, 2, 3, 4])
-def test_mtp_front_matches_the_model_math(rows):
-    kernel = select_qwen4_exp_mtp_front(4)
+def test_mtp_fuse_inputs_matches_the_model_math(rows):
+    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(4)
     ops = _operands(rows, rows)
     got, ref = _run(kernel, ops), _reference(ops)
     # Only the linears' FP32 summation order differs. A linear's output can
@@ -95,7 +95,7 @@ def test_mtp_front_matches_the_model_math(rows):
 
 
 def test_rows_equal_one_row_launches():
-    kernel = select_qwen4_exp_mtp_front(4)
+    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(4)
     ops = _operands(4, 7)
     together = _run(kernel, ops)
     for r in range(4):
@@ -105,8 +105,8 @@ def test_rows_equal_one_row_launches():
 
 
 def test_row_count_does_not_recompile():
-    kernel = select_qwen4_exp_mtp_front(4)
+    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(4)
     _run(kernel, _operands(1, 0))
-    with assert_no_triton_compile(_qwen4_exp_mtp_front_kernel):
+    with assert_no_triton_compile(_qwen4_exp_mtp_fuse_inputs_kernel):
         for rows in (2, 3, 4, 1):
             _run(kernel, _operands(rows, rows))

@@ -37,9 +37,10 @@ number of tokens per request (`k + 1` for `k` draft tokens), and the state
 operands are the verify buffers that TokenSpeed's backends already own.
 
 A model can also have small portable kernels around its layer monokernels
-(`triton.py`). `qwen4_exp_mtp_front` runs the Qwen3.8-Flash-Next MTP draft
+(`triton.py`). `qwen4_exp_mtp_fuse_inputs` runs the Qwen3.8-Flash-Next MTP draft
 input (two Gemma RMSNorms, two BF16 linears and the stream add) for a decode
-step's rows in one launch instead of six.
+step's rows in one launch instead of six: the same math as the MTP head's
+`_fuse_inputs`.
 
 ## How a model uses the ops
 

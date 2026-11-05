@@ -29,10 +29,10 @@ from typing import Any
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.monokernel import (
-    qwen4_exp_mtp_front,
-    select_qwen4_exp_mtp_front,
+    qwen4_exp_mtp_fuse_inputs,
+    select_qwen4_exp_mtp_fuse_inputs_kernel,
 )
-from tokenspeed_kernel.ops.monokernel.triton import MTP_FRONT_ROWS
+from tokenspeed_kernel.ops.monokernel.triton import MTP_FUSE_INPUTS_MAX_ROWS
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -247,7 +247,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         # Set by post_quant_warmup when the draft layer runs the decode
         # monokernel: the kernel that runs _fuse_inputs in one launch for a
         # decode step's rows.
-        self.front_kernel: Any | None = None
+        self.fuse_inputs_kernel: Any | None = None
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=mapping.attn.has_dp,
@@ -265,11 +265,13 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         # The draft layer is a monokernel layer unless the draft steps reuse
         # the first step's top-k (Qwen4ExpDraftModel._decode_monokernel).
         enable_decode_monokernels(self.model)
-        if self.model.monokernel_state is not None and self._front_fusable():
-            self.front_kernel = select_qwen4_exp_mtp_front(MTP_FRONT_ROWS)
+        if self.model.monokernel_state is not None and self._can_fuse_inputs():
+            self.fuse_inputs_kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(
+                MTP_FUSE_INPUTS_MAX_ROWS
+            )
 
-    def _front_fusable(self) -> bool:
-        """Whether the fused front reads this model's weights as they are:
+    def _can_fuse_inputs(self) -> bool:
+        """Whether the fused input kernel reads this model's weights as they are:
         4 streams, an unsharded embedding and BF16 linears without
         quantization."""
         linears = (self.fc_embedding, self.fc_hidden)
@@ -352,17 +354,17 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
                 raise ValueError("Qwen4-Exp MTP does not accept input_embeds")
             rows = input_ids.shape[0]
             if (
-                self.front_kernel is not None
+                self.fuse_inputs_kernel is not None
                 and ctx.forward_mode.is_decode()
-                and rows <= MTP_FRONT_ROWS
+                and rows <= MTP_FUSE_INPUTS_MAX_ROWS
             ):
                 # A decode step's rows: the norms, linears and stream add in
                 # one launch (the same math as _fuse_inputs).
                 fused = captured_hidden_states.new_empty(
                     rows, self.hc_count * self.hidden_size
                 )
-                qwen4_exp_mtp_front(
-                    self.front_kernel,
+                qwen4_exp_mtp_fuse_inputs(
+                    self.fuse_inputs_kernel,
                     input_ids,
                     self.model.embed_tokens.weight,
                     captured_hidden_states.contiguous(),
