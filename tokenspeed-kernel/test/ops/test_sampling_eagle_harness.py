@@ -850,10 +850,11 @@ def _triton_tree_round(rows: int, depth: int, k: int = 2) -> None:
     eh_triton.triton_eagle_harness_stable_topk_desc(
         work, _count(rows), _count(verify), _count(k), values, indices
     )
+    # The verify tree takes the k ranked nodes: ``indices`` holds k + 2 columns.
     eh_triton.triton_eagle_harness_write_verify_tree(
         indices, pool_tokens, pool_prev, zeros(rows, verify),
         zeros(rows, 16, dtype=torch.int32), zeros(rows, 16, dtype=torch.int32),
-        _count(rows), _count(16),
+        _count(rows), _count(k),
     )  # fmt: skip
 
 
