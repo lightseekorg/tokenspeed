@@ -2522,6 +2522,21 @@ def kimi3_mla_qkv_gate_projection(
     return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=None)
 
 
+def kimi3_mla_gate_projection(
+    hidden_states: torch.Tensor, weight: torch.Tensor, qkv_width: int
+) -> torch.Tensor:
+    """The gate rows of ``kimi3_mla_qkv_gate_projection``'s split schedule alone.
+
+    For callers that already hold the QKV-a rows; the gate keeps the split
+    schedule's kernel, so its bits do not change.
+    """
+    gate_weight = weight[qkv_width:]
+    gate = _try_gluon_largem_gfx950(hidden_states, gate_weight)
+    if gate is None:
+        gate = torch.nn.functional.linear(hidden_states, gate_weight)
+    return gate
+
+
 # Retained fused add3 tile configurations, independent of ordinary GEMV tuning.
 # These configurations were measured on sm103 for the K3 latent-up projection.
 _SKINNY_ADD3_CONFIGS = MappingProxyType(
