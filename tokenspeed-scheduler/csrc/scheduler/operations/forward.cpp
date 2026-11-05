@@ -68,31 +68,6 @@ constexpr std::int32_t kRetractionSafeSteps = 4096;
 // scan is bounded.
 constexpr std::int32_t kMaxRestoreAttemptsPerRound = 4;
 
-// Waiting prompts the short-first bypass probes per round for one whose rest
-// fits a final chunk (Scheduler::planShortFirst). Each probe builds the cache
-// keys of the prompt's every candidate page and walks the prefix index, so a
-// queue of long cold prompts must not turn every round's planning into a scan
-// of all of them.
-constexpr std::int32_t kMaxShortFirstProbesPerRound = 8;
-
-// How many times planShortFirst passes over a waiting prompt, without probing
-// it or counting it against the probe cap, after a probe found its uncached
-// rest (with the replay window) larger than the whole short-first share. Its
-// hit grows only when another request publishes pages along its prompt, which
-// a waiting continuation turn rarely sees, so it is re-probed now and then
-// rather than every round -- and a short prompt queued behind a burst of
-// long cold ones still gets probed within a round or two.
-constexpr std::int32_t kShortFirstPassesAfterTooLong = 8;
-
-// The short-first counters are logged when one of them reaches a power of two
-// and then every this many: the first bypass, guard refusal or unused
-// reservation shows at once, and a busy P node logs rarely after that.
-constexpr std::int64_t kShortFirstLogEvery = 64;
-
-bool shortFirstLogPoint(std::int64_t count) {
-    return count > 0 && ((count & (count - 1)) == 0 || count % kShortFirstLogEvery == 0);
-}
-
 // An incomplete prefill keeps the head of line: admission reserved only this
 // chunk, and a later candidate could strand it by consuming the capacity it
 // needs to finish.
@@ -345,7 +320,7 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 
 }  // namespace
 
-Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, bool probe_only) {
+Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
     _assert(request->Is<fsm::Submitted>(), "the admission probe is for a Submitted request");
@@ -373,15 +348,10 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, bo
     const std::int32_t candidate_prefix_pages = config_.role == Role::kD
                                                     ? request->PrefillSize() / prefix_granularity
                                                     : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
-    // Hashed once per request (Request::PromptPrefixHashes), so the
-    // short-first bypass re-probing a waiting prompt every round rehashes
-    // nothing.
     const auto hashes = request->PromptPrefixHashes().first(static_cast<std::size_t>(candidate_prefix_pages));
 
     AdmissionMatch match;
-    if (!probe_only) {
-        match.candidate_prefix_hashes = hashes;
-    }
+    match.candidate_prefix_hashes = hashes;
     if (config_.disable_prefix_cache) {
         match.probe = probe(CacheCoordinator::PromptPrefix{});
         return match;
@@ -401,9 +371,6 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, bo
     match.probe = probe(prompt);
     if (config_.role != Role::kD && coordinator_.EvictionStoresExtendPrefix(prompt, match.probe)) {
         match.waits_for_eviction_store = true;
-        return match;
-    }
-    if (probe_only) {
         return match;
     }
     // Opt-in diagnostics deliberately walk more than matching needs. Emit
@@ -450,32 +417,6 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, bo
     const auto extension_begin = static_cast<std::size_t>(match.probe.device.full_page_tokens / prefix_granularity);
     match.extension_hashes = hashes.subspan(extension_begin, static_cast<std::size_t>(extension_pages));
     return match;
-}
-
-// The same hit, junction and chunk shaping schedulePrefillFirstChunk applies
-// to a local first chunk, kept in step with it: a prompt qualifies only when
-// the shaped chunk is its whole unscheduled rest. A junction cut or an
-// in-forward checkpoint boundary reached from inside a page leaves a second
-// chunk -- such a prompt would become an incomplete prefill beside the
-// resident one, which the bypass never creates.
-std::optional<std::int32_t> Scheduler::singleFinalChunkCost(const Request& request, const AdmissionMatch& match,
-                                                            std::int32_t budget) const {
-    const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-    const std::int32_t kv_tokens = std::max(match.probe.device.kv_tokens, match.probe.host.kv_tokens);
-    const std::int32_t junction_tokens = kv_tokens > hit_tokens ? kv_tokens : 0;
-    const std::int32_t unscheduled = request.PrefillSize() - hit_tokens;
-    std::int32_t tokens = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled,
-                                             std::max(budget, 0), junction_tokens);
-    if (tokens == 0) {
-        return std::nullopt;
-    }
-    tokens = chunkTowardInForwardCheckpoint(inForwardStateCheckpoint(config_, coordinator_, request.PrefillSize()),
-                                            hit_tokens, tokens, junction_tokens, config_.max_scheduled_tokens,
-                                            coordinator_.PrefixGranularity());
-    if (tokens != unscheduled) {
-        return std::nullopt;
-    }
-    return unscheduled + coordinator_.ReplayTokens(hit_tokens);
 }
 
 void Scheduler::recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result) {
@@ -550,7 +491,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request, std::int32_t remaining,
                                                                   std::int32_t decode_input_tokens,
-                                                                  std::int64_t kv_token_limit, bool final_chunk_only) {
+                                                                  std::int64_t kv_token_limit) {
     // No admission is possible while slots are full. L3 preparation runs
     // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
@@ -561,20 +502,6 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         // The ACK makes the segment visible. Re-probe then, without taking
         // pages or reporting a capacity failure while the copy is pending.
         return FirstChunkOutcome{};
-    }
-    // A short-first admission re-checks its plan against the cache as it is
-    // now -- the resident's chunk admitted before it may have evicted part of
-    // its hit -- and backs out before anything below registers or admits. It
-    // shapes the chunk on the same budget as below: `remaining` clamped to
-    // the round's KV page budget (max_kv_page_num) past the hit.
-    if (final_chunk_only) {
-        const std::int32_t probed_hit_tokens =
-            std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-        const auto final_chunk_budget = static_cast<std::int32_t>(
-            std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - probed_hit_tokens)));
-        if (!singleFinalChunkCost(*request, match, final_chunk_budget)) {
-            return FirstChunkOutcome{};
-        }
     }
 
     // The D role's prompts are the peer's work; every other first chunk is local.
@@ -698,11 +625,6 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                        /*copy_in_blocks=*/{}, copy_in_point, /*request_access_epoch=*/std::nullopt,
                                        /*evict_blocks_past_segments=*/false, request->SessionId());
         if (!admission) {
-            if (final_chunk_only) {
-                // The cut would leave the prompt incomplete; it waits for
-                // an ordinary admission instead.
-                return FirstChunkOutcome{};
-            }
             writes_checkpoint = false;
             tokens_this_round = state_checkpoint - hit_tokens;
         }
@@ -719,10 +641,6 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     }
     request->HoldSessionAccess(std::move(admission->session_access));
     const bool completes_prefill = tokens_this_round == unscheduled;
-    _assert(!final_chunk_only || completes_prefill, "a short-first admission completes its prompt in one chunk");
-    if (!short_first_waiting_.empty()) {
-        short_first_waiting_.erase(request->Id());  // no longer waiting
-    }
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
     // Every Host hit is an entry the admission acquired in the same step, so
     // the admitted prefix is the probed one.
@@ -1022,8 +940,7 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
                                                                     Request* request, std::int32_t token_budget,
                                                                     std::int32_t decode_reserve,
                                                                     std::vector<LoadBackOperation>& load_backs,
-                                                                    std::int32_t kv_page_budget,
-                                                                    bool final_chunk_only) {
+                                                                    std::int32_t kv_page_budget) {
     const std::int64_t kv_token_limit = config_.max_kv_page_num == 0 || config_.role == Role::kD
                                             ? std::numeric_limits<std::int64_t>::max()
                                             : static_cast<std::int64_t>(kv_page_budget) * config_.prefix_granularity;
@@ -1033,8 +950,8 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
         }
         return std::nullopt;
     }
-    FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve,
-                                                          kv_token_limit, final_chunk_only);
+    FirstChunkOutcome outcome =
+        schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve, kv_token_limit);
     if (outcome.event) {
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
@@ -1691,18 +1608,9 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
 // -- the two simply do not fit together), but it does seal new-prompt
 // admission (new_prompts_sealed): a newcomer taking the pages it is waiting
 // for would starve it.
-//
-// The one exception is the opt-in short-first bypass (short_first_tokens >
-// 0, the P role's prefill_short_first_tokens): when it applies it builds the
-// round's local prefill work itself, and otherwise -- always when it is off
-// -- the loop below runs exactly as without it (scheduleShortFirst).
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
-                                         std::int32_t decode_reserve, std::int32_t short_first_tokens) {
-    if (short_first_tokens > 0 && !new_prompts_sealed &&
-        scheduleShortFirst(feedback, build, candidates, decode_reserve, short_first_tokens)) {
-        return;
-    }
+                                         std::int32_t decode_reserve) {
     for (const bool resident : {true, false}) {
         if (!resident && new_prompts_sealed) {
             return;
@@ -1731,245 +1639,6 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             }
         }
     }
-}
-
-// The short-first bypass of the prefill head of line (P role,
-// SchedulerConfig::prefill_short_first_tokens = S > 0).
-//
-// Under the head-of-line rule an incomplete prefill owns every round it
-// spends chunking: a cold prompt of a few hundred thousand tokens holds
-// dozens of rounds, and every continuation turn that arrives meanwhile --
-// typically a few hundred to a few thousand uncached tokens -- waits for all
-// of them. The bypass lets a round whose resident prefill R cannot finish
-// keep up to S tokens of its budget for waiting prompts whose whole rest
-// fits one final chunk; R takes the rest of the budget.
-//
-// Why R can never be stranded, which is all the head-of-line rule protects:
-// - R is admitted first, on the budget left after the planned prompts, so
-//   its chunk has capacity priority. If that admission fails, the round ends
-//   as the loop would end it (the smaller chunk failing means the whole one
-//   would have too) and no bypass prompt is tried.
-// - A bypass prompt is admitted only as one chunk that completes it
-//   (final_chunk_only), so it goes straight to PrefillAwaitingResult and is
-//   never Prefilling. On this role its pages come back through the PD
-//   transfer alone -- the remote decode consumes the decode slot its
-//   completing chunk reserved -- so it never waits for anything R holds,
-//   and R can at worst wait for that prompt's PD ACK. The set of incomplete
-//   prefills is what the loop allows: two of them, which on a role that
-//   never retracts could wait on each other forever, never arise.
-// - The headroom guard (planShortFirst) keeps the free and evictable parents
-//   covering R's whole remaining prompt besides the planned prompts, so R
-//   does not even wait in practice. It counts cache parents a Host store
-//   still pins as evictable; that is the one optimistic case, and the wait
-//   it allows ends with those stores' ACKs.
-// - R advances every round by its ordinary chunk of at least
-//   max_scheduled_tokens - S tokens, which Validate keeps at least half the
-//   budget and above the replay minimum.
-// The bypass prompts and their budgets come only from replicated scheduler
-// state, so every mirrored rank decides the same. A prompt the plan picks
-// whose admission then fails waits as before and is never recorded as the
-// capacity blocker.
-//
-// The batch lists the bypass prompts first and R's chunk last: its single
-// incomplete row is the batch's last prefill row, as in every batch where a
-// prompt completes ahead of the next prompt's first chunk.
-//
-// Returns false -- nothing scheduled, no cache or request state changed --
-// when the bypass does not apply this round: no resident prefill, one that
-// finishes this round (the loop admits new prompts behind it anyway), no
-// waiting prompt that qualifies or passes the guard, or an R chunk that
-// aligns to nothing on the smaller budget.
-bool Scheduler::scheduleShortFirst(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                                   std::int32_t decode_reserve, std::int32_t short_first_tokens) {
-    if (build.Full(config_.max_batch_size)) {
-        return false;
-    }
-    // R is the resident the loop would try first.
-    const auto resident_it = std::ranges::find_if(candidates, [&build](const Request* request) {
-        return request->Is<fsm::Prefilling>() && !build.Scheduled(*request);
-    });
-    if (resident_it == candidates.end() || (*resident_it)->UnscheduledPrefillSize() <= build.token_budget) {
-        return false;
-    }
-    Request* resident = *resident_it;
-    const ShortFirstPlan short_first = planShortFirst(build, candidates, *resident, decode_reserve, short_first_tokens);
-    if (short_first.prompts.empty()) {
-        return false;
-    }
-
-    feedback.admission_failed = false;
-    std::optional<PrefillOperation> resident_chunk =
-        schedulePrefillCandidate(build.plan, feedback, resident, build.token_budget - short_first.reserved_tokens,
-                                 decode_reserve, build.load_backs, build.kv_page_budget);
-    if (!resident_chunk) {
-        if (!feedback.admission_failed) {
-            return false;  // nothing aligned to the smaller budget; the loop tries R on the whole one
-        }
-        feedback.NoteCapacityBlocked(resident);
-        return true;
-    }
-    _assert(holdsHeadOfLine(*resident), "a resident that cannot finish this round stays incomplete");
-
-    // The bypass prompts share what R left of the round, at most S; R's row
-    // is held for it.
-    std::int32_t available = std::min(build.token_budget - resident_chunk->input_length, short_first_tokens);
-    // R's row is pushed last, so the KV pages it debits from the round's
-    // max_kv_page_num budget (as pushOperation counts them) come off the
-    // bypass prompts' page budget now.
-    std::int32_t resident_kv_pages = 0;
-    if (config_.max_kv_page_num > 0) {
-        const std::int64_t end =
-            static_cast<std::int64_t>(resident_chunk->extend_prefix_len) + resident_chunk->input_length;
-        resident_kv_pages =
-            static_cast<std::int32_t>((end + config_.prefix_granularity - 1) / config_.prefix_granularity);
-    }
-    bool log_stats = false;
-    std::int32_t admitted_prompts = 0;
-    for (Request* request : short_first.prompts) {
-        if (available <= 0 || build.operations.size() + 1 >= static_cast<std::size_t>(config_.max_batch_size)) {
-            break;
-        }
-        // A scratch feedback: whatever stops this prompt now (its hit shrank
-        // under R's admission, the pool is short), it waits like any waiting
-        // prompt and never becomes the capacity blocker.
-        AdmissionFeedback bypass_feedback;
-        if (auto admitted = schedulePrefillCandidate(build.plan, bypass_feedback, request, available, decode_reserve,
-                                                     build.load_backs, build.kv_page_budget - resident_kv_pages,
-                                                     /*final_chunk_only=*/true)) {
-            available -= admitted->input_length;
-            ++admitted_prompts;
-            log_stats |= shortFirstLogPoint(++short_first_stats_.prompts);
-            short_first_stats_.tokens += admitted->input_length;
-            pushOperation(build, *request, std::move(*admitted));
-            request->TrackScheduledForward();
-        }
-    }
-    // R's chunk is already admitted on the smaller budget, so a reservation
-    // no planned prompt could use stays empty this round; R still advanced
-    // by at least B - S. Counted, so a run shows how often that happens.
-    if (admitted_prompts > 0) {
-        ++short_first_stats_.rounds;
-    } else {
-        log_stats |= shortFirstLogPoint(++short_first_stats_.unused_reservations);
-    }
-    if (log_stats) {
-        logShortFirstStats();
-    }
-    pushOperation(build, *resident, std::move(*resident_chunk));
-    resident->TrackScheduledForward();
-    return true;
-}
-
-void Scheduler::logShortFirstStats() const {
-    spdlog::info(
-        "[Scheduler] short-first prefill: {} prompts ({} input tokens) ran beside an incomplete prefill in {} rounds; "
-        "the headroom guard held prompts back in {} rounds; {} rounds kept tokens for prompts none of which could "
-        "then be admitted",
-        short_first_stats_.prompts, short_first_stats_.tokens, short_first_stats_.rounds,
-        short_first_stats_.guard_skips, short_first_stats_.unused_reservations);
-}
-
-// The bypass prompts, chosen without changing the cache or any request:
-// the waiting prompts in submission order, the first
-// kMaxShortFirstProbesPerRound of them probed, each kept when its rest fits
-// one final chunk of what S has left (singleFinalChunkCost: replay window
-// included), until S or the free rows (batch and request pool, R's row
-// kept) run out. A prompt that does not qualify keeps its place for the
-// ordinary admission once R completes. One whose uncached rest alone
-// exceeds S is not probed again for its next kShortFirstPassesAfterTooLong
-// passes, nor counted against the cap, so a burst of long cold prompts at
-// the head of the queue cannot hide a short one behind it for more than a
-// round or two -- the waiting-prompt memo is the only state this touches
-// (besides the request's own hash and prefix-key memos the probe fills). A
-// prompt whose probe waits for an eviction store's ACK is skipped: its
-// admission would wait this round.
-//
-// The headroom guard then keeps the longest prefix of them for which the
-// free and evictable parents cover R's whole remaining prompt plus each
-// prompt's whole working set, all bounded by the single-request model
-// (shortFirstLcmBlocksBound). A prompt counts with its hit, because the
-// cached parents it shares stop being evictable while it holds them.
-Scheduler::ShortFirstPlan Scheduler::planShortFirst(const PlanBuild& build, std::span<Request* const> candidates,
-                                                    const Request& resident, std::int32_t decode_reserve,
-                                                    std::int32_t short_first_tokens) {
-    ShortFirstPlan short_first;
-    const std::int64_t batch_rows =
-        std::int64_t{config_.max_batch_size} - static_cast<std::int64_t>(build.operations.size()) - 1;
-    const std::int64_t free_rows = std::min<std::int64_t>(req_pool_allocator_.AvailableSlots(), batch_rows);
-    std::vector<std::int32_t> costs;
-    std::int32_t left = std::min(short_first_tokens, build.token_budget);
-    std::int32_t probes = 0;
-    for (Request* request : candidates) {
-        if (left <= 0 || static_cast<std::int64_t>(short_first.prompts.size()) >= free_rows ||
-            probes == kMaxShortFirstProbesPerRound) {
-            break;
-        }
-        if (!request->Is<fsm::Submitted>() || build.Scheduled(*request)) {
-            continue;
-        }
-        if (const auto known = short_first_waiting_.find(request->Id());
-            known != short_first_waiting_.end() && known->second.passes_to_skip > 0) {
-            --known->second.passes_to_skip;
-            continue;
-        }
-        ++probes;
-        const AdmissionMatch match = matchPrefixAtAdmission(request, /*probe_only=*/true);
-        if (match.waits_for_eviction_store) {
-            // Its admission would wait for the store's ACK this round
-            // (schedulePrefillFirstChunk); keep no budget for it.
-            continue;
-        }
-        if (const std::optional<std::int32_t> cost = singleFinalChunkCost(*request, match, left)) {
-            short_first.prompts.push_back(request);
-            costs.push_back(*cost);
-            left -= *cost;
-            continue;
-        }
-        const std::int32_t hit_tokens =
-            std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-        if (request->PrefillSize() - hit_tokens + coordinator_.ReplayTokens(hit_tokens) > short_first_tokens) {
-            // Erased when its first chunk is admitted or it is aborted.
-            short_first_waiting_[request->Id()].passes_to_skip = kShortFirstPassesAfterTooLong;
-        }
-    }
-    if (short_first.prompts.empty()) {
-        return short_first;
-    }
-
-    const std::int64_t free_blocks = std::int64_t{coordinator_.TotalLcmBlocks()} - ActiveLcmBlocks();
-    std::int64_t needed = shortFirstLcmBlocksBound(resident.UnscheduledPrefillSize() + decode_reserve);
-    std::size_t kept = 0;
-    for (; kept < short_first.prompts.size(); ++kept) {
-        const std::int64_t prompt_blocks =
-            shortFirstLcmBlocksBound(short_first.prompts[kept]->PrefillSize() + decode_reserve);
-        if (needed + prompt_blocks > free_blocks) {
-            break;
-        }
-        needed += prompt_blocks;
-    }
-    if (kept < short_first.prompts.size()) {
-        if (shortFirstLogPoint(++short_first_stats_.guard_skips)) {
-            logShortFirstStats();
-        }
-        short_first.prompts.resize(kept);
-        costs.resize(kept);
-    }
-    for (const std::int32_t cost : costs) {
-        short_first.reserved_tokens += cost;
-    }
-    return short_first;
-}
-
-std::int64_t Scheduler::shortFirstLcmBlocksBound(std::int32_t tokens) const {
-    std::vector<std::int64_t> group_pages = capacity_model_.SingleRequestGroupPages(tokens);
-    if (config_.state_checkpoint_in_forward) {
-        for (std::size_t i = 0; i < group_pages.size(); ++i) {
-            if (coordinator_.GroupIsState(i)) {
-                ++group_pages[i];  // the block the forward spanning the checkpoint writes
-            }
-        }
-    }
-    return capacity_model_.LcmBlocksNeededFor(group_pages);
 }
 
 // The decode batch shared by the D and fused grammars: every PrefillDone
@@ -2006,9 +1675,7 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
 // candidate window into that reserve before the remote decode ships it. No
 // retraction either: a P node's pressure valve is the transfer itself, so
 // this grammar never calls maybeRetractForCapacity and nothing here is ever
-// restored. With prefill_short_first_tokens set, short prompts may run
-// beside an incomplete resident prefill (scheduleShortFirst); their release
-// is the same transfer, which is what makes that safe here.
+// restored.
 void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build,
                                        std::span<Request* const> candidates) {
     // The prompt decodes on the peer node: its KV goes out on the plan's own
@@ -2027,8 +1694,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens,
-                             config_.prefill_short_first_tokens);
+    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
 }
 
 // D role: decode worker. One restore rides beside the decode batch, then at
@@ -2104,13 +1770,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    // No short-first bypass on this role: outside mixed mode a bypassed
-    // prompt would get its first token and then wait behind the resident
-    // prefill for its decodes anyway, and every fused admission prepays
-    // decode headroom, which would make the resident -- an incomplete
-    // prefill, the victim policy's first pick -- a retraction victim.
-    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens,
-                             /*short_first_tokens=*/0);
+    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
 
     if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
         scheduleDecodeBatch(feedback, build, candidates);

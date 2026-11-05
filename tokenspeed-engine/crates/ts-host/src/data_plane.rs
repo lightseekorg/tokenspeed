@@ -30,8 +30,7 @@
 //!
 //! The control thread runs the completion queries itself: a launched
 //! forward's results (it waits on the forward's copy event, which releases
-//! the GIL), whether they landed yet (never waits; no GIL before the launch)
-//! and the cache acknowledgments. Each takes the GIL for its call
+//! the GIL) and the cache acknowledgments. Each takes the GIL for its call
 //! only, under a dispatch guard that rejects device work, and none waits
 //! behind the forward thread's queue: the round head never waits for
 //! launches in flight. The L3 tier's storage executor is the host's own
@@ -229,9 +228,6 @@ pub struct PythonDataPlane {
     shared: Arc<Shared>,
     next_forward: ForwardId,
     thread: Option<thread::JoinHandle<()>>,
-    /// The loop polls `landed` (`--pd-prefill-poll-transfers`) and the Python
-    /// plane answers it; an older package does not.
-    polls_landed: bool,
 }
 
 impl PythonDataPlane {
@@ -239,31 +235,13 @@ impl PythonDataPlane {
     /// dispatch guard on the calling thread, the control thread, which must
     /// also drop the data plane. With PD, the forward thread stages each
     /// plan's remote stream with the transfer peer (`streams`).
-    pub fn start(
-        plane: Py<PyAny>,
-        streams: Option<Streams>,
-        poll_transfers: bool,
-    ) -> Result<Self, String> {
+    pub fn start(plane: Py<PyAny>, streams: Option<Streams>) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
                 .call_method0(py, "control_thread_guard")
                 .and_then(|guard| guard.call_method0(py, "__enter__").map(|_| guard))
                 .map_err(|error| describe(py, &error))
         })?;
-        // Probed only when the loop will ask: off, the control thread touches
-        // nothing it did not before.
-        let polls_landed = poll_transfers
-            && Python::attach(|py| {
-                plane
-                    .bind(py)
-                    .getattr("landed")
-                    .is_ok_and(|landed| landed.is_callable())
-            });
-        if poll_transfers && !polls_landed {
-            tracing::warn!(
-                "the data plane has no `landed`: PD transfers are polled between forwards only"
-            );
-        }
         let (ops, queue) = mpsc::channel();
         let shared = Arc::new(Shared::default());
         let mut data_plane = Self {
@@ -273,7 +251,6 @@ impl PythonDataPlane {
             shared: shared.clone(),
             next_forward: 0,
             thread: None,
-            polls_landed,
         };
         let thread = thread::Builder::new()
             .name("ts-forward".to_owned())
@@ -421,33 +398,6 @@ impl DataPlane for PythonDataPlane {
         // The profiler counts committed forwards, on the thread it traces.
         self.queue(Op::Committed(launched))?;
         Ok(result)
-    }
-
-    /// A completion query that never waits. While the forward thread is
-    /// still launching the forward, false without the GIL: the launch holds
-    /// it, and a query would queue behind a launch-bound rank.
-    fn landed(&mut self, forward: &ForwardId) -> Result<bool, DataPlaneError> {
-        self.failed()?;
-        if !self.polls_landed {
-            return Ok(true);
-        }
-        if !self.shared.state().launched.contains_key(forward) {
-            return Ok(false);
-        }
-        let shared = &self.shared;
-        self.query(|plane| {
-            // GIL then lock, as `Shared::launch`; the guard drops at the end
-            // of the statement, before Python runs (the lock is a leaf).
-            let launched = shared
-                .state()
-                .launched
-                .get(forward)
-                .map(|launched| launched.clone_ref(plane.py()));
-            match launched {
-                Some(launched) => plane.call_method1("landed", (launched,))?.extract(),
-                None => Ok(true),
-            }
-        })
     }
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
@@ -960,11 +910,7 @@ mod tests {
     //! The two-thread contract, against a Python stand-in for `HostDataPlane`
     //! that records which thread made each call.
 
-    use std::{
-        ffi::CString,
-        sync::Once,
-        time::{Duration, Instant},
-    };
+    use std::{ffi::CString, sync::Once, time::Duration};
 
     use pyo3::types::PyDict;
     use ts_scheduler::{ForwardBatchView, Scheduler};
@@ -1000,8 +946,7 @@ mod tests {
 
     /// The stand-in, and an idle scheduler to draw plans from. A launch
     /// returns the next token, from 100; the launch numbered `held` waits
-    /// for `unblock`, and every launch raises once `failing` is set. A
-    /// launched forward reports landed while `landed_flag` is set.
+    /// for `unblock`, and every launch raises once `failing` is set.
     const PLANE: &str = r#"
 import threading
 
@@ -1026,7 +971,6 @@ class Plane:
         self.held = None
         self.unblock = threading.Event()
         self.failing = False
-        self.landed_flag = True
         self.cumulative_probs = None
 
     def note(self, name):
@@ -1054,10 +998,6 @@ class Plane:
     def complete(self, launched):
         self.note("complete")
         return ([launched], [1], None, None, None, None, None, None, self.cumulative_probs)
-
-    def landed(self, launched):
-        self.note("landed")
-        return bool(self.landed_flag)
 
     def note_committed(self, launched):
         self.note("note_committed")
@@ -1104,7 +1044,7 @@ result = (Plane(), ts.Scheduler(cfg))
     }
 
     fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None, true).unwrap()
+        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
     }
 
     /// A one-row batch: the stand-in launches whatever it is handed.
@@ -1267,97 +1207,5 @@ result = (Plane(), ts.Scheduler(cfg))
         // Every later call reports the failure, on either thread's side.
         assert!(data_plane.poll_cache_events().is_err());
         assert!(data_plane.release(&["r".to_owned()]).is_err());
-    }
-
-    /// The threads the stand-in's `landed` calls ran on, in order.
-    fn landed_calls(plane: &Py<PyAny>) -> Vec<u64> {
-        calls(plane)
-            .into_iter()
-            .filter(|(name, _)| name == "landed")
-            .map(|(_, ran_on)| ran_on)
-            .collect()
-    }
-
-    #[test]
-    fn a_forward_still_launching_is_not_landed_without_asking_python() {
-        let (plane, mut scheduler) = plane();
-        let batch = batch();
-        let dispatch = Dispatch {
-            forward: Some(&batch),
-            ..Dispatch::default()
-        };
-        set(&plane, "held", 100);
-        set(&plane, "landed_flag", 0);
-        let mut data_plane = start(&plane);
-        let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
-            .unwrap()
-            .unwrap();
-        // The forward thread sits in the launch: the answer comes without
-        // the interpreter.
-        assert!(!data_plane.landed(&forward).unwrap());
-        assert!(landed_calls(&plane).is_empty());
-        Python::attach(|py| plane.getattr(py, "unblock")?.call_method0(py, "set")).unwrap();
-        // Once launched, the query runs on this, the control thread.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while landed_calls(&plane).is_empty() {
-            assert!(Instant::now() < deadline, "the launch never registered");
-            assert!(!data_plane.landed(&forward).unwrap());
-            thread::sleep(Duration::from_millis(1));
-        }
-        let control = this_thread();
-        let seen = landed_calls(&plane);
-        assert!(seen.iter().all(|&ran_on| ran_on == control), "{seen:?}");
-        set(&plane, "landed_flag", 1);
-        assert!(data_plane.landed(&forward).unwrap());
-        assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
-    }
-
-    #[test]
-    fn a_failed_launch_is_reported_by_landed() {
-        let (plane, mut scheduler) = plane();
-        let batch = batch();
-        let dispatch = Dispatch {
-            forward: Some(&batch),
-            ..Dispatch::default()
-        };
-        set(&plane, "failing", 1);
-        let mut data_plane = start(&plane);
-        let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
-            .unwrap()
-            .unwrap();
-        // Not landed until the forward thread recorded the failure.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let error = loop {
-            match data_plane.landed(&forward) {
-                Ok(landed) => assert!(!landed, "a failed launch landed"),
-                Err(error) => break error,
-            }
-            assert!(Instant::now() < deadline, "the failure never reached it");
-            thread::sleep(Duration::from_millis(1));
-        };
-        assert!(error.0.contains("the launch failed"), "{}", error.0);
-        assert!(data_plane.complete(forward).is_err());
-    }
-
-    #[test]
-    fn a_plane_without_landed_leaves_the_commit_the_only_wait() {
-        let (plane, mut scheduler) = plane();
-        let batch = batch();
-        let dispatch = Dispatch {
-            forward: Some(&batch),
-            ..Dispatch::default()
-        };
-        // An older package's plane: this instance has no `landed` to call.
-        Python::attach(|py| plane.setattr(py, "landed", py.None())).unwrap();
-        let mut data_plane = start(&plane);
-        let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
-            .unwrap()
-            .unwrap();
-        assert!(data_plane.landed(&forward).unwrap());
-        assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
-        assert!(landed_calls(&plane).is_empty());
     }
 }

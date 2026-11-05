@@ -267,7 +267,6 @@ def scheduler_config_from_args(
         prefix_replay_tokens=prefix_replay_tokens,
         cache_groups=specs.cache_groups,
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
-        prefill_short_first_tokens=server_args.prefill_short_first_tokens,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
         checkpoint_retention_requests=server_args.checkpoint_retention_requests,
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,

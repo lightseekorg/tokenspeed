@@ -247,8 +247,6 @@ struct HostConfig {
     grammar: Option<GrammarConfig>,
     /// The data plane fills bitmasks from the matchers' committed state.
     eager_grammar: bool,
-    /// `--pd-prefill-poll-transfers`.
-    pd_prefill_poll_transfers: bool,
 }
 
 /// `rust_host.HostConfig.eplb`.
@@ -470,11 +468,6 @@ impl HostConfig {
                 }
             },
             eager_grammar: config.getattr("eager_grammar")?.extract()?,
-            // Absent from an older runtime's config: off.
-            pd_prefill_poll_transfers: match config.getattr("pd_prefill_poll_transfers") {
-                Ok(value) => value.extract()?,
-                Err(_) => false,
-            },
             metrics: Metrics::from_python(config)?,
             batch_log: BatchLogConfig {
                 enabled: config.getattr("batch_log")?.extract()?,
@@ -678,8 +671,8 @@ fn serve(args: &Args) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    let data_plane = PythonDataPlane::start(data_plane, peers.streams, config.pd_prefill_poll_transfers)
-        .map_err(HostError::DataPlane)?;
+    let data_plane =
+        PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
     let trace = config
         .trace
         .as_ref()
@@ -723,7 +716,6 @@ fn serve(args: &Args) -> Result<(), HostError> {
         kv_events: config.kv_events,
         epd_receive_enabled: config.epd_receive_enabled,
         eager_grammar: config.eager_grammar,
-        pd_prefill_poll_transfers: config.pd_prefill_poll_transfers,
     };
     tracing::info!(
         rank = config.rank,

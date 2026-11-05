@@ -256,18 +256,13 @@ def test_prefill_kv_capacity_must_exceed_the_unchanged_prompt_limit(
 
 class _LandedCopy:
     """The CPU stand-in for a result's copy event: already landed; counts
-    the waits on it and the queries of it."""
+    the waits on it."""
 
     def __init__(self) -> None:
         self.waits = 0
-        self.queries = 0
 
     def synchronize(self) -> None:
         self.waits += 1
-
-    def query(self) -> bool:
-        self.queries += 1
-        return True
 
 
 class _CpuExecutor:
@@ -604,22 +599,6 @@ def test_a_forward_lands_once_and_counts_toward_a_profile_at_its_note(executor):
     assert profiled._profiler.forward_ct == 0
     profiled.note_committed(launched)
     assert profiled._profiler.forward_ct == 1
-
-
-def test_a_launched_forward_reports_landed_without_waiting(executor):
-    """``landed`` queries the copy event and never waits on it; the commit
-    still waits exactly once."""
-    plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
-    launched = plane.execute(
-        _plan_with_one_request("r1"), None, None, None, (None, 0), None
-    )
-
-    assert plane.landed(launched) is True
-    copy_event = launched.results.copy_event
-    assert (copy_event.queries, copy_event.waits) == (1, 0)
-    assert plane.complete(launched)[0] == [100]
-    assert copy_event.waits == 1
 
 
 def test_a_result_without_a_copy_event_cannot_land():

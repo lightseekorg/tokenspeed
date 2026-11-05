@@ -136,12 +136,6 @@ struct SchedulerConfig {
     // branch rank as it does: 0 only the newest request's, 1 the previous
     // turn's too. Below CheckpointTree::kMaxDistance.
     std::int32_t checkpoint_retention_leaf_distance{0};
-    // P role only, opt-in (0 = off, --prefill-short-first-tokens): the round
-    // budget a waiting prompt may take beside an incomplete resident prefill
-    // when its whole rest fits one final chunk of at most this many tokens
-    // (Scheduler::scheduleShortFirst). The fused and D roles ignore it. Last,
-    // so positional initializers of the fields above keep their meaning.
-    std::int32_t prefill_short_first_tokens{0};
     std::int64_t CheckpointRetentionRequests() const {
         return checkpoint_retention_requests.value_or(
             std::min<std::int64_t>(std::int64_t{16} * max_batch_size, kMaxCheckpointRetentionRequests));

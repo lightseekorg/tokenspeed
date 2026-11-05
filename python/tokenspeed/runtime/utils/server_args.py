@@ -378,8 +378,6 @@ class ServerArgs:
     max_num_seqs: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
-    # PD prefill role: tokens of each round kept for prompts that finish in it (0 = off).
-    prefill_short_first_tokens: int = 0
     max_prefill_tokens: int = 8192
     # Optional bound on summed per-request KV pages in a local prefill batch.
     chunk_prefill_kv_size: int | None = None
@@ -745,8 +743,6 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
-    # PD prefill role: also poll KV transfers at the round head and during forwards.
-    pd_prefill_poll_transfers: bool = False
     pdlb_url: str | None = None
 
     # For communication + norm fusion
@@ -2702,15 +2698,6 @@ class ServerArgs:
             help="Maximum number of tokens the scheduler may issue in a single iteration. Setting this to -1 disables chunked prefill.",
         )
         parser.add_argument(
-            "--prefill-short-first-tokens",
-            type=int,
-            default=ServerArgs.prefill_short_first_tokens,
-            help="PD prefill role only: a round whose chunked prefill cannot finish "
-            "keeps up to this many of its --chunked-prefill-size tokens for waiting "
-            "prompts whose uncached rest completes in that round. At most half of "
-            "--chunked-prefill-size; 0 (the default) turns it off.",
-        )
-        parser.add_argument(
             "--enable-mixed-batch",
             action="store_true",
             dest="enable_mixed_batch",
@@ -4319,15 +4306,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_layerwise_interval,
             help="The interval of layerwise transfer for disaggregation. Default is 1.",
-        )
-        parser.add_argument(
-            "--pd-prefill-poll-transfers",
-            action="store_true",
-            help="PD prefill role: besides the round tail, poll the KV transfers "
-            "before planning a round, so a request whose decode node allocated "
-            "during the last forward runs in this round, and every 2 ms while a "
-            "forward runs, so a finished request streams without waiting for the "
-            "forward. Each poll is a cross-rank agreement. Off by default.",
         )
         parser.add_argument(
             "--pdlb-url",

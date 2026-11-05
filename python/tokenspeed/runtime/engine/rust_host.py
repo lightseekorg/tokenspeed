@@ -465,7 +465,6 @@ class HostConfig:
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
-        pd_prefill_poll_transfers: ``--pd-prefill-poll-transfers``.
     """
 
     handshake_address: str
@@ -520,7 +519,6 @@ class HostConfig:
     epd_receive_enabled: bool
     grammar: GrammarSettings | None
     eager_grammar: bool
-    pd_prefill_poll_transfers: bool
 
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
@@ -580,7 +578,7 @@ class HostDataPlane:
     the completion queries, one at a time in the order the control thread
     queued them, so a request is admitted before any plan names it and
     released only after the last forward that does was launched. The control
-    thread runs the completion queries -- ``complete``, ``landed`` and
+    thread runs the completion queries -- ``complete`` and
     ``poll_cache_events`` -- under its dispatch guard: they read what landed
     and touch no stream.
     """
@@ -844,15 +842,6 @@ class HostDataPlane:
                 else None
             ),
         )
-
-    def landed(self, dispatched: _Dispatched) -> bool:
-        """Whether a launched forward's host copies landed: a completion
-        query on the control thread that never waits (the commit's
-        ``complete`` then returns at once). Reads the copy event only; no
-        stream work. A result without one reports landed, and its
-        ``complete`` raises."""
-        event = dispatched.results.copy_event
-        return event is None or bool(event.query())
 
     def note_committed(self, dispatched: _Dispatched) -> None:
         """A committed forward counts toward a profile's steps. The forward
@@ -1356,7 +1345,6 @@ class HostBootstrap:
                     else None
                 ),
                 eager_grammar=specs.uses_eager_grammar,
-                pd_prefill_poll_transfers=server_args.pd_prefill_poll_transfers,
                 eplb=(
                     EplbSettings(
                         specs=specs.expert_rebalance,

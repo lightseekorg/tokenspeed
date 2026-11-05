@@ -421,7 +421,6 @@ Trainer-side contract:
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
-| `--prefill-short-first-tokens` | PD prefill role only. A round whose chunked prefill cannot finish keeps up to this many of its `--chunked-prefill-size` tokens for waiting prompts whose uncached rest completes in that round, so they do not wait for every chunk of a long prompt; the long prompt still advances by at least `--chunked-prefill-size` minus this per round. At most half of `--chunked-prefill-size`. See [scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue). `0` (default) is off. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
@@ -824,15 +823,6 @@ including `ts_mooncake_write_pages` for page transfers.
 Both Prefill and Decode engines select their transport from the detected
 platform. Startup settings pass this protocol to the Rust transfer peer,
 which keeps it when recreating a session after a memory resume.
-
-By default the prefill role polls its KV transfers once per round, after the
-forward. `--pd-prefill-poll-transfers` adds two polls: one before planning a
-round, so a request whose decode node allocated its pages during the last
-forward is planned in this round instead of the next, and one every 2 ms
-while a forward runs, so a request whose transfer concluded streams its
-output without waiting for the forward to finish. Every poll is a cross-rank
-agreement; the forward-time poll needs `--disaggregation-mode prefill`
-without pipeline stages, attention DP or overlap scheduling. Off by default.
 
 ## Observability
 

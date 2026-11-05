@@ -121,10 +121,8 @@ operation that issues or orders device work, or changes the data plane's
 state, is queued for the forward thread, and fire-and-forget unless the loop
 needs its answer (a DP idle forward, the low-rate control operations), so a
 slow forward thread delays nothing but its own queue. The completion
-queries — a launched forward's results, whether they landed yet (`landed`:
-an event query that never waits, and skips Python while the forward thread
-is still launching the forward), and the cache acknowledgments — read what
-landed and touch no stream, and the control thread calls them itself,
+queries — a launched forward's results and the cache acknowledgments — read
+what landed and touch no stream, and the control thread calls them itself,
 taking the GIL for the call: queued,
 the round head would wait for every forward still being launched. A commit
 waits for the forward thread to have launched its forward, then on the
@@ -486,7 +484,7 @@ Consequences:
 
 ## Principle 3: scheduler feedback is explicit and centralized
 
-The scheduler advances in exactly three places, all in `EventLoop::round`
+The scheduler advances in exactly two places, both in `EventLoop::round`
 itself — never in a helper or subsystem. Helpers RETURN their events, or push
 them into the round's `events` list. Reading the round alone must reveal
 every point where the scheduler's state advances, and why:
@@ -500,18 +498,12 @@ every point where the scheduler's state advances, and why:
   request whose stored prefix landed in Host, a suspended request's restore,
   which waits for both of its store ACKs, then its own -- are delayed by a
   full round.
-* **P role, round head after admission** — the PD transfer poll, so a
-  request whose decode node pre-allocated while the previous forward ran is
-  planned in this round; otherwise the bootstrap gate (a P request is not a
-  planning candidate until `PdBootstrapped`) costs a full round. Outputs it
-  finishes stream at once; their releases join the round's. Its collective
-  depends only on the peer's tracked transfers, the same on every rank.
 * **Tail of the round** — forward results and PD transfer events, funneled
   through the round's single `events` list, through `advance`; all events
   must advance before the *next* round plans.
 
 Anything that produces scheduler events (a new transfer backend, a new async
-op kind) either returns events into one of these points or adds a new
+op kind) either returns events into one of these two points or adds a new
 explicit call site in `round` with a comment stating why the existing points
 don't fit. It must not advance the scheduler itself.
 
@@ -784,11 +776,8 @@ For orientation, one `EventLoop::round`:
 3. Frozen? Commit what is dispatched, plan (the tick forbade forwards, so
    the plan carries cache and storage work only) and dispatch that work,
    and join the attention-DP agreement.
-   Otherwise: P role: poll the PD transfers, stream what finished, and
-   **advance the scheduler** with their events (Principle 3), so a request
-   bootstrapped since the last poll joins this round's plan; then plan
-   (`next_execution_plan`), count its cache ops, finish the requests the
-   plan aborted (`plan.aborts`: a capacity retraction whose
+   Otherwise: plan (`next_execution_plan`), count its cache ops, finish the
+   requests the plan aborted (`plan.aborts`: a capacity retraction whose
    victim could not be imaged aborted the newest resident inside the plan
    build; the scheduler released its pages in that round and emits nothing
    further for it, so the request finishes toward the client with a capacity
@@ -841,14 +830,9 @@ For orientation, one `EventLoop::round`:
    forward, and every forward is enqueued behind the store fence, so the
    slot-state export reads the victim's bytes; a restore names the resumed
    request's new slot. The rebalance controller notes whether this rank
-   forwarded, and so does the data plane's garbage-collection hook. P at
-   depth 0 (no PP, no attention DP): while the forward runs, re-poll the
-   transfers this plan and earlier ones handed over and stream the outputs
-   of those that concluded; the ranks agree on leaving (MAX of `landed`),
-   so they run the same polls, and the events still advance at the tail.
-   Then commit from the queue head down to the effective depth (a
-   pipeline's stages adopting the last stage's results first) and poll the
-   PD transfers.
+   forwarded, and so does the data plane's garbage-collection hook. Then commit
+   from the queue head down to the effective depth (a pipeline's stages
+   adopting the last stage's results first) and poll the PD transfers.
 5. **Advance the scheduler (tail)** with the round's `events`, publish KV
    events (once), release the data plane's state for the requests that
    ended, send the round's outputs with the scheduler's load, resolve any

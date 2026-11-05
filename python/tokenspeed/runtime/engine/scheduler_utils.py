@@ -124,7 +124,6 @@ def make_config(
     disable_prefix_cache: bool = False,
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
-    prefill_short_first_tokens: int = 0,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
     max_kv_page_num: int = 0,
@@ -175,7 +174,6 @@ def make_config(
         disable_prefix_cache: No prefix matching at admission.
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
-        prefill_short_first_tokens: ``--prefill-short-first-tokens``; 0 is off.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
         state_checkpoint_in_forward:
             ``--enable-state-checkpoint-in-forward``: the prefill forward that
@@ -255,9 +253,6 @@ def make_config(
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
-    if prefill_short_first_tokens:
-        # Set only when on, as above: an older scheduler wheel lacks the field.
-        cfg.prefill_short_first_tokens = prefill_short_first_tokens
     if cache_groups:
         cfg.cache_groups = list(cache_groups)
     return cfg

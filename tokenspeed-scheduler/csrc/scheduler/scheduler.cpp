@@ -91,7 +91,6 @@ CacheKey eventKey(const CacheKey& key) {
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
-      capacity_model_{config_},
       req_pool_allocator_{config_.max_batch_size},
       snapshot_slots_{config_.max_retracted_requests},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
@@ -112,7 +111,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     for (const CacheGroupConfig& group : config_.cache_groups) {
         cache_group_ids_.push_back(group.group_id);
     }
-    max_single_request_tokens_ = capacity_model_.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
+    max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
         coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation) {
@@ -122,29 +121,6 @@ Scheduler::Scheduler(SchedulerConfig config)
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
-    }
-
-    // Every rank states the value it runs with: the mirrored schedulers must
-    // agree on it, and a rank that did not inherit the variable shows here.
-    if (config_.prefill_short_first_tokens > 0) {
-        if (config_.role == Role::kP) {
-            spdlog::info(
-                "[Scheduler] short-first prefill on: a waiting prompt whose rest fits one final chunk of at most {} "
-                "of the round's {} tokens runs beside an incomplete resident prefill",
-                config_.prefill_short_first_tokens, config_.max_scheduled_tokens);
-            // A hit re-feeds the replay window ahead of it, so a share no
-            // larger than the window admits no continuation with a hit --
-            // only cold prompts -- which Validate accepts but no one expects.
-            if (config_.prefill_short_first_tokens <= coordinator_.ReplayWindowTokens()) {
-                spdlog::warn(
-                    "[Scheduler] prefill_short_first_tokens={} is not above the {}-token replay window: a prompt with "
-                    "a cache hit re-feeds that window, so only prompts without one can run beside a resident prefill",
-                    config_.prefill_short_first_tokens, coordinator_.ReplayWindowTokens());
-            }
-        } else {
-            spdlog::info("[Scheduler] prefill_short_first_tokens={} ignored: the short-first bypass is P-role only",
-                         config_.prefill_short_first_tokens);
-        }
     }
 }
 
@@ -511,7 +487,6 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         if (!request->template Is<fsm::Finished>()) {
             return false;
         }
-        short_first_waiting_.erase(request->Id());  // aborted while it waited
         requests_by_id_.erase(request->Id());
         return true;
     });

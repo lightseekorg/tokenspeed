@@ -430,7 +430,6 @@ fn bench_rounds(name: &str, shape: RoundShape) {
         kv_events: false,
         epd_receive_enabled: false,
         eager_grammar: false,
-        pd_prefill_poll_transfers: false,
     };
     let mut event_loop = EventLoop::new(
         round_scheduler(&shape, pages),

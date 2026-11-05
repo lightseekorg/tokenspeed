@@ -168,34 +168,6 @@ void SchedulerConfig::Validate() const {
     } else if (!host_group_packing.empty()) {
         throw std::invalid_argument("Scheduler: Host packing requires an L2 or snapshot pool");
     }
-    if (prefill_short_first_tokens < 0) {
-        throw std::invalid_argument(
-            "Scheduler: prefill_short_first_tokens (--prefill-short-first-tokens) must be >= 0");
-    }
-    // Only the P role spends it, so only there must it leave the resident
-    // prefill a chunk: at most half the round, and never less than the
-    // smallest chunk a replayable model can advance by (the minimum
-    // ValidateCapacityInputs holds the whole budget to). The fused and D
-    // roles accept any non-negative value and ignore it.
-    if (role == Role::kP && prefill_short_first_tokens > 0) {
-        if (prefill_short_first_tokens > max_scheduled_tokens / 2) {
-            throw std::invalid_argument(
-                "Scheduler: prefill_short_first_tokens (--prefill-short-first-tokens) must be at most half "
-                "of max_scheduled_tokens (--chunked-prefill-size), so the resident prefill keeps the larger share");
-        }
-        std::int32_t replay_window_tokens = 0;
-        for (const CacheGroupConfig& group : cache_groups) {
-            if (group.replayable) {
-                replay_window_tokens = std::max(replay_window_tokens, *group.sliding_window_tokens);
-            }
-        }
-        if (replay_window_tokens > 0 && max_scheduled_tokens - prefill_short_first_tokens <
-                                            replay_window_tokens + std::max(replay_window_tokens, prefix_granularity)) {
-            throw std::invalid_argument(
-                "Scheduler: max_scheduled_tokens minus prefill_short_first_tokens must still cover the replayable "
-                "groups' largest sliding_window_tokens plus max(that window, prefix_granularity)");
-        }
-    }
 }
 
 void SchedulerConfig::ValidateCapacityInputs() const {
