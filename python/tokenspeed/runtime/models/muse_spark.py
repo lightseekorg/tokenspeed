@@ -2081,7 +2081,6 @@ class MuseSparkModel(BaseTransformerModel):
             has_weight=True,
             weight_offset=OUTPUT_GAIN_OFFSET,
         )
-        self._final_norm_op = self._build_final_norm_op()
         self.iris_state: MuseIrisState | None = None
 
     def resolve_layers(
