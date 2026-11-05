@@ -104,6 +104,8 @@ class MLADecodeMetadata:
     # kernel needs none); the dense leaf itself never reads them.
     _dsa_seq_lens_2d: torch.Tensor | None = None
     _dsa_plan: object | None = None
+    # Per-token causal KV lengths ([bs * spec_num_tokens] int32) for sparse decode.
+    _dsa_kv_seq_lens: torch.Tensor | None = None
 
     @property
     def seq_lens_k(self) -> torch.Tensor:
@@ -138,6 +140,12 @@ class MLAAttnBackend(PagedAttentionBackend):
         # seq_len, so every block query sees the whole block including its own
         # future. Target verify and ordinary decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
+        if config.draft_block_causal:
+            raise NotImplementedError(
+                f"{type(self).__name__} attends a draft block as a whole; a causal "
+                "block draft (Kimi-K3.1 DSpark) needs --drafter-attention-backend "
+                "tokenspeed_mla"
+            )
 
         backend_name = spec.backend_name or "mla"
         self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
