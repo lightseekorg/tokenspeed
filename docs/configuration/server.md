@@ -575,6 +575,7 @@ parser option keeps its existing behavior.
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees and chains (see below). Off by default. |
+| `--speculative-rejection-sample-method` | Verify rule, named as vLLM's `rejection_sample_method`: `standard` (default, token-wise), `block` (block verification; see [Block verification](#block-verification-experimental)) or `synthetic` (set by `--synthetic-acceptance-length`). |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. A target whose forward returns no layer taps (for example Qwen3, Qwen3-MoE or DeepSeek V4.1) refuses these drafts and `DFLASH` at startup. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
@@ -622,6 +623,9 @@ AL `2.6`:
 
 Conflicting values between the flag and JSON configuration are rejected.
 The value must be finite and speculative decoding must be enabled.
+It selects the `synthetic` rejection method. The flashinfer backend accepts it
+only over sampled drafts (`--enable-speculative-sampling`); see
+[Block verification](#block-verification-experimental).
 For block drafters with implicit widths, the upper bound is checked against
 the checkpoint's resolved verify width when the sampler is initialized.
 
@@ -838,6 +842,8 @@ which keeps it when recreating a session after a memory resume.
 | `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+| `--otlp-traces-endpoint` | OTLP/HTTP traces endpoint (a collector's `/v1/traces`, Jaeger, Langfuse). Each finished request exports one span built from its lifecycle timestamps. |
+| `--trace-sample-ratio` | The share of requests the OTLP endpoint traces (0..1). 0, the default, disables tracing. |
 
 Every `--decode-log-interval` decode rounds the scheduler's representative rank
 prints one `Decode batch.` line: `#running-req`, `avg_seq_len` (the mean of
@@ -946,6 +952,21 @@ retraction whose victim cannot be imaged aborts it instead — those are
 `tokenspeed:num_capacity_aborted_requests`, never preemptions. A forced
 retraction's victim refused after its pages were published is aborted and
 counts there too.
+
+### OTLP tracing
+
+`--otlp-traces-endpoint` exports one span per request to an OTLP/HTTP
+receiver, assembled at the request's release from the same timestamps the
+stats line prints — the serving loop never blocks on it, a full export
+queue drops spans and counts them, and `--trace-sample-ratio` bounds the
+share. A request that names a continual-prompting session
+(`session_params.id`) carries it as the `session.id` attribute, so a
+tracing UI groups one conversation's requests under the session. Trace ids derive from the request id, so a span, its `Req: … Finish!`
+line and its Prometheus samples cross-reference. The span carries the GenAI
+attribute conventions (`gen_ai.request.model`, prompt and completion tokens,
+finish reason) plus the cached prompt tokens and preemption counts, with the
+lifecycle points as time-stamped events. See
+[the tracing design](../design/tracing.md).
 
 ### Per-request stats
 
@@ -1220,12 +1241,21 @@ budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size its configured pinned
-allocator reserves. On CUDA/ROCm, the launcher defaults
-`pinned_max_round_threshold_mb:1024` before starting the ranks: allocations
-up to 1 GiB round to a power of two; larger buffers use their requested size.
-This avoids reserving 274.88 GB for a 140 GB L2 buffer. Explicit thresholds
-and other allocator options are preserved. To override the default, set
+headroom per rank. Available means the smaller of the host's free memory and
+what the process's memory cgroup still allows (its limit, `memory.max` or
+`memory.high` on cgroup v2, less its usage with page cache counted as free;
+the tightest limit over its cgroup and the ones above it, found through
+`/proc/self/mountinfo`), so a container or a Slurm step is sized against its
+own limit; the sizing warning and the refusal name which one was used.
+Each buffer counts at the size its configured pinned
+allocator reserves. When the CUDA/ROCm allocator supports it, the launcher sets
+`pinned_max_round_threshold_mb:1024` as the default before starting the ranks.
+Allocations up to 1 GiB round to a power of two; larger buffers use their
+requested size.
+This avoids reserving 274.88 GB for a 140 GB L2 buffer. Allocators without this
+option keep their native defaults. The capability probe has a 60-second timeout.
+Probe failures stop startup. Explicit thresholds and other allocator options
+are preserved. To override the default, set
 `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:<MiB>` before launch;
 the legacy `PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_HIP_ALLOC_CONF` variables
 take precedence, in that order. The check reads the effective allocator
@@ -1382,3 +1412,47 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### Block verification (experimental)
+
+`--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`
+verifies a sampled draft chain by block verification instead of token-wise
+rejection. The names follow vLLM: `--enable-speculative-sampling` is
+`draft_sample_method=probabilistic`, and `--speculative-config` also accepts
+the `draft_sample_method` and `rejection_sample_method` keys. It supports `DSPARK` (probabilistic Markov drafting) and `EAGLE3`
+with `--speculative-eagle-topk 1`; block verification is defined on a single
+chain, so draft trees are refused. EAGLE3 already samples its chain under
+`--enable-speculative-sampling`, and its hot-token `q` is recorded over the full
+vocabulary with zeros outside the draft vocabulary. The feature is disabled by
+default; without it, the greedy DSpark path and the token-wise EAGLE3 verifier
+are unchanged. The initial support scope is aggregate TP, including DCP, without
+attention DP, DP sampling, pipeline parallelism or PD disaggregation. Other
+combinations fail at startup.
+
+Draft probabilities follow the request temperature; greedy requests retain
+one-hot proposals. Target filtering and grammar masks still apply before
+verification. The verifier uses clipped prefix likelihood ratios, selects the
+longest accepted prefix, and samples a prefix-scaled positive residual (or a
+target bonus token). It is not a single whole-block likelihood-ratio test.
+The output uses the existing accepted-length and state rollback contract.
+
+The existing per-request proposal RNG and verifier coin streams are reused.
+A stochastic output difference from greedy decoding is expected; validate the
+output distribution and accuracy, rather than requiring identical token IDs.
+
+Replacing `block` with `--synthetic-acceptance-length L` (the `synthetic`
+method) gives a benchmark-only mode, the equivalent of vLLM's probabilistic
+draft sampling with synthetic rejection; for `DSPARK` it also turns on sampled
+Markov drafting.
+The drafter still samples: the full-vocabulary draft logits (and DSpark's Markov
+steps) and the recorded fp32 draft probabilities all stay on the path. Verify
+gathers those probabilities and runs the standard draft-probability chain rule
+for its cost; the synthetic length then replaces its outcome, as in the greedy
+synthetic mode above. The block verifier itself is not run, because synthetic
+rejection replaces it. The token at the cutoff is drawn from the target
+probabilities at that position (the argmax for greedy requests); this costs one
+full-vocabulary pass per request. Do not use generated text for correctness or
+accuracy evaluation; validate the algorithm and its natural acceptance length
+without this flag. Full-vocabulary draft gathering, probability storage, and
+verification reductions all add work; measure their cost and natural acceptance
+length before drawing performance conclusions.

@@ -72,6 +72,7 @@ from tokenspeed.runtime.layers.moe import (
     MoELayer,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.moe.block import MoEBlock, MoEBlockFusion
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -85,7 +86,6 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
-    DeepseekV3MoE,
     MoEGate,
     absorb_mla_kv_b_proj,
 )
@@ -104,7 +104,6 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -392,7 +391,7 @@ class Glm53FlashIndexerOutput:
     gate: torch.Tensor
 
 
-class Glm53FlashMoE(DeepseekV3MoE):
+class Glm53FlashMoE(MoEBlock):
     """DeepSeek routing with GLM-5.3-Flash's clamped SwiGLU experts."""
 
     def __init__(
@@ -404,20 +403,13 @@ class Glm53FlashMoE(DeepseekV3MoE):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.layer_index = layer_index
-        self.n_shared_experts = config.n_shared_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.stream_fork = StreamFork(alt_stream)
-
         if mapping.moe.ep_size > config.n_routed_experts:
             raise ValueError(
                 f"EP size {mapping.moe.ep_size} is greater than the number of "
                 f"experts {config.n_routed_experts}."
             )
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
-        self.experts = MoELayer(
+        gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        experts = MoELayer(
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
@@ -437,22 +429,22 @@ class Glm53FlashMoE(DeepseekV3MoE):
                 "topk_group": config.topk_group,
                 "routed_scaling_factor": config.routed_scaling_factor,
                 "normalize_topk_weights": config.norm_topk_prob,
-                "correction_bias": self.gate.e_score_correction_bias,
+                "correction_bias": gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
         )
-        self.topk = TopK(
+        topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             num_fused_shared_experts=0,
             topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
+            correction_bias=gate.e_score_correction_bias,
             routed_scaling_factor=config.routed_scaling_factor,
-            output_format=self.experts.topk_output_format,
+            output_format=experts.topk_output_format,
         )
-        self.shared_experts = GatedMLP.tensor_parallel(
+        shared_experts = GatedMLP.tensor_parallel(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
             activation=gated_activation(config.hidden_act, config.swiglu_limit),
@@ -463,6 +455,14 @@ class Glm53FlashMoE(DeepseekV3MoE):
             fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
+        )
+        super().__init__(
+            gate,
+            topk,
+            experts,
+            shared_experts,
+            alt_stream,
+            fusions=(MoEBlockFusion.FINALIZE_ADD_SHARED,),
         )
 
 
@@ -883,6 +883,8 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         self.index_topk = config.index_topk
         self.index_kpool = config.index_kpool
         self.is_nextn = False
+        # Every rank selects every prefill row (validated configuration).
+        self.prefill_topk_tp_split = False
         self.skip_indexer_topk = config.indexer_types[layer_id] == "shared"
         self.indexer = (
             None

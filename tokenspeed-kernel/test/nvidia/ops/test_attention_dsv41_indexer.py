@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
 from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
     _sparse_candidate_scores,
     clean_logits_and_block_max,
+    gather_index_pages,
 )
 from tokenspeed_kernel.ops.attention.dsv41.deep_select import (
     _native_indices,
@@ -43,7 +44,9 @@ from tokenspeed_kernel.ops.attention.dsv41.deep_select import (
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _clean_logits,
     clean_logits,
+    clean_logits_for_selection,
     finish_selection,
+    pack_index_inputs,
     pack_index_queries,
     prepare_scores,
 )
@@ -411,16 +414,290 @@ def _check_selection(scores, ends, selected):
     assert not ((selected >= ends[:, None]) & (selected >= 0)).any()
 
 
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("prepare_blocks", [False, True])
+def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
+    queries, weights, cache, table, lengths, _, api = _sparse_inputs(4, 128, True)
+    weights = weights.float().contiguous()
+    capacity = table.shape[1] * 64
+    ends = lengths.clamp(0, capacity).to(torch.int32)
+    if paged:
+        safe_table = table.masked_fill((table < 0) | (table >= cache.shape[0]), 0)
+        context_lens = ends[:, None]
+        schedule = api.get_paged_mqa_logits_metadata(
+            context_lens, 64, api.get_num_sms()
+        )
+        reference = api.fp8_fp4_paged_mqa_logits(
+            q=(queries[0].view(torch.int8).unsqueeze(1), queries[1].unsqueeze(1)),
+            kv_cache=cache.as_strided(
+                (cache.shape[0], 64, 1, 68), (cache.stride(0), 68, 68, 1)
+            ),
+            weights=weights,
+            context_lens=context_lens,
+            block_table=safe_table,
+            schedule_meta=schedule,
+            max_context_len=capacity,
+            clean_logits=False,
+            logits_dtype=torch.float32,
+        )
+        scores, actual_ends, blocks = deep_gemm._paged_scores(
+            queries,
+            cache,
+            weights,
+            table,
+            lengths,
+            capacity,
+            64,
+            None,
+            0,
+            4,
+            prepare_blocks,
+        )
+        torch.testing.assert_close(actual_ends, ends, rtol=0, atol=0)
+    else:
+        table = table[-1:].expand(4, -1)
+        keys = gather_index_pages(cache, table[0], 64)
+        reference = api.fp8_fp4_mqa_logits(
+            q=(queries[0].view(torch.int8), queries[1]),
+            kv=(keys[0].view(torch.int8), keys[1]),
+            weights=weights,
+            cu_seq_len_k_start=torch.zeros_like(ends),
+            cu_seq_len_k_end=ends,
+            clean_logits=False,
+            max_seqlen_k=capacity,
+            logits_dtype=torch.float32,
+        )
+        scores, blocks = deep_gemm._dense_scores(
+            queries,
+            keys,
+            weights,
+            ends,
+            table,
+            cache.shape[0],
+            capacity,
+            prepare_blocks,
+        )
+    assert scores.dtype == torch.bfloat16
+    position = torch.arange(capacity, device="cuda")[None, :]
+    physical_pages = table[:, position[0] // 64]
+    valid = (
+        (position < ends[:, None])
+        & (physical_pages >= 0)
+        & (physical_pages < cache.shape[0])
+    )
+    expected = (
+        reference[:, :capacity].to(torch.bfloat16).masked_fill(~valid, -torch.inf)
+    )
+    written = position < ((ends[:, None] + 1023) // 1024) * 1024
+    if prepare_blocks or not paged:
+        torch.testing.assert_close(scores, expected, rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(scores[written], expected[written], rtol=0, atol=0)
+    if blocks is not None:
+        assert blocks[0].dtype == torch.float32
+    expected_blocks = expected.float().reshape(4, -1, 8).amax(dim=-1)
+    block_ends = (ends + 7) // 8
+    latest = (block_ends - 1).clamp_min(0)
+    rows = torch.arange(4, device="cuda")
+    pin = (block_ends > 0) & (expected_blocks[rows, latest] > -torch.inf)
+    expected_blocks[rows[pin], latest[pin]] = torch.inf
+    if blocks is None:
+        chosen = select_candidates(scores, ends, 64, 8)
+    else:
+        torch.testing.assert_close(blocks[0], expected_blocks, rtol=0, atol=0)
+        torch.testing.assert_close(blocks[1], block_ends, rtol=0, atol=0)
+        chosen = finish_selection(
+            _native_indices(*blocks, 64),
+            *blocks,
+            None,
+            expected_blocks.shape[1],
+            8,
+            False,
+        )
+    selected_block_scores = expected_blocks.gather(1, chosen.long().clamp_min(0))
+    selected_block_scores.masked_fill_(chosen < 0, -torch.inf)
+    torch.testing.assert_close(
+        selected_block_scores.sort().values,
+        expected_blocks.topk(64).values.sort().values,
+        rtol=0,
+        atol=0,
+    )
+    selected = _select_topk_prepared(scores, ends, 512)
+    _check_selection(expected, ends, selected)
+
+
+@pytest.mark.parametrize("tokens", [33, 2049])
+def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
+    # With 2049 rows the final BF16 row starts beyond 2**31 elements. Keep
+    # physical storage and live histories small while exercising that address.
+    capacity = (1 << 20) + 64
+    page_count = capacity // 64
+    cache = torch.empty((2, 4352), device="cuda", dtype=torch.uint8)
+    cache[:, :4096].random_(0, 256)
+    cache[:, 4096:].random_(123, 127)
+    table = torch.arange(page_count, device="cuda", dtype=torch.int32)[None, :]
+    table = table.remainder(2).expand(tokens, -1).clone()
+    lengths = torch.zeros(tokens, device="cuda", dtype=torch.int32)
+    q = torch.randn((tokens, 32, 128), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((tokens, 32), device="cuda", dtype=torch.bfloat16)
+    paged_cache = cache.view(2, 64, 68)
+
+    def run(query_chunk_size):
+        return dsv41.index_topk(
+            q,
+            weights,
+            paged_cache,
+            table,
+            lengths,
+            None,
+            32,
+            32,
+            8,
+            query_chunk_size,
+            256,
+            None,
+            None,
+            solution="deep_gemm",
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graphs = []
+    with torch.cuda.stream(stream):
+        for query_chunk_size in ((1, tokens) if tokens == 33 else (tokens,)):
+            run(query_chunk_size)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = run(query_chunk_size)
+            graphs.append((graph, outputs))
+    torch.cuda.current_stream().wait_stream(stream)
+
+    for live_lengths, invalid_first_page in (
+        (([0, 1, 7, 8, 63, 64, 65, 127, 128] * ((tokens + 8) // 9))[:tokens], False),
+        (([128, 127, 65, 64, 63, 8, 7, 1, 0] * ((tokens + 8) // 9))[:tokens], True),
+    ):
+        q.normal_()
+        weights.normal_()
+        lengths.copy_(torch.tensor(live_lengths, device="cuda", dtype=torch.int32))
+        table[:, 0].copy_(torch.arange(tokens, device="cuda") % 2)
+        table[:, 1].copy_((torch.arange(tokens, device="cuda") + 1) % 2)
+        if invalid_first_page:
+            table[::3, 0] = -1
+            table[1::3, 1] = cache.shape[0]
+        packed_q, packed_weights = pack_index_inputs(q, weights, torch.float32)
+        api = deep_gemm._api(packed_q)
+        reference_ends = lengths.clamp(0, 128).to(torch.int32)
+        context_lens = reference_ends[:, None]
+        safe_table = table[:, :2].masked_fill(
+            (table[:, :2] < 0) | (table[:, :2] >= cache.shape[0]), 0
+        )
+        schedule = api.get_paged_mqa_logits_metadata(
+            context_lens, 64, api.get_num_sms()
+        )
+        reference = api.fp8_fp4_paged_mqa_logits(
+            q=(
+                packed_q[0].view(torch.int8).unsqueeze(1),
+                packed_q[1].unsqueeze(1),
+            ),
+            kv_cache=cache.view(2, 64, 1, 68),
+            weights=packed_weights,
+            context_lens=context_lens,
+            block_table=safe_table,
+            schedule_meta=schedule,
+            max_context_len=128,
+            clean_logits=False,
+            logits_dtype=torch.float32,
+        )
+        positions = torch.arange(128, device="cuda")[None, :]
+        physical_pages = table[:, :2][:, positions[0] // 64]
+        valid = (
+            (positions < reference_ends[:, None])
+            & (physical_pages >= 0)
+            & (physical_pages < cache.shape[0])
+        )
+        expected = reference[:, :128].to(torch.bfloat16).masked_fill(~valid, -torch.inf)
+
+        for graph, outputs in graphs:
+            graph.replay()
+            rows, row_lengths, blocks, block_lengths = outputs
+            _check_selection(expected, reference_ends, rows)
+            torch.testing.assert_close(
+                row_lengths, (rows >= 0).sum(1).to(torch.int32), rtol=0, atol=0
+            )
+
+            block_scores = expected.float().reshape(tokens, 16, 8).amax(-1)
+            block_scores = torch.cat(
+                (
+                    block_scores,
+                    torch.full((tokens, 16), -torch.inf, device="cuda"),
+                ),
+                dim=1,
+            )
+            block_ends = (reference_ends + 7) // 8
+            latest = (block_ends - 1).clamp_min(0)
+            rows_idx = torch.arange(tokens, device="cuda")
+            pin = (block_ends > 0) & (block_scores[rows_idx, latest] > -torch.inf)
+            block_scores[rows_idx[pin], latest[pin]] = torch.inf
+            selected_scores = block_scores.gather(1, blocks.long().clamp_min(0))
+            selected_scores.masked_fill_(blocks < 0, -torch.inf)
+            expected_block_scores = block_scores.topk(32, dim=1).values
+            torch.testing.assert_close(
+                selected_scores.sort().values,
+                expected_block_scores.sort().values,
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                block_lengths, (blocks >= 0).sum(1).to(torch.int32), rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize("count", [128, 513])
+def test_bf16_candidate_gather_selection_matches_score_multiset(count):
+    torch.manual_seed(317)
+    width = 4103
+    scores = torch.randn(4, width, device="cuda", dtype=torch.bfloat16)
+    ends = torch.tensor([0, 1, 1330, width], device="cuda", dtype=torch.int32)
+    positions = torch.arange(width, device="cuda")
+    scores.masked_fill_(positions[None, :] >= ends[:, None], torch.nan)
+    candidates = torch.randint(-3, 516, (4, count), device="cuda", dtype=torch.int32)
+    candidates[:, :5] = torch.tensor([0, 0, -1, 512, 9999], device="cuda")
+    candidates[:, -1] = (ends - 1).clamp_min(0) // 8
+    reference = scores.clone()
+    for row in range(4):
+        valid = torch.isin(positions // 8, candidates[row]) & (positions < ends[row])
+        reference[row].masked_fill_(~valid, -torch.inf)
+    selected = select_topk(scores, ends, candidates, 512, 8)
+    _check_selection(reference, ends, selected)
+
+
+def test_bf16_prepared_topk_graph_refresh_ignores_poisoned_future():
+    original = torch.randn(4, 4096, device="cuda", dtype=torch.bfloat16)
+    scores = original.clone()
+    ends = torch.full((4,), 4096, device="cuda", dtype=torch.int32)
+    positions = torch.arange(4096, device="cuda")[None, :]
+    _select_topk_prepared(scores, ends, 512)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = _select_topk_prepared(scores, ends, 512)
+    for values in ([0, 1, 513, 4095], [4096, 0, 1025, 1024]):
+        ends.copy_(torch.tensor(values, device="cuda", dtype=torch.int32))
+        scores.copy_(original).masked_fill_(positions >= ends[:, None], torch.nan)
+        graph.replay()
+        _check_selection(scores, ends, selected)
+
+
 @pytest.mark.parametrize("width", [16384, 16320])
 @pytest.mark.parametrize("topk", [1, 512])
-def test_prepared_ends_topk_layouts_and_poisoned_future(width, topk):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_prepared_ends_topk_layouts_and_poisoned_future(width, topk, dtype):
     torch.manual_seed(317)
     ends = torch.tensor(
         [0, 1, 511, 512, 513, 1023, 1024, 1025, width - 1, width],
         dtype=torch.int32,
         device="cuda",
     )
-    scores = torch.randn(ends.numel(), width, device="cuda")
+    scores = torch.randn(ends.numel(), width, device="cuda", dtype=dtype)
     scores[:, ::17] = -torch.inf
     scores.masked_fill_(
         torch.arange(width, device="cuda")[None, :] >= ends[:, None], torch.nan
@@ -443,9 +720,12 @@ def test_prepared_ends_topk_layouts_and_poisoned_future(width, topk):
         (16384, "broadcast", 2048),
     ],
 )
-def test_clean_block_max_matches_separate_full_buffers(capacity, paged, alignment):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_clean_block_max_matches_separate_full_buffers(
+    capacity, paged, alignment, dtype
+):
     torch.manual_seed(193)
-    values = torch.randn(4, capacity + 7, device="cuda")[:, :capacity]
+    values = torch.randn(4, capacity + 7, device="cuda", dtype=dtype)[:, :capacity]
     values.sub_(10)
     lengths = torch.tensor([-1, 0, min(67, capacity), capacity + 3], device="cuda")
     lengths_storage = torch.empty(8, dtype=torch.int64, device="cuda")
@@ -476,12 +756,14 @@ def test_clean_block_max_matches_separate_full_buffers(capacity, paged, alignmen
     torch.testing.assert_close(blocks, expected_blocks, rtol=0, atol=0)
     torch.testing.assert_close(ends, expected_ends, rtol=0, atol=0)
     assert cleaned.is_contiguous() and blocks.is_contiguous() and ends.is_contiguous()
+    assert cleaned.dtype == dtype and blocks.dtype == torch.float32
     assert blocks.stride(0) * blocks.element_size() % alignment == 0
 
 
-def test_clean_block_max_replay_changes_lengths_pages_and_scores():
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_clean_block_max_replay_changes_lengths_pages_and_scores(dtype):
     capacity = 16384
-    values = torch.randn(4, capacity, device="cuda")
+    values = torch.randn(4, capacity, device="cuda", dtype=dtype)
     lengths = torch.zeros(4, dtype=torch.int32, device="cuda")
     table = torch.zeros(4, capacity // 64, dtype=torch.int32, device="cuda")
     clean_logits_and_block_max(values, lengths, table, 2, capacity, 64, 2048)
@@ -549,6 +831,7 @@ def test_live_logits_masks_prefetched_tail_for_selection(poison):
             table.shape[1],
             70,
             capacity,
+            output.stride(0),
             64,
             True,
             True,
@@ -575,6 +858,58 @@ def test_live_logits_masks_prefetched_tail_for_selection(poison):
             torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
 
 
+def test_aligned_clean_logits_for_selection_graph_replay():
+    capacity, page_size = 4163, 64
+    pages = triton.cdiv(capacity, page_size)
+    alignment = deep_select_alignment()[0] // 4
+    values = torch.randn((4, capacity), device="cuda")
+    lengths = torch.tensor([0, 63, 64, 4097], device="cuda", dtype=torch.int32)
+    table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(4, 1)
+    table[:, 1::3] = -1
+    table[:, 2::5] = pages + 3
+
+    def run():
+        scores = clean_logits_for_selection(
+            values, lengths, table, pages, capacity, page_size, alignment
+        )
+        return scores, select_topk(scores, lengths, None, 512, 1)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    expected_width = triton.cdiv(capacity, alignment) * alignment
+    assert actual[0].shape == (4, expected_width)
+
+    for visible in ([0, 1, 63, 64], [4097, 4163, 1024, 0], [17, 65, 1025, 4163]):
+        lengths.copy_(torch.tensor(visible, device="cuda", dtype=torch.int32))
+        values.normal_().sub_(1000)
+        table[:, 1::3] = -1 if visible[0] == 0 else 1
+        actual[0].fill_(float("nan"))
+        actual[1].fill_(123456)
+        graph.replay()
+
+        expected_scores = clean_logits(
+            values, lengths, table, pages, capacity, page_size
+        )
+        columns = torch.arange(capacity, device="cuda")[None, :]
+        initialized = columns < ((lengths[:, None] + 1023) // 1024) * 1024
+        torch.testing.assert_close(
+            actual[0][:, :capacity][initialized],
+            expected_scores[initialized],
+            rtol=0,
+            atol=0,
+        )
+        if visible[3] >= capacity:
+            torch.testing.assert_close(
+                actual[0][3, capacity:],
+                torch.full_like(actual[0][3, capacity:], -float("inf")),
+                rtol=0,
+                atol=0,
+            )
+        _check_selection(expected_scores, lengths, actual[1])
+
+
 @pytest.mark.parametrize("changed", ["candidates", "table", "lengths", "topk", "pages"])
 def test_sparse_metadata_reuses_only_matching_input_geometry(monkeypatch, changed):
     args = list(_sparse_inputs(4, 128, True))
@@ -582,7 +917,7 @@ def test_sparse_metadata_reuses_only_matching_input_geometry(monkeypatch, change
     api = args[-1]
     schedule = Mock(wraps=api.get_paged_sparse_mqa_logits_metadata)
     monkeypatch.setattr(api, "get_paged_sparse_mqa_logits_metadata", schedule)
-    metadata = dsv41.new_index_metadata(args[3], args[4])
+    metadata = dsv41.new_index_metadata(args[3], args[4], None)
     baseline = _sparse_candidate_scores(
         *args, skip_score_topk=0, index_metadata=metadata
     )
@@ -624,7 +959,7 @@ def test_sparse_metadata_reuse_across_streams_and_graph_replay(monkeypatch):
     consumer.wait_stream(current)
 
     def run():
-        metadata = dsv41.new_index_metadata(table, lengths)
+        metadata = dsv41.new_index_metadata(table, lengths, None)
         first = _sparse_candidate_scores(
             *args, skip_score_topk=0, index_metadata=metadata
         )
@@ -674,7 +1009,7 @@ def test_full_metadata_reuses_schedule_and_refreshes_live_inputs(monkeypatch):
     monkeypatch.setattr(api, "get_paged_mqa_logits_metadata", schedule)
 
     def run(shared):
-        metadata = dsv41.new_index_metadata(table, lengths) if shared else None
+        metadata = dsv41.new_index_metadata(table, lengths, None) if shared else None
         return tuple(
             deep_gemm._paged_scores(
                 queries,
@@ -711,3 +1046,178 @@ def test_full_metadata_reuses_schedule_and_refreshes_live_inputs(monkeypatch):
         assert schedule.call_count == before + 1
         torch.testing.assert_close(eager, expected, rtol=0, atol=0)
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+def _full_inputs():
+    torch.manual_seed(229)
+    capacity, page_size, pages = 4096, 64, 17
+    q = torch.randn((4, 32, 128), device="cuda", dtype=torch.bfloat16)
+    queries = pack_index_queries(q)
+    weights = torch.randn((4, 32), device="cuda", dtype=torch.bfloat16)
+    cache = torch.empty((pages, 4608), dtype=torch.uint8, device="cuda")[:, :4352]
+    cache[:, :4096].random_(0, 256)
+    cache[:, 4096:].fill_(126)
+    table = (
+        torch.arange(1, 65, device="cuda", dtype=torch.int32)
+        .remainder_(pages - 1)
+        .add_(1)
+        .expand(4, -1)
+        .clone()
+    )
+    table[:, 1] = -1
+    table[:, 3] = pages + 2
+    lengths = torch.tensor([0, 65, 129, 193], device="cuda", dtype=torch.int32)
+    return queries, weights, cache, table, lengths, capacity, page_size
+
+
+def _run_full_scores(
+    queries, weights, cache, table, lengths, capacity, page_size, metadata
+):
+    return deep_gemm._paged_scores(
+        queries,
+        cache,
+        weights,
+        table,
+        lengths,
+        capacity,
+        page_size,
+        metadata,
+        0,
+        table.shape[0],
+        False,
+    )[0]
+
+
+def _check_full_live_scores(actual, expected, lengths):
+    columns = torch.arange(actual.shape[1], device="cuda")[None, :]
+    initialized = columns < ((lengths[:, None] + 1023) // 1024) * 1024
+    torch.testing.assert_close(
+        actual[initialized], expected[initialized], rtol=0, atol=0
+    )
+
+
+def test_full_grouped_scores_match_independent_native_rows():
+    queries, weights, cache, table, lengths, capacity, page_size = _full_inputs()
+    # Each consecutive group shares a page table and has nondecreasing lengths.
+    request_indices = torch.tensor([11, 11, 23, 23], device="cuda", dtype=torch.int32)
+    expected = _run_full_scores(
+        queries, weights, cache, table, lengths, capacity, page_size, None
+    )
+    metadata = dsv41.new_index_metadata(table, lengths, request_indices)
+    actual = _run_full_scores(
+        queries, weights, cache, table, lengths, capacity, page_size, metadata
+    )
+    _check_full_live_scores(actual, expected, lengths)
+
+    consumer = torch.cuda.Stream()
+    consumer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(consumer):
+        shared = _run_full_scores(
+            queries, weights, cache, table, lengths, capacity, page_size, metadata
+        )
+    torch.cuda.current_stream().wait_stream(consumer)
+    _check_full_live_scores(shared, expected, lengths)
+
+
+def test_full_grouped_metadata_graph_replay_changes_ids_lengths_and_weights():
+    queries, weights, cache, table, lengths, capacity, page_size = _full_inputs()
+    request_indices = torch.full((4,), 7, device="cuda", dtype=torch.int32)
+
+    def run():
+        metadata = dsv41.new_index_metadata(table, lengths, request_indices)
+        return _run_full_scores(
+            queries, weights, cache, table, lengths, capacity, page_size, metadata
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+
+    for ids, visible in (
+        ([7, 7, 8, 8], [0, 65, 129, 193]),
+        ([7, 7, 7, 7], [63, 64, 4095, 4096]),
+        ([7, 7, 8, 8], [63, 64, 4095, 4096]),
+        ([7, 7, 7, 7], [63, 64, 65, 0]),
+    ):
+        request_indices.copy_(torch.tensor(ids, device="cuda", dtype=torch.int32))
+        lengths.copy_(torch.tensor(visible, device="cuda", dtype=torch.int32))
+        weights.normal_()
+        expected = _run_full_scores(
+            queries, weights, cache, table, lengths, capacity, page_size, None
+        )
+        eager = run()
+        graph.replay()
+        _check_full_live_scores(eager, expected, lengths)
+        _check_full_live_scores(captured, expected, lengths)
+
+
+def test_native_candidate_scores_match_full_preparation_after_replay():
+    block_size = 8
+    logits = torch.randn((4, 35), dtype=torch.bfloat16, device="cuda")
+    lengths = torch.tensor([0, 9, 17, 35], dtype=torch.int32, device="cuda")
+    alignment = deep_select_alignment()[0] // 4
+
+    def run():
+        return select_candidates(logits, lengths, 4, block_size)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for visible in ([0, 9, 17, 35], [35, 0, 1, 8], [8, 17, 33, 35]):
+        lengths.copy_(torch.tensor(visible, dtype=torch.int32, device="cuda"))
+        logits.normal_()
+        columns = torch.arange(35, device="cuda")[None, :]
+        logits.masked_fill_(columns >= lengths[:, None], torch.nan)
+        graph.replay()
+        scores, ends = prepare_scores(logits, lengths, block_size, alignment, True)
+        _check_selection(scores, ends, actual)
+
+
+def test_full_grouped_metadata_slices_ids_across_request_boundaries():
+    queries, weights, cache, table, lengths, capacity, page_size = _full_inputs()
+    queries = tuple(
+        tensor.repeat(2, 1, 1) if tensor.ndim == 3 else tensor.repeat(2, 1)
+        for tensor in queries
+    )
+    weights = weights.repeat(2, 1)
+    table = torch.cat((table, table.roll(1, dims=1)), dim=0)
+    lengths = torch.tensor(
+        [0, 61, 62, 63, 127, 128, 129, 130], device="cuda", dtype=torch.int32
+    )
+    request_indices = torch.tensor(
+        [5, 5, 5, 5, 7, 7, 7, 7], device="cuda", dtype=torch.int32
+    )
+    metadata = dsv41.new_index_metadata(table, lengths, request_indices)
+    begin, end = 2, 6
+    packed = tuple(tensor[begin:end] for tensor in queries)
+    args = (
+        packed,
+        cache,
+        weights[begin:end],
+        table[begin:end],
+        lengths[begin:end],
+        capacity,
+        page_size,
+    )
+    expected = deep_gemm._paged_scores(*args, None, 0, end - begin, False)[0]
+    actual = deep_gemm._paged_scores(*args, metadata, begin, end, False)[0]
+    _check_full_live_scores(actual, expected, lengths[begin:end])
+
+
+@pytest.mark.parametrize("bad_indices", ["dtype", "shape", "stride", "device"])
+def test_index_metadata_rejects_incompatible_request_indices(bad_indices):
+    table = torch.zeros((4, 2), dtype=torch.int32, device="cuda")
+    lengths = torch.ones(4, dtype=torch.int32, device="cuda")
+    indices = torch.zeros(4, dtype=torch.int32, device="cuda")
+    if bad_indices == "dtype":
+        indices = indices.long()
+    elif bad_indices == "shape":
+        indices = indices[:3]
+    elif bad_indices == "stride":
+        indices = torch.zeros(8, dtype=torch.int32, device="cuda")[::2]
+    else:
+        indices = indices.cpu()
+    with pytest.raises(ValueError, match="request_indices"):
+        dsv41.new_index_metadata(table, lengths, indices)

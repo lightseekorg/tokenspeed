@@ -192,6 +192,8 @@ class TRTLLMMLADecodeMetadata:
     # kernel needs none); the dense leaf itself never reads them.
     _dsa_seq_lens_2d: torch.Tensor | None = None
     _dsa_plan: object | None = None
+    # Per-token causal KV lengths ([bs * spec_num_tokens] int32) for sparse decode.
+    _dsa_kv_seq_lens: torch.Tensor | None = None
 
 
 class TRTLLMMLABackend(PagedAttentionBackend):
@@ -219,6 +221,12 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.draft_block_decode = bool(config.draft_block_decode)
+        if config.draft_block_causal:
+            raise NotImplementedError(
+                f"{type(self).__name__} attends a draft block as a whole; a causal "
+                "block draft (Kimi-K3.1 DSpark) needs --drafter-attention-backend "
+                "tokenspeed_mla"
+            )
 
         # Workspace zero-initialized for the fused kernel semaphore.
         self.trtllm_workspace = get_trtllm_workspace_buffer(config.device)
@@ -319,12 +327,16 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         )
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
         max_extend_seq_len = extend_seq_lens_cpu.max().item()
+        # The host chunk boundaries only feed the distributed prefix-history
+        # gather (KVP), which this backend does not support: it reads every
+        # history row from its own pool, so the boundaries are not needed here.
         (
             chunked_loop_num,
             chunk_kv_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
+            _chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,

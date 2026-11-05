@@ -36,6 +36,7 @@ Triton verify on Blackwell for BF16 windows of up to 16 tokens.
 
 from __future__ import annotations
 
+import importlib.util
 import math
 from importlib.util import find_spec
 
@@ -69,7 +70,11 @@ _SUPPORTED_ARCHES = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
 def cutedsl_kda_supported() -> bool:
     """Whether the current platform supports the packaged CuteDSL KDA kernel."""
     platform = current_platform()
-    return platform.is_nvidia and platform.arch_version in _SUPPORTED_ARCHES
+    return (
+        platform.is_nvidia
+        and platform.arch_version in _SUPPORTED_ARCHES
+        and importlib.util.find_spec("tokenspeed_cutedsl_kda") is not None
+    )
 
 
 if cutedsl_kda_supported():

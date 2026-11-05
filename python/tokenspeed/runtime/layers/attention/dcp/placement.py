@@ -24,7 +24,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    compact_owned_slots,
+    virtual_slots_to_local,
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,32 @@ def resolve_cache_slots(
         return loc, None
     return virtual_slots_to_local(
         loc,
+        rows_per_page=placement.block_granularity,
+        virtual_block_count=placement.virtual_block_count,
+        degree=len(placement.group),
+        rank=placement.rank,
+    )
+
+
+def compact_owned_cache_slots(
+    slots: torch.Tensor,
+    lengths: torch.Tensor | None,
+    placement: CachePlacement | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Move each row's owned slots, as local slots, to the row's front.
+
+    ``slots`` holds one selection row per query (virtual slots, ``-1`` where
+    empty) and ``lengths`` its live count, or None for the whole width. The
+    result keeps this rank's live slots in selection order, then ``-1``, and
+    its owned count per row as the new length, so a sparse core that honours
+    the lengths iterates only this rank's share. A None placement preserves
+    both: every slot is local.
+    """
+    if placement is None:
+        return slots, lengths
+    return compact_owned_slots(
+        slots,
+        lengths,
         rows_per_page=placement.block_granularity,
         virtual_block_count=placement.virtual_block_count,
         degree=len(placement.group),
@@ -158,19 +187,78 @@ def owned_history_rows(
     return counts[:, :degree].transpose(0, 1).contiguous()
 
 
+def max_owned_index_pages(
+    page_table_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    *,
+    page_size: int,
+    placement: CachePlacement,
+) -> int:
+    """Bound, on the host, the owned index pages of every query row on every rank.
+
+    A sharded indexer compacts each query row's pages that its rank owns
+    below the row's causal length. A row's causal length is at most its
+    request's ``seq_len``, so the most pages any rank owns among a request's
+    first ``ceil(seq_len / page_size)`` columns, over every rank and request,
+    bounds every row's compaction: the bound is exact for each request's last
+    row and an over-count for the others. Ownership follows
+    :func:`owned_history_rows`: page ``p`` belongs to rank
+    ``(block - 1) % degree`` of its scheduler block. Pages without an owner
+    (holes: the null block or a block past the virtual capacity) count for no
+    rank, as the device compaction skips them; unlike the history gather, a
+    hole is not an error here. Every rank holds the same host mirror, so
+    every rank computes the same bound without a device sync.
+
+    Args:
+        page_table_cpu: ``[requests, columns]`` host int32 kernel-page table
+            (virtual pages, batch-ordered; holes are page 0).
+        seq_lens_cpu: ``[requests]`` host total lengths (prefix plus this
+            chunk's rows).
+        page_size: Tokens per kernel page.
+        placement: The sharded group's ownership geometry.
+
+    Returns:
+        The most owned pages of any rank and request; 0 without pages.
+    """
+    if page_table_cpu.dim() != 2 or seq_lens_cpu.dim() != 1:
+        raise ValueError("max_owned_index_pages takes a [requests, columns] table")
+    if page_table_cpu.shape[0] != seq_lens_cpu.numel():
+        raise ValueError(
+            f"page table has {page_table_cpu.shape[0]} rows for "
+            f"{seq_lens_cpu.numel()} requests"
+        )
+    # Host arithmetic in numpy, once per forward ahead of the device.
+    degree = len(placement.group)
+    seq_lens = seq_lens_cpu.numpy().astype(np.int64)
+    max_len = int(seq_lens.max()) if seq_lens.size else 0
+    # Only the pages below the longest length matter; the mirror may be wider.
+    columns = min(-(-max_len // page_size), page_table_cpu.shape[1])
+    if columns <= 0:
+        return 0
+    subpages = placement.block_granularity // page_size
+    block = page_table_cpu[:, :columns].numpy().astype(np.int64) // subpages
+    starts = np.arange(columns, dtype=np.int64) * page_size
+    live = starts[None, :] < seq_lens[:, None]
+    valid = live & (block > 0) & (block < placement.virtual_block_count)
+    # Owner ``degree`` is the sink for pages without an owner or past a length.
+    owner = np.where(valid, (block - 1) % degree, degree)
+    requests = owner.shape[0]
+    bins = owner + np.arange(requests, dtype=np.int64)[:, None] * (degree + 1)
+    counts = np.bincount(bins.ravel(), minlength=requests * (degree + 1))
+    return int(counts.reshape(requests, degree + 1)[:, :degree].max())
+
+
 def owned_prefix_chunk_rows(
     page_table_cpu: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
+    chunk_bounds_cpu: torch.Tensor,
     *,
-    chunk_len: int,
-    num_chunks: int,
     page_size: int,
     placement: CachePlacement,
 ) -> torch.Tensor:
     """Count, on the host, how many rows of every prefix chunk each rank owns.
 
-    Prefix-chunk loop ``j`` reads rows ``[j * chunk_len, (j + 1) * chunk_len)``
-    of every request's cached prefix (``chunk.get_chunks_paged``). A rank's
+    Each loop reads the interval between consecutive per-request boundaries
+    from ``chunk.get_chunks_paged``. A rank's
     rows below position ``x`` are its whole pages below page ``x // page_size``
     plus ``x % page_size`` rows of that page when it owns it, so every chunk's
     counts are differences at the chunk bounds: one pass over the page table
@@ -179,9 +267,7 @@ def owned_prefix_chunk_rows(
     Args:
         page_table_cpu: ``[requests, columns]`` host int32 kernel-page table
             (virtual pages, batch-ordered; holes are page 0).
-        prefix_lens_cpu: ``[requests]`` host cached-prefix lengths.
-        chunk_len: Prefix rows every request contributes to one loop.
-        num_chunks: The forward's prefix-chunk loop count.
+        chunk_bounds_cpu: ``[num_chunks + 1, requests]`` host prefix positions.
         page_size: Tokens per kernel page.
         placement: The sharded group's ownership geometry.
 
@@ -192,17 +278,23 @@ def owned_prefix_chunk_rows(
         ValueError: the table does not cover a prefix, or a prefix row lies
             on a page without an owner, so the gather could not rebuild it.
     """
-    if page_table_cpu.dim() != 2 or prefix_lens_cpu.dim() != 1:
-        raise ValueError("owned_prefix_chunk_rows takes a [requests, columns] table")
-    if page_table_cpu.shape[0] != prefix_lens_cpu.numel():
-        raise ValueError(
-            f"page table has {page_table_cpu.shape[0]} rows for "
-            f"{prefix_lens_cpu.numel()} requests"
-        )
-    # Host arithmetic on small arrays, in numpy: torch dispatch would cost
-    # more than the counting, once per forward ahead of the device.
+    if (
+        page_table_cpu.device.type != "cpu"
+        or chunk_bounds_cpu.device.type != "cpu"
+        or page_table_cpu.dim() != 2
+        or chunk_bounds_cpu.dim() != 2
+        or chunk_bounds_cpu.shape[0] == 0
+        or page_table_cpu.shape[0] != chunk_bounds_cpu.shape[1]
+    ):
+        raise ValueError("expected CPU page table and [loops + 1, requests] boundaries")
+    # Count once on the host; the page-owner gather must use the same variable
+    # boundaries as the local slot-index builder.
     degree = len(placement.group)
-    prefix_lens = prefix_lens_cpu.numpy().astype(np.int64)
+    bounds = chunk_bounds_cpu.numpy().astype(np.int64).T
+    if np.any(bounds[:, 0] != 0) or np.any(np.diff(bounds, axis=1) < 0):
+        raise ValueError("prefix boundaries must start at zero and be nondecreasing")
+    num_chunks = bounds.shape[1] - 1
+    prefix_lens = bounds[:, -1]
     max_prefix = int(prefix_lens.max()) if prefix_lens.size else 0
     # Only the pages holding prefix rows matter; the mirror may be wider.
     columns = -(-max_prefix // page_size)
@@ -222,10 +314,6 @@ def owned_prefix_chunk_rows(
     below = np.zeros((owner.shape[0], columns + 1, degree + 1), dtype=np.int64)
     np.cumsum(
         np.eye(degree + 1, dtype=np.int64)[owner] * page_size, axis=1, out=below[:, 1:]
-    )
-    bounds = np.minimum(
-        np.arange(num_chunks + 1, dtype=np.int64)[None, :] * chunk_len,
-        prefix_lens[:, None],
     )
     whole = bounds // page_size
     rows_below = np.take_along_axis(below, whole[:, :, None], axis=1)

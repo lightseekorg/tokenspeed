@@ -187,6 +187,12 @@ class FlashMLABackend(PagedAttentionBackend):
         # captured decode graph seeds block-end lengths via
         # ``fill_block_decode_seq_lens`` (see the drafter's is_capturing path).
         self.draft_block_decode = bool(config.draft_block_decode)
+        if config.draft_block_causal:
+            raise NotImplementedError(
+                f"{type(self).__name__} attends a draft block as a whole; a causal "
+                "block draft (Kimi-K3.1 DSpark) needs --drafter-attention-backend "
+                "tokenspeed_mla"
+            )
 
         if self.kv_cache_quant_method == "per_token_head":
             raise NotImplementedError(
@@ -554,6 +560,7 @@ class FlashMLABackend(PagedAttentionBackend):
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
+            chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
@@ -563,7 +570,7 @@ class FlashMLABackend(PagedAttentionBackend):
         self._prepare_prefix_history(
             chunk_kv_indices_list,
             page_table_cpu=page_table_cpu,
-            prefix_lens_cpu=extend_prefix_lens_cpu,
+            chunk_bounds_cpu=chunk_bounds_cpu,
         )
         self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,

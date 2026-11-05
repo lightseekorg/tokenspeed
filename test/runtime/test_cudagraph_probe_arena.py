@@ -39,7 +39,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution import device  # noqa: E402
+from tokenspeed.runtime.execution import device, prefill_graph  # noqa: E402
 from tokenspeed.runtime.execution.cudagraph_memory import (  # noqa: E402
     probe_arena_parent_blocks,
 )
@@ -324,6 +324,7 @@ def test_the_boot_floor_reads_both_knobs(
     ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected
 ) -> None:
     server_args = SimpleNamespace(
+        disaggregation_mode="null",
         all2all_backend="none",
         prefill_graph_max_tokens=ceiling,
         chunked_prefill_size=8192,
@@ -356,6 +357,8 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
 
     class Executor:
         attn_backend = draft_attn_backend = None
+        # Read by Kimi-K3.1's aggregated plan agreement, faked out below.
+        prefill_graph = None
 
         def __init__(self):
             free[0] -= init_keeps
@@ -408,6 +411,8 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     driver = SimpleNamespace(
         synchronize=lambda gpu: reads.append(gpu),
         empty_cache=lambda: None,
+        memory_reserved=lambda: 0,
+        memory_allocated=lambda: 0,
         mem_get_info=lambda gpu: reads.append(gpu) or (free[0], 1 << 40),
     )
     monkeypatch.setattr(torch, "get_device_module", lambda _device: driver)
@@ -429,6 +434,10 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     monkeypatch.setattr(device, "probe_arena_floor", lambda *_, **__: 1)
     monkeypatch.setattr(device, "pool_views", views)
     monkeypatch.setattr(device, "_rebind_under_reserve", rebind)
+    # Kimi-K3.1's aggregated prefill graph plan agreement takes no memory.
+    monkeypatch.setattr(
+        prefill_graph, "check_rank_uniform_prefill_plan", lambda *_: None
+    )
     server_args = SimpleNamespace(
         disaggregation_mode="null",
         enable_external_encoder=False,
@@ -444,7 +453,12 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     with pytest.raises(_ServingCapture):
         device.build_device_side(
             server_args=server_args,
-            model_config=SimpleNamespace(context_len=4096, is_multimodal_active=False),
+            # Kimi-K3.1-like: the aggregated role agrees on its prefill plan.
+            model_config=SimpleNamespace(
+                context_len=4096,
+                is_multimodal_active=False,
+                dsa_padded_prefill_replay=True,
+            ),
             draft_model_config=None,
             gpu_id=3,
             global_rank=7,
@@ -654,6 +668,46 @@ def test_each_refusal_turns_the_probe_off_and_names_itself() -> None:
     assert "--disable-cudagraph-memory-reserve" in refusal(disable=True)
     assert "--enforce-eager" in refusal(eager=True)
     assert "tagged CUDA-graph probe pool" in refusal(memory_saver=True)
+
+
+def test_the_roles_that_replay_prefill_graphs_agree_on_and_release_them() -> None:
+    """The prefill role, and the aggregated role of a model that declares
+    the DSA padded-replay contract (Kimi-K3.1's DSA prefill graph is
+    admitted on both), agree on the prefill graph plan before any capture,
+    keyed on the role and the checkpoint so every rank enters the
+    collective, and return the capture stream's allocator cache after the
+    serving capture when they captured prefill graphs. The decode role, and
+    other models' aggregated role, do neither."""
+    build = _function("execution/device.py", "build_device_side")
+    (assigned,) = [
+        node.value
+        for node in ast.walk(build)
+        if isinstance(node, ast.Assign)
+        and [ast.unparse(target) for target in node.targets]
+        == ["replays_prefill_graphs"]
+    ]
+    assert ast.unparse(assigned) == (
+        "server_args.disaggregation_mode == 'prefill' or "
+        "(server_args.disaggregation_mode == 'null' and "
+        "model_config.dsa_padded_prefill_replay)"
+    )
+    guards: dict[str, list[str]] = {}
+    for node in ast.walk(build):
+        if not isinstance(node, ast.If):
+            continue
+        called = {
+            _callee(call)
+            for statement in node.body
+            for call in ast.walk(statement)
+            if isinstance(call, ast.Call)
+        }
+        for name in ("check_rank_uniform_prefill_plan", "empty_cache"):
+            if name in called:
+                guards.setdefault(name, []).append(ast.unparse(node.test))
+    assert guards["check_rank_uniform_prefill_plan"] == ["replays_prefill_graphs"]
+    assert guards["empty_cache"] == [
+        "replays_prefill_graphs and (not executor.prefill_graph.disable)"
+    ]
 
 
 if __name__ == "__main__":

@@ -229,6 +229,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # Block draft: one decode metadata entry per block position; see
         # block_decode_expansion.
         self.draft_block_decode = bool(config.draft_block_decode)
+        # Its queries attend causally within the block (Kimi-K3.1 DSpark).
+        self.draft_block_causal = bool(config.draft_block_causal)
 
         # MLA dimensions
         self.kv_lora_rank = spec.kv_lora_rank
@@ -448,6 +450,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
+            chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
@@ -457,7 +460,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._prepare_prefix_history(
             chunk_kv_indices_list,
             page_table_cpu=page_table_cpu,
-            prefix_lens_cpu=extend_prefix_lens_cpu,
+            chunk_bounds_cpu=chunk_bounds_cpu,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,
@@ -496,7 +499,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             lengths,
             page_size=self.kernel_page_size,
             query_count=self.spec_num_tokens,
-            causal=not self.block_decode_active,
+            causal=not self.block_decode_active or self.draft_block_causal,
         )
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
@@ -694,13 +697,10 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         causal_mask = True
         if self.block_decode_active:
             q_len_per_req = q.shape[0] // bs if bs > 0 else 1
-            # The block is non-causal, so the kernel takes it on the query axis
-            # with one page table row and one cache length per request. The
-            # metadata was expanded from rows [0, bs), which is what this query
-            # covers, so no extend offset applies on either layout.
+            # Causal row r ends at block end minus the rows after it; no extend offset.
             self._log_block_layout(layer.tp_q_head_num, q_len_per_req, window_left >= 0)
             if q_len_per_req == self.spec_num_tokens:
-                causal_mask = False
+                causal_mask = self.draft_block_causal
                 query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
                 page_table = metadata.block_page_table
                 cache_seqlens = metadata.block_seq_lens
@@ -710,6 +710,10 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 # every drafter this backend serves.
                 if self._dcp is not None:
                     raise ValueError("DCP block draft requires the full query block")
+                if self.draft_block_causal:
+                    raise ValueError(
+                        "a causal block draft requires the full query block"
+                    )
                 if window_left >= 0:
                     raise ValueError(
                         f"a {q_len_per_req}-wide draft forward over a "

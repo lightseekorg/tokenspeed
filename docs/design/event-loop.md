@@ -22,6 +22,13 @@ Peripheral threads stay off the round: the wire's Tokio runtime
 transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
 publisher, the expert-rebalance solver.
 
+Request traces use a bounded, lossy background queue. Plugins register a provider
+with `register_trace_provider`, selected explicitly by `--trace-provider NAME`.
+The provider maps a request ID to `(trace_id, optional_parent_span_id)` or `None`;
+ID policies belong to plugins. It runs only on the export thread and must be
+short and nonblocking, without I/O or GPU access. Missing or invalid context
+preserves native IDs; span lifecycle and RID sampling remain unchanged.
+
 With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host
@@ -70,6 +77,32 @@ native frontend timestamps receipt and exposes a complete per-rank snapshot
 set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
+
+## Request identity and submission failures
+
+The wire identifies a request and its output stream by `rid` alone. A new
+request, including a retry after abort, should use a fresh id. Before ingress
+can publish a refusal or register data-plane state, the loop discards repeated
+ids in the same received round and ids still owned by the output processor.
+The original request keeps its state and stream; a warning records the
+duplicate. Sending a final error for that duplicate would end the original
+stream, since the wire cannot distinguish the two submissions.
+
+Output completion and scheduler retirement are separate fences. After the
+output processor forgets a request, the scheduler may still hold it while
+forward results drain or until the next plan removes its finished entry.
+An id in that interval receives a 409 refusal before data-plane admission.
+The check uses the scheduler's existing request lookup; it does not reclaim
+an id ahead of its in-flight work. Once both owners have released an id, this
+admission guard allows it again.
+
+The Rust/C++ submission bridge returns `Result`: native validation exceptions
+must never escape a `noexcept` bridge. The scheduler validates a complete
+submission batch before inserting requests. If it rejects the batch, the
+loop finishes and releases those unscheduled requests with a client error
+and continues serving; it starts PD transfers only after submission succeeds.
+Already running requests remain intact. Other requests in a rejected batch
+also receive its error and can be retried with fresh ids.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
@@ -525,6 +558,14 @@ The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
+Only ranks with an engine metrics exporter retain per-request timing samples.
+Decode request logs, exported latency metrics, and request traces use the
+arrival of the bootstrap token as the first-token timestamp. Metrics and
+tracing are independently enabled; tracing alone retains no metric samples.
+Decode throughput counts tokens appended to the request, including the stop
+token when present. A speculative suffix discarded at the stop boundary still
+advances the scheduler frontier but contributes no output tokens.
+
 Metric output plugins run in the node's metrics relay process
 (`metrics/relay.py`); the rank's `ts-metrics` hands them every update as an
 event and writes Prometheus' multiprocess files itself, so the loop never
@@ -545,10 +586,22 @@ retracted request re-enters the C++ waiting queue without passing the funnel
 again, so preemption yields no second observation. The stamp rides the
 request's state and dies with it; no cleanup pass exists.
 
+Generation throughput counts tokens committed by decode forwards; on a plain
+worker the first token normally comes from prefill. Completion counts are
+role-local: the bootstrap token appears in both P and D totals. Use decode
+completion totals for a disaggregated service's output-token count.
+L3 query hits count the token span of each successful storage key. Cache
+groups can cover the same prompt positions, so this measures storage hits
+per group rather than unique prompt tokens.
+
 Page gauges count LCM parents, excluding the reserved null parent. The
 per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`.
 Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
+The used and free token gauges prorate the recipe's effective token capacity
+by the resident and non-active parent counts, respectively. Round down after
+scaling so a fully free pool reports its full capacity, including packed or
+capacity-limited layouts.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
 `active_lcm_blocks()` walks every live request's block tables, which at long
