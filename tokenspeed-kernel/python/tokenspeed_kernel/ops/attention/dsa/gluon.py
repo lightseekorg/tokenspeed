@@ -822,16 +822,20 @@ if current_platform().is_amd:
             softmax_scale=softmax_scale,
             query_group_size=query_group_size,
         )
-        mask_index_scores(
-            scores,
-            positions,
-            lengths,
-            causal_lens,
-            page_size,
-            initial_tokens,
-            local_tokens,
-            mask_tail=False,
-        )
+        if initial_tokens or local_tokens:
+            # Without mandatory windows the mask has nothing to add: the
+            # scorer stores non-finite scores as -inf, and every row's
+            # length ends at its causal length.
+            mask_index_scores(
+                scores,
+                positions,
+                lengths,
+                causal_lens,
+                page_size,
+                initial_tokens,
+                local_tokens,
+                mask_tail=False,
+            )
         select_width = next(width for width in (512, 1024, 2048) if width >= topk)
         # Owned rows are a fraction of the table-wide scores buffer.
         offsets, _ = gluon_dsa_row_bounded_logical_topk_gfx950(

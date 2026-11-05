@@ -71,7 +71,8 @@ def launch_gluon_dsa_index_candidates_gfx950(
     of the final row's list. That last list is the group's union; every row
     retains its own runtime visible length. Thus appended foreign tokens do
     not remove owned keys, and four verify rows can share each key tile.
-    Only each row's valid prefix is written. The tail is uninitialized.
+    Only each row's valid prefix is written, NaN and infinite scores as
+    -inf. The tail is uninitialized.
     """
     page_stride = _check_fp8_rows_scorer_inputs(
         q, q_scales, weights, index_k_cache, page_size
@@ -137,6 +138,7 @@ def launch_gluon_dsa_index_candidates_gfx950(
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         CHUNK_LOOP=splits < chunks,
         explicit_row_lens=lengths,
+        NONFINITE_TO_NEG_INF=True,
         num_warps=_BF16_DECODE_NUM_WARPS,
         waves_per_eu=waves,
     )
