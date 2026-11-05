@@ -1809,9 +1809,9 @@ class ProducerAllReduce:
     # two-shot was faster in 8-rank MI355X graph replay. TP4 keeps push.
     LAMPORT_TWO_SHOT_MIN_ELEMENTS = 48 * 1024
     # Covers 172 rows of 8192, the most rows a speculative verify step
-    # reduces; from 129 to 172 rows the two-shot took 11.7-14.7 us against
-    # 22.1-25.5 us for the producer pull. Its three-stage mailboxes cost
-    # 16.1 MiB of symmetric heap per rank, 4.1 MiB more than at 128 rows.
+    # reduces; from 129 to 172 rows the two-shot was faster than the producer
+    # pull. Its three-stage mailboxes take symmetric heap in proportion to
+    # this bound.
     LAMPORT_TWO_SHOT_MAX_ELEMENTS = 172 * 8192
     # iris_lamport_twoshot_bf16_allreduce reduces one 128-element tile of every
     # shard per program.
@@ -1819,13 +1819,12 @@ class ProducerAllReduce:
     PUSH_MAX_ELEMENTS = 128 * 8192
     # Largest payload reduce_ordinary takes from a caller that can fall back
     # to RCCL. Measured on [rows, 8192] BF16 in MI355X graph replay and
-    # applied to any width: the producer pull beat RCCL up to 16 MiB at TP8
-    # and 4 MiB at TP4 (1024 and 256 rows); past that RCCL was as fast or
-    # faster.
+    # applied to any width: the producer pull beat RCCL up to these sizes
+    # (1024 rows at TP8, 256 at TP4); past them RCCL was as fast or faster.
     ORDINARY_MAX_BYTES = {4: 4 << 20, 8: 16 << 20}
     # Smallest payload for which reduce_ordinary uses the push at TP4: it
-    # beat the producer pull by 0.6-2.5 us from 64 to 128 rows of 8192 and
-    # lost by up to 1.1 us from 22 to 48 rows. TP8 never selects it.
+    # beat the producer pull from 64 to 128 rows of 8192 and lost from 22 to
+    # 48 rows. TP8 never selects it.
     ORDINARY_PUSH_MIN_BYTES = {4: 1 << 20}
     # BF16 elements in 16 packed 8-byte words.
     _ORDINARY_GRANULE = 64
@@ -2014,8 +2013,8 @@ class ProducerAllReduce:
             and begin % 16 == 0
             and 0 < numel <= data.numel()
             # Each rank's share is whole 16-word groups. The pulls specialize
-            # their size arguments on divisibility by 16 (unspecializing them
-            # cost up to 2.5% at TP8), so admitted sizes share one compiled
+            # their size arguments on divisibility by 16 (unspecialized, they
+            # ran slower), so admitted sizes share one compiled
             # variant and a new batch shape cannot compile a second one.
             and numel % (self.world_size * self._ORDINARY_GRANULE) == 0
             and (
@@ -2041,8 +2040,8 @@ class ProducerAllReduce:
         pushed through its mailboxes and summed in place; at TP4, payloads in
         the push window are pushed and copied back. Other payloads are copied
         into the producer buffer and reduced by the generic producer pull,
-        which beat run's two-shot pull at every size measured (21.5 vs 27.9 us
-        at 129 rows and 91 vs 118 us at 1024 rows of 8192, TP8). Callers must
+        which beat run's two-shot pull at every size measured (129 to 1024
+        rows of 8192 at TP8). Callers must
         not hold borrowed producer-buffer or pull-scratch views across this
         call. Every rank must make the same call, on the stream that orders
         this state's other uses.
