@@ -109,6 +109,9 @@ _EP1_STAGE2 = _RouteTileStage(128, 256, 0, 1)
 # slice, fewer than one per route, so each keeps up to eight K tiles of loads
 # in flight to keep HBM busy.
 _ID_GROUPS_STAGE = _RouteTileStage(64, 128, 8, 4)
+# At EP1, 128-column stage 2 tiles (four K tiles each) beat 64-column tiles
+# at 14-16 rows.
+_EP1_ID_STAGE2 = _RouteTileStage(128, 128, 8, 4)
 
 # Key: hidden width, intermediate width, local experts, global experts, top-k.
 # Entries: inclusive row bounds and the route-tile schedule. Rows outside every
@@ -149,16 +152,14 @@ _EP8_ROUTE_TILES = _ID_ROUTE_TILES + (
 _ROUTE_TILE_CONFIGS = {
     (4096, 4096, 32, 256, 8): _EP8_ROUTE_TILES,
     (4096, 4096, 64, 256, 8): _DECODE_ROUTE_TILES,
-    # EP1 (TP8 intermediate shard), 14-16 rows: 0.78-0.87x the direct decode's
-    # time with recorded routing (59.9 -> 46.3 us at 16 verify rows, 66.7 ->
-    # 55.3 with plain decode routing), 1.01x with uniform routing. Below 14
-    # rows grouping won on average but lost up to 3.5 us on samples with few
-    # repeated experts, and at 8 rows it only broke even, so direct decode
-    # keeps them. 17-128 rows: 0.92-0.99x the staged package's time (113 -> 107
-    # us at 32 rows); with both uniform and Zipf routing it breaks even at 160
-    # rows.
+    # EP1 (TP8 intermediate shard), 10-16 rows: grouping the routes from the
+    # top-k IDs beats the direct decode on recorded verify and plain decode
+    # routing, except a few plain decode samples with many distinct experts.
+    # At 6-8 rows plain decode routing loses, so the direct decode keeps
+    # them. 17-128 rows: faster than the staged package; with uniform and
+    # Zipf routing it breaks even at 160 rows.
     (4096, 512, 256, 256, 8): (
-        (14, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),
+        (10, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _EP1_ID_STAGE2)),
         (17, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2)),
         (65, 128, _RouteTileConfig(128, _EP1_STAGE, _EP1_STAGE2)),
     ),
