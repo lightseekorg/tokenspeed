@@ -22,9 +22,11 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, is_cdna4, vmcnt_zero_before_barrier
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -226,23 +228,16 @@ def test_splitk_router_compiles_once_per_bucket() -> None:
             _launch(x[:rows].contiguous(), prepared, MULTIPLIER)
 
 
-def test_splitk_partials_reach_l2_before_arrival() -> None:
-    """Every wave's partial reaches L2 before the split arrives.
+def _compile_splitk(**config):
+    """Compile the split-K kernel for gfx950 without launching it.
 
-    All waves write the split's partial, and one thread bumps the tile's
-    relaxed counter. Compile without launching and check that, on every
-    path, each wave runs s_waitcnt vmcnt(0) before the barrier preceding
-    the counter atomic.
+    ``config`` overrides the 8192 x 256 router's 64-row bucket.
     """
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel_amd._scheduling import sched_compile_options
-    from utils import vmcnt_zero_before_barrier
 
     fn = gluon_fp32_router_gemv_splitk_gfx950
     pointers = ("x_ptr", "weight_ptr", "out_ptr", "partial_ptr", "counter_ptr")
-    signature = {name: "*fp32" for name in pointers}
-    signature.update(counter_ptr="*i32", M="i32")
-    # The 8192-wide router over 256 experts at 64 rows.
     constexprs = {
         "K": 8192,
         "N": 256,
@@ -251,23 +246,65 @@ def test_splitk_partials_reach_l2_before_arrival() -> None:
         "SPLIT_K": 8,
         "CHUNKS": 1,
         "MULTIPLIER": 1.0,
+        **config,
     }
+    signature = {name: "*fp32" for name in pointers}
+    signature.update(counter_ptr="*i32", M="i32")
     signature.update({name: "constexpr" for name in constexprs})
-    signature = {name: signature[name] for name in fn.arg_names}
     attrs = {
         (index,): [["tt.divisibility", 16]]
         for index, name in enumerate(fn.arg_names)
         if name in pointers
     }
-    kernel = triton.compile(
+    return triton.compile(
         gluon._runtime.GluonASTSource(
-            fn, signature, constexprs=constexprs, attrs=attrs
+            fn,
+            {name: signature[name] for name in fn.arg_names},
+            constexprs=constexprs,
+            attrs=attrs,
         ),
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
         options={"num_warps": 4, **sched_compile_options()},
     )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        dict(BLOCK_M=16, BLOCK_N=16, SPLIT_K=8, CHUNKS=1),
+        dict(BLOCK_M=32, BLOCK_N=16, SPLIT_K=16, CHUNKS=2),
+    ],
+)
+def test_splitk_partials_bypass_l2_and_weights_stream(config) -> None:
+    # The programs of a tile can run on different XCDs, so every partial store
+    # and load must be system scope (SC0 SC1). Each weight element is read
+    # once, so its loads are non-temporal (NT); x loads keep the defaults.
+    lines = _compile_splitk(**config).asm["amdgcn"].splitlines()
+
+    def cache_bits(op):
+        return [
+            frozenset(b for b in ("sc0", "sc1", "nt") if re.search(rf"\b{b}\b", line))
+            for line in lines
+            if re.match(rf"\s+{op}_dword", line)
+        ]
+
+    system, stream, default = frozenset({"sc0", "sc1"}), frozenset({"nt"}), frozenset()
+    loads, stores = cache_bits("buffer_load"), cache_bits("buffer_store")
+    assert set(loads) == {system, stream, default}, loads
+    assert loads.count(system) % config["SPLIT_K"] == 0
+    assert system in stores, stores
+
+
+def test_splitk_partials_reach_l2_before_arrival() -> None:
+    """Every wave's partial reaches L2 before the split arrives.
+
+    All waves write the split's partial, and one thread bumps the tile's
+    relaxed counter. Compile without launching and check that, on every
+    path, each wave runs s_waitcnt vmcnt(0) before the barrier preceding
+    the counter atomic.
+    """
     arrivals = vmcnt_zero_before_barrier(
-        kernel.asm["amdgcn"],
+        _compile_splitk().asm["amdgcn"],
         "gluon_fp32_router_gemv_splitk_gfx950",
         r"\bglobal_atomic_add\w*\b",
     )
