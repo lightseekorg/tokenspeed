@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 
 import torch
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
@@ -49,6 +50,8 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+
+logger = logging.getLogger(__name__)
 
 
 def _deepseek_v4_mega_moe_max_num_tokens() -> int:
@@ -358,16 +361,34 @@ class DeepseekV4MoE(nn.Module):
         if (
             gate_up.weight.dtype != torch.float8_e4m3fn
             or down.weight.dtype != torch.float8_e4m3fn
-            # MegaMoE clamps every expert with the routed experts' limit.
-            or shared.act_fn.swiglu_limit != self.experts.swiglu_arg.limit
         ):
-            return
-        self.experts.process_weights_after_loading(self.experts)
-        self.shared_expert_fused = self.experts.fuse_shared_expert(
-            gate_up.weight.data,
-            gate_up.weight_scale_inv.data,
-            down.weight.data,
-            down.weight_scale_inv.data,
+            reason = (
+                f"its weights are {gate_up.weight.dtype} and {down.weight.dtype}, "
+                "not torch.float8_e4m3fn"
+            )
+        # MegaMoE clamps every expert with the routed experts' limit.
+        elif shared.act_fn.swiglu_limit != self.experts.swiglu_arg.limit:
+            reason = (
+                f"its SwiGLU limit {shared.act_fn.swiglu_limit} differs from the "
+                f"routed experts' {self.experts.swiglu_arg.limit}"
+            )
+        else:
+            self.experts.process_weights_after_loading(self.experts)
+            self.shared_expert_fused = self.experts.fuse_shared_expert(
+                gate_up.weight.data,
+                gate_up.weight_scale_inv.data,
+                down.weight.data,
+                down.weight_scale_inv.data,
+            )
+            if self.shared_expert_fused:
+                return
+            reason = (
+                "the MegaMoE kernel does not take its weight shapes "
+                f"{tuple(gate_up.weight.shape)} and {tuple(down.weight.shape)}"
+            )
+        logger.info(
+            f"Layer {self.layer_index} runs its shared expert outside MegaMoE: "
+            f"{reason}"
         )
 
     def warmup(self) -> None:

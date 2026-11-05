@@ -181,6 +181,27 @@ def test_fused_shared_expert_adds_its_output():
 
 
 @pytest.mark.usefixtures("process_group")
+def test_fused_shared_expert_takes_an_empty_batch():
+    # A DP rank with no local tokens still joins the MegaMoE launch.
+    plan = {
+        "persistent_max_num_tokens_per_gpu": 64,
+        "process_group": None,
+        "fast_math": True,
+    }
+    w = _Experts()
+    mega_moe.deep_gemm_mxfp4_mega_moe_process_weights(plan, w)
+    assert mega_moe.fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
+        plan, w, *_shared_weights(5)
+    )
+    x = torch.empty(0, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    weights = torch.empty(0, TOP_K, device="cuda")
+    ids = torch.empty(0, TOP_K, device="cuda", dtype=torch.int32)
+    out = _apply(plan, w, x, weights, ids)
+    torch.cuda.synchronize()
+    assert out.shape == (0, HIDDEN)
+
+
+@pytest.mark.usefixtures("process_group")
 def test_mismatched_shared_expert_stays_unfused():
     plan = {
         "persistent_max_num_tokens_per_gpu": 64,
