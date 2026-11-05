@@ -97,7 +97,7 @@ def test_largem_warp_pipeline_compiles_under_compile_monitor():
 
 # Serving projections (M, K, N): a K3 projection from its first row, a range's
 # first row and the row before it, a closed range's last row and a row past
-# it, and weights with no range.
+# it, a gap and a later range on one weight, and weights with no range.
 @pytest.mark.parametrize(
     "m,k,n,selected",
     [
@@ -107,6 +107,8 @@ def test_largem_warp_pipeline_compiles_under_compile_monitor():
         (768, 4096, 6416, False),
         (8192, 4096, 288, True),  # GLM MoE router
         (12288, 4096, 288, False),
+        (1793, 8192, 4096, False),
+        (7424, 8192, 4096, True),
         (8192, 21504, 896, False),  # K3 EAGLE3 fc
         (8192, 4096 + 64, 4096, False),  # K must be a multiple of 128
     ],
