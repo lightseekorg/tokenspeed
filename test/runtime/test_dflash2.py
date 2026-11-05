@@ -199,7 +199,9 @@ def test_block_drafter_declares_only_its_sliding_mask(
 
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter = DFlash2.__new__(DFlash2)
-    drafter.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32))
+    drafter.model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=32), fp8_head=None
+    )
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
     drafter.candidate_logits_processor = None
