@@ -45,6 +45,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     token_all_gather_rows,
 )
 from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
+from tokenspeed.runtime.layers.attention.chunk import get_max_chunk_capacity
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     cyclic_slot_owner,
@@ -273,10 +274,10 @@ def gather_history_rows(
     return target
 
 
-# Consecutive prefix-chunk loops one history all-gather covers. A gather costs
-# a fixed host launch whatever it moves, so one per layer serves a typical
-# multi-turn history; the window still bounds the transient buffer, at about
-# this many loops' rows of cache-dtype bytes.
+# Consecutive prefix-chunk loops one NCCL history all-gather covers. A gather
+# costs a fixed host launch whatever it moves, so one per layer serves a
+# typical multi-turn history; the window still bounds the transient buffer, at
+# about this many loops' rows of cache-dtype bytes.
 PREFIX_HISTORY_WINDOW_LOOPS = 4
 
 
@@ -319,14 +320,19 @@ def plan_prefix_history_gather(
     chunk_bounds_cpu: torch.Tensor,
     page_size: int,
     placement: CachePlacement,
+    max_loops: int | None,
+    max_send_rows: int | None,
 ) -> tuple[PrefixHistoryWindow, ...]:
     """Plan one forward's page-owner gathers of its prefix-chunk loops.
 
-    Consecutive loops share a window (``PREFIX_HISTORY_WINDOW_LOOPS``); every
-    MLA layer reuses the plan. The owned-row counts come from the host page
-    table, so nothing waits on the device; one kernel per window
-    (``split_slots_by_owner``) gives every row its all-gather output row and
-    this rank's rows their physical slots.
+    A window takes consecutive loops: the next loop joins while the window
+    keeps at most ``max_loops`` loops and its busiest owner at most
+    ``max_send_rows`` rows, so a loop past ``max_send_rows`` alone makes a
+    window of its own. The owners' counts decide, not an even split, so
+    uneven ownership packs fewer loops. Every MLA layer reuses the plan. The
+    owned-row counts come from the host page table, so nothing waits on the
+    device; one kernel per window (``split_slots_by_owner``) gives every row
+    its all-gather output row and this rank's rows their physical slots.
 
     Args:
         chunk_kv_indices_list: Each loop's ``[rows]`` virtual slots, position
@@ -336,24 +342,44 @@ def plan_prefix_history_gather(
         chunk_bounds_cpu: ``[loops + 1, requests]`` host prefix positions.
         page_size: Tokens per kernel page.
         placement: The MLA history group's page ownership.
+        max_loops: The most loops a window takes, or None for no bound (the
+            NCCL all-gather's windows: ``PREFIX_HISTORY_WINDOW_LOOPS``).
+        max_send_rows: The most rows a window's busiest owner holds, or None
+            for no bound (the fused all-gather's: its receive slot's rows).
 
     Returns:
         The windows, in loop order.
     """
     if chunk_bounds_cpu.shape[0] != len(chunk_kv_indices_list) + 1:
         raise ValueError("prefix boundaries must delimit every history loop")
+    if (max_loops is not None and max_loops < 1) or (
+        max_send_rows is not None and max_send_rows < 1
+    ):
+        raise ValueError(
+            f"window bounds must be positive, got max_loops {max_loops} and "
+            f"max_send_rows {max_send_rows}"
+        )
     counts = owned_prefix_chunk_rows(
         page_table_cpu,
         chunk_bounds_cpu,
         page_size=page_size,
         placement=placement,
-    )
+    ).tolist()
     degree = len(placement.group)
     windows = []
-    for first in range(0, len(chunk_kv_indices_list), PREFIX_HISTORY_WINDOW_LOOPS):
-        loops = chunk_kv_indices_list[first : first + PREFIX_HISTORY_WINDOW_LOOPS]
+    first = 0
+    while first < len(counts):
+        # The same windows on every rank, which holds the same host table.
+        end, owned = first + 1, counts[first]
+        while end < len(counts) and (max_loops is None or end - first < max_loops):
+            joined = [mine + more for mine, more in zip(owned, counts[end])]
+            if max_send_rows is not None and max(joined) > max_send_rows:
+                break
+            owned, end = joined, end + 1
+        loops = chunk_kv_indices_list[first:end]
+        first = end
         slots = torch.cat(loops) if len(loops) > 1 else loops[0]
-        owned = tuple(counts[first : first + len(loops)].sum(dim=0).tolist())
+        owned = tuple(owned)
         if sum(owned) != slots.numel():
             raise ValueError(
                 f"owned rows sum to {sum(owned)} but the window has "
@@ -392,14 +418,6 @@ def plan_prefix_history_gather(
         )
     return tuple(windows)
 
-
-# Receive bytes per rank and slot of a KVP history group's fused all-gather:
-# 24576 rows of 576 bytes (K3's FP8 MLA rows), which hold a window of four
-# 8192-token loops on the busiest of eight owners at random block placement.
-# Its two slots take 2 * 8 * 13.5 MiB = 216 MiB per rank of an eight-rank
-# group, reserved before the KV cache is sized; a window past it keeps the
-# NCCL all-gather.
-FUSED_HISTORY_CAP_BYTES = 24576 * 576
 
 # Backends and plans whose kernels never wait across ranks inside a kernel
 # that needs the whole GPU. A fused history window in flight on the same GPU
@@ -468,6 +486,13 @@ class FusedHistoryTransport:
         self._rows: dict[tuple[int, torch.dtype, tuple[int, ...]], torch.Tensor] = {}
         self.poisoned = False
 
+    def accepts(self, row_bytes: int, slots_dtype: torch.dtype) -> bool:
+        """Whether windows of ``row_bytes``-byte rows, planned from virtual
+        slots of ``slots_dtype``, fit the compiled kernel: its row width and
+        its int32 fetch slots. Equal on every rank, whose pools are built
+        alike."""
+        return row_bytes == self.state.row_bytes and slots_dtype == torch.int32
+
     def launch(
         self,
         cache: torch.Tensor,
@@ -482,7 +507,7 @@ class FusedHistoryTransport:
         Args:
             cache: One layer's ``[slots, *row]`` latent plane.
             window: The planned window to gather.
-            header: The window's 32-bit identity, equal on every rank.
+            header: The window's identity, equal on every rank, below 2**63.
             reader: The window's only consumer.
 
         Returns:
@@ -511,9 +536,11 @@ class FusedHistoryTransport:
         # planner's code fixes the slots' dtype.
         if (
             not cache.is_contiguous()
-            or cache.shape[1:].numel() * cache.element_size() != state.row_bytes
+            or not self.accepts(
+                cache.shape[1:].numel() * cache.element_size(),
+                window.fetch_slots.dtype,
+            )
             or window.send_rows * state.row_bytes > state.cap_bytes
-            or window.fetch_slots.dtype != torch.int32
         ):
             return None
         # Refused before the launch changes anything: a launch that would
@@ -643,8 +670,15 @@ def prepare_prefix_history_transport(
     call does nothing; after a refusal, it votes again. The group keeps
     the NCCL all-gather when its model reads no MLA prefix history through
     ``PrefixHistoryGather`` (DeepSeek V4.1 gathers its own) or reads
-    ``per_token_head`` rows, on a decode role, or when a configured kernel
-    could deadlock with a fused window (``_FUSED_HISTORY_SAFE_MOE_BACKENDS``).
+    ``per_token_head`` rows, on a decode role, without chunked prefill, or
+    when a configured kernel could deadlock with a fused window
+    (``_FUSED_HISTORY_SAFE_MOE_BACKENDS``).
+
+    A rank's part of a receive slot holds the MLA history capacity
+    (``chunk.get_max_chunk_capacity``) in rows: the chunk planner expands at
+    most that many history rows a loop, so any one loop fits whatever its
+    owners hold, and the window planner packs loops by their owners' counts
+    to fit it.
 
     Args:
         server_args: The launch's resolved server arguments.
@@ -684,6 +718,7 @@ def prepare_prefix_history_transport(
         moe_backends.add(server_args.draft_moe_backend or server_args.moe_backend)
     reason = None
     row_bytes = 0
+    cap_rows = 0
     # V4.1 gathers its own KVP history, outside PrefixHistoryGather.
     if (
         model_config.attention_arch != AttentionArch.MLA
@@ -699,7 +734,11 @@ def prepare_prefix_history_transport(
         reason = f"MoE backends {sorted(moe_backends)}"
     elif not All2AllBackend(server_args.all2all_backend).is_none():
         reason = f"all-to-all backend {server_args.all2all_backend!r}"
+    elif get_max_chunk_capacity() <= 0:
+        # The chunk planner refuses such a capacity: no prefix-chunk loops.
+        reason = "chunked prefill is off"
     else:
+        cap_rows = get_max_chunk_capacity()
         row_bytes = (
             model_config.kv_lora_rank + model_config.qk_rope_head_dim
         ) * resolve_dtype(server_args.kv_cache_dtype).itemsize
@@ -735,7 +774,7 @@ def prepare_prefix_history_transport(
         pg_manager.get_process_group("gloo", group),
         device,
         row_bytes=row_bytes,
-        cap_bytes=FUSED_HISTORY_CAP_BYTES,
+        cap_bytes=cap_rows * row_bytes,
         timeout_ns=timeout_ns,
         modes=("multicast", "peer"),
         eligible=reason is None,
@@ -775,10 +814,10 @@ class PrefixHistoryGather:
 
     :meth:`prepare` records each forward's prefix-chunk loops; :meth:`read`
     yields one layer's rows of every loop. The rows come from their page
-    owners, in windows of consecutive loops (``PREFIX_HISTORY_WINDOW_LOOPS``)
-    that the forward's first read plans: planning is host launch work, so
-    deferring it from before the forward's first kernel to that layer lets
-    it run while the device works through the layers queued ahead.
+    owners, in windows of consecutive loops (:meth:`windows`) that the
+    forward's first read plans: planning is host launch work, so deferring it
+    from before the forward's first kernel to that layer lets it run while
+    the device works through the layers queued ahead.
 
     Each window is all-gathered asynchronously on ``comm``, a backend on the
     named KVP history groups (``KVP_HISTORY_GROUP_NAME``) whose communicators
@@ -828,8 +867,8 @@ class PrefixHistoryGather:
         # Prepares so far: a read of an older forward neither resumes nor
         # cleans up after a newer prepare.
         self._generation = 0
-        # The fused windows' headers, by window index, for this forward.
-        self._headers: dict[int, int] = {}
+        # The fused windows' checksums, by window index, for this forward.
+        self._checksums: dict[int, int] = {}
 
     @classmethod
     def on_history_groups(
@@ -868,7 +907,7 @@ class PrefixHistoryGather:
             chunk_bounds_cpu: ``[loops + 1, requests]`` host prefix positions.
         """
         self._generation += 1
-        self._headers.clear()
+        self._checksums.clear()
         # A forward that stopped before draining its reads leaves gathers in
         # flight; they are waited on before they are dropped.
         self._abandon()
@@ -883,17 +922,36 @@ class PrefixHistoryGather:
         # A forward without prefix loops has nothing to gather.
         self._windows = None if chunk_kv_indices_list else ()
 
-    @property
-    def windows(self) -> tuple[PrefixHistoryWindow, ...]:
-        """The current forward's windows, in loop order (planned at first
-        access)."""
+    def windows(self, pool: MLATokenToKVPool) -> tuple[PrefixHistoryWindow, ...]:
+        """The current forward's windows of ``pool``'s rows, in loop order,
+        planned at the first call (the forward's first read makes it).
+
+        Windows the fused transport takes join loops while their busiest
+        owner fits its receive slot, which any one loop does; NCCL windows
+        keep ``PREFIX_HISTORY_WINDOW_LOOPS`` loops, which bounds their
+        all-gather's transient buffer. A reader whose rows the transport does
+        not take (a draft caching another dtype than the target) plans NCCL
+        windows, judged from the pool's row layout: reading a plane would
+        wait for its layer's Host load.
+        """
         if self._windows is None:
+            transport = self._transport
+            fused = transport is not None and transport.accepts(
+                pool.kv_cache_dim * pool.dtype.itemsize,
+                self._chunk_kv_indices_list[0].dtype,
+            )
             self._windows = plan_prefix_history_gather(
                 self._chunk_kv_indices_list,
                 page_table_cpu=self._page_table_cpu,
                 chunk_bounds_cpu=self._chunk_bounds_cpu,
                 page_size=self._page_size,
                 placement=self._placement,
+                max_loops=None if fused else PREFIX_HISTORY_WINDOW_LOOPS,
+                max_send_rows=(
+                    transport.state.cap_bytes // transport.state.row_bytes
+                    if fused
+                    else None
+                ),
             )
         return self._windows
 
@@ -927,7 +985,7 @@ class PrefixHistoryGather:
         """
         if chunk_kv_indices_list is not self._chunk_kv_indices_list:
             raise ValueError("the prefix-chunk loops are not the prepared forward's")
-        windows = self.windows
+        windows = self.windows(pool)
         if not windows:
             return
         generation = self._generation
@@ -1028,15 +1086,13 @@ class PrefixHistoryGather:
         bytes and one all-gather collects every owner's."""
         if (layer_id, index) in self._launched:
             return
-        window = self.windows[index]
+        window = self.windows(pool)[index]
         cache = pool.get_key_buffer(layer_id)
         if self._transport is not None:
-            header = self._headers.get(index)
-            if header is None:
-                # The window's identity, equal on every rank, which plans the
-                # same forward; the kernel checks it across ranks.
+            checksum = self._checksums.get(index)
+            if checksum is None:
                 owned = window.owned_rows_per_rank
-                header = zlib.crc32(
+                checksum = zlib.crc32(
                     struct.pack(
                         f"<{3 + len(owned)}q",
                         self._generation,
@@ -1045,7 +1101,11 @@ class PrefixHistoryGather:
                         *owned,
                     )
                 )
-                self._headers[index] = header
+                self._checksums[index] = checksum
+            # The window's identity, equal on every rank, which plans the same
+            # forward and reads the layers in the same order; the kernel
+            # checks it across ranks.
+            header = (layer_id << 32) | checksum
             fused = self._transport.launch(cache, window, header, reader=self)
             if fused is not None:
                 rows, done, epoch = fused

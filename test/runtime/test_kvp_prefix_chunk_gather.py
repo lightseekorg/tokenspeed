@@ -154,14 +154,21 @@ def test_owned_prefix_chunk_rows_refuses_a_hole():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("plan", ["nccl", "fused", "narrow_slot", "both_bounds"])
 @pytest.mark.parametrize("reuse", [False, True])
 @pytest.mark.parametrize("prefix_lens,page_size,subpages,chunk_len,degree", CASES)
 def test_every_rank_reads_the_position_order_rows(
-    prefix_lens, page_size, subpages, chunk_len, degree, reuse
+    prefix_lens, page_size, subpages, chunk_len, degree, reuse, plan
 ):
     """Emulate each window's all-gather over ``degree`` owners: every rank's
     send rows come from its own physical cache, and every rank's plan must
-    read the rank-major, padded output back as each loop's rows, in order."""
+    read the rank-major, padded output back as each loop's rows, in order.
+
+    Every rank plans the same windows. A window keeps its bounds unless one
+    loop alone exceeds the rows bound, and takes every loop it can: the NCCL
+    windows of ``PREFIX_HISTORY_WINDOW_LOOPS`` loops, the fused ones packed
+    into a slot of the loops' capacity (which then holds every window), a
+    slot narrower than some loops, and both bounds at once."""
     from tokenspeed.runtime.layers.attention.dcp.cache import (
         PREFIX_HISTORY_WINDOW_LOOPS,
         plan_prefix_history_gather,
@@ -170,6 +177,14 @@ def test_every_rank_reads_the_position_order_rows(
         resolve_cache_slots,
     )
 
+    # Either chunk plan expands at most this many rows a loop.
+    capacity = chunk_len * len(prefix_lens)
+    max_loops, max_send_rows = {
+        "nccl": (PREFIX_HISTORY_WINDOW_LOOPS, None),
+        "fused": (None, capacity),
+        "narrow_slot": (None, max(1, capacity // (2 * degree))),
+        "both_bounds": (2, capacity),
+    }[plan]
     generator = torch.Generator().manual_seed(11)
     virtual_block_count = 4096
     rows = page_size * subpages
@@ -215,16 +230,34 @@ def test_every_rank_reads_the_position_order_rows(
             chunk_bounds_cpu=bounds,
             page_size=page_size,
             placement=placement,
+            max_loops=max_loops,
+            max_send_rows=max_send_rows,
         )
         for placement in placements
     ]
-    expected_windows = -(-len(chunks) // PREFIX_HISTORY_WINDOW_LOOPS)
-    assert all(len(plan) == expected_windows for plan in plans)
+    assert all(len(windows) == len(plans[0]) for windows in plans)
+    if plan == "nccl":
+        assert len(plans[0]) == -(-len(chunks) // PREFIX_HISTORY_WINDOW_LOOPS)
+    counts = owned_prefix_chunk_rows(
+        table, bounds, page_size=page_size, placement=placements[0]
+    ).tolist()
     loop = 0
     for windows in zip(*plans):
         send_rows = windows[0].send_rows
+        owned = windows[0].owned_rows_per_rank
+        taken = len(windows[0].loop_bounds) - 1
         assert all(w.send_rows == send_rows for w in windows)
+        assert all(w.owned_rows_per_rank == owned for w in windows)
         assert all(w.loop_bounds == windows[0].loop_bounds for w in windows)
+        assert max_loops is None or taken <= max_loops
+        assert max_send_rows is None or taken == 1 or send_rows <= max_send_rows
+        if plan == "fused":
+            assert send_rows <= capacity
+        if loop + taken < len(chunks):
+            # The next loop would break a bound.
+            joined = max(mine + more for mine, more in zip(owned, counts[loop + taken]))
+            overflows = max_send_rows is not None and joined > max_send_rows
+            assert taken == max_loops or overflows
         gathered = torch.full(
             (degree * send_rows, width), -2, dtype=torch.int32, device="cuda"
         )
@@ -244,6 +277,70 @@ def test_every_rank_reads_the_position_order_rows(
                 )
             loop += 1
     assert loop == len(chunks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_windows_pack_loops_by_their_busiest_owner():
+    """Loops whose rows all sit on one owner fill a slot of one loop's rows
+    alone, and loops dealt over the owners share one while their busiest
+    owner fits: the owners' counts decide, not an even split of the slot. Four
+    loops a window would put 640 rows on one owner."""
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        PREFIX_HISTORY_WINDOW_LOOPS,
+        plan_prefix_history_gather,
+    )
+
+    degree, page_size, subpages = 4, 64, 2
+    rows = page_size * subpages
+    # Loops of two blocks: two loops on owner 0's blocks only, then four
+    # going round the owners.
+    blocks = [1, 5, 9, 13] + list(range(17, 25))
+    pages = [block * subpages + sub for block in blocks for sub in range(subpages)]
+    prefix_len = len(blocks) * rows
+    bounds = _chunk_plan([prefix_len], 2 * rows, reuse=True).boundaries
+    chunks = [
+        torch.tensor(chunk, dtype=torch.int32, device="cuda")
+        for chunk in _chunk_slots(
+            [
+                [
+                    pages[p // page_size] * page_size + p % page_size
+                    for p in range(prefix_len)
+                ]
+            ],
+            bounds,
+        )
+    ]
+    layout = dict(
+        page_table_cpu=torch.tensor([pages], dtype=torch.int32),
+        chunk_bounds_cpu=bounds,
+        page_size=page_size,
+        placement=CachePlacement(
+            block_granularity=rows,
+            virtual_block_count=64,
+            group=tuple(range(degree)),
+            rank=0,
+        ),
+    )
+    fused = plan_prefix_history_gather(
+        chunks, **layout, max_loops=None, max_send_rows=2 * rows
+    )
+    assert [w.loop_bounds for w in fused] == [
+        (0, 256),
+        (0, 256),
+        (0, 256, 512, 768, 1024),
+    ]
+    assert [w.owned_rows_per_rank for w in fused] == [
+        (256, 0, 0, 0),
+        (256, 0, 0, 0),
+        (256, 256, 256, 256),
+    ]
+    assert [w.send_rows for w in fused] == [256] * 3
+    nccl = plan_prefix_history_gather(
+        chunks, **layout, max_loops=PREFIX_HISTORY_WINDOW_LOOPS, max_send_rows=None
+    )
+    assert [w.send_rows for w in nccl] == [640, 128]
+    with pytest.raises(ValueError, match="positive"):
+        plan_prefix_history_gather(chunks, **layout, max_loops=None, max_send_rows=0)
 
 
 class _StubLatentPool:
@@ -365,7 +462,7 @@ def test_read_prefix_history_prefetches_one_window_ahead(reuse):
             page_table_cpu=table,
             chunk_bounds_cpu=bounds,
         )
-        num_windows = len(history.windows)
+        num_windows = len(history.windows(pool))
         assert num_windows > 1
         launched_after_layer = []
         outputs = {}
@@ -483,10 +580,10 @@ def test_a_prefetched_window_waits_for_its_layers_host_load(reuse):
             page_table_cpu=table,
             chunk_bounds_cpu=bounds,
         )
-        # Planned before the load starts, so the reads below enqueue at once.
-        num_windows = len(history.windows)
-        assert num_windows > 1
         pool = _StubLatentPool(planes)
+        # Planned before the load starts, so the reads below enqueue at once.
+        num_windows = len(history.windows(pool))
+        assert num_windows > 1
         pool.layerwise_load_tracker = LayerwiseLoadTracker(len(planes))
         load_stream = None
         if bool(landing.any()):
@@ -567,7 +664,7 @@ def test_history_gather_plans_at_first_read():
         chunk_bounds_cpu=torch.tensor([[0], [3]]),
     )
     with pytest.raises(ValueError, match="holes"):
-        history.windows
+        history.windows(_StubLatentPool([None]))
 
     # A forward without prefix loops (a prefill with no cached prefix) has
     # no host table to plan from and reads nothing.
@@ -604,7 +701,8 @@ class _CountingBackend(_RecordingBackend):
 
 def _two_layer_reader():
     """A rank-1 reader of two latent layers (1 and 3) over two owners, whose
-    forward plans three windows; its gathers count their waits."""
+    forward plans three windows, and its pool; its gathers count their
+    waits."""
     from tokenspeed.runtime.layers.attention.dcp.cache import PrefixHistoryGather
 
     page_size, subpages, chunk_len = 32, 4, 512
@@ -651,7 +749,7 @@ def _two_layer_reader():
             pool, SimpleNamespace(layer_id=layer_id), loops, dst_dtype=torch.int32
         )
 
-    return history, backend, prepare, read
+    return history, pool, backend, prepare, read
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -659,10 +757,10 @@ def test_a_read_stopped_early_waits_for_its_windows():
     """A read closed after any yield waits for every gather it left in flight
     (its next window, or the next layer's first) and drops it; reads after it
     gather every window afresh."""
-    history, backend, prepare, read = _two_layer_reader()
+    history, pool, backend, prepare, read = _two_layer_reader()
     prepare()
-    windows = len(history.windows)
-    loops = sum(len(window.loop_bounds) - 1 for window in history.windows)
+    windows = len(history.windows(pool))
+    loops = sum(len(window.loop_bounds) - 1 for window in history.windows(pool))
     assert windows == 3
     for taken in range(1, loops + 1):
         prepare()
@@ -686,7 +784,7 @@ def test_an_older_read_never_touches_a_newer_forward():
     import gc
     import threading
 
-    _, backend, prepare, read = _two_layer_reader()
+    _, _, backend, prepare, read = _two_layer_reader()
     prepare()
     older = read(1)
     next(older)
@@ -719,7 +817,7 @@ def test_a_failed_cleanup_wait_tries_every_window():
     """Every wait of a stopped read's cleanup is tried and the windows are
     dropped even when one fails; the error that stopped the read stays the
     one raised, with the cleanup's in a note, unless a close stopped it."""
-    _, backend, prepare, read = _two_layer_reader()
+    _, _, backend, prepare, read = _two_layer_reader()
     prepare()
     first = read(1)
     next(first)
@@ -794,13 +892,17 @@ def _mla_model_config(attention_arch):
 def startup_verdicts(monkeypatch):
     """The verdicts this rank brings to the startup vote. The vote needs the
     group's processes: the factory is stood in for by one that records its
-    arguments and refuses."""
+    arguments and refuses. The MLA history capacity is the defaults' (8192
+    x 4 rows), as the server's arguments resolve it."""
     from tokenspeed_kernel.ops.communication import cute_dsl
 
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg_manager,
     )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
 
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 8192)
+    monkeypatch.setitem(global_server_args_dict, "mla_chunk_multiplier", 4)
     verdicts = []
     monkeypatch.setattr(
         cute_dsl,
@@ -912,10 +1014,48 @@ def test_startup_keeps_nccl_where_a_fused_window_could_deadlock(
     assert verdict["eligible"] is eligible
     if eligible:
         assert verdict["row_bytes"] == 576
+        # One loop's history rows per rank.
+        assert verdict["cap_bytes"] == 8192 * 4 * 576
         # The process groups' default timeout less 30 s.
         default_s = DistributedConfig.distributed_timeout_seconds
         assert verdict["timeout_ns"] == (default_s - 30) * 10**9
     assert _FUSED_HISTORY_TRANSPORTS == {}
+
+
+@pytest.mark.parametrize(
+    "chunked_prefill_size,multiplier,cap_rows",
+    [(2048, 2, 4096), (16384, 4, 65536), (-1, 4, None)],
+)
+def test_startup_sizes_the_slot_from_the_history_capacity(
+    monkeypatch, startup_verdicts, chunked_prefill_size, multiplier, cap_rows
+):
+    """A rank's part of a receive slot holds the MLA history capacity in
+    rows, what the chunk planner expands at most a loop; without chunked
+    prefill no loop reads history and the group keeps NCCL."""
+    from tokenspeed.runtime.configs.model_config import AttentionArch
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        prepare_prefix_history_transport,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(
+        global_server_args_dict, "chunked_prefill_size", chunked_prefill_size
+    )
+    monkeypatch.setitem(global_server_args_dict, "mla_chunk_multiplier", multiplier)
+    mapping = Mapping(
+        rank=0, world_size=2, attn_tp_size=2, attn_dp_size=1, attn_kvp_size=2
+    )
+    prepare_prefix_history_transport(
+        _startup_args(mapping, timeout_s=None),
+        _mla_model_config(AttentionArch.MLA),
+        [],
+        torch.device("cpu"),
+    )
+    (verdict,) = startup_verdicts
+    assert verdict["eligible"] is (cap_rows is not None)
+    if cap_rows is not None:
+        assert verdict["cap_bytes"] == cap_rows * verdict["row_bytes"]
 
 
 def test_startup_keeps_nccl_beside_fused_dp_projections(startup_verdicts):

@@ -213,8 +213,9 @@ def create_paged_row_all_gather_state(
             distributed initializer gathers) the group keeps its all-gather.
         device: This rank's CUDA device, with its index.
         row_bytes: Bytes per cache row, a multiple of 16; equal on every rank.
-        cap_bytes: Receive bytes per rank and slot, a whole number of rows;
-            equal on every rank.
+        cap_bytes: Receive bytes per rank and slot, a whole number of rows,
+            with the slot (``degree * cap_bytes``) under 2 GiB; equal on
+            every rank.
         timeout_ns: Bound of every in-kernel wait; a peer that does not reach
             the same window within it fails the kernel with a trap.
         modes: Modes in preference order, from ``multicast`` (one NVLink
@@ -307,8 +308,8 @@ def create_paged_row_all_gather_state(
         if group.rank() == 0:
             logger.info(
                 f"paged_row_all_gather: ranks {ranks} keep their all-gather (a rank "
-                "is not eligible, or lacks the GB300 platform, group size, fabric "
-                "or kernel module)"
+                "is not eligible, or lacks the GB300 platform, group size, a slot "
+                "under 2 GiB, fabric or kernel module)"
             )
         return None
     return build_paged_row_all_gather_state(

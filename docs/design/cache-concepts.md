@@ -1985,7 +1985,10 @@ before its layer instead of queueing with those collectives. On GB300 a KVP
 group may gather the same raw rows with a fused paged-row all-gather on a
 stream of its own instead (`ops/communication/README.md` in
 `tokenspeed-kernel`), still one window ahead: each owner reads its
-rows in place and stores them into every rank's receive slot. GPU DSA sparse
+rows in place and stores them into every rank's receive slot. A slot holds the
+history-expansion capacity from every owner, so any one loop fits however its
+pages are owned, and a window packs loops while each owner's rows still fit.
+GPU DSA sparse
 prefill instead combines local sparse-attention partials.
 Ascend's generic MLA prefill gathers each layer's complete cache plane into
 an owner-major temporary view. That view is not published as persistent cache;

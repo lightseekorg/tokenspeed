@@ -88,12 +88,15 @@ HOLD_CYCLES = 1_000_000_000
 
 class _LatentPool(_StubLatentPool):
     """The stub pool reading rows through the MLA pool's own latent read
-    (``get_mla_kv_buffer_triton``)."""
+    (``get_mla_kv_buffer_triton``), with the MLA pool's row layout:
+    ``kv_cache_dim`` elements of ``dtype``, its planes'."""
 
     def __init__(self, planes: list[torch.Tensor | None]):
         super().__init__(planes)
         self.kv_lora_rank = 512
         self.qk_rope_head_dim = 64
+        self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self.dtype = next(plane for plane in planes if plane is not None).dtype
 
     def read_latent_rows(self, rows, loc, dst_dtype):
         from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
@@ -183,7 +186,9 @@ def _layouts(device):
         "small_segments": _layout(
             device, prefix_lens=[1000, 37, 513, 129, 0, 77], chunk_len=50, seed=3
         ),
-        # One window a layer, eight, and a last window of two loops.
+        # Loops of 2048 rows: several fused windows a layer.
+        "long": _layout(device, prefix_lens=[40000], chunk_len=2048, seed=9),
+        # NCCL windows: one a layer, eight, and a last one of two loops.
         "one_window": _layout(device, prefix_lens=[2000], chunk_len=2048, seed=4),
         "eight_windows": _layout(device, prefix_lens=[4096], chunk_len=128, seed=5),
         "partial_window": _layout(device, prefix_lens=[4096], chunk_len=300, seed=6),
@@ -372,7 +377,8 @@ def _nccl_then_fused(world: _World, layout: _Layout, transport):
     epoch = transport.state.epoch
     got = _forward(history, pool, layout, between=None)
     _assert_rows(world, got, want, "the fused reader")
-    assert transport.state.epoch - epoch == len(history.windows) * len(LATENT_LAYERS)
+    windows = len(history.windows(pool))
+    assert transport.state.epoch - epoch == windows * len(LATENT_LAYERS)
     _assert_clean(world, transport)
     return history, pool
 
@@ -455,24 +461,34 @@ def _case_startup(world: _World):
     )
     got = _forward(reader, pool, layout, between=None)
     _assert_rows(world, got, want, "the group's reader")
-    assert transport.state.epoch - epoch == len(reader.windows) * len(LATENT_LAYERS)
+    windows = len(reader.windows(pool))
+    assert transport.state.epoch - epoch == windows * len(LATENT_LAYERS)
     _assert_clean(world, transport)
     return transport
 
 
 def _case_layouts(world: _World, transport):
-    expected_windows = {
+    """Every layout through both readers: the NCCL one keeps windows of
+    ``PREFIX_HISTORY_WINDOW_LOOPS`` loops, the fused one packs loops while
+    their busiest owner fits the receive slot (the 32 loops of
+    ``eight_windows`` share one)."""
+    nccl_windows = {
         "one_window": 1,
         "eight_windows": 8,
         "partial_window": 4,
         "shared_capacity": 2,
     }
     for name, layout in _layouts(world.device).items():
-        history, _ = _nccl_then_fused(world, layout, transport)
-        if name in expected_windows:
-            assert len(history.windows) == expected_windows[name]
+        history, pool = _nccl_then_fused(world, layout, transport)
+        nccl = _reader(world, layout, None)
+        _prepare(nccl, layout)
+        windows = nccl.windows(pool)
+        if name in nccl_windows:
+            assert len(windows) == nccl_windows[name]
         if name == "partial_window":
-            assert len(history.windows[-1].loop_bounds) - 1 == 2
+            assert len(windows[-1].loop_bounds) - 1 == 2
+        if name == "eight_windows":
+            assert len(history.windows(pool)) == 1
 
 
 def _case_late_ranks(world: _World, transport):
@@ -483,7 +499,7 @@ def _case_late_ranks(world: _World, transport):
         if world.rank % 2 == 0:
             torch.cuda._sleep(2_000_000)
 
-    for name in ("fragmented", "eight_windows"):
+    for name in ("fragmented", "eight_windows", "long"):
         layout = _layouts(world.device)[name]
         planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
         pool = _LatentPool(planes)
@@ -585,27 +601,30 @@ def _case_target_then_draft(world: _World, transport):
         _assert_rows(world, got, want, f"the target of forward {forward}")
         got = _forward(draft, pool, layout, between=None)
         _assert_rows(world, got, want, f"the draft of forward {forward}")
-    windows = len(target.windows) * len(LATENT_LAYERS)
+    windows = len(target.windows(pool)) * len(LATENT_LAYERS)
     assert transport.state.epoch - epoch == 6 * windows
     _assert_clean(world, transport)
 
 
-def _case_release_before_the_last_yield(world: _World, transport):
+def _case_release_before_the_last_yield(world: _World):
     """A window's slot is released once its last loop's read is enqueued,
     before that loop is yielded: at that yield the transport holds only the
-    window prefetched after it."""
+    window prefetched after it. A 256-row slot packs a few one-block loops a
+    window, so each layer reads several."""
     layout = _layouts(world.device)["eight_windows"]
+    transport = _own_transport(world, cap_rows=256, modes=("multicast", "peer"))
     planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
     pool = _LatentPool(planes)
     want = _expected(pool, layout, dtype=FP8)
     history = _reader(world, layout, transport)
     _prepare(history, layout)
+    assert len(history.windows(pool)) > 2
     failure = None
     got = {}
     for layer_id in LATENT_LAYERS:
         got[layer_id] = []
         reading = _read(history, pool, layout, layer_id)
-        for window_index, window in enumerate(history.windows):
+        for window_index, window in enumerate(history.windows(pool)):
             for loop in range(len(window.loop_bounds) - 1):
                 got[layer_id].append(next(reading))
                 # The windows held: holds() says only whether there are any.
@@ -613,7 +632,7 @@ def _case_release_before_the_last_yield(world: _World, transport):
                 last = loop == len(window.loop_bounds) - 2
                 prefetched = not (
                     layer_id == LATENT_LAYERS[-1]
-                    and window_index == len(history.windows) - 1
+                    and window_index == len(history.windows(pool)) - 1
                 )
                 if last and held != int(prefetched) and failure is None:
                     failure = (
@@ -625,6 +644,7 @@ def _case_release_before_the_last_yield(world: _World, transport):
     _agree(world, failure, "the release before the last yield")
     _assert_rows(world, got, want, "the reads around the releases")
     _assert_clean(world, transport)
+    transport.state.close()
 
 
 def _case_prepare_drains(world: _World, transport):
@@ -648,16 +668,16 @@ def _case_prepare_drains(world: _World, transport):
     _assert_rows(world, got, want, "the draft after an abandoned target")
     del abandoned
 
-    # Two windows launched (no take; only the reader's own launch step does
-    # that), the second ~2 s late on every rank (rank 0's kernel starts late;
-    # the others wait for its credit), then a prepare on a side stream: the
-    # side stream does not wait, the consumer does.
+    # Two windows launched, two layers' first (no take; only the reader's
+    # own launch step does that), the second ~2 s late on every rank (rank
+    # 0's kernel starts late; the others wait for its credit), then a prepare
+    # on a side stream: the side stream does not wait, the consumer does.
     _prepare(target, layout)
     target._launch(pool, LATENT_LAYERS[0], 0)
     if world.rank == 0:
         with torch.cuda.stream(transport.state.stream):
             torch.cuda._sleep(4 * HOLD_CYCLES)
-    target._launch(pool, LATENT_LAYERS[0], 1)
+    target._launch(pool, LATENT_LAYERS[1], 0)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -678,19 +698,21 @@ def _case_prepare_drains(world: _World, transport):
 
 
 def _case_over_cap_alternates(world: _World):
-    """Windows alternately spread over every owner (128 rows each) and held
-    by one (512 rows), on a 256-row slot: inside every layer, fused, NCCL,
-    fused, ... Epochs count the fused windows only."""
+    """Loops of four blocks alternately spread over the owners (at most 256
+    rows each) and held by one (512 rows), on a 256-row slot, narrower than
+    a loop as no startup sizes it: each loop makes a window, and inside
+    every layer the windows go fused, NCCL, fused, ... Epochs count the
+    fused windows only."""
     degree = len(world.group)
     blocks = []
-    for window in range(6):
-        base = 1 + window * 4 * degree
-        step = 1 if window % 2 == 0 else degree
+    for loop in range(6):
+        base = 1 + loop * 4 * degree
+        step = 1 if loop % 2 == 0 else degree
         blocks += [base + i * step for i in range(4)]
     layout = _layout(
         world.device,
         prefix_lens=[len(blocks) * GRANULARITY - 10],
-        chunk_len=128,
+        chunk_len=4 * GRANULARITY,
         blocks=blocks,
     )
     transport = _own_transport(world, cap_rows=256, modes=("multicast", "peer"))
@@ -701,30 +723,40 @@ def _case_over_cap_alternates(world: _World):
     epoch = transport.state.epoch
     got = _forward(history, pool, layout, between=None)
     _assert_rows(world, got, want, "alternating windows")
-    assert [window.send_rows > 256 for window in history.windows] == [False, True] * 3
+    windows = history.windows(pool)
+    assert [window.send_rows > 256 for window in windows] == [False, True] * 3
     assert transport.state.epoch - epoch == 3 * len(LATENT_LAYERS)
     _assert_clean(world, transport)
     transport.state.close()
 
 
 def _case_other_row_width(world: _World, transport):
-    """A plane of 2-byte elements (1152-byte rows, not the compiled 576), and
-    int64 virtual slots (which plan int64 fetch slots, not the kernel's
-    int32), take the NCCL all-gather in every window, on every rank,
-    bitwise."""
+    """A plane of 2-byte elements (1152-byte rows, not the compiled 576: a
+    BF16 draft beside an FP8 target), and int64 virtual slots (which plan
+    int64 fetch slots, not the kernel's int32), plan NCCL windows and take
+    the NCCL all-gather in every one, on every rank, bitwise."""
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        PREFIX_HISTORY_WINDOW_LOOPS,
+    )
+
     layout = _layouts(world.device)["fragmented"]
+    nccl_windows = -(-len(layout.chunks) // PREFIX_HISTORY_WINDOW_LOOPS)
     planes, _, _ = _planes(world, layout, dtype=torch.bfloat16, payload_layer_offset=0)
     pool = _LatentPool(planes)
     want = _expected(pool, layout, dtype=torch.bfloat16)
     epoch = transport.state.epoch
-    got = _forward(_reader(world, layout, transport), pool, layout, between=None)
+    history = _reader(world, layout, transport)
+    got = _forward(history, pool, layout, between=None)
     _assert_rows(world, got, want, "2-byte rows")
+    assert len(history.windows(pool)) == nccl_windows
     wide = replace(layout, chunks=[chunk.to(torch.int64) for chunk in layout.chunks])
     planes, _, _ = _planes(world, wide, dtype=FP8, payload_layer_offset=0)
     pool = _LatentPool(planes)
     want = _expected(pool, wide, dtype=FP8)
-    got = _forward(_reader(world, wide, transport), pool, wide, between=None)
+    history = _reader(world, wide, transport)
+    got = _forward(history, pool, wide, between=None)
     _assert_rows(world, got, want, "int64 slots")
+    assert len(history.windows(pool)) == nccl_windows
     assert transport.state.epoch == epoch
     _assert_clean(world, transport)
 
@@ -740,8 +772,8 @@ def _case_owner_without_rows(world: _World, transport):
         chunk_len=256,
         blocks=blocks,
     )
-    history, _ = _nccl_then_fused(world, layout, transport)
-    for window in history.windows:
+    history, pool = _nccl_then_fused(world, layout, transport)
+    for window in history.windows(pool):
         assert window.owned_rows_per_rank[2:] == (0,) * (degree - 2)
 
 
@@ -846,7 +878,7 @@ def _host_load_case(world, layout, readers, *, loaded_from_block, late_cycles, s
                 layer_id + 100, layout.every_slot[landing], FP8
             ).view(torch.uint8)
         _prepare(history, layout)
-        history.windows  # planned before the load starts: the reads enqueue at once
+        history.windows(pool)  # planned before the load: the reads enqueue at once
         tracker = pool.layerwise_load_tracker
         load_index = tracker.begin_load()
         events = tracker.event_sets[load_index].layer_done_events
@@ -1002,11 +1034,13 @@ def _case_late_release_flags(world: _World, transport):
     _assert_clean(world, transport)
 
 
-def _case_event_sets_rotate(world: _World, transport):
+def _case_event_sets_rotate(world: _World):
     """One pool, one Host load per forward over 44 forwards (the tracker's
     three event sets reused many times), with random device skew on every
-    rank: the fused ready / done event pairs run over 1000 epochs."""
+    rank: the fused ready / done event pairs run over 1000 epochs, on a
+    256-row slot that packs a few loops a window."""
     layout = _layout(world.device, prefix_lens=[4096, 900], chunk_len=128, seed=14)
+    transport = _own_transport(world, cap_rows=256, modes=("multicast", "peer"))
     fused = _reader(world, layout, transport)
     start = transport.state.epoch
     _host_load_case(
@@ -1019,26 +1053,34 @@ def _case_event_sets_rotate(world: _World, transport):
     )
     assert transport.state.epoch - start >= 1000
     _assert_clean(world, transport)
+    transport.state.close()
 
 
 def _case_nccl_window_then_fused_after_host_load(world: _World):
-    """Each layer's first window past the slot takes the NCCL all-gather; its
-    later windows are fused and still read the layer's loaded rows."""
+    """Each layer's first window, a loop of 512 rows on one owner past a
+    256-row slot, takes the NCCL all-gather; its later windows, of loops
+    spread over the owners, are fused and still read the layer's loaded
+    rows."""
+    degree = len(world.group)
+    blocks = [1 + i * degree for i in range(4)] + list(range(100, 116))
     layout = _layout(
-        world.device, prefix_lens=[5000, 1500, 1500], chunk_len=256, seed=15
+        world.device,
+        prefix_lens=[len(blocks) * GRANULARITY - 10],
+        chunk_len=4 * GRANULARITY,
+        blocks=blocks,
     )
-    planner = _reader(world, layout, None)
+    transport = _own_transport(world, cap_rows=256, modes=("multicast", "peer"))
+    planner = _reader(world, layout, transport)
     _prepare(planner, layout)
-    sizes = [window.send_rows for window in planner.windows]
-    cap_rows = max(sizes[1:])
-    assert sizes[0] > cap_rows
-    transport = _own_transport(world, cap_rows=cap_rows, modes=("multicast", "peer"))
+    planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
+    sizes = [window.send_rows for window in planner.windows(_LatentPool(planes))]
+    assert sizes[0] > 256 and max(sizes[1:]) <= 256
     epoch = transport.state.epoch
     _host_load_case(
         world,
         layout,
         (_reader(world, layout, None), _reader(world, layout, transport)),
-        loaded_from_block=1000,
+        loaded_from_block=108,
         late_cycles=HOLD_CYCLES,
         skew=0,
     )
@@ -1090,7 +1132,7 @@ def _case_capture(world: _World):
         got = _forward(history, pool, layout, between=None)
         _assert_rows(world, got, want, "the capture case's first forward")
         _prepare(history, layout)
-        history.windows  # planned before the capture
+        history.windows(pool)  # planned before the capture
         epoch = transport.state.epoch
         # thread_local: the NCCL watchdog thread queries events meanwhile.
         with torch.cuda.graph(
@@ -1102,7 +1144,7 @@ def _case_capture(world: _World):
 
         _prepare(history, layout)
         reading = _read(history, pool, layout, LATENT_LAYERS[0])
-        next(reading)  # window 0 taken, window 1 launched: the last epoch
+        next(reading)  # window 0 taken, the next launched: the last epoch
         with torch.cuda.graph(
             torch.cuda.CUDAGraph(), capture_error_mode="thread_local"
         ):
@@ -1144,7 +1186,10 @@ def _case_transport_invariants(world: _World, transport):
     one = _reader(world, layout, transport)
     other = _reader(world, layout, transport)
     _prepare(one, layout)
-    windows = one.windows
+    # NCCL windows, which the slot holds: three of them.
+    planner = _reader(world, layout, None)
+    _prepare(planner, layout)
+    windows = planner.windows(pool)
     assert len(windows) >= 3
     cache = pool.get_key_buffer(LATENT_LAYERS[0])
 
@@ -1202,7 +1247,7 @@ def _case_failed_cleanup_poisons(world: _World):
     history = _reader(world, layout, transport)
     _prepare(history, layout)
     reading = _read(history, pool, layout, LATENT_LAYERS[0])
-    next(reading)  # window 0 taken, window 1 launched
+    next(reading)  # window 0 taken, the next launched
     # Another gather in flight, whose wait fails as an errored collective's:
     # injected, since a real collective does not fail on demand.
     backend = _CountingBackend()
@@ -1224,7 +1269,7 @@ def _case_failed_cleanup_poisons(world: _World):
         failure = "a launch went on"
         try:
             transport.launch(
-                wide[LATENT_LAYERS[0]], history.windows[0], 0, reader=history
+                wide[LATENT_LAYERS[0]], history.windows(pool)[0], 0, reader=history
             )
         except RuntimeError as error:
             failure = None if "refuses launches" in str(error) else repr(error)
@@ -1295,7 +1340,8 @@ def _case_real_collectives_in_flight(world: _World, transport):
         hidden_dim=7168,
     )
     _agree(world, None if armed else "trtllm all-reduce unavailable", "arming")
-    layout = _layouts(world.device)["fragmented"]
+    # Several fused windows a layer: the last take comes after a loop.
+    layout = _layouts(world.device)["long"]
     planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
     pool = _LatentPool(planes)
     want = _expected(pool, layout, dtype=FP8)
@@ -1311,7 +1357,7 @@ def _case_real_collectives_in_flight(world: _World, transport):
     def all_reduces(layer_id):
         seen[layer_id] += 1
         held = current["fused"] and layer_id != LATENT_LAYERS[-1]
-        windows = readers[1].windows if current["fused"] else readers[0].windows
+        windows = readers[int(current["fused"])].windows(pool)
         last_window_loops = len(windows[-1].loop_bounds) - 1
         if world.rank == 1:
             torch.cuda._sleep(rng.randrange(4_000_000))
@@ -1417,7 +1463,11 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
     from tokenspeed.runtime.layers.attention.dcp.cache import (
         _FUSED_HISTORY_TRANSPORTS,
     )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
 
+    # The MLA history capacity the startup sizes its receive slot by: 4096
+    # rows, at least any loop of the layouts here.
+    global_server_args_dict.update(chunked_prefill_size=1024, mla_chunk_multiplier=4)
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
@@ -1455,7 +1505,7 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
     _case_late_ranks(world, transport)
     _case_closed_after_every_yield(world, transport)
     _case_target_then_draft(world, transport)
-    _case_release_before_the_last_yield(world, transport)
+    _case_release_before_the_last_yield(world)
     _case_prepare_drains(world, transport)
     _case_over_cap_alternates(world)
     _case_other_row_width(world, transport)
@@ -1469,7 +1519,7 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
         # layer's first window past the slot) or single-node budgets.
         _case_transport_invariants(world, transport)
         _case_neighbour_rows_written(world, transport)
-        _case_event_sets_rotate(world, transport)
+        _case_event_sets_rotate(world)
         _case_nccl_window_then_fused_after_host_load(world)
         _case_capture(world)
         _case_failed_cleanup_poisons(world)
