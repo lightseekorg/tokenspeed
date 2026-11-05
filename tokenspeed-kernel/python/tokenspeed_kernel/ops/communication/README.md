@@ -6,10 +6,29 @@
 plane with the row pack fused into the transfer: each rank reads its own rows in
 `fetch_slots` order and stores them straight into every rank's receive slot,
 through the NVLink multicast address of one symmetric workspace (`multicast`
-mode, two CTAs per window) or with one store per peer (`peer` mode, 24 CTAs).
-The rows a reader addresses are byte-identical to an all-gather of the packed
-rows. The KVP prefix-history reads (`PrefixHistoryGather` in the runtime) use
-it in place of a copy plus an NCCL all-gather.
+mode) or with one store per peer (`peer` mode). The rows a reader addresses
+are byte-identical to an all-gather of the packed rows. The KVP prefix-history
+reads (`PrefixHistoryGather` in the runtime) use it in place of a copy plus an
+NCCL all-gather.
+
+### Launch configuration
+
+A state launches the same number of CTAs every window, fixed by its mode and
+group size when it is built; the grid is a launch argument, outside the
+compile. In `multicast` mode a GPU's stores leave at about 40 GB/s per CTA on
+GB300, and each GPU receives one share from every rank, saturating near
+600 GB/s. The fewest CTAs that saturate the receive side therefore depend on
+the group size alone: 8 CTAs for 2 ranks, 4 for 4, and 2 for 8. A window's
+rows, the row width, and the queries reading alongside change how much moves,
+not which side limits it: over 576-byte rows from 512 to 32768 per rank, alone
+and overlapping a stand-in for the Kimi-K3 prefix loops' compute with 128 or
+2048 queries, no other count (2 to 16 CTAs) shortens a window's device time
+by more than 3 us. Fewer CTAs leave the receive side idle (at 4 ranks and
+32768 rows per rank, 2 CTAs take 227 us and 4 take 127 us); more slow the
+compute a window overlaps (at 8 ranks, 32768 rows per rank and 128 queries,
+8 CTAs add 89 us a window to it, 2 add 13 us). `peer` mode keeps 24 CTAs at
+every group size, which was not measured per size. The counts are calibrated
+on GB300; other hardware needs measuring again.
 
 ### Layout
 

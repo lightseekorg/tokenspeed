@@ -112,9 +112,17 @@ _FIRST_WINDOW_TIMEOUT_NS = 30_000_000_000
 # vectors, and a rank's rows at most cap_bytes / 16 < 2**27 vectors.
 _THREADS = 512
 _UNROLL = 8
-# CTAs per window: a multicast store reaches every peer at once, unicast
-# stores need more CTAs in flight to reach the same bandwidth.
-_NUM_CTAS = {"multicast": 2, "peer": 24}
+# CTAs per window, by mode and group size: a state launches its group size's
+# count every window (the grid is a launch argument, outside the compile).
+# Multicast: a GPU's stores leave at about 40 GB/s per CTA, and each GPU
+# receives a share from every rank, saturating near 600 GB/s, so the fewest
+# CTAs that saturate the receive side follow from the group size alone. A
+# window's rows, the row width and the reader's queries change how much
+# moves, not which side limits it: on the GB300 sweeps (the communication
+# README) no other count shortens a window by more than 3 us, and more CTAs
+# slow the compute a window overlaps. Other hardware needs measuring again.
+# Peer stores keep 24 CTAs at every group size, not measured per size.
+_NUM_CTAS = {"multicast": {2: 8, 4: 4, 8: 2}, "peer": {2: 24, 4: 24, 8: 24}}
 
 # Error record (pinned host int64 words): stage, epoch, peer mask, rank,
 # block, expected header, a word set once those are written, then the value
@@ -699,7 +707,7 @@ class PagedRowAllGatherState:
         self.rank = group.rank()
         self.degree = group.size()
         self.mode = mode
-        self.num_ctas = _NUM_CTAS[mode]
+        self.num_ctas = _NUM_CTAS[mode][self.degree]
         self.row_bytes = row_bytes
         self.cap_bytes = cap_bytes
         self.slot_bytes = self.degree * cap_bytes

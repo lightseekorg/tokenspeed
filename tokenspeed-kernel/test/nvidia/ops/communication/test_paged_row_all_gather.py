@@ -20,7 +20,8 @@
 
 """The fused paged-row all-gather against NCCL's all-gather of the packed rows,
 on two and four node-local GB300 GPUs: every byte value, both slots, owners
-without rows, source offsets past 2**31, both modes, group-consistent
+without rows, source offsets past 2**31, both modes with each group size's
+CTA count, windows of any row count on one compiled kernel, group-consistent
 refusals and argument errors, and the in-kernel failure records."""
 
 import json
@@ -39,7 +40,7 @@ from tokenspeed_kernel.ops.communication.cute_dsl import (
     create_paged_row_all_gather_state,
     cute_dsl_paged_row_all_gather,
 )
-from utils import kernel_supported, move_pages_past_int32
+from utils import assert_no_cute_compile, kernel_supported, move_pages_past_int32
 
 ROW_BYTES = 576
 CAP_ROWS = 4096
@@ -188,6 +189,13 @@ def _worker(rank, size, rendezvous):
         None if state.mode == expected else f"mode {state.mode}",
         f"the {expected} mode inside a node",
     )
+    # The fewest multicast CTAs that saturate the receive side of the group.
+    ctas = {2: 8, 4: 4}[size] if expected == "multicast" else 24
+    _agree(
+        device,
+        None if state.num_ctas == ctas else f"{state.num_ctas} CTAs",
+        f"{ctas} CTAs a window on {size} ranks",
+    )
     # The first window waited under its own short bound; the later ones wait
     # up to the caller's (no public accessor: the kernel reads the bound).
     bound = int(state.params[paged_row_all_gather._PARAM_TIMEOUT])
@@ -196,44 +204,43 @@ def _worker(rank, size, rendezvous):
         None if bound == LONG_TIMEOUT_NS else f"bound {bound}",
         "the wait bound after the first window",
     )
-    compiles = patch.object(
-        paged_row_all_gather,
-        "compile_paged_row_all_gather",
-        wraps=paged_row_all_gather.compile_paged_row_all_gather,
+    # The same rows past 2**31 bytes of the plane: int64 source offsets.
+    (far,), far_slots = move_pages_past_int32(
+        (plane,), torch.arange(PLANE_ROWS, dtype=torch.int32, device=device)
     )
-    with compiles as compile_calls:
-        failure = _check_windows(state, device, size, plane, (shapes, generator), 64)
-        _agree(device, failure, f"{expected} windows")
-        # The same rows past 2**31 bytes of the plane: int64 source offsets.
-        (far,), far_slots = move_pages_past_int32(
-            (plane,), torch.arange(PLANE_ROWS, dtype=torch.int32, device=device)
-        )
-        offset = int(far_slots[0])
-        _agree(
-            device,
-            None if offset * ROW_BYTES > 2**31 else "no offset past 2**31",
-            "the far plane",
-        )
-        owned = [max(count, 1) for count in _owned_rows(shapes, size)]
-        send_rows = max(owned)
-        fetch = _fetch(generator, owned[rank], send_rows, device)
-        epoch, done = cute_dsl_paged_row_all_gather(
-            state, far, fetch + offset, owned[rank], send_rows, 0
-        )
-        torch.cuda.current_stream().wait_event(done)
-        got = state.receive_view(epoch)[: size * send_rows].clone()
-        failure = _compare(got, _expected(plane, fetch, size), owned, send_rows)
-        _agree(device, failure, "rows past 2**31")
-        del far
+    offset = int(far_slots[0])
     _agree(
         device,
-        (
-            None
-            if compile_calls.call_count == 0
-            else f"{compile_calls.call_count} compiles"
-        ),
-        "launches after the state's creation",
+        None if offset * ROW_BYTES > 2**31 else "no offset past 2**31",
+        "the far plane",
     )
+    # Windows of every row count, the far one included, launch the state's
+    # compiled kernel: nothing traces.
+    traced = None
+    try:
+        with assert_no_cute_compile():
+            failure = _check_windows(
+                state, device, size, plane, (shapes, generator), 64
+            )
+            owned = [max(count, 1) for count in _owned_rows(shapes, size)]
+            send_rows = max(owned)
+            fetch = _fetch(generator, owned[rank], send_rows, device)
+            # Held until the current stream waits for the window: the kernel
+            # reads them on the state's stream, and the agreement below
+            # allocates on the current stream before that wait.
+            far_fetch = fetch + offset
+            epoch, done = cute_dsl_paged_row_all_gather(
+                state, far, far_fetch, owned[rank], send_rows, 0
+            )
+    except AssertionError as error:
+        traced = str(error)
+    _agree(device, failure, f"{expected} windows")
+    torch.cuda.current_stream().wait_event(done)
+    got = state.receive_view(epoch)[: size * send_rows].clone()
+    failure = _compare(got, _expected(plane, fetch, size), owned, send_rows)
+    _agree(device, failure, "rows past 2**31")
+    del far
+    _agree(device, traced, "launches after the state's creation")
     _agree(device, None if state.read_error() is None else "error record", "errors")
     state.close()
 
