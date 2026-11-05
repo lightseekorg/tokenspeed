@@ -490,6 +490,77 @@ def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatc
     backend._nccl.all_reduce_two.assert_not_called()
 
 
+def _lending_exchange(lent: torch.Tensor) -> Mock:
+    """A pull exchange lending ``lent``'s start and serving only inputs there."""
+
+    def owned(_output, input):
+        return input.data_ptr() == lent.data_ptr()
+
+    exchange = Mock()
+    exchange.input.side_effect = lambda nbytes: (
+        lent[:nbytes] if nbytes <= lent.numel() else None
+    )
+    exchange.can_all_gather.side_effect = owned
+    exchange.can_all_to_all.side_effect = owned
+    return exchange
+
+
+def test_iris_pull_exchange_serves_the_inputs_it_lends():
+    fallback = Mock()
+    backend = IrisBackend(fallback)
+    group = (0, 1)
+    lent = torch.empty(16, dtype=torch.uint8)
+    exchange = _lending_exchange(lent)
+    backend.install_pull_exchange(group, exchange)
+    backend.install_pull_exchange(group, exchange)
+    with pytest.raises(RuntimeError, match="cannot replace"):
+        backend.install_pull_exchange(group, Mock())
+    like = torch.empty(1)
+
+    borrowed = backend.acquire_exchange_input(16, like, group)
+    assert borrowed.data_ptr() == lent.data_ptr()
+    # Past the exchange's capacity, or over another group: ordinary storage.
+    for nbytes, other in ((32, group), (8, (0, 2))):
+        ordinary = backend.acquire_exchange_input(nbytes, like, other)
+        assert ordinary.dtype == torch.uint8 and ordinary.numel() == nbytes
+        assert ordinary.data_ptr() != lent.data_ptr()
+
+    out = torch.empty(32, dtype=torch.uint8)
+    backend.all_gather_single(out, borrowed, group)
+    assert exchange.all_gather.call_args.args[1] is borrowed
+    backend.all_gather_single(out, ordinary, group)
+    assert fallback.all_gather_single.call_args.args[1] is ordinary
+    backend.all_to_all_single(out[:16], borrowed, group)
+    assert exchange.all_to_all.call_args.args[1] is borrowed
+    # Uneven exchanges keep the fallback.
+    backend.all_to_all_single(
+        out[:16], borrowed, group, output_split_sizes=[8, 8], input_split_sizes=[8, 8]
+    )
+    assert fallback.all_to_all_single.call_args.args[1] is borrowed
+    assert exchange.all_gather.call_count == exchange.all_to_all.call_count == 1
+
+
+def test_exchanges_route_through_iris_only_where_it_reaches(backend, monkeypatch):
+    monkeypatch.setattr(backend, "_iris_reaches", lambda group: group == (0, 1))
+    out, input, like = torch.empty(8), torch.empty(4), torch.empty(1)
+    for group, served, other in (
+        ((0, 1), backend._iris, backend._nccl),
+        ((0, 2), backend._nccl, backend._iris),
+    ):
+        backend.all_gather_single(out, input, group)
+        backend.all_to_all_single(out, input, group)
+        served.all_gather_single.assert_called_once()
+        served.all_to_all_single.assert_called_once()
+        other.all_gather_single.assert_not_called()
+        other.all_to_all_single.assert_not_called()
+        served.reset_mock()
+    backend._iris.acquire_exchange_input.return_value = input
+    assert backend.acquire_exchange_input(4, like, (0, 1)) is input
+    ordinary = backend.acquire_exchange_input(4, like, (0, 2))
+    assert ordinary.dtype == torch.uint8 and ordinary.numel() == 4
+    backend._iris.acquire_exchange_input.assert_called_once_with(4, like, (0, 1))
+
+
 # ---- The one routing decision ----------------------------------------------
 
 

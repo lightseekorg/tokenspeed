@@ -609,9 +609,20 @@ class AutoBackend(CommBackend):
             return self._rsag.all_gather(tensor, group, dim)
         return self._nccl.all_gather(tensor, group, dim)
 
+    def acquire_exchange_input(
+        self, nbytes: int, like: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        if self._iris_reaches(group):
+            return self._iris.acquire_exchange_input(nbytes, like, group)
+        return super().acquire_exchange_input(nbytes, like, group)
+
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
+        # Pure data movement: an input borrowed from Iris's pull exchange is
+        # pulled in place, every bit preserved.
+        if self._iris_reaches(group):
+            return self._iris.all_gather_single(output, input, group)
         return self._nccl.all_gather_single(output, input, group)
 
     def all_gather_single_async(
@@ -690,6 +701,14 @@ class AutoBackend(CommBackend):
     ) -> None:
         # Pure data movement: no reduction, so nothing to fold for the
         # batch-invariant envelope and no symmetric-memory path to veto.
+        if self._iris_reaches(group):
+            return self._iris.all_to_all_single(
+                output,
+                input,
+                group,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+            )
         return self._nccl.all_to_all_single(
             output,
             input,

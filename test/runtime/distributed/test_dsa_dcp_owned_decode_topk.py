@@ -37,7 +37,8 @@ decode's query rides it) must leave the selection as it was and land as an
 all-gather of every rank's rider lands. A forward's captured metadata build
 and owned selection with its rider, replayed after the lengths, the table
 and the rider change in place, must select what the eager merge selects
-for the new batch and gather the new riders.
+for the new batch and gather the new riders. All of it holds again on CDNA4
+with the score gather pulling its input from an Iris pull exchange.
 """
 
 import sys
@@ -192,7 +193,7 @@ def _assert_same_rows(slots: torch.Tensor, expected: torch.Tensor) -> None:
     )
 
 
-def _worker(rank, degree, rendezvous):
+def _worker(rank, degree, rendezvous, pull_exchange):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     # Runtime imports may initialize CUDA, so select the rank's device first.
@@ -233,6 +234,28 @@ def _worker(rank, degree, rendezvous):
         backend = AutoBackend()
         backend.configure(use_pynccl=False)
         set_global_backend(backend)
+        exchange = None
+        if pull_exchange:
+            # The score gather then pulls its input where the scorer wrote it.
+            from tokenspeed_kernel.ops.communication._iris import (
+                IrisGroup,
+                get_or_create_context,
+            )
+            from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+                IrisPullExchange,
+            )
+
+            exchange = IrisPullExchange(
+                IrisGroup(
+                    get_or_create_context(heap_size=1 << 28),
+                    dist.group.WORLD,
+                    rank,
+                    device,
+                ),
+                16 * _Q_LEN * (_TOPK * 4 + _RIDER),
+            )
+            exchange.peers.finish_prepare()
+            backend.iris.install_pull_exchange(group, exchange)
         kwargs = dict(
             page_size=_PAGE,
             topk=_TOPK,
@@ -436,6 +459,8 @@ def _worker(rank, degree, rendezvous):
         graph = None
         torch.cuda.synchronize()
         dist.barrier(group=coordination)
+        # Every rider gather above ran through the pull exchange.
+        assert exchange is None or int(exchange.state[0]) > 0
     finally:
         # NCCL shutdown waits for communicators retained by captured graphs.
         if graph is not None:
@@ -443,13 +468,21 @@ def _worker(rank, degree, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("pull_exchange", [False, True])
 @pytest.mark.parametrize("degree", [2, 4, 8])
-def test_owned_decode_topk_is_each_ranks_share_of_the_merge(tmp_path, degree):
+def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
+    tmp_path, degree, pull_exchange
+):
     if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
         pytest.skip(f"requires {degree} GPUs")
+    if pull_exchange:
+        from tokenspeed_kernel.platform import current_platform
+
+        if not current_platform().is_cdna4:
+            pytest.skip("Iris pull exchanges run on CDNA4")
     mp.spawn(
         _worker,
-        args=(degree, f"file://{tmp_path / 'rendezvous'}"),
+        args=(degree, f"file://{tmp_path / 'rendezvous'}", pull_exchange),
         nprocs=degree,
         join=True,
     )

@@ -779,6 +779,35 @@ def dsa_decode_dcp_records_supported(
     )
 
 
+def dsa_decode_dcp_records_workspace_bytes(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> int:
+    """Bytes of the ``workspace`` :func:`dsa_decode_dcp_records` writes for a
+    decode of this size, which :func:`dsa_decode_dcp_records_supported`
+    accepts: its key splits, the records first. Host values only; arguments
+    as for :func:`dsa_decode_dcp_records_supported`."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+        gluon_dsa_decode_dcp_records_workspace_bytes_gfx950,
+    )
+
+    return gluon_dsa_decode_dcp_records_workspace_bytes_gfx950(
+        tokens=tokens,
+        heads=heads,
+        topk=topk,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+
+
 def dsa_decode_dcp_records(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -795,6 +824,7 @@ def dsa_decode_dcp_records(
     solution: str | None = None,
     *,
     slot_order: str,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse DSA decode of KVP-gathered query heads, written as DCP records.
 
@@ -823,17 +853,21 @@ def dsa_decode_dcp_records(
         k_scale: KV scale multiplier for FP8 caches.
         solution: Optional kernel solution to force through normal selection.
         slot_order: As for :func:`dsa_decode`. Required keyword.
+        workspace: Optional flat contiguous int32 storage of at least
+            :func:`dsa_decode_dcp_records_workspace_bytes` bytes for the key
+            splits, such as a buffer the records' exchange reads in place.
 
     Returns:
         Contiguous int32 ``[ranks, tokens, local_heads, kv_lora_rank / 2 + 1]``:
         the records ``dispatch_dcp_attention_partials(out, lse,
         degree=ranks)`` packs from ``dsa_decode(..., return_lse=True)`` on the
-        token-major gather (head ``r * local_heads + h``). A row splits its
-        keys by its own live length, so a short one, as one near its rank's
-        share of the selection in a small launch, may split less than that
-        decode and round differently; a longer row matches it bit for bit.
-        Raises ``ValueError`` for a size
-        :func:`dsa_decode_dcp_records_supported` refuses.
+        token-major gather (head ``r * local_heads + h``), leading
+        ``workspace`` when given. A row splits its keys by its own live
+        length, so a short one, as one near its rank's share of the selection
+        in a small launch, may split less than that decode and round
+        differently; a longer row matches it bit for bit. Raises
+        ``ValueError`` for a size :func:`dsa_decode_dcp_records_supported`
+        refuses.
     """
     if q.dim() != 4:
         raise ValueError(
@@ -900,6 +934,7 @@ def dsa_decode_dcp_records(
             page_size=page_size,
             logit_cap=logit_cap,
             k_scale=k_scale,
+            workspace=workspace,
             **slot_order_kwargs,
         )
 
@@ -2134,6 +2169,7 @@ __all__ = [
     "dsa_decode",
     "dsa_decode_dcp_records",
     "dsa_decode_dcp_records_supported",
+    "dsa_decode_dcp_records_workspace_bytes",
     "dsa_index_candidates_accepts_pages",
     "dsa_interleave_rope",
     "dsa_prefill",

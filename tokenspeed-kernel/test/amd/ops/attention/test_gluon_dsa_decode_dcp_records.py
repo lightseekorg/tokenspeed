@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.dsa import (  # isort: skip
     dsa_decode,
     dsa_decode_dcp_records,
     dsa_decode_dcp_records_supported,
+    dsa_decode_dcp_records_workspace_bytes,
 )
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (  # isort: skip
     dispatch_dcp_attention_partials,
@@ -254,6 +255,37 @@ def test_decode_records_read_a_query_riding_in_a_gathered_chunk(tokens):
     shifted = odd[:, : tokens * local_heads * 576].view(q.dtype).view(q.shape)
     shifted.view(torch.uint8).copy_(q.view(torch.uint8))
     assert torch.equal(dsa_decode_dcp_records(q=shifted, **kwargs), expected)
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 48, 64])
+def test_decode_records_lead_a_given_workspace(tokens):
+    # An exchange that reads the records in place lends their storage: they
+    # lead it, bit for bit what the core writes into its own.
+    degree, local_heads = 8, 12
+    q, cache, slots, lengths = _inputs(tokens, degree, local_heads, seed=tokens + 9)
+    kwargs = _kwargs(cache, slots, lengths)
+    expected = dsa_decode_dcp_records(q=q, **kwargs)
+    words = (
+        dsa_decode_dcp_records_workspace_bytes(
+            tokens=tokens,
+            heads=degree * local_heads,
+            topk=TOPK,
+            q_dtype=q.dtype,
+            kv_dtype=cache.dtype,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        // 4
+    )
+    assert words >= expected.numel()
+    # Stale words in the lent storage, and room past the splits.
+    workspace = torch.full((words + 64,), -7, device="cuda", dtype=torch.int32)
+    records = dsa_decode_dcp_records(q=q, workspace=workspace, **kwargs)
+    assert records.data_ptr() == workspace.data_ptr()
+    assert torch.equal(records, expected)
+    for bad in (workspace[: words - 1], workspace.view(torch.uint8), workspace[::2]):
+        with pytest.raises(ValueError, match="workspace"):
+            dsa_decode_dcp_records(q=q, workspace=bad, **kwargs)
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])

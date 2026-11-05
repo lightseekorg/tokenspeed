@@ -108,6 +108,7 @@ class K3IrisState:
         attnres_max_rows: int,
         enable_lamport: bool,
         sharded_max_rows: int,
+        pull_exchange_max_bytes: int = 0,
     ):
         from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerLamport
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
@@ -116,8 +117,17 @@ class K3IrisState:
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
             IrisAttnResState,
         )
+        from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+            IrisPullExchange,
+        )
 
         self.all_reduce = all_reduce
+        # K3.1's KVP decode gathers and records exchange, pulled in place.
+        self.pull_exchange = (
+            IrisPullExchange(all_reduce.peers, pull_exchange_max_bytes)
+            if pull_exchange_max_bytes
+            else None
+        )
         self.enable_lamport = enable_lamport
         self.attnres = (
             IrisAttnResState(
@@ -964,12 +974,14 @@ def prepare_k3_communication(
     dtype: torch.dtype,
     device: torch.device,
     all_reduce: "IrisAllReduce | None",
+    pull_exchange_max_bytes: int = 0,
 ) -> K3IrisState:
     """Prepare a group's combined K3 buffers before graph capture.
 
-    Capacities are elements except the explicitly named row capacities. Zero
-    omits that path. ``all_reduce`` shares an already prepared generic operation,
-    or None creates it. The returned state owns all model-specific storage.
+    Capacities are elements except the explicitly named row and byte
+    capacities. Zero omits that path. ``all_reduce`` shares an already
+    prepared generic operation, or None creates it. The returned state owns
+    all model-specific storage.
     """
     from tokenspeed_kernel.ops.communication._iris import (
         HEAP_HEADROOM_BYTES,
@@ -984,6 +996,9 @@ def prepare_k3_communication(
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
         IrisAttnResState,
     )
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
     world_size = group.size()
@@ -994,6 +1009,7 @@ def prepare_k3_communication(
             attnres_max_numel,
             attnres_max_rows,
             sharded_max_rows,
+            pull_exchange_max_bytes,
         )
         < 0
     ):
@@ -1036,6 +1052,8 @@ def prepare_k3_communication(
             total_bytes += ProducerLamport.heap_bytes(lamport_numel)
             if world_size == 8:
                 total_bytes += _k3_two_shot_heap_bytes(producer_direct_max_numel)
+    if pull_exchange_max_bytes:
+        total_bytes += IrisPullExchange.heap_bytes(pull_exchange_max_bytes, world_size)
     sharded_bytes = (
         IrisAllReduceShardedState.heap_bytes(sharded_max_rows, world_size, dtype)
         if sharded_max_rows
@@ -1059,6 +1077,7 @@ def prepare_k3_communication(
         attnres_max_rows=attnres_max_rows,
         enable_lamport=enable_lamport,
         sharded_max_rows=sharded_max_rows,
+        pull_exchange_max_bytes=pull_exchange_max_bytes,
     )
     all_reduce.peers.finish_prepare()
     return state
