@@ -809,6 +809,51 @@ one row. The span is a multiple of the tile and a runtime argument, so
 batch-size changes do not recompile the scorer. Only the first program of a
 KPool row writes its `row_ends_out`.
 
+### gfx950 standard-cache DSA scoring over a bf16 index-K plane
+
+`gluon_dsa_decode_topk_bf16_gfx950` and `gluon_dsa_prefill_topk_bf16_gfx950`
+in `standard_cache_logits.py` share one multi-row scorer body, then the same
+radix top-k as the FP8 standard-cache scorers.
+
+#### Contract
+
+- The plane is a contiguous bf16 `[slots, 128]` matrix with no scales; slot
+  `page * 64 + row` is its row. Queries are BF16 `[tokens, 32 | 64, 128]`
+  without `q_scales`; weights are BF16 or FP32 with a contiguous head axis.
+- The score, workspace-row (prefill) and global-slot (decode) outputs, the
+  `q_len_per_req` bounds, and the `topk` and `page_size` limits are those of
+  the FP8 standard-cache scorers. Each row writes only its own candidate
+  span of the logits.
+
+#### Algorithm
+
+Scoring is a GEMM of `[rows x heads, 128]` queries against gathered
+`[128, keys]` key tiles with a ReLU, head-weight, head-sum epilogue. A
+program owns a block of query rows and one chunk of candidates: prefill
+blocks are 8 consecutive rows (4 with 64 heads) against 4096-row workspace
+chunks; decode blocks are one request's `q_len_per_req` rows (bucketed to a
+power of two) against 256-position chunks. Every 64-key tile is gathered once
+into LDS and shared by all rows of the block, and the four waves split the
+rows, so each wave reads the whole tile as its MFMA B operand. The program
+scans the union of its rows' spans and masks each row's stores to its own
+span and to the chunk.
+
+- The chunk's slots (workspace indirection or page-table lookups) are loaded
+  into LDS once, so per-tile slot reads do not wait behind in-flight key
+  copies on the vector-memory counter.
+- Key rows are copied to LDS 16 bytes per lane with the 16-byte chunks of a
+  row XOR-swizzled by the key index; operand reads of 16 consecutive keys
+  then hit distinct banks. A three-stage copy pipeline issues one (possibly
+  masked) copy group per tile.
+- MFMA row `m` is query row `m // 32`, head `m % 32`: each row owns one
+  `32x32x16` MFMA block and reduces its heads in the same order as a one-row
+  tile, so the scores are bitwise independent of the block size and match
+  the single-row scorer they replaced.
+
+Block size, tile, and chunk are compile-time constants; row counts, spans,
+and `q_len_per_req` are runtime arguments (the decode row bucket takes at
+most four values).
+
 ### gfx950 selected-slot sparse attention
 
 For dense BF16, E4M3, and E5M2 query and KV rows with 512 latent values,
@@ -874,6 +919,46 @@ softmax and P stay inside the wave. Rows arrive by TDM gather, with each
 step's indices loaded a step ahead and clamped to a zero-filled row past the
 end. The four partial softmaxes merge once, behind a single barrier, through
 the dead KV tile. Q^T stays in LDS so two workgroups fit on a CU.
+
+### gfx950 DSA decode top-k across workgroups
+
+`_dsa_topk_indices` in `dsa/sparse_mla.py` selects the decode top-k of up to
+32 query rows with two kernels that spread each row over many workgroups;
+larger batches, prefill and decode logits of at most 16384 columns keep one
+workgroup per row. The second launch costs ~1.8 us, so the split pays off only
+on rows past ~9K candidates (~12K from 16 rows); on short rows it is 0.5-2 us
+slower, and rows of at most `topk` candidates take ~4.2 us instead of ~2.4 us.
+
+#### Contract
+
+- Inputs and outputs are the one-workgroup top-k's: FP32 logits
+  `[rows, pages * page_size]` whose rows start 16-byte aligned (otherwise the
+  one-workgroup kernel runs), and each row's global KV slots in any order,
+  padded with -1 past its length. Exact ties at the k-th value take any of the
+  tied keys.
+- Batch rows and row lengths are runtime values. Rows 1-8 use 2048-column
+  workgroups and rows 9-32 4096-column ones, each one compiled variant.
+- A per-stream workspace holds each row's histogram and counters and is back
+  to zero after every call, so graph replays reuse it.
+
+#### Algorithm
+
+A row's workgroup `t` of `n` takes every `n`-th run of 64 columns, so keys
+crowded into a few runs spread evenly. The histogram kernel counts the
+12-bit key prefixes of its runs in LDS and adds the nonzero bins, and the sums
+of each 64-bin run, to the row's global histogram with device atomics.
+
+The select kernel's workgroups find the threshold bin from the run sums and
+then the bins of one run, each wave on its own copy with a DPP wave scan.
+They rank their keys below the bin (winners) and in it (listed) with one
+block scan, write the listed keys and KV slots write-through to the
+workgroup's slots (spilling past 128 or 256 to a per-row overflow list), and
+arrive on the row's counter with their winner count; the count returned
+places their winners in the output. The last workgroup to arrive gathers the
+listed keys with system-scope loads, counts their next 12 bits in LDS, and
+either ranks the few keys sharing the resulting 24-bit prefix in LDS or
+counts their last 8 bits, then emits the rest of the row's top-k and zeroes
+the row's histogram and counters.
 
 ### DeepSeek V4.1 CSA2 index selection
 
