@@ -155,6 +155,7 @@ def test_the_gemma_offset_is_formed_in_fp32(solution):
         norm=norm,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 64, seed=54)),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -210,6 +211,7 @@ def test_a_zero_offset_keeps_negative_zero_weights(solution):
         norm=HeadNorm(weight, weight, 0.0, 1e-6),
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 8, seed=61)),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -263,6 +265,7 @@ def test_the_norm_epsilon_is_applied(solution, scale, eps):
         norm=norm,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 16, seed=132)),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -330,6 +333,7 @@ def test_an_override_must_serve_the_request(override):
                 None,
             ),
             cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 256, seed=141)),
+            query_dtype=q.dtype,
             return_kv=False,
             solution=None,
             override=override,
@@ -425,6 +429,7 @@ def test_gqa_composite_writes_mxfp8():
             scales=MXFP8Scales(ks, vs, page_tokens),
             slots=loc,
         ),
+        query_dtype=q.dtype,
         return_kv=False,
         solution=None,
         override=None,
@@ -525,6 +530,7 @@ def test_gqa_writes_only_the_slotted_rows(solution, cache_dtype):
             scales=None,
             slots=loc,
         ),
+        query_dtype=q.dtype,
         return_kv=False,
         solution=solution,
         override=None,
@@ -548,6 +554,7 @@ def _scaled_gqa(solution, inputs, hq, hkv, dim, loc, total, scales):
         norm=None,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, scales, loc),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -575,6 +582,62 @@ def test_gqa_scaled_fp8_cache_holds_rows_over_their_scale():
     assert bytes_equal(v_rows, stored(out.v, scales.v))
     assert bytes_equal(k_rows, stored(out.k, scales.k))
     assert (k_rows.float().abs() == 448).any()
+
+
+@pytest.mark.parametrize(
+    "solution,cache_dtype,scales,steps",
+    [
+        ("triton", FP8, None, True),
+        ("triton", FP8, FP8TensorScales(k=0.5, v=2.0), True),
+        # Prepared rows (no norm or RoPE) skip the query copy unless converted.
+        ("triton", FP8, None, False),
+        ("triton", BF16, None, True),
+        ("composite", FP8, None, True),
+        ("composite", BF16, None, False),
+    ],
+)
+def test_query_comes_back_in_fp8_query_dtype(solution, cache_dtype, scales, steps):
+    """An FP8 ``query_dtype`` converts the query in the prologue: Triton rounds
+    the fp32 result once, the composite converts its activation-dtype result.
+    The key and value rows and the cache write are unchanged."""
+    tokens, hq, hkv, dim, total = 65, 4, 2, 64, 96
+    inputs = qkv(tokens, hq, hkv, dim, seed=23)
+    norm = head_norm(dim, 0.0, seed=24) if steps else None
+    g = torch.Generator(device="cuda").manual_seed(25)
+    positions = torch.randint(0, 4096, (tokens,), device="cuda", generator=g)
+    rotary = (
+        Rotary(cos_sin_cache(dim), positions, RopeStyle.NEOX, None) if steps else None
+    )
+    loc = slots(tokens, total, seed=26)
+
+    def run(query_dtype):
+        q, k, v = split(inputs.clone(), hq, hkv, dim)
+        k_cache, v_cache = gqa_cache(total, hkv, dim, cache_dtype)
+        out = gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=rotary,
+            cache=HeadKVCache(k_cache, v_cache, scales, loc),
+            query_dtype=query_dtype,
+            return_kv=True,
+            solution=solution,
+            override=None,
+        )
+        return out, k_cache, v_cache
+
+    fp8, k_cache, v_cache = run(FP8)
+    native, k_native, v_native = run(BF16)
+    assert fp8.q.dtype is FP8
+    assert bytes_equal(fp8.k, native.k) and bytes_equal(fp8.v, native.v)
+    assert bytes_equal(k_cache, k_native) and bytes_equal(v_cache, v_native)
+    if solution == "composite":
+        assert bytes_equal(fp8.q, native.q.to(FP8))
+    else:
+        q = split(inputs.clone(), hq, hkv, dim)[0]
+        weight = None if norm is None else norm.q_weight
+        assert_rounded_once(fp8.q, *reference_heads(q, weight, norm, rotary, dim))
 
 
 def test_kv_scale_values_reuse_the_compiled_kernel():
@@ -622,6 +685,7 @@ def test_per_tensor_kv_scales_need_an_fp8_cache_and_positive_values():
             cache=HeadKVCache(
                 k_cache, v_cache, FP8TensorScales(0.5, 0.5), slots(tokens, total, 16)
             ),
+            query_dtype=q.dtype,
             return_kv=False,
             solution=None,
             override=None,
@@ -695,6 +759,7 @@ def test_triton_reads_query_heads_past_int32_offsets():
         norm=None,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, torch.arange(1, device="cuda")),
+        query_dtype=q.dtype,
         return_kv=False,
         solution="triton",
         override=None,
@@ -829,6 +894,7 @@ def test_fp16_rows_round_once_into_a_bf16_cache(solution, tokens):
         norm=None,
         rotary=rotary,
         cache=HeadKVCache(k_cache, v_cache, None, loc),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -907,6 +973,7 @@ def test_a_single_kv_head_cache_may_carry_any_head_stride():
             norm=None,
             rotary=None,
             cache=HeadKVCache(k_cache, v_cache, None, loc),
+            query_dtype=q.dtype,
             return_kv=False,
             solution=None,
             override=None,
@@ -947,6 +1014,7 @@ def test_prepared_gqa_reuses_rows_and_replays_the_cache_write(
             norm=None,
             rotary=None,
             cache=target,
+            query_dtype=q.dtype,
             return_kv=return_kv,
             solution="triton",
             override=None,
@@ -1001,6 +1069,7 @@ def test_composite_reads_kv_rows_past_int32_offsets():
         norm=None,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, loc),
+        query_dtype=q.dtype,
         return_kv=False,
         solution="composite",
         override=None,
@@ -1073,6 +1142,7 @@ def test_the_composite_writes_a_prefill_past_65535_tokens(fmt):
                 cache=HeadKVCache(
                     k_cache, v_cache, scales, torch.arange(a, b, device="cuda")
                 ),
+                query_dtype=q.dtype,
                 return_kv=False,
                 solution="composite",
                 override=None,
@@ -1109,6 +1179,7 @@ def test_non_interleaved_strided_queries_are_accepted(layout):
             cache=HeadKVCache(
                 *gqa_cache(4, hkv, dim, BF16), None, slots(tokens, 4, seed=157)
             ),
+            query_dtype=x.dtype,
             return_kv=False,
             solution=None,
             override=None,
@@ -1724,6 +1795,7 @@ def test_prologues_accept_zero_tokens(mrope):
             scales=None,
             slots=empty,
         ),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=None,
         override=None,
@@ -1764,6 +1836,7 @@ def _gqa_request(**change) -> dict:
             scales=None,
             slots=slots(tokens, 8, seed=38),
         ),
+        query_dtype=q.dtype,
         return_kv=False,
         solution=None,
         override=None,
@@ -1992,6 +2065,7 @@ def _mxfp8_request(
         norm=None,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, scales, slots(tokens, rows, seed=4)),
+        query_dtype=q.dtype,
         return_kv=False,
         solution=None,
         override=None,
@@ -2348,6 +2422,7 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
                 None,
                 torch.arange(-offset, count, device="cuda")[offset:],
             ),
+            query_dtype=q.dtype,
             return_kv=True,
             solution="triton",
             override=None,
