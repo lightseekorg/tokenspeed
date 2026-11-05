@@ -78,6 +78,13 @@ FlashInfer receives host CSR metadata derived from those mirrors, with fresh
 pinned sources for asynchronous uploads. Planning does not download device
 lengths or indptrs; mixed batches apply the same rule to their extend rows.
 
+Prefill token inputs arrive as the scheduler's read-only, one-dimensional
+int32 NumPy views. Input fill copies them directly into fresh pinned storage
+for the round, then uploads that storage asynchronously. It neither wraps
+the read-only source in a writable tensor nor creates an intermediate token
+copy. The pinned allocation must remain per-round: overlap can prepare the
+next round while the previous upload is still reading its source.
+
 NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
@@ -1735,9 +1742,15 @@ builder. Decode-only refresh/capture remains unchanged and carries no
 prefill convolution schedule. Breakable prefill graphs consume the live
 metadata in the eager attention break, as ordinary eager forwards do.
 
+Prefill convolution returns `[channels, tokens]` with contiguous channels per
+token, independent of the input strides. Transposing to `[tokens, channels]`
+and splitting the packed channels can therefore remain views.
+
 Prefill state staging fuses resumed conv-window copying, recurrent-state
-gather/zero, and history flags in one kernel. It preserves scheduler-owned
-block ids and arbitrary cache strides. Fresh rows never read null or stale
+gather/zero, and history flags in one kernel. KDA gathers directly into FP32
+scan state, including from BF16 cache storage; final writeback casts to the
+cache dtype. It preserves scheduler-owned block ids and arbitrary cache strides.
+Fresh rows never read null or stale
 recurrent state; their conv working windows remain unchanged. Shared input
 snapshots are read-only, output blocks are unique, and a private in-place
 source/destination is legal. This changes neither scan arithmetic nor cache
@@ -1869,7 +1882,8 @@ host lengths and GPU boundaries still agree. Its `PrefillCapacity` validates
 the packed bounds it builds. For KDA, an explicit
 `KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
 each sequence may fill the bucket, but their combined tokens must also fit it.
-The CuTeDSL adapter alone converts this descriptor to native planning bounds.
+The CuTeDSL adapter converts this descriptor to native planning bounds;
+cuDNN plans from tensor capacities and reads live boundaries on the device.
 Convolution maps reserve `ceil(token_capacity / block_m) + sequences - 1`
 programs, bounding the sum of per-request rounded lengths without reserving
 the entire token bucket for every request. One GPU metadata refresh
@@ -1893,11 +1907,16 @@ global functions or changing scan arithmetic. Routing and workspace partition
 rules remain owned by the native host. Unsupported layouts retain the public
 wrapper's capacity preparation.
 
-The preparation copies every input with its capacity padding scrubbed: the
+The CuTeDSL preparation copies every input with its capacity padding scrubbed: the
 gate projection can produce undefined padding, and the inline path has no
 handoff copy to clean it. Per-call plan and scratch tensors belong to the
 active graph pool or eager invocation; they are not a mutable process-global
 plan shared across replay streams.
+
+The cuDNN adapter reuses FlashInfer's cached plans and workspace, warmed by the
+existing startup capture loop. Replay matches eager execution at the same
+capacity bitwise; different capacities can select different scan partitions
+and therefore differ by floating-point rounding.
 
 Changes to this capacity contract require validation of full-model overlap,
 memory use and performance in addition to kernel correctness.
@@ -1918,8 +1937,8 @@ and the same slice of every per-row input; per-request inputs keep the whole
 batch with `RequestTokenHistoryView.row_offset = start`; a pipeline stage's
 boundary bundle carries shard rows. `ctx.input_num_tokens` and
 `global_num_tokens` keep the scheduler's full-chunk meaning: only collective
-sizing (`CommManager`, `models/base/comm_ops.py`) reads them, a model reads
-its rows from its tensors or `ctx.query_shard`.
+sizing (`CommManager`) reads them, a model reads its rows from its tensors or
+`ctx.query_shard`.
 
 The contract a model (in tree or a plugin) implements:
 

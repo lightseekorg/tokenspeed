@@ -1794,7 +1794,11 @@ def _fp8_group32_ue8m0_quantize_swizzled(
     K: tl.constexpr,
     GROUPS: tl.constexpr,
     ZERO_BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid = tl.program_id(0).to(tl.int64)
     k_tiles = tl.cdiv(K, 128)
     if pid * GROUPS < M * (K // 32):
@@ -1854,6 +1858,7 @@ def _quantize_fp8_group32_swizzled(
         programs = max(
             triton.cdiv(m * (k // 32), groups), triton.cdiv(scale_count, zero_block)
         )
+        enable_pdl = pdl_enabled()
         kernel_launcher(_fp8_group32_ue8m0_quantize_swizzled, (programs,))(
             x,
             quantized,
@@ -1863,8 +1868,10 @@ def _quantize_fp8_group32_swizzled(
             k,
             groups,
             zero_block,
+            enable_pdl,
             num_warps=4,
             num_stages=1,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return quantized, scales
 
