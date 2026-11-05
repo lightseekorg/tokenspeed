@@ -123,13 +123,13 @@ def _dense_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
 def _selection_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
     """History past index_topk: the group selects what one rank holding the
     whole history selects, and attends it to the same output."""
-    from tokenspeed_kernel.platform import current_platform
-
     from test.runtime.test_kimi_k31 import (
         _assert_close_to_reference,
         _k31_attention_stack,
         _prefill_then_decode_twice,
     )
+
+    from tokenspeed_kernel.platform import current_platform
 
     sharded = _sharded_layer(
         rank, kv_cache_dtype=kv_cache_dtype, spec_width=spec_width, index_topk=512
