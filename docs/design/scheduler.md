@@ -102,6 +102,9 @@ pending probe, including optional checkpoint retries. The pre-admission state
 owns the request's reference and releases it when the first admission succeeds.
 The pending match views the request-owned hashes. Mutable execution progress
 copies the reused prefix only after admission succeeds.
+KV-event descriptors are also registered only after first admission succeeds,
+before any new cache publication, so capacity-blocked retries do not rebuild
+them.
 
 An eviction write-back releases its Device entries before its Host segment
 becomes visible. If recorded or in-flight segment keys would extend a submitted
