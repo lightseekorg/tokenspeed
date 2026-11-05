@@ -2196,7 +2196,8 @@ expert's 64 tags with scalar loads that bypass the scalar cache, so the wait
 does not queue behind the wave's weight loads; tags written on another XCD
 are visible because the tag buffer is uncached. The tags carry a per-launch
 value in two copies chosen by launch parity; each launch clears the copy the
-next one reads.
+next one reads. Every access to the intermediates and the tags, the clear
+included, is system scope (SC0 SC1), because waves on other XCDs read them.
 
 Progress: gate/up work never waits on another workgroup and every workgroup
 finishes it before its first down wait, so the waits end once all 256
