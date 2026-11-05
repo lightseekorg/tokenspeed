@@ -29,7 +29,9 @@ index-K bytes, fp32 scales, fp8 latent) travel through a bf16-only gather
 backend byte-identically, the replicated (``placement=None``) path is a local
 gather, the host owner rule agrees with the kernel's per-rank translation, and
 the DSA leaf's index-K history gather rebuilds the plane in its own format
-(``fp8_scaled`` bytes and scales, or ``bf16`` keys).
+(``fp8_scaled`` bytes and scales, or ``bf16`` keys), and the KVP history
+prefill's page gathers land every history row of both planes at the slot its
+plan maps the row to.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from test.runtime.dsa_index_k_test_utils import (
     index_k_pool,
     write_index_k_plane,
 )
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -56,6 +59,7 @@ from tokenspeed.runtime.layers.attention.dcp.placement import (
     cyclic_slot_owner,
     owned_history_rows,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
@@ -276,7 +280,9 @@ def _index_k_keys() -> torch.Tensor:
     )
 
 
-def _local_index_k_planes(index_k_format: str) -> list[torch.Tensor]:
+def _local_index_k_planes(
+    index_k_format: str, page_size: int = GRANULARITY
+) -> list[torch.Tensor]:
     """Every rank's physical index-K plane: the virtual slots it owns, written
     at their local slots through the pool's production write path (built in
     the parent, so the gloo workers stay host-only)."""
@@ -296,7 +302,7 @@ def _local_index_k_planes(index_k_format: str) -> list[torch.Tensor]:
             write_index_k_plane(
                 index_k_format,
                 head_dim=INDEX_HEAD_DIM,
-                page_size=GRANULARITY,
+                page_size=page_size,
                 slots=local_pages * GRANULARITY,
                 loc=local[owned],
                 keys=keys[owned],
@@ -432,6 +438,131 @@ def test_the_dsa_leaf_gathers_the_index_k_history_in_the_planes_format(
     errors = mp.Manager().dict()
     mp.spawn(
         _index_k_worker,
+        args=(port, index_k_format, planes, expected, errors),
+        nprocs=WORLD,
+        join=True,
+    )
+    if errors:
+        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))
+
+
+# --- the KVP history prefill's page gathers -----------------------------------
+
+# Chunks continuing cached prefixes of SEQ_LENS - EXTEND rows.
+EXTEND = torch.tensor([3, 2, 7], dtype=torch.int64)
+
+
+def _run_history_pages(
+    rank: int,
+    port: int,
+    index_k_format: str,
+    index_plane: torch.Tensor,
+    expected: tuple[torch.Tensor, torch.Tensor | None],
+) -> None:
+    from tokenspeed.runtime.distributed.comm_backend import registry
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+
+    mapping = Mapping(
+        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
+    )
+    pg_manager.init_distributed(
+        mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
+    )
+    group = mapping.attn.kvp_group
+    pg_manager.init_process_group(group, backend="gloo")
+    pg_manager.register_process_group(
+        "nccl", group, pg_manager.get_process_group("gloo", group)
+    )
+    registry._global_backend = NcclBackend()
+
+    # 16 pages: requests 0 and 1 share a group (the busiest owner sends 4 of
+    # their pages, 16 gathered); request 2 gathers alone.
+    leaf = _dsa_leaf(rank, index_k_format, max_model_len=32)
+    leaf._history_prefill = True
+    table = _page_table()
+    plan = leaf._plan_history_prefill(
+        num_extends=3,
+        page_table_cpu=table,
+        extend_seq_lens_cpu=EXTEND,
+        extend_prefix_lens_cpu=SEQ_LENS - EXTEND,
+    )
+    assert [g.requests for g in plan.groups] == [slice(0, 2), slice(2, 3)]
+    assert [g.query for g in plan.groups] == [slice(0, 5), slice(5, 12)]
+    # Every rank sends the busiest owner's page count: its own pages, then
+    # padding.
+    assert [g.send_pages for g in plan.groups] == [4, 2]
+    latent = _local_plane(rank)
+    index_pool = index_k_pool(index_plane, head_dim=INDEX_HEAD_DIM, page_size=PAGE)
+    pool = SimpleNamespace(
+        get_key_buffer=lambda layer_id: latent,
+        get_index_k_buffer=index_pool.get_index_k_buffer,
+        index_k_page_size=PAGE,
+    )
+    layer = SimpleNamespace(layer_id=0)
+    expected_keys, expected_scale = expected
+    first = 0
+    for group_ in plan.groups:
+        rows = int(SEQ_LENS[group_.requests].sum())
+        virtual_slots = build_prefill_kv_workspace_slots(
+            page_table=table[group_.requests],
+            seq_lens=SEQ_LENS[group_.requests],
+            max_seq_len=int(SEQ_LENS[group_.requests].max()),
+            page_size=PAGE,
+            device=torch.device("cpu"),
+            num_tokens=rows,
+        )
+        slots = plan.slots[first : first + rows]
+        first += rows
+        # Every history row at its slot; no slot reaches a padding page (the
+        # foreign rows of a rank's plane are NaN).
+        kv = leaf.gather_history_kv_pages(layer, pool, group_)
+        assert kv.shape == (WORLD * group_.send_pages * PAGE, DIM)
+        torch.testing.assert_close(kv[slots], _reference(virtual_slots), rtol=0, atol=0)
+        plane = leaf.gather_history_index_k_pages(0, pool, group_)
+        keys, scale = split_index_k_rows(
+            index_k_pool(
+                plane, head_dim=INDEX_HEAD_DIM, page_size=PAGE
+            ).gather_index_k_rows(0, slots, index_k_format=index_k_format),
+            index_head_dim=INDEX_HEAD_DIM,
+            index_k_format=index_k_format,
+        )
+        assert torch.equal(keys, expected_keys[virtual_slots])
+        if index_k_format == "fp8_scaled":
+            assert torch.equal(scale, expected_scale[virtual_slots])
+    assert first == int(SEQ_LENS.sum())
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _history_pages_worker(
+    rank: int, port: int, index_k_format: str, planes, expected, errors
+):
+    try:
+        _run_history_pages(rank, port, index_k_format, planes[rank], expected)
+    except Exception:  # pragma: no cover - reported to the parent
+        import traceback
+
+        errors[rank] = traceback.format_exc()
+
+
+@pytest.mark.parametrize("index_k_format", ["fp8_scaled", "bf16"])
+def test_the_history_prefill_gathers_every_row_to_its_planned_slot(index_k_format):
+    """The KVP history prefill's plan over page-sharded planes groups the
+    requests by gathered pages, and its page gathers (one all-gather per
+    plane and group) land every history row of the latent and index-K planes
+    at the slot the plan maps it to, on every rank -- the slots the prefill
+    top-k scores through and the sparse core reads."""
+    planes = _local_index_k_planes(index_k_format, page_size=PAGE)
+    expected = expected_index_k_rows(index_k_format, _index_k_keys())
+    port = _get_open_port()
+    errors = mp.Manager().dict()
+    mp.spawn(
+        _history_pages_worker,
         args=(port, index_k_format, planes, expected, errors),
         nprocs=WORLD,
         join=True,

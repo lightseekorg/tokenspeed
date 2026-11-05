@@ -1198,10 +1198,23 @@ class CacheGroupRouter(AttentionBackend):
             layer_id, token_to_kv_pool, group
         )
 
+    def gather_history_index_k_pages(self, layer_id: int, token_to_kv_pool, group):
+        return self._sole_leaf(
+            "gather_history_index_k_pages"
+        ).gather_history_index_k_pages(layer_id, token_to_kv_pool, group)
+
+    def require_history_prefill(self):
+        return self._sole_leaf("require_history_prefill").require_history_prefill()
+
     # DSA KVP prefill: top-k over KVP pages tiles by the leaf's planned owned width.
 
     def prefill_index_columns(self) -> int | None:
         return self._sole_leaf("prefill_index_columns").prefill_index_columns()
+
+    def takes_history_prefill_topk(self) -> bool:
+        return self._sole_leaf(
+            "takes_history_prefill_topk"
+        ).takes_history_prefill_topk()
 
     # ------------------------------------------------------------------
     # DSA KPool surface (GLM-5.3-Flash): the model drives the leaf's pooled

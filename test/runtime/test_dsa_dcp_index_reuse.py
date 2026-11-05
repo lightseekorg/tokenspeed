@@ -521,6 +521,7 @@ def _prefill_ctx(columns):
         cache_placement=lambda layer: _PLACEMENT,
         sparse_topk=SimpleNamespace(prefill=None, decode=None),
         prefill_index_columns=lambda: columns,
+        takes_history_prefill_topk=lambda: False,
     )
     pool = SimpleNamespace(
         get_index_k_buffer=lambda layer_id: torch.zeros(128, 132, dtype=torch.uint8),
@@ -650,6 +651,8 @@ def _kvp_leaf(rank, *, degree=4):
     backend.kvp_block_granularity = 128
     backend.kvp_virtual_block_count = 1 + 64 * degree
     backend.query_shard_metadata = None
+    backend._history_prefill = False
+    backend.history_prefill = None
     backend._prefill_page_table = None
     backend._prefill_index_columns = None
     backend._dense_backend = SimpleNamespace(
@@ -738,3 +741,104 @@ def test_owned_index_columns_need_kvp_and_the_host_table(case):
         page_table_cpu=None if case == "no_host_table" else table,
     )
     assert backend.prefill_index_columns() is None
+
+
+# --- KVP prefill over gathered histories --------------------------------------
+
+
+def test_a_history_prefill_selects_each_group_over_its_gathered_pages(monkeypatch):
+    """Over gathered histories (AMD) the KVP prefill top-k selects
+    as an unsharded cache does, per request group over the index-K pages
+    gathered for it, through the plan's slot map: the forward's rows and
+    workspace numbering unchanged, the selection handed back as the
+    unsharded selection returns it with the plan's slots to map it, and no
+    KVP candidate merge or owned index."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the KVP candidate path ran")
+
+    monkeypatch.setattr(glm5, "select_dsa_topk", refuse)
+    monkeypatch.setattr(glm5, "build_dcp_index_metadata", refuse)
+    # Requests of histories [6, 5, 5] continuing [2, 4, 0] cached rows with
+    # chunks of [4, 1, 5]: the first two share a group.
+    plan = SimpleNamespace(
+        groups=(
+            SimpleNamespace(query=slice(0, 5)),
+            SimpleNamespace(query=slice(5, 10)),
+        ),
+        slots=torch.tensor([*range(11), *range(5)]),
+    )
+    planes = []
+
+    def gather_pages(layer_id, pool, group):
+        planes.append((layer_id, group))
+        return torch.full((12, 132), len(planes), dtype=torch.uint8)
+
+    backend = SimpleNamespace(
+        cache_placement=lambda layer: _PLACEMENT,
+        sparse_topk=SimpleNamespace(prefill=None, decode=None),
+        prefill_index_columns=refuse,
+        takes_history_prefill_topk=lambda: True,
+        require_history_prefill=lambda: plan,
+        gather_history_index_k_pages=gather_pages,
+    )
+    pool = SimpleNamespace(
+        get_index_k_buffer=lambda layer_id: torch.zeros(128, 132, dtype=torch.uint8),
+        index_k_page_size=64,
+    )
+    ctx = SimpleNamespace(attn_backend=backend, token_to_kv_pool=pool, num_extends=3)
+    calls = []
+    layer = _layer()
+    layer.index_topk = _TOPK
+
+    def select_rows(**kw):
+        calls.append(kw)
+        rows = kw["q"].shape[0]
+        selected = torch.full((rows, _TOPK), -1, dtype=torch.int16)
+        selected[:, 0] = kw["row_starts"].to(torch.int16)
+        return selected, torch.full((rows,), 2, dtype=torch.int32)
+
+    layer._select_prefill_topk_rows = select_rows
+    row_starts = torch.tensor([0, 0, 0, 0, 6] + [11] * 5, dtype=torch.int32)
+    row_ends = torch.tensor([3, 4, 5, 6, 11, 12, 13, 14, 15, 16], dtype=torch.int32)
+    output = glm5.GlmDsaIndexerOutput(
+        query=torch.zeros(10, 1, 8, dtype=torch.bfloat16),
+        key=torch.zeros(10, 8, dtype=torch.bfloat16),
+        weights=torch.zeros(10, 1),
+    )
+    record = layer._compute_prefill_topk_indices_portable(
+        indexer_output=output,
+        ctx=ctx,
+        seq_lens=torch.tensor([6, 5, 5], dtype=torch.int32),
+        page_table=torch.zeros((3, 4), dtype=torch.int32),
+        kv_workspace_slots=torch.arange(16),
+        row_starts=row_starts,
+        row_ends=row_ends,
+        candidate_lens_cpu=(row_ends - row_starts).long(),
+        kv_seq_lens=row_ends - row_starts,
+        max_seq_len=6,
+        num_prefill_tokens=10,
+        topk=_TOPK,
+        dcp_index=None,
+    )
+
+    assert planes == [(3, plan.groups[0]), (3, plan.groups[1])]
+    assert [call["q"].shape[0] for call in calls] == [5, 5]
+    for call, group, plane_id in zip(calls, plan.groups, (1, 2)):
+        rows = group.query
+        assert torch.equal(call["row_starts"], row_starts[rows])
+        assert torch.equal(call["row_ends"], row_ends[rows])
+        assert call["kv_workspace_slots"] is plan.slots
+        assert torch.equal(
+            call["candidate_lens_cpu"], (row_ends - row_starts).long()[rows]
+        )
+        assert int(call["index_k_cache"][0, 0]) == plane_id
+        assert call["page_size"] == 64 and call["topk"] == _TOPK
+    # The sparse prefill maps the rows through the plan's slots.
+    assert record.kv_workspace_slots is plan.slots
+    indices = record.workspace_indices
+    assert indices.dtype == torch.int16
+    assert torch.equal(indices[:, 0], row_starts.to(torch.int16))
+    assert bool((indices[:, 1:] == -1).all())
+    assert torch.equal(record.topk_lens, torch.full((10,), 2, dtype=torch.int32))
+    assert record.dcp_index is None

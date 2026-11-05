@@ -45,7 +45,10 @@ from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
 from tokenspeed.runtime.layers.attention.configs.dots3_note import (
     Dots3NoteAttentionConfig,
 )
-from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_kvp_history_prefill,
+)
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
     LinearAttnConfig,
     Mamba2Config,
@@ -1167,9 +1170,10 @@ def _prepare_fixed_workspaces(
     (``CacheRecipe.workspace_bytes``) and check the bytes agree.
 
     The verify workspaces of the paged-state families, Qwen4-Exp's QSA BF16
-    prefill scratch (``qsa_bf16_scratch``, the target's) and the
-    query-context-parallel history gather workspace of GPU DSA: the target
-    tree allocates the latter once and the draft tree gathers into the same
+    prefill scratch (``qsa_bf16_scratch``, the target's) and the history
+    gather workspace of GPU DSA, under query context parallelism or a KVP
+    prefill over gathered histories: the target tree allocates the latter
+    once and a query-context-parallel draft tree gathers into the same
     buffers (the draft's extend step follows the target's forward on the
     same stream), so the plan budgets one workspace.
     """
@@ -1181,8 +1185,11 @@ def _prepare_fixed_workspaces(
     width = int(server_args.speculative_num_draft_tokens or 1)
     allocated = False
     actual_bytes = 0
+    if dsa_kvp_history_prefill(config):
+        actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
+        allocated = True
     if isinstance(backend, Qwen4ExpBackend) or (
-        uses_paged_state_verify and expected_bytes
+        uses_paged_state_verify and expected_bytes > actual_bytes
     ):
         actual_bytes += backend.preallocate_verify_workspace(config.max_bs, width)
         allocated = True
