@@ -93,6 +93,7 @@ from tokenspeed_kernel.ops.gemm import (
     grouped_bf16_projection_quantize_fp8,
     grouped_fp8_projection,
     grouped_fp8_projection_quantize_fp8,
+    has_grouped_fp8_projection,
     mm,
     prepare_fp8_projection,
     prepare_grouped_fp8_projection,
@@ -1004,22 +1005,46 @@ class DeepseekV41Attention(nn.Module):
         self.kv_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps).to(
             dtype=torch.bfloat16
         )
+        wo_a_input = config.num_attention_heads * config.head_dim // config.o_groups
+        # True when wo_a.weight keeps the FP8 checkpoint's codes for a grouped
+        # FP8 kernel, with the loaded scales in wo_a_scale_inv and that
+        # kernel's layout of them in wo_a_scales; False when it holds BF16
+        # weights. The fused inverse-RoPE quantizer takes 512-wide heads, 64
+        # rotated. Decided here, not by the load: the sharded-state loader
+        # copies a saved state dict into a freshly built model.
+        self.wo_a_fp8 = (
+            quant_config is not None
+            and (config.head_dim, config.qk_rope_head_dim) == (512, 64)
+            and has_grouped_fp8_projection(
+                self.attn_sink.device, config.o_lora_rank, wo_a_input
+            )
+        )
         self.wo_a = _column(
-            config.num_attention_heads * config.head_dim // config.o_groups,
+            wo_a_input,
             config.o_groups * config.o_lora_rank,
-            torch.bfloat16,
+            torch.float8_e4m3fn if self.wo_a_fp8 else torch.bfloat16,
             None,
             add_prefix("wo_a", prefix),
             mapping,
         )
-        # Decided by the first wo_a load: True when wo_a.weight keeps the
-        # checkpoint's FP8 codes for a grouped FP8 kernel, with wo_a_scales in
-        # that kernel's layout; False when it holds BF16 weights.
-        self.wo_a_fp8: bool | None = None
-        self.register_buffer("wo_a_scales", None)
-        # Decided by the first prepare_wo_b once wo_a runs in FP8: True when
-        # wo_b reads wo_a's FP8 output through an FP8 kernel, with wo_b_scales
-        # derived from its loaded scales; False keeps wo_b's own method.
+        # Zeros decode to finite scales for dummy weights.
+        self.register_buffer(
+            "wo_a_scale_inv",
+            (
+                torch.zeros(
+                    self.wo_a.weight.shape[0],
+                    wo_a_input // 32,
+                    dtype=torch.uint8,
+                )
+                if self.wo_a_fp8
+                else None
+            ),
+        )
+        self.register_buffer("wo_a_scales", None, persistent=False)
+        # Decided by the first prepare_output_projections once wo_a runs in
+        # FP8: True when wo_b reads wo_a's FP8 output through an FP8 kernel,
+        # with wo_b_scales derived from its loaded scales; False keeps wo_b's
+        # own method.
         self.wo_b_fp8: bool | None = None
         self.register_buffer("wo_b_scales", None, persistent=False)
         self.wo_b = RowParallelLinear(
@@ -1064,13 +1089,24 @@ class DeepseekV41Attention(nn.Module):
             self._padded_attn_sink[: self.n_local_heads].copy_(param)
 
     @torch.no_grad()
-    def prepare_wo_b(self) -> None:
-        """Derive wo_b's FP8-kernel scales from its loaded ones once wo_a runs in FP8.
+    def prepare_output_projections(self) -> None:
+        """Derive the FP8 kernels' wo_a and wo_b scales from the loaded ones.
 
         Call once the loaded weights are final; later calls refresh the scales
-        in place, so captured graphs keep reading the same buffer.
+        in place, so captured graphs keep reading the same buffers.
         """
-        if not self.wo_a_fp8 or self.wo_b_fp8 is False:
+        if not self.wo_a_fp8:
+            return
+        prepared = prepare_grouped_fp8_projection(
+            self.wo_a.weight, self.wo_a_scale_inv, self.n_local_groups
+        )
+        if prepared is None:
+            raise RuntimeError("No grouped FP8 kernel serves the FP8 wo_a weights")
+        if self.wo_a_scales is None:
+            self.wo_a_scales = prepared
+        else:
+            self.wo_a_scales.copy_(prepared)
+        if self.wo_b_fp8 is False:
             return
         prepared = None
         # FP8 output packs four scales per 128 columns of each wo_a group.
@@ -3000,9 +3036,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             if scale is not None:
                 raise ValueError(f"{key}: BF16 wo_a must not have a quantization scale")
             if attn.wo_a_fp8:
-                raise ValueError(f"{key}: BF16 wo_a cannot replace loaded FP8 codes")
+                raise ValueError(f"{key}: BF16 wo_a cannot fill FP8 wo_a storage")
             default_weight_loader(linear.weight, weight)
-            attn.wo_a_fp8 = False
             # Keep the dtype marker to reject a scale arriving after BF16 weights.
             pair["weight"] = weight.new_empty(0)
         elif scale is not None:
@@ -3011,25 +3046,11 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             scale = scale.to(device).repeat_interleave(32, dim=0)
             scale = scale[start % 32 : start % 32 + rows]
             weight = weight.to(device)
-            prepared = None
-            # The fused inverse-RoPE quantizer takes 512-wide heads, 64 rotated.
-            if attn.wo_a_fp8 is not False and (
-                attn.head_dim,
-                attn.rotary_emb.dim,
-            ) == (512, 64):
-                prepared = prepare_grouped_fp8_projection(
-                    weight, scale, attn.n_local_groups
-                )
-            if attn.wo_a_fp8 is None:
-                attn.wo_a_fp8 = prepared is not None
-                if prepared is not None:
-                    linear.weight.data = weight
-                    attn.wo_a_scales = prepared
-            elif attn.wo_a_fp8:
-                # Refresh in place: captured graphs keep reading these buffers.
+            if attn.wo_a_fp8:
+                # post_load_weights derives the kernel's scale layout.
                 linear.weight.copy_(weight)
-                attn.wo_a_scales.copy_(prepared)
-            if not attn.wo_a_fp8:
+                attn.wo_a_scale_inv.copy_(scale)
+            else:
                 scale = scale.view(torch.float8_e8m0fnu).float()
                 weight = weight.float().unflatten(-1, (-1, 32))
                 default_weight_loader(
@@ -3273,18 +3294,24 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 # a complete weight update; captured graphs retain the buffer.
                 module.quant_method.prepare_weight_scales(module)
             elif isinstance(module, DeepseekV41Attention):
-                module.prepare_wo_b()
+                module.prepare_output_projections()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded
         # state loader post-processes modules before copying the saved state
         # in, so scales prepared during post-processing are stale there.
         self.post_load_weights()
+        warmed = set()
         for module in self.modules():
-            if isinstance(module, DeepseekV41Attention) and module.wo_a_fp8:
-                # Every layer shares these shapes, so one layer warms them all.
+            if (
+                isinstance(module, DeepseekV41Attention)
+                and module.wo_a_fp8
+                and module.wo_b_fp8 not in warmed
+            ):
+                # Layers share these shapes, so one layer per wo_b kernel
+                # choice warms them all.
                 module.warmup_output_projections(_max_forward_tokens())
-                break
+                warmed.add(module.wo_b_fp8)
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()

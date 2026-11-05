@@ -118,9 +118,10 @@ activations and weights that both carry one UE8M0 scale per 32 K channels
 (DeepSeek V4.1's grouped `wo_a`). `prepare_grouped_fp8_projection` re-lays the
 canonical `[groups * N, K / 32]` weight scales out once for the serving kernel
 and returns None where no kernel serves the weights, so callers keep their
-dequantized BF16 path. The DeepGEMM kernel (SM100/SM103) takes activation
-scales packed four per int32, MN-major and TMA-aligned, which is what
-`dsv41.rope_quantize_fp8_grouped` writes.
+dequantized BF16 path. `has_grouped_fp8_projection` answers the same question
+from the device and shape alone, before any weight is loaded. The DeepGEMM
+kernel (SM100/SM103) takes activation scales packed four per int32, MN-major
+and TMA-aligned, which is what `dsv41.rope_quantize_fp8_grouped` writes.
 `grouped_fp8_projection_quantize_fp8` instead writes E4M3 codes of the
 BF16-rounded result with packed scales in that same layout, which
 `fp8_projection` (a dense E4M3 GEMM, `prepare_fp8_projection` for its weight

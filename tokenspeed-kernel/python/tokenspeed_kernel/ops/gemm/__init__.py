@@ -92,6 +92,7 @@ __all__ = [
     "fp8_projection",
     "grouped_fp8_projection",
     "grouped_fp8_projection_quantize_fp8",
+    "has_grouped_fp8_projection",
     "prepare_fp8_projection",
     "prepare_grouped_fp8_projection",
     "warmup_fp8_projections",
@@ -1343,6 +1344,30 @@ def _packed_fp8_scales(tokens: int, words: int, device: torch.device) -> torch.T
     aligned = (tokens + 3) // 4 * 4
     storage = torch.empty(words * aligned, dtype=torch.int32, device=device)
     return storage.as_strided((tokens, words), (1, aligned))
+
+
+def has_grouped_fp8_projection(
+    device: torch.device, output_dim: int, input_dim: int
+) -> bool:
+    """Whether a registered kernel serves ``grouped_fp8_projection`` on ``device``.
+
+    Lets a caller choose FP8 weight storage before any weight exists; given
+    such weights, ``prepare_grouped_fp8_projection`` then returns scales.
+
+    Args:
+        device: Device the weights will live on.
+        output_dim: Output channels per group (N).
+        input_dim: Input channels (K).
+
+    Returns:
+        True when a kernel serves ``[groups, output_dim, input_dim]`` E4M3
+        weights on ``device``.
+    """
+    try:
+        _fp8_projection_kernel("grouped_fp8_projection", device, output_dim, input_dim)
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def prepare_grouped_fp8_projection(

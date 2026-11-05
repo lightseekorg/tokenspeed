@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.gemm import (
     fp8_projection,
     grouped_fp8_projection,
     grouped_fp8_projection_quantize_fp8,
+    has_grouped_fp8_projection,
     prepare_fp8_projection,
     prepare_grouped_fp8_projection,
 )
@@ -189,6 +190,16 @@ def test_prepare_grouped_fp8_projection_declines_cpu_weights():
     weight = torch.zeros(2 * 64, 128, dtype=torch.float8_e4m3fn)
     scales = torch.full((2 * 64, 4), 127, dtype=torch.uint8)
     assert prepare_grouped_fp8_projection(weight, scales, 2) is None
+
+
+def test_has_grouped_fp8_projection_agrees_with_prepare():
+    input_dim = HEADS_PER_GROUP * 512
+    weight, weight_scales = _weights(GROUPS, OUTPUT_DIM, input_dim)
+    assert has_grouped_fp8_projection(weight.device, OUTPUT_DIM, input_dim)
+    assert prepare_grouped_fp8_projection(weight, weight_scales, GROUPS) is not None
+    weight, weight_scales = weight.cpu(), weight_scales.cpu()
+    assert not has_grouped_fp8_projection(weight.device, OUTPUT_DIM, input_dim)
+    assert prepare_grouped_fp8_projection(weight, weight_scales, GROUPS) is None
 
 
 def _projection_inputs(tokens):

@@ -2226,6 +2226,102 @@ def test_sharded_state_load_prepares_fp8_scales_from_loaded_state(
     torch.testing.assert_close(model.proj(x)[0], source.proj(x)[0], rtol=0, atol=0)
 
 
+class _TinyFp8WoAModel(BaseCausalLM):
+    """One V4.1 attention layer behind the V4.1 wo_a loading and warmup hooks."""
+
+    def __init__(self, config):
+        mapping = _mapping(0, 1, 1)
+        super().__init__(config=SimpleNamespace(), mapping=mapping, encoder_only=True)
+        layer = nn.Module()
+        layer.attn = DeepseekV41Attention(
+            config,
+            mapping,
+            0,
+            0,
+            v41_mxfp8_config(_quant()),
+            "layers.0.attn",
+            aux_stream=None,
+        )
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([layer])
+
+    def post_load_weights(self):
+        DeepseekV41ForCausalLM.post_load_weights(self)
+
+    def post_quant_warmup(self):
+        DeepseekV41ForCausalLM.post_quant_warmup(self)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and current_platform().is_nvidia
+        and current_platform().arch_version.major == 10
+        and importlib.util.find_spec("deep_gemm") is not None
+    ),
+    reason="FP8 wo_a runs on DeepGEMM on SM100/SM103",
+)
+@torch.inference_mode()
+def test_sharded_state_load_restores_fp8_wo_a(monkeypatch, tmp_path):
+    """A state dict saved after loading FP8 wo_a fits a freshly built model,
+    and the sharded-state load rederives the kernels' wo_a and wo_b scales."""
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    monkeypatch.setattr(v41, "_max_forward_tokens", lambda: 32)
+    config = _config()
+    config.hidden_size = 256
+    config.num_attention_heads = config.o_groups = 2
+    config.head_dim, config.qk_rope_head_dim = 512, 64
+    config.q_lora_rank = 128
+    # A 128-wide wo_a group output lets FP8 kernels serve wo_a and wo_b.
+    config.o_lora_rank = 128
+    torch.manual_seed(17)
+    with torch.device("cuda"):
+        source = _TinyFp8WoAModel(config)
+        a_codes = torch.randn(256, 512).to(torch.float8_e4m3fn)
+        a_scales = torch.randint(118, 124, (8, 16), dtype=torch.uint8)
+        b_codes = torch.randn(256, 256).to(torch.float8_e4m3fn)
+        b_scales = torch.randint(118, 124, (8, 8), dtype=torch.uint8)
+    pending = {}
+    for field, tensor in (("weight", a_codes), ("scale", a_scales)):
+        DeepseekV41ForCausalLM._load_wo_a(
+            source, f"layers.0.attn.wo_a.{field}", tensor, pending
+        )
+    source.load_weights(
+        [
+            ("model.layers.0.attn.wo_b.weight", b_codes),
+            ("model.layers.0.attn.wo_b.weight_scale_inv", b_scales),
+        ]
+    )
+    source.post_load_weights()
+    save_file(
+        {name: value.contiguous() for name, value in source.state_dict().items()},
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+
+    monkeypatch.setattr(
+        loader_module,
+        "_initialize_model",
+        lambda model_config, load_config: _TinyFp8WoAModel(config),
+    )
+    loader = loader_module.ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    model = loader.load_model(
+        model_config=SimpleNamespace(
+            model_path=str(tmp_path),
+            revision=None,
+            dtype=torch.bfloat16,
+            mapping=SimpleNamespace(rank=0),
+        ),
+        device_config=SimpleNamespace(device="cuda"),
+    )
+    attn = model.model.layers[0].attn
+    assert attn.wo_a_fp8 and attn.wo_b_fp8
+    _assert_fp8_wo_a_matches_checkpoint(attn, a_codes, a_scales, b_codes, b_scales)
+    with pytest.raises(ValueError, match="BF16 wo_a"):
+        DeepseekV41ForCausalLM._load_wo_a(
+            model, "layers.0.attn.wo_a.weight", a_codes.bfloat16(), {}
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
     reason="requires Blackwell MXFP8",
