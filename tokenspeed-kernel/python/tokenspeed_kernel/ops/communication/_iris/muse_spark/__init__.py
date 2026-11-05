@@ -217,8 +217,8 @@ class MuseIrisState:
         # Expert TP8 completes routes on token owners, normalizes there and
         # gathers the 8x smaller sums once the route all-reduce outgrows the
         # Lamport two-shot (44 rows). Below that the all-reduce plus replicated
-        # norm stays faster (32 rows: 21.1 vs 25.0 us in 8-rank graph replay,
-        # MI350X). The start is tied to the two-shot capacity on purpose:
+        # norm stays faster (measured in 8-rank graph replay on MI350X). The
+        # start is tied to the two-shot capacity on purpose:
         # retuning LAMPORT_TWO_SHOT_MAX_ELEMENTS means re-measuring it.
         self.route_scatter_min_rows: int | None = (
             self.reduction.lamport_two_shot_max_numel
