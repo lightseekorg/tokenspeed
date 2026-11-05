@@ -46,6 +46,9 @@ documented on it.
 
 from __future__ import annotations
 
+import struct
+
+import torch
 from tokenspeed_kernel._triton import tl, triton
 
 # The kernels read these globals, and Triton only lets @triton.jit code read a
@@ -951,3 +954,312 @@ def _policy_select_verify_kernel(
             _shift_in(history, r, hist_len, verify_num),
             mask=r < hist_len,
         )
+
+
+# Host wrappers (registered in ``eagle_harness/triton.py``).
+
+# One IEEE rounding per operation (no FMA contraction): reproducible bits.
+_EXACT = dict(enable_fp_fusion=False)
+
+
+def triton_eagle_harness_policy_load() -> None:
+    """Nothing to load: the kernels compile on first launch."""
+
+
+def _round_depth(slots: torch.Tensor) -> int:
+    """tree_depth from the [4, tree_depth + 1] slots."""
+    if not (
+        slots.dim() == 2
+        and slots.size(0) == 4
+        and slots.is_contiguous()
+        and 2 <= slots.size(1) <= MAX_DEPTH + 1
+    ):
+        raise ValueError(
+            f"eagle_harness: slots must be [4, depth + 1], depth <= {MAX_DEPTH}"
+        )
+    return slots.size(1) - 1
+
+
+def _check_decision(depth: int, tree_depth: int, work_deltas: torch.Tensor, n: int):
+    if not 1 <= depth < tree_depth:
+        raise ValueError("eagle_harness: decision depth")
+    if not (
+        work_deltas.dim() == 1
+        and work_deltas.size(0) == n
+        and work_deltas.stride(0) == 1
+    ):
+        raise ValueError(f"eagle_harness: work deltas must be contiguous [{n}]")
+
+
+def _f64_bits(value: float) -> int:
+    """A double as the int64 of its bits (Triton would pass a float as fp32)."""
+    return struct.unpack("<q", struct.pack("<d", value))[0]
+
+
+def triton_eagle_harness_policy_begin_round(
+    state: torch.Tensor,
+    seq: torch.Tensor,
+    hist: torch.Tensor,
+    slots: torch.Tensor,
+    go_host: torch.Tensor,
+    batch_table: torch.Tensor,
+    tier_table: torch.Tensor,
+    cost_f64: torch.Tensor,
+    round_f64: torch.Tensor,
+    live_rows: torch.Tensor,
+    frontier: torch.Tensor,
+    sampled: torch.Tensor,
+    chain: bool,
+    node_top_k: int,
+    chain_past_verify_num: int,
+    verify_num: int,
+    min_verify_count: int,
+) -> None:
+    """Starts a policy round of ``live_rows[0]`` requests (int32; 0 runs no
+    round) whose cached lengths are the first ``live_rows[0]`` entries of
+    ``frontier`` (int64, strided) and which draw their children when
+    ``sampled`` (bool ``[1]``).
+
+    Increments ``seq`` (int64 ``[1]``), clears the round's scalars of
+    ``state`` (int32) and the ``[4, depth + 1]`` int32 ``slots`` (width,
+    cumu_start, work_size, go per depth), writes depth 0's slots, takes
+    depth 0's decision and writes depth 1's, publishing ``go_host[1]``
+    (pinned int64 ``[depth + 1]``, ``(seq << 1) | go``). A chain round whose
+    ``batch_table`` row holds a width table width ``W`` instead writes
+    every depth's slots (depths 1..W-2 draft) and go flags up to
+    ``go_host[max(W - 1, 2)]``, and verifies ``min(W, verify_num)`` nodes.
+
+    ``hist`` (``[max_bs, rounds <= 32]`` int32) holds the past verify
+    widths; ``tier_table`` (int32 ``[9]``) the verify floor per cost
+    variant (four tiers, then tiny), then the width per tier (unused for a
+    chain); ``batch_table`` (int64 ``[max_bs, 5]``) per batch size the cost
+    id, chain tier row, interval count, cache step and chain table width
+    (0: the cost rule decides). The round's row of ``cost_f64`` (a tree's
+    interval table, a chain's per-depth stop terms) is copied to
+    ``round_f64`` for the decisions. A chain's past verify width is
+    ``chain_past_verify_num``; ``verify_num`` and ``min_verify_count`` cap
+    the ranked node count when a decision stops the round. ``node_top_k``,
+    the tree depth (``<= 32``) and ``chain`` are compiled in. Grid:
+    ``(1,)``.
+    """
+    tree_depth = _round_depth(slots)
+    if hist.size(1) > MAX_HISTORY:
+        raise ValueError("eagle_harness: verify history")
+    if not (
+        batch_table.size(1) == BATCH_COLS
+        and (chain or tier_table.size(0) == TIER_TABLE_SIZE)
+    ):
+        raise ValueError("eagle_harness: policy tables")
+    cost_cols = 0 if chain else cost_f64.size(2)
+    copy = tree_depth * CHAIN_F64 if chain else 2 + tree_depth
+    _policy_begin_round_kernel[(1,)](
+        state,
+        seq,
+        hist,
+        slots,
+        go_host,
+        batch_table,
+        tier_table,
+        cost_f64,
+        round_f64,
+        live_rows,
+        frontier,
+        sampled,
+        frontier.stride(0),
+        hist.size(1),
+        cost_f64.size(1),
+        cost_cols,
+        chain_past_verify_num,
+        verify_num,
+        min_verify_count,
+        NODE_TOP_K=node_top_k,
+        TREE_DEPTH=tree_depth,
+        CHAIN=chain,
+        DEPTH_PAD=triton.next_power_of_2(tree_depth + 1),
+        COPY_PAD=triton.next_power_of_2(copy),
+        **_EXACT,
+    )
+
+
+def triton_eagle_harness_policy_decide_tree(
+    state: torch.Tensor,
+    seq: torch.Tensor,
+    slots: torch.Tensor,
+    go_host: torch.Tensor,
+    work_deltas: torch.Tensor,
+    round_f64: torch.Tensor,
+    tier_table: torch.Tensor,
+    depth: int,
+    node_top_k: int,
+    exec_mode: int,
+    async_layer_ratio: float,
+    verify_num: int,
+    min_verify_count: int,
+) -> None:
+    """A tree round's decision after ``depth`` (``1 <= depth < tree_depth``),
+    on the work deltas (contiguous fp32 ``[node_top_k + 1]``) queued after
+    ``depth - 1``.
+
+    Writes depth ``depth + 1``'s slots and publishes its go flag; once the
+    round stopped, only clears that flag. The gain of going on,
+    ``(deltas[narrow] - deltas[0]) / draft_cost * model_cost_ratio *
+    async_layer_ratio`` (fp64, ``narrow`` the tier's width), is compared
+    with the depth's stop threshold from ``round_f64``; exec mode 1 cuts a
+    batch much smaller than the benchmark batch to width 1. A stopping
+    decision records the round's ranked node count, ``min(verify_num, pool
+    size, max(2 * past verify width, min_verify_count))``, and in a
+    sampled round the next sampled round's planned stop depth (a sampled
+    round stops only at its planned depth). Grid: ``(1,)``.
+    """
+    tree_depth = _round_depth(slots)
+    _check_decision(depth, tree_depth, work_deltas, node_top_k + 1)
+    _policy_decide_kernel[(1,)](
+        state,
+        seq,
+        slots,
+        go_host,
+        work_deltas,
+        round_f64,
+        tier_table,
+        depth,
+        exec_mode,
+        _f64_bits(async_layer_ratio),
+        verify_num,
+        min_verify_count,
+        NODE_TOP_K=node_top_k,
+        TREE_DEPTH=tree_depth,
+        CHAIN=False,
+        **_EXACT,
+    )
+
+
+def triton_eagle_harness_policy_decide_chain(
+    state: torch.Tensor,
+    seq: torch.Tensor,
+    slots: torch.Tensor,
+    go_host: torch.Tensor,
+    work_deltas: torch.Tensor,
+    round_f64: torch.Tensor,
+    depth: int,
+    verify_num: int,
+) -> None:
+    """A chain round's decision after ``depth`` (``1 <= depth <
+    tree_depth``), on contiguous fp32 ``[2]`` work deltas.
+
+    The gain ``2 * (deltas[1] - deltas[0]) / gain_denom`` per step cost
+    (fp64, the depth's terms in ``round_f64``) below the depth's threshold
+    stops the round; a depth with a verify cost cliff instead looks two
+    depths ahead. Writes depth ``depth + 1``'s slots and go flag, or on a
+    stop the round's counts (every ranked node, ``verify_num`` at most, is
+    verified). A width table round's decision changes no state or slot:
+    past its last drafted depth it only clears ``go_host[depth + 1]``.
+    Grid: ``(1,)``.
+    """
+    tree_depth = _round_depth(slots)
+    _check_decision(depth, tree_depth, work_deltas, 2)
+    # A chain reads no tier table; any int32 tensor stands in for the pointer.
+    _policy_decide_kernel[(1,)](
+        state,
+        seq,
+        slots,
+        go_host,
+        work_deltas,
+        round_f64,
+        state,
+        depth,
+        0,
+        0,
+        verify_num,
+        0,
+        NODE_TOP_K=1,
+        TREE_DEPTH=tree_depth,
+        CHAIN=True,
+        **_EXACT,
+    )
+
+
+def triton_eagle_harness_policy_select_verify(
+    state: torch.Tensor,
+    recent: torch.Tensor,
+    hist: torch.Tensor,
+    published: torch.Tensor,
+    top_scores: torch.Tensor,
+    interval_i32: torch.Tensor,
+    interval_f64: torch.Tensor,
+    verify_i32: torch.Tensor,
+    verify_f64: torch.Tensor,
+    tree_depth: int,
+    exec_mode: int,
+) -> None:
+    """A tree round's cumulative ranked scores and verify width.
+
+    The scores of ``t = top_scores[:live rows, :verify count]`` (fp32, unit
+    column stride, at most 32 rows and 64 columns) are the inclusive prefix
+    sums of its column means, or of ``t`` flattened row-major for a flat
+    round, in fp32 with one rounding per operation in this order:
+
+    * column means, ``cols > 1``: four accumulators per column, row ``k``
+      added in increasing ``k`` into accumulator ``k % 4``, combined as
+      ``((a0 + a1) + a2) + a3`` and multiplied by the fp32 quotient
+      ``cols / (rows * cols)``. One column: with ``w`` the largest power of
+      two ``<= rows``, lane ``i < w`` holds ``t[i] + t[i + w]`` (``+ 0`` when
+      ``i + w >= rows``), the 32 zero-padded lanes are summed as adjacent
+      pairs ``(2j, 2j + 1)`` five times, and the total is multiplied by the
+      same quotient (``1 / rows``);
+    * prefix sum: the values ``v`` (zero past the count) form one tile of
+      128 lanes x 16 consecutive items (lane ``l`` holds ``v[16 l]`` to
+      ``v[16 l + 15]``). Each lane sums its items left to right; an
+      inclusive scan runs within each 16-lane row with steps 1, 2, 4, 8
+      (``p[l] = p[l - s] + p[l]``); lanes 16..31 of each 32-lane half add
+      lane 15's value, lanes 32..63 of each 64-lane group add lane 31's;
+      lane ``l``'s exclusive prefix ``x`` is ``p[l - 1]`` for ``l < 64``,
+      ``p[63]`` for ``l = 64`` and ``p[63] + p[l - 1]`` for ``l > 64``. The
+      outputs are ``x + v[16 l]`` (just ``v[0]`` for lane 0), then each
+      next item added to the previous output.
+
+    ``published`` (fp32) holds
+    the previous round's scores, which size the verify (this round's in the
+    first round; a sampled first round takes the largest measured width
+    below its ranked count), and then receives this round's. The width is
+    written to ``state`` and shifted into ``hist`` (``[max_bs, <= 32]``
+    int32) and ``recent`` (``[<= 32]`` int32). ``verify_i32`` /
+    ``verify_f64`` hold per batch size and interval the tier and the
+    stable / unstable thresholds; ``interval_i32`` the measured widths and
+    ``interval_f64`` the cost deltas after the ``2 + 5 * tree_depth`` stop
+    columns. Grid: ``(1,)``.
+    """
+    if not (hist.size(1) <= MAX_HISTORY and recent.size(0) <= MAX_HISTORY):
+        raise ValueError("eagle_harness: verify history")
+    if not (
+        hist.size(0) <= RANK_MAX_ROWS
+        and top_scores.size(1) <= RANK_MAX_COLS
+        and top_scores.stride(1) == 1
+    ):
+        raise ValueError(
+            "eagle_harness: ranked scores: at most 32 rows and 64 unit-stride columns"
+        )
+    max_widths = interval_i32.size(2) - 1
+    if max_widths > MAX_WIDTHS:
+        raise ValueError("eagle_harness: measured widths")
+    _policy_select_verify_kernel[(1,)](
+        state,
+        recent,
+        hist,
+        published,
+        top_scores,
+        interval_i32,
+        interval_f64,
+        verify_i32,
+        verify_f64,
+        recent.size(0),
+        hist.size(1),
+        published.size(0),
+        top_scores.stride(0),
+        interval_i32.size(1),
+        interval_i32.size(2),
+        interval_f64.size(2),
+        2 + 5 * tree_depth,
+        max_widths,
+        exec_mode,
+        **_EXACT,
+    )
