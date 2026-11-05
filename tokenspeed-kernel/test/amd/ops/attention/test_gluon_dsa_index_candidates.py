@@ -266,3 +266,110 @@ def test_gluon_owned_page_scorer_writes_scores_into_a_send_buffer(device):
     ):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert buffer[rows * topk :].isnan().all()
+
+
+def _set_key_scale(cache: torch.Tensor, slot: int, value: float) -> None:
+    page, row = divmod(slot, PAGE_SIZE)
+    page_floats = PAGE_SIZE * (HEAD_DIM + 4) // 4
+    scales = page * page_floats + PAGE_SIZE * HEAD_DIM // 4
+    cache.reshape(-1).view(torch.float32)[scales + row] = value
+
+
+def _count_mask_launches(monkeypatch) -> list[int]:
+    from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates
+
+    launches = []
+    mask = index_candidates.mask_index_scores
+
+    def counted(*args, **kwargs):
+        launches.append(kwargs.get("mask_tail"))
+        return mask(*args, **kwargs)
+
+    monkeypatch.setattr(index_candidates, "mask_index_scores", counted)
+    return launches
+
+
+def test_gluon_owned_page_scorer_never_selects_non_finite_scores(device, monkeypatch):
+    table, requests, lens, q, q_scales, weights, cache, keys = _inputs(32, 4, device)
+    scale, topk = 0.1, 256
+    # Request 0's logical tokens 5 and 130 sit on physical pages 12 and 3.
+    poisoned = {5: float("nan"), 130: float("inf")}
+    for position, value in poisoned.items():
+        page = int(table[0, position // PAGE_SIZE])
+        _set_key_scale(cache, page * PAGE_SIZE + position % PAGE_SIZE, value)
+    launches = _count_mask_launches(monkeypatch)
+
+    offsets, scores = dsa_index_candidates(
+        q,
+        weights,
+        cache,
+        table,
+        requests,
+        lens,
+        page_size=PAGE_SIZE,
+        topk=topk,
+        softmax_scale=scale,
+        initial_tokens=0,
+        local_tokens=0,
+        solution=None,
+        pages=plan_dsa_index_candidates(
+            q, weights, cache, table, requests, lens, page_size=PAGE_SIZE
+        ),
+        q_scales=q_scales,
+        query_group_size=4,
+    )
+
+    assert launches == []
+    reference = _reference(table, requests, lens, q, q_scales, weights, keys, scale)
+    for row, (positions, expected) in enumerate(reference):
+        if int(requests[row]) == 0:
+            clean = ~torch.isin(positions, torch.tensor(list(poisoned), device=device))
+            positions, expected = positions[clean], expected[clean]
+        valid = offsets[row] >= 0
+        got = offsets[row][valid].long()
+        assert got.numel() == min(topk, positions.numel())
+        assert scores[row][valid].isfinite().all()
+        by_position = torch.full(
+            (int(lens[row]),), float("nan"), device=device, dtype=torch.float32
+        )
+        by_position[positions] = expected
+        chosen = by_position[got]
+        assert not chosen.isnan().any(), f"row {row} selected a poisoned token"
+        tol = 1.0e-4 * float(expected.abs().max()) + 1.0e-5
+        torch.testing.assert_close(scores[row][valid], chosen, rtol=0, atol=tol)
+        cutoff = float(torch.topk(expected, got.numel()).values[-1])
+        assert float(chosen.min()) >= cutoff - tol, f"row {row} missed a better token"
+
+
+def test_gluon_owned_page_scorer_forces_mandatory_windows(device, monkeypatch):
+    table, requests, lens, q, q_scales, weights, cache, _ = _inputs(32, 4, device)
+    initial, local, topk = 4, 64, 256
+    launches = _count_mask_launches(monkeypatch)
+
+    offsets, scores = dsa_index_candidates(
+        q,
+        weights,
+        cache,
+        table,
+        requests,
+        lens,
+        page_size=PAGE_SIZE,
+        topk=topk,
+        softmax_scale=0.1,
+        initial_tokens=initial,
+        local_tokens=local,
+        solution=None,
+        q_scales=q_scales,
+        query_group_size=4,
+    )
+
+    assert launches == [False]
+    for row in range(requests.numel()):
+        pages = table[int(requests[row])]
+        positions = torch.arange(int(lens[row]), device=device)
+        owned = positions[pages[positions // PAGE_SIZE] >= 0]
+        forced = owned[(owned < initial) | (owned >= int(lens[row]) - local)]
+        got = offsets[row][offsets[row] >= 0]
+        assert forced.numel() > 0
+        assert torch.isin(forced, got).all(), f"row {row} dropped a mandatory token"
+        assert (scores[row][torch.isin(offsets[row], forced)] == float("inf")).all()

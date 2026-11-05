@@ -1255,6 +1255,7 @@ def _score_candidate_chunk(
     Q_FP8: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    NONFINITE_TO_NEG_INF: gl.constexpr = False,
 ):
     # Slots stay in LDS so slot reads never queue behind key copies on the shared vmcnt.
     slot_positions = candidate_start + gl.arange(
@@ -1376,6 +1377,9 @@ def _score_candidate_chunk(
         if KEY_FP8:
             key_scales = scale_shared.gather(tile_id * BLOCK_N + columns, axis=0)
             scores = scores * key_scales[None, :]
+        if NONFINITE_TO_NEG_INF:
+            finite = (scores == scores) & (gl.abs(scores) != float("inf"))
+            scores = gl.where(finite, scores, -float("inf"))
         positions = tile_start + columns
         # Columns past the chunk belong to the next program.
         valid = (
@@ -1440,8 +1444,10 @@ def _multi_row_index_k_scores_body(
     USE_BUFFER_STORE: gl.constexpr,
     CHUNK_LOOP: gl.constexpr,
     EXPLICIT_ROW_LENS: gl.constexpr = False,
+    NONFINITE_TO_NEG_INF: gl.constexpr = False,
 ):
     # Program (i, j): rows i on chunk j; positive key scales apply after the head sum.
+    # NONFINITE_TO_NEG_INF stores NaN and infinite scores as -inf.
     NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
     row_block = gl.program_id(0)
     split = gl.program_id(1)
@@ -1612,6 +1618,7 @@ def _multi_row_index_k_scores_body(
                 Q_FP8,
                 USE_BUFFER_LOAD,
                 USE_BUFFER_STORE,
+                NONFINITE_TO_NEG_INF,
             )
     else:
         _score_candidate_chunk(
@@ -1650,6 +1657,7 @@ def _multi_row_index_k_scores_body(
             Q_FP8,
             USE_BUFFER_LOAD,
             USE_BUFFER_STORE,
+            NONFINITE_TO_NEG_INF,
         )
 
 
@@ -1980,6 +1988,7 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     USE_BUFFER_STORE: gl.constexpr,
     CHUNK_LOOP: gl.constexpr,
     explicit_row_lens=None,
+    NONFINITE_TO_NEG_INF: gl.constexpr = False,
 ):
     """Decode scorer over an fp8_scaled paged plane and BF16 or FP8 q.
 
@@ -1991,6 +2000,8 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
 
     With ``Q_FP8``, ``q`` is E4M3 with FP32 ``q_scales[row, head]`` and the
     keys multiply as E4M3; otherwise ``q`` is BF16 and ``q_scales`` unused.
+    With ``NONFINITE_TO_NEG_INF``, NaN and infinite scores are stored as
+    -inf.
     """
     _multi_row_index_k_scores_body(
         q,
@@ -2034,4 +2045,5 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
         USE_BUFFER_STORE,
         CHUNK_LOOP,
         explicit_row_lens is not None,
+        NONFINITE_TO_NEG_INF,
     )
