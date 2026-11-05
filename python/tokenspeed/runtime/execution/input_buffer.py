@@ -540,14 +540,16 @@ class InputBuffers:
         if num_extends > 0:
             prefill_token_count = sum(input_lengths[:num_extends])
             # One cast per field, through numpy: as_tensor(list) boxes every
-            # token as a Python int while np.asarray stores int32 directly,
-            # and the staging sizes come from the converted tensors instead
-            # of extra len() casts of the same lists. The [:prefill_token_count]
-            # copies still enforce len(input_ids) == sum(input_lengths
-            # [:num_extends]) (pinned by the scheduler's FSM tests) by shape
-            # mismatch.
+            # token as a Python int while np.array stores int32 directly, and
+            # the staging sizes come from the converted tensors instead of
+            # extra len() casts of the same lists. copy=True is one memcpy
+            # either way and is byte-identical for the released list binding
+            # and the read-only ndarray views the scheduler hands over (torch
+            # needs writable memory). The [:prefill_token_count] copies still
+            # enforce len(input_ids) == sum(input_lengths[:num_extends])
+            # (pinned by the scheduler's FSM tests) by shape mismatch.
             input_ids_t = torch.from_numpy(
-                np.asarray(forward_op.input_ids, dtype=np.int32)
+                np.array(forward_op.input_ids, dtype=np.int32, copy=True)
             )
             (input_ids_cpu,) = self._bulk_pinned((input_ids_t.numel(), torch.int32))
             input_ids_cpu.copy_(input_ids_t)
@@ -556,7 +558,7 @@ class InputBuffers:
                 non_blocking=True,
             )
             shifted_ids_t = torch.from_numpy(
-                np.asarray(forward_op.shifted_input_ids, dtype=np.int32)
+                np.array(forward_op.shifted_input_ids, dtype=np.int32, copy=True)
             )
             (shifted_ids_cpu,) = self._bulk_pinned((shifted_ids_t.numel(), torch.int32))
             shifted_ids_cpu.copy_(shifted_ids_t)
