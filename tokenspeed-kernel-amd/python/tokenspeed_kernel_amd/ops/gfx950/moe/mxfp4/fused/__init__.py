@@ -54,6 +54,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (
     gluon_mxfp_fused_moe,
     gluon_mxfp_precomputed_mxfp4_fused_moe,
     sorted_route_capacity,
+    warm_gluon_mxfp4_situ_prefill_rows,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.quantize import (
     _quantize_mxfp4_activation,
@@ -71,6 +72,7 @@ __all__ = [
     "gluon_mxfp_fused_moe",
     "gluon_mxfp_precomputed_mxfp4_fused_moe",
     "sorted_route_capacity",
+    "warm_gluon_mxfp4_situ_prefill_rows",
     # Private helpers shared with the tokenspeed-kernel MoE adapter and the
     # unit tests.
     "_biased_grouped_topk_reference",

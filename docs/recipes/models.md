@@ -665,13 +665,13 @@ start each one with the command below plus
 `--nnodes 2 --node-rank <rank> --dist-init-addr <first-node>:<port>`, where
 `<rank>` is the node's rank (`0` on the first node, `1` on the second) and
 `<first-node>:<port>` is the first node's address and a free port on it. Drop
-the 4 speculative flags to serve without the draft.
+the 4 speculative flags to serve without the draft. The context length is the
+checkpoint's 1,048,576 tokens.
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
-  --max-model-len 32768 \
   --kv-cache-dtype fp8 \
   --tensor-parallel-size 8 \
   --mm-encoder-tp-mode data \

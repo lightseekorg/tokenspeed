@@ -36,7 +36,7 @@ def make_leaf(monkeypatch):
     # These tests execute real metadata kernels, but never prefill attention.
     monkeypatch.setattr(tokenspeed_mla, "warmup_compile_prefill", lambda **kwargs: None)
 
-    def make(*, queries, draft, block, rank, degree, context=512):
+    def make(*, queries, draft, block, rank, degree, causal=False, context=512):
         spec = MLAConfig(
             backend_name="tokenspeed_mla",
             num_attention_heads=128,
@@ -60,6 +60,7 @@ def make_leaf(monkeypatch):
             speculative_num_draft_tokens=queries,
             is_draft=draft,
             draft_block_decode=block,
+            draft_block_causal=causal,
             kvp_size=degree,
             kvp_rank=rank,
             kvp_group=tuple(range(degree)),
@@ -85,13 +86,13 @@ def _pages(blocks):
     )
 
 
-def _check(metadata, blocks, ends, *, rank, degree, queries, block):
+def _check(metadata, blocks, ends, *, rank, degree, queries, block, causal=False):
     expected = []
     for row, length in zip(blocks, ends):
         owned = [b > 0 and (b - 1) % degree == rank for b in row for _ in range(128)]
         bounds = (
             [length] * queries
-            if block
+            if block and not causal
             else [max(0, length - queries + q + 1) for q in range(queries)]
         )
         expected.append([sum(owned[:end]) for end in bounds])
@@ -124,21 +125,28 @@ def _pointers(metadata):
 
 
 @pytest.mark.parametrize(
-    "queries,draft,block,rank,degree",
+    "queries,draft,block,rank,degree,causal",
     [
-        pytest.param(1, False, False, 0, 2, id="decode"),
-        pytest.param(4, False, False, 0, 2, id="verify"),
-        pytest.param(4, True, False, 0, 2, id="mtp"),
-        pytest.param(4, True, True, 0, 2, id="block-draft"),
-        pytest.param(4, True, False, 1, 2, id="mtp-rank1"),
-        pytest.param(4, True, False, 3, 4, id="mtp-degree4"),
+        pytest.param(1, False, False, 0, 2, False, id="decode"),
+        pytest.param(4, False, False, 0, 2, False, id="verify"),
+        pytest.param(4, True, False, 0, 2, False, id="mtp"),
+        pytest.param(4, True, True, 0, 2, False, id="block-draft"),
+        # Kimi-K3.1's DSpark block: each query sees the block up to itself.
+        pytest.param(4, True, True, 0, 2, True, id="causal-block-draft"),
+        pytest.param(4, True, False, 1, 2, False, id="mtp-rank1"),
+        pytest.param(4, True, False, 3, 4, False, id="mtp-degree4"),
     ],
 )
 def test_refresh_and_draft_updates_reuse_reserved_pages(
-    make_leaf, queries, draft, block, rank, degree
+    make_leaf, queries, draft, block, rank, degree, causal
 ):
     leaf = make_leaf(
-        queries=queries, draft=draft, block=block, rank=rank, degree=degree
+        queries=queries,
+        draft=draft,
+        block=block,
+        rank=rank,
+        degree=degree,
+        causal=causal,
     )
     blocks = [[5, 2, 8, 1], [2, 5, 1, 8], [0, 0, 0, 0]]
     table = _pages(blocks)
@@ -155,6 +163,7 @@ def test_refresh_and_draft_updates_reuse_reserved_pages(
         degree=degree,
         queries=queries,
         block=block,
+        causal=causal,
     )
     assert metadata.num_extends == 1
     table_before = metadata.dcp.local_page_table.clone()
@@ -188,6 +197,7 @@ def test_refresh_and_draft_updates_reuse_reserved_pages(
             degree=degree,
             queries=queries,
             block=block,
+            causal=causal,
         )
         replay = metadata.dcp.local_visible_lens.clone()
         advance()
