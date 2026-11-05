@@ -387,8 +387,8 @@ def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
             assert not _use_mv(x[:m], weight)
             out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
             assert mm(x[:m], weight, out=out).data_ptr() == out.data_ptr()
-            # Small weights take a pinned TGV tile, which never enters FI's
-            # tuner; the others keep cuBLASLt.
+            # Small weights with K in the TGV window take a pinned TGV tile,
+            # which never enters FI's tuner; the others keep cuBLASLt.
             tactic = fi_adapter.flashinfer_tgv_decode_tactic(x[:m], weight, out)
             expected = (
                 x[:m] @ weight.T

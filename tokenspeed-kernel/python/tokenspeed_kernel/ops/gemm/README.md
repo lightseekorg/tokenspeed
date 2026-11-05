@@ -91,6 +91,7 @@ instead of cuBLASLt when all of these hold:
 - `BF16_GEMM_MAX_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows,
   `mm` takes FlashInfer's joint BF16 GEMM (`flashinfer_bf16_gemm`) instead, in
   which FlashInfer's tuner chooses among its TGV and CuTe DSL tactics;
+- `TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K` (2048 <= K <= 3072; below);
 - this rank's weight takes at most `TGV_DECODE_MAX_WEIGHT_BYTES` (16 MiB);
 - one of the pinned tiles covers the GEMM in one wave (below);
 - PDL is enabled (`pdl_enabled()`, which the server's `--disable-pdl` turns
@@ -107,16 +108,22 @@ of the 2-CTA tiles of 128 weight rows by 16, 32 or 64 activation rows, each
 with the most stages that fit in shared memory, the first whose grid has at
 most one CTA per SM. A GEMM for which none fits keeps cuBLASLt, and so does
 every GEMM without PDL, which has no overlap to gain. The choice depends only
-on M, N, the weight size, the SM count and the PDL setting.
+on M, N, K, the weight size, the SM count and the PDL setting.
 
-The weight limit is a size per rank, not a list of layers. On a quantized
-checkpoint, the BF16 GEMMs that reach it are the small projections the
-checkpoint leaves unquantized; the route was measured only in such a model's
-decode graphs. On a BF16 checkpoint it also admits dense projection shards
-under tensor parallelism, which have not been measured: at TP4, a model with
-hidden size 4096 and 8 KV heads of 128 has a 12 MiB fused QKV shard, routed up
-to M = 384 on 148 SMs, and an 8 MiB output projection shard, routed up to
-M = 128.
+The K window is measured, not derived: on GB300, in a captured PDL chain of an
+RMSNorm and this GEMM on a weight cold in L2, TGV beat cuBLASLt on most shapes
+with K in the window, by up to 1.30x. Outside it TGV lost on many shapes, down
+to 0.73x cuBLASLt's speed, mainly at K of 512 to 1024 and at K >= 4096 with
+few weight rows; at K = 1536 it also lost on some shapes (down to 0.92x).
+
+The weight limit and the K window are bounds on shape, not a list of layers.
+On a quantized checkpoint, the BF16 GEMMs that reach them are the small
+projections the checkpoint leaves unquantized; the route was measured end to
+end only in such a model's decode graphs. On a BF16 checkpoint they also admit
+dense projection shards under tensor parallelism, not measured in a model: at
+TP4, a model with hidden size 3072 and 8 KV heads of 128 has a 7.5 MiB fused
+QKV shard (K = 3072), routed up to M = 448 on 148 SMs, while its output
+projection shard (K = 768) keeps cuBLASLt.
 
 The serving gate has a different reason than the joint path's, which
 compiles once per row count. TGV compiles once per tile, but the route was

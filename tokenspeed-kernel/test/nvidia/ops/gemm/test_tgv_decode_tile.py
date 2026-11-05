@@ -65,7 +65,7 @@ FLASHINFER_0_7_2_TACTICS = [
 
 def select(m, n, k=2560, *, arch=SM100, sm_count=148, pdl=True):
     return fi.select_tgv_decode_tile(
-        m=m, n=n, weight_bytes=2 * n * k, arch=arch, sm_count=sm_count, pdl=pdl
+        m=m, n=n, k=k, weight_bytes=2 * n * k, arch=arch, sm_count=sm_count, pdl=pdl
     )
 
 
@@ -82,7 +82,8 @@ def test_weights_up_to_16_mib_are_routed():
     def tile(weight_bytes):
         return fi.select_tgv_decode_tile(
             m=64,
-            n=1024,
+            n=4096,
+            k=2048,
             weight_bytes=weight_bytes,
             arch=SM100,
             sm_count=148,
@@ -90,10 +91,38 @@ def test_weights_up_to_16_mib_are_routed():
         )
 
     assert fi.TGV_DECODE_MAX_WEIGHT_BYTES == 16 * MIB
-    assert tile(16 * MIB) == TILE16
+    # A 4096 x 2048 weight takes exactly 16 MiB.
+    assert tile(16 * MIB) == TILE32
     assert tile(16 * MIB + 2) is None
-    # A 2560 x 6144 attention output projection takes 30 MiB.
-    assert select(160, 2560, 6144) is None
+    # 3072 x 3072 takes 18 MiB, though its K is in the window and its grid
+    # fits in one wave at 48 rows.
+    assert select(48, 3072, 3072) is None
+
+
+@pytest.mark.parametrize("arch", [SM100, SM103])
+def test_k_from_2048_to_3072_is_routed(arch):
+    assert (fi.TGV_DECODE_MIN_K, fi.TGV_DECODE_MAX_K) == (2048, 3072)
+    assert select(64, 512, 2047, arch=arch) is None
+    assert select(64, 512, 2048, arch=arch) == TILE16
+    assert select(64, 512, 3072, arch=arch) == TILE16
+    assert select(64, 512, 3073, arch=arch) is None
+
+
+@pytest.mark.parametrize("m", [36, 64, 128])
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        # cuBLASLt time over TGV time, measured on GB300:
+        (2560, 640),  # a shared expert's down projection, 0.90 to 0.96
+        (160, 7168),  # an indexer projection, 0.73 to 0.91
+        (3072, 512),  # a latent-attention KV up-projection shard, 0.87 to 0.95
+    ],
+)
+def test_k_outside_the_window_is_not_routed(m, n, k):
+    """Small weights that TGV ran slower than cuBLASLt. Only K keeps them
+    off the route: at K = 2560 the same rows and weight rows get a tile."""
+    assert select(m, n) is not None
+    assert select(m, n, k) is None
 
 
 @pytest.mark.parametrize(
@@ -105,7 +134,7 @@ def test_only_sm100_and_sm103_are_routed(arch, routed):
 
 @pytest.mark.parametrize("arch", [SM100, SM103])
 @pytest.mark.parametrize(
-    "m,n,k", [(33, 512, 2560), (64, 1024, 8192), (192, 2560, 2560), (512, 640, 2560)]
+    "m,n,k", [(33, 512, 2560), (64, 4096, 2048), (192, 2560, 2560), (512, 640, 2560)]
 )
 def test_without_pdl_no_tile_is_chosen(arch, m, n, k):
     """The tiles are pinned for the overlap PDL gives them; without it every

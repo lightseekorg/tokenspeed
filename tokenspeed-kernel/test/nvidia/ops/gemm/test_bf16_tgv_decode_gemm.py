@@ -131,16 +131,26 @@ def test_installed_flashinfer_lists_the_pinned_tiles():
         (33, 512, 2560, True),
         (512, 512, 2560, True),
         (513, 512, 2560, False),
-        (64, 1024, 8192, True),  # exactly 16 MiB of weight
-        (64, 1024, 8200, False),
-        (48, 2560, 160, True),  # one partial K tile
+        (64, 4096, 2048, True),  # exactly 16 MiB of weight
+        (64, 4096, 2056, False),
+        (48, 2560, 2080, True),  # a partial last K tile
         # Weight rows ending inside a 64-row tile; for 160 rows, the second
         # CTA of the last 2-CTA cluster lies wholly past the weight.
         (48, 160, 2560, True),
         (400, 1000, 2560, True),
         (192, 2560, 2560, True),
         (288, 2560, 2560, False),  # no tile's grid fits in one wave
-        (160, 2560, 6144, False),  # a 30 MiB attention output projection
+        (
+            160,
+            2560,
+            6144,
+            False,
+        ),  # a 30 MiB attention output projection (also outside the K window)
+        # Small weights whose grid fits in one wave, with K outside
+        # TGV_DECODE_MIN_K..TGV_DECODE_MAX_K: they keep the existing GEMM.
+        (64, 2560, 640, False),
+        (64, 160, 7168, False),
+        (64, 3072, 512, False),
     ],
 )
 def test_mm_routes_decode_rows_by_the_tile_policy(m, n, k, routed):
@@ -164,7 +174,8 @@ def test_mm_routes_decode_rows_by_the_tile_policy(m, n, k, routed):
 
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize(
-    "n,k", [(512, 2560), (960, 2560), (2560, 160), (160, 2560), (1000, 2560)]
+    "n,k",
+    [(512, 2560), (960, 2560), (2560, 2080), (2560, 160), (160, 2560), (1000, 2560)],
 )
 def test_pinned_tiles_match_fp64(pdl, n, k):
     """Every tile, with full and partial last activation, weight and K tiles:
@@ -188,6 +199,7 @@ def test_captured_graph_replays_the_tile_bit_for_bit(m, tile):
     chosen = fi.select_tgv_decode_tile(
         m=m,
         n=n,
+        k=k,
         weight_bytes=2 * n * k,
         arch=fi.platform.arch_version,
         sm_count=fi.platform.sm_count,
@@ -311,7 +323,7 @@ def test_warmup_compiles_the_tiles_for_every_row_and_weight(tgv_compiles):
     module, compiled = tgv_compiles
     pairs = [
         inputs(fi.TGV_DECODE_MAX_M, 512, 2560, 11),
-        inputs(fi.TGV_DECODE_MAX_M, 2560, 160, 13),
+        inputs(fi.TGV_DECODE_MAX_M, 2560, 2080, 13),
     ]
     rows = range(fi.BF16_GEMM_MAX_M + 1, fi.TGV_DECODE_MAX_M + 1)
     warmed_x, warmed_w = pairs[0]

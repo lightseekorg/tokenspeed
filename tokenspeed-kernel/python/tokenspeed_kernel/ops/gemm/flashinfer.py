@@ -944,7 +944,8 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 # ===-----------------------------------------------------------------------===#
 #
 # With PDL and before serving, mm() runs a bias-free BF16 GEMM with
-# BF16_GEMM_MAX_M < M <= TGV_DECODE_MAX_M rows on a weight of at most
+# BF16_GEMM_MAX_M < M <= TGV_DECODE_MAX_M rows and
+# TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K on a weight of at most
 # TGV_DECODE_MAX_WEIGHT_BYTES with one TGV tile instead of cuBLASLt. Under
 # PDL, TGV's weight-load warp fills its shared-memory stages while the
 # producer kernel still runs; only its activation-load warp waits for the
@@ -961,6 +962,13 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 
 TGV_DECODE_MAX_M = 512
 TGV_DECODE_MAX_WEIGHT_BYTES = 16 << 20
+# Measured on GB300 against cuBLASLt in a captured PDL chain (an RMSNorm, then
+# this GEMM on a weight cold in L2): with K in this window TGV was faster on
+# most shapes; outside it, it lost on many shapes, down to 0.73x cuBLASLt's
+# speed: at K of 512 to 1024, at K >= 4096 with few weight rows, and on some
+# shapes at K = 1536.
+TGV_DECODE_MIN_K = 2048
+TGV_DECODE_MAX_K = 3072
 
 
 class TgvTile(NamedTuple):
@@ -993,6 +1001,7 @@ def select_tgv_decode_tile(
     *,
     m: int,
     n: int,
+    k: int,
     weight_bytes: int,
     arch: ArchVersion,
     sm_count: int,
@@ -1007,6 +1016,7 @@ def select_tgv_decode_tile(
     Args:
         m: Activation rows.
         n: Weight rows, i.e. output columns.
+        k: Weight columns, the reduction length.
         weight_bytes: Size of the weight in bytes.
         arch: GPU architecture.
         sm_count: Number of streaming multiprocessors of the GPU.
@@ -1017,7 +1027,8 @@ def select_tgv_decode_tile(
 
     Returns:
         With PDL on SM100 and SM103, for
-        ``BF16_GEMM_MAX_M < m <= TGV_DECODE_MAX_M`` and
+        ``BF16_GEMM_MAX_M < m <= TGV_DECODE_MAX_M``,
+        ``TGV_DECODE_MIN_K <= k <= TGV_DECODE_MAX_K`` and
         ``weight_bytes <= TGV_DECODE_MAX_WEIGHT_BYTES``, the first tile of
         :data:`TGV_DECODE_TILES` whose grid has at most ``sm_count`` CTAs. TGV
         gives each CTA a whole SM's shared memory and has no split-K, so a
@@ -1027,6 +1038,7 @@ def select_tgv_decode_tile(
         not pdl
         or arch not in _CUTE_DSL_SM100_ARCHS
         or not BF16_GEMM_MAX_M < m <= TGV_DECODE_MAX_M
+        or not TGV_DECODE_MIN_K <= k <= TGV_DECODE_MAX_K
         or weight_bytes > TGV_DECODE_MAX_WEIGHT_BYTES
     ):
         return None
@@ -1138,6 +1150,7 @@ def flashinfer_tgv_decode_tactic(
     tile = select_tgv_decode_tile(
         m=x.shape[0],
         n=weight.shape[0],
+        k=weight.shape[1],
         weight_bytes=weight.numel() * weight.element_size(),
         arch=platform.arch_version,
         sm_count=platform.sm_count,
@@ -1216,6 +1229,7 @@ def warm_tgv_decode_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
         select_tgv_decode_tile(
             m=m,
             n=weight.shape[0],
+            k=weight.shape[1],
             weight_bytes=weight.numel() * weight.element_size(),
             arch=platform.arch_version,
             sm_count=platform.sm_count,
