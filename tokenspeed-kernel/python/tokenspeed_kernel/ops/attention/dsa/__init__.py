@@ -749,9 +749,9 @@ def dsa_decode_dcp_records_supported(
     """Whether :func:`dsa_decode_dcp_records` serves a decode of this size.
 
     Host values only, so every rank of a KVP group decides alike before the
-    query gather. The op has one leaf, gfx950's dense matrix core, whose
-    reduction over split keys writes the records: sizes it runs unsplit, and
-    other platforms, are refused.
+    query gather. The op has one leaf, gfx950's dense matrix core, which
+    writes a row's records itself or through its reduction over split keys:
+    other inputs, and other platforms, are refused.
 
     Args:
         tokens: Query rows.
@@ -826,11 +826,14 @@ def dsa_decode_dcp_records(
 
     Returns:
         Contiguous int32 ``[ranks, tokens, local_heads, kv_lora_rank / 2 + 1]``:
-        bit for bit the records ``dispatch_dcp_attention_partials(out, lse,
+        the records ``dispatch_dcp_attention_partials(out, lse,
         degree=ranks)`` packs from ``dsa_decode(..., return_lse=True)`` on the
-        token-major gather (head ``r * local_heads + h``). Raises
-        ``ValueError`` for a size :func:`dsa_decode_dcp_records_supported`
-        refuses.
+        token-major gather (head ``r * local_heads + h``). A row splits its
+        keys by its own live length, so a short one, as one near its rank's
+        share of the selection in a small launch, may split less than that
+        decode and round differently; a longer row matches it bit for bit.
+        Raises ``ValueError`` for a size
+        :func:`dsa_decode_dcp_records_supported` refuses.
     """
     if q.dim() != 4:
         raise ValueError(

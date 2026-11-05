@@ -19,7 +19,8 @@
 # SOFTWARE.
 
 """GFX950 KVP decode records: the dense matrix core on a rank-major query
-gather, its split reduction writing the DCP partials exchange's records."""
+gather, it or its split reduction writing the DCP partials exchange's
+records."""
 
 from __future__ import annotations
 
@@ -92,11 +93,11 @@ def _inputs(tokens, degree, local_heads, *, seed):
 def _token_major(q):
     """The rank-major gather as ``gather_query_heads`` lays it out: head
     ``r * local_heads + h`` of every token. Copied as bytes."""
-    degree, tokens, local_heads, dim = q.shape
+    degree, tokens, local_heads, _ = q.shape
     return (
         q.view(torch.uint8)
         .permute(1, 0, 2, 3)
-        .reshape(tokens, degree * local_heads, dim)
+        .reshape(tokens, degree * local_heads, -1)
         .view(q.dtype)
     )
 
@@ -129,6 +130,47 @@ def _supported(tokens, heads):
     )
 
 
+def _dispatched(q, kwargs):
+    """Today's head-sharded decode: the token-major gather, the core with its
+    LSE, then the repack into the records the all-to-all sends."""
+    out, lse = dsa_decode(
+        q=_token_major(q),
+        sparse_kv_cache=None,
+        max_seqlen_k=PAGES * 64,
+        return_lse=True,
+        **kwargs,
+    )
+    return dispatch_dcp_attention_partials(out, lse, degree=q.shape[0])
+
+
+def _assert_records_attend(records, q, cache, slots, lengths):
+    """Each head's record against FP32 attention over its row's live slots:
+    the output within what the core's FP8 probabilities cost the
+    token-major decode too, the natural-log LSE of the scaled scores within
+    FP32 rounding. The NaN query head is left out."""
+    degree, tokens, local_heads, _ = q.shape
+    keys = cache.view(-1, 576).float()
+    out = torch.zeros((degree, tokens, local_heads, 512), device="cuda")
+    lse = torch.full((degree, tokens, local_heads), -torch.inf, device="cuda")
+    for row in range(tokens):
+        live = slots[row, : int(lengths[row])]
+        row_keys = keys[live[live >= 0].long()]
+        if row_keys.shape[0]:
+            scores = torch.einsum("rhd,kd->rhk", q[:, row].float(), row_keys) * SCALE
+            lse[:, row] = torch.logsumexp(scores, dim=-1)
+            out[:, row] = torch.softmax(scores, dim=-1) @ row_keys[:, :512]
+    kept = ~lse.isnan()
+    error = (records[..., :256].contiguous().view(torch.bfloat16).float() - out)[kept]
+    assert error.abs().max() < 0.15
+    assert error.square().mean().sqrt() <= 0.02 * out[kept].square().mean().sqrt()
+    torch.testing.assert_close(
+        records[..., 256].contiguous().view(torch.float32)[kept],
+        lse[kept],
+        atol=2e-4,
+        rtol=1e-5,
+    )
+
+
 @pytest.mark.parametrize(
     "tokens,degree,local_heads",
     [
@@ -147,26 +189,38 @@ def test_decode_records_match_the_dispatched_decode(tokens, degree, local_heads)
     )
     assert _supported(tokens, degree * local_heads)
     kwargs = _kwargs(cache, slots, lengths)
-    # Today's head-sharded decode: the token-major gather, the core with its
-    # LSE, then the repack into the records the all-to-all sends.
-    out, lse = dsa_decode(
-        q=_token_major(q),
-        sparse_kv_cache=None,
-        max_seqlen_k=PAGES * 64,
-        return_lse=True,
-        **kwargs,
-    )
-    expected = dispatch_dcp_attention_partials(out, lse, degree=degree)
+    expected = _dispatched(q, kwargs)
     records = dsa_decode_dcp_records(q=q, **kwargs)
     assert records.dtype == torch.int32 and records.is_contiguous()
     assert records.shape == (degree, tokens, local_heads, 257)
-    assert torch.equal(records, expected)
+    # Rows near a rank's share of the selection split less than the
+    # token-major decode; the full-width row splits as it does, bit for bit.
+    _assert_records_attend(records, q, cache, slots, lengths)
+    _assert_records_attend(expected, q, cache, slots, lengths)
+    if tokens > 2:
+        assert torch.equal(records[:, 2], expected[:, 2])
     # The empty and all-invalid rows are zero output with a -inf LSE, as the
     # combine expects of an empty partial.
     empty = records[:, : min(tokens, 2)]
     assert not empty[..., :256].any()
     neg_inf_bits = torch.tensor(-torch.inf).view(torch.int32).item()
     assert (empty[..., 256] == neg_inf_bits).all()
+
+
+@pytest.mark.parametrize("tokens", [4, 16, 48, 64])
+def test_decode_records_of_a_row_follow_only_its_own_length(tokens):
+    # A row's split count comes from its own live length, so its record
+    # does not move when the other rows' lengths do.
+    degree, local_heads = 8, 12
+    q, cache, slots, lengths = _inputs(tokens, degree, local_heads, seed=tokens + 5)
+    kwargs = _kwargs(cache, slots, lengths)
+    before = dsa_decode_dcp_records(q=q, **kwargs)
+    row = tokens - 1
+    for other in (0, 256, 1000, TOPK):
+        lengths[:row] = other
+        after = dsa_decode_dcp_records(q=q, **kwargs)
+        assert torch.equal(after[:, row], before[:, row])
+        _assert_records_attend(after, q, cache, slots, lengths)
 
 
 @pytest.mark.parametrize("tokens", [4, 48, 64])
@@ -202,24 +256,26 @@ def test_decode_records_read_a_query_riding_in_a_gathered_chunk(tokens):
     assert torch.equal(dsa_decode_dcp_records(q=shifted, **kwargs), expected)
 
 
-def test_decode_records_refuse_unsplit_launches():
-    # Past 512 programs (two waves of 256 CUs) the core runs one split and
-    # writes its output itself, not through the reduction.
-    assert _supported(85, 96)
-    assert not _supported(86, 96)
-    assert not _supported(0, 96)
-    assert not dsa_decode_dcp_records_supported(
-        tokens=16,
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_decode_records_serve_unsplit_launches(dtype):
+    # Past 512 programs (two waves of 256 CUs), and for a BF16 query and
+    # cache at any size, the core runs one split and writes the records
+    # itself, as the token-major decode writes its output.
+    tokens = 86 if dtype == torch.float8_e4m3fn else 16
+    q, cache, slots, lengths = _inputs(tokens, 8, 12, seed=5)
+    q, cache = q.to(dtype), cache.to(dtype)
+    assert dsa_decode_dcp_records_supported(
+        tokens=tokens,
         heads=96,
         topk=TOPK,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        q_dtype=dtype,
+        kv_dtype=dtype,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
-    q, cache, slots, lengths = _inputs(86, 8, 12, seed=5)
-    with pytest.raises(ValueError, match="split keys"):
-        dsa_decode_dcp_records(q=q, **_kwargs(cache, slots, lengths))
+    kwargs = _kwargs(cache, slots, lengths)
+    assert torch.equal(dsa_decode_dcp_records(q=q, **kwargs), _dispatched(q, kwargs))
+    assert not _supported(0, 96)
 
 
 def test_decode_records_replay_in_a_graph_across_lengths():
@@ -231,20 +287,14 @@ def test_decode_records_replay_in_a_graph_across_lengths():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = dsa_decode_dcp_records(q=q, **kwargs)
-    for visible in (0, 13, 257, TOPK):
+    for visible in (0, 13, 256, 257, 700, TOPK):
         lengths.fill_(visible)
         slots.copy_(torch.roll(slots, 1, dims=1))
         graph.replay()
-        out, lse = dsa_decode(
-            q=_token_major(q),
-            sparse_kv_cache=None,
-            max_seqlen_k=PAGES * 64,
-            return_lse=True,
-            **kwargs,
-        )
-        expected = dispatch_dcp_attention_partials(out, lse, degree=degree)
+        expected = dsa_decode_dcp_records(q=q, **kwargs)
         torch.cuda.synchronize()
         assert torch.equal(captured, expected)
+        _assert_records_attend(captured, q, cache, slots, lengths)
 
 
 def test_decode_records_compile_once_across_tokens():
