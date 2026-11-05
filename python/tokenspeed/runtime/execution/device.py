@@ -1363,7 +1363,10 @@ def build_device_side(
         NULL_MEMORY_DELTA_OBSERVER,
         DriverMemoryDeltaObserver,
     )
-    from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
+    from tokenspeed.runtime.execution.prefill_graph import (
+        check_rank_uniform_prefill_plan,
+        narrowing_prefill_model,
+    )
     from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
@@ -1493,6 +1496,14 @@ def build_device_side(
             draft_attn_backend=attention.draft_attn_backend,
             draft_token_to_kv_pool=views.draft_token_to_kv_pool,
         )
+    # Breaks of these graphs may run collectives; an instance-wide fact, so ranks agree.
+    replays_prefill_graphs = server_args.disaggregation_mode == "prefill" or (
+        server_args.disaggregation_mode == "null"
+        and model_config.dsa_padded_prefill_replay
+    )
+    if replays_prefill_graphs:
+        # Ranks must plan alike: one rank eager while its peers replay hangs them.
+        check_rank_uniform_prefill_plan(executor.prefill_graph, server_args)
     # Once per process, before the probe: a graph keeps its capture-time tactic.
     with (
         startup_memory.measure("startup"),
@@ -1500,6 +1511,13 @@ def build_device_side(
         current_platform().restore_stack_limit(),
     ):
         executor.autotune()
+    if probing and current_platform().is_nvidia:
+        # After empty_cache, reserved minus allocated is residue pinned by live buffers.
+        device_module = torch.get_device_module(server_args.device)
+        pinned = device_module.memory_reserved() - device_module.memory_allocated()
+        logger.info(
+            f"startup allocator cache after empty_cache: {pinned / 2**30:.2f} GiB"
+        )
     if probing:
         # Consumers above keep the probe's: they read only block-count-invariant fields.
         with startup_phase("graph.probe_rebind"):
@@ -1527,6 +1545,16 @@ def build_device_side(
 
     with startup_phase("graph.capture"):
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+    if replays_prefill_graphs and not executor.prefill_graph.disable:
+        # Release capture-stream cache no forward reuses; graph pools are not freed.
+        device_module = torch.get_device_module(server_args.device)
+        before = device_module.memory_reserved() - device_module.memory_allocated()
+        device_module.empty_cache()
+        after = device_module.memory_reserved() - device_module.memory_allocated()
+        logger.info(
+            f"post-capture allocator cache: {before / 2**30:.2f} -> "
+            f"{after / 2**30:.2f} GiB"
+        )
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
     start_expert_load_window(executor)
