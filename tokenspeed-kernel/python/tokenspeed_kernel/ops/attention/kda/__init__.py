@@ -203,12 +203,10 @@ def kda_paged_prefill(
             or BF16.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
         cu_seqlens_cpu: REQUIRED host int64 copy of ``cu_seqlens`` with equal
-            contents. Every solution plans its chunk indices from it on the
-            host; reading the device boundaries instead would issue a
-            stream-synchronizing D2H per KDA layer per chunk, which stalls
-            the launch thread behind all queued work (and serializes the
-            chunk pipeline's stages).
-        capacity: Explicit CuTeDSL graph planning bounds, or None for exact
+            contents. Used for capacity admission and backends that require
+            host planning, without a synchronizing D2H per layer. Backends
+            with device planning consume cu_seqlens directly.
+        capacity: Explicit graph planning bounds, or None for exact
             live-length planning. Live boundaries retain their normal meaning.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
@@ -249,10 +247,7 @@ def kda_paged_prefill(
         solution = "triton"
     capacity_kwargs = {}
     if capacity is not None:
-        if solution != "cutedsl_kda":
-            raise ValueError("KDA capacity planning requires explicit cutedsl_kda")
         capacity.validate(cu_seqlens_cpu, q.shape[1])
-        capacity_kwargs["capacity"] = capacity
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",
@@ -261,10 +256,13 @@ def kda_paged_prefill(
         override=override,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)
-    if capacity is not None and (
-        spec is None or True not in spec.traits.get("prefill_capacity", ())
-    ):
+    supports_capacity = spec is not None and True in spec.traits.get(
+        "prefill_capacity", ()
+    )
+    if capacity is not None and not supports_capacity:
         raise ValueError("Selected KDA kernel does not support planning capacity")
+    if supports_capacity:
+        capacity_kwargs["capacity"] = capacity
     supported = None if spec is None else spec.traits.get("recurrent_layout")
     # Kernels that declare no layout consume the caller's state as it is.
     relayout = supported is not None and recurrent_layout not in supported
@@ -764,6 +762,7 @@ import tokenspeed_kernel.ops.attention.kda.vllm_recoverssm  # noqa: E402,F401
 if importlib.util.find_spec("flash_kda") is not None:
     import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.cudnn  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
 # isort: on

@@ -31,16 +31,7 @@ from tokenspeed.runtime.execution.context import ForwardContext, TargetCaptureSi
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from tokenspeed.runtime.models.base.comm_ops import FinalNormOp
-from tokenspeed.runtime.models.base.compiler import (
-    compile_decoder_layer,
-    find_first_compute_input_group,
-)
-from tokenspeed.runtime.models.base.decoder_layer import (
-    BaseDecoderLayer,
-    CompiledDecoderLayer,
-)
-from tokenspeed.runtime.models.base.placement import ParallelGroup, PlacementType
+from tokenspeed.runtime.models.base.decoder_layer import BaseDecoderLayer
 from tokenspeed.runtime.utils import add_prefix, make_layers
 
 
@@ -98,60 +89,6 @@ class BaseTransformerModel(nn.Module):
         # concatenates taps in this order); set_dflash_layers_to_capture().
         self._dflash_capture_idx_map: dict[int, int] = {}
 
-        self._compile_decoder_stack()
-
-        # Build the final norm op that handles cross-layer communication
-        # after the last decoder layer (fused allreduce + norm, or separate
-        # norm + all-gather for RSAG mode).
-        self._final_norm_op = self._build_final_norm_op()
-
-    def _compile_decoder_stack(self) -> None:
-        """Compile only ``CompiledDecoderLayer`` instances."""
-        prev_output_group = None
-        for idx, layer in enumerate(self.layers):
-            if not isinstance(layer, CompiledDecoderLayer):
-                continue
-            next_layer_input_group = None
-            if idx + 1 < len(self.layers):
-                next_layer = self.layers[idx + 1]
-                if isinstance(next_layer, CompiledDecoderLayer):
-                    next_exec_plan = next_layer.resolve_exec_plan()
-                    next_layer_input_group = find_first_compute_input_group(
-                        next_exec_plan
-                    )
-            compiled = compile_decoder_layer(
-                layer=layer,
-                exec_plan=layer.resolve_exec_plan(),
-                mapping=self.mapping,
-                prev_layer_output_group=prev_output_group,
-                next_layer_input_group=next_layer_input_group,
-            )
-            layer.set_compiled(compiled)
-            if compiled.final_placement is not None:
-                prev_output_group = compiled.final_placement.group
-            else:
-                prev_output_group = None
-
-    def _build_final_norm_op(self) -> FinalNormOp:
-        """Create a FinalNormOp for the post-last-layer norm + comm."""
-        last_layer = self.layers[-1] if len(self.layers) > 0 else None
-
-        use_ar = True
-        group_type = ParallelGroup.ATTN_TP
-        if isinstance(last_layer, CompiledDecoderLayer):
-            compiled = getattr(last_layer, "_compiled", None)
-            if compiled is not None and compiled.final_placement is not None:
-                use_ar = compiled.final_placement.type != PlacementType.SHARD
-                group_type = compiled.final_placement.group
-
-        return FinalNormOp(
-            mapping=self.mapping,
-            group_type=group_type,
-            norm_module=self.norm,
-            use_all_reduce_mode=use_ar,
-            lm_head_group_type=ParallelGroup.ATTN_TP,
-        )
-
     def resolve_embed(self, config: PretrainedConfig, prefix: str) -> nn.Module:
         return VocabParallelEmbedding(
             config.vocab_size,
@@ -196,18 +133,10 @@ class BaseTransformerModel(nn.Module):
             # NCCL allreduce in the embedding and let the first decoder layer
             # fuse it with the input layernorm via the fused all-reduce kernel.
             first_layer = self.layers[0]
-            if isinstance(first_layer, CompiledDecoderLayer):
-                first_compiled = first_layer._compiled
-                fuse_embed_reduce = first_compiled.can_fuse_embed_reduce(
-                    input_ids.shape[0]
-                )
-            elif isinstance(first_layer, BaseDecoderLayer):
-                fuse_embed_reduce = (
-                    self.embed_tokens.tp_size > 1
-                    and first_layer.comm_manager.should_fuse(input_ids.shape[0])
-                )
-            else:
-                fuse_embed_reduce = False
+            fuse_embed_reduce = (
+                self.embed_tokens.tp_size > 1
+                and first_layer.comm_manager.should_fuse(input_ids.shape[0])
+            )
             hidden_states = self.embed_tokens(
                 input_ids, reduce_results=not fuse_embed_reduce
             )
@@ -241,29 +170,19 @@ class BaseTransformerModel(nn.Module):
             if residual is None:
                 raise RuntimeError("residual is required for non-idle forward mode.")
 
-            if isinstance(layer, BaseDecoderLayer):
-                hidden_states, final_residual = layer.comm_manager.final_norm(
-                    hidden_states, residual, ctx, self.norm
-                )
-            else:
-                hidden_states, final_residual = self._final_norm_op(
-                    hidden_states, residual, ctx
-                )
+            hidden_states, final_residual = layer.comm_manager.final_norm(
+                hidden_states, residual, ctx, self.norm
+            )
 
             # Capture index num_layers + 1 (EAGLE3's id num_layers, DFLASH's
             # last layer id) selects the final norm's output residual as an
-            # aux state, matching how each layer type captures in-loop:
-            # BaseDecoderLayer gathers across attn-TP, CompiledDecoderLayer
-            # appends raw.
+            # aux state, gathered across attn-TP as the in-loop captures are.
             if (
                 aux_hidden_states is not None
                 and final_residual is not None
                 and len(self.layers) + 1 in self.layers_to_capture
             ):
-                if hasattr(layer, "comm_manager"):
-                    final_residual = layer.comm_manager.gather_residual(
-                        final_residual, ctx
-                    )
+                final_residual = layer.comm_manager.gather_residual(final_residual, ctx)
                 aux_hidden_states.append(final_residual.clone())
                 if ctx.target_capture_sink is not None:
                     notify_target_capture(
