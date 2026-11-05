@@ -22,6 +22,7 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import current_platform
 
 
 @triton.jit
@@ -40,12 +41,13 @@ def _compact(
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # 64-bit row offsets: row * stride overflows int32 on a 1M-wide decode table.
+    row = tl.program_id(0).to(tl.int64)
     req = tl.load(Requests + row)
     length = tl.load(Causal + row)
     col = tl.arange(0, BLOCK)
     page = tl.load(
-        Table + req * STRIDE + col,
+        Table + req.to(tl.int64) * STRIDE + col,
         mask=(req >= 0) & (req < ROWS) & (col < COLS),
         other=-1,
     )
@@ -55,6 +57,87 @@ def _compact(
     tl.store(Positions + row * COLS + index, col, mask=valid)
     count = tl.sum(tl.where(valid, tl.minimum(PAGE, length - col * PAGE), 0))
     tl.store(Lengths + row, count)
+
+
+@triton.jit(do_not_specialize=["ROWS", "COLS", "STRIDE", "OUT_COLS"])
+def _compact_bounded(
+    Table,
+    Requests,
+    Causal,
+    Pages,
+    Positions,
+    Lengths,
+    Overflow,
+    # Runtime, unspecialized batch geometry: every batch shape shares one binary.
+    ROWS,
+    COLS,
+    STRIDE,
+    OUT_COLS,
+    PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Keep only the first OUT_COLS valid pages: Lengths covers them, Overflow the rest.
+    row = tl.program_id(0).to(tl.int64)
+    req = tl.load(Requests + row)
+    length = tl.load(Causal + row)
+    # Columns from ceil(length / PAGE) on start at or past the causal length.
+    end = tl.minimum(COLS, (tl.maximum(length, 0) + PAGE - 1) // PAGE)
+    end = tl.where((req >= 0) & (req < ROWS), end, 0)
+    table = Table + req.to(tl.int64) * STRIDE
+    found = 0
+    tokens = 0
+    for start in range(0, end, BLOCK):
+        col = start + tl.arange(0, BLOCK)
+        page = tl.load(table + col, mask=col < end, other=-1)
+        valid = page > 0
+        index = found + tl.cumsum(valid.to(tl.int32), axis=0) - 1
+        stored = valid & (index < OUT_COLS)
+        tl.store(Pages + row * OUT_COLS + index, page, mask=stored)
+        tl.store(Positions + row * OUT_COLS + index, col, mask=stored)
+        tokens += tl.sum(
+            tl.where(stored, tl.minimum(PAGE, length - col * PAGE), 0), axis=0
+        )
+        found += tl.sum(valid.to(tl.int32), axis=0)
+    tl.store(Lengths + row, tokens)
+    if Overflow is not None:
+        tl.store(Overflow + row, tl.maximum(found - OUT_COLS, 0))
+
+
+@triton.jit
+def _mask_block(
+    Logits,
+    Positions,
+    Causal,
+    row,
+    start,
+    length,
+    WIDTH,
+    STRIDE,
+    COL_STRIDE,
+    COLS,
+    PAGE: tl.constexpr,
+    INITIAL: tl.constexpr,
+    LOCAL: tl.constexpr,
+    MASK_TAIL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    col = start + tl.arange(0, BLOCK)
+    valid = (col < WIDTH) & (col < length)
+    page = tl.load(Positions + row * COLS + col // PAGE, mask=valid, other=-1)
+    logical = page * PAGE + col % PAGE
+    causal = tl.load(Causal + row)
+    score = tl.load(
+        Logits + row * STRIDE + col * COL_STRIDE, mask=valid, other=-float("inf")
+    )
+    finite = (score == score) & (tl.abs(score) != float("inf"))
+    score = tl.where(finite, score, -float("inf"))
+    forced = (logical < INITIAL) | (logical >= causal - LOCAL)
+    score = tl.where(valid & forced, float("inf"), score)
+    tl.store(
+        Logits + row * STRIDE + col * COL_STRIDE,
+        tl.where(valid, score, -float("inf")),
+        mask=(col < WIDTH) & (MASK_TAIL | valid),
+    )
 
 
 @triton.jit(do_not_specialize=["WIDTH", "STRIDE", "COL_STRIDE", "COLS"])
@@ -75,29 +158,82 @@ def _mask_scores(
     MASK_TAIL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    start = tl.program_id(1) * BLOCK
+    row = tl.program_id(0).to(tl.int64)
     length = tl.load(Lengths + row)
-    # Length-aware selection never reads the tail. The full-width fallback
-    # still needs it initialized, including after an empty graph replay.
-    if MASK_TAIL or start < length:
-        col = start + tl.arange(0, BLOCK)
-        valid = (col < WIDTH) & (col < length)
-        page = tl.load(Positions + row * COLS + col // PAGE, mask=valid, other=-1)
-        logical = page * PAGE + col % PAGE
-        causal = tl.load(Causal + row)
-        score = tl.load(
-            Logits + row * STRIDE + col * COL_STRIDE, mask=valid, other=-float("inf")
+    if MASK_TAIL:
+        # Full-width selection reads the tail: initialize it, even on an empty replay.
+        _mask_block(
+            Logits,
+            Positions,
+            Causal,
+            row,
+            tl.program_id(1) * BLOCK,
+            length,
+            WIDTH,
+            STRIDE,
+            COL_STRIDE,
+            COLS,
+            PAGE,
+            INITIAL,
+            LOCAL,
+            MASK_TAIL,
+            BLOCK,
         )
-        finite = (score == score) & (tl.abs(score) != float("inf"))
-        score = tl.where(finite, score, -float("inf"))
-        forced = (logical < INITIAL) | (logical >= causal - LOCAL)
-        score = tl.where(valid & forced, float("inf"), score)
-        tl.store(
-            Logits + row * STRIDE + col * COL_STRIDE,
-            tl.where(valid, score, -float("inf")),
-            mask=(col < WIDTH) & (MASK_TAIL | valid),
-        )
+    else:
+        # Selection never reads the tail; a replay-fixed grid strides the valid prefix.
+        for start in range(
+            tl.program_id(1) * BLOCK, length, tl.num_programs(1) * BLOCK
+        ):
+            _mask_block(
+                Logits,
+                Positions,
+                Causal,
+                row,
+                start,
+                length,
+                WIDTH,
+                STRIDE,
+                COL_STRIDE,
+                COLS,
+                PAGE,
+                INITIAL,
+                LOCAL,
+                MASK_TAIL,
+                BLOCK,
+            )
+
+
+# Table columns one bounded-compaction program reads per iteration.
+_COMPACT_BLOCK = 1024
+
+
+def _launch_compact_bounded(
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    page_size: int,
+    pages: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    overflow: torch.Tensor | None,
+) -> None:
+    """Compact each row's pages into ``pages`` / ``positions`` (``[rows,
+    columns]``, zero-filled by the caller), at most ``columns`` per row."""
+    _compact_bounded[(requests.numel(),)](
+        table,
+        requests,
+        causal_lens,
+        pages,
+        positions,
+        lengths,
+        overflow,
+        table.shape[0],
+        table.shape[1],
+        table.stride(0),
+        pages.shape[1],
+        page_size,
+        _COMPACT_BLOCK,
+    )
 
 
 def compact_index_pages(
@@ -105,13 +241,49 @@ def compact_index_pages(
     requests: torch.Tensor,
     causal_lens: torch.Tensor,
     page_size: int,
+    *,
+    columns: int | None = None,
+    overflow: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return compact physical pages, logical page positions and local lengths.
 
     Inputs use one request ID and causal length per query. Table entries <= 0
     are absent pages. Outputs have fixed shapes for CUDA graph replay; lengths
     exclude invalid requests, empty shards and the unused portion of a tail.
+
+    With ``columns`` the outputs are ``[rows, columns]`` instead of the
+    table's width: a row keeps its first ``columns`` pages, its length counts
+    only their tokens, and ``overflow`` (an optional ``[rows]`` int32 output)
+    receives the number of pages it left out, zero when they all fit. One
+    binary serves every table and output width. Without ``columns`` (decode's
+    static width) the full-width kernel runs.
     """
+    if columns is not None:
+        if columns <= 0:
+            raise ValueError(f"compact index pages need columns > 0, got {columns}")
+        rows = requests.numel()
+        pages = torch.zeros((rows, columns), device=table.device, dtype=torch.int32)
+        positions = torch.zeros_like(pages)
+        lengths = torch.empty((rows, 1), device=table.device, dtype=torch.int32)
+        if overflow is not None and (
+            overflow.shape != (rows,)
+            or overflow.dtype != torch.int32
+            or not overflow.is_contiguous()
+        ):
+            raise ValueError("overflow must be a contiguous [rows] int32 tensor")
+        _launch_compact_bounded(
+            table,
+            requests,
+            causal_lens,
+            page_size,
+            pages,
+            positions,
+            lengths,
+            overflow,
+        )
+        return pages, positions, lengths
+    if overflow is not None:
+        raise ValueError("only pages compacted to columns can overflow")
     shape = (requests.numel(), table.shape[1])
     pages = torch.zeros(shape, device=table.device, dtype=torch.int32)
     positions = torch.zeros_like(pages)
@@ -132,7 +304,12 @@ def compact_index_pages(
     return pages, positions, lengths
 
 
-def mask_index_scores(
+# Scores per iteration; the prefix mask has few programs per row, so it loads wider.
+_TAIL_MASK_BLOCK = 256
+_PREFIX_MASK_BLOCK = 1024
+
+
+def _launch_mask_scores(
     logits: torch.Tensor,
     positions: torch.Tensor,
     lengths: torch.Tensor,
@@ -142,9 +319,12 @@ def mask_index_scores(
     local_tokens: int,
     *,
     mask_tail: bool,
+    programs: int,
+    block: int,
+    num_warps: int = 4,
 ) -> None:
-    """Mark mandatory windows; mask the tail only for full-width consumers."""
-    _mask_scores[(logits.shape[0], triton.cdiv(logits.shape[1], 256))](
+    """Launch ``programs`` mask programs per row, ``block`` scores at a time."""
+    _mask_scores[(logits.shape[0], programs)](
         logits,
         positions,
         lengths,
@@ -157,7 +337,43 @@ def mask_index_scores(
         initial_tokens,
         local_tokens,
         mask_tail,
-        256,
+        block,
+        num_warps=num_warps,
+    )
+
+
+def mask_index_scores(
+    logits: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    causal_lens: torch.Tensor,
+    page_size: int,
+    initial_tokens: int,
+    local_tokens: int,
+    *,
+    mask_tail: bool,
+) -> None:
+    """Mark mandatory windows; mask the tail only for full-width consumers."""
+    rows = logits.shape[0]
+    if mask_tail:
+        block = _TAIL_MASK_BLOCK
+        programs = triton.cdiv(logits.shape[1], block)
+    else:
+        # Size the grid to the device, not the width; static shapes keep replay valid.
+        block = _PREFIX_MASK_BLOCK
+        target = triton.cdiv(8 * current_platform().sm_count, max(rows, 1))
+        programs = min(max(target, 1), triton.cdiv(logits.shape[1], block))
+    _launch_mask_scores(
+        logits,
+        positions,
+        lengths,
+        causal_lens,
+        page_size,
+        initial_tokens,
+        local_tokens,
+        mask_tail=mask_tail,
+        programs=programs,
+        block=block,
     )
 
 
@@ -190,7 +406,7 @@ def _gather_candidates(
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     offset = tl.load(Offsets + row * OFFSET_STRIDE + col, mask=col < TOPK, other=-1)
     end = WIDTH
