@@ -102,24 +102,45 @@ cache_remote_wheel() {
             local tmp_path="${cache_path}.tmp.$$"
             trap 'rm -f "${tmp_path}"' EXIT
             rm -f "${cache_path}"
-            echo "Downloading ${wheel_url} to persistent cache" >&2
-            curl --fail --location --retry 5 --retry-all-errors \
-                --connect-timeout 30 --output "${tmp_path}" "${wheel_url}"
-            if [ -n "${expected_sha256}" ]; then
-                local downloaded_sha256
-                downloaded_sha256="$(sha256sum "${tmp_path}")"
-                downloaded_sha256="${downloaded_sha256%% *}"
-                if [ "${downloaded_sha256}" != "${expected_sha256}" ]; then
+            # Retry content-level failures curl cannot see: a corrupted CDN
+            # edge can answer a wheel GET with a success status and a
+            # truncated or empty body (observed 2026-11-05 for a FlashInfer
+            # GitHub release asset served to the Slurm cluster egress).
+            local max_attempts=3 attempt=1
+            local delay="${CI_WHEEL_DOWNLOAD_RETRY_DELAY:-15}"
+            while true; do
+                echo "Downloading ${wheel_url} to persistent cache" >&2
+                if curl --fail --location --retry 5 --retry-all-errors \
+                    --connect-timeout 30 --output "${tmp_path}" "${wheel_url}" \
+                    && [ -s "${tmp_path}" ]; then
+                    if [ -z "${expected_sha256}" ]; then
+                        break
+                    fi
+                    local downloaded_sha256
+                    downloaded_sha256="$(sha256sum "${tmp_path}")"
+                    downloaded_sha256="${downloaded_sha256%% *}"
+                    if [ "${downloaded_sha256}" = "${expected_sha256}" ]; then
+                        break
+                    fi
                     echo "SHA256 mismatch for ${wheel_url}: expected ${expected_sha256}, got ${downloaded_sha256}" >&2
+                else
+                    echo "Download failed or returned an empty body for ${wheel_url}" >&2
+                fi
+                if [ "${attempt}" -eq "${max_attempts}" ]; then
+                    echo "Giving up on ${wheel_url} after ${max_attempts} attempts" >&2
                     return 1
                 fi
-            fi
+                echo "Retrying in ${delay}s (attempt $((attempt + 1))/${max_attempts})..." >&2
+                sleep "${delay}"
+                attempt=$((attempt + 1))
+                delay=$((delay * 2))
+            done
             mv "${tmp_path}" "${cache_path}"
             trap - EXIT
         else
             echo "Using cached wheel ${cache_path}" >&2
         fi
-    ) 9>"${cache_path}.lock"
+    ) 9>"${cache_path}.lock" || return 1
 
     printf '%s\n' "${cache_path}"
 }
