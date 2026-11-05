@@ -186,6 +186,40 @@ class TestGetRopeDispatch:
         assert torch.equal(rope.cos_sin_cache, direct.cos_sin_cache)
         assert rope.mscale == pytest.approx((0.1 * math.log(4.0) + 1.0) * 0.9)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_deepseek_yarn(self, monkeypatch):
+        # The cache builds on the platform default device (CUDA here), so
+        # build the reference the same way; the point is that mscale and
+        # mscale_all_dim reach the constructor. Real DeepSeek checkpoints set
+        # mscale_all_dim: 1.0, far from the RopeScaling default of 0, so a
+        # dropped kwarg changes the cache numerically.
+        monkeypatch.setitem(global_server_args_dict, "yarn_ramp_mask_device", "cpu")
+        monkeypatch.setitem(global_server_args_dict, "yarn_frequency_device", "cpu")
+        rope = _get_rope(
+            {
+                "rope_type": "deepseek_yarn",
+                "factor": 40.0,
+                "original_max_position_embeddings": ORIGINAL_MAX_POSITION,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+            }
+        )
+        direct = DeepseekScalingRotaryEmbedding(
+            HEAD_SIZE,
+            ROTARY_DIM,
+            ORIGINAL_MAX_POSITION,
+            BASE,
+            True,
+            40.0,
+            torch.float32,
+            mscale=1.0,
+            mscale_all_dim=1.0,
+            ramp_device="cpu",
+            frequency_device="cpu",
+        )
+        assert type(rope) is DeepseekScalingRotaryEmbedding
+        assert torch.equal(rope.cos_sin_cache, direct.cos_sin_cache)
+
     def test_longrope(self):
         factors = {
             "rope_type": "longrope",
@@ -208,9 +242,7 @@ class TestGetRopeDispatch:
         assert torch.equal(rope.cos_sin_cache, direct.cos_sin_cache)
 
     def test_mrope_section_selects_mrotary(self):
-        rope = _get_rope(
-            {"rope_type": "default", "mrope_section": [8, 12, 12]}
-        )
+        rope = _get_rope({"rope_type": "default", "mrope_section": [8, 12, 12]})
         assert type(rope) is MRotaryEmbedding
         assert rope.mrope_section == [8, 12, 12]
         assert rope.mrope_interleaved is False
