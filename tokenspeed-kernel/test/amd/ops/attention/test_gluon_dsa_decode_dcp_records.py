@@ -195,11 +195,18 @@ def test_decode_records_match_the_dispatched_decode(tokens, degree, local_heads)
     assert records.dtype == torch.int32 and records.is_contiguous()
     assert records.shape == (degree, tokens, local_heads, 257)
     # Rows near a rank's share of the selection split less than the
-    # token-major decode; the full-width row splits as it does, bit for bit.
+    # token-major decode; the full-width row splits as it does: the same LSE,
+    # and outputs within one BF16 rounding (that decode's merge unrolls its
+    # splits).
     _assert_records_attend(records, q, cache, slots, lengths)
     _assert_records_attend(expected, q, cache, slots, lengths)
     if tokens > 2:
-        assert torch.equal(records[:, 2], expected[:, 2])
+        assert torch.equal(records[:, 2, :, 256], expected[:, 2, :, 256])
+        bits = [
+            r[:, 2, :, :256].contiguous().view(torch.int16).int()
+            for r in (records, expected)
+        ]
+        assert (bits[0] - bits[1]).abs().max() <= 1
     # The empty and all-invalid rows are zero output with a -inf LSE, as the
     # combine expects of an empty partial.
     empty = records[:, : min(tokens, 2)]
@@ -245,7 +252,7 @@ def test_decode_records_read_a_query_riding_in_a_gathered_chunk(tokens):
     assert not rider.is_contiguous()
     with assert_no_triton_compile(
         gfx950_attention._dsa_dense_mfma_kv_kernel,
-        gfx950_attention._dsa_dense_mfma_reduce_kernel,
+        gfx950_attention._dsa_dense_mfma_records_reduce_kernel,
     ):
         assert torch.equal(dsa_decode_dcp_records(q=rider, **kwargs), expected)
     # A rank stride the query's copy to LDS cannot take is copied first.
@@ -352,6 +359,7 @@ def test_decode_records_compile_once_across_tokens():
     with assert_no_triton_compile(
         gfx950_attention._dsa_dense_mfma_kv_kernel,
         gfx950_attention._dsa_dense_mfma_reduce_kernel,
+        gfx950_attention._dsa_dense_mfma_records_reduce_kernel,
     ):
         for tokens in (4, 16, 20, 48):
             run(tokens)

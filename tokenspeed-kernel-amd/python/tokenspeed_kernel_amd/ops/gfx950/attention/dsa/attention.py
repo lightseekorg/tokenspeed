@@ -1354,12 +1354,7 @@ def _dsa_sparse_prefill_fp8_kernel(
         "stride_lse_h",
         "stride_lo_t",
         "stride_lo_h",
-        "stride_o_r",
-        "stride_lo_r",
         "num_kv_splits",
-        "topk_width",
-        "tile_k",
-        "split_tiles",
     )
 )
 def _dsa_dense_mfma_reduce_kernel(
@@ -1377,60 +1372,22 @@ def _dsa_dense_mfma_reduce_kernel(
     stride_o_h,
     stride_lo_t,
     stride_lo_h,
-    # Head r * OUT_LOCAL_HEADS + h goes to out[r, token, h] and lse_out[r,
-    # token, h], as DCP records hold them; token-major outputs have
-    # OUT_LOCAL_HEADS 0 and no rank stride.
-    stride_o_r,
-    stride_lo_r,
     num_kv_splits,
-    # Records only: the core's record-shaped splits sit split stride apart
-    # from the record (their split 0), and a row ran as many splits as its
-    # live tiles fill split_tiles each.
-    topk_lens,
-    topk_width,
-    tile_k,
-    split_tiles,
     D_V: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
     STORE_LSE: tl.constexpr,
-    OUT_LOCAL_HEADS: tl.constexpr = 0,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     offs_v = tl.arange(0, D_V)
-    if OUT_LOCAL_HEADS:
-        valid_len = tl.load(topk_lens + token_idx).to(tl.int32)
-        total_tiles = tl.cdiv(tl.minimum(tl.maximum(valid_len, 0), topk_width), tile_k)
-        row_splits = tl.minimum(
-            num_kv_splits, tl.maximum(tl.cdiv(total_tiles, split_tiles), 1)
-        )
-        # The core stored a one-split row's record itself.
-        if row_splits == 1:
-            return
-        out_rank = head_idx // OUT_LOCAL_HEADS
-        out_head = head_idx % OUT_LOCAL_HEADS
-        out_base = (
-            out_rank * stride_o_r + token_idx * stride_o_t + out_head * stride_o_h
-        )
-        lse_out_base = (
-            out_rank * stride_lo_r + token_idx * stride_lo_t + out_head * stride_lo_h
-        )
-        partial_base = out_base
-        lse_base = lse_out_base
-        split_stride = stride_po_s
-    else:
-        row_splits = num_kv_splits
-        out_base = token_idx * stride_o_t + head_idx * stride_o_h
-        lse_out_base = token_idx * stride_lo_t + head_idx * stride_lo_h
-        partial_base = token_idx * stride_po_t + head_idx * stride_po_h
-        lse_base = token_idx * stride_lse_t + head_idx * stride_lse_h
-        split_stride = D_V
+    lse_base = token_idx * stride_lse_t + head_idx * stride_lse_h
+    partial_base = token_idx * stride_po_t + head_idx * stride_po_h
 
     max_lse = -float("inf")
     for split_idx in tl.static_range(MAX_SPLITS):
         split_lse = tl.load(
             partial_lse + lse_base + split_idx * stride_lse_s,
-            mask=split_idx < row_splits,
+            mask=split_idx < num_kv_splits,
             other=-float("inf"),
         )
         max_lse = tl.maximum(max_lse, split_lse)
@@ -1439,7 +1396,7 @@ def _dsa_dense_mfma_reduce_kernel(
     acc = tl.zeros([D_V], dtype=tl.float32)
     safe_max_lse = tl.where(max_lse > -float("inf"), max_lse, 0.0)
     for split_idx in tl.static_range(MAX_SPLITS):
-        live = split_idx < row_splits
+        live = split_idx < num_kv_splits
         split_lse = tl.load(
             partial_lse + lse_base + split_idx * stride_lse_s,
             mask=live,
@@ -1449,7 +1406,7 @@ def _dsa_dense_mfma_reduce_kernel(
         safe_split_lse = tl.where(split_valid, split_lse, 0.0)
         weight = tl.where(split_valid, tl.exp(safe_split_lse - safe_max_lse), 0.0)
         partial = tl.load(
-            partial_out + partial_base + split_idx * split_stride + offs_v,
+            partial_out + partial_base + split_idx * D_V + offs_v,
             mask=live,
             other=0.0,
         ).to(tl.float32)
@@ -1458,12 +1415,111 @@ def _dsa_dense_mfma_reduce_kernel(
 
     safe_denom = tl.where(denom > 0.0, denom, 1.0)
     result = tl.where(denom > 0.0, acc / safe_denom, 0.0)
-    tl.store(out + out_base + offs_v, result)
+    tl.store(out + token_idx * stride_o_t + head_idx * stride_o_h + offs_v, result)
     if STORE_LSE:
         tl.store(
-            lse_out + lse_out_base,
+            lse_out + token_idx * stride_lo_t + head_idx * stride_lo_h,
             tl.where(denom > 0.0, safe_max_lse + tl.log(safe_denom), -float("inf")),
         )
+
+
+@triton.jit(
+    do_not_specialize=(
+        "stride_s",
+        "stride_r",
+        "stride_t",
+        "stride_h",
+        "stride_lse_s",
+        "stride_lse_r",
+        "stride_lse_t",
+        "stride_lse_h",
+        "num_kv_splits",
+        "topk_width",
+        "tile_k",
+        "split_tiles",
+    )
+)
+def _dsa_dense_mfma_records_reduce_kernel(
+    records,
+    records_lse,
+    topk_lens,
+    # Split s of head r * LOCAL_HEADS + h sits at records[s, r, token, h]
+    # (its LSE likewise); split 0 is the record, which the merge overwrites.
+    stride_s,
+    stride_r,
+    stride_t,
+    stride_h,
+    stride_lse_s,
+    stride_lse_r,
+    stride_lse_t,
+    stride_lse_h,
+    num_heads,
+    # A row ran as many splits as its live tiles fill split_tiles each, at
+    # most num_kv_splits; the core stored a one-split row's record itself.
+    num_kv_splits,
+    topk_width,
+    tile_k,
+    split_tiles,
+    LOCAL_HEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_V: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    valid_len = tl.load(topk_lens + token_idx).to(tl.int32)
+    total_tiles = tl.cdiv(tl.minimum(tl.maximum(valid_len, 0), topk_width), tile_k)
+    row_splits = tl.minimum(
+        num_kv_splits, tl.maximum(tl.cdiv(total_tiles, split_tiles), 1)
+    )
+    if row_splits == 1:
+        return
+    offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < num_heads
+    rank = offs_h // LOCAL_HEADS
+    head = offs_h % LOCAL_HEADS
+    base = rank * stride_r + token_idx * stride_t + head * stride_h
+    lse_base = rank * stride_lse_r + token_idx * stride_lse_t + head * stride_lse_h
+    offs_v = tl.arange(0, D_V)
+
+    max_lse = tl.full([BLOCK_H], -float("inf"), dtype=tl.float32)
+    for split_idx in range(row_splits):
+        split_lse = tl.load(
+            records_lse + lse_base + split_idx * stride_lse_s,
+            mask=mask_h,
+            other=-float("inf"),
+        )
+        max_lse = tl.maximum(max_lse, split_lse)
+
+    denom = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, D_V], dtype=tl.float32)
+    safe_max_lse = tl.where(max_lse > -float("inf"), max_lse, 0.0)
+    for split_idx in range(row_splits):
+        split_lse = tl.load(
+            records_lse + lse_base + split_idx * stride_lse_s,
+            mask=mask_h,
+            other=-float("inf"),
+        )
+        split_valid = split_lse > -float("inf")
+        safe_split_lse = tl.where(split_valid, split_lse, 0.0)
+        weight = tl.where(split_valid, tl.exp(safe_split_lse - safe_max_lse), 0.0)
+        partial = tl.load(
+            records + base[:, None] + split_idx * stride_s + offs_v[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc += weight[:, None] * partial
+        denom += weight
+
+    safe_denom = tl.where(denom > 0.0, denom, 1.0)
+    result = tl.where(denom[:, None] > 0.0, acc / safe_denom[:, None], 0.0)
+    # The merge overwrites split 0 in place, and every warp reads its LSE: no
+    # warp may store before all have loaded.
+    tl.debug_barrier()
+    tl.store(records + base[:, None] + offs_v[None, :], result, mask=mask_h[:, None])
+    tl.store(
+        records_lse + lse_base,
+        tl.where(denom > 0.0, safe_max_lse + tl.log(safe_denom), -float("inf")),
+        mask=mask_h,
+    )
 
 
 @gluon.jit
@@ -1825,9 +1881,35 @@ def _select_num_kv_splits(
 # Each split of a KVP decode's records row runs at least this many of its live
 # key tiles. A rank owns about an eighth of each row's top-k, which the
 # launch's split count, sized for full rows, would spread a tile or less per
-# split; a row with this many tiles per launch split splits as the
-# token-major decode does.
+# split.
 _RECORDS_MIN_SPLIT_TILES = 2
+# Heads one program of the records reduction merges: few enough that a small
+# launch's split rows spread over the CUs, enough that a large launch of
+# one-split rows exits in few programs.
+_RECORDS_REDUCE_HEADS = 2
+
+
+def _records_split_tiles(
+    *, tokens: int, heads: int, ranks: int, topk: int, tile_k: int, num_kv_splits: int
+) -> int:
+    """Live key tiles per split of a KVP decode's records rows.
+
+    A row of a rank's typical share (``topk / ranks`` keys) splits only while
+    the launch's rows and head groups fill under three quarters of the CUs,
+    into as many parts as reach that; longer rows split proportionally more,
+    and a full-width row into all ``num_kv_splits``. Splitting a launch that
+    already fills the CUs only adds the reduction: on MI350X, 32 to 64 rows
+    of 96 heads and 256 keys take 20-25 us unsplit against 29-37 us in two
+    splits.
+    """
+    typical_tiles = triton.cdiv(triton.cdiv(topk, ranks), tile_k)
+    base_ctas = tokens * triton.cdiv(heads, 16)
+    splits = max(1, _GFX950_COMPUTE_UNITS * 3 // 4 // base_ctas)
+    full_row = triton.cdiv(topk, tile_k) // num_kv_splits
+    return max(
+        _RECORDS_MIN_SPLIT_TILES,
+        min(triton.cdiv(typical_tiles, splits), full_row),
+    )
 
 
 def _trim_topk_slots_for_context(
@@ -1983,7 +2065,14 @@ def _launch_dense_kv(
     split_tiles = 1
     stride_o_r = stride_lse_r = 0
     if records:
-        split_tiles = _RECORDS_MIN_SPLIT_TILES
+        split_tiles = _records_split_tiles(
+            tokens=tokens,
+            heads=heads,
+            ranks=ranks,
+            topk=topk_slots.shape[1],
+            tile_k=tile_k,
+            num_kv_splits=num_kv_splits,
+        )
         # One record-shaped plane per split; split 0 is the records, which a
         # one-split row writes directly and the reduction overwrites.
         planes = (num_kv_splits, ranks, tokens, q_local_heads, kv_lora_rank // 2 + 1)
@@ -2091,46 +2180,52 @@ def _launch_dense_kv(
             # Unbounded SLP splits the in-loop KV prefetch around an LDS wait.
             llvm_cl_opts="slp-schedule-budget=100",
         )
-    if num_kv_splits > 1:
-        if records:
-            # The splits merge into their split 0, the records.
-            reduced, reduced_lse, out_local_heads = (
-                stage_out,
-                partial_lse,
-                q_local_heads,
-            )
-            partial_strides = (stride_o_t, stride_o_h, stride_o_s)
-            out_strides = (stride_o_r, stride_o_t, stride_o_h)
-            lse_strides = (stride_lse_r, stride_lse_t, stride_lse_h)
-        else:
-            reduced, reduced_lse, out_local_heads = out, lse, 0
-            partial_strides = stage_out.stride()[:3]
-            out_strides = (0, out.stride(0), out.stride(1))
-            lse_strides = (0, 0, 0) if lse is None else (0, *lse.stride())
-        _dsa_dense_mfma_reduce_kernel[(tokens, heads)](
+    if num_kv_splits > 1 and records:
+        # The splits merge into their split 0, the records.
+        _dsa_dense_mfma_records_reduce_kernel[
+            (tokens, triton.cdiv(heads, _RECORDS_REDUCE_HEADS))
+        ](
             stage_out,
             partial_lse,
-            reduced,
-            reduced if reduced_lse is None else reduced_lse,
-            *partial_strides,
+            topk_lens,
+            stride_o_s,
+            stride_o_r,
+            stride_o_t,
+            stride_o_h,
+            stride_lse_s,
+            stride_lse_r,
             stride_lse_t,
             stride_lse_h,
-            stride_lse_s,
-            out_strides[1],
-            out_strides[2],
-            lse_strides[1],
-            lse_strides[2],
-            out_strides[0],
-            lse_strides[0],
+            heads,
             num_kv_splits,
-            topk_lens,
             topk_slots.shape[1],
             tile_k,
             split_tiles,
+            LOCAL_HEADS=q_local_heads,
+            BLOCK_H=_RECORDS_REDUCE_HEADS,
+            D_V=kv_lora_rank,
+            num_warps=4,
+        )
+    elif num_kv_splits > 1:
+        _dsa_dense_mfma_reduce_kernel[(tokens, heads)](
+            stage_out,
+            partial_lse,
+            out,
+            out if lse is None else lse,
+            stage_out.stride(0),
+            stage_out.stride(1),
+            stage_out.stride(2),
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+            out.stride(0),
+            out.stride(1),
+            0 if lse is None else lse.stride(0),
+            0 if lse is None else lse.stride(1),
+            num_kv_splits,
             D_V=kv_lora_rank,
             MAX_SPLITS=triton.next_power_of_2(num_kv_splits),
-            STORE_LSE=reduced_lse is not None,
-            OUT_LOCAL_HEADS=out_local_heads,
+            STORE_LSE=lse is not None,
             num_warps=4,
         )
     return workspace[0] if records else out
@@ -2450,10 +2545,11 @@ def launch_gluon_dsa_decode_dcp_records_gfx950(
     KVP gather's rank-major query ``[ranks, tokens, local_heads, dim]``,
     returning the DCP records ``[ranks, tokens, local_heads, kv_lora_rank /
     2 + 1]`` (int32) that ``dispatch_dcp_attention_partials`` packs from its
-    output and LSE. A row runs at most as many key splits as give each two of
-    its live tiles: a short one, as one of about its rank's share of the
-    selection in a small launch, runs fewer splits than that decode (and may
-    round differently), a longer one the same splits, bit for bit. The ranks
+    output and LSE. A row runs at most as many key splits as its live tiles
+    fill with :func:`_records_split_tiles` each: a short one, as one of about
+    its rank's share of the selection, runs fewer splits than that decode
+    (and may round differently), one filling them all the same splits: the
+    same LSE, and outputs within one BF16 rounding. The ranks
     may lie further apart than their contiguous rows, as when the query
     rides in a larger gathered chunk; other layouts, and rank strides or
     bases the query's copy to LDS cannot take, are copied first. A flat
