@@ -738,3 +738,155 @@ def test_rank_major_core_matches_packed_partials(tmp_path, use_pynccl):
         nprocs=2,
         join=True,
     )
+
+
+def _decode_records_leaf(dsa, group, rank, requests, records_core):
+    """The DSA leaf's head-sharded KVP decode state on an FP8 cache, verifying
+    K3.1's 4 rows per request (the 3.1 drafter's three tokens)."""
+    from types import SimpleNamespace
+
+    leaf = object.__new__(dsa.DSABackend)
+    leaf.kernel_page_size = 64
+    leaf.kernel_solution = None
+    leaf.decode_kernel_plan = None
+    leaf.slot_order = "selection"
+    leaf.data_type = torch.float8_e4m3fn
+    leaf.kv_lora_rank = 512
+    leaf.qk_nope_head_dim = 128
+    leaf.qk_rope_head_dim = 64
+    leaf.index_topk = _RECORDS_TOPK
+    leaf.max_context_len = _records_virtual_blocks(len(group)) * _RECORDS_BLOCK
+    leaf.kvp_group = group
+    leaf.kvp_rank = rank
+    leaf.kvp_block_granularity = _RECORDS_BLOCK
+    leaf.kvp_virtual_block_count = _records_virtual_blocks(len(group))
+    leaf.num_attention_heads = _RECORDS_HEADS * len(group)
+    leaf.num_local_heads = _RECORDS_HEADS
+    leaf.is_draft = False
+    leaf.spec_num_tokens = 4
+    # configure_runtime's probe on gfx950
+    # (test_dcp_decode_records_core_on_the_real_k31_selection), or its
+    # verdict where another core decodes.
+    leaf._dcp_decode_records_core = records_core
+    leaf._dense_backend = SimpleNamespace(
+        forward_decode_metadata=SimpleNamespace(
+            num_extends=0,
+            seq_lens_k=torch.full(
+                (requests,), leaf.max_context_len, dtype=torch.int32, device="cuda"
+            ),
+            max_seq_len_k=leaf.max_context_len,
+            _dsa_kv_seq_lens=None,
+        )
+    )
+    return leaf
+
+
+def _decode_records_worker(rank, degree, rendezvous, use_pynccl):
+    torch.set_num_threads(1)
+    torch.cuda.set_device(rank)
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=degree,
+        device_id=device,
+        timeout=timedelta(seconds=90),
+    )
+    try:
+        group = tuple(range(degree))
+        coordination = dist.new_group(backend="gloo", timeout=timedelta(seconds=90))
+        process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
+        process_group_manager.register_process_group("gloo", group, coordination)
+        backend = AutoBackend()
+        backend.configure(use_pynccl=use_pynccl)
+        set_global_backend(backend)
+        communicator = backend.nccl._get_or_create_resources(group)["pynccl_comm"]
+        context = (
+            communicator.change_state(
+                enable=True, stream=torch.cuda.current_stream(device)
+            )
+            if use_pynccl
+            else nullcontext()
+        )
+        # The records arm must run, not only agree: count its core's launches.
+        records_core = dsa.dsa_decode_dcp_records
+        launches = []
+
+        def counted_records_core(**kwargs):
+            launches.append(tuple(kwargs["q"].shape))
+            return records_core(**kwargs)
+
+        dsa.dsa_decode_dcp_records = counted_records_core
+        cache = _records_cache(degree, rank, device)
+        pool = SimpleNamespace(quant_method=None, get_key_buffer=lambda layer_id: cache)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=_RECORDS_HEADS,
+            head_dim=576,
+            v_head_dim=512,
+            scaling=192**-0.5,
+            logit_cap=0.0,
+        )
+        with context:
+            # 4 and 16 requests reach the records core; 128 requests' rows
+            # fill the gfx950 core's grid without splitting its keys, so the
+            # decode keeps the packed partials.
+            for requests, records_arm in ((16, True), (4, True), (128, False)):
+                tokens = requests * 4
+                slots, lengths = _records_selection(degree, tokens, device)
+                generator = torch.Generator().manual_seed(900 + rank)
+                q = torch.randn((tokens, _RECORDS_HEADS, 576), generator=generator)
+                q = q.to(device=device, dtype=torch.bfloat16)
+                outputs = []
+                for probed in (False, True):
+                    launches.clear()
+                    leaf = _decode_records_leaf(dsa, group, rank, requests, probed)
+                    outputs.append(
+                        leaf.forward_sparse_decode(
+                            q=q,
+                            layer=layer,
+                            token_to_kv_pool=pool,
+                            bs=requests,
+                            topk_indices=slots,
+                            topk_lens=lengths,
+                        )
+                    )
+                    ran = probed and records_arm
+                    shape = (degree, tokens, _RECORDS_HEADS, 576)
+                    assert launches == ([shape] if ran else [])
+                off, on = outputs
+                assert off.shape == (tokens, _RECORDS_HEADS * 512)
+                # Bit for bit, signed zeros included.
+                assert torch.equal(off.view(torch.int16), on.view(torch.int16))
+                assert not off[0].any()
+        torch.cuda.synchronize()
+        dist.barrier(group=coordination)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("degree,use_pynccl", [(2, False), (2, True), (8, True)])
+def test_rank_major_decode_core_matches_packed_partials(tmp_path, degree, use_pynccl):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
+        pytest.skip(f"requires {degree} GPUs")
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+    platform = current_platform()
+    if not platform.is_amd or platform.arch_version != ArchVersion(9, 5):
+        pytest.skip("the DSA decode records core registers on AMD gfx950 GPUs")
+    mp.spawn(
+        _decode_records_worker,
+        args=(degree, f"file://{tmp_path / 'rendezvous'}", use_pynccl),
+        nprocs=degree,
+        join=True,
+    )

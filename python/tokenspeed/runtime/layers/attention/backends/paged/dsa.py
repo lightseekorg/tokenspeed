@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
+    dsa_decode_dcp_records,
+    dsa_decode_dcp_records_supported,
     dsa_plan,
     dsa_prefill,
     dsa_prefill_dcp_records,
@@ -354,6 +356,9 @@ class DSABackend(PagedAttentionBackend):
         self._dcp_records_core: bool = False
         # Whether that selection runs the trtllm-gen core, which takes a padded query.
         self._dcp_padded_query: bool = False
+        # Whether every KVP decode selection runs gfx950's dense core on an
+        # FP8 cache, whose DCP records form the head-sharded decode runs.
+        self._dcp_decode_records_core: bool = False
         self._prefill_page_table: torch.Tensor | None = None
         # Owned KVP index-tile width in kernel pages; None means the page table's width.
         self._prefill_index_columns: int | None = None
@@ -441,6 +446,7 @@ class DSABackend(PagedAttentionBackend):
         # Probed here: a router's solution pin lands after construction.
         self._dcp_records_core = self._probe_dcp_records_core()
         self._dcp_padded_query = self._probe_dcp_padded_query()
+        self._dcp_decode_records_core = self._probe_dcp_decode_records_core()
         self._log_sparse_leaves()
         self._reserve_trtllm_sparse_buffers()
 
@@ -556,6 +562,46 @@ class DSABackend(PagedAttentionBackend):
                 return False
             return core.name == "flashinfer_trtllm_dsa_prefill"
         return False
+
+    def _probe_dcp_decode_records_core(self) -> bool:
+        """Whether the head-sharded KVP decode may run the DCP records core.
+
+        ``dsa_decode_dcp_records`` is gfx950's dense ``dsa_decode`` core
+        reading the rank-major gather, its split reduction writing the
+        partials exchange's records, so it stands in only where every decode
+        selection the forward makes (``_sparse_leaf_probes``: one row per
+        request and the verify rows) picks ``gluon_dsa_decode_gfx950``
+        without a plan, and where the records op selects for the same inputs.
+        An FP8 cache only, as :meth:`_probe_dcp_records_core`. Boot
+        configuration only, so every rank of the group agrees.
+        """
+        if (
+            len(self.kvp_group) <= 1
+            or self.decode_kernel_plan is not None
+            or self.data_type != torch.float8_e4m3fn
+            or current_platform().is_npu
+        ):
+            return False
+        decodes = [
+            probe for probe in self._sparse_leaf_probes() if probe[1] == "dsa_decode"
+        ]
+        for _, mode, signature, traits, solution, _ in decodes:
+            try:
+                core = select_kernel(
+                    "attention", mode, signature, traits=traits, solution=solution
+                )
+                select_kernel(
+                    "attention",
+                    "dsa_decode_dcp_records",
+                    signature,
+                    traits=traits,
+                    solution=solution,
+                )
+            except NoKernelFoundError:
+                return False
+            if core.name != "gluon_dsa_decode_gfx950":
+                return False
+        return bool(decodes)
 
     def _sparse_leaf_probes(self) -> list[tuple]:
         """The sparse selections this leaf's forward makes, as ``(label, mode,
@@ -1931,6 +1977,30 @@ class DSABackend(PagedAttentionBackend):
                 topk_slots, topk_lens = compact_owned_cache_slots(
                     topk_slots, topk_lens, self.cache_placement(layer)
                 )
+            # Decided before the query gather, from boot configuration and
+            # host sizes every rank of the group shares.
+            if (
+                not keep_all_heads
+                and self._dcp_decode_records_core
+                and dsa_decode_dcp_records_supported(
+                    tokens=num_tokens,
+                    heads=heads * len(self.kvp_group),
+                    topk=topk_slots.shape[1],
+                    q_dtype=q_view.dtype,
+                    kv_dtype=kv_cache.dtype,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                )
+            ):
+                out = self._forward_dcp_records_decode(
+                    q_view=q_view,
+                    layer=layer,
+                    kv_cache=kv_cache,
+                    topk_slots=topk_slots,
+                    topk_lens=topk_lens,
+                    q_len_per_req=q_len_per_req,
+                )
+                return out.reshape(-1, heads * layer.v_head_dim)
             if not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(
@@ -1967,6 +2037,47 @@ class DSABackend(PagedAttentionBackend):
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             )
         return out.reshape(-1, heads * layer.v_head_dim)
+
+    def _forward_dcp_records_decode(
+        self,
+        *,
+        q_view: torch.Tensor,
+        layer,
+        kv_cache: torch.Tensor,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor,
+        q_len_per_req: int,
+    ) -> torch.Tensor:
+        """The head-sharded KVP decode as :meth:`_forward_dcp_records_prefill`
+        runs the prefill: the same core and exchange as ``dsa_decode`` plus
+        ``combine_attention_partials``, bit for bit, without the relayout of
+        the gathered heads or the repack of the partials."""
+        records = dsa_decode_dcp_records(
+            q=gather_query_heads_rank_major(q_view, self.kvp_group),
+            kv_cache=kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            softmax_scale=layer.scaling,
+            page_size=self.kernel_page_size,
+            q_len_per_req=q_len_per_req,
+            logit_cap=layer.logit_cap,
+            k_scale=1.0,
+            solution=self.kernel_solution,
+            slot_order=self.slot_order,
+        )
+        # The core writes BF16 partials for its FP8 query, and the combine
+        # keeps their dtype: the BF16 output the other arm casts to.
+        return combine_attention_records(
+            records,
+            group=self.kvp_group,
+            head_dim=self.kv_lora_rank,
+            partial_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            sink=None,
+        )
 
 
 if not current_platform().is_npu:

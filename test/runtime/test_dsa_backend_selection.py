@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -198,6 +198,7 @@ _K31_SPARSE_LEAF = dict(
     kvp_prefill_query_layout=False,
     _dcp_records_core=False,
     _dcp_padded_query=False,
+    _dcp_decode_records_core=False,
 )
 
 
@@ -729,6 +730,81 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
     assert solution == "triton"
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "gfx950",
+        "verify_other_core",
+        "other_core",
+        "no_records_leaf",
+        "planned",
+        "no_kvp",
+        "bf16_cache",
+    ],
+)
+def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, case):
+    """The decode records core stands in for gfx950's dense decode core only,
+    and only where both decode selections pick it: one row per request and
+    the verify rows.
+
+    configure_runtime asks each LSE decode selection (an FP8 query on the FP8
+    cache) and the records op for the same inputs. A planned decode keeps its
+    core, a leaf without KVP runs no head-sharded decode and a BF16 cache's
+    query keeps the ordinary gather, so none of them asks.
+    """
+    dsa = backends.dsa
+    backend, _ = _sparse_leaf_backend(
+        monkeypatch,
+        data_type=torch.bfloat16 if case == "bf16_cache" else torch.float8_e4m3fn,
+        kvp_group=(0,) if case == "no_kvp" else (0, 1, 2, 3),
+        decode_kernel_plan=_plan("planned_decode", []) if case == "planned" else None,
+    )
+    calls = []
+
+    def select(family, mode, signature, *, traits, solution):
+        assert family == "attention"
+        calls.append((mode, signature, traits, solution))
+        if mode == "dsa_decode":
+            other = case == "other_core" or (
+                case == "verify_other_core" and traits["q_len"] > 1
+            )
+            return SimpleNamespace(
+                name="triton_dsa_decode" if other else "gluon_dsa_decode_gfx950"
+            )
+        if mode == "dsa_decode_dcp_records" and case == "no_records_leaf":
+            raise NoKernelFoundError("no records leaf")
+        return SimpleNamespace(name=f"fake_{mode}")
+
+    monkeypatch.setattr(dsa, "select_kernel", select)
+    backend.configure_runtime(
+        block_granularity=128,
+        virtual_block_count=17,
+        shard_count=len(backend.kvp_group),
+    )
+    assert backend._dcp_decode_records_core is (case == "gfx950")
+    records = [call for call in calls if call[0] == "dsa_decode_dcp_records"]
+    if case in ("planned", "no_kvp", "bf16_cache"):
+        assert not records
+        return
+    if case != "gfx950":
+        return
+    # The probe runs before the startup log, and asks the records op what it
+    # asked each decode selection.
+    decodes = [call for call in calls if call[0].startswith("dsa_decode")][:4]
+    assert [mode for mode, *_ in decodes] == [
+        "dsa_decode",
+        "dsa_decode_dcp_records",
+    ] * 2
+    assert records[:2] == decodes[1::2]
+    for core, records_call in zip(decodes[::2], decodes[1::2]):
+        assert core[1:] == records_call[1:]
+    assert [traits["q_len"] for _, _, traits, _ in decodes[::2]] == [1, 8]
+    _, signature, traits, solution = decodes[0]
+    assert signature == format_signature(q=dense_tensor_format(torch.float8_e4m3fn))
+    assert traits["return_lse"] is True and traits["topk"] == 2048
+    assert solution is None
+
+
 @pytest.mark.parametrize("kvp", [1, 8])
 def test_trtllm_sparse_buffers_are_reserved_before_any_forward(monkeypatch, kvp):
     """configure_runtime reserves the trtllm-gen cores' persistent buffers for
@@ -804,3 +880,32 @@ def test_dcp_records_core_on_the_real_k31_selection(monkeypatch, solution):
     )
     # Where trtllm-gen runs the 96 gathered heads, as 128, qlayout pads them.
     assert backend._dcp_padded_query is (solution is None and trtllm_outranks)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform().is_amd
+    or current_platform().arch_version != ArchVersion(9, 5),
+    reason="the gfx950 DSA decode core registers on AMD gfx950 GPUs",
+)
+@pytest.mark.parametrize("solution", [None, "gluon", "triton"])
+def test_dcp_decode_records_core_on_the_real_k31_selection(monkeypatch, solution):
+    # K3.1's FP8 cache at KVP8 with its 4 verify rows (the 3.1 drafter's three
+    # tokens) against the real registry: gfx950's dense core decodes both
+    # widths, so the records core stands in unless another solution is pinned.
+    dsa = backends.dsa
+    backend = object.__new__(dsa.DSABackend)
+    values = dict(
+        _K31_SPARSE_LEAF,
+        data_type=torch.float8_e4m3fn,
+        kvp_group=tuple(range(8)),
+        kernel_solution=solution,
+        spec_num_tokens=4,
+    )
+    for name, value in values.items():
+        setattr(backend, name, value)
+    monkeypatch.setattr(dsa, "_LOGGED_SPARSE_LEAVES", set())
+    backend.configure_runtime(
+        block_granularity=128, virtual_block_count=17, shard_count=8
+    )
+    assert backend._dcp_decode_records_core is (solution != "triton")
