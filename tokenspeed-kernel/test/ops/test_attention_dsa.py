@@ -33,12 +33,18 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_topk,
     dsa_plan,
     dsa_prefill,
+    dsa_prefill_dcp_records,
+    dsa_prefill_dcp_records_supported,
     dsa_prefill_topk,
 )
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
+from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
+    dispatch_dcp_attention_partials,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import current_platform
 
 torch.manual_seed(42)
 
@@ -143,7 +149,7 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
     _assert_topk_sets_match(topk_slots, topk_lens, expected, expected_lens)
 
 
-@pytest.mark.parametrize("q_len_per_req", [2, 4])
+@pytest.mark.parametrize("q_len_per_req", [2, 4, 7, 8])
 def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> None:
     """Per-request (MTP) decode: seq_lens/block_table are per-request and the
     kernel derives each token's causal bound seq_lens[req] - (q-1) + j."""
@@ -306,6 +312,29 @@ def test_dsa_workspace_topk_to_global_slots(device: str) -> None:
     )
     assert slots.data_ptr() == out.data_ptr()
     torch.testing.assert_close(slots.cpu(), expected.cpu())
+
+
+def test_dsa_workspace_conversion_reads_unsigned_int16_indices(device: str) -> None:
+    rows = 65534
+    kv_workspace_slots = torch.arange(rows, device=device, dtype=torch.int64) * 7 + 3
+    indices = torch.tensor(
+        [[0, 1, 32767, 32768, 40000, 65533, -1]], device=device, dtype=torch.int32
+    )
+
+    actual = dsa_workspace_topk_to_global_slots(
+        workspace_indices=indices.to(torch.int16),
+        kv_workspace_slots=kv_workspace_slots,
+    )
+
+    expected = kv_workspace_slots[indices.clamp_min(0).long()].to(torch.int32)
+    expected.masked_fill_(indices < 0, -1)
+    assert actual.dtype == torch.int32
+    torch.testing.assert_close(actual, expected)
+    with pytest.raises(ValueError, match="fewer than 65535"):
+        dsa_workspace_topk_to_global_slots(
+            workspace_indices=indices.to(torch.int16),
+            kv_workspace_slots=torch.zeros(65535, device=device, dtype=torch.int64),
+        )
 
 
 @pytest.mark.parametrize("total", [1, 255, 256, 257, 513])
@@ -1037,6 +1066,141 @@ def test_deep_gemm_index_candidates_empty_shard_large_batch(device, tokens):
     assert torch.isneginf(scores).all()
 
 
+def _by_offset(
+    candidates: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Candidate order is unspecified; offsets are unique but -1 padding, scored -inf.
+    offsets, scores = candidates
+    order = offsets.argsort(dim=1, stable=True)
+    return offsets.gather(1, order), scores.gather(1, order)
+
+
+def test_deep_gemm_index_candidates_precomputed_pages(device):
+    from tokenspeed_kernel.ops.attention.dsa import (
+        DSAIndexCandidatePages,
+        dsa_index_candidates,
+        plan_dsa_index_candidates,
+    )
+    from tokenspeed_kernel.platform import current_platform
+
+    if not torch.cuda.is_available() or not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
+    torch.manual_seed(829)
+    heads, page_size = 32, 64
+    # Scrambled page order, absent pages, partial tails, unknown request, empty row.
+    table = torch.tensor(
+        [[5, -1, 8, 1, 6, 3, 4, -1, 9, 2], [7, 10, -1, -1, -1, -1, -1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    requests = torch.tensor(
+        [0, 0, 0, 1, 1, -1, 0, 1, 0], dtype=torch.int32, device=device
+    )
+    lens = torch.tensor(
+        [640, 13, 575, 128, 70, 64, 0, 1, 600], dtype=torch.int32, device=device
+    )
+    rows = requests.numel()
+    q = torch.randn(rows, heads, 128, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(rows, heads, device=device)
+    cache, _ = _pack_index_k_cache(
+        torch.randn(11 * page_size, 128, device=device), page_size
+    )
+    kwargs = dict(
+        page_size=page_size,
+        topk=512,
+        softmax_scale=0.1,
+        initial_tokens=4,
+        local_tokens=8,
+        solution=None,
+    )
+
+    def plan():
+        return plan_dsa_index_candidates(
+            q, weights, cache, table, requests, lens, page_size=page_size
+        )
+
+    def candidates(start, end, pages=None):
+        return dsa_index_candidates(
+            q[start:end],
+            weights[start:end],
+            cache,
+            table,
+            requests[start:end],
+            lens[start:end],
+            pages=None if pages is None else pages.rows(start, end),
+            **kwargs,
+        )
+
+    # The portable leaf compacts per call and declares no pages.
+    assert (
+        plan_dsa_index_candidates(
+            q, weights, cache, table, requests, lens, page_size=64, solution="triton"
+        )
+        is None
+    )
+    tiles = ((0, rows), (0, 4), (4, rows))
+    pages = plan()
+    assert pages is not None and pages.kernel == "deep_gemm_dsa_index_candidates"
+    assert pages.pages.shape == pages.positions.shape == (rows, table.shape[1])
+    for start, end in tiles:
+        planned = _by_offset(candidates(start, end, pages))
+        inline = _by_offset(candidates(start, end))
+        for actual, expected in zip(planned, inline, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    foreign = DSAIndexCandidatePages(
+        "triton_dsa_sharded_index_candidates",
+        pages.pages,
+        pages.positions,
+        pages.lengths,
+    )
+    with pytest.raises(ValueError, match="planned for"):
+        dsa_index_candidates(
+            q, weights, cache, table, requests, lens, pages=foreign, **kwargs
+        )
+    with pytest.raises(ValueError, match="rows x columns"):
+        dsa_index_candidates(
+            q[:4],
+            weights[:4],
+            cache,
+            table,
+            requests[:4],
+            lens[:4],
+            pages=pages.rows(0, 5),
+            **kwargs,
+        )
+    with pytest.raises(ValueError, match="rows x columns"):
+        dsa_index_candidates(
+            q,
+            weights,
+            cache,
+            torch.nn.functional.pad(table, (0, 1), value=-1),
+            requests,
+            lens,
+            pages=pages,
+            **kwargs,
+        )
+
+    # Two calls read one captured plan, like decode indexer layers; replay refreshes it.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = plan()
+        first = candidates(*tiles[1], captured)
+        second = candidates(*tiles[2], captured)
+    lens.copy_(torch.tensor([129, 600, 0, 70, 128, 1, 13, 64, 575], dtype=torch.int32))
+    table[0].copy_(table[0].flip(0))
+    table[1, 2] = 3
+    graph.replay()
+    eager = plan()
+    for (start, end), captured_tile in zip(tiles[1:], (first, second), strict=True):
+        expected = _by_offset(candidates(start, end))
+        for actual, reference in zip(_by_offset(captured_tile), expected, strict=True):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        torch.testing.assert_close(
+            captured.rows(start, end).lengths, eager.rows(start, end).lengths
+        )
+
+
 def test_gather_index_candidates_matches_tensor_reference(device):
     from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
         gather_index_candidates,
@@ -1251,6 +1415,160 @@ def test_dsa_strided_pages_are_read_in_place(dtype, channel_stride, monkeypatch)
         torch.testing.assert_close(lse[row], logits.logsumexp(-1), atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(out, out2)
     torch.testing.assert_close(lse, lse2)
+
+
+# K3.1 under KVP: FP8 576-wide rows on 64-token pages; a rank owns ~256 of 2048 slots.
+_RECORDS_PAGES = 64
+_RECORDS_TOPK = 2048
+_RECORDS_SCALE = 192**-0.5
+
+
+def _records_inputs(tokens, degree, local_heads, *, seed):
+    """Every rank's FP8 query heads ``[degree, tokens, local_heads, 576]``, a
+    paged FP8 cache and one rank's compacted selection: an empty row, an
+    all-invalid live row, a full-width row, a NaN query head, ``-1`` holes
+    inside live prefixes and stale slots past every length."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    slots_count = _RECORDS_PAGES * 64
+    cache = torch.randn(
+        (_RECORDS_PAGES, 64, 1, 576),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).to(torch.float8_e4m3fn)
+    q = torch.randn(
+        (degree, tokens, local_heads, 576),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).to(torch.float8_e4m3fn)
+    # FP8 E4M3 NaN: every key of that head scores NaN.
+    q.view(torch.uint8)[degree - 1, 3, local_heads - 1, 7] = 0x7F
+    slots = torch.randint(
+        0,
+        slots_count,
+        (tokens, _RECORDS_TOPK),
+        device="cuda",
+        dtype=torch.int32,
+        generator=generator,
+    )
+    lengths = torch.randint(
+        0, 320, (tokens,), device="cuda", dtype=torch.int32, generator=generator
+    )
+    lengths[:4] = torch.tensor([0, 5, _RECORDS_TOPK, 64], device="cuda")
+    slots[1, :5] = -1
+    slots[4::7, ::5] = -1
+    return q, cache, slots, lengths
+
+
+def _token_major(q):
+    """The rank-major gather as ``gather_query_heads`` lays it out: head
+    ``r * local_heads + h`` of every token. Copied as bytes."""
+    degree, tokens, local_heads, dim = q.shape
+    return (
+        q.view(torch.uint8)
+        .permute(1, 0, 2, 3)
+        .reshape(tokens, degree * local_heads, dim)
+        .view(q.dtype)
+    )
+
+
+def _records_kwargs(cache, slots, lengths):
+    return dict(
+        kv_cache=cache,
+        topk_slots=slots,
+        topk_lens=lengths,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=_RECORDS_SCALE,
+        page_size=64,
+        solution="triton",
+        slot_order="selection",
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "tokens,degree,local_heads",
+    [
+        *[
+            (tokens, degree, local_heads)
+            for tokens in (1024, 1037)
+            for degree in (2, 8)
+            for local_heads in (8, 12, 16)
+        ],
+        # A full K3.1 prefill chunk at TP8 / KVP8.
+        (16384, 8, 12),
+    ],
+)
+def test_dsa_prefill_dcp_records_match_dispatch(tokens, degree, local_heads):
+    q, cache, slots, lengths = _records_inputs(
+        tokens, degree, local_heads, seed=tokens + 31 * degree + local_heads
+    )
+    heads = degree * local_heads
+    assert dsa_prefill_dcp_records_supported(
+        tokens=tokens, heads=heads, topk=_RECORDS_TOPK
+    )
+    kwargs = _records_kwargs(cache, slots, lengths)
+    # Reference: head-sharded prefill with LSE, repacked into the all-to-all records.
+    out, lse = dsa_prefill(
+        q=_token_major(q),
+        sparse_kv_cache=None,
+        max_seqlen_k=_RECORDS_PAGES * 64,
+        return_lse=True,
+        **kwargs,
+    )
+    expected = dispatch_dcp_attention_partials(out, lse, degree=degree)
+    records = dsa_prefill_dcp_records(q=q, **kwargs)
+    assert records.dtype == torch.int32 and records.is_contiguous()
+    assert records.shape == (degree, tokens, local_heads, 257)
+    assert torch.equal(records, expected)
+    # Empty and all-invalid rows give zero output and -inf LSE, as the combine expects.
+    empty = records[:, :2]
+    assert not empty[..., :256].any()
+    neg_inf_bits = torch.tensor(-torch.inf).view(torch.int32).item()
+    assert (empty[..., 256] == neg_inf_bits).all()
+    assert torch.isfinite(records[..., 2, :, 256].view(torch.float32)).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_dsa_prefill_dcp_records_refuse_split_launches():
+    # Under one program per SM, dsa_prefill splits keys and the records would differ.
+    sm_count = current_platform().sm_count
+    assert not dsa_prefill_dcp_records_supported(tokens=0, heads=16, topk=2048)
+    assert not dsa_prefill_dcp_records_supported(tokens=1, heads=16, topk=2048)
+    assert not dsa_prefill_dcp_records_supported(tokens=sm_count, heads=16, topk=2048)
+    assert dsa_prefill_dcp_records_supported(tokens=sm_count + 1, heads=16, topk=2048)
+    # Heads past one 16-head block double the programs per token.
+    assert dsa_prefill_dcp_records_supported(
+        tokens=sm_count // 2 + 1, heads=17, topk=2048
+    )
+    q, cache, slots, lengths = _records_inputs(8, 2, 8, seed=5)
+    with pytest.raises(ValueError, match="runs one split"):
+        dsa_prefill_dcp_records(q=q, **_records_kwargs(cache, slots, lengths))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_dsa_prefill_dcp_records_compile_once_across_tokens():
+    from tokenspeed_kernel.ops.attention.dsa import triton as dsa_triton
+    from utils import assert_no_triton_compile
+
+    degree, local_heads, most = 2, 12, 4099
+    q, cache, slots, lengths = _records_inputs(most, degree, local_heads, seed=7)
+
+    def run(tokens):
+        rows = q.view(torch.uint8)[:, :tokens].contiguous().view(q.dtype)
+        return dsa_prefill_dcp_records(
+            q=rows, **_records_kwargs(cache, slots[:tokens], lengths[:tokens])
+        )
+
+    # Token count is not integer-specialized: one binary serves every prefill size.
+    run(1024)
+    with assert_no_triton_compile(dsa_triton._dsa_dense_kv_dcp_records_kernel):
+        for tokens in (1025, 1040, 1999, 2048, most):
+            run(tokens)
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("cols", [32759, 32763, 32768, 32768 + 64])
