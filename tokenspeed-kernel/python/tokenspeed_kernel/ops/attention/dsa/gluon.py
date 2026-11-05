@@ -929,16 +929,33 @@ if current_platform().is_amd:
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``dsa_select_owned_candidates`` through the live top-k the merge
+        """``dsa_select_owned_candidates`` in one launch over the gathered
+        scores where they fit it, else through the live top-k the merge
         takes its threshold from."""
         from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
             rank_major_planar_scores,
             select_owned_through_threshold,
         )
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
+            gathered_owned_selection_fits,
+            gluon_dsa_select_owned_from_gathered_gfx950,
+        )
         from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
             gluon_dsa_live_logical_topk_gfx950,
         )
 
+        if gathered_owned_selection_fits(scores, topk):
+            return gluon_dsa_select_owned_from_gathered_gfx950(
+                scores,
+                positions,
+                local_page_table,
+                query_requests,
+                rank=rank,
+                topk=topk,
+                page_size=page_size,
+                out=out,
+                lens_out=lens_out,
+            )
         merged, starts, ends = rank_major_planar_scores(scores)
         order, _ = gluon_dsa_live_logical_topk_gfx950(merged, starts, ends, topk=topk)
         return select_owned_through_threshold(

@@ -59,6 +59,9 @@ from tokenspeed_kernel.signature import (  # isort: skip
     dense_tensor_format,
     format_signature,
 )
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (  # isort: skip
+    _select_owned_from_gathered_kernel,
+)
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
     gluon_dsa_live_logical_topk_gfx950,
     gluon_dsa_logical_topk_gfx950,
@@ -338,8 +341,8 @@ _PAGE, _BLOCK = 64, 128
 def _owned_candidates(degree: int, rows: int, q_len: int, topk: int, seed: int):
     """A virtual index-page table and every rank's candidates, all on pages
     the rank owns: positions ``[degree, rows, topk]`` (``-1`` invalid) and
-    their scores (``-inf`` invalid), with mandatory, signed-zero, short and
-    empty rows."""
+    their scores (``-inf`` invalid), with mandatory, signed-zero, NaN, short
+    and empty rows."""
     generator = torch.Generator(device="cuda").manual_seed(seed)
     requests = rows // q_len
     blocks_per_request = 24 * degree
@@ -365,6 +368,7 @@ def _owned_candidates(degree: int, rows: int, q_len: int, topk: int, seed: int):
     scores = torch.rand((degree, rows, topk), device="cuda", generator=generator)
     scores[:, 0, 3:6] = torch.tensor([torch.inf, torch.inf, -0.0], device="cuda")
     scores[:, 0, 6] = 0.0
+    scores[:, 0, 7] = torch.nan
     if rows > 2:
         # A short history: fewer valid candidates in all than topk.
         positions[:, 1, topk // (2 * degree) :] = -1
@@ -416,7 +420,9 @@ def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk
 
 
 @pytest.mark.parametrize("solution", ["gluon", "triton"])
-@pytest.mark.parametrize("degree", [2, 4, 8])
+# Three ranks are outside the one-launch gfx950 selection's power-of-two
+# layout and take the merged path.
+@pytest.mark.parametrize("degree", [2, 3, 4, 8])
 @pytest.mark.parametrize("rows,q_len", [(1, 1), (7, 1), (64, 4)])
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize("tied", [False, True])
@@ -495,15 +501,22 @@ def test_owned_selection_writes_into_the_callers_rows():
     assert int(lens_out[0]) == 7 and int(lens_out[rows + 1]) == 7
 
 
-def test_owned_selection_launches_one_specialization_across_batch_rows():
+@pytest.mark.parametrize(
+    "degree,kernels",
+    [
+        (2, (_select_owned_from_gathered_kernel,)),
+        (3, (_rank_major_planar_scores, _select_owned_through_threshold)),
+    ],
+)
+def test_owned_selection_launches_one_specialization_across_batch_rows(degree, kernels):
     def select(rows):
         table, virtual_blocks, positions, scores = _owned_candidates(
-            2, rows, 1, 2048, seed=rows
+            degree, rows, 1, 2048, seed=rows
         )
         dsa_select_owned_candidates(
             scores,
             positions[1].contiguous(),
-            _local_pages(table, virtual_blocks, 2, 1),
+            _local_pages(table, virtual_blocks, degree, 1),
             torch.arange(rows, device="cuda", dtype=torch.int32),
             rank=1,
             topk=2048,
@@ -512,8 +525,46 @@ def test_owned_selection_launches_one_specialization_across_batch_rows():
         )
 
     select(1)
-    with assert_no_triton_compile(
-        _rank_major_planar_scores, _select_owned_through_threshold
-    ):
+    with assert_no_triton_compile(*kernels):
         for rows in (3, 8, 37, 64):
             select(rows)
+
+
+def test_owned_selection_selects_from_kvp8_gathered_scores_in_one_launch(
+    monkeypatch,
+):
+    # K3.1's KVP8 decode: 16 requests of 4 verify rows, top-2048.
+    degree, rows, q_len, topk = 8, 64, 4, 2048
+    table, virtual_blocks, positions, scores = _owned_candidates(
+        degree, rows, q_len, topk, seed=17
+    )
+    expected = _merged_then_compacted(
+        table, virtual_blocks, positions, scores, q_len, topk
+    )
+    requests = (torch.arange(rows, device="cuda") // q_len).int()
+    from tokenspeed_kernel.ops.attention.dsa._triton import candidate_exchange
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import sparse_mla
+
+    def merged_path(*args, **kwargs):
+        raise AssertionError("the gathered scores went through the merged path")
+
+    for module, name in (
+        (candidate_exchange, "rank_major_planar_scores"),
+        (candidate_exchange, "select_owned_through_threshold"),
+        (sparse_mla, "gluon_dsa_live_logical_topk_gfx950"),
+    ):
+        monkeypatch.setattr(module, name, merged_path)
+
+    for rank, (slots, counts) in enumerate(expected):
+        local_slots, local_counts = dsa_select_owned_candidates(
+            scores,
+            positions[rank].contiguous(),
+            _local_pages(table, virtual_blocks, degree, rank),
+            requests,
+            rank=rank,
+            topk=topk,
+            page_size=_PAGE,
+            solution="gluon",
+        )
+        torch.testing.assert_close(local_slots, slots, atol=0, rtol=0)
+        torch.testing.assert_close(local_counts, counts, atol=0, rtol=0)
