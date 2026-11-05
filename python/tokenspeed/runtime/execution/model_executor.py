@@ -139,6 +139,7 @@ from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import BLOCK_SPEC_ALGORITHMS
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -352,6 +353,27 @@ def warn_past_rope_table(
             "Lower --max-model-len by at least "
             f"{physical_context_len - table_len!s} to stay in bounds.",
         )
+
+
+def drafter_accept_lengths(
+    accept_lengths: torch.Tensor, decode_requests: slice
+) -> torch.Tensor:
+    """The accepted lengths the drafter continues from.
+
+    A stopped request keeps no token and its drafts are discarded, but the
+    drafter still indexes the last accepted position, so each decode
+    request's length is at least 1. ``accept_lengths`` is left unchanged.
+
+    Args:
+        accept_lengths: ``[bs]`` accepted tokens per request.
+        decode_requests: The decode requests' rows.
+
+    Returns:
+        A new ``[bs]`` tensor.
+    """
+    lengths = accept_lengths.clone()
+    lengths[decode_requests].clamp_(min=1)
+    return lengths
 
 
 @dataclass
@@ -646,17 +668,21 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
-        # Trees keep their draft q per tree instead (bind_tree).
+        # Trees keep their draft q per tree instead (bind_tree), and DFLASH
+        # (DFlash2) records a sparse q over its selector's candidates
+        # (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend):
+        # only the step drafters need the dense per-vocab rows.
         if config.enable_speculative_sampling and not config.spec_draft_tree:
             if config.spec_algo is None:
                 raise ValueError(
                     "enable_speculative_sampling needs a speculative drafter to "
                     "record proposal distributions for"
                 )
-            self.runtime_states.init_draft_probs(
-                spec_num_tokens=spec_num_tokens,
-                reject_threshold=config.spec_reject_draft_prob_threshold,
-            )
+            if config.spec_algo not in BLOCK_SPEC_ALGORITHMS:
+                self.runtime_states.init_draft_probs(
+                    spec_num_tokens=spec_num_tokens,
+                    reject_threshold=config.spec_reject_draft_prob_threshold,
+                )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -1807,13 +1833,8 @@ class ModelExecutor:
         if self.drafter is not None:
             draft_accept_lengths = accept_lengths
             if ctx.output_layout.num_decodes:
-                # A stopped request keeps no token; its drafts are discarded,
-                # but the drafter indexes the last accepted position.
-                draft_accept_lengths = accept_lengths.clone()
-                draft_accept_lengths[ctx.output_layout.decode_request_slice] = (
-                    draft_accept_lengths[ctx.output_layout.decode_request_slice].clamp(
-                        min=1
-                    )
+                draft_accept_lengths = drafter_accept_lengths(
+                    accept_lengths, ctx.output_layout.decode_request_slice
                 )
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,
@@ -1920,6 +1941,7 @@ class ModelExecutor:
                 else None
             ),
             draft_probs=self.runtime_states.draft_probs,
+            draft_q=self.runtime_states.future_draft_q,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
