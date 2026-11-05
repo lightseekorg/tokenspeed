@@ -18,29 +18,42 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""fill_input_buffers lands the extend rows' tokens through one cast per field.
+"""Real scheduler token views reach input buffers without mutating the plan.
 
-The token path converts the plan's Python lists via numpy (a C-level int32
-store instead of boxing every token) and sizes the pinned staging from the
-converted tensors; these tests pin the round trip: input ids and shifted ids
-land intact, the host-side extend facts keep their values, and the padding
-tail is still scrubbed — a staging sized wrong would leave stale ids past the
-active prefix, which is exactly what the scrub exists to prevent.
+CPU checks substitute only GPU metadata kernels and pinned allocation; CUDA
+checks exercise the real fill path, including its asynchronous token uploads.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import os
+import sys
 
 import pytest
 import torch
+from tokenspeed_scheduler import (
+    AttnKind,
+    CacheGroupConfig,
+    RequestSpec,
+    Scheduler,
+    SchedulerConfig,
+)
 
 from tokenspeed.runtime.execution import input_buffer
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
 VOCAB_SIZE = 128
 MAX_BS, MAX_TOKENS, PAD_POOL = 8, 64, 5
+
+pytestmark = pytest.mark.filterwarnings(
+    "error:The given NumPy array is not writable:UserWarning"
+)
 
 
 @pytest.fixture(params=["cpu", "cuda"])
@@ -50,7 +63,7 @@ def buffers(request, monkeypatch):
         pytest.skip("requires CUDA")
     if device == "cpu":
         # The kernels the fill path launches are GPU-only; the CPU runs here
-        # check the list/tensor plumbing around them, so they stand in with
+        # check the host token copies around them, so they stand in with
         # the same tensor contract.
         def bulk(self, *specs):
             return [torch.empty(n, dtype=dtype) for n, dtype in specs]
@@ -84,6 +97,7 @@ def buffers(request, monkeypatch):
         max_num_tokens=MAX_TOKENS,
         state_write_padding_pool_index=PAD_POOL,
         device=device,
+        reads_state_checkpoints=False,
     )
     runtime = RuntimeStates(
         req_pool_size=8, vocab_size=VOCAB_SIZE, output_length=1, device=device
@@ -91,26 +105,30 @@ def buffers(request, monkeypatch):
     return ib, runtime
 
 
-def _op(rids, slots, lengths, prefixes, prompt_lens, overrides=None):
-    """The fill reads only the plan's attribute surface; the values keep the
-    scheduler's invariants (len(input_ids) == sum(input_lengths[:num_extends]),
-    prefix + chunk <= prompt)."""
-    ids = []
-    for length, prefix, prompt in zip(lengths, prefixes, prompt_lens):
-        assert prefix + length <= prompt
-        ids.extend(range(prompt)[prefix : prefix + length])
-    return SimpleNamespace(
-        request_ids=list(rids),
-        request_pool_indices=list(slots),
-        input_lengths=list(lengths),
-        prefill_lengths=list(prompt_lens),
-        input_ids=ids,
-        shifted_input_ids=ids[1:] + [-1] if ids else [],
-        extend_prefix_lens=list(prefixes),
-        extend_replay_lens=[0] * len(rids),
-        decode_input_ids=overrides,
-        num_extends=lambda: len(prefixes),
-    )
+def _scheduler(*, token_budget: int, mixed: bool) -> Scheduler:
+    config = SchedulerConfig()
+    config.max_batch_size = PAD_POOL - 1
+    config.max_scheduled_tokens = token_budget
+    config.prefix_granularity = 4
+    config.num_device_pages = 128
+    config.num_snapshot_pages = 1
+    config.enable_mixed_prefill_decode = mixed
+    config.cache_groups = [
+        CacheGroupConfig(
+            group_id="full_attention",
+            block_granularity=4,
+            total_pages=128,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    return Scheduler(config)
+
+
+def _submit(scheduler: Scheduler, rid: str, tokens: list[int]) -> None:
+    spec = RequestSpec()
+    spec.request_id = rid
+    spec.tokens = tokens
+    scheduler.submit_requests([spec])
 
 
 def _fill(ib, runtime, op):
@@ -124,45 +142,78 @@ def _fill(ib, runtime, op):
     return total
 
 
-def test_mid_chunk_predicate_needs_every_row_non_final(buffers):
+def test_mid_chunk_predicate_tracks_prefill_completion(buffers):
     ib, runtime = buffers
-    # Two extends, both mid-prompt chunks (prefix + chunk < prompt).
-    op = _op(["a", "b"], [1, 2], [4, 4], [0, 4], [16, 16])
-    _fill(ib, runtime, op)
-    assert ib.all_extends_mid_chunk is True
+    scheduler = _scheduler(token_budget=4, mixed=False)
+    _submit(scheduler, "a", list(range(12)))
+    for expected in (True, True, False):
+        op = scheduler.next_execution_plan().forward[0]
+        _fill(ib, runtime, op)
+        assert ib.all_extends_mid_chunk is expected
 
-    # The second row's chunk completes its prompt: not all mid-chunk.
-    op = _op(["a", "b"], [1, 2], [4, 4], [0, 12], [16, 16])
-    _fill(ib, runtime, op)
-    assert ib.all_extends_mid_chunk is False
-
-    # A decode row in the batch (num_extends < batch_size).
-    op = _op(["a", "c"], [1, 3], [4, 1], [0], [16, 5])
+    op = scheduler.next_execution_plan().forward[0]
+    assert op.num_extends() == 0
     _fill(ib, runtime, op)
     assert ib.all_extends_mid_chunk is False
 
-    # Decode-only rounds never claim mid-chunk.
-    op = _op(["a", "b"], [1, 2], [1, 1], [], [16, 16])
+
+def test_mid_chunk_predicate_excludes_mixed_batches(buffers):
+    ib, runtime = buffers
+    scheduler = _scheduler(token_budget=8, mixed=True)
+    _submit(scheduler, "a", [10, 11, 12, 13])
+    _fill(ib, runtime, scheduler.next_execution_plan().forward[0])
+    _submit(scheduler, "b", list(range(32, 48)))
+    op = scheduler.next_execution_plan().forward[0]
+    assert op.num_extends() == 1
+    assert len(op.request_ids) == 2
     _fill(ib, runtime, op)
     assert ib.all_extends_mid_chunk is False
 
 
 def test_tokens_and_extend_facts_land_intact(buffers):
     ib, runtime = buffers
-    rids, slots = ["a", "b"], [1, 2]
-    lengths, prefixes, prompt_lens = [4, 4], [0, 4], [16, 16]
-    op = _op(rids, slots, lengths, prefixes, prompt_lens)
+    scheduler = _scheduler(token_budget=32, mixed=False)
+    tokens = {"a": [300, 301, 302, 303], "b": [128000, 128001, 128002]}
+    for rid, ids in tokens.items():
+        _submit(scheduler, rid, ids)
+    op = scheduler.next_execution_plan().forward[0]
+    assert set(op.request_ids) == set(tokens)
+    expected_ids = [token for rid in op.request_ids for token in tokens[rid]]
+    expected_shifted = [
+        token for rid in op.request_ids for token in tokens[rid][1:] + [-1]
+    ]
     total = _fill(ib, runtime, op)
 
-    assert ib.input_ids_buf[:total].tolist() == op.input_ids
-    assert ib.shifted_prefill_ids_buf[:total].tolist() == op.shifted_input_ids
-    assert ib.input_lengths_buf[: len(slots)].tolist() == lengths
-    assert ib.req_pool_indices_buf[: len(slots)].tolist() == slots
+    assert ib.input_ids_buf[:total].tolist() == expected_ids
+    assert ib.shifted_prefill_ids_buf[:total].tolist() == expected_shifted
+    assert op.input_ids.tolist() == expected_ids
+    assert op.shifted_input_ids.tolist() == expected_shifted
+    assert not op.input_ids.flags.writeable
+    assert not op.shifted_input_ids.flags.writeable
     n = op.num_extends()
-    assert ib.extend_prefix_lens_cpu[:n].tolist() == prefixes
-    assert ib.extend_seq_lens_cpu[:n].tolist() == lengths[:n]
-    assert ib.extend_prompt_lens_cpu[:n].tolist() == prompt_lens[:n]
+    lengths = [len(tokens[rid]) for rid in op.request_ids]
+    assert ib.input_lengths_buf[:n].tolist() == lengths
+    assert ib.req_pool_indices_buf[:n].tolist() == op.request_pool_indices
+    assert ib.extend_prefix_lens_cpu[:n].tolist() == [0] * n
+    assert ib.extend_seq_lens_cpu[:n].tolist() == lengths
+    assert ib.extend_prompt_lens_cpu[:n].tolist() == lengths
+    assert ib.input_ids_buf[total:].tolist() == [1] * (ib.max_num_tokens - total)
 
-    # The padding tail keeps its safe defaults: a mis-sized staging copy
-    # would leave stale ids past the active prefix for padded rows to read.
+
+def test_shorter_chunk_clears_previous_token_tail(buffers):
+    ib, runtime = buffers
+    scheduler = _scheduler(token_budget=8, mixed=False)
+    tokens = list(range(300, 312))
+    _submit(scheduler, "a", tokens)
+    first = scheduler.next_execution_plan().forward[0]
+    assert _fill(ib, runtime, first) == 8
+    assert ib.input_ids_buf[:8].tolist() == tokens[:8]
+
+    last = scheduler.next_execution_plan().forward[0]
+    total = _fill(ib, runtime, last)
+    assert total == 4
+    assert ib.input_ids_buf[:total].tolist() == tokens[8:]
+    assert ib.shifted_prefill_ids_buf[:total].tolist() == tokens[9:] + [-1]
+    assert ib.extend_prefix_lens_cpu[0].item() == 8
+    assert ib.extend_prompt_lens_cpu[0].item() == len(tokens)
     assert ib.input_ids_buf[total:].tolist() == [1] * (ib.max_num_tokens - total)

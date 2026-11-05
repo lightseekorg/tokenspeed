@@ -78,6 +78,13 @@ FlashInfer receives host CSR metadata derived from those mirrors, with fresh
 pinned sources for asynchronous uploads. Planning does not download device
 lengths or indptrs; mixed batches apply the same rule to their extend rows.
 
+Prefill token inputs arrive as the scheduler's read-only, one-dimensional
+int32 NumPy views. Input fill copies them directly into fresh pinned storage
+for the round, then uploads that storage asynchronously. It neither wraps
+the read-only source in a writable tensor nor creates an intermediate token
+copy. The pinned allocation must remain per-round: overlap can prepare the
+next round while the previous upload is still reading its source.
+
 NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.

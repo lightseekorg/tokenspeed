@@ -411,10 +411,8 @@ class InputBuffers:
         and writes none of them (see ``load_round_inputs``)."""
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
-        # Every forward_op attribute read re-boxes the whole C++ vector into a
-        # fresh Python list (the plan's def_ro value semantics), so a vector
-        # read more than once per round goes through one local list — the
-        # per-element all() below would cast 3*B whole vectors otherwise.
+        # Request metadata still casts C++ vectors to lists on each read.
+        # Cache repeated reads, especially inside the per-row all() below.
         req_pool_indices = forward_op.request_pool_indices
         input_lengths = forward_op.input_lengths
 
@@ -539,29 +537,19 @@ class InputBuffers:
         # Determine input_ids and forward_mode
         if num_extends > 0:
             prefill_token_count = sum(input_lengths[:num_extends])
-            # One cast per field, through numpy: as_tensor(list) boxes every
-            # token as a Python int while np.array stores int32 directly, and
-            # the staging sizes come from the converted tensors instead of
-            # extra len() casts of the same lists. copy=True is one memcpy
-            # either way and is byte-identical for the released list binding
-            # and the read-only ndarray views the scheduler hands over (torch
-            # needs writable memory). The [:prefill_token_count] copies still
-            # enforce len(input_ids) == sum(input_lengths[:num_extends])
-            # (pinned by the scheduler's FSM tests) by shape mismatch.
-            input_ids_t = torch.from_numpy(
-                np.array(forward_op.input_ids, dtype=np.int32, copy=True)
+            input_ids = forward_op.input_ids
+            shifted_ids = forward_op.shifted_input_ids
+            input_ids_cpu, shifted_ids_cpu = self._bulk_pinned(
+                (input_ids.size, torch.int32), (shifted_ids.size, torch.int32)
             )
-            (input_ids_cpu,) = self._bulk_pinned((input_ids_t.numel(), torch.int32))
-            input_ids_cpu.copy_(input_ids_t)
+            # Copy the scheduler's read-only int32 views directly into this
+            # step's writable pinned storage; no intermediate token copy.
+            np.copyto(input_ids_cpu.numpy(), input_ids, casting="no")
+            np.copyto(shifted_ids_cpu.numpy(), shifted_ids, casting="no")
             self.input_ids_buf[:prefill_token_count].copy_(
                 input_ids_cpu,
                 non_blocking=True,
             )
-            shifted_ids_t = torch.from_numpy(
-                np.array(forward_op.shifted_input_ids, dtype=np.int32, copy=True)
-            )
-            (shifted_ids_cpu,) = self._bulk_pinned((shifted_ids_t.numel(), torch.int32))
-            shifted_ids_cpu.copy_(shifted_ids_t)
             self.shifted_prefill_ids_buf[:prefill_token_count].copy_(
                 shifted_ids_cpu,
                 non_blocking=True,

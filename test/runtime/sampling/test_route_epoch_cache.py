@@ -35,11 +35,11 @@ import torch
 
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.backends.triton import (
-    TritonSamplingBackend,
     _SAMPLE_ROUTE_GUMBEL_GENERIC,
     _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
     _SAMPLE_ROUTE_GUMBEL_TOP_K,
     _TOP_K_TOP_P_PAD,
+    TritonSamplingBackend,
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
