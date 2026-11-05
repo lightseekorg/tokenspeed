@@ -75,8 +75,6 @@ from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
-from tokenspeed.runtime.models.base.comm_ops import FinalNormOp
-from tokenspeed.runtime.models.base.placement import ParallelGroup
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
@@ -585,7 +583,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.layer_id = layer_id
-        self.is_final_layer = layer_id == config.num_hidden_layers - 1
         self.is_moe_layer = config.mlp_layer_types[layer_id] == "sparse"
         previous_is_moe_layer = (
             layer_id > 0 and config.mlp_layer_types[layer_id - 1] == "sparse"
@@ -672,18 +669,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
-        # In all-reduce mode the model's FinalNormOp reduces the last layer's
-        # MLP output, fused with the norm or not, so this layer must not reduce
-        # it as well. Idle forwards skip the final norm and keep this collective.
-        defer_to_final_norm = (
-            self.is_final_layer
-            and not ctx.forward_mode.is_idle()
-            and self.comm_manager.use_all_reduce(self.is_moe_layer)
+        hidden_states, residual = self.comm_manager.post_mlp_fused(
+            hidden_states, residual, ctx
         )
-        if not defer_to_final_norm:
-            hidden_states, residual = self.comm_manager.post_mlp_fused(
-                hidden_states, residual, ctx
-            )
         return hidden_states, residual
 
 
@@ -728,21 +716,6 @@ class MiniMaxM3Model(BaseTransformerModel):
     ) -> None:
         super().__init__(config, mapping, quant_config, prefix)
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        last_layer = self.layers[-1]
-        group_type = (
-            ParallelGroup.MOE_TP_EP
-            if last_layer.is_moe_layer
-            else ParallelGroup.DENSE_TP
-        )
-        self._final_norm_op = FinalNormOp(
-            mapping=mapping,
-            group_type=group_type,
-            norm_module=self.norm,
-            use_all_reduce_mode=last_layer.comm_manager.use_all_reduce(
-                last_layer.is_moe_layer
-            ),
-            lm_head_group_type=ParallelGroup.ATTN_TP,
-        )
 
 
 class MiniMaxM3SparseForCausalLM(BaseCausalLM):
