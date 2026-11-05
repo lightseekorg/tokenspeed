@@ -28,7 +28,6 @@ and select free devices with CUDA_VISIBLE_DEVICES.
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import math
 import os
@@ -54,6 +53,7 @@ from tokenspeed_kernel.ops.gemm import (
     fp8_projection,
     grouped_fp8_projection,
     grouped_fp8_projection_quantize_fp8,
+    has_grouped_fp8_projection,
     mm,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
@@ -2255,11 +2255,10 @@ class _TinyFp8WoAModel(BaseCausalLM):
 @pytest.mark.skipif(
     not (
         torch.cuda.is_available()
-        and current_platform().is_nvidia
-        and current_platform().arch_version.major == 10
-        and importlib.util.find_spec("deep_gemm") is not None
+        # The test's o_lora_rank and wo_a input width.
+        and has_grouped_fp8_projection(torch.device("cuda"), 128, 512)
     ),
-    reason="FP8 wo_a runs on DeepGEMM on SM100/SM103",
+    reason="needs a grouped FP8 kernel for wo_a",
 )
 @torch.inference_mode()
 def test_sharded_state_load_restores_fp8_wo_a(monkeypatch, tmp_path):
@@ -2538,13 +2537,12 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     adapter.load_weights(_bind_engram_tables(adapter, weights, tmp_path).items())
     adapter.initialize_engram(_Tokenizer())
     model = adapter.model
-    # SM100/SM103 run wo_a on its FP8 codes and feed wo_b its FP8 output;
-    # other GPUs dequantize wo_a.
-    platform = current_platform()
-    fp8_wo_a = (
-        platform.is_nvidia
-        and platform.arch_version.major == 10
-        and importlib.util.find_spec("deep_gemm") is not None
+    # GPUs with a grouped FP8 kernel run wo_a on its FP8 codes and feed wo_b
+    # its FP8 output; other GPUs dequantize wo_a.
+    fp8_wo_a = has_grouped_fp8_projection(
+        torch.device("cuda:0"),
+        config.o_lora_rank,
+        config.num_attention_heads * config.head_dim // config.o_groups,
     )
     for layer in model.layers:
         assert layer.attn.wo_a_fp8 is fp8_wo_a
