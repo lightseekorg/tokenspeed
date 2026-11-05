@@ -71,6 +71,7 @@ def _run_mla_decode(
     )
     backend.is_draft = is_draft
     backend.draft_block_decode = draft_block_decode
+    backend.draft_block_causal = False
     backend.spec_num_tokens = spec if draft_block_decode else 1
     backend.max_context_len = 256
     backend.kernel_page_size = page_size
@@ -330,6 +331,7 @@ def _run_cutedsl_decode(
         block_seq_lens=seq_lens,
     )
     backend.draft_block_decode = draft_block_decode
+    backend.draft_block_causal = False
     backend.spec_num_tokens = spec
     backend.is_draft = draft_block_decode
     backend.data_type = torch.float32
@@ -416,6 +418,7 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
     backend.spec_num_tokens = spec
     backend.max_context_len = 256
     backend.draft_block_decode = True
+    backend.draft_block_causal = False
     backend._decode_views_by_bs = {}
     backend._block_page_table_buf = None
     backend._block_seq_lens_buf = None
