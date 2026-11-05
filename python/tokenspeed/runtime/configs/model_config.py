@@ -165,6 +165,22 @@ def configure_deepseek_v41_attention(model_config, server_args: ServerArgs) -> N
     model_config.scaling = hf.head_dim**-0.5
 
 
+def configure_kimi_k31_attention(model_config, server_args: ServerArgs) -> None:
+    """Kimi-K3.1: DSA geometry with the indexer's keys stored as FP8 with scales.
+
+    ``fp8_scaled`` keys take 132 bytes per token per layer against 256 for
+    ``bf16``, so 8x MI350X at the default memory utilization fits 15 rather
+    than 12 requests of 50K input tokens. AIME26 and OpenAI MRCR (2 needles,
+    up to 45K tokens) score the same on both formats within run-to-run
+    noise. The checkpoint's BF16 indexer weights (``KimiK3Config`` rejects
+    ``indexer_use_fp8: true``) do not pin the serving format of the keys.
+    """
+    configure_dsa_attention(model_config, server_args)
+    model_config.index_k_format = "fp8_scaled"
+    # K3.1 keeps all DSA ops in one eager break narrowing padded replays to live rows.
+    model_config.dsa_padded_prefill_replay = True
+
+
 def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     """Derive MLA latent plus DSA indexer geometry (GLM-DSA, DeepSeek-V3.2).
 
@@ -481,6 +497,12 @@ _ATTENTION_FAMILY_SPECS = (
         architectures=_DSA_ARCHITECTURES,
         configure=configure_dsa_attention,
         default_backend="dsa",
+    ),
+    _AttentionFamilySpec(
+        # K3's MLA plus a DSA indexer: the hybrid resolver picks the dsa leaf under KDA.
+        name="Kimi-K3.1",
+        architectures=frozenset({"KimiK31ForConditionalGeneration"}),
+        configure=configure_kimi_k31_attention,
     ),
     _AttentionFamilySpec(
         name="MLA",
@@ -878,6 +900,8 @@ class ModelConfig:
         # hook names it (configure_dsa_attention: "fp8_scaled"); None for a
         # model without an indexer, and DSAConfig refuses None.
         self.index_k_format: str | None = None
+        # Rank-uniform: all DSA ops run in one eager break that narrows padded replays.
+        self.dsa_padded_prefill_replay: bool = False
 
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.
@@ -1208,6 +1232,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",

@@ -35,7 +35,9 @@ from tokenspeed_kernel.ops.gemm import _select_mv, mm  # noqa: E402
 from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     gluon_gemv_a16w16_gfx950 as registered_gemv,
 )
+from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (  # noqa: E402
+    _HALF_TILE_MAX_M,
     _PREFERRED_BUCKETS,
     gluon_gemv_a16w16_gfx950,
     launch_gluon_gemv_a16w16_gfx950,
@@ -140,6 +142,40 @@ def test_gemv_rejects_unsupported_shapes():
     with pytest.raises(ValueError, match="contiguous"):
         x = torch.empty(1, 64, device="cuda", dtype=torch.bfloat16)
         launch_gluon_gemv_a16w16_gfx950(x, w[:, :64], x.new_empty(1, 64))
+
+
+@pytest.mark.parametrize("n,k", sorted(_HALF_TILE_MAX_M))
+@pytest.mark.parametrize("m", [2, 4, 8, 16])
+def test_half_tiles_match_one_program_per_cu_bitwise(m, n, k):
+    """16-row programs keep every column's MFMA chain, so the bits match."""
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    out = launch_gluon_gemv_a16w16_gfx950(x, w, x.new_empty(m, n))
+
+    cus = torch.cuda.get_device_properties(x.device).multi_processor_count
+    rows = triton.cdiv(n, cus)
+    one_per_cu = x.new_empty(m, n)
+    gluon_gemv_a16w16_gfx950[(triton.cdiv(n, rows),)](
+        x,
+        w,
+        one_per_cu,
+        m,
+        n,
+        rows,
+        x.stride(0),
+        one_per_cu.stride(0),
+        K=k,
+        BLOCK_M=16,
+        BLOCK_N=triton.next_power_of_2(rows),
+        BLOCK_K=128,
+        STAGES=0,
+        num_warps=4,
+    )
+
+    assert torch.equal(out, one_per_cu)
+    torch.testing.assert_close(
+        out, _reference(x, w), rtol=_RTOL[torch.bfloat16], atol=_ATOL
+    )
 
 
 def test_gemv_compiles_once_per_row_bucket():
