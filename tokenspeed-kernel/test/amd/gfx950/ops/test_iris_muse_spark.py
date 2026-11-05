@@ -977,11 +977,12 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
+def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=(), options=None):
     """Compile a Gluon kernel for gfx950 without launching it.
 
     Arguments named in unspecialized get no 16-byte divisibility, as when a
     caller passes them in do_not_specialize or compiles ahead of time.
+    ``options`` adds compile options (such as extern libraries).
     """
     from tokenspeed_kernel._triton import gluon, triton
 
@@ -1005,7 +1006,7 @@ def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
     return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": num_warps},
+        options={"num_warps": num_warps, **(options or {})},
     )
 
 
@@ -1384,6 +1385,7 @@ def test_moetail_lamport_codegen(block_m):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
         iris_fused_gemv_lamport_allgather_muse_moetail as fn,
     )
+    from tokenspeed_kernel_amd._scheduling import sched_compile_options
 
     types = {
         "x_ptr": "*bf16",
@@ -1423,6 +1425,7 @@ def test_moetail_lamport_codegen(block_m):
         },
         num_warps=16,
         unspecialized=("region", "M"),
+        options=sched_compile_options(),
     )
     assembly = kernel.asm["amdgcn"]
     lines = assembly.splitlines()
