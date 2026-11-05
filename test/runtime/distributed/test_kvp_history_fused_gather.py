@@ -33,10 +33,12 @@ collectives still line up.
 ``_worker`` runs every case on an initialized world; the test spawns it on two
 and four local GPUs. Run as a script under ``torchrun`` (eight ranks across
 two nodes), the same worker adds the case with real all-reduces in flight and
-skips the single-node ones.
+skips the single-node ones. ``_layer_order_worker`` runs the one case that
+traps the kernel, in processes of its own.
 """
 
 import gc
+import json
 import os
 import random
 import sys
@@ -1449,9 +1451,10 @@ def _case_compiles_once(world: _World, transport):
     _assert_clean(world, transport)
 
 
-def _worker(rank: int, world_size: int, init_method: str) -> None:
-    """Every case on a fresh world of ``world_size`` ranks; the device is
-    ``LOCAL_RANK`` under torchrun, else ``rank``."""
+def _world(rank: int, world_size: int, init_method: str) -> _World:
+    """A fresh world of ``world_size`` ranks, its KVP group and the named
+    history groups on it; the device is ``LOCAL_RANK`` under torchrun, else
+    ``rank``."""
     from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
 
     from tokenspeed.runtime.distributed.comm_backend import set_global_backend
@@ -1459,9 +1462,6 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
     from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME, Mapping
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg_manager,
-    )
-    from tokenspeed.runtime.layers.attention.dcp.cache import (
-        _FUSED_HISTORY_TRANSPORTS,
     )
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -1491,7 +1491,7 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
     pg_manager.init_process_group(group, backend="nccl", name=KVP_HISTORY_GROUP_NAME)
     gather_fabric_map()
     set_global_backend(NcclBackend())
-    world = _World(
+    return _World(
         rank=group.index(dist.get_rank()),
         device=device,
         group=group,
@@ -1500,6 +1500,15 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
         gloo=pg_manager.get_process_group("gloo", group),
         one_node=int(os.environ.get("LOCAL_WORLD_SIZE", world_size)) == world_size,
     )
+
+
+def _worker(rank: int, world_size: int, init_method: str) -> None:
+    """Every case on a fresh world of ``world_size`` ranks."""
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        _FUSED_HISTORY_TRANSPORTS,
+    )
+
+    world = _world(rank, world_size, init_method)
     transport = _case_startup(world)
     _case_layouts(world, transport)
     _case_late_ranks(world, transport)
@@ -1530,8 +1539,32 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
     _case_compiles_once(world, transport)
     torch.cuda.synchronize()
     dist.barrier()
-    _FUSED_HISTORY_TRANSPORTS.pop(group).state.close()
+    _FUSED_HISTORY_TRANSPORTS.pop(world.group).state.close()
     dist.destroy_process_group()
+
+
+def _layer_order_worker(rank: int, world_size: int, init_method: str, out: str) -> None:
+    """Even ranks start window 0 of the first latent layer, odd ranks window
+    0 of the second, of one prepared forward: the windows plan alike, so the
+    layer id in the window header is what the kernel finds unequal. Writes
+    this rank's error record once the kernel trapped, with host-only
+    operations, then exits."""
+    world = _world(rank, world_size, init_method)
+    layout = _layouts(world.device)["fragmented"]
+    transport = _own_transport(world, cap_rows=4096, modes=("multicast", "peer"))
+    planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
+    pool = _LatentPool(planes)
+    history = _reader(world, layout, transport)
+    _prepare(history, layout)
+    record = None
+    try:
+        history._launch(pool, LATENT_LAYERS[world.rank % 2], 0)
+        torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001 - the trap surfaces as a CUDA error
+        record = transport.state.read_error()
+    with open(os.path.join(out, f"rank{rank}.json"), "w") as f:
+        json.dump(record, f)
+    os._exit(0)
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -1546,6 +1579,47 @@ def test_kvp_history_fused_gather(tmp_path, world_size):
         nprocs=world_size,
         join=True,
     )
+
+
+def test_kvp_history_fused_gather_layer_order(tmp_path):
+    """Each rank in a process of its own (a trapped context cannot take part
+    in a collective, and ``mp.spawn`` stops the others when one fails): ranks
+    that start the same window of different layers trap with a header
+    mismatch on every rank instead of exchanging the wrong layer's rows."""
+    world_size = 2
+    if torch.cuda.device_count() < world_size or (
+        torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    ):
+        pytest.skip(f"requires {world_size} node-local SM100 or SM103 GPUs")
+    # Imported once the platform is known to have CuTe DSL.
+    from tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather import (
+        STAGE_HEADER,
+    )
+
+    context = mp.get_context("spawn")
+    rendezvous = f"file://{tmp_path / 'rendezvous'}"
+    workers = [
+        context.Process(
+            target=_layer_order_worker,
+            args=(rank, world_size, rendezvous, str(tmp_path)),
+        )
+        for rank in range(world_size)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=300)
+    stuck = [rank for rank, worker in enumerate(workers) if worker.is_alive()]
+    for worker in workers:
+        if worker.is_alive():
+            worker.kill()
+    assert not stuck, f"ranks {stuck} did not finish"
+    records = []
+    for rank in range(world_size):
+        with open(tmp_path / f"rank{rank}.json") as f:
+            records.append(json.load(f))
+    stages = [record and record["stage_code"] for record in records]
+    assert stages == [STAGE_HEADER] * world_size, records
 
 
 if __name__ == "__main__":
