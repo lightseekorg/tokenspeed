@@ -18,9 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Each PDL-enabled kernel must call ``gdc_wait()`` before it reads anything an
-upstream kernel wrote, since ``launch_pdl=True`` lets its CTAs be scheduled
-before that upstream kernel retires.
+"""Tests that PDL-enabled kernels wait for upstream writes before reading.
+
+Each must call ``gdc_wait()`` before it reads anything an upstream kernel
+wrote, since ``launch_pdl=True`` lets its CTAs be scheduled before that
+upstream kernel retires.
 
 Every case below races a synthetic slow producer against the kernel under
 test on the same stream, with no host sync in between. Like the production
@@ -123,8 +125,9 @@ def _poison_like(real: torch.Tensor) -> torch.Tensor:
 
 
 def _publish_with_delay(real: torch.Tensor, dst: torch.Tensor, delay_ns: int) -> None:
-    """Copy ``real``'s bytes into ``dst`` after a delay, letting the next
-    kernel launch before the copy lands.
+    """Copy ``real``'s bytes into ``dst`` after a delay.
+
+    The next kernel can launch before the copy lands.
     """
     assert real.shape == dst.shape and real.dtype == dst.dtype
     assert real.is_contiguous() and dst.is_contiguous()
