@@ -209,6 +209,22 @@ def test_pdl_off_matches_pdl_on(
     assert _bitwise_equal(v_off, v_on)
 
 
+def test_kv_pack_reuses_compilation(device: str) -> None:
+    from tokenspeed_mla.mla_kv_pack_quantize_fp8 import _mla_kv_pack_quantize_fp8_kernel
+    from utils import assert_no_triton_compile
+
+    inputs = _make_kv_slice_inputs(device)
+
+    def run(tokens):
+        # With 12 heads, row counts can be non-multiples of 16.
+        return mla_kv_pack_quantize_fp8(*(tensor[:tokens, :12] for tensor in inputs))
+
+    run(S)
+    with assert_no_triton_compile(_mla_kv_pack_quantize_fp8_kernel):
+        for tokens in (1, 3, 17, 255):
+            run(tokens)
+
+
 def test_sm103_bf16_decode_causal_variants_compile() -> None:
     """The SM103 BF16 decode path compiles for both mask variants."""
     repo_root = Path(__file__).resolve().parents[4]
