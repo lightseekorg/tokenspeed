@@ -24,7 +24,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    compact_owned_slots,
+    virtual_slots_to_local,
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,32 @@ def resolve_cache_slots(
         return loc, None
     return virtual_slots_to_local(
         loc,
+        rows_per_page=placement.block_granularity,
+        virtual_block_count=placement.virtual_block_count,
+        degree=len(placement.group),
+        rank=placement.rank,
+    )
+
+
+def compact_owned_cache_slots(
+    slots: torch.Tensor,
+    lengths: torch.Tensor | None,
+    placement: CachePlacement | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Move each row's owned slots, as local slots, to the row's front.
+
+    ``slots`` holds one selection row per query (virtual slots, ``-1`` where
+    empty) and ``lengths`` its live count, or None for the whole width. The
+    result keeps this rank's live slots in selection order, then ``-1``, and
+    its owned count per row as the new length, so a sparse core that honours
+    the lengths iterates only this rank's share. A None placement preserves
+    both: every slot is local.
+    """
+    if placement is None:
+        return slots, lengths
+    return compact_owned_slots(
+        slots,
+        lengths,
         rows_per_page=placement.block_granularity,
         virtual_block_count=placement.virtual_block_count,
         degree=len(placement.group),
@@ -156,6 +185,67 @@ def owned_history_rows(
             "query-context-parallel gather needs an owner for every row"
         )
     return counts[:, :degree].transpose(0, 1).contiguous()
+
+
+def max_owned_index_pages(
+    page_table_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    *,
+    page_size: int,
+    placement: CachePlacement,
+) -> int:
+    """Bound, on the host, the owned index pages of every query row on every rank.
+
+    A sharded indexer compacts each query row's pages that its rank owns
+    below the row's causal length. A row's causal length is at most its
+    request's ``seq_len``, so the most pages any rank owns among a request's
+    first ``ceil(seq_len / page_size)`` columns, over every rank and request,
+    bounds every row's compaction: the bound is exact for each request's last
+    row and an over-count for the others. Ownership follows
+    :func:`owned_history_rows`: page ``p`` belongs to rank
+    ``(block - 1) % degree`` of its scheduler block. Pages without an owner
+    (holes: the null block or a block past the virtual capacity) count for no
+    rank, as the device compaction skips them; unlike the history gather, a
+    hole is not an error here. Every rank holds the same host mirror, so
+    every rank computes the same bound without a device sync.
+
+    Args:
+        page_table_cpu: ``[requests, columns]`` host int32 kernel-page table
+            (virtual pages, batch-ordered; holes are page 0).
+        seq_lens_cpu: ``[requests]`` host total lengths (prefix plus this
+            chunk's rows).
+        page_size: Tokens per kernel page.
+        placement: The sharded group's ownership geometry.
+
+    Returns:
+        The most owned pages of any rank and request; 0 without pages.
+    """
+    if page_table_cpu.dim() != 2 or seq_lens_cpu.dim() != 1:
+        raise ValueError("max_owned_index_pages takes a [requests, columns] table")
+    if page_table_cpu.shape[0] != seq_lens_cpu.numel():
+        raise ValueError(
+            f"page table has {page_table_cpu.shape[0]} rows for "
+            f"{seq_lens_cpu.numel()} requests"
+        )
+    # Host arithmetic in numpy, once per forward ahead of the device.
+    degree = len(placement.group)
+    seq_lens = seq_lens_cpu.numpy().astype(np.int64)
+    max_len = int(seq_lens.max()) if seq_lens.size else 0
+    # Only the pages below the longest length matter; the mirror may be wider.
+    columns = min(-(-max_len // page_size), page_table_cpu.shape[1])
+    if columns <= 0:
+        return 0
+    subpages = placement.block_granularity // page_size
+    block = page_table_cpu[:, :columns].numpy().astype(np.int64) // subpages
+    starts = np.arange(columns, dtype=np.int64) * page_size
+    live = starts[None, :] < seq_lens[:, None]
+    valid = live & (block > 0) & (block < placement.virtual_block_count)
+    # Owner ``degree`` is the sink for pages without an owner or past a length.
+    owner = np.where(valid, (block - 1) % degree, degree)
+    requests = owner.shape[0]
+    bins = owner + np.arange(requests, dtype=np.int64)[:, None] * (degree + 1)
+    counts = np.bincount(bins.ravel(), minlength=requests * (degree + 1))
+    return int(counts.reshape(requests, degree + 1)[:, :degree].max())
 
 
 def owned_prefix_chunk_rows(
