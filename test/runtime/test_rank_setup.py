@@ -123,6 +123,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
+        prefill_decode_interval=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -133,6 +134,16 @@ def test_make_config_requires_and_maps_the_host_write_policy():
     # Mapped as given: the scheduler, not make_config, decides what it runs.
     cfg = make_config(**fields, host_write_policy="write_back")
     assert cfg.host_write_policy == policy.WriteBack
+
+
+def test_the_prefill_decode_interval_reaches_the_scheduler():
+    args = prepare_server_args(
+        ["--model", "x", "--max-num-seqs", "8", "--prefill-decode-interval", "64"]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_interval == 64
 
 
 @pytest.mark.parametrize("tokens,pages", [(None, 0), (1, 1), (16, 1), (17, 2)])

@@ -420,6 +420,9 @@ class ServerArgs:
     # chunked_prefill_size; a decode server ignores it.
     prefill_chunk_yield_tokens: int = 0
     enable_mixed_batch: bool = False
+    # Decode rounds owed to the running decodes after each prefill round; 0 is
+    # off (docs/design/scheduler.md §3.3).
+    prefill_decode_interval: int = 0
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -2696,6 +2699,14 @@ class ServerArgs:
             raise ValueError("--input-logprob-chunk-tokens must be positive")
         if self.chunk_prefill_kv_size is not None and self.chunk_prefill_kv_size <= 0:
             raise ValueError("--chunk-prefill-kv-size must be positive")
+        if self.prefill_decode_interval < 0:
+            raise ValueError("--prefill-decode-interval must be non-negative")
+        if self.prefill_decode_interval and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--prefill-decode-interval needs --disaggregation-mode null: a "
+                "prefill engine runs no decodes and a decode engine no local "
+                "prefill rounds"
+            )
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -3006,6 +3017,17 @@ class ServerArgs:
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the "
             "same iteration. Not supported with aggregated DCP.",
+        )
+        parser.add_argument(
+            "--prefill-decode-interval",
+            type=int,
+            default=ServerArgs.prefill_decode_interval,
+            help="After a round that runs a prefill chunk, run this many decode "
+            "rounds before the next prefill round, unless no decode can run. "
+            "Every chunk starts a new interval, but no prompt is held back "
+            "more than this many decode rounds in total. Trades TTFT for "
+            "fewer decode stalls. Aggregated serving only. 0 (the default) is "
+            "off.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",
