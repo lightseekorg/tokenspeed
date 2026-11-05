@@ -1981,9 +1981,9 @@ amplifying FP8 attention rounding when changing the softmax partitioning.
 The gathers run on a named
 copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
-before its layer instead of queueing with those collectives. On GB300 a KVP
-group may gather the same raw rows with a fused paged-row all-gather on a
-stream of its own instead (`ops/communication/README.md` in
+before its layer instead of queueing with those collectives. On SM100 and
+SM103 a KVP group may gather the same raw rows with a fused paged-row
+all-gather on a stream of its own instead (`ops/communication/README.md` in
 `tokenspeed-kernel`), still one window ahead: each owner reads its
 rows in place and stores them into every rank's receive slot. A slot holds the
 history-expansion capacity from every owner, so any one loop fits however its

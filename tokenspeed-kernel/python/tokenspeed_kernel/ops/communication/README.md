@@ -2,14 +2,14 @@
 
 ## Paged-row all-gather
 
-`cute_dsl_paged_row_all_gather` (GB300 only) all-gathers rows of a paged cache
-plane with the row pack fused into the transfer: each rank reads its own rows in
-`fetch_slots` order and stores them straight into every rank's receive slot,
-through the NVLink multicast address of one symmetric workspace (`multicast`
-mode) or with one store per peer (`peer` mode). The rows a reader addresses
-are byte-identical to an all-gather of the packed rows. The KVP prefix-history
-reads (`PrefixHistoryGather` in the runtime) use it in place of a copy plus an
-NCCL all-gather.
+`cute_dsl_paged_row_all_gather` (SM100 and SM103: GB200, GB300) all-gathers
+rows of a paged cache plane with the row pack fused into the transfer: each
+rank reads its own rows in `fetch_slots` order and stores them straight into
+every rank's receive slot, through the NVLink multicast address of one
+symmetric workspace (`multicast` mode) or with one store per peer (`peer`
+mode). The rows a reader addresses are byte-identical to an all-gather of the
+packed rows. The KVP prefix-history reads (`PrefixHistoryGather` in the
+runtime) use it in place of a copy plus an NCCL all-gather.
 
 ### Launch configuration
 
@@ -135,4 +135,4 @@ working "with no code changes needed in other components", which rely on the
 same hand-offs for their buffers. Neither document says at which scope a
 task-boundary fence orders writes across domains: that link is not documented,
 and the evidence for it is empirical (byte-exact gathers over long runs with
-concurrent compute and collectives).
+concurrent compute and collectives, on GB300).

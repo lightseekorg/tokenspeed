@@ -468,7 +468,7 @@ class FusedHistoryTransport:
 
     def __init__(self, state: PagedRowAllGatherState):
         # Not through select_kernel: a collective with state, whose platform
-        # the startup vote decided (no state off GB300).
+        # the startup vote decided (no state off SM100 and SM103).
         from tokenspeed_kernel.ops.communication.cute_dsl import (
             cute_dsl_paged_row_all_gather,
         )
@@ -693,7 +693,7 @@ def prepare_prefix_history_transport(
     if group in _FUSED_HISTORY_TRANSPORTS:
         return
     # Not through the registry: a collective state factory, which votes on the
-    # platform itself (every rank gets None off GB300).
+    # platform itself (every rank gets None off SM100 and SM103).
     from tokenspeed_kernel.ops.communication.cute_dsl import (
         create_paged_row_all_gather_state,
     )

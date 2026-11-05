@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""KVP prefix-history reads through the fused all-gather on GB300: the real
-``PrefixHistoryGather``, the real NCCL all-gather on the named KVP history
-groups, the real fused transport built by the startup function, and the MLA
-pool's own latent read.
+"""KVP prefix-history reads through the fused all-gather on SM100 and SM103:
+the real ``PrefixHistoryGather``, the real NCCL all-gather on the named KVP
+history groups, the real fused transport built by the startup function, and
+the MLA pool's own latent read.
 
 Every case reads a forward through an NCCL reader and a fused reader of the
 same rank-sharded fp8 MLA planes (every byte value, NaN and denormal patterns
@@ -1536,11 +1536,10 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_kvp_history_fused_gather(tmp_path, world_size):
-    if torch.cuda.device_count() < world_size or torch.cuda.get_device_capability() != (
-        10,
-        3,
+    if torch.cuda.device_count() < world_size or (
+        torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
     ):
-        pytest.skip(f"requires {world_size} node-local GB300 GPUs")
+        pytest.skip(f"requires {world_size} node-local SM100 or SM103 GPUs")
     mp.spawn(
         _worker,
         args=(world_size, f"file://{tmp_path / 'rendezvous'}"),

@@ -19,10 +19,11 @@
 # SOFTWARE.
 
 """The fused paged-row all-gather against NCCL's all-gather of the packed rows,
-on two and four node-local GB300 GPUs: every byte value, both slots, owners
-without rows, source offsets past 2**31, both modes with each group size's
-CTA count, windows of any row count on one compiled kernel, group-consistent
-refusals and argument errors, and the in-kernel failure records."""
+on two and four node-local SM100 or SM103 GPUs: every byte value, both slots,
+owners without rows, source offsets past 2**31, both modes with each group
+size's CTA count, windows of any row count on one compiled kernel,
+group-consistent refusals and argument errors, and the in-kernel failure
+records."""
 
 import json
 import multiprocessing
@@ -329,10 +330,13 @@ def _worker(rank, size, rendezvous):
 
 @pytest.mark.parametrize("size", [2, 4], ids=["tp2", "tp4"])
 def test_paged_row_all_gather(size, tmp_path):
-    if torch.cuda.device_count() < size or not kernel_supported(
-        "cute_dsl_paged_row_all_gather"
+    if (
+        torch.cuda.device_count() < size
+        or not kernel_supported("cute_dsl_paged_row_all_gather")
+        # The registered range admits 10.1 and 10.2 too.
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
     ):
-        pytest.skip(f"requires {size} node-local GB300 GPUs")
+        pytest.skip(f"requires {size} node-local SM100 or SM103 GPUs")
     mp.spawn(
         _worker,
         args=(size, f"file://{tmp_path / 'rendezvous'}"),
@@ -382,10 +386,13 @@ def test_paged_row_all_gather_failures(case, tmp_path):
     in a collective, and ``mp.spawn`` stops the others when one fails): the
     error records name the expected stage on every rank."""
     size = 4
-    if torch.cuda.device_count() < size or not kernel_supported(
-        "cute_dsl_paged_row_all_gather"
+    if (
+        torch.cuda.device_count() < size
+        or not kernel_supported("cute_dsl_paged_row_all_gather")
+        # The registered range admits 10.1 and 10.2 too.
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
     ):
-        pytest.skip(f"requires {size} node-local GB300 GPUs")
+        pytest.skip(f"requires {size} node-local SM100 or SM103 GPUs")
     # Imported once the platform is known to have CuTe DSL.
     from tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather import (
         STAGE_ENTRY_AHEAD,

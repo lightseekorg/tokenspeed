@@ -18,8 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused block-FP8 DP column and row projections and the fused paged-row
-all-gather on GB300."""
+"""Fused block-FP8 DP column and row projections on GB300, and the fused
+paged-row all-gather on SM100 and SM103."""
 
 import logging
 from typing import TYPE_CHECKING
@@ -242,7 +242,7 @@ def create_paged_row_all_gather_state(
         and current_platform().is_nvidia
         and device.type == "cuda"
         and device.index is not None
-        and torch.cuda.get_device_capability(device) == (10, 3)
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
         and degree in (2, 4, 8)
         and row_bytes > 0
         and row_bytes % 16 == 0
@@ -308,8 +308,8 @@ def create_paged_row_all_gather_state(
         if group.rank() == 0:
             logger.info(
                 f"paged_row_all_gather: ranks {ranks} keep their all-gather (a rank "
-                "is not eligible, or lacks the GB300 platform, group size, a slot "
-                "under 2 GiB, fabric or kernel module)"
+                "is not eligible, or lacks an SM100 or SM103 GPU, group size, a "
+                "slot under 2 GiB, fabric or kernel module)"
             )
         return None
     return build_paged_row_all_gather_state(
@@ -461,7 +461,7 @@ if current_platform().is_nvidia:
         name="cute_dsl_paged_row_all_gather",
         solution="cute_dsl",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 3),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
