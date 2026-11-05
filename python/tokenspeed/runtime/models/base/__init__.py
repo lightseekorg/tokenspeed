@@ -23,7 +23,6 @@ from tokenspeed.runtime.models.base.decoder_layer import (
     BaseDecoderLayer,
     BaseMoEDecoderLayer,
     CompiledDecoderLayer,
-    CompiledMoEDecoderLayer,
 )
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 
@@ -32,6 +31,5 @@ __all__ = [
     "BaseDecoderLayer",
     "BaseMoEDecoderLayer",
     "CompiledDecoderLayer",
-    "CompiledMoEDecoderLayer",
     "BaseTransformerModel",
 ]
