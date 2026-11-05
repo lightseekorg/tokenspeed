@@ -26,7 +26,7 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
 
@@ -1346,6 +1346,123 @@ def _attnres_partial_dual_kernel(
 
 
 @triton.jit
+def _attnres_partial_pair_kernel(
+    blocks_ptr,  # [KB, T, H]
+    wp_ptr,  # [H] precomputed rms_w * res_w
+    m_ptr,  # [T]
+    s_ptr,  # [T]
+    acc_ptr,  # [T, H] fp32
+    n_blocks,
+    n_cols: tl.constexpr,
+    stride_bk,
+    stride_bt,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    """``_attnres_partial_kernel`` with both column halves in one [2, BLOCK] tile.
+
+    Each half keeps its own 1-D summation tree, so results are bitwise equal on
+    64-lane waves, but a block pays one cross-wave reduction per quantity
+    instead of two.
+    """
+    t = tl.program_id(0)
+    n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
+    tl.static_assert(n_iters == 2)
+    cols = tl.arange(0, 2)[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+    mask = cols < n_cols
+    wp = tl.load(wp_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    acc = tl.zeros([2, BLOCK], tl.float32)
+    m_run = -float("inf")
+    s_run = 0.0
+    b = 0
+    while b < n_blocks:
+        base = blocks_ptr + b * stride_bk + t * stride_bt
+        v = tl.load(base + cols, mask=mask, other=0.0).to(tl.float32)
+        sq = tl.sum(tl.sum(v * v, axis=1), axis=0)
+        dot = tl.sum(tl.sum(v * wp, axis=1), axis=0)
+        rsig = tl.math.rsqrt(sq / n_cols + eps)
+        logit = dot * rsig
+        m_new = tl.maximum(m_run, logit)
+        corr = tl.exp(m_run - m_new)
+        wgt = tl.exp(logit - m_new)
+        acc = acc * corr + wgt * v
+        s_run = s_run * corr + wgt
+        m_run = m_new
+        b += 1
+    tl.store(acc_ptr + t * n_cols + cols, acc, mask=mask)
+    tl.store(m_ptr + t, m_run)
+    tl.store(s_ptr + t, s_run)
+
+
+@triton.jit
+def _attnres_partial_dual_pair_kernel(
+    blocks_ptr,  # [KB, T, H]
+    wp_a_ptr,  # [H] precomputed side-A rms_w * res_w
+    wp_b_ptr,  # [H] side-B product
+    m_a_ptr,
+    s_a_ptr,
+    acc_a_ptr,
+    m_b_ptr,
+    s_b_ptr,
+    acc_b_ptr,
+    n_blocks,
+    n_cols: tl.constexpr,
+    stride_bk,
+    stride_bt,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    """``_attnres_partial_dual_kernel`` with both column halves in one [2, BLOCK] tile.
+
+    Bitwise equal on 64-lane waves; see ``_attnres_partial_pair_kernel``.
+    """
+    t = tl.program_id(0)
+    n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
+    tl.static_assert(n_iters == 2)
+    cols = tl.arange(0, 2)[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+    mask = cols < n_cols
+    wa = tl.load(wp_a_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    wb = tl.load(wp_b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    acc_a = tl.zeros([2, BLOCK], tl.float32)
+    acc_b = tl.zeros([2, BLOCK], tl.float32)
+    m_a = -float("inf")
+    s_a = 0.0
+    m_b = -float("inf")
+    s_b = 0.0
+    b = 0
+    while b < n_blocks:
+        base = blocks_ptr + b * stride_bk + t * stride_bt
+        v = tl.load(base + cols, mask=mask, other=0.0).to(tl.float32)
+        sq = tl.sum(tl.sum(v * v, axis=1), axis=0)
+        rsig = tl.math.rsqrt(sq / n_cols + eps)
+        dot_a = tl.sum(tl.sum(v * wa, axis=1), axis=0)
+        logit_a = dot_a * rsig
+        m_an = tl.maximum(m_a, logit_a)
+        corr_a = tl.exp(m_a - m_an)
+        wgt_a = tl.exp(logit_a - m_an)
+        acc_a = acc_a * corr_a + wgt_a * v
+        s_a = s_a * corr_a + wgt_a
+        m_a = m_an
+        dot_b = tl.sum(tl.sum(v * wb, axis=1), axis=0)
+        logit_b = dot_b * rsig
+        m_bn = tl.maximum(m_b, logit_b)
+        corr_b = tl.exp(m_b - m_bn)
+        wgt_b = tl.exp(logit_b - m_bn)
+        acc_b = acc_b * corr_b + wgt_b * v
+        s_b = s_b * corr_b + wgt_b
+        m_b = m_bn
+        b += 1
+    tl.store(acc_a_ptr + t * n_cols + cols, acc_a, mask=mask)
+    tl.store(m_a_ptr + t, m_a)
+    tl.store(s_a_ptr + t, s_a)
+    tl.store(acc_b_ptr + t * n_cols + cols, acc_b, mask=mask)
+    tl.store(m_b_ptr + t, m_b)
+    tl.store(s_b_ptr + t, s_b)
+
+
+@triton.jit
 def _attnres_combine_kernel(
     prefix_ptr,  # [T, H]
     wp_ptr,  # [H] precomputed rms_w * res_w
@@ -1437,6 +1554,22 @@ def attnres_partial(blocks, wp, eps, scratch):
     """Blocks-side online-softmax partial. scratch = (m [T], s [T], acc [T,H] fp32)."""
     KB, T, H = blocks.shape
     m, s_, acc = scratch
+    if current_platform().is_amd:
+        _attnres_partial_pair_kernel[(T,)](
+            blocks,
+            wp,
+            m,
+            s_,
+            acc,
+            KB,
+            n_cols=H,
+            stride_bk=blocks.stride(0),
+            stride_bt=blocks.stride(1),
+            eps=eps,
+            BLOCK=4096,
+            num_warps=8,
+        )
+        return
     enable_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_partial_kernel[(T,)](
@@ -1469,6 +1602,26 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
     KB, T, H = blocks.shape
     m_a, s_a, acc_a = scratch_a
     m_b, s_b, acc_b = scratch_b
+    if current_platform().is_amd:
+        _attnres_partial_dual_pair_kernel[(T,)](
+            blocks,
+            wp_a,
+            wp_b,
+            m_a,
+            s_a,
+            acc_a,
+            m_b,
+            s_b,
+            acc_b,
+            KB,
+            n_cols=H,
+            stride_bk=blocks.stride(0),
+            stride_bt=blocks.stride(1),
+            eps=eps,
+            BLOCK=4096,
+            num_warps=8,
+        )
+        return
     enable_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_partial_dual_kernel[(T,)](
