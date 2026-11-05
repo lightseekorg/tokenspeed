@@ -2739,7 +2739,7 @@ def safe_metadata(table, lengths, pages, capacity, page_size):
 
 
 @triton.jit(
-    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
+    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP", "O0"],
 )
 def _clean_logits(
     X,
@@ -2753,13 +2753,14 @@ def _clean_logits(
     TC,
     NP,
     CAP,
+    O0,
     P: tl.constexpr,
     PAGED: tl.constexpr,
     LIVE_TILES_ONLY: tl.constexpr,
     B: tl.constexpr,
 ):
-    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    end = tl.load(L + row * L0)
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), CAP)
     if not LIVE_TILES_ONLY or tile * B < end:
         column = tile * B + tl.arange(0, B)
         valid = (column < CAP) & (column < end)
@@ -2771,13 +2772,13 @@ def _clean_logits(
         value = tl.load(X + row * X0 + column, valid, other=-float("inf"))
         # Write the entire last live 1024-value tile, including its -inf tail.
         # DeepSelect can prefetch the last 512-value segment before masking it.
-        tl.store(O + row * CAP + column, value, column < CAP)
+        tl.store(O + row * O0 + column, value, column < O0)
 
 
 def clean_logits(values, lengths, table, pages, capacity, page_size):
     """Copy logits, masking every future row and invalid page to -inf."""
     return _clean_logits_output(
-        values, lengths, table, pages, capacity, page_size, False
+        values, lengths, table, pages, capacity, page_size, 1, False
     )
 
 
@@ -2906,28 +2907,41 @@ def _reduce_blocks(
     BLOCK_SIZE: tl.constexpr,
     GROUP: tl.constexpr,
     PIN_NEWEST: tl.constexpr,
+    FULL_WIDTH: tl.constexpr,
+    ALIGNMENT: tl.constexpr,
     B: tl.constexpr,
 ):
-    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    block = tile * B + tl.arange(0, B)
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     lane = tl.arange(0, GROUP)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
-    position = block[:, None] * BLOCK_SIZE + lane[None, :]
-    value = tl.load(
-        X + row * X0 + position * X1,
-        (position < end) & (lane[None, :] < BLOCK_SIZE),
-        other=-float("inf"),
-    )
-    scores = tl.max(value, axis=1)
-    if PIN_NEWEST:
-        scores = tl.where(
-            (end > 0) & (block == (end - 1) // BLOCK_SIZE) & (scores > -float("inf")),
-            float("inf"),
-            scores,
+    count = tl.cdiv(end, BLOCK_SIZE)
+    if FULL_WIDTH:
+        stop = SW
+    else:
+        # Native selection may prefetch the final aligned segment before masking.
+        stop = tl.cdiv(count, ALIGNMENT) * ALIGNMENT
+    for start in range(tile * B, stop, tl.num_programs(1) * B):
+        block = start + tl.arange(0, B)
+        position = block[:, None] * BLOCK_SIZE + lane[None, :]
+        value = tl.load(
+            X + row * X0 + position * X1,
+            (position < end) & (lane[None, :] < BLOCK_SIZE),
+            other=-float("inf"),
         )
-    tl.store(S + row * S0 + block, scores, block < SW)
+        # torch.amax propagates NaNs, including in the pinned newest block.
+        has_nan = tl.sum((value != value).to(tl.int32), axis=1) != 0
+        scores = tl.where(has_nan, float("nan"), tl.max(value, axis=1))
+        if PIN_NEWEST:
+            scores = tl.where(
+                (end > 0)
+                & (block == (end - 1) // BLOCK_SIZE)
+                & (scores > -float("inf")),
+                float("inf"),
+                scores,
+            )
+        tl.store(S + row * S0 + block, scores, block < stop)
     if tile == 0:
-        tl.store(E + row, (end + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        tl.store(E + row, count)
 
 
 @triton.jit(
@@ -3078,6 +3092,41 @@ def prepare_native_dense_scores(logits, lengths, alignment):
     return prepare_scores(logits, lengths, 1, alignment, False)
 
 
+def prepare_native_block_scores(logits, lengths, block_size, alignment):
+    """Return FP32 block maxima/newest pin and clamped native exclusive ends.
+
+    Rows have ``alignment``-element padding. Only live blocks and their final
+    aligned segment are initialized; native consumers must honor the ends.
+    """
+    width = logits.shape[1]
+    logical_width = (width + block_size - 1) // block_size
+    stride = (logical_width + alignment - 1) // alignment * alignment
+    scores = torch.empty(
+        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
+    )
+    ends = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    if logits.shape[0]:
+        _reduce_blocks[(logits.shape[0], 32)](
+            logits,
+            lengths,
+            scores,
+            ends,
+            logits.stride(0),
+            logits.stride(1),
+            lengths.stride(0),
+            stride,
+            width,
+            stride,
+            block_size,
+            triton.next_power_of_2(block_size),
+            True,
+            False,
+            alignment,
+            128,
+        )
+    return scores, ends
+
+
 def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
     """Fuse causal masking/alignment, optionally block maxima and newest pin."""
     width = logits.shape[1]
@@ -3115,6 +3164,8 @@ def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
             block_size,
             triton.next_power_of_2(block_size),
             pin_newest,
+            True,
+            alignment,
             128,
         )
     return scores, end
@@ -4103,20 +4154,22 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
     return out
 
 
-def clean_logits_for_selection(values, lengths, table, pages, capacity, page_size):
-    """Copy valid logits for bounded DeepSelect consumers, preserving row layout.
+def clean_logits_for_selection(
+    values, lengths, table, pages, capacity, page_size, alignment
+):
+    """Copy valid logits to rows padded to ``alignment`` elements for DeepSelect.
 
     Every live 1024-value tile is fully initialized, including its -inf tail;
     wholly future tiles are unspecified. Consumers must pass exclusive ends.
     Ordinary clean_logits retains its full-width contract, including on Hopper.
     """
     return _clean_logits_output(
-        values, lengths, table, pages, capacity, page_size, True
+        values, lengths, table, pages, capacity, page_size, alignment, True
     )
 
 
 def _clean_logits_output(
-    values, lengths, table, pages, capacity, page_size, live_tiles_only
+    values, lengths, table, pages, capacity, page_size, alignment, live_tiles_only
 ):
     if (
         values.ndim != 2
@@ -4126,11 +4179,12 @@ def _clean_logits_output(
         or values.dtype not in (torch.float32, torch.bfloat16)
     ):
         raise RuntimeError("DeepGEMM returned incompatible score geometry")
+    stride = (capacity + alignment - 1) // alignment * alignment
     output = torch.empty(
-        (values.shape[0], capacity), dtype=values.dtype, device=values.device
+        (values.shape[0], stride), dtype=values.dtype, device=values.device
     )
     if output.numel():
-        _clean_logits[(values.shape[0], triton.cdiv(capacity, 1024))](
+        _clean_logits[(values.shape[0], triton.cdiv(stride, 1024))](
             values,
             lengths,
             table if table is not None else lengths,
@@ -4142,6 +4196,7 @@ def _clean_logits_output(
             table.shape[1] if table is not None else 0,
             pages,
             capacity,
+            stride,
             page_size,
             table is not None,
             live_tiles_only,
