@@ -33,6 +33,10 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
 
+buffer = gl.amd.cdna4.buffer
+# Non-temporal (NT) loads: the data is not expected to be reused.
+_STREAM = gl.constexpr(gl.amd.cdna4.CachePolicy(nontemporal=True))
+
 # Most rows the GEMV takes; more go to the split-K GEMM or torch.addmm.
 MAX_ROWS = 16
 # A program stages its whole weight row in LDS; longer rows go to torch.matmul.
@@ -259,11 +263,15 @@ def gluon_fp32_router_gemv_splitk_gfx950(
     # operand layouts would scatter them over many short reads.
     x_layout: gl.constexpr = _x_load_layout(WAVES, K_CHUNK)
     w_layout: gl.constexpr = _w_load_layout(WAVES, K_CHUNK)
+    # The scalar offset (soffset) of the x loads below starts them at this
+    # tile's first row, so their per-lane offsets stay within a tile.
+    x_rows = buffer.make_buffer_descriptor(x_ptr, M * K * 4)
+    w_rows = buffer.make_buffer_descriptor(weight_ptr, N * K * 4)
     # Rows past M read row M - 1 instead of masking (a masked load selects
     # after it lands, which waits for it); the store drops those rows.
     xm = gl.minimum(
-        m0 + gl.arange(0, BLOCK_M, gl.SliceLayout(0, gl.SliceLayout(2, x_layout))),
-        M - 1,
+        gl.arange(0, BLOCK_M, gl.SliceLayout(0, gl.SliceLayout(2, x_layout))),
+        M - 1 - m0,
     )
     xw = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, x_layout)))
     xk = gl.arange(0, K_CHUNK, gl.SliceLayout(0, gl.SliceLayout(1, x_layout)))
@@ -281,12 +289,13 @@ def gluon_fp32_router_gemv_splitk_gfx950(
         + wk[None, :, None]
     )
     # Issue every load before any MFMA, chunk by chunk, so the first MFMAs
-    # wait only for the first chunk; loads return in issue order.
-    x0 = gl.amd.cdna4.buffer_load(x_ptr, x_offs)
-    w0 = gl.amd.cdna4.buffer_load(weight_ptr, w_offs, cache=".cg")
+    # wait only for the first chunk; loads return in issue order. Each weight
+    # element is read once per call, so its loads are non-temporal (NT).
+    x0 = buffer.load(x_rows, x_offs, soffset=m0 * K)
+    w0 = buffer.load(w_rows, w_offs, cache_policy=_STREAM)
     if CHUNKS > 1:
-        x1 = gl.amd.cdna4.buffer_load(x_ptr, x_offs + K_CHUNK)
-        w1 = gl.amd.cdna4.buffer_load(weight_ptr, w_offs + K_CHUNK, cache=".cg")
+        x1 = buffer.load(x_rows, x_offs + K_CHUNK, soffset=m0 * K)
+        w1 = buffer.load(w_rows, w_offs + K_CHUNK, cache_policy=_STREAM)
     # Keep the loads above the MFMAs: left free, the scheduler sinks them
     # between MFMAs and waits on them one at a time.
     gl.amd.hint.sched_barrier()
@@ -306,35 +315,40 @@ def gluon_fp32_router_gemv_splitk_gfx950(
     om = gl.arange(0, BLOCK_M, gl.SliceLayout(1, out_layout))
     on = gl.arange(0, BLOCK_N, gl.SliceLayout(0, out_layout))
     tile_offs = om[:, None] * BLOCK_N + on[None, :]
-    gl.amd.cdna4.buffer_store(
+    # One descriptor covers every partial; the scalar offset picks one.
+    TILE: gl.constexpr = BLOCK_M * BLOCK_N
+    partials = buffer.make_buffer_descriptor(
+        partial_ptr, SPLIT_K * num_tiles * TILE * 4
+    )
+    # The programs of a tile can run on different XCDs, each with its own L2,
+    # so the partials are stored and read at system scope (SC0 SC1), which
+    # bypasses L2.
+    buffer.store(
         tile_acc,
-        partial_ptr + (split * num_tiles + tile) * (BLOCK_M * BLOCK_N),
+        partials,
         tile_offs,
-        cache=".wt",
+        soffset=(split * num_tiles + tile) * TILE,
+        scope="sys",
     )
     # Publish the partial as the split-K decode GEMM does (gemm/fp16/mm.py):
-    # ".wt" writes through to memory, each wave waits for its stores to
-    # complete, and the barrier orders every wave's stores before the counter
-    # bump; a release atomic would also write back and invalidate the whole L2.
+    # each wave waits for its stores to complete, and the barrier orders every
+    # wave's stores before the counter bump. A release atomic would instead
+    # write back this XCD's whole L2 (BUFFER_WBL2).
     release_drain()
     gl.barrier()
     arrived = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
     if arrived == SPLIT_K - 1:
         # Sum in split order, not arrival order, so results are deterministic.
-        # ".cv" reads bypass the caches, so partials from other XCDs are fresh.
-        tile_acc = gl.amd.cdna4.buffer_load(
-            partial_ptr + tile * (BLOCK_M * BLOCK_N), tile_offs, cache=".cv"
-        )
+        tile_acc = buffer.load(partials, tile_offs, soffset=tile * TILE, scope="sys")
         for s in gl.static_range(1, SPLIT_K):
-            tile_acc += gl.amd.cdna4.buffer_load(
-                partial_ptr + (s * num_tiles + tile) * (BLOCK_M * BLOCK_N),
-                tile_offs,
-                cache=".cv",
+            tile_acc += buffer.load(
+                partials, tile_offs, soffset=(s * num_tiles + tile) * TILE, scope="sys"
             )
         gl.store(counter_ptr + tile, 0)
-        gl.amd.cdna4.buffer_store(
+        out_rows = buffer.make_buffer_descriptor(out_ptr + m0 * N + n0, BLOCK_M * N * 4)
+        buffer.store(
             tile_acc * MULTIPLIER,
-            out_ptr + m0 * N + n0,
+            out_rows,
             om[:, None] * N + on[None, :],
             mask=(m0 + om < M)[:, None],
         )

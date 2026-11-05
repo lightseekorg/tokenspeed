@@ -206,7 +206,10 @@ each wave of a program owns one contiguous K slice. A wave loads its slice of
 both operands along K into registers, issues every load before the first
 `V_MFMA_F32_16X16X4_F32`, and the waves' tiles are summed. Each program stores
 its partial and bumps the tile's arrival counter; the last to arrive sums the
-partials in split order, scales, writes the tile and resets the counter.
+partials in split order, scales, writes the tile and resets the counter. A
+tile's programs can run on different XCDs, so partials are stored and loaded
+at system scope, which bypasses the per-XCD L2. Weight loads are
+non-temporal.
 
 ### gfx950 FP32 router with a decode GEMM
 
