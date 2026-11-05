@@ -219,9 +219,11 @@ class DFlash2(DFlash):
         is off) take the best edge; sampling rows draw from q, with noise
         keyed by the request's seed, this round's position and the drawn
         token id, so every TP rank draws the same token from the same
-        replicated scores. The kernel writes each request's chain straight
-        into ``RuntimeStates.future_draft_q``. Tensor-only, so it records
-        into the draft graph.
+        replicated scores. With the flag on, the kernel writes each request's
+        chain straight into ``RuntimeStates.future_draft_q`` (a request that
+        proposes nothing gets slot -1 on every node); with it off, into a
+        private scratch table nothing reads. Tensor-only, so it records into
+        the draft graph.
         """
         bs = candidate_ids.shape[0]
         draft_q = self._draft_q

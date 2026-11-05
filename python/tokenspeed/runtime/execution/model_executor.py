@@ -139,7 +139,6 @@ from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
-from tokenspeed.runtime.utils.spec_block_geometry import BLOCK_SPEC_ALGORITHMS
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -668,21 +667,7 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
-        # Trees keep their draft q per tree instead (bind_tree), and DFLASH
-        # (DFlash2) records a sparse q over its selector's candidates
-        # (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend):
-        # only the step drafters need the dense per-vocab rows.
-        if config.enable_speculative_sampling and not config.spec_draft_tree:
-            if config.spec_algo is None:
-                raise ValueError(
-                    "enable_speculative_sampling needs a speculative drafter to "
-                    "record proposal distributions for"
-                )
-            if config.spec_algo not in BLOCK_SPEC_ALGORITHMS:
-                self.runtime_states.init_draft_probs(
-                    spec_num_tokens=spec_num_tokens,
-                    reject_threshold=config.spec_reject_draft_prob_threshold,
-                )
+        self._init_draft_probs(config, spec_num_tokens)
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -1930,6 +1915,30 @@ class ModelExecutor:
             num_extends,
             ib.state_write_padding_pool_index,
         )
+
+    def _init_draft_probs(
+        self, config: ModelExecutorConfig, spec_num_tokens: int
+    ) -> None:
+        """Allocate the dense per-vocab draft q under --enable-speculative-sampling.
+
+        Trees keep their draft q per tree instead (bind_tree), and DFLASH
+        (DFlash2) records a sparse q over its selector's candidates
+        (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
+        The step drafters and DSpark sample from full-vocab logits and need
+        the dense rows.
+        """
+        if not config.enable_speculative_sampling or config.spec_draft_tree:
+            return
+        if config.spec_algo is None:
+            raise ValueError(
+                "enable_speculative_sampling needs a speculative drafter to "
+                "record proposal distributions for"
+            )
+        if config.spec_algo != "DFLASH":
+            self.runtime_states.init_draft_probs(
+                spec_num_tokens=spec_num_tokens,
+                reject_threshold=config.spec_reject_draft_prob_threshold,
+            )
 
     def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
