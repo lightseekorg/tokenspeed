@@ -226,6 +226,7 @@ def gluon_fp32_router_gemv_splitk_gfx950(
     gl.static_assert(CHUNKS == 1 or CHUNKS == 2, "1 or 2 chunks")
     K_CHUNK: gl.constexpr = K_WAVE // CHUNKS
     gl.static_assert(K_CHUNK % 16 == 0, "each chunk spans whole 16-deep K blocks")
+    gl.static_assert(N % BLOCK_N == 0, "N must tile evenly")
     pid = gl.program_id(0)
     num_n: gl.constexpr = N // BLOCK_N
     num_tiles = gl.cdiv(M, BLOCK_M) * num_n
