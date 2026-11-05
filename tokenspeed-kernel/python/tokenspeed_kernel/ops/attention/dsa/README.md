@@ -40,8 +40,9 @@ libraries. Select `solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
 and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`
 for serving. TRTLLM keeps its higher default priority, and also returns the
-LSE that decode context parallelism merges. The solution registers only when the installed FlashInfer provides the Prims-TS sparse MLA
-wrapper; otherwise such calls fall back to Triton. The indexer is unchanged.
+LSE that decode context parallelism merges. The solution registers only when
+the installed FlashInfer provides the Prims-TS sparse MLA wrapper; otherwise
+such calls fall back to Triton. The indexer is unchanged.
 
 The upstream plan owns PDL scheduling. This adapter requires PDL enabled and
 rejects an explicit disable request. The caller prepares Q and the selected
@@ -55,19 +56,12 @@ warmup. Use `tokenspeed_kernel.workspace.capture_session(graph)` when capturing
 standalone calls. Captured plans live with their graph owner. Graphs sharing
 a plan must replay in order; concurrent streams need their own warmed plans.
 
-The comparison environment uses FlashInfer 0.7.2 and CUTLASS DSL 4.8.0.
-Only `flashinfer/attention/prims_ts` is replaced with the PR revision above;
-the TRTLLM adapter and cubins keep their original versions. From the repo root:
+The adapter tests check both solutions against an FP32 reference. From the
+repo root:
 
 ```bash
 python -m pytest tokenspeed-kernel/test/nvidia/ops/test_dsa_flashinfer_prims.py
-python tokenspeed-kernel/test/nvidia/ops/bench_dsa_flashinfer_prims.py --output /tmp/dsa-comparison
 ```
-
-The benchmark checks both outputs against a separate FP32 reference. It times
-the registered adapters under CUDA graphs, including head padding and copies.
-It reports hot-L2 and cold-L2 times for 12 and 96 local heads. JIT compilation
-and host planning are excluded. These are kernel times, not serving throughput.
 
 ## Speculative verify width
 
