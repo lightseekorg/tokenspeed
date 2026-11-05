@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
@@ -171,6 +173,41 @@ def _dsa_score_4x128(
 
 
 @gluon.jit
+def _dsa_score_4x128_regs(
+    q0,
+    q1,
+    q2,
+    q3,
+    kv_smem: gl.shared_memory_descriptor,
+    k_layout: gl.constexpr,
+    score_layout: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    TILE_K: gl.constexpr,
+):
+    """The 512-wide score product with the query phases already in registers."""
+
+    phase: gl.constexpr = 128
+    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+    scores = gl.amd.cdna4.mfma(q0, kv_smem.slice(0, phase, 0).load(k_layout), scores)
+    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+    score_tile = gl.amd.cdna4.mfma(
+        q1, kv_smem.slice(phase, phase, 0).load(k_layout), score_tile
+    )
+    scores += score_tile
+    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+    score_tile = gl.amd.cdna4.mfma(
+        q2, kv_smem.slice(2 * phase, phase, 0).load(k_layout), score_tile
+    )
+    scores += score_tile
+    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+    score_tile = gl.amd.cdna4.mfma(
+        q3, kv_smem.slice(3 * phase, phase, 0).load(k_layout), score_tile
+    )
+    scores += score_tile
+    return scores
+
+
+@gluon.jit
 def _dsa_value_4x128(
     probs_smem: gl.shared_memory_descriptor,
     kv_smem: gl.shared_memory_descriptor,
@@ -292,7 +329,15 @@ def _dsa_store_output(
     )
 
 
-@gluon.jit
+# The split count and LSE strides follow the batch; output strides stay 16-aligned.
+@gluon.jit(
+    do_not_specialize=(
+        "stride_lse_t",
+        "stride_lse_h",
+        "stride_lse_s",
+        "num_kv_splits",
+    )
+)
 def _dsa_dense_mfma_kv_kernel(
     q,
     kv,
@@ -312,6 +357,7 @@ def _dsa_dense_mfma_kv_kernel(
     stride_topk_t: tl.int64,
     scale: tl.float32,
     num_heads: tl.int32,
+    num_kv_splits: tl.int32,
     TOPK: gl.constexpr,
     BLOCK_H: gl.constexpr,
     TILE_K: gl.constexpr,
@@ -321,7 +367,7 @@ def _dsa_dense_mfma_kv_kernel(
     CONVERT_INPUTS: gl.constexpr,
     NATIVE_FP8: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
-    NUM_KV_SPLITS: gl.constexpr,
+    SPLIT_KV: gl.constexpr,
 ):
     # CDNA4 exposes the FP8 MFMA at K=32. Keeping FP8 operands native halves
     # the score/value instruction count and avoids per-tile BF16 expansion.
@@ -463,7 +509,7 @@ def _dsa_dense_mfma_kv_kernel(
 
     token_idx = gl.program_id(axis=0)
     hg_idx = gl.program_id(axis=1)
-    if NUM_KV_SPLITS > 1:
+    if SPLIT_KV:
         split_idx = gl.program_id(axis=2)
     else:
         split_idx: gl.constexpr = 0
@@ -545,9 +591,9 @@ def _dsa_dense_mfma_kv_kernel(
         gl.minimum(gl.maximum(valid_len, 0), TOPK),
         TILE_K,
     )
-    if NUM_KV_SPLITS > 1:
-        tile_start = (split_idx * total_tiles) // NUM_KV_SPLITS
-        tile_end = ((split_idx + 1) * total_tiles) // NUM_KV_SPLITS
+    if SPLIT_KV:
+        tile_start = (split_idx * total_tiles) // num_kv_splits
+        tile_end = ((split_idx + 1) * total_tiles) // num_kv_splits
         split_has_tiles = tile_start < tile_end
         num_tiles = gl.maximum(tile_end - tile_start, 1)
     else:
@@ -872,7 +918,7 @@ def _dsa_dense_mfma_kv_kernel(
         BLOCK_H,
         smem_dtype,
     )
-    if NUM_KV_SPLITS > 1:
+    if SPLIT_KV:
         o_base = (
             token_idx.to(tl.int64) * stride_o_t + split_idx.to(tl.int64) * stride_o_s
         )
@@ -892,7 +938,7 @@ def _dsa_dense_mfma_kv_kernel(
         blk_out_phase,
         BLOCK_H,
     )
-    if NUM_KV_SPLITS > 1:
+    if SPLIT_KV:
         lse = gl.where(l_new > 0.0, m_new + gl.log(l_new), -float("inf"))
         lse = gl.convert_layout(lse, gl.SliceLayout(1, mfma_s))
         offs_h_lse = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_s))
@@ -910,21 +956,350 @@ def _dsa_dense_mfma_kv_kernel(
         )
 
 
-@triton.jit
+@gluon.jit
+def _load_selected(topk_indices, idx_row, offsets, TOPK: gl.constexpr):
+    """A row's selected KV slots at ``offsets``, -1 past ``TOPK``."""
+    return gl.amd.cdna4.buffer_load(
+        ptr=topk_indices, offsets=idx_row + offsets, mask=offsets < TOPK, other=-1
+    )
+
+
+# Same contract as _dsa_dense_mfma_kv_kernel for native FP8 with 64 RoPE dims.
+@gluon.jit(
+    do_not_specialize=(
+        "stride_lse_t",
+        "stride_lse_h",
+        "stride_lse_s",
+        "num_kv_splits",
+    )
+)
+def _dsa_sparse_prefill_fp8_kernel(
+    q,
+    kv,
+    topk_indices,
+    topk_lens,
+    out,
+    partial_lse,
+    stride_q_t: tl.int64,
+    stride_q_h: tl.int64,
+    stride_kv_t: tl.int64,
+    stride_o_t: tl.int64,
+    stride_o_h: tl.int64,
+    stride_o_s: tl.int64,
+    stride_lse_t: tl.int64,
+    stride_lse_h: tl.int64,
+    stride_lse_s: tl.int64,
+    stride_topk_t: tl.int64,
+    scale: tl.float32,
+    num_heads: tl.int32,
+    num_kv_splits: tl.int32,
+    TOPK: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    TILE_K: gl.constexpr,
+    D_V: gl.constexpr,
+    D_ROPE: gl.constexpr,
+    NATIVE_E5M2: gl.constexpr,
+    SPLIT_KV: gl.constexpr,
+):
+    """Native-FP8 sparse MLA for prefill rows, one key tile at a time.
+
+    The per-tile work is a short dependent chain (gather, score, cross-wave
+    softmax, value product), so throughput comes from CTAs per CU rather than
+    from prefetch depth: the query sits in registers, each tile loads its
+    selected indices from global memory (an LDS copy of the row's selection
+    would cost a CTA per CU), and one key tile buffer keeps four CTAs per CU
+    at the launch's four waves per EU.
+    """
+    instr_k: gl.constexpr = 32
+    QK_K_WIDTH: gl.constexpr = 16
+    PV_K_WIDTH: gl.constexpr = 8
+    INPUT_VEC: gl.constexpr = 16
+    ROPE_LOAD_VEC: gl.constexpr = 4
+    SHARED_INTERVAL: gl.constexpr = 1024
+    SHARED_PADDING: gl.constexpr = 32
+    LAST_TILE: gl.constexpr = (TOPK + TILE_K - 1) // TILE_K - 1
+    mfma_qk: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, instr_k], transposed=True, warps_per_cta=[1, 4]
+    )
+    mfma_s: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, instr_k], transposed=True, warps_per_cta=[4, 1]
+    )
+    softmax_layout: gl.constexpr = mfma_qk
+    softmax_scalar_layout: gl.constexpr = gl.SliceLayout(1, softmax_layout)
+    mfma_acc: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, instr_k],
+        transposed=True,
+        warps_per_cta=[1, 4],
+        tiles_per_warp=[1, 2],
+    )
+    blk_out_phase: gl.constexpr = _value_output_layout(BLOCK_H)
+    _qrope_tpw_k: gl.constexpr = min(64, D_ROPE // INPUT_VEC)
+    blk_qrope: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, INPUT_VEC],
+        threads_per_warp=[64 // _qrope_tpw_k, _qrope_tpw_k],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+    _klora_tpw_m: gl.constexpr = min(64, D_V // INPUT_VEC)
+    blk_klora: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[INPUT_VEC, 1],
+        threads_per_warp=[_klora_tpw_m, 64 // _klora_tpw_m],
+        warps_per_cta=[1, 4],
+        order=[0, 1],
+    )
+    _krope_tpw_m: gl.constexpr = min(64, D_ROPE // ROPE_LOAD_VEC)
+    blk_krope: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[ROPE_LOAD_VEC, 1],
+        threads_per_warp=[_krope_tpw_m, 64 // _krope_tpw_m],
+        warps_per_cta=[1, 4],
+        order=[0, 1],
+    )
+    sh_qrope: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=INPUT_VEC, per_phase=2, max_phase=8, order=[1, 0]
+    )
+    sh_klora: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[SHARED_INTERVAL, SHARED_PADDING]], [D_V, TILE_K], [0, 1]
+    )
+    sh_krope: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=INPUT_VEC, per_phase=2, max_phase=8, order=[0, 1]
+    )
+    sh_probs: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[SHARED_INTERVAL, SHARED_PADDING]], [BLOCK_H, TILE_K], [1, 0]
+    )
+    dot_qlora_a: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_qk, k_width=QK_K_WIDTH
+    )
+    dot_qrope_a: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_qk, k_width=QK_K_WIDTH
+    )
+    dot_klora_b: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_qk, k_width=QK_K_WIDTH
+    )
+    dot_krope_b: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_qk, k_width=QK_K_WIDTH
+    )
+    dot_p_a: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_acc, k_width=PV_K_WIDTH
+    )
+    dot_v_b: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_acc, k_width=PV_K_WIDTH
+    )
+    smem_dtype: gl.constexpr = gl.float8e5 if NATIVE_E5M2 else gl.float8e4nv
+
+    token_idx = gl.program_id(axis=0)
+    hg_idx = gl.program_id(axis=1)
+    if SPLIT_KV:
+        split_idx = gl.program_id(axis=2)
+    else:
+        split_idx: gl.constexpr = 0
+    hg_offset = hg_idx * BLOCK_H
+    valid_len = gl.load(topk_lens + token_idx).to(tl.int32)
+    q_base = token_idx.to(tl.int64) * stride_q_t
+
+    offs_h_qrope = hg_offset + gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, blk_qrope)
+    )
+    offs_r_qrope = gl.arange(0, D_ROPE, layout=gl.SliceLayout(0, blk_qrope))
+    q_offs_rope = (
+        q_base
+        + offs_h_qrope[:, None].to(tl.int64) * stride_q_h
+        + (D_V + offs_r_qrope[None, :]).to(tl.int64)
+    )
+    smem_qrope = gl.allocate_shared_memory(
+        smem_dtype, [BLOCK_H, D_ROPE], layout=sh_qrope
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        dest=smem_qrope,
+        ptr=q,
+        offsets=q_offs_rope.to(tl.int32),
+        mask=(offs_h_qrope < num_heads)[:, None],
+    )
+    gl.amd.cdna4.async_copy.commit_group()
+
+    offs_h_qdot = hg_offset + gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, dot_qlora_a)
+    )
+    offs_v_qdot = gl.arange(0, 128, layout=gl.SliceLayout(0, dot_qlora_a))
+    q_offs_dot = (
+        q_base
+        + offs_h_qdot[:, None].to(tl.int64) * stride_q_h
+        + offs_v_qdot[None, :].to(tl.int64)
+    ).to(tl.int32)
+    mask_h_qdot = (offs_h_qdot < num_heads)[:, None]
+    q_dot0 = gl.amd.cdna4.buffer_load(
+        ptr=q, offsets=q_offs_dot, mask=mask_h_qdot, other=0.0
+    )
+    q_dot1 = gl.amd.cdna4.buffer_load(
+        ptr=q, offsets=q_offs_dot + 128, mask=mask_h_qdot, other=0.0
+    )
+    q_dot2 = gl.amd.cdna4.buffer_load(
+        ptr=q, offsets=q_offs_dot + 256, mask=mask_h_qdot, other=0.0
+    )
+    q_dot3 = gl.amd.cdna4.buffer_load(
+        ptr=q, offsets=q_offs_dot + 384, mask=mask_h_qdot, other=0.0
+    )
+
+    idx_row = (token_idx.to(tl.int64) * stride_topk_t).to(tl.int32)
+
+    total_tiles = gl.cdiv(gl.minimum(gl.maximum(valid_len, 0), TOPK), TILE_K)
+    if SPLIT_KV:
+        tile_start = (split_idx * total_tiles) // num_kv_splits
+        tile_end = ((split_idx + 1) * total_tiles) // num_kv_splits
+        num_tiles = gl.maximum(tile_end - tile_start, 1)
+    else:
+        tile_start: gl.constexpr = 0
+        tile_end = total_tiles
+        num_tiles = gl.maximum(total_tiles, 1)
+
+    local_offs_klora = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_klora))
+    local_offs_krope = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_krope))
+    local_offs_mma = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, softmax_layout))
+    offs_v_klora = gl.arange(0, D_V, layout=gl.SliceLayout(1, blk_klora))
+    offs_r_krope = gl.arange(0, D_ROPE, layout=gl.SliceLayout(1, blk_krope))
+    smem_krope = gl.allocate_shared_memory(
+        smem_dtype, [D_ROPE, TILE_K], layout=sh_krope
+    )
+    smem_klora = gl.allocate_shared_memory(smem_dtype, [D_V, TILE_K], layout=sh_klora)
+    smem_probs = gl.allocate_shared_memory(
+        smem_dtype, [BLOCK_H, TILE_K], layout=sh_probs
+    )
+
+    gl.amd.cdna4.async_copy.wait_group(0)
+    q_rope_dot = smem_qrope.load(dot_qrope_a)
+    offs_h_mma = hg_offset + gl.arange(0, BLOCK_H, layout=softmax_scalar_layout)
+    mask_h_mma = offs_h_mma < num_heads
+    m_i = gl.full(
+        [BLOCK_H], float("-inf"), dtype=gl.float32, layout=softmax_scalar_layout
+    )
+    l_i = gl.full([BLOCK_H], 0.0, dtype=gl.float32, layout=softmax_scalar_layout)
+    acc0 = gl.zeros([BLOCK_H, 128], dtype=gl.float32, layout=blk_out_phase)
+    acc1 = gl.zeros([BLOCK_H, 128], dtype=gl.float32, layout=blk_out_phase)
+    acc2 = gl.zeros([BLOCK_H, 128], dtype=gl.float32, layout=blk_out_phase)
+    acc3 = gl.zeros([BLOCK_H, 128], dtype=gl.float32, layout=blk_out_phase)
+    for i in range(num_tiles):
+        tile = tile_start + i
+        live = tile < tile_end
+        # An empty split still runs one fully masked tile.
+        idx_base = gl.minimum(tile, LAST_TILE) * TILE_K
+        idx_k = _load_selected(topk_indices, idx_row, idx_base + local_offs_klora, TOPK)
+        idx_r = _load_selected(topk_indices, idx_row, idx_base + local_offs_krope, TOPK)
+        valid_k = live & ((tile * TILE_K + local_offs_klora) < valid_len) & (idx_k >= 0)
+        valid_r = live & ((tile * TILE_K + local_offs_krope) < valid_len) & (idx_r >= 0)
+        klora_offs = gl.where(valid_k, idx_k, 0)[None, :].to(
+            tl.int64
+        ) * stride_kv_t + offs_v_klora[:, None].to(tl.int64)
+        krope_offs = gl.where(valid_r, idx_r, 0)[None, :].to(tl.int64) * stride_kv_t + (
+            D_V + offs_r_krope[:, None]
+        ).to(tl.int64)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dest=smem_klora,
+            ptr=kv,
+            offsets=klora_offs.to(tl.int32),
+            mask=valid_k[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dest=smem_krope,
+            ptr=kv,
+            offsets=krope_offs.to(tl.int32),
+            mask=valid_r[None, :],
+        )
+        gl.amd.cdna4.async_copy.commit_group()
+        idx_m = _load_selected(topk_indices, idx_row, idx_base + local_offs_mma, TOPK)
+        valid_mma = live & ((tile * TILE_K + local_offs_mma) < valid_len) & (idx_m >= 0)
+        gl.amd.cdna4.async_copy.wait_group(0)
+
+        scores = _dsa_score_4x128_regs(
+            q_dot0,
+            q_dot1,
+            q_dot2,
+            q_dot3,
+            smem_klora,
+            dot_klora_b,
+            mfma_qk,
+            BLOCK_H,
+            TILE_K,
+        )
+        scores = gl.amd.cdna4.mfma(q_rope_dot, smem_krope.load(dot_krope_b), scores)
+        probs, alpha, m_i, l_i = _dsa_online_softmax(
+            scores, valid_mma, mask_h_mma, m_i, l_i, scale
+        )
+        acc0, acc1, acc2, acc3 = _dsa_value_4x128(
+            smem_probs,
+            smem_klora,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            alpha,
+            probs,
+            dot_p_a,
+            dot_v_b,
+            mfma_acc,
+            blk_out_phase,
+            BLOCK_H,
+            smem_dtype,
+        )
+
+    if SPLIT_KV:
+        o_base = (
+            token_idx.to(tl.int64) * stride_o_t + split_idx.to(tl.int64) * stride_o_s
+        )
+    else:
+        o_base = token_idx.to(tl.int64) * stride_o_t
+    _dsa_store_output(
+        out,
+        acc0,
+        acc1,
+        acc2,
+        acc3,
+        l_i,
+        o_base,
+        stride_o_h,
+        hg_offset,
+        num_heads,
+        blk_out_phase,
+        BLOCK_H,
+    )
+    if SPLIT_KV:
+        lse = gl.where(l_i > 0.0, m_i + gl.log(l_i), -float("inf"))
+        lse = gl.convert_layout(lse, gl.SliceLayout(1, mfma_s))
+        offs_h_lse = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_s))
+        lse_offsets = (
+            token_idx.to(tl.int64) * stride_lse_t
+            + offs_h_lse.to(tl.int64) * stride_lse_h
+            + split_idx.to(tl.int64) * stride_lse_s
+        )
+        gl.amd.cdna4.buffer_store(
+            stored_value=lse,
+            ptr=partial_lse,
+            offsets=lse_offsets.to(tl.int32),
+            mask=offs_h_lse < num_heads,
+        )
+
+
+@triton.jit(
+    do_not_specialize=(
+        "stride_lse_t",
+        "stride_lse_h",
+        "num_kv_splits",
+    )
+)
 def _dsa_dense_mfma_reduce_kernel(
     partial_out,
     partial_lse,
     out,
-    stride_po_t: tl.constexpr,
-    stride_po_h: tl.constexpr,
-    stride_po_s: tl.constexpr,
-    stride_lse_t: tl.constexpr,
-    stride_lse_h: tl.constexpr,
-    stride_lse_s: tl.constexpr,
-    stride_o_t: tl.constexpr,
-    stride_o_h: tl.constexpr,
-    NUM_KV_SPLITS: tl.constexpr,
+    stride_po_t,
+    stride_po_h,
+    stride_po_s,
+    stride_lse_t,
+    stride_lse_h,
+    stride_lse_s,
+    stride_o_t,
+    stride_o_h,
+    num_kv_splits,
     D_V: tl.constexpr,
+    MAX_SPLITS: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -933,20 +1308,31 @@ def _dsa_dense_mfma_reduce_kernel(
     partial_base = token_idx * stride_po_t + head_idx * stride_po_h
 
     max_lse = -float("inf")
-    for split_idx in range(NUM_KV_SPLITS):
-        split_lse = tl.load(partial_lse + lse_base + split_idx * stride_lse_s)
+    for split_idx in tl.static_range(MAX_SPLITS):
+        split_lse = tl.load(
+            partial_lse + lse_base + split_idx * stride_lse_s,
+            mask=split_idx < num_kv_splits,
+            other=-float("inf"),
+        )
         max_lse = tl.maximum(max_lse, split_lse)
 
     denom = 0.0
     acc = tl.zeros([D_V], dtype=tl.float32)
     safe_max_lse = tl.where(max_lse > -float("inf"), max_lse, 0.0)
-    for split_idx in range(NUM_KV_SPLITS):
-        split_lse = tl.load(partial_lse + lse_base + split_idx * stride_lse_s)
+    for split_idx in tl.static_range(MAX_SPLITS):
+        live = split_idx < num_kv_splits
+        split_lse = tl.load(
+            partial_lse + lse_base + split_idx * stride_lse_s,
+            mask=live,
+            other=-float("inf"),
+        )
         split_valid = split_lse > -float("inf")
         safe_split_lse = tl.where(split_valid, split_lse, 0.0)
         weight = tl.where(split_valid, tl.exp(safe_split_lse - safe_max_lse), 0.0)
         partial = tl.load(
-            partial_out + partial_base + split_idx * stride_po_s + offs_v
+            partial_out + partial_base + split_idx * D_V + offs_v,
+            mask=live,
+            other=0.0,
         ).to(tl.float32)
         acc += weight * partial
         denom += weight
@@ -1344,6 +1730,7 @@ def _run_dense_kv(
     qk_rope_head_dim: int,
     is_prefill: bool,
     out: torch.Tensor | None = None,
+    warm_split_variants: bool = False,
 ) -> torch.Tensor:
     if out is None:
         out = torch.empty(
@@ -1351,16 +1738,12 @@ def _run_dense_kv(
             dtype=_output_dtype(q),
             device=q.device,
         )
-    # Direct-to-shared copies preserve the source bits. Mixed inputs must
-    # convert to the common BF16 compute format before their shared store.
-    convert_inputs = q.dtype != kv_cache.dtype
     native_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
     # Use the configured selected-key capacity for scheduling.
     # Per-row live/causal lengths stay in topk_lens and are loaded by the
     # kernel. This keeps graph replay on one compiled object when those
     # runtime lengths change.
-    num_kv_splits = _select_num_kv_splits(
-        num_tokens=q.shape[0],
+    schedule = dict(
         num_heads=q.shape[1],
         topk_width=topk_slots.shape[1],
         max_seqlen_k=int(topk_slots.shape[1]),
@@ -1369,6 +1752,63 @@ def _run_dense_kv(
         qk_rope_head_dim=qk_rope_head_dim,
         is_prefill=is_prefill,
     )
+    launch = functools.partial(
+        _launch_dense_kv,
+        softmax_scale=softmax_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=is_prefill,
+    )
+    if warm_split_variants and q.shape[0] > 0:
+        # One row per reduce bucket compiles every split variant serving can reach.
+        for num_kv_splits in _warmup_split_counts(q.shape[0], **schedule):
+            launch(
+                q[:1],
+                kv_cache,
+                topk_slots[:1],
+                topk_lens[:1],
+                out[:1],
+                num_kv_splits=num_kv_splits,
+            )
+    launch(
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens,
+        out,
+        num_kv_splits=_select_num_kv_splits(num_tokens=q.shape[0], **schedule),
+    )
+    return out
+
+
+@functools.cache
+def _warmup_split_counts(max_tokens: int, **schedule) -> tuple[int, ...]:
+    """One split count per reduce bucket that up to ``max_tokens`` rows select."""
+    by_bucket: dict[int, int] = {}
+    for num_tokens in range(1, max_tokens + 1):
+        num_kv_splits = _select_num_kv_splits(num_tokens=num_tokens, **schedule)
+        if num_kv_splits > 1:
+            by_bucket.setdefault(triton.next_power_of_2(num_kv_splits), num_kv_splits)
+    return tuple(by_bucket.values())
+
+
+def _launch_dense_kv(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    num_kv_splits: int,
+    softmax_scale: float,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    is_prefill: bool,
+) -> None:
+    # Direct-to-shared copies preserve the source bits. Mixed inputs must
+    # convert to the common BF16 compute format before their shared store.
+    convert_inputs = q.dtype != kv_cache.dtype
+    native_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
     if num_kv_splits == 1:
         stage_out = out
         partial_lse = out
@@ -1396,7 +1836,7 @@ def _run_dense_kv(
             num_kv_splits,
         )
 
-    _dsa_dense_mfma_kv_kernel[grid](
+    args = (
         q,
         kv_cache,
         topk_slots,
@@ -1415,26 +1855,41 @@ def _run_dense_kv(
         topk_slots.stride(0),
         float(softmax_scale),
         q.shape[1],
+        num_kv_splits,
         topk_slots.shape[1],
-        D_V=kv_lora_rank,
-        # Keep the compile-time matrix shape MFMA-compatible for no-RoPE models;
-        # HAS_ROPE removes its storage, loads, and score term.
-        D_ROPE=max(qk_rope_head_dim, 64),
-        HAS_ROPE=qk_rope_head_dim > 0,
-        CONVERT_INPUTS=convert_inputs,
-        NATIVE_FP8=native_fp8,
-        NATIVE_E5M2=(
-            q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
-        ),
-        NUM_KV_SPLITS=num_kv_splits,
-        BLOCK_H=16,
-        TILE_K=64 if qk_rope_head_dim == 0 else 32,
-        num_warps=4,
-        # Bound how far the SLP vectorizer moves instructions. Unbounded, it
-        # splits the in-loop KV prefetch around an LDS wait; with the bound,
-        # the default machine scheduler beats iterative-ilp for BF16 too.
-        llvm_cl_opts="slp-schedule-budget=100",
     )
+    if is_prefill and native_fp8 and qk_rope_head_dim == 64:
+        _dsa_sparse_prefill_fp8_kernel[grid](
+            *args,
+            BLOCK_H=16,
+            TILE_K=64,
+            D_V=kv_lora_rank,
+            D_ROPE=qk_rope_head_dim,
+            NATIVE_E5M2=q.dtype == torch.float8_e5m2,
+            SPLIT_KV=num_kv_splits > 1,
+            num_warps=4,
+            # Four CTAs per CU: their LDS fits, and 128 VGPRs hold the loop.
+            waves_per_eu=4,
+        )
+    else:
+        _dsa_dense_mfma_kv_kernel[grid](
+            *args,
+            D_V=kv_lora_rank,
+            # MFMA-legal shape for no-RoPE models; HAS_ROPE=False removes all RoPE work.
+            D_ROPE=max(qk_rope_head_dim, 64),
+            HAS_ROPE=qk_rope_head_dim > 0,
+            CONVERT_INPUTS=convert_inputs,
+            NATIVE_FP8=native_fp8,
+            NATIVE_E5M2=(
+                q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
+            ),
+            SPLIT_KV=num_kv_splits > 1,
+            BLOCK_H=16,
+            TILE_K=64 if qk_rope_head_dim == 0 else 32,
+            num_warps=4,
+            # Unbounded SLP splits the in-loop KV prefetch around an LDS wait.
+            llvm_cl_opts="slp-schedule-budget=100",
+        )
     if num_kv_splits > 1:
         _dsa_dense_mfma_reduce_kernel[(q.shape[0], q.shape[1])](
             stage_out,
@@ -1448,11 +1903,11 @@ def _run_dense_kv(
             partial_lse.stride(2),
             out.stride(0),
             out.stride(1),
-            NUM_KV_SPLITS=num_kv_splits,
+            num_kv_splits,
             D_V=kv_lora_rank,
+            MAX_SPLITS=triton.next_power_of_2(num_kv_splits),
             num_warps=4,
         )
-    return out
 
 
 def _run_dense_kv_scalar(
@@ -1545,6 +2000,7 @@ def _run_dsa(
     out: torch.Tensor | None,
     max_seqlen_k: int,
     is_prefill: bool,
+    warm_split_variants: bool,
 ) -> torch.Tensor:
     _check_inputs(
         q,
@@ -1620,6 +2076,7 @@ def _run_dsa(
                 qk_rope_head_dim=qk_rope_head_dim,
                 is_prefill=is_prefill,
                 out=out_view,
+                warm_split_variants=warm_split_variants,
             )
         else:
             result = _run_dense_kv_scalar(
@@ -1657,6 +2114,7 @@ def launch_gluon_dsa_decode_gfx950(
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    warm_split_variants: bool = False,
 ) -> torch.Tensor:
     del q_len_per_req
     if logit_cap != 0.0 or return_lse:
@@ -1676,6 +2134,7 @@ def launch_gluon_dsa_decode_gfx950(
         out=out,
         max_seqlen_k=max_seqlen_k,
         is_prefill=False,
+        warm_split_variants=warm_split_variants,
     )
 
 
@@ -1696,6 +2155,7 @@ def launch_gluon_dsa_prefill_gfx950(
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    warm_split_variants: bool = False,
 ) -> torch.Tensor:
     del q_len_per_req
     if logit_cap != 0.0 or return_lse:
@@ -1715,4 +2175,5 @@ def launch_gluon_dsa_prefill_gfx950(
         out=out,
         max_seqlen_k=max_seqlen_k,
         is_prefill=True,
+        warm_split_variants=warm_split_variants,
     )

@@ -28,6 +28,11 @@ The draft's attention is *not* K3's. K3 runs NoPE MLA with an output gate; this
 draft is a DeepSeek-V3-style RoPE MLA with YaRN scaling. Only the 576-element
 latent KV shape is shared, which is what lets the draft's pages sit alongside
 the target's rather than in a second format.
+
+Kimi-K3.1's draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`) has the same
+layout. Its block attends causally (``dflash_config.causal``, see
+``block_draft_is_causal``), and its YaRN ``attn_factor`` sets the RoPE
+magnitude.
 """
 
 from __future__ import annotations
@@ -61,6 +66,7 @@ class KimiK3DSparkConfig(PretrainedConfig):
         kv_lora_rank: int = 512,
         qk_nope_head_dim: int = 128,
         qk_rope_head_dim: int = 64,
+        qk_head_dim: int | None = None,
         v_head_dim: int = 128,
         mla_use_nope: bool = False,
         mla_use_output_gate: bool = False,
@@ -82,6 +88,8 @@ class KimiK3DSparkConfig(PretrainedConfig):
         markov_head_type: str = "vanilla",
         enable_confidence_head: bool = True,
         confidence_head_with_markov: bool = True,
+        sample_from_anchor: bool = True,
+        rope_interleave: bool = True,
         **kwargs,
     ) -> None:
         self.hidden_size = int(hidden_size)
@@ -93,6 +101,12 @@ class KimiK3DSparkConfig(PretrainedConfig):
         self.kv_lora_rank = int(kv_lora_rank)
         self.qk_nope_head_dim = int(qk_nope_head_dim)
         self.qk_rope_head_dim = int(qk_rope_head_dim)
+        # Kimi-K3.1's draft spells the sum out; it must agree with the parts.
+        if qk_head_dim is not None and int(qk_head_dim) != self.qk_head_dim:
+            raise ValueError(
+                f"K3 DSpark qk_head_dim={qk_head_dim} is not qk_nope_head_dim + "
+                f"qk_rope_head_dim = {self.qk_head_dim}."
+            )
         self.v_head_dim = int(v_head_dim)
         self.mla_use_nope = bool(mla_use_nope)
         self.mla_use_output_gate = bool(mla_use_output_gate)
@@ -118,6 +132,17 @@ class KimiK3DSparkConfig(PretrainedConfig):
         self.markov_head_type = str(markov_head_type).lower()
         self.enable_confidence_head = bool(enable_confidence_head)
         self.confidence_head_with_markov = bool(confidence_head_with_markov)
+        if not sample_from_anchor:
+            raise ValueError(
+                "K3 DSpark drafts its block from the anchor token "
+                "(sample_from_anchor=true); this draft asks otherwise."
+            )
+        # The draft's DeepSeek-V3 MLA rotates interleaved pairs.
+        if not rope_interleave:
+            raise ValueError(
+                "K3 DSpark rotates interleaved RoPE pairs (rope_interleave=true); "
+                "this draft asks otherwise."
+            )
         if not kwargs.get("architectures"):
             # The published K3 DSpark config may omit ``architectures``. The
             # runtime model registry dispatches by this field, so materialize
@@ -162,6 +187,8 @@ class KimiK3DSparkConfig(PretrainedConfig):
                 "beta_slow",
                 "mscale",
                 "mscale_all_dim",
+                "attn_factor",
+                "extrapolation_factor",
             )
             if key in params
         }
