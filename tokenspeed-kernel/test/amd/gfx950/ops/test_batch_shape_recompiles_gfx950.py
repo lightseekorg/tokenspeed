@@ -27,12 +27,7 @@ specialization class, then sweep the batch-dependent value inside
 
 import pytest
 import torch
-from utils import (
-    assert_no_triton_compile,
-    int_specialization_class,
-    is_cdna4,
-    warm_specialization_classes,
-)
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -260,7 +255,7 @@ def test_mxfp4_moe_sorting_route_count():
     experts, topk, block = 64, 8, 32
     generator = torch.Generator(device=DEVICE).manual_seed(3)
 
-    def run(tokens):
+    def run(tokens, block=block):
         ids = torch.randint(
             0, experts, (tokens, topk), device=DEVICE, generator=generator
         ).int()
@@ -289,24 +284,18 @@ def test_mxfp4_moe_sorting_route_count():
         torch.testing.assert_close(sorted_weights[position], weights.flatten()[flat])
         assert torch.equal(block_experts[position // block], ids.flatten()[flat])
 
-    def key(tokens):
-        routes = tokens * topk
-        programs = max(experts, -(-routes // 1024))
-        per_program = -(-routes // programs)
-        counts = (routes, programs, per_program)
-        return (
-            *map(int_specialization_class, counts),
-            1 << (per_program - 1).bit_length(),
-        )
-
-    # Route counts from 8K to 16K share one power-of-two route block.
-    sweep = (1033, 1100, 1500, 2000)
-    warm_specialization_classes(run, key, sweep, range(1030, 2049))
+    # Prefill sizes vary routes per program and the padding block; neither recompiles.
+    sweep = (100, 300, 1033, 1100, 3000, 8000)
+    run(1030)
     with assert_no_triton_compile(
-        moe_sorting._moe_sorting_stage1_kernel, moe_sorting._moe_sorting_stage4_kernel
+        moe_sorting._moe_sorting_stage1_kernel,
+        moe_sorting._moe_sorting_stage2_kernel,
+        moe_sorting._moe_sorting_stage3_kernel,
+        moe_sorting._moe_sorting_stage4_kernel,
     ):
         for tokens in sweep:
-            run(tokens)
+            for padding_block in (16, 32, 64, 128):
+                run(tokens, padding_block)
 
 
 def test_moe_topk_row_count():
