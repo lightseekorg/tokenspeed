@@ -4016,3 +4016,50 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 torch.testing.assert_close(actual_tap, expected_tap, rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("limit_matches", [True, False])
+def test_mega_moe_takes_the_shared_expert_once(monkeypatch, limit_matches):
+    """The MoE hands its FP8 shared expert to a kernel that fuses it, once, and
+    keeps it when MegaMoE would clamp it with a different SwiGLU limit."""
+    metadata = vars(_loader_config())
+    metadata["hidden_size"] = 256
+    metadata["moe_intermediate_size"] = 256
+    config = v41.DeepseekV41Config(text_config=metadata).text_config
+    mapping = _mapping(1, 1, 2)
+    _mock_loader_hardware(monkeypatch, mapping)
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
+    )
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
+    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    shared = moe.shared_experts
+    assert shared.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+    if not limit_matches:
+        shared.act_fn.swiglu_limit = 2 * moe.experts.swiglu_arg.limit
+    calls = []
+
+    def fuse(plan, layer, *tensors):
+        calls.append((layer, tensors))
+        return True
+
+    moe.experts.plan["fuse_shared_expert"] = fuse
+    # The mocked loader hardware stubs the routed weight processing.
+    moe.experts._weights_processed = True
+    moe.process_weights_after_loading(moe)
+    moe.process_weights_after_loading(moe)
+
+    assert moe.shared_expert_fused is limit_matches
+    if not limit_matches:
+        assert calls == []
+        return
+    assert len(calls) == 1
+    layer, tensors = calls[0]
+    assert layer is moe.experts
+    params = (
+        shared.gate_up_proj.weight,
+        shared.gate_up_proj.weight_scale_inv,
+        shared.down_proj.weight,
+        shared.down_proj.weight_scale_inv,
+    )
+    assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))

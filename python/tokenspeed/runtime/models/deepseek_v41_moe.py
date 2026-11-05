@@ -293,6 +293,8 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             self.shared_experts = None
+        # Set once MegaMoE runs the shared expert inside its own launch.
+        self.shared_expert_fused = False
 
         if self.use_mega_moe and global_server_args_dict["moe_mxfp4_fp8_activation"]:
             raise ValueError(
@@ -335,6 +337,37 @@ class DeepseekV4MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             hash_routing=self.gate.tid2eid is not None,
             weights_dtype=self.experts.topk_weights_dtype,
+        )
+
+    def process_weights_after_loading(self, module: nn.Module) -> None:
+        # Loaders call this once per module. The sharded-state loader calls it
+        # before copying a saved state in, which then holds the fused layout,
+        # as the routed experts' processing expects too.
+        self.fuse_shared_expert()
+
+    def fuse_shared_expert(self) -> None:
+        """Hand the shared expert to MegaMoE when its kernel can run it.
+
+        The shared expert's weights are then laid out in place for MegaMoE and
+        its own forward is no longer used.
+        """
+        shared = self.shared_experts
+        if not self.use_mega_moe or shared is None or self.shared_expert_fused:
+            return
+        gate_up, down = shared.gate_up_proj, shared.down_proj
+        if (
+            gate_up.weight.dtype != torch.float8_e4m3fn
+            or down.weight.dtype != torch.float8_e4m3fn
+            # MegaMoE clamps every expert with the routed experts' limit.
+            or shared.act_fn.swiglu_limit != self.experts.swiglu_arg.limit
+        ):
+            return
+        self.experts.process_weights_after_loading(self.experts)
+        self.shared_expert_fused = self.experts.fuse_shared_expert(
+            gate_up.weight.data,
+            gate_up.weight_scale_inv.data,
+            down.weight.data,
+            down.weight_scale_inv.data,
         )
 
     def warmup(self) -> None:
@@ -432,6 +465,16 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
+        if self.shared_expert_fused:
+            # The routed output already includes the shared expert.
+            with nvtx_range("moe_mega_experts"):
+                return self._forward_routed_experts(
+                    hidden_states,
+                    topk_output,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
+                    do_finalize=True,
+                )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_mega_experts"):
