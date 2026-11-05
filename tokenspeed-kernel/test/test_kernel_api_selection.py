@@ -367,6 +367,7 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
         "gluon_petit_mxfp4_megamoe_apply": Priority.SPECIALIZED + 3,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
         # Prefer packed routing while keeping overlapping Gluon selectable.
+        "triton_kimi3_packed_sigmoid_bias_topk_gfx950": Priority.SPECIALIZED + 1,
         "triton_kimi3_packed_sigmoid_bias_topk_gfx1250": Priority.SPECIALIZED + 1,
     }
     actual_offsets = {
@@ -2559,6 +2560,41 @@ def _attention_dsa_prefill_topk_standard(
     )
 
 
+def _attention_dsa_decode_topk_bf16_plane(
+    index_heads: int, weights_dtype: torch.dtype
+) -> object:
+    return _attention_dsa_pkg.dsa_decode_topk(
+        torch.empty((2, index_heads, 128), dtype=torch.bfloat16),
+        torch.empty((2, index_heads), dtype=weights_dtype),
+        torch.tensor([64, 64], dtype=torch.int32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        batch_invariant=False,
+        index_k_cache=torch.zeros((128, 128), dtype=torch.bfloat16),
+        slot_order="selection",
+    )
+
+
+def _attention_dsa_prefill_topk_bf16_plane(
+    index_heads: int, weights_dtype: torch.dtype
+) -> object:
+    return _attention_dsa_pkg.dsa_prefill_topk(
+        torch.empty((2, index_heads, 128), dtype=torch.bfloat16),
+        torch.empty((2, index_heads), dtype=weights_dtype),
+        torch.arange(64, dtype=torch.int64),
+        torch.tensor([0, 8], dtype=torch.int32),
+        torch.tensor([8, 16], dtype=torch.int32),
+        topk=512,
+        softmax_scale=1.0,
+        batch_invariant=False,
+        index_k_cache=torch.zeros((128, 128), dtype=torch.bfloat16),
+        page_size=64,
+        slot_order="selection",
+    )
+
+
 @pytest.mark.parametrize("index_heads", [32, 64])
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
 def test_dsa_topk_selection_receives_index_heads(
@@ -3519,6 +3555,48 @@ def test_triton_decode_sigmoid_topk_priority_beats_broad_gluon(
     assert triton_spec.priority == Priority.SPECIALIZED + 1
     assert gluon_spec.priority == Priority.SPECIALIZED
     assert selected.name == "triton_decode_sigmoid_bias_topk"
+
+
+def test_gfx950_sigmoid_topk_selects_by_token_count(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    packed_spec = registry.get_by_name("triton_kimi3_packed_sigmoid_bias_topk_gfx950")
+    gluon_spec = registry.get_by_name("gluon_sigmoid_bias_topk_gfx950")
+    if packed_spec is None or gluon_spec is None:
+        pytest.skip("gfx950 sigmoid top-k kernels are unavailable")
+
+    signature = format_signature(
+        router_logits=dense_tensor_format(torch.float32),
+    )
+
+    def select(tokens: int, **kwargs) -> str:
+        return select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": tokens, "experts": 896, "topk": 16},
+            **kwargs,
+        ).name
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        decode = select(1)
+        verify = select(4)
+        last_packed = select(512)
+        past_packed = select(513)
+        forced_gluon = select(4, solution="gluon")
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert decode == "triton_decode_sigmoid_bias_topk"
+    assert verify == "triton_kimi3_packed_sigmoid_bias_topk_gfx950"
+    assert last_packed == "triton_kimi3_packed_sigmoid_bias_topk_gfx950"
+    assert past_packed == "gluon_sigmoid_bias_topk_gfx950"
+    assert forced_gluon == "gluon_sigmoid_bias_topk_gfx950"
 
 
 def test_gfx1250_sigmoid_topk_selects_by_token_count(
@@ -6300,27 +6378,49 @@ _CASES = [
             "cdna4",
             "attention",
             operation,
-            expected,
+            # FP8 queries take the multi-row scorers; BF16 queries the standard ones.
+            f"gluon_{operation}_{'fp8_rows' if dtype == torch.float8_e4m3fn else 'standard'}"
+            "_gfx950",
             lambda heads=heads, dtype=dtype, layout=layout, invoke=invoke: invoke(
                 heads, dtype, layout
             ),
             id_suffix=(f"h{heads}-{str(dtype).removeprefix('torch.')}-{layout}"),
         )
-        for operation, expected, invoke in (
-            (
-                "dsa_decode_topk",
-                "gluon_dsa_decode_topk_standard_gfx950",
-                _attention_dsa_decode_topk_standard,
-            ),
-            (
-                "dsa_prefill_topk",
-                "gluon_dsa_prefill_topk_standard_gfx950",
-                _attention_dsa_prefill_topk_standard,
-            ),
+        for operation, invoke in (
+            ("dsa_decode_topk", _attention_dsa_decode_topk_standard),
+            ("dsa_prefill_topk", _attention_dsa_prefill_topk_standard),
         )
         for heads in (32, 64)
         for dtype in (torch.bfloat16, torch.float8_e4m3fn)
         for layout in ("packed", "page_planar")
+    ),
+    # A bf16 index-K plane selects only the bf16 scorers.
+    *(
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            operation,
+            expected,
+            partial(invoke, heads, weights_dtype),
+            id_suffix=(
+                f"bf16-plane-h{heads}-w{str(weights_dtype).removeprefix('torch.')}"
+            ),
+        )
+        for operation, expected, invoke in (
+            (
+                "dsa_decode_topk",
+                "gluon_dsa_decode_topk_bf16_gfx950",
+                _attention_dsa_decode_topk_bf16_plane,
+            ),
+            (
+                "dsa_prefill_topk",
+                "gluon_dsa_prefill_topk_bf16_gfx950",
+                _attention_dsa_prefill_topk_bf16_plane,
+            ),
+        )
+        for heads in (32, 64)
+        for weights_dtype in (torch.bfloat16, torch.float32)
     ),
     _case(
         _is_cdna4,

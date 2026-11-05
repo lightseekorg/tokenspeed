@@ -86,6 +86,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_N_BLOCK,
 )
 
+_NUM_XCDS = 8
+
 
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
     """Permute a 3-D MoE weight into the (16, 16) MFMA-tile layout.
@@ -910,6 +912,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     A_FORMAT: gl.constexpr,
     OUTPUT_FP8: gl.constexpr,
     INPUT_SORTED: gl.constexpr,
+    NUM_XCDS: gl.constexpr = 1,
 ):
     """Stage 1 kernel with per-token A gather and fused SwiGLU.
 
@@ -960,6 +963,23 @@ def gluon_mxfp4_moe_stage1_kernel(
     # physical BLOCK_N tile for each OUTPUT_BLOCK_N result tile; separate
     # layouts issue gate and up MFMAs for the same output tile.
     num_pid_n = gl.cdiv(I_r, OUTPUT_BLOCK_N)
+    # Keep an expert's tiles on one XCD for L2 reuse; only tiles with routes are spread.
+    if NUM_XCDS != 1:
+        valid_pid_m = gl.cdiv(gl.load(num_tokens_post_padded_ptr), BLOCK_M)
+        grid_mn = gl.minimum(valid_pid_m, num_pid_m) * num_pid_n
+        if pid < grid_mn:
+            pids_per_xcd = (grid_mn + NUM_XCDS - 1) // NUM_XCDS
+            tall_xcds = grid_mn % NUM_XCDS
+            tall_xcds = gl.where(tall_xcds == 0, NUM_XCDS, tall_xcds)
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            pid = gl.where(
+                xcd < tall_xcds,
+                xcd * pids_per_xcd + local_pid,
+                tall_xcds * pids_per_xcd
+                + (xcd - tall_xcds) * (pids_per_xcd - 1)
+                + local_pid,
+            )
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -2526,6 +2546,7 @@ def invoke_gluon_mxfp4_moe_stage1(
         A_FORMAT=a_format,
         OUTPUT_FP8=output_format == "e4m3",
         INPUT_SORTED=bool(input_sorted),
+        NUM_XCDS=_NUM_XCDS,
         num_warps=NUM_WARPS,
         # Interleaving the MFMAs with the next K tile's loads makes the 128-row
         # E2M1 tile faster. Narrower tiles lose occupancy to the extra registers
