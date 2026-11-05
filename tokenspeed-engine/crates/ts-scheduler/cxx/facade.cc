@@ -274,6 +274,16 @@ StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
     };
 }
 
+PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::HostCacheStats stats = scheduler.GetHostCacheStats();
+    return PrefixHitView{
+        .prompt_tokens = stats.prefix_hits.prompt_tokens,
+        .device_hit_tokens = stats.prefix_hits.device_hit_tokens,
+        .host_hit_tokens = stats.prefix_hits.host_hit_tokens,
+        .l3_hit_tokens = stats.storage_query_hit_tokens,
+    };
+}
+
 bool clear_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearCache(); }
 
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearL1Cache(); }
