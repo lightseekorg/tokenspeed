@@ -327,12 +327,9 @@ def _dsa_store_output(
     )
 
 
-# Split count and workspace strides follow the batch, so one binary serves every split.
+# The split count and LSE strides follow the batch; output strides stay 16-aligned.
 @gluon.jit(
     do_not_specialize=(
-        "stride_o_t",
-        "stride_o_h",
-        "stride_o_s",
         "stride_lse_t",
         "stride_lse_h",
         "stride_lse_s",
@@ -968,9 +965,6 @@ def _load_selected(topk_indices, idx_row, offsets, TOPK: gl.constexpr):
 # Same contract as _dsa_dense_mfma_kv_kernel for native FP8 with 64 RoPE dims.
 @gluon.jit(
     do_not_specialize=(
-        "stride_o_t",
-        "stride_o_h",
-        "stride_o_s",
         "stride_lse_t",
         "stride_lse_h",
         "stride_lse_s",
@@ -1284,14 +1278,9 @@ def _dsa_sparse_prefill_fp8_kernel(
 
 @triton.jit(
     do_not_specialize=(
-        "stride_po_t",
-        "stride_po_h",
-        "stride_po_s",
         "stride_lse_t",
         "stride_lse_h",
         "stride_lse_s",
-        "stride_o_t",
-        "stride_o_h",
         "num_kv_splits",
     )
 )
