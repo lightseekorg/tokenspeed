@@ -38,14 +38,10 @@ from __future__ import annotations
 
 from tokenspeed_kernel._triton import libdevice, tl, triton
 
-# Draft depth d >= 1's children enter the pool at path score * DEPTH_DECAY^(d + 1).
-DEPTH_DECAY = tl.constexpr(0.9999)
 # The depth update's sort network size (width * K children at most) and sort list head.
 MAX_CHILDREN = 64
 MAX_VERIFY = 256
 MAX_MASK_WORDS = 4
-# Verify tree nodes per request.
-MAX_TREE_NODES = tl.constexpr(64)
 
 
 @triton.jit(do_not_specialize=["rows", "node_stride", "work_stride", "sort_stride"])
@@ -211,6 +207,9 @@ def _draft_depth_update_kernel(
     are device int32 ``[1]`` scalars, so one compiled launch serves every
     round.
     """
+    # Draft depth d >= 1's children enter the pool at path score * DEPTH_DECAY^(d + 1).
+    DEPTH_DECAY: tl.constexpr = 0.9999
+
     b = tl.program_id(0).to(tl.int64)
     width = tl.load(width_ptr)
     cumu_count = tl.load(cumu_count_ptr)
@@ -426,6 +425,9 @@ def _write_verify_tree_kernel(
     ``MAX_TREE_NODES``) and ``BLOCK_S`` (a power of two covering it) are
     constexpr; ``live_rows`` and ``verify_num`` are device int32 ``[1]``.
     """
+    # Verify tree nodes per request.
+    MAX_TREE_NODES: tl.constexpr = 64
+
     b = tl.program_id(0)
     if b < tl.load(live_rows_ptr):
         verify_num = tl.load(verify_num_ptr)

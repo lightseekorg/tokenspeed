@@ -26,7 +26,7 @@ Every kernel is a single program (grid ``(1,)``) running a scalar state
 machine over:
 
 * ``state``: int32 ``[NUM_STATE]``, the scalars indexed by the ``_TINY`` ..
-  ``_TABLE_WIDTH`` constants below;
+  ``_TABLE_WIDTH`` constants each kernel defines;
 * ``slots``: contiguous int32 ``[4, tree_depth + 1]``, per depth its
   width (lanes expanded), cumu_start (first pool node of its children),
   work_size (entries the next work deltas merge; 0: none) and go
@@ -48,70 +48,22 @@ from __future__ import annotations
 
 from tokenspeed_kernel._triton import tl, triton
 
-# The kernels read these globals, and Triton only lets @triton.jit code read a
-# global made with tl.constexpr(...) (a plain int raises NameError at compile).
-# The plain ints below (NUM_STATE, MAX_*, ...) are only used on the host.
-
+# Host-side sizes. Each kernel defines the state scalars and table columns it
+# reads as local tl.constexpr values.
 # Scalars of the int32 state tensor.
-_TINY = tl.constexpr(0)
-_TIER = tl.constexpr(1)
-_SAMPLED_NEXT = tl.constexpr(2)
-_SAMPLED_PLAN = tl.constexpr(3)
-_SAMPLED_SEEN = tl.constexpr(4)
-_BENCH_BATCH_SIZE = tl.constexpr(5)
-_RANKED_COUNT = tl.constexpr(6)
-_BATCH_SIZE = tl.constexpr(7)
-_SAMPLED = tl.constexpr(8)
-_COST_ID = tl.constexpr(9)
-_INTERVAL = tl.constexpr(10)
-_VARIANT = tl.constexpr(11)
-_HIST_MAX = tl.constexpr(12)
-_PAST_VERIFY_NUM = tl.constexpr(13)
-_LAST_DEPTH = tl.constexpr(14)
-_STOP_WIDTH = tl.constexpr(15)
-_CUMU_COUNT = tl.constexpr(16)
-_VERIFY_COUNT = tl.constexpr(17)
-_FLAT = tl.constexpr(18)
-_VERIFY_NUM = tl.constexpr(19)
-_TABLE_WIDTH = tl.constexpr(20)
 NUM_STATE = 21
-
-# Tiers, then the cost variant (and verify floor) of a tiny round; tier_table holds
-# the verify floor per variant, then the width per tier.
-_TINY_VARIANT = tl.constexpr(4)
-_VARIANTS = tl.constexpr(5)
+# tier_table: the verify floor per cost variant, then the width per tier.
 TIER_TABLE_SIZE = 9
 # Columns of batch_table.
-_COST_ID_COL = tl.constexpr(0)
-_CHAIN_TIER_ROW_COL = tl.constexpr(1)
-_INTERVALS_COL = tl.constexpr(2)
-_CACHE_STEP_COL = tl.constexpr(3)
-_TABLE_WIDTH_COL = tl.constexpr(4)
 BATCH_COLS = 5
-# Entries of a chain cost row per depth, and of a tree round's cost row copy.
-_GAIN_DENOM = tl.constexpr(0)
-_STEP_COST = tl.constexpr(1)
-_CHAIN_THRESHOLD = tl.constexpr(2)
-_CLIFF_GAIN_DENOM = tl.constexpr(3)
-_CLIFF_COST = tl.constexpr(4)
+# fp64 entries of a chain cost row per depth.
 CHAIN_F64 = 5
-_ROUND_DRAFT_COST = tl.constexpr(0)
-_ROUND_MODEL_COST_RATIO = tl.constexpr(1)
-_ROUND_THRESHOLDS = tl.constexpr(2)
-# Columns of interval_i32: the measured width count, then the widths.
-_WIDTHS_COL = tl.constexpr(1)
 # Capacities: verify history, measured widths, tree depth, ranked shapes.
 MAX_HISTORY = 32
 MAX_WIDTHS = 32
 MAX_DEPTH = 32
 RANK_MAX_ROWS = 32
 RANK_MAX_COLS = 64
-# The ranked-score scan's blocked layout: 128 threads of 16 items each.
-_SCAN_THREADS = tl.constexpr(128)
-_SCAN_ITEMS = tl.constexpr(16)
-
-_INT32_MIN = tl.constexpr(-(2**31))
-_INT32_MAX = tl.constexpr(2**31 - 1)
 
 
 @triton.jit
@@ -198,6 +150,9 @@ def _commit(
     """Takes depth d's decision (a sampled round stops only at its planned
     depth): stops the round (its counts, the next sampled round's plan) or
     returns depth d + 1's slots."""
+    # The cost variant (and verify floor) of a tiny round.
+    _TINY_VARIANT: tl.constexpr = 4
+
     is_sampled = sampled != 0
     sampled_seen = tl.where(
         is_sampled & cost_stop & (sampled_seen < 0), d, sampled_seen
@@ -313,6 +268,41 @@ def _policy_begin_round_kernel(
     strides, table sizes, ``chain_past_verify_num``, ``verify_num`` and
     ``min_verify_count``.
     """
+    # Scalars of the int32 state tensor.
+    _TINY: tl.constexpr = 0
+    _TIER: tl.constexpr = 1
+    _SAMPLED_NEXT: tl.constexpr = 2
+    _SAMPLED_PLAN: tl.constexpr = 3
+    _SAMPLED_SEEN: tl.constexpr = 4
+    _BATCH_SIZE: tl.constexpr = 7
+    _SAMPLED: tl.constexpr = 8
+    _COST_ID: tl.constexpr = 9
+    _INTERVAL: tl.constexpr = 10
+    _VARIANT: tl.constexpr = 11
+    _HIST_MAX: tl.constexpr = 12
+    _PAST_VERIFY_NUM: tl.constexpr = 13
+    _LAST_DEPTH: tl.constexpr = 14
+    _STOP_WIDTH: tl.constexpr = 15
+    _CUMU_COUNT: tl.constexpr = 16
+    _VERIFY_COUNT: tl.constexpr = 17
+    _FLAT: tl.constexpr = 18
+    _VERIFY_NUM: tl.constexpr = 19
+    _TABLE_WIDTH: tl.constexpr = 20
+    # The cost variant (and verify floor) of a tiny round.
+    _TINY_VARIANT: tl.constexpr = 4
+    # Cost variants.
+    _VARIANTS: tl.constexpr = 5
+    # Columns of batch_table.
+    _COST_ID_COL: tl.constexpr = 0
+    _CHAIN_TIER_ROW_COL: tl.constexpr = 1
+    _INTERVALS_COL: tl.constexpr = 2
+    _CACHE_STEP_COL: tl.constexpr = 3
+    _TABLE_WIDTH_COL: tl.constexpr = 4
+    # Entries of a tree round's cost row copy.
+    _ROUND_THRESHOLDS: tl.constexpr = 2
+    # The int32 range.
+    _INT32_MIN: tl.constexpr = -(2**31)
+
     tiny = tl.load(state_ptr + _TINY)
     tier = tl.load(state_ptr + _TIER)
     sampled_next = tl.load(state_ptr + _SAMPLED_NEXT)
@@ -553,6 +543,37 @@ def _policy_decide_kernel(
     int64 bit pattern of an fp64. Constexpr: ``NODE_TOP_K``,
     ``TREE_DEPTH``, ``CHAIN``.
     """
+    # Scalars of the int32 state tensor.
+    _TINY: tl.constexpr = 0
+    _TIER: tl.constexpr = 1
+    _SAMPLED_NEXT: tl.constexpr = 2
+    _SAMPLED_PLAN: tl.constexpr = 3
+    _SAMPLED_SEEN: tl.constexpr = 4
+    _BENCH_BATCH_SIZE: tl.constexpr = 5
+    _BATCH_SIZE: tl.constexpr = 7
+    _SAMPLED: tl.constexpr = 8
+    _HIST_MAX: tl.constexpr = 12
+    _PAST_VERIFY_NUM: tl.constexpr = 13
+    _LAST_DEPTH: tl.constexpr = 14
+    _STOP_WIDTH: tl.constexpr = 15
+    _CUMU_COUNT: tl.constexpr = 16
+    _VERIFY_COUNT: tl.constexpr = 17
+    _FLAT: tl.constexpr = 18
+    _VERIFY_NUM: tl.constexpr = 19
+    _TABLE_WIDTH: tl.constexpr = 20
+    # Cost variants.
+    _VARIANTS: tl.constexpr = 5
+    # Entries of a chain cost row per depth.
+    _GAIN_DENOM: tl.constexpr = 0
+    _STEP_COST: tl.constexpr = 1
+    _CHAIN_THRESHOLD: tl.constexpr = 2
+    _CLIFF_GAIN_DENOM: tl.constexpr = 3
+    _CLIFF_COST: tl.constexpr = 4
+    # Entries of a tree round's cost row copy.
+    _ROUND_DRAFT_COST: tl.constexpr = 0
+    _ROUND_MODEL_COST_RATIO: tl.constexpr = 1
+    _ROUND_THRESHOLDS: tl.constexpr = 2
+
     d = depth
     depth_slots: tl.constexpr = TREE_DEPTH + 1
     tiny = tl.load(state_ptr + _TINY)
@@ -692,6 +713,9 @@ def _shift_in(values, offs, n, value):
 def _scan_item(top_ptr, top_stride, means, t, i, rows, cols, flat):
     """Blocked item ``i`` of scan thread ``t``: entry ``t * 16 + i`` of the
     scanned scores (zero past them)."""
+    # The ranked-score scan's blocked layout: 128 threads of 16 items each.
+    _SCAN_ITEMS: tl.constexpr = 16
+
     e = t * _SCAN_ITEMS + i
     n = tl.where(flat, rows * cols, cols)
     ok = e < n
@@ -772,6 +796,26 @@ def _policy_select_verify_kernel(
     ``recent`` and the batch size's ``hist`` row, and ``verify_i32`` gives
     the next tier. All parameters are runtime values.
     """
+    # Scalars of the int32 state tensor.
+    _TIER: tl.constexpr = 1
+    _BENCH_BATCH_SIZE: tl.constexpr = 5
+    _RANKED_COUNT: tl.constexpr = 6
+    _BATCH_SIZE: tl.constexpr = 7
+    _SAMPLED: tl.constexpr = 8
+    _COST_ID: tl.constexpr = 9
+    _INTERVAL: tl.constexpr = 10
+    _VERIFY_COUNT: tl.constexpr = 17
+    _FLAT: tl.constexpr = 18
+    _VERIFY_NUM: tl.constexpr = 19
+    # Column of interval_i32 where the measured widths start.
+    _WIDTHS_COL: tl.constexpr = 1
+    # The ranked-score scan's blocked layout: 128 threads of 16 items each.
+    _SCAN_THREADS: tl.constexpr = 128
+    _SCAN_ITEMS: tl.constexpr = 16
+    # The int32 range.
+    _INT32_MIN: tl.constexpr = -(2**31)
+    _INT32_MAX: tl.constexpr = 2**31 - 1
+
     bs = tl.load(state_ptr + _BATCH_SIZE)
     if bs > 0:
         bench_batch_size = tl.load(state_ptr + _BENCH_BATCH_SIZE)
