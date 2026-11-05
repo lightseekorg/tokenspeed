@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gc
 import importlib.util
 import json
 import os
@@ -1020,6 +1021,13 @@ def test_cuda_host_table_gather_matches_device_shard():
         AssertionError("host gather must not register")
     )
     host_embed(ids, query_shard=None)
+    torch.cuda.synchronize()
+    weight = host_embed.weight.detach()
+    scale = host_embed.scale.detach()
+    del host_embed
+    gc.collect()
+    assert not weight.is_pinned()
+    assert not scale.is_pinned()
 
 
 @pytest.mark.parametrize("counts", [(2, 1, 1, 1), (1, 1, 0, 0)])
