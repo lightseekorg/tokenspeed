@@ -1687,7 +1687,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     source_table,
                     tile_table,
                     visible,
-                    dsv41.new_index_metadata(tile_table, visible),
+                    dsv41.new_index_metadata(
+                        tile_table,
+                        visible,
+                        scoring_requests[start:stop].to(torch.int32).contiguous(),
+                    ),
                 )
             else:
                 geometry = self._selection_geometry(
@@ -2563,13 +2567,33 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # Arbitrary prefill windows may cover a whole prompt. Retaining
             # every replicated table would defeat query tiling's memory bound.
             cacheable = mode.is_decode() or span is not None
+            # DeepGEMM schedules a request from its last query's length. A
+            # free decode window can put a shorter query after a longer one.
+            decode = self.forward_decode_metadata
+            ordered = span is not None or (
+                decode is not None
+                and positions is decode.positions
+                and requests is decode.request_indices
+            )
             geometry = V41IndexGeometry(
                 positions,
                 requests,
                 source_table,
                 tile_table,
                 visible,
-                dsv41.new_index_metadata(tile_table, visible) if cacheable else None,
+                (
+                    dsv41.new_index_metadata(
+                        tile_table,
+                        visible,
+                        (
+                            requests[start:stop].to(torch.int32).contiguous()
+                            if ordered
+                            else None
+                        ),
+                    )
+                    if cacheable
+                    else None
+                ),
             )
             if cacheable:
                 self._index_geometry[key] = geometry

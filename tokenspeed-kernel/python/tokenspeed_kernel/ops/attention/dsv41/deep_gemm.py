@@ -153,14 +153,32 @@ def _paged_scores(
             block_table, valid_lengths, cache.shape[0], capacity, page_size
         )
         context_lens = lengths[:, None]
+        request_indices = (
+            index_metadata.source.acquire()[2] if index_metadata is not None else None
+        )
+        indices = None
+        if request_indices is not None:
+            # Padding must not end an active request's run with a zero length:
+            # the native scheduler sizes shared KV work from the run's last row.
+            padding_start = torch.iinfo(torch.int32).min
+            indices = torch.where(
+                lengths > 0,
+                request_indices[tile_begin:tile_end],
+                torch.arange(
+                    padding_start,
+                    padding_start + lengths.numel(),
+                    device=cache.device,
+                    dtype=torch.int32,
+                ),
+            )
         schedule = api.get_paged_mqa_logits_metadata(
-            context_lens, page_size, api.get_num_sms()
+            context_lens, page_size, api.get_num_sms(), indices=indices
         )
         if index_metadata is not None:
-            geometry = IndexGeometry((table, lengths, context_lens, schedule))
+            geometry = IndexGeometry((table, lengths, context_lens, schedule, indices))
             index_metadata.paged[key] = geometry
     else:
-        table, lengths, context_lens, schedule = geometry.acquire()
+        table, lengths, context_lens, schedule, indices = geometry.acquire()
     logits = api.fp8_fp4_paged_mqa_logits(
         q=(
             queries[0].contiguous().view(torch.int8).unsqueeze(1),
@@ -174,6 +192,7 @@ def _paged_scores(
         max_context_len=capacity,
         clean_logits=False,
         logits_dtype=torch.bfloat16,
+        indices=indices,
     )
     if prepare_blocks:
         input_alignment, _ = deep_select_alignment()
@@ -189,7 +208,13 @@ def _paged_scores(
         return cleaned, lengths, (block_scores, block_ends)
     return (
         clean_logits_for_selection(
-            logits, lengths, block_table, cache.shape[0], capacity, page_size
+            logits,
+            lengths,
+            block_table,
+            cache.shape[0],
+            capacity,
+            page_size,
+            deep_select_alignment()[0] // logits.element_size(),
         ),
         lengths,
         None,
