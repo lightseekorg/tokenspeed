@@ -501,8 +501,8 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(
 // repeats just failed in its last variant: the request's blocks of packed
 // groups are gathered into fewer parents (CacheCoordinator::CompactLoneRequest),
 // the moves go on the plan with the retry's own pages, the plan is stamped
-// as the compaction's (last_lone_compaction_plan_: never twice in one plan),
-// and the admission is retried once. One
+// as the compaction's (last_lone_compaction_plan_: never twice in one plan,
+// never the no-progress abort's), and the admission is retried once. One
 // line logs the moves, what clearing their destinations evicted and how the
 // retry went. Nullopt when nothing could move, or the retry still fails.
 template <typename Retry>
@@ -1253,7 +1253,9 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
 // and the request stays as it is: its step waits for the next plan, where
 // they are published blocks that move. The tail and the state of a
 // junction-cut chunk end go unpublished, as when the copy-in is dropped. The
-// plan is the compaction's own (last_lone_compaction_plan_).
+// plan is the compaction's own (last_lone_compaction_plan_): the no-progress
+// abort (NextExecutionPlan) must not take the plan whose publication is what
+// the next plan's compaction moves.
 void Scheduler::publishCompletedPagesFirst(ExecutionPlan& plan, Request& request, StagedCacheProgress& staged,
                                            const RequestProgress& progress) {
     RequestProgress pages_only = progress;
@@ -2372,6 +2374,24 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
             break;
     }
 
+    // Who the no-progress abort would take (NextExecutionPlan,
+    // docs/design/scheduler.md §1.4, §2): the request that failed for
+    // capacity, else the landed image the restore phase tried first (in a
+    // stall its restore failed, as did every other the round tried), when no
+    // other request holds pages -- there is no release left that could fund
+    // it.
+    const auto blocked = std::ranges::find_if(feedback.capacity_blocked, [](const Request* request) {
+        return request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>();
+    });
+    const std::vector<Request*> landed = rankedReadmissions(candidates);
+    Request* const stuck = blocked != feedback.capacity_blocked.end() ? *blocked
+                           : !landed.empty()                          ? landed.front()
+                                                                      : nullptr;
+    const bool alone =
+        stuck != nullptr && std::ranges::none_of(requests_, [stuck](const std::unique_ptr<Request>& other) {
+            return other.get() != stuck && other->HoldsPages();
+        });
+
     if (!build.remote_decode.empty()) {
         plan.remote_decode.emplace(std::move(build.remote_decode));
     }
@@ -2383,6 +2403,7 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
         .load_backs = std::move(build.load_backs),
         .snapshot_stores = std::move(build.snapshot_stores),
         .snapshot_restores = std::move(build.snapshot_restores),
+        .blocked_alone = alone ? stuck : nullptr,
     };
 }
 

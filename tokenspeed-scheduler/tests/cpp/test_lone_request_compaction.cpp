@@ -35,12 +35,16 @@
 // frees none.
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -409,8 +413,9 @@ TEST_F(LoneRequestCompactionSuite, WritesBackTheClearedPageInTheSamePlan) {
 // published first, by a zero-growth admission, and the plan runs nothing.
 // The next plan's compaction moves nothing either: every parent the request
 // could leave keeps a held page, so no move would free one. From then on the
-// request waits, its pages staying published.
-TEST_F(LoneRequestCompactionSuite, PublishesCompletedPagesFirstWhenNothingCanMove) {
+// request makes no progress for Scheduler::kNoProgressAbortPlans plans and
+// is aborted with the reason, its pages staying published.
+TEST_F(LoneRequestCompactionSuite, PublishesCompletedPagesFirstAndAbortsWhenNothingCanEverMove) {
     FragmentThePool();
     CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
     const BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
@@ -475,19 +480,206 @@ TEST_F(LoneRequestCompactionSuite, PublishesCompletedPagesFirstWhenNothingCanMov
     EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 0u);
     EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compaction_moves, 0u);
     EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.compaction.blocks, 0u);
-    // Still held, nothing moves: the plans run nothing and the request stays.
-    for (int plan = 0; plan < 8; ++plan) {
+    // The publication's plan was the first built empty; every plan up to the
+    // one before the kNoProgressAbortPlans-th moves nothing and aborts
+    // nothing.
+    for (std::int64_t stalled = 2; stalled + 1 < Scheduler::kNoProgressAbortPlans; ++stalled) {
         const ExecutionPlan next = PlanOnce();
-        EXPECT_TRUE(FindForwardBatch(next)->request_ids.empty()) << plan;
-        EXPECT_TRUE(next.aborts.empty()) << plan;
+        ASSERT_TRUE(FindForwardBatch(next)->request_ids.empty()) << stalled;
+        ASSERT_TRUE(next.aborts.empty()) << stalled;
+        ASSERT_TRUE(next.pages_to_copy.at("full_attention").empty()) << stalled;
     }
-    EXPECT_EQ(scheduler_->RequestTokenSize("R"), 126);
     EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 0u);
-    // The first chunk's eight pages stay published.
-    for (std::size_t i = 0; i < 15; ++i) {
-        EXPECT_EQ(CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, keys[i]).has_value(), i < 8) << i;
-    }
+    EXPECT_EQ(scheduler_->RequestTokenSize("R"), 126);
+    const ExecutionPlan last = PlanOnce();
+    EXPECT_TRUE(FindForwardBatch(last)->request_ids.empty());
+    ASSERT_EQ(last.aborts.size(), 1u);
+    EXPECT_EQ(last.aborts.front().request_id, "R");
+    EXPECT_EQ(last.aborts.front().reason, AbortReason::kNoProgress);
+    EXPECT_NE(last.aborts.front().detail.find("no progress for " + std::to_string(Scheduler::kNoProgressAbortPlans) +
+                                              " consecutive plans"),
+              std::string::npos);
+    EXPECT_NE(last.aborts.front().detail.find("its admission needs Device pages"), std::string::npos);
+    EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 0u);
+    // Finished by the abort, it leaves at the next plan: its unwritten
+    // blocks are freed (three fresh parents and the half parent empty; the
+    // fourth fresh one keeps two published pages), its published pages (and
+    // their sliding twins) stay cached beside the eight held ones.
+    EXPECT_TRUE(PlanOnce().aborts.empty());
+    EXPECT_EQ(scheduler_->RequestTokenSize("R"), -1);
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 4);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 20);
     held.clear();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), kParents);
+}
+
+// The no-progress abort never takes the compaction's own plan. The layout
+// above, stalled up to the plan before the kNoProgressAbortPlans-th; then
+// a2's history page, beside the published block of slot 0 (page 14) in a
+// kept parent, is released. The kNoProgressAbortPlans-th plan re-places the
+// unwritten slot 14 (page 5) into that page's slot (page 13, cleared): its
+// parent then empties, but the retry needs two parents and still fails, so
+// the plan runs nothing -- it is the compaction's, not the abort's; the
+// next plan, with nothing left to move, is.
+TEST_F(LoneRequestCompactionSuite, NeverAbortsInTheCompactionsOwnPlan) {
+    FragmentThePool();
+    CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    const BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
+    std::vector<CacheBlockRef> held;
+    for (std::int32_t k = 0; k < 8; ++k) {
+        for (const CacheKey& key :
+             scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(MakeTokens(kP + 1, 100 + 50 * k)))) {
+            if (key.group_id == 0) {
+                held.push_back(coordinator.GroupPrefixIndex(0).Find(pool, key));
+            }
+        }
+    }
+    ASSERT_EQ(held.size(), 8u);
+    Submit(RequestSpec{.request_id = "R", .tokens = MakeTokens(126, 3000), .max_new_tokens = 1});
+    Land(PlanOnce());
+    EXPECT_TRUE(FindForwardBatch(PlanOnce())->request_ids.empty());  // publishes the first chunk's pages
+    for (std::int64_t stalled = 1; stalled + 1 < Scheduler::kNoProgressAbortPlans; ++stalled) {
+        const ExecutionPlan next = PlanOnce();
+        ASSERT_TRUE(next.aborts.empty()) << stalled;
+        ASSERT_TRUE(next.pages_to_copy.at("full_attention").empty()) << stalled;
+    }
+    EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 0u);
+    held[2] = CacheBlockRef{};
+    const ExecutionPlan own = PlanOnce();
+    EXPECT_TRUE(FindForwardBatch(own)->request_ids.empty());
+    EXPECT_TRUE(own.aborts.empty());
+    EXPECT_TRUE(own.pages_to_copy.at("full_attention").empty());
+    EXPECT_EQ(own.pages_to_zero.at("full_attention"), std::vector<std::int32_t>{13});
+    EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 1u);
+    EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compaction_moves, 1u);
+    EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.compaction.blocks, 1u);
+    EXPECT_EQ(scheduler_->RequestTokenSize("R"), 126);
+    const ExecutionPlan last = PlanOnce();
+    ASSERT_EQ(last.aborts.size(), 1u);
+    EXPECT_EQ(last.aborts.front().request_id, "R");
+    EXPECT_EQ(last.aborts.front().reason, AbortReason::kNoProgress);
+    EXPECT_NE(last.aborts.front().detail.find(
+                  "no progress for " + std::to_string(Scheduler::kNoProgressAbortPlans + 1) + " consecutive plans"),
+              std::string::npos);
+    EXPECT_TRUE(PlanOnce().aborts.empty());
+    EXPECT_EQ(scheduler_->RequestTokenSize("R"), -1);
+    held.clear();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), kParents);
+}
+
+// Under KV parallelism a lone first admission whose probe hits a Device tail
+// can fail every plan with nothing to move: three parents of two blocks, one
+// of each of two buckets, and no other group. X (17 tokens) leaves its two
+// pages cached in bucket 1 and its one-token tail in bucket 0. R, X plus 14
+// tokens, hits both pages and the tail: the tail's private copy takes a
+// second bucket-0 slot, and the prompt end's block and its copy-in block,
+// which share a bucket, find two free slots in neither; the hit pages and
+// the tail keep their buckets, so compaction moves nothing. On the fused role
+// R, still Submitted, is aborted at the kNoProgressAbortPlans-th plan, which
+// ends the stall streak: S, the same prompt submitted right after, stalls
+// the same way and is aborted at its own kNoProgressAbortPlans-th plan, not
+// at its first.
+TEST_F(LoneRequestCompactionSuite, AbortsALoneFirstAdmissionItsDeviceTailBindsToOneBucket) {
+    config_ = MakeConfig();
+    config_.device_allocator.total_pages = 4;
+    config_.max_scheduled_tokens = 16;
+    config_.cache_groups.resize(1);
+    config_.cache_groups[0].total_pages = 4 * 2;
+    config_.cache_groups[0].shard_count = 2;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    ASSERT_EQ(scheduler_->MaxSingleRequestTokens(), 32);
+    Submit(RequestSpec{.request_id = "X", .tokens = MakeTokens(17, 20000), .max_new_tokens = 1});
+    for (int plan = 0; plan < 4 && scheduler_->RequestTokenSize("X") != -1; ++plan) {
+        Land(PlanOnce());
+    }
+    ASSERT_EQ(scheduler_->RequestTokenSize("X"), -1);
+    ASSERT_EQ(scheduler_->TailEntries(), 1u);
+    std::vector<std::int32_t> prompt = MakeTokens(17, 20000);
+    const std::vector<std::int32_t> more = MakeTokens(14, 50000);
+    prompt.insert(prompt.end(), more.begin(), more.end());
+    for (const std::string id : {"R", "S"}) {
+        SCOPED_TRACE(id);
+        Submit(RequestSpec{.request_id = id, .tokens = prompt, .max_new_tokens = 1});
+        for (std::int64_t stalled = 1; stalled < Scheduler::kNoProgressAbortPlans; ++stalled) {
+            const ExecutionPlan next = PlanOnce();
+            ASSERT_TRUE(FindForwardBatch(next)->request_ids.empty()) << stalled;
+            ASSERT_TRUE(next.aborts.empty()) << stalled;
+            ASSERT_EQ(scheduler_->WaitingSize(), 1u) << stalled;
+        }
+        const ExecutionPlan last = PlanOnce();
+        ASSERT_EQ(last.aborts.size(), 1u);
+        EXPECT_EQ(last.aborts.front().request_id, id);
+        EXPECT_EQ(last.aborts.front().reason, AbortReason::kNoProgress);
+        EXPECT_NE(last.aborts.front().detail.find(
+                      "no progress for " + std::to_string(Scheduler::kNoProgressAbortPlans) + " consecutive plans"),
+                  std::string::npos);
+        EXPECT_NE(last.aborts.front().detail.find("its admission needs Device pages"), std::string::npos);
+        EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 0u);
+    }
+    EXPECT_TRUE(PlanOnce().aborts.empty());
+    EXPECT_EQ(scheduler_->RequestTokenSize("S"), -1);
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+}
+
+// The P and D roles keep only the stall warning: a stuck Submitted request
+// there has its PD transfer registered, which a scheduler abort does not
+// conclude. The layout above on the P role, which reserves no copy-in
+// blocks: X (33 tokens) leaves four pages and its tail in five of the six
+// slots, the free one in the other bucket than the tail; R, X plus a token,
+// needs the tail's private copy in the tail's bucket, and waits past
+// kNoProgressAbortPlans plans with the warning logged and no abort.
+TEST_F(LoneRequestCompactionSuite, PRoleNeverAbortsALoneStuckFirstAdmission) {
+    config_ = MakeConfig();
+    config_.role = Role::kP;
+    config_.device_allocator.total_pages = 4;
+    config_.max_scheduled_tokens = 16;
+    config_.cache_groups.resize(1);
+    config_.cache_groups[0].total_pages = 4 * 2;
+    config_.cache_groups[0].shard_count = 2;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    ASSERT_EQ(scheduler_->MaxSingleRequestTokens(), 40);
+    const auto submit = [&](const std::string& id, const std::vector<std::int32_t>& tokens) {
+        Submit(RequestSpec{.request_id = id, .tokens = tokens, .max_new_tokens = 1});
+        ExecutionEvent bootstrapped;
+        bootstrapped.With(pd::BootstrappedEvent{id});
+        scheduler_->Advance(bootstrapped);
+    };
+    std::vector<std::int32_t> prompt = MakeTokens(33, 20000);
+    submit("X", prompt);
+    for (int plan = 0; plan < 8 && scheduler_->RequestTokenSize("X") != -1; ++plan) {
+        const ExecutionPlan next = PlanOnce();
+        Land(next);
+        if (next.remote_decode) {
+            ExecutionEvent read;
+            read.With(pd::SucceededEvent{"X"});
+            scheduler_->Advance(read);
+        }
+    }
+    ASSERT_EQ(scheduler_->RequestTokenSize("X"), -1);
+    ASSERT_EQ(scheduler_->TailEntries(), 1u);
+    prompt.push_back(1);
+    submit("R", prompt);
+
+    std::ostringstream log;
+    const std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    spdlog::set_default_logger(
+        std::make_shared<spdlog::logger>("stall", std::make_shared<spdlog::sinks::ostream_sink_mt>(log)));
+    std::size_t aborts = 0;
+    std::size_t forwards = 0;
+    for (std::int64_t plan = 0; plan < Scheduler::kNoProgressAbortPlans + 8; ++plan) {
+        const ExecutionPlan next = PlanOnce();
+        aborts += next.aborts.size();
+        forwards += FindForwardBatch(next)->request_ids.size();
+    }
+    spdlog::set_default_logger(previous);
+    EXPECT_EQ(aborts, 0u);
+    EXPECT_EQ(forwards, 0u);
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 0u);
+    EXPECT_NE(log.str().find("no work scheduled for " + std::to_string(Scheduler::kNoProgressAbortPlans) +
+                             " consecutive rounds"),
+              std::string::npos);
+    EXPECT_EQ(log.str().find("no-progress abort"), std::string::npos);
 }
 
 // Once the held pages are released but one (a0's history page, so the seven
@@ -523,6 +715,7 @@ TEST_F(LoneRequestCompactionSuite, MovesPublishedPagesByCopyAndKeepsTheirKeys) {
     const std::vector<CacheKey> keys = scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(prompt));
     const ExecutionPlan publishes = PlanOnce();  // publishes the first chunk's pages
     EXPECT_TRUE(FindForwardBatch(publishes)->request_ids.empty());
+    EXPECT_TRUE(publishes.aborts.empty());
     EXPECT_EQ(scheduler_->RequestTokenSize("R"), 126);
     const std::optional<CacheBlockLocation> published_at =
         CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, keys[5]);

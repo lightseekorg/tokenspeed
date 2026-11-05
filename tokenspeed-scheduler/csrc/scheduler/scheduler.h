@@ -104,6 +104,16 @@ class Scheduler {
 public:
     explicit Scheduler(SchedulerConfig config);
 
+    // The stall diagnostic (docs/design/scheduler.md §2): consecutive plans
+    // built empty with nothing in flight before the first warning, which
+    // repeats at every doubling of the streak (so a stall that never ends
+    // still logs only a few dozen lines), and the plan at which a lone
+    // request behind such a stall is aborted on the fused role (§1.4): two
+    // doublings after the first warning, so the warning precedes the abort
+    // in every log.
+    static constexpr std::int64_t kStalledRoundsBeforeWarning{1024};
+    static constexpr std::int64_t kNoProgressAbortPlans{4096};
+
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
 
     // What one plan call may do, decided by the control plane's prefill-delay
@@ -291,6 +301,12 @@ private:
         std::vector<LoadBackOperation> load_backs;
         std::vector<SnapshotStoreOperation> snapshot_stores;
         std::vector<SnapshotRestoreOperation> snapshot_restores;
+        // The request this build left blocked for capacity -- the first
+        // whose admission failed for it, else the landed image the restore
+        // phase tried first (rankedReadmissions) -- while no other request
+        // holds pages, so no release can fund it: the one the no-progress
+        // abort takes (NextExecutionPlan).
+        Request* blocked_alone{nullptr};
     };
     BuiltOperations buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
                                            std::vector<WriteBackOperation>& write_back_operations, PlanOptions options);
@@ -717,7 +733,8 @@ private:
     PrefixHitStats prefix_hit_stats_;
     // The plan the last lone-request compaction ran in, or published a
     // request's completed pages first for the next plan's: at most one per
-    // plan, whichever admission of the build asks (plan_calls_ stamps it).
+    // plan, whichever admission of the build asks (plan_calls_ stamps it),
+    // and never a plan the no-progress abort takes.
     std::int64_t last_lone_compaction_plan_{-1};
 
     // Stamped onto each retraction; the readmission order lives on the
@@ -734,7 +751,8 @@ private:
     std::int32_t prefill_deferral_rounds_left_{0};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
-    // that schedules work or leaves work in flight.
+    // that schedules work, leaves work in flight or aborts a request (the
+    // no-progress abort resets it itself, its plan judged stalled before).
     std::int64_t stalled_rounds_{0};
 
     // Submission order -- the FIFO every scheduling phase walks, identical

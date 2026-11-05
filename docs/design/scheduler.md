@@ -917,8 +917,16 @@ are boundary-tree ancestors of
 the request's own pages in use, so neither eviction pass takes them, and
 compaction does not merge a copy with its cached block: a step short of
 exactly those parents is never funded (randomized runs reached this only
-under forced retraction, §2). Such a request waits as before,
-under the stall diagnostic's warning (§2).
+under forced retraction, §2). On the fused role such a request is
+not left waiting for good: after `Scheduler::kNoProgressAbortPlans` (4096)
+consecutive plans that ran nothing with nothing in flight, in a plan where
+compaction had nothing left to move or publish first, it is aborted with
+`AbortReason::kNoProgress` (§2, "Stall diagnostic"). On the P and D roles
+the abort does not run and such a request waits behind the stall warning as
+before: there a stuck `Submitted` request's PD transfer is already registered
+(bootstrapped; on the P role the decode peer holds pages for it), and a
+scheduler abort does not conclude it, so the peer would wait for its own
+timeout and the engine's transfer layer would keep the room for good.
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
@@ -1306,8 +1314,26 @@ victims in one round until a decode or the blocked admission fits.
 **Stall diagnostic.** `NextExecutionPlan` counts consecutive rounds whose plan
 carries nothing — no forward, remote stream, cache op or abort — while
 requests are live and nothing is out (no forward result, PD transfer or tier
-transfer) that could change the next plan, and warns at 1024 such rounds and
-every doubling after. It never changes a plan.
+transfer) that could change the next plan, and warns at
+`Scheduler::kStalledRoundsBeforeWarning` (1024) such rounds and every
+doubling after. The warning never changes a plan. On the fused role the
+**no-progress abort** does, decided on the same count: at the
+`kNoProgressAbortPlans`-th such round (4096, two doublings after the first
+warning, so the warning precedes the abort in every log), unless lone-request
+compaction ran or published pages first in that plan (§1.4), the request the
+build left blocked for capacity — the first whose admission failed for it,
+else the landed image the restore phase tried first, the head of the
+readmission order (`rankedReadmissions`, below), whose restore failed even
+claiming no cached page — is
+aborted when no other request holds pages (`fsm::AbortEvent`, recorded in
+`ExecutionPlan::aborts` as `AbortReason::kNoProgress` with the pool's
+occupancy as the detail, so the runtime fails it toward its client like
+the image-fit abort above). It is the one abort of a request that is no
+retraction victim: alone, with nothing left to evict, move or unclaim,
+waiting would last for good. Its plan ends the streak, like any plan
+carrying an abort, so the next request stuck alone gets a window of its own.
+The P and D roles keep only the warning (§1.4): a scheduler abort does not
+conclude a PD transfer the stuck request has registered.
 
 **Forced retraction** (`debug_force_retraction_interval`, a debug knob; `0`
 off) exercises the path without pressure: every `|interval|` plans the oldest
@@ -1397,7 +1423,8 @@ are pinned until the peer acknowledges, then released wholesale. Retracting a
 prompt whose KV is mid-transfer would strand the decode side. Lone-request
 compaction (§1.4) is gated on the same pin, so past its first admission a
 request here waits as before; the pin counts as a transfer in flight, so the
-stall diagnostic (§2) counts no stall for it either.
+stall diagnostic (§2) counts no stall for it either. The no-progress abort
+runs on the fused role only.
 
 While P holds a request, prefix publication uses a copy of its block table.
 Deduplication may redirect that copy to canonical cache blocks, but the real
@@ -1951,9 +1978,12 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   through it, empties no parent it keeps, vacates only a parent the retry can
   then empty, never increases a group's parents, and runs at most once per
   plan. A request the single-request bound accepts therefore completes once
-  it is alone, except where a block's bucket, two of the probe's tail blocks
-  in one parent, a State group's packing, a restored copy of a page another
-  block keeps cached or the P role's pin leaves its step unfunded (1.4).
+  it is alone, or -- where a block's bucket, two of the probe's tail blocks
+  in one parent, a State group's packing or a restored copy of a page
+  another block keeps cached leaves its step unfunded (1.4) -- is aborted on
+  the fused role after `kNoProgressAbortPlans` plans with nothing in flight
+  (2); on the P and D roles it waits as before, as does a P request past its
+  first admission, which the transfer pin holds.
 - A request whose admission prepaid its generation never needs a block it did
   not reserve: the decode slot is reserved on the completing chunk, a State
   group's rotation swaps a released block for a fresh one, and each copy-in

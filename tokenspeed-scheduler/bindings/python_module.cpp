@@ -612,10 +612,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     // A request the scheduler finished on its own while building the plan:
     // the last resort of a capacity retraction whose victim's KV image did not
-    // fit the host budgets. Already Finished on every rank; the runtime fails
-    // it toward the client with `detail` as the message.
+    // fit the host budgets, or a lone request on the fused role that made no
+    // progress for Scheduler::kNoProgressAbortPlans consecutive plans. Already
+    // Finished on every rank; the runtime fails it toward the client with
+    // `detail` as the message.
     nb::enum_<tokenspeed::AbortReason>(m, "AbortReason", nb::is_arithmetic())
-        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit);
+        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit)
+        .value("NoProgress", tokenspeed::AbortReason::kNoProgress);
     nb::class_<tokenspeed::SchedulerAbort>(m, "SchedulerAbort")
         .def_ro("request_id", &tokenspeed::SchedulerAbort::request_id)
         .def_ro("reason", &tokenspeed::SchedulerAbort::reason)

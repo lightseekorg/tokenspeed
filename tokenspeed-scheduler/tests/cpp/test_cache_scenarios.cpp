@@ -3475,6 +3475,73 @@ TEST_F(ReadmissionScanSuite, ASmallerLandedImageRestoresBehindALargeOneThatDoesN
     EXPECT_EQ(scheduler_->DecodingSize(), 2u) << "small resumed beside filler";
 }
 
+// The no-progress abort of a landed image takes the one the restore phase
+// tries first -- the head of the readmission order, whose restore failed --
+// not the first in submission order. The knob retracts a at plan 3, which
+// restores at plan 4; with that restore out, b is the oldest decode and is
+// retracted at plan 6, then a again at plan 9, so b's image is the older one
+// and ranks first. Both land, and with every page the retractions freed held
+// outside any request (as store tickets would hold them) neither fits even
+// claiming nothing; nothing else holds pages or is in flight, and every plan
+// runs nothing: b is aborted at the kNoProgressAbortPlans-th, and a, on a
+// streak of its own, after as many again.
+TEST_F(ReadmissionScanSuite, TheNoProgressAbortTakesTheImageTheRestorePhaseTriesFirst) {
+    Submit(MakeRequestSpec("a", /*num_pages=*/2));
+    Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/70001));
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, (std::vector<std::string>{"a", "b"}));
+    SendForwardDone("a", {7});
+    SendForwardDone("b", {8});
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids.size(), 2u);  // first decodes
+    SendForwardDone("a", {7});
+    SendForwardDone("b", {8});
+
+    const ExecutionPlan p3 = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(p3), nullptr);
+    ASSERT_EQ(FindSnapshotStore(p3)->request_ids, std::vector<std::string>{"a"});
+    SendForwardDone("b", {8});
+    AckImageStores(p3);
+    const ExecutionPlan p4 = PlanOnce();
+    ASSERT_NE(FindRestore(p4), nullptr);
+    ASSERT_EQ(FindRestore(p4)->request_ids, std::vector<std::string>{"a"});
+    SendForwardDone("b", {8});
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"b"});  // plan 5
+    SendForwardDone("b", {8});
+    const ExecutionPlan p6 = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(p6), nullptr);
+    ASSERT_EQ(FindSnapshotStore(p6)->request_ids, std::vector<std::string>{"b"});
+    AckRestores(p4);
+    for (int plan = 7; plan <= 8; ++plan) {
+        ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"a"}) << plan;
+        SendForwardDone("a", {7});
+    }
+    const ExecutionPlan p9 = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(p9), nullptr);
+    ASSERT_EQ(FindSnapshotStore(p9)->request_ids, std::vector<std::string>{"a"});
+    AckImageStores(p6);
+    AckImageStores(p9);
+    ASSERT_EQ(scheduler_->RetractedSize(), 2u);
+    // Every page the two retractions freed, held outside any request.
+    std::vector<BlockTable> held(1);
+    ASSERT_TRUE(AdmitForTest(SchedulerTestAccess::Coordinator(*scheduler_), held,
+                             GroupDemand{.extent = DenseGrowth{scheduler_->AvailableLcmBlocks() * 1024}}));
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+
+    for (const std::string expected : {"b", "a"}) {
+        SCOPED_TRACE(expected);
+        for (std::int64_t stalled = 1; stalled < Scheduler::kNoProgressAbortPlans; ++stalled) {
+            const ExecutionPlan next = PlanOnce();
+            ASSERT_EQ(FindRestore(next), nullptr) << stalled;
+            ASSERT_TRUE(next.aborts.empty()) << stalled;
+        }
+        const ExecutionPlan last = PlanOnce();
+        ASSERT_EQ(last.aborts.size(), 1u);
+        EXPECT_EQ(last.aborts.front().request_id, expected);
+        EXPECT_EQ(last.aborts.front().reason, AbortReason::kNoProgress);
+        EXPECT_NE(last.aborts.front().detail.find("its restore needs Device pages"), std::string::npos);
+    }
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+}
+
 // A mid-prefill victim resumes its next chunk: with max_scheduled_tokens = 4
 // the 6-token prompt of "a" takes two chunks, and "a" is retracted between
 // them.
