@@ -1237,7 +1237,13 @@ budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size its configured pinned
+headroom per rank. Available means the smaller of the host's free memory and
+what the process's memory cgroup still allows (its limit, `memory.max` or
+`memory.high` on cgroup v2, less its usage with page cache counted as free;
+the tightest limit over its cgroup and the ones above it, found through
+`/proc/self/mountinfo`), so a container or a Slurm step is sized against its
+own limit; the sizing warning and the refusal name which one was used.
+Each buffer counts at the size its configured pinned
 allocator reserves. When the CUDA/ROCm allocator supports it, the launcher sets
 `pinned_max_round_threshold_mb:1024` as the default before starting the ranks.
 Allocations up to 1 GiB round to a power of two; larger buffers use their
