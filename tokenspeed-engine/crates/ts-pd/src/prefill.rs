@@ -35,7 +35,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Condvar, Mutex, MutexGuard,
+        mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -74,7 +74,9 @@ struct Registration {
     endpoint: String,
     /// Its port.
     port: u16,
-    /// Its transfer session.
+    /// The cache incarnation used by requests.
+    cache_id: String,
+    /// The Mooncake address used for writes, which can be reused.
     session_id: String,
     /// The Decode node's attention TP size.
     decode_tp_size: i64,
@@ -147,7 +149,7 @@ pub struct PrefillConfig {
 /// One destination of a room.
 #[derive(Debug, Clone)]
 struct Destination {
-    session_id: String,
+    cache_id: String,
     /// Its manifest of the request's blocks; `None` from a rank this one
     /// only joins the status agreement with.
     manifest: Option<Arc<Manifest>>,
@@ -225,7 +227,7 @@ struct State {
     /// still unclaimed after the bootstrap timeout is dropped.
     unclaimed: HashMap<u64, Instant>,
     registrations: HashMap<String, Registration>,
-    /// Sessions whose registration was rejected: their reply route.
+    /// Rejected or retired cache identities: their reply route. Never revive them.
     rejected: HashMap<String, (String, u16)>,
     destinations: HashMap<u64, Vec<Destination>>,
     failed_sessions: HashMap<String, Instant>,
@@ -238,11 +240,11 @@ struct State {
 }
 
 impl State {
-    fn route_of(&self, session_id: &str) -> Option<(String, u16)> {
+    fn route_of(&self, cache_id: &str) -> Option<(String, u16)> {
         self.registrations
-            .get(session_id)
+            .get(cache_id)
             .map(|registration| (registration.endpoint.clone(), registration.port))
-            .or_else(|| self.rejected.get(session_id).cloned())
+            .or_else(|| self.rejected.get(cache_id).cloned())
     }
 
     fn ended(&self, room: u64) -> bool {
@@ -277,7 +279,7 @@ impl State {
                     destinations
                         .iter()
                         .filter(|destination| !destination.is_dummy())
-                        .filter_map(|destination| self.route_of(&destination.session_id))
+                        .filter_map(|destination| self.route_of(&destination.cache_id))
                         .map(|route| (route, room)),
                 );
             }
@@ -304,7 +306,7 @@ impl State {
             .iter()
             .map(|destination| {
                 self.registrations
-                    .get(&destination.session_id)
+                    .get(&destination.cache_id)
                     .ok_or_else(|| {
                         "CachePD request references an unregistered Decode session".to_owned()
                     })
@@ -334,6 +336,8 @@ struct Shared {
     transport: Arc<Transport>,
     layout: PrefillLayout,
     state: Mutex<State>,
+    /// Retirement waits for native writes; queued writes recheck their cache id.
+    registration_gate: RwLock<()>,
     status_rank: i64,
     failed_session_ttl: Duration,
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
@@ -381,11 +385,11 @@ impl Shared {
                 .iter()
                 .filter(|destination| !destination.is_dummy())
                 .filter_map(|destination| {
-                    let route = state.route_of(&destination.session_id);
+                    let route = state.route_of(&destination.cache_id);
                     if route.is_none() {
                         tracing::error!(
                             room,
-                            session = destination.session_id,
+                            session = destination.cache_id,
                             "cannot notify Decode of a failed room: unregistered session"
                         );
                     }
@@ -413,6 +417,7 @@ impl Shared {
         Ok(Registration {
             endpoint: info.endpoint,
             port: info.port,
+            cache_id: info.cache_id,
             session_id: info.session_id,
             decode_tp_size: info.tp_size,
             decode_tp_rank: info.tp_rank,
@@ -423,34 +428,66 @@ impl Shared {
     }
 
     fn handle_registration(&self, frames: &[Bytes]) {
+        let _gate = self
+            .registration_gate
+            .write()
+            .expect("the registration gate is poisoned");
         let registered = self.plan_registration(frames).and_then(|registration| {
-            let mut state = self.state();
-            let session_id = registration.session_id.clone();
+            let state = self.state();
+            let cache_id = registration.cache_id.clone();
+            // A delayed registration must not revive a superseded cache and
+            // retire the current one, even if its transport address is reused.
+            if state.rejected.contains_key(&cache_id) {
+                return Err("registration for a retired CachePD cache instance".to_owned());
+            }
             if state
                 .registrations
-                .get(&session_id)
+                .get(&cache_id)
                 .is_some_and(|previous| *previous != registration)
             {
                 return Err("conflicting registration for an active CachePD session".to_owned());
             }
-            state.rejected.remove(&session_id);
-            state.failed_sessions.remove(&session_id);
-            state.registrations.insert(session_id, registration);
+            let retired: Vec<_> = state
+                .registrations
+                .values()
+                .filter(|previous| {
+                    previous.cache_id != cache_id
+                        && ((previous.endpoint == registration.endpoint
+                            && previous.port == registration.port)
+                            || previous.session_id == registration.session_id)
+                })
+                .map(|previous| {
+                    (
+                        previous.endpoint.clone(),
+                        previous.port,
+                        previous.cache_id.clone(),
+                    )
+                })
+                .collect();
+            drop(state);
+            // Keep each old reply route available while its unfinished rooms
+            // fail. New requests may only refer to the new cache identity.
+            for (endpoint, port, old_id) in retired {
+                self.reject_session(endpoint, port, &old_id, "cache instance superseded");
+            }
+            let mut state = self.state();
+            state.failed_sessions.remove(&cache_id);
+            state.registrations.insert(cache_id, registration);
             Ok(())
         });
         match registered {
             Ok(()) => {}
             Err(reason) => {
                 tracing::error!(reason, "rejecting a CachePD Decode registration");
-                if let Ok((endpoint, port, session_id)) = wire::registration_route(frames) {
-                    self.reject_session(endpoint, port, &session_id, &reason);
+                if let Ok((endpoint, port, cache_id)) = wire::registration_route(frames) {
+                    self.reject_session(endpoint, port, &cache_id, &reason);
                 }
             }
         }
     }
 
     /// Invalidate a session and fail the rooms that reference it.
-    fn reject_session(&self, endpoint: String, port: u16, session_id: &str, reason: &str) {
+    fn reject_session(&self, endpoint: String, port: u16, cache_id: &str, reason: &str) {
         let affected: Vec<u64> = self
             .state()
             .destinations
@@ -458,35 +495,33 @@ impl Shared {
             .filter(|(_, destinations)| {
                 destinations
                     .iter()
-                    .any(|destination| destination.session_id == session_id)
+                    .any(|destination| destination.cache_id == cache_id)
             })
             .map(|(&room, _)| room)
             .collect();
         for room in affected {
             self.abort_room(
                 room,
-                &format!("Decode session {session_id} registration rejected: {reason}"),
+                &format!("Decode session {cache_id} registration rejected: {reason}"),
             );
         }
         let mut state = self.state();
-        state.registrations.remove(session_id);
-        state
-            .rejected
-            .insert(session_id.to_owned(), (endpoint, port));
+        state.registrations.remove(cache_id);
+        state.rejected.insert(cache_id.to_owned(), (endpoint, port));
     }
 
     fn handle_preallocation(&self, frames: &[Bytes]) {
-        let (room, session_id) = match wire::preallocation_route(frames) {
+        let (room, cache_id) = match wire::preallocation_route(frames) {
             Ok(route) => route,
             Err(error) => {
                 tracing::error!(%error, "rejecting a malformed CachePD pre-allocation");
                 return;
             }
         };
-        if let Err(reason) = self.accept_preallocation(room, &session_id, frames) {
+        if let Err(reason) = self.accept_preallocation(room, &cache_id, frames) {
             tracing::error!(room, reason, "rejecting CachePD pre-allocation metadata");
             self.abort_room(room, &format!("invalid pre-allocation metadata: {reason}"));
-            match self.state().route_of(&session_id) {
+            match self.state().route_of(&cache_id) {
                 Some(route) => self.notify_failed(route, room),
                 None => tracing::error!(room, "cannot notify a malformed Decode peer"),
             }
@@ -496,13 +531,13 @@ impl Shared {
     fn accept_preallocation(
         &self,
         room: u64,
-        session_id: &str,
+        cache_id: &str,
         frames: &[Bytes],
     ) -> Result<(), String> {
         let registration = self
             .state()
             .registrations
-            .get(session_id)
+            .get(cache_id)
             .cloned()
             .ok_or("CachePD request references an unregistered Decode session")?;
         let route = (registration.endpoint.clone(), registration.port);
@@ -522,12 +557,12 @@ impl Shared {
         let mut destinations = state.destinations.get(&room).cloned().unwrap_or_default();
         if destinations
             .iter()
-            .any(|destination| destination.session_id == session_id)
+            .any(|destination| destination.cache_id == cache_id)
         {
             return Err("duplicate CachePD pre-allocation for Decode session".to_owned());
         }
         destinations.push(Destination {
-            session_id: session_id.to_owned(),
+            cache_id: cache_id.to_owned(),
             manifest: preallocation.manifest.map(Arc::new),
         });
         let expected = registration.planned.expected_decode_ranks.len();
@@ -568,33 +603,33 @@ impl Shared {
         }
     }
 
-    fn session_failed(&self, session_id: &str) -> bool {
+    fn session_failed(&self, cache_id: &str) -> bool {
         if self.failed_session_ttl.is_zero() {
             return false;
         }
         let mut state = self.state();
-        match state.failed_sessions.get(session_id) {
+        match state.failed_sessions.get(cache_id) {
             None => false,
             Some(at) if at.elapsed() < self.failed_session_ttl => true,
             Some(_) => {
-                state.failed_sessions.remove(session_id);
+                state.failed_sessions.remove(cache_id);
                 false
             }
         }
     }
 
-    fn mark_session_failed(&self, session_id: &str) {
+    fn mark_session_failed(&self, cache_id: &str) {
         if self.failed_session_ttl.is_zero() {
             return;
         }
         tracing::warn!(
-            session = session_id,
+            session = cache_id,
             ttl = ?self.failed_session_ttl,
             "Decode session marked failed"
         );
         self.state()
             .failed_sessions
-            .insert(session_id.to_owned(), Instant::now());
+            .insert(cache_id.to_owned(), Instant::now());
     }
 
     /// Run one chunk of transfer work.
@@ -656,15 +691,15 @@ impl Shared {
         destinations
             .iter()
             .map(|destination| {
-                if self.session_failed(&destination.session_id) {
+                if self.session_failed(&destination.cache_id) {
                     return Err(format!(
                         "Decode session {} is not alive",
-                        destination.session_id
+                        destination.cache_id
                     ));
                 }
                 self.state()
                     .registrations
-                    .get(&destination.session_id)
+                    .get(&destination.cache_id)
                     .cloned()
                     .ok_or_else(|| {
                         "CachePD request references an unregistered Decode session".to_owned()
@@ -674,9 +709,26 @@ impl Shared {
     }
 
     fn write_copies(&self, registration: &Registration, copies: &[Copy]) -> Result<(), String> {
+        let _gate = self
+            .registration_gate
+            .read()
+            .expect("the registration gate is poisoned");
+        // A worker can hold a planned registration across a cache replacement.
+        // Checking under the gate prevents its stale copies from reaching the
+        // new memory at a reused transport address.
+        if !self
+            .state()
+            .registrations
+            .contains_key(&registration.cache_id)
+        {
+            return Err("CachePD transfer references a retired cache instance".to_owned());
+        }
         let started = Instant::now();
-        if let Err(error) = self.transport.write(&registration.session_id, copies) {
-            self.mark_session_failed(&registration.session_id);
+        if let Err(error) =
+            self.transport
+                .write_cache(&registration.session_id, &registration.cache_id, copies)
+        {
+            self.mark_session_failed(&registration.cache_id);
             return Err(format!(
                 "Mooncake transfer failed for {}:{}: {error}",
                 registration.endpoint, registration.port
@@ -784,7 +836,7 @@ impl Shared {
             return Err("CachePD transfer room has no destinations".to_owned());
         }
         let registrations = self.live_registrations(&destinations)?;
-        let sessions: Vec<String> = destinations.iter().map(|d| d.session_id.clone()).collect();
+        let sessions: Vec<String> = destinations.iter().map(|d| d.cache_id.clone()).collect();
         // Every peer's copies of every interval, planned once, before any DMA.
         let plans = registrations
             .iter()
@@ -1129,7 +1181,8 @@ impl PrefillOutbox {
             };
             let ports: u64 = destinations
                 .iter()
-                .filter_map(|destination| wire::session_port(&destination.session_id))
+                .filter_map(|destination| state.registrations.get(&destination.cache_id))
+                .filter_map(|registration| wire::session_port(&registration.session_id))
                 .sum();
             *state.pending_chunks.entry(room).or_default() += 1;
             (ports % self.queues.len() as u64) as usize
@@ -1290,6 +1343,7 @@ impl PrefillPeer {
             transport,
             layout: config.layout,
             state: Mutex::new(State::default()),
+            registration_gate: RwLock::new(()),
             status_rank: config.status_rank,
             failed_session_ttl: config.failed_session_ttl,
             metrics: config.peer.metrics.clone(),
@@ -1631,7 +1685,8 @@ mod tests {
             Registration {
                 endpoint: "decode".to_owned(),
                 port: 7,
-                session_id: "s0".to_owned(),
+                cache_id: "s0".to_owned(),
+                session_id: "decode:7000".to_owned(),
                 decode_tp_size: 1,
                 decode_tp_rank: 0,
                 arena_base: 0x1000,
@@ -1646,7 +1701,7 @@ mod tests {
         );
         let destination = || {
             vec![Destination {
-                session_id: "s0".to_owned(),
+                cache_id: "s0".to_owned(),
                 manifest: Some(Arc::new(Manifest {
                     groups: Vec::new(),
                     prefix_len: 0,
@@ -1723,7 +1778,7 @@ mod tests {
         state.destinations.insert(
             room,
             vec![Destination {
-                session_id: "decode:7000".to_owned(),
+                cache_id: "decode:7000".to_owned(),
                 manifest: Some(Arc::new(Manifest {
                     groups: Vec::new(),
                     prefix_len: prefix,
@@ -1836,3 +1891,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/registration.rs"]
+mod registration_tests;

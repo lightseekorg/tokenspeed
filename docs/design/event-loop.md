@@ -624,10 +624,17 @@ for their images' embeddings, which end once their receives settle — the
 drain waits for those.
 A disaggregated engine refuses new requests while a release is draining or
 memory is released: their transfer registration would name memory the
-release unmaps. On release the prefill peer deregisters its cache regions and
-registers them again on resume under the same session; the decode peer
-starts a fresh transfer engine on resume, so its prefill peers see a new
-session and register it again. A release is refused while transfers are in
+release unmaps. On release the prefill peer deregisters its cache regions
+from both receiving and sending engines, and registers them again on resume.
+The decode peer starts a fresh transfer engine and assigns a new random cache
+identity on resume. Registrations carry this identity separately from the
+transport address: reusing an IP and port cannot identify the previous cache.
+A new registration retires old identities at the same control endpoint or
+transport address. Retirement waits for writes already in progress; queued
+writes recheck their identity, and late registrations cannot revive it. When
+a transport address is reused, the sender replaces its private transfer
+engine to discard cached remote memory keys, preserving the public engine
+address used by EPD. A release is refused while transfers are in
 flight, and refused for a paused PD engine with buffered requests, whose
 transfers cannot drain until those requests are admitted; their transfer
 registration is deferred until resume admits them, and aborted buffered

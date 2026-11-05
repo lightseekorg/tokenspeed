@@ -31,6 +31,8 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    fs::File,
+    io::Read,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex, MutexGuard,
@@ -61,6 +63,13 @@ const SOCKET_POLL: Duration = Duration::from_millis(100);
 
 /// How long a bootstrap-server lookup may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A fresh cache must never inherit the identity of a reused transport address.
+fn new_cache_id() -> std::io::Result<String> {
+    let mut random = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    Ok(format!("{:032x}", u128::from_be_bytes(random)))
+}
 
 /// A Decode rank's settings.
 #[derive(Debug, Clone)]
@@ -108,6 +117,8 @@ type ConnectionKey = (String, u64, Vec<i64>);
 
 #[derive(Default)]
 struct State {
+    /// Changes whenever the cache is restored, even if its address is reused.
+    cache_id: String,
     rooms: RoomTable,
     /// The rooms of the requests the scheduling loop tracks. Only these
     /// keep state: a late report, connection or admission of a room the
@@ -338,6 +349,13 @@ impl Shared {
     /// look up the route, register with its ranks the first time the route
     /// is used, and mark the room bootstrapped.
     fn connect(&self, room: u64, addr: &str) -> Result<(), String> {
+        let cache_id = {
+            let state = self.state();
+            if !state.tracked.contains(&room) {
+                return Ok(());
+            }
+            state.cache_id.clone()
+        };
         let route = self.route(addr)?;
         let dp_group = room % route.prefill_dp_size.max(1) as u64;
         let key: ConnectionKey = (addr.to_owned(), dp_group, route.target_tp_ranks.clone());
@@ -377,30 +395,38 @@ impl Shared {
                         is_dummy: route.dummy_tp_ranks.contains(&rank),
                     });
                 }
-                let targets = Arc::new(targets);
-                self.state().connections.insert(key, targets.clone());
-                // Registered once per route; a room's pre-allocation follows
-                // on the same socket, so it arrives after the registration.
-                let session_id = self.transport.session_id();
-                for target in targets.iter() {
-                    self.transport.sockets.send(
-                        &target.host,
-                        target.port,
-                        wire::registration_frames(
-                            &self.local_ip,
-                            self.transport.sockets.port(),
-                            &session_id,
-                            self.arena_base,
-                            &self.layout_wire,
-                            self.tp_size,
-                            self.tp_rank,
-                        ),
-                    );
-                }
-                targets
+                Arc::new(targets)
             }
         };
-        if self.state().attach(room, addr, &route, targets) {
+        let mut state = self.state();
+        // The HTTP lookup may outlive a cancelled request or a cache release.
+        // Do not repopulate the new cache's connections with that old work.
+        if !state.tracked.contains(&room) || state.cache_id != cache_id {
+            return Ok(());
+        }
+        if !state.connections.contains_key(&key) {
+            // Enqueue registration while holding the incarnation lock. A
+            // room's pre-allocation follows on this same socket.
+            let session_id = self.transport.session_id();
+            for target in targets.iter() {
+                self.transport.sockets.send(
+                    &target.host,
+                    target.port,
+                    wire::registration_frames(
+                        &self.local_ip,
+                        self.transport.sockets.port(),
+                        &session_id,
+                        &state.cache_id,
+                        self.arena_base,
+                        &self.layout_wire,
+                        self.tp_size,
+                        self.tp_rank,
+                    ),
+                );
+            }
+            state.connections.insert(key, targets.clone());
+        }
+        if state.attach(room, addr, &route, targets) {
             tracing::debug!(room, "connected");
         }
         Ok(())
@@ -482,13 +508,17 @@ impl DecodeOutbox {
         self.shared.transport.release_regions()
     }
 
-    /// A wake re-mapped the cache: register it under a fresh transfer
-    /// session, as the Prefill ranks write into this memory with the keys of
-    /// its registration, and forget the registrations made under the old
-    /// one, so the next request registers the new session again.
+    /// A wake re-mapped the cache: replace both its transfer engine and its
+    /// identity. The next request registers this incarnation even when the
+    /// engine reuses an earlier transport address.
     pub fn restore_registration(&self) -> Result<(), String> {
+        let cache_id = new_cache_id()
+            .map_err(StartError::CacheIdentity)
+            .map_err(|error| error.to_string())?;
+        let mut state = self.shared.state();
         self.shared.transport.restore_regions(true)?;
-        self.shared.state().connections.clear();
+        state.cache_id = cache_id;
+        state.connections.clear();
         Ok(())
     }
 
@@ -540,20 +570,18 @@ impl DecodeOutbox {
     /// A request's pages are admitted: send its manifest to its Prefill
     /// ranks; its KV lands at `request_pool_index`.
     fn receive(&self, rid: &str, room: u64, request_pool_index: i32, manifest: &[u8]) {
-        let targets = {
-            let mut state = self.shared.state();
-            if !state.tracked.contains(&room) {
-                // The loop ended the request (its transfer failed) after it
-                // planned this admission: its pages go back, so no Prefill
-                // rank may write them.
-                tracing::debug!(rid, room, "not pre-allocating an ended request");
-                return;
-            }
-            state.admissions.insert(room, request_pool_index);
-            state.waiting_since.insert(room, Instant::now());
-            state.rooms.update(room, TransferPoll::WaitingForInput);
-            state.targets.get(&room).cloned()
-        };
+        let mut state = self.shared.state();
+        if !state.tracked.contains(&room) {
+            // The loop ended the request (its transfer failed) after it
+            // planned this admission: its pages go back, so no Prefill
+            // rank may write them.
+            tracing::debug!(rid, room, "not pre-allocating an ended request");
+            return;
+        }
+        state.admissions.insert(room, request_pool_index);
+        state.waiting_since.insert(room, Instant::now());
+        state.rooms.update(room, TransferPoll::WaitingForInput);
+        let targets = state.targets.get(&room).cloned();
         let Some(targets) = targets else {
             tracing::warn!(
                 rid,
@@ -562,14 +590,13 @@ impl DecodeOutbox {
             );
             return;
         };
-        let session_id = self.shared.transport.session_id();
         for target in targets.iter() {
             self.shared.transport.sockets.send(
                 &target.host,
                 target.port,
                 wire::preallocation_frames(
                     room,
-                    &session_id,
+                    &state.cache_id,
                     (!target.is_dummy).then_some(manifest),
                 ),
             );
@@ -605,11 +632,15 @@ impl DecodePeer {
     /// socket and start the threads.
     pub fn start(config: DecodeConfig) -> Result<(Self, DecodeOutbox), StartError> {
         let layout = Contract::from_wire(&config.layout)?;
+        let cache_id = new_cache_id().map_err(StartError::CacheIdentity)?;
         let (incoming, messages) = mpsc::channel::<Vec<bytes::Bytes>>();
         let transport = Transport::start(&config.peer, incoming)?;
         let shared = Arc::new(Shared {
             transport,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                cache_id,
+                ..State::default()
+            }),
             local_ip: config.peer.local_ip.clone(),
             engine_rank: config.peer.engine_rank,
             arena_base: config.arena_base,
@@ -694,6 +725,11 @@ impl DecodePeer {
     /// The transfer engine's session id.
     pub fn session_id(&self) -> String {
         self.shared.transport.session_id()
+    }
+
+    /// The current cache incarnation, independent of its transfer address.
+    pub fn cache_id(&self) -> String {
+        self.shared.state().cache_id.clone()
     }
 
     fn forget(&mut self, rid: &str) {
