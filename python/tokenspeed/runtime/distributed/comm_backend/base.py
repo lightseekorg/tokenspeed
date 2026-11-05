@@ -309,8 +309,8 @@ class CommBackend(ABC):
         self, nbytes: int, like: torch.Tensor, group: Group
     ) -> torch.Tensor:
         """Acquire ``nbytes`` (uint8) for a producer to fill and a later
-        ``all_gather_single``, or even ``all_to_all_single``, over ``group``
-        to send.
+        ``all_gather_single``, even ``all_to_all_single`` or
+        ``try_combine_records`` over ``group`` to send.
 
         A backend whose exchange pulls each rank's input in place returns its
         storage, which the next such exchange's producer may overwrite.
@@ -323,6 +323,33 @@ class CommBackend(ABC):
             group: Global ranks of the exchange.
         """
         return torch.empty((nbytes,), dtype=torch.uint8, device=like.device)
+
+    def try_combine_records(
+        self,
+        records: torch.Tensor,
+        group: Group,
+        *,
+        head_dim: int,
+        partial_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Exchange DCP attention ``records`` to their head owners and combine
+        this rank's without a sink in one step, or return None for the
+        caller's even ``all_to_all_single`` and ``combine_dcp_attention_partials``.
+
+        A result is theirs bit for bit: contiguous ``[tokens, local_heads,
+        head_dim]`` of ``output_dtype``. Must decide identically on every
+        rank of ``group``.
+
+        Args:
+            records: Contiguous int32 ``[len(group), tokens, local_heads,
+                words + 1]``: row ``r`` goes to group rank ``r``.
+            group: Global ranks of the exchange.
+            head_dim: Unpadded partial head dimension.
+            partial_dtype: The dtype the records pack.
+            output_dtype: The combined output's dtype.
+        """
+        return None
 
     @abstractmethod
     def all_gather(

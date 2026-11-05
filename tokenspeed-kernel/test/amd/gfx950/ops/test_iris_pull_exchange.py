@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Iris pull gathers and all-to-alls match NCCL's, back to back and replayed."""
+"""Iris pull gathers, all-to-alls and records combines match NCCL's (and the
+Triton combine's), back to back and replayed."""
 
 import socket
 from datetime import timedelta
@@ -184,6 +185,178 @@ def _exchange_worker(rank: int, port: int) -> None:
     dist.destroy_process_group()
 
 
+HEADS, HEAD_DIM = 12, 512
+
+
+def _records(tokens: int, rank: int, device: torch.device, seed: int) -> torch.Tensor:
+    """Rank ``rank``'s K3.1 KVP8 decode records for every rank: BF16 partials,
+    LSEs with empty (-inf, and +inf as the combine also reads it) and NaN
+    entries, and a head no rank attended."""
+    gen = torch.Generator(device=device).manual_seed(8 * seed + rank)
+    values = torch.randn((8, tokens, HEADS, HEAD_DIM), device=device, generator=gen).to(
+        torch.bfloat16
+    )
+    lse = torch.randn((8, tokens, HEADS), device=device, generator=gen) * 4
+    lse.view(-1)[::7] = -float("inf")
+    lse.view(-1)[3::29] = float("inf")
+    if tokens >= 4:
+        lse[rank, 3, 5] = float("nan")
+        lse[:, 2, 1] = -float("inf")
+    records = torch.empty(
+        (8, tokens, HEADS, HEAD_DIM // 2 + 1), dtype=torch.int32, device=device
+    )
+    records[..., : HEAD_DIM // 2] = values.view(torch.int32).view(
+        8, tokens, HEADS, HEAD_DIM // 2
+    )
+    records[..., HEAD_DIM // 2] = lse.view(torch.int32)
+    return records
+
+
+def _same_bits(actual: torch.Tensor, expected: torch.Tensor) -> bool:
+    return bool(
+        (
+            (actual.view(torch.int16) == expected.view(torch.int16))
+            | (actual.isnan() & expected.isnan())
+        ).all()
+    )
+
+
+def _combine_worker(rank: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=8,
+        timeout=timedelta(seconds=180),
+    )
+    group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+    from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
+        combine_dcp_attention_partials,
+    )
+    from tokenspeed_kernel.ops.communication._iris import (
+        IrisGroup,
+        get_or_create_context,
+    )
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
+
+    ctx = get_or_create_context(heap_size=1 << 28)
+    exchange = IrisPullExchange(IrisGroup(ctx, group, rank, device), MAX_BYTES)
+    exchange.peers.finish_prepare()
+    dtypes = {"partial_dtype": torch.bfloat16, "output_dtype": torch.bfloat16}
+
+    def reference(records: torch.Tensor) -> torch.Tensor:
+        received = torch.empty_like(records)
+        dist.all_to_all_single(received.view(-1), records.view(-1), group=group)
+        return combine_dcp_attention_partials(
+            received, head_dim=HEAD_DIM, sink=None, **dtypes
+        )
+
+    def lend(records: torch.Tensor) -> torch.Tensor:
+        send = exchange.input(records.nbytes).view(torch.int32).view(records.shape)
+        send.copy_(records)
+        assert exchange.can_combine_records(send, head_dim=HEAD_DIM, **dtypes)
+        return send
+
+    # One-subgroup and four-subgroup programs; the slow rank makes peers wait.
+    for tokens in (1, 4, 16, 48, 64):
+        records = _records(tokens, rank, device, tokens)
+        expected = reference(records)
+        torch.cuda.synchronize()
+        dist.barrier()
+        if rank == 3:
+            torch.cuda._sleep(5_000_000)
+        combined = exchange.combine_records(lend(records), head_dim=HEAD_DIM)
+        assert combined.shape == (tokens, HEADS, HEAD_DIM)
+        assert combined.dtype == torch.bfloat16 and combined.is_contiguous()
+        assert _same_bits(combined, expected)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    # Between gathers, as a DSA layer's records follow its score gather: each
+    # producer overwrites the buffer the previous call's slow peer pulled.
+    calls = []
+    for call in range(12):
+        records = _records(16 + call, rank, device, 100 + call)
+        gathered = torch.randint(
+            0, 256, (4096,), dtype=torch.uint8, device=device
+        ).roll(rank)
+        wanted = torch.empty((8 * 4096,), dtype=torch.uint8, device=device)
+        dist.all_gather_into_tensor(wanted, gathered, group=group)
+        calls.append((records, gathered, reference(records), wanted))
+    torch.cuda.synchronize()
+    dist.barrier()
+    results = []
+    for call, (records, gathered, _, _) in enumerate(calls):
+        if rank == 3 and call % 3 == 1:
+            torch.cuda._sleep(200_000)
+        send = exchange.input(gathered.numel())
+        send.copy_(gathered)
+        out = torch.empty((8 * 4096,), dtype=torch.uint8, device=device)
+        exchange.all_gather(out, send)
+        results.append(
+            (out, exchange.combine_records(lend(records), head_dim=HEAD_DIM))
+        )
+    torch.cuda.synchronize()
+    for (out, combined), (_, _, expected, wanted) in zip(results, calls):
+        assert torch.equal(out, wanted)
+        assert _same_bits(combined, expected)
+    dist.barrier()
+
+    # Replayed graphs read each replay's epoch from the device.
+    source = torch.empty_like(_records(48, rank, device, 0))
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        for _ in range(3):
+            replayed = exchange.combine_records(lend(source), head_dim=HEAD_DIM)
+    for replay in range(6):
+        source.copy_(_records(48, rank, device, 200 + replay))
+        expected = reference(source)
+        torch.cuda.synchronize()
+        dist.barrier()
+        if rank == 3 and replay % 2:
+            torch.cuda._sleep(2_000_000)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert _same_bits(replayed, expected)
+    dist.barrier()
+
+    empty = exchange.input(0).view(torch.int32).view(_records(0, rank, device, 0).shape)
+    assert not exchange.can_combine_records(empty, head_dim=HEAD_DIM, **dtypes)
+    records = lend(_records(4, rank, device, 0))
+    assert not exchange.can_combine_records(
+        records.clone(), head_dim=HEAD_DIM, **dtypes
+    )
+    assert not exchange.can_combine_records(
+        records.view(torch.float32), head_dim=HEAD_DIM, **dtypes
+    )
+    assert not exchange.can_combine_records(records[:4], head_dim=HEAD_DIM, **dtypes)
+    assert not exchange.can_combine_records(
+        records[:, :, :6], head_dim=HEAD_DIM, **dtypes
+    )
+    assert not exchange.can_combine_records(records, head_dim=HEAD_DIM - 2, **dtypes)
+    assert not exchange.can_combine_records(
+        records,
+        head_dim=HEAD_DIM,
+        partial_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+    )
+    assert not exchange.can_combine_records(
+        records,
+        head_dim=HEAD_DIM,
+        partial_dtype=torch.bfloat16,
+        output_dtype=torch.float16,
+    )
+    torch.cuda.synchronize()
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 @pytest.mark.skipif(
     not current_platform().is_cdna4 or torch.cuda.device_count() < 8,
     reason="requires eight CDNA4 GPUs",
@@ -193,3 +366,14 @@ def test_pull_exchange_matches_nccl_gathers_and_all_to_alls():
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_exchange_worker, args=(port,), nprocs=8, join=True)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4 or torch.cuda.device_count() < 8,
+    reason="requires eight CDNA4 GPUs",
+)
+def test_pull_combine_matches_nccl_all_to_all_then_combine():
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_combine_worker, args=(port,), nprocs=8, join=True)

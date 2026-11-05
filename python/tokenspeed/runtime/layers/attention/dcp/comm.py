@@ -36,6 +36,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     all_to_all_single,
     reduce_scatter,
+    try_combine_records,
 )
 
 
@@ -162,6 +163,16 @@ def combine_attention_records(
     Returns:
         Contiguous ``[tokens, local_heads, head_dim]`` of this rank's heads.
     """
+    if sink is None:
+        combined = try_combine_records(
+            records,
+            group,
+            head_dim=head_dim,
+            partial_dtype=partial_dtype,
+            output_dtype=output_dtype,
+        )
+        if combined is not None:
+            return combined
     received = torch.empty_like(records)
     all_to_all_single(received.flatten(), records.flatten(), group)
     return combine_dcp_attention_partials(

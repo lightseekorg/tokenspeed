@@ -616,6 +616,27 @@ class AutoBackend(CommBackend):
             return self._iris.acquire_exchange_input(nbytes, like, group)
         return super().acquire_exchange_input(nbytes, like, group)
 
+    def try_combine_records(
+        self,
+        records: torch.Tensor,
+        group: Group,
+        *,
+        head_dim: int,
+        partial_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        # The combine is the unfused one's, bit for bit, so neither the
+        # batch-invariant envelope nor determinism vetoes it.
+        if self._iris_reaches(group):
+            return self._iris.try_combine_records(
+                records,
+                group,
+                head_dim=head_dim,
+                partial_dtype=partial_dtype,
+                output_dtype=output_dtype,
+            )
+        return None
+
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
