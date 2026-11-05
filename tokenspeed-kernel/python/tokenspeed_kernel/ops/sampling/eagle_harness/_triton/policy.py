@@ -48,6 +48,10 @@ from __future__ import annotations
 
 from tokenspeed_kernel._triton import tl, triton
 
+# The kernels read these globals, and Triton only lets @triton.jit code read a
+# global made with tl.constexpr(...) (a plain int raises NameError at compile).
+# The plain ints below (NUM_STATE, MAX_*, ...) are only used on the host.
+
 # Scalars of the int32 state tensor.
 _TINY = tl.constexpr(0)
 _TIER = tl.constexpr(1)

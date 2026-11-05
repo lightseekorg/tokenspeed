@@ -69,24 +69,15 @@ _EXACT = dict(enable_fp_fusion=False)
 _MAX_BATCH_SIZE = 512
 
 
-def _register(op: str, capability: CapabilityRequirement = _PORTABLE):
-    return register_kernel(
-        "sampling",
-        op,
-        name=f"triton_{op}",
-        solution="triton",
-        capability=capability,
-        signatures=frozenset({format_signature()}),
-        priority=Priority.PORTABLE,
-    )
-
-
-def _check(condition: bool, message: str) -> None:
-    if not condition:
-        raise ValueError(f"eagle_harness: {message}")
-
-
-@_register("eagle_harness_update_node_data")
+@register_kernel(
+    "sampling",
+    "eagle_harness_update_node_data",
+    name="triton_eagle_harness_update_node_data",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_update_node_data(
     pool_scores: torch.Tensor,
     pool_tokens: torch.Tensor,
@@ -103,11 +94,10 @@ def triton_eagle_harness_update_node_data(
     ``sort_scores`` (row-strided fp32). Grid: ``cdiv(bs * K, 256)``
     programs of 256 elements; ``K`` is constexpr.
     """
-    _check(pool_tokens.stride(0) == pool_scores.stride(0), "pool row strides")
-    _check(
-        child_scores.is_contiguous() and child_tokens.is_contiguous(),
-        "contiguous [bs, K] children",
-    )
+    if pool_tokens.stride(0) != pool_scores.stride(0):
+        raise ValueError("eagle_harness: pool row strides")
+    if not (child_scores.is_contiguous() and child_tokens.is_contiguous()):
+        raise ValueError("eagle_harness: contiguous [bs, K] children")
     rows, k = child_scores.shape
     if rows * k == 0:
         return
@@ -128,7 +118,15 @@ def triton_eagle_harness_update_node_data(
     )
 
 
-@_register("eagle_harness_work_deltas")
+@register_kernel(
+    "sampling",
+    "eagle_harness_work_deltas",
+    name="triton_eagle_harness_work_deltas",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_work_deltas(
     work_scores: torch.Tensor,
     work_deltas: torch.Tensor,
@@ -149,8 +147,10 @@ def triton_eagle_harness_work_deltas(
     tree over 256 lanes (512 when ``work_scores`` has more than 256 rows),
     so the sum's order depends only on that row capacity.
     """
-    _check(work_scores.size(0) <= _MAX_BATCH_SIZE, "work deltas past 512 rows")
-    _check(work_scores.stride(1) == 1, "work score rows")
+    if work_scores.size(0) > _MAX_BATCH_SIZE:
+        raise ValueError("eagle_harness: work deltas past 512 rows")
+    if work_scores.stride(1) != 1:
+        raise ValueError("eagle_harness: work score rows")
     # The rows the live ones are among fix the sum tree's width.
     threads = _MAX_BATCH_SIZE // 2
     if work_scores.size(0) > threads:
@@ -168,7 +168,15 @@ def triton_eagle_harness_work_deltas(
     )
 
 
-@_register("eagle_harness_draft_depth_update")
+@register_kernel(
+    "sampling",
+    "eagle_harness_draft_depth_update",
+    name="triton_eagle_harness_draft_depth_update",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_draft_depth_update(
     child_probs: torch.Tensor,
     child_tokens: torch.Tensor,
@@ -245,43 +253,43 @@ def triton_eagle_harness_draft_depth_update(
         slot_starts,
         lane_mask,
     ):
-        _check(t.is_contiguous() and t.size(0) == rows, "contiguous [rows, ...]")
+        if not (t.is_contiguous() and t.size(0) == rows):
+            raise ValueError("eagle_harness: contiguous [rows, ...]")
     for t in (child_probs, child_tokens, child_hidden, frontier_hidden, lane_mask):
-        _check(t.dim() == 3 and t.size(1) == k, "[rows, lanes, *] tensors")
-    _check(
+        if not (t.dim() == 3 and t.size(1) == k):
+            raise ValueError("eagle_harness: [rows, lanes, *] tensors")
+    if not (
         child_probs.size(2) == k
         and child_tokens.size(2) == k
-        and k * k <= _tree.MAX_CHILDREN,
-        f"{k} lanes of {child_probs.size(2)} children",
-    )
+        and k * k <= _tree.MAX_CHILDREN
+    ):
+        raise ValueError(f"eagle_harness: {k} lanes of {child_probs.size(2)} children")
     for t in (expanded, frontier_tokens, frontier_scores, frontier_index, positions):
-        _check(t.dim() == 2 and t.size(1) == k, "frontier")
+        if not (t.dim() == 2 and t.size(1) == k):
+            raise ValueError("eagle_harness: frontier")
     num_nodes = pool_tokens.size(1)
-    _check(
-        pool_scores.size(1) == num_nodes and pool_prev.size(1) == num_nodes,
-        "node pool",
-    )
-    _check(
+    if not (pool_scores.size(1) == num_nodes and pool_prev.size(1) == num_nodes):
+        raise ValueError("eagle_harness: node pool")
+    if not (
         depth >= 1
         and sort_scores.size(1) <= _tree.MAX_VERIFY
-        and sort_scores.size(1) + k <= work_scores.size(1),
-        "verify lists",
-    )
+        and sort_scores.size(1) + k <= work_scores.size(1)
+    ):
+        raise ValueError("eagle_harness: verify lists")
     mask_words = lane_mask.size(2)
-    _check(
-        mask_words <= _tree.MAX_MASK_WORDS and 0 <= num_slots <= 64 * mask_words,
-        "lane masks",
-    )
+    if not (mask_words <= _tree.MAX_MASK_WORDS and 0 <= num_slots <= 64 * mask_words):
+        raise ValueError("eagle_harness: lane masks")
     hidden_size = child_hidden.size(2)
-    _check(
+    if not (
         child_hidden.dtype == frontier_hidden.dtype
-        and frontier_hidden.size(2) == hidden_size,
-        "hidden rows",
-    )
+        and frontier_hidden.size(2) == hidden_size
+    ):
+        raise ValueError("eagle_harness: hidden rows")
     # The copy gathers rows across lanes: it cannot run in place.
     span = rows * k * hidden_size * child_hidden.element_size()
     a, b = child_hidden.data_ptr(), frontier_hidden.data_ptr()
-    _check(a + span <= b or b + span <= a, "child_hidden overlaps frontier_hidden")
+    if not (a + span <= b or b + span <= a):
+        raise ValueError("eagle_harness: child_hidden overlaps frontier_hidden")
     if rows == 0:
         return
     _tree._draft_depth_update_kernel[(rows,)](
@@ -319,7 +327,15 @@ def triton_eagle_harness_draft_depth_update(
     )
 
 
-@_register("eagle_harness_stable_topk_desc")
+@register_kernel(
+    "sampling",
+    "eagle_harness_stable_topk_desc",
+    name="triton_eagle_harness_stable_topk_desc",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_stable_topk_desc(
     scores: torch.Tensor,
     live_rows: torch.Tensor,
@@ -338,24 +354,26 @@ def triton_eagle_harness_stable_topk_desc(
     output is unique. ``live_rows``, ``n`` and ``k`` (``1 <= k <= n``) are
     device int32 ``[1]``. Grid: one program per row of ``scores``.
     """
-    _check(
+    if not (
         scores.dim() == 2
         and out_values.dim() == 2
         and out_indices.dim() == 2
         and scores.stride(1) == 1
         and out_values.stride(1) == 1
         and out_indices.stride(1) == 1
-        and out_values.stride(0) == out_indices.stride(0),
-        "stable_topk_desc layouts",
-    )
+        and out_values.stride(0) == out_indices.stride(0)
+    ):
+        raise ValueError("eagle_harness: stable_topk_desc layouts")
     rows = scores.size(0)
-    _check(
+    if not (
         scores.size(1) <= 1024
         and out_values.size(0) == rows
         and out_indices.size(0) == rows
-        and out_values.size(1) == out_indices.size(1),
-        "stable_topk_desc needs <= 1024 score columns and [rows, max_k] outputs",
-    )
+        and out_values.size(1) == out_indices.size(1)
+    ):
+        raise ValueError(
+            "eagle_harness: stable_topk_desc needs <= 1024 score columns and [rows, max_k] outputs"
+        )
     if rows == 0:
         return
     _tree._stable_topk_desc_kernel[(rows,)](
@@ -372,7 +390,15 @@ def triton_eagle_harness_stable_topk_desc(
     )
 
 
-@_register("eagle_harness_write_verify_tree")
+@register_kernel(
+    "sampling",
+    "eagle_harness_write_verify_tree",
+    name="triton_eagle_harness_write_verify_tree",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_write_verify_tree(
     ranked: torch.Tensor,
     pool_tokens: torch.Tensor,
@@ -393,13 +419,14 @@ def triton_eagle_harness_write_verify_tree(
     root (pool node 0) with parent -1. ``live_rows`` and ``verify_num`` are
     device int32 ``[1]``. Grid: one program per request.
     """
-    _check(
+    if not (
         ranked.stride(1) == 1
         and pool_tokens.stride(1) == 1
-        and pool_prev.stride(1) == 1,
-        "unit column strides",
-    )
-    _check(pool_tokens.stride(0) == pool_prev.stride(0), "pool row strides")
+        and pool_prev.stride(1) == 1
+    ):
+        raise ValueError("eagle_harness: unit column strides")
+    if pool_tokens.stride(0) != pool_prev.stride(0):
+        raise ValueError("eagle_harness: pool row strides")
     batch_size = ranked.size(0)
     if batch_size == 0:
         return
@@ -422,31 +449,42 @@ def triton_eagle_harness_write_verify_tree(
     )
 
 
-@_register("eagle_harness_policy_load")
+@register_kernel(
+    "sampling",
+    "eagle_harness_policy_load",
+    name="triton_eagle_harness_policy_load",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_policy_load() -> None:
     """Nothing to load: the kernels compile on first launch."""
 
 
 def _round_depth(slots: torch.Tensor) -> int:
     """tree_depth from the [4, tree_depth + 1] slots."""
-    _check(
+    if not (
         slots.dim() == 2
         and slots.size(0) == 4
         and slots.is_contiguous()
-        and 2 <= slots.size(1) <= _policy.MAX_DEPTH + 1,
-        f"slots must be [4, depth + 1], depth <= {_policy.MAX_DEPTH}",
-    )
+        and 2 <= slots.size(1) <= _policy.MAX_DEPTH + 1
+    ):
+        raise ValueError(
+            f"eagle_harness: slots must be [4, depth + 1], depth <= {_policy.MAX_DEPTH}"
+        )
     return slots.size(1) - 1
 
 
 def _check_decision(depth: int, tree_depth: int, work_deltas: torch.Tensor, n: int):
-    _check(1 <= depth < tree_depth, "decision depth")
-    _check(
+    if not 1 <= depth < tree_depth:
+        raise ValueError("eagle_harness: decision depth")
+    if not (
         work_deltas.dim() == 1
         and work_deltas.size(0) == n
-        and work_deltas.stride(0) == 1,
-        f"work deltas must be contiguous [{n}]",
-    )
+        and work_deltas.stride(0) == 1
+    ):
+        raise ValueError(f"eagle_harness: work deltas must be contiguous [{n}]")
 
 
 def _f64_bits(value: float) -> int:
@@ -454,7 +492,15 @@ def _f64_bits(value: float) -> int:
     return struct.unpack("<q", struct.pack("<d", value))[0]
 
 
-@_register("eagle_harness_policy_begin_round")
+@register_kernel(
+    "sampling",
+    "eagle_harness_policy_begin_round",
+    name="triton_eagle_harness_policy_begin_round",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_policy_begin_round(
     state: torch.Tensor,
     seq: torch.Tensor,
@@ -502,12 +548,13 @@ def triton_eagle_harness_policy_begin_round(
     ``(1,)``.
     """
     tree_depth = _round_depth(slots)
-    _check(hist.size(1) <= _policy.MAX_HISTORY, "verify history")
-    _check(
+    if hist.size(1) > _policy.MAX_HISTORY:
+        raise ValueError("eagle_harness: verify history")
+    if not (
         batch_table.size(1) == _policy.BATCH_COLS
-        and (chain or tier_table.size(0) == _policy.TIER_TABLE_SIZE),
-        "policy tables",
-    )
+        and (chain or tier_table.size(0) == _policy.TIER_TABLE_SIZE)
+    ):
+        raise ValueError("eagle_harness: policy tables")
     cost_cols = 0 if chain else cost_f64.size(2)
     copy = tree_depth * _policy.CHAIN_F64 if chain else 2 + tree_depth
     _policy._policy_begin_round_kernel[(1,)](
@@ -539,7 +586,15 @@ def triton_eagle_harness_policy_begin_round(
     )
 
 
-@_register("eagle_harness_policy_decide_tree")
+@register_kernel(
+    "sampling",
+    "eagle_harness_policy_decide_tree",
+    name="triton_eagle_harness_policy_decide_tree",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_policy_decide_tree(
     state: torch.Tensor,
     seq: torch.Tensor,
@@ -592,7 +647,15 @@ def triton_eagle_harness_policy_decide_tree(
     )
 
 
-@_register("eagle_harness_policy_decide_chain")
+@register_kernel(
+    "sampling",
+    "eagle_harness_policy_decide_chain",
+    name="triton_eagle_harness_policy_decide_chain",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_policy_decide_chain(
     state: torch.Tensor,
     seq: torch.Tensor,
@@ -638,7 +701,15 @@ def triton_eagle_harness_policy_decide_chain(
     )
 
 
-@_register("eagle_harness_policy_select_verify", capability=_AMD)
+@register_kernel(
+    "sampling",
+    "eagle_harness_policy_select_verify",
+    name="triton_eagle_harness_policy_select_verify",
+    solution="triton",
+    capability=_AMD,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
 def triton_eagle_harness_policy_select_verify(
     state: torch.Tensor,
     recent: torch.Tensor,
@@ -689,18 +760,21 @@ def triton_eagle_harness_policy_select_verify(
     ``interval_f64`` the cost deltas after the ``2 + 5 * tree_depth`` stop
     columns. Grid: ``(1,)``.
     """
-    _check(
-        hist.size(1) <= _policy.MAX_HISTORY and recent.size(0) <= _policy.MAX_HISTORY,
-        "verify history",
-    )
-    _check(
+    if not (
+        hist.size(1) <= _policy.MAX_HISTORY and recent.size(0) <= _policy.MAX_HISTORY
+    ):
+        raise ValueError("eagle_harness: verify history")
+    if not (
         hist.size(0) <= _policy.RANK_MAX_ROWS
         and top_scores.size(1) <= _policy.RANK_MAX_COLS
-        and top_scores.stride(1) == 1,
-        "ranked scores: at most 32 rows and 64 unit-stride columns",
-    )
+        and top_scores.stride(1) == 1
+    ):
+        raise ValueError(
+            "eagle_harness: ranked scores: at most 32 rows and 64 unit-stride columns"
+        )
     max_widths = interval_i32.size(2) - 1
-    _check(max_widths <= _policy.MAX_WIDTHS, "measured widths")
+    if max_widths > _policy.MAX_WIDTHS:
+        raise ValueError("eagle_harness: measured widths")
     _policy._policy_select_verify_kernel[(1,)](
         state,
         recent,
