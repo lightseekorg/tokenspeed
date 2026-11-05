@@ -521,10 +521,7 @@ class TestCLIConfigCompat:
                 (["--sampling-backend", name], "requires --sampling-backend greedy")
                 for name in ("triton", "triton_full", "flashinfer", "flashinfer_full")
             ],
-            *[
-                (["--sampling-backend", "greedy", flag], "does not support")
-                for flag in ("--dp-sampling", "--enable-output-logprobs")
-            ],
+            (["--sampling-backend", "greedy", "--dp-sampling"], "does not support"),
             (
                 [
                     "--sampling-backend",
@@ -554,6 +551,33 @@ class TestCLIConfigCompat:
                 sa.resolve_basic_defaults()
                 with pytest.raises((ValueError), match=(message)):
                     sa.resolve_speculative_decoding()
+
+    @pytest.mark.parametrize("length", [1, 2.6, 4])
+    def test_synthetic_acceptance_length_allows_forced_trajectory_logprobs(
+        self, length
+    ):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--sampling-backend",
+                "greedy",
+                "--speculative-algorithm",
+                "DUMMY",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--synthetic-acceptance-length",
+                str(length),
+                "--enable-output-logprobs",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        sa.resolve_speculative_decoding()
+        assert sa.synthetic_acceptance_length == length
+        assert sa.enable_output_logprobs
+        assert sa.sampling_backend == "greedy"
+        assert not sa.dp_sampling
 
     def test_synthetic_acceptance_length_conflicting_sources(self):
         args = self._parse_args(

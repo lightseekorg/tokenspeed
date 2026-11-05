@@ -18,11 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Synthetic AL commits the requested draft prefix, including under graph replay."""
+"""Synthetic AL keeps a forced prefix and scores its actual conditional rows.
+
+Forced text is not a normal greedy trajectory or an accuracy result. Logprob
+checks exercise state/trajectory consistency of that supplied prefix.
+"""
 
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -281,6 +286,124 @@ def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
         observed.update(lengths.tolist())
     if al == 2.6:
         assert observed == {1, 2, 3}
+
+
+def _verify_with_logprobs(lengths, *, dtype, row_offset):
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+
+    width, bs = 8, len(lengths)
+    backend = GreedySamplingBackend(
+        replace(
+            _config(8.0, bs + row_offset, width, "cpu"),
+            enable_output_logprobs=True,
+            enable_tp_sync=False,
+        )
+    )
+    backend.prepare_step([], [], [], width)
+    backend._synthetic_lengths.fill_(width)
+    backend._synthetic_lengths[row_offset : row_offset + bs].copy_(
+        torch.tensor(lengths, dtype=torch.int32)
+    )
+    generator = torch.Generator().manual_seed(721)
+    logits = (torch.randn(bs * width, 512, generator=generator) * 0.125).clamp(-1, 1)
+    target_ids = torch.arange(bs * width, dtype=torch.int64) + 256
+    logits.scatter_(1, target_ids[:, None], 4.0)
+    logits = logits.to(dtype)
+    candidates = torch.arange(bs * width, dtype=torch.int32).reshape(bs, width) + 10
+    output = LogitsProcessorOutput(
+        next_token_logits=logits,
+        # The supported precomputed-argmax ABI, derived from these same logits.
+        next_token_ids=logits.argmax(dim=-1),
+    )
+    tokens, accepted = backend.verify(
+        output,
+        SamplingBatchInfo(vocab_size=512, device="cpu", batch_row_offset=row_offset),
+        candidates,
+        tree=None,
+    )
+    return backend, output, tokens, accepted, candidates
+
+
+def _assert_kept_logprobs(backend, output, tokens, lengths, candidates):
+    width = candidates.shape[1]
+    paths = backend.accepted_path(len(lengths), width)
+    probabilities = output.next_token_logprobs
+    assert probabilities is not None
+    for row, length in enumerate(lengths.tolist()):
+        indices = paths[row, :length].long()
+        expected = []
+        for column, index in enumerate(indices.tolist()):
+            token = int(tokens[index])
+            assert index == row * width + column
+            expected.append(
+                torch.log_softmax(
+                    output.next_token_logits[index], dim=-1, dtype=torch.float32
+                )[token]
+            )
+        actual = probabilities.index_select(0, indices)
+        reference = torch.stack(expected) if expected else probabilities.new_empty(0)
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        assert actual.numel() == length
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("row_offset", [0, 1])
+def test_forced_prefix_and_bonus_logprobs_use_their_own_logits_rows(dtype, row_offset):
+    lengths = list(range(1, 9))
+    backend, output, tokens, accepted, candidates = _verify_with_logprobs(
+        lengths, dtype=dtype, row_offset=row_offset
+    )
+    assert not backend.reads_only_argmax()
+    torch.testing.assert_close(accepted, torch.tensor(lengths, dtype=torch.int32))
+    paths = backend.accepted_path(8, 8)
+    target = output.next_token_logits.argmax(dim=-1).view(8, 8)
+    for row, length in enumerate(lengths):
+        expected = torch.cat(
+            (candidates[row, 1:length], target[row, length - 1 : length])
+        )
+        torch.testing.assert_close(
+            tokens.view(8, 8)[row, :length], expected.to(torch.int32)
+        )
+        assert paths[row].tolist() == list(range(row * 8, row * 8 + length)) + [-1] * (
+            8 - length
+        )
+        assert not tokens.view(8, 8)[row, length:].any()
+    _assert_kept_logprobs(backend, output, tokens, accepted, candidates)
+
+
+def test_stop_clipping_keeps_only_the_existing_prefix_logprobs():
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+
+    backend, output, tokens, accepted, candidates = _verify_with_logprobs(
+        [8, 8, 8], dtype=torch.float32, row_offset=1
+    )
+    states = RuntimeStates(3, 512, 8, device="cpu")
+    states.valid_cache_lengths[1:].fill_(100)
+    states.stop_token_ids[1, 0] = tokens.view(3, 8)[0, 1]
+    states.token_limits[2] = 104  # Three output tokens remain after the root input.
+    states.stopped[3] = True
+    original_tokens = tokens.clone()
+    original_probabilities = output.next_token_logprobs.clone()
+    states.apply_stop_conditions(
+        torch.tensor([1, 2, 3], dtype=torch.int64),
+        tokens,
+        accepted,
+        torch.full((3,), 8, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        num_extends=0,
+        num_prefill_outputs=0,
+        decode_width=8,
+        padding_index=-1,
+    )
+    torch.testing.assert_close(accepted, torch.tensor([2, 3, 0], dtype=torch.int32))
+    assert states.stopped[1:].all()
+    torch.testing.assert_close(tokens, original_tokens, rtol=0, atol=0)
+    torch.testing.assert_close(
+        output.next_token_logprobs, original_probabilities, rtol=0, atol=0
+    )
+    _assert_kept_logprobs(backend, output, tokens, accepted, candidates)
 
 
 if __name__ == "__main__":
