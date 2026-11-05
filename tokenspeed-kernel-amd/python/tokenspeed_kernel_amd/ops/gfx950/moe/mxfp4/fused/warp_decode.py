@@ -809,6 +809,129 @@ def _warp_decode_precomputed_situ_stage1_kernel(
     )
 
 
+@gluon.jit(do_not_specialize=("M",))
+def _warp_decode_precomputed_situ_dedup_stage1_kernel(
+    X,
+    W,
+    WScale,
+    TopkIds,
+    Y,
+    M,
+    D,
+    i_dim,
+    stride_xm,
+    stride_xk,
+    stride_tim,
+    stride_tik,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NUM_LOCAL_EXPERTS: gl.constexpr,
+):
+    """Route-direct W13/SiTU that loads each routed expert's W once per batch.
+
+    The CTA of a route's first token computes every token routed to the same
+    expert as one packed tile (M <= BLOCK_M) and stores each to its own
+    ``token * TOPK + slot`` row; the CTAs of the later duplicates exit.
+    """
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(2 * i_dim, BLOCK_N)
+    slot = pid % TOPK
+    rest = pid // TOPK
+    pid_n = rest % num_pid_n
+    token = rest // num_pid_n
+    raw_expert = gl.load(
+        TopkIds + token.to(gl.int64) * stride_tim + slot * stride_tik,
+        mask=token < M,
+        other=-1,
+    ).to(gl.int32)
+    expert = raw_expert - EXPERT_START
+    expert = gl.where((expert >= 0) & (expert < NUM_LOCAL_EXPERTS), expert, -1)
+
+    ids_layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 4], [NUM_WARPS, 1], [1, 0])
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, ids_layout))
+    cols = gl.arange(0, TOPK, layout=gl.SliceLayout(0, ids_layout))
+    ids = gl.load(
+        TopkIds + rows[:, None] * stride_tim + cols[None, :] * stride_tik,
+        mask=rows[:, None] < M,
+        other=-1,
+    ).to(gl.int32)
+    match = ids == raw_expert
+    has = gl.max(match.to(gl.int32), axis=1) > 0
+    first = gl.min(gl.where(has, rows, BLOCK_M), axis=0)
+    if (expert >= 0) & (first == token):
+        row_slot = gl.sum(gl.where(match, cols[None, :], 0), axis=1)
+        load_x_layout: gl.constexpr = _load_layout(
+            BLOCK_K, BLOCK_M, NUM_WARPS, [1, 0], 8
+        )
+        row_l: gl.constexpr = gl.SliceLayout(1, load_x_layout)
+        routed = gl.convert_layout(has, row_l)
+        row_token = gl.convert_layout(gl.where(has, rows, M), row_l)
+        packed_row = gl.convert_layout(rows * TOPK + row_slot, row_l)
+        packed_row = gl.where(routed, packed_row, 0)
+        _warp_decode_stage1_coop_compute(
+            row_token,
+            slot,
+            packed_row,
+            expert,
+            pid_n,
+            X,
+            W,
+            WScale,
+            Y,
+            M,
+            D,
+            i_dim,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_wk,
+            stride_wn,
+            stride_wse,
+            stride_wsk,
+            stride_wsn,
+            stride_ym,
+            stride_yn,
+            x_global_scale_ptr,
+            out_quant_scale_ptr,
+            w13_bias,
+            TOPK,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_BUFFERS,
+            NUM_WARPS,
+            W_PRESHUFFLED,
+            EVEN_K,
+            HAS_BIAS,
+            SITU_BETA,
+            SITU_LINEAR_BETA,
+            0.0,
+            DO_SITU=True,
+            PACKED_ROUTES=True,
+        )
+
+
 @gluon.jit(launch_metadata=_sorted_stage1_launch_metadata, do_not_specialize=("M",))
 def _warp_decode_precomputed_situ_sorted_stage1_kernel(
     X,
