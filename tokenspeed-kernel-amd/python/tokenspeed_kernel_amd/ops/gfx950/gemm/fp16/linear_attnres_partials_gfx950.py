@@ -23,19 +23,194 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import gemv
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     gluon_mm_a16w16_medium_gfx950,
 )
 
 _INPUT_SIZE = gl.constexpr(7168)
 _BLOCK_N_SIZE = 16
-_M4_WAVES_PER_EU = 1
+# Four-token tile width: the narrowest whose CTAs fit one wave of 256 CUs, one per CU.
+_M4_BLOCK_N_SIZES = {3648: 16, 6288: 32}
 _BLOCK_N = gl.constexpr(_BLOCK_N_SIZE)
 _BLOCK_K = gl.constexpr(512)
 _NUM_WARPS = gl.constexpr(8)
 _LANES = gl.constexpr(64)
 _PARTIAL_BLOCK = gl.constexpr(8192)
+# Tokens the GEMV-projection launch takes: the decode GEMV's MFMA tile.
+_GEMV_TOKENS = range(5, gemv.MAX_M + 1)
+_GEMV_OUTPUT_SIZES = frozenset({6288})
+# Half the hidden size, padded to a power of two: 8 waves x 64 lanes x 8 elements.
+_HALF = gl.constexpr(4096)
+_HALF_WAVES = gl.constexpr(8)
+_HALF_ELEMENTS = gl.constexpr(8)
+
+
+@gluon.jit
+def _half_offsets(start):
+    """``start`` plus a ``[8, 64, 8]`` (wave, lane, element) half-row index.
+
+    Four waves hold the eight Triton waves, wave ``w`` holding ``w`` and
+    ``w + 4``, so in-thread, lane and cross-wave sums pair the same values
+    as Triton's 8-wave butterfly.
+    """
+    gl.static_assert(gl.num_warps() * 2 == _HALF_WAVES)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, _HALF_ELEMENTS], [1, _LANES, 1], [gl.num_warps(), 1, 1], [2, 1, 0]
+    )
+    waves = gl.arange(0, _HALF_WAVES, gl.SliceLayout(1, gl.SliceLayout(2, layout)))
+    lanes = gl.arange(0, _LANES, gl.SliceLayout(0, gl.SliceLayout(2, layout)))
+    elements = gl.arange(
+        0, _HALF_ELEMENTS, gl.SliceLayout(0, gl.SliceLayout(1, layout))
+    )
+    return (
+        start
+        + waves[:, None, None] * (_LANES * _HALF_ELEMENTS)
+        + lanes[None, :, None] * _HALF_ELEMENTS
+        + elements[None, None, :]
+    )
+
+
+@gluon.jit
+def _half_sum(values):
+    return gl.sum(gl.sum(gl.sum(values, axis=2), axis=1), axis=0)
+
+
+@gluon.jit
+def _dual_partial_triton_order(
+    token,
+    blocks_ptr,
+    score_weight_a_ptr,
+    score_weight_b_ptr,
+    max_a_ptr,
+    sum_a_ptr,
+    accumulator_a_ptr,
+    max_b_ptr,
+    sum_b_ptr,
+    accumulator_b_ptr,
+    num_blocks,
+    block_stride,
+    token_stride,
+    eps,
+):
+    """One token's two partials, bitwise with ``attnres_partial_dual``."""
+    col0 = _half_offsets(0)
+    col1 = _half_offsets(_HALF)
+    mask0 = col0 < _INPUT_SIZE
+    mask1 = col1 < _INPUT_SIZE
+    wa0 = gl.load(score_weight_a_ptr + col0, mask=mask0, other=0.0).to(gl.float32)
+    wa1 = gl.load(score_weight_a_ptr + col1, mask=mask1, other=0.0).to(gl.float32)
+    wb0 = gl.load(score_weight_b_ptr + col0, mask=mask0, other=0.0).to(gl.float32)
+    wb1 = gl.load(score_weight_b_ptr + col1, mask=mask1, other=0.0).to(gl.float32)
+    acc_a0 = gl.zeros_like(wa0)
+    acc_a1 = gl.zeros_like(wa0)
+    acc_b0 = gl.zeros_like(wa0)
+    acc_b1 = gl.zeros_like(wa0)
+    m_a = gl.full((), -float("inf"), gl.float32)
+    s_a = gl.full((), 0.0, gl.float32)
+    m_b = gl.full((), -float("inf"), gl.float32)
+    s_b = gl.full((), 0.0, gl.float32)
+    b = 0
+    while b < num_blocks:
+        base = blocks_ptr + b * block_stride + token * token_stride
+        v0 = gl.load(base + col0, mask=mask0, other=0.0).to(gl.float32)
+        v1 = gl.load(base + col1, mask=mask1, other=0.0).to(gl.float32)
+        sq = _half_sum(v0 * v0) + _half_sum(v1 * v1)
+        rsig = gl.rsqrt(sq / _INPUT_SIZE + eps)
+        dot_a = _half_sum(v0 * wa0) + _half_sum(v1 * wa1)
+        logit_a = dot_a * rsig
+        m_an = gl.maximum(m_a, logit_a)
+        corr_a = gl.exp(m_a - m_an)
+        wgt_a = gl.exp(logit_a - m_an)
+        acc_a0 = acc_a0 * corr_a + wgt_a * v0
+        acc_a1 = acc_a1 * corr_a + wgt_a * v1
+        s_a = s_a * corr_a + wgt_a
+        m_a = m_an
+        dot_b = _half_sum(v0 * wb0) + _half_sum(v1 * wb1)
+        logit_b = dot_b * rsig
+        m_bn = gl.maximum(m_b, logit_b)
+        corr_b = gl.exp(m_b - m_bn)
+        wgt_b = gl.exp(logit_b - m_bn)
+        acc_b0 = acc_b0 * corr_b + wgt_b * v0
+        acc_b1 = acc_b1 * corr_b + wgt_b * v1
+        s_b = s_b * corr_b + wgt_b
+        m_b = m_bn
+        b += 1
+    row = token * _INPUT_SIZE
+    gl.store(accumulator_a_ptr + row + col0, acc_a0, mask=mask0)
+    gl.store(accumulator_a_ptr + row + col1, acc_a1, mask=mask1)
+    gl.store(max_a_ptr + token, m_a)
+    gl.store(sum_a_ptr + token, s_a)
+    gl.store(accumulator_b_ptr + row + col0, acc_b0, mask=mask0)
+    gl.store(accumulator_b_ptr + row + col1, acc_b1, mask=mask1)
+    gl.store(max_b_ptr + token, m_b)
+    gl.store(sum_b_ptr + token, s_b)
+
+
+@gluon.jit(do_not_specialize=("num_tokens",))
+def gluon_linear_attnres_partials_gemv_gfx950(
+    hidden_ptr,
+    weight_ptr,
+    output_ptr,
+    blocks_ptr,
+    score_weight_a_ptr,
+    score_weight_b_ptr,
+    max_a_ptr,
+    sum_a_ptr,
+    accumulator_a_ptr,
+    max_b_ptr,
+    sum_b_ptr,
+    accumulator_b_ptr,
+    num_blocks,
+    block_stride,
+    eps,
+    num_tokens,
+    rows,
+    output_size: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+):
+    """One dual-AttnRes CTA per token, then the decode GEMV's MFMA tiles.
+
+    Both match their standalone kernels bit for bit: the tiles are
+    ``gluon_gemv_a16w16_gfx950``'s, and the partials follow
+    ``attnres_partial_dual``'s summation order.
+    """
+    pid = gl.program_id(0)
+    if pid < num_tokens:
+        _dual_partial_triton_order(
+            pid,
+            blocks_ptr,
+            score_weight_a_ptr,
+            score_weight_b_ptr,
+            max_a_ptr,
+            sum_a_ptr,
+            accumulator_a_ptr,
+            max_b_ptr,
+            sum_b_ptr,
+            accumulator_b_ptr,
+            num_blocks,
+            block_stride,
+            _INPUT_SIZE,
+            eps,
+        )
+    else:
+        gemv._mfma_tile(
+            pid - num_tokens,
+            hidden_ptr,
+            weight_ptr,
+            output_ptr,
+            num_tokens,
+            output_size,
+            rows,
+            _INPUT_SIZE,
+            output_size,
+            K=_INPUT_SIZE,
+            BLOCK_M=16,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+        )
 
 
 @gluon.jit
@@ -227,6 +402,7 @@ def gluon_linear_attnres_partials_m4_gfx950(
     block_stride,
     eps,
     output_size: gl.constexpr,
+    BLOCK_N: gl.constexpr,
 ):
     """Run an M=4 MFMA projection alongside dual-AttnRes CTAs."""
     pid = gl.program_id(0)
@@ -253,7 +429,7 @@ def gluon_linear_attnres_partials_m4_gfx950(
             output_size,
             1,
             BLOCK_M=16,
-            BLOCK_N=_BLOCK_N,
+            BLOCK_N=BLOCK_N,
             BLOCK_K=512,
             WARPS_M=1,
             WARPS_N=4,
@@ -301,9 +477,14 @@ def launch_gluon_linear_attnres_partials_gfx950(
 ) -> torch.Tensor:
     """Run a decode projection and two AttnRes block reductions."""
     num_tokens = hidden_states.shape[0]
-    if num_tokens not in (1, 2, 4):
-        raise ValueError("tokens must be one of 1, 2, or 4")
     output_size = weight.shape[0]
+    gemv_projection = num_tokens in _GEMV_TOKENS
+    if gemv_projection and output_size not in _GEMV_OUTPUT_SIZES:
+        raise ValueError(
+            f"{num_tokens} tokens need an output size in {sorted(_GEMV_OUTPUT_SIZES)}"
+        )
+    if num_tokens not in (1, 2, 4) and not gemv_projection:
+        raise ValueError("tokens must be 1, 2, 4 or 5-16")
     if output_size % _BLOCK_N_SIZE != 0:
         raise ValueError(f"output size must be divisible by {_BLOCK_N_SIZE}")
     expected = (
@@ -354,8 +535,44 @@ def launch_gluon_linear_attnres_partials_gfx950(
     if eps <= 0.0:
         raise ValueError("AttnRes epsilon must be positive")
 
-    if num_tokens == 4 and output_size == 6288:
-        gluon_linear_attnres_partials_m4_gfx950[(output_size // _BLOCK_N_SIZE + 4,)](
+    if gemv_projection:
+        cus = torch.cuda.get_device_properties(
+            hidden_states.device
+        ).multi_processor_count
+        _, _, block_n, block_k, _, num_warps = gemv._config(
+            num_tokens, output_size, 7168, cus
+        )
+        # Wider tiles leave a CU per AttnRes CTA; row count never changes the sum order.
+        rows = triton.cdiv(output_size, cus - num_tokens)
+        if triton.next_power_of_2(rows) != block_n:
+            raise ValueError(f"no single-wave GEMV tiling for {output_size} columns")
+        gluon_linear_attnres_partials_gemv_gfx950[
+            (num_tokens + triton.cdiv(output_size, rows),)
+        ](
+            hidden_states,
+            weight,
+            out,
+            blocks,
+            score_weight_a,
+            score_weight_b,
+            *scratch_a,
+            *scratch_b,
+            blocks.shape[0],
+            blocks.stride(0),
+            float(eps),
+            num_tokens,
+            rows,
+            output_size,
+            block_n,
+            block_k,
+            num_warps=num_warps,
+        )
+        return out
+
+    m4_block_n = _M4_BLOCK_N_SIZES.get(output_size) if num_tokens == 4 else None
+    if m4_block_n is not None:
+        m4_programs = triton.cdiv(output_size, m4_block_n) + 4
+        gluon_linear_attnres_partials_m4_gfx950[(m4_programs,)](
             hidden_states,
             weight,
             out,
@@ -368,9 +585,10 @@ def launch_gluon_linear_attnres_partials_gfx950(
             blocks.stride(0),
             float(eps),
             output_size,
+            m4_block_n,
             num_warps=4,
             num_stages=1,
-            waves_per_eu=_M4_WAVES_PER_EU,
+            waves_per_eu=1,
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
         )
         return out

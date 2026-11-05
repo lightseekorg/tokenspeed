@@ -1100,6 +1100,26 @@ def test_compact_kvp_pages_table_width():
             run(cols)
 
 
+def test_virtual_slots_to_local_slot_count():
+    from tokenspeed_kernel.ops.kvcache import triton_cache_placement as placement
+
+    geometry = dict(rows_per_page=128, virtual_block_count=40, degree=4, rank=1)
+
+    def run(count):
+        # Null and foreign blocks, a block past the capacity, and -1 holes.
+        slots = torch.randint(-1, 41 * 128, (count,), dtype=torch.int32)
+        want = placement.virtual_slots_to_local(slots, **geometry)
+        got = placement.virtual_slots_to_local(slots.to(DEVICE), **geometry)
+        for value, expected in zip(got, want, strict=True):
+            torch.testing.assert_close(value.cpu(), expected, rtol=0, atol=0)
+
+    # The count is unspecialized: one count warms 1 and multiples of 16 too.
+    run(33)
+    with assert_no_triton_compile(placement._translate_virtual_slots):
+        for count in (1, 7, 16, 255, 256, 257, 4096, 70001):
+            run(count)
+
+
 def test_mhc_mixes_split_count():
     from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
     from tokenspeed_kernel.ops.residual import triton as residual
