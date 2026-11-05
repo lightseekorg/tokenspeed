@@ -592,7 +592,8 @@ def packed_block_tables_from_forward_op(
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
         device: Destination device for the packed tensor.
         num_reqs: Optional expected row count for every group.
-        expected_group_ids: Optional contract order and exact key set.
+        expected_group_ids: Optional pack order and exact key set; the
+            packed buffer and the returned views follow it.
         max_page_id: Optional common inclusive upper bound for page IDs.
         max_page_ids: Optional per-group inclusive upper bounds.
 

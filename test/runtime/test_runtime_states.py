@@ -298,6 +298,13 @@ def test_masked_state_tables_pads_only_the_stopped_rows_of_state_groups(device, 
     assert tuple(tables) == tuple(group_id for group_id, _ in _GROUP_KINDS)
     if layout == "separate":
         tables = {group_id: table.clone() for group_id, table in tables.items()}
+    else:
+        # The one-launch padding needs the bridge to pack the state groups end to end.
+        conv_a, conv_b = (tables[group_id] for group_id in _STATE_GROUPS)
+        assert (
+            conv_b.untyped_storage().data_ptr() == conv_a.untyped_storage().data_ptr()
+        )
+        assert conv_b.storage_offset() == conv_a.storage_offset() + conv_a.numel()
     for group_id, table in tables.items():
         assert torch.equal(table.cpu(), expected[group_id])
 
