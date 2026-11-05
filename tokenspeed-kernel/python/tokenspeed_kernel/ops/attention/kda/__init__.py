@@ -632,6 +632,7 @@ def try_kda_replay_commit(
                 "num_heads": num_heads,
                 "head_dim": head_dim,
                 "flat_state": True,
+                "batched_layers": False,
                 "recurrent_layout": recurrent_layout,
             },
             solution=solution,
@@ -696,14 +697,25 @@ def resolve_kda_batched_replay_commit(
             "kda_replay_commit",
             signature,
             traits=traits,
-            override=(
-                "triton_nvidia_kda_batched_replay_commit"
-                if current_platform().is_nvidia
-                else None
-            ),
+            override=_nvidia_batched_replay_override(),
         )
     except NoKernelFoundError:
         return None
+
+
+def _nvidia_batched_replay_override() -> str | None:
+    """Name the NVIDIA all-layer replay explicitly.
+
+    The per-layer replay declares no ``batched_layers`` trait, so trait
+    matching alone would not exclude it.
+    """
+    platform = current_platform()
+    if not platform.is_nvidia:
+        return None
+    cute = KernelRegistry.get().get_by_name("cutedsl_nvidia_kda_batched_replay_commit")
+    if cute is not None and cute.capability.satisfied_by(platform):
+        return cute.name
+    return "triton_nvidia_kda_batched_replay_commit"
 
 
 def kda_batched_replay_uses_raw_gate(

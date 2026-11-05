@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuteDSL KDA adapter for the chunked KDA prefill scan.
+"""CuteDSL KDA adapters: the chunked prefill scan and the batched replay.
 
 States use the native ``[N, HV, V, K]`` convention, matching the NVIDIA
 cache and the CuteDSL ABI. The dispatch facade adapts other cache layouts;
@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.prefill_scan_inputs import (
     prepare_capacity_scan,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
+    _DENSE_BF16_SIGNATURES,
     _DENSE_HALF_SIGNATURES,
     _nvidia_kda_prefill,
 )
@@ -72,7 +73,11 @@ if cutedsl_kda_supported():
     )
 
 
-__all__ = ["cutedsl_kda_chunk_prefill", "cutedsl_kda_supported"]
+__all__ = [
+    "cutedsl_kda_chunk_prefill",
+    "cutedsl_kda_supported",
+    "cutedsl_nvidia_kda_batched_replay_commit",
+]
 
 
 @register_kernel(
@@ -287,3 +292,124 @@ def cutedsl_kda_chunk_prefill(
         cu_seqlens_cpu=cu_seqlens_cpu,
     )
     return out.view(batch, tokens, num_value_heads, value_dim), final_state
+
+
+@register_kernel(
+    "attention",
+    "kda_replay_commit",
+    name="cutedsl_nvidia_kda_batched_replay_commit",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=_DENSE_BF16_SIGNATURES,
+    priority=Priority.PERFORMANT,
+    traits={
+        "batched_layers": frozenset({True}),
+        "flat_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+)
+def cutedsl_nvidia_kda_batched_replay_commit(
+    descriptors: torch.Tensor,
+    *,
+    group_indices: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    draft_token_num: int,
+    num_heads: int,
+    head_dim: int,
+    f_a_dim: int,
+    qkv_stride: int,
+    conv_stride: int,
+    f_a_stride: int,
+    beta_stride: int,
+    state_stride: int,
+    state_dtype: torch.dtype,
+    gate_stride: int,
+    conv_width: int,
+    lower_bound: float,
+) -> None:
+    """Replay every KDA layer described by stable device pointer tables.
+
+    Same contract as ``triton_nvidia_kda_batched_replay_commit``: the gate
+    precompute and the convolution-window publication are the shared Triton
+    launches; the recurrence runs as one persistent CuTe DSL kernel.
+
+    Args:
+        descriptors: Device pointers for every layer's inputs, weights, and state.
+        group_indices: Cache-group row for each descriptor.
+        read_indices: Source page indices, shaped ``[groups, batch]``.
+        write_indices: Destination page indices, shaped ``[groups, batch]``.
+        accepted_length: Accepted draft-token count for each request.
+        draft_token_num: Maximum number of draft tokens in the replay window.
+        num_heads: Number of local KDA value heads.
+        head_dim: Per-head key and value dimension (128).
+        f_a_dim: Width of the low-rank gate projection.
+        qkv_stride: Token stride of the packed QKV payload.
+        conv_stride: Page stride of the convolution state.
+        f_a_stride: Token stride of the low-rank gate payload.
+        beta_stride: Token stride of beta.
+        state_stride: Page stride of the recurrent state.
+        state_dtype: Storage dtype of every recurrent-state descriptor.
+        gate_stride: Token stride of the gate scratch tensor.
+        conv_width: Width of the depthwise convolution kernel (4).
+        lower_bound: Lower bound used by the KDA decay gate.
+
+    Returns:
+        None.
+    """
+    from tokenspeed_kernel.ops.attention.kda._cute_dsl.replay import (
+        kda_batched_replay,
+    )
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        batched_kda_replay_conv_window,
+        batched_kda_replay_gate,
+        check_batched_replay_args,
+    )
+
+    check_batched_replay_args(
+        descriptors, group_indices, head_dim=head_dim, state_dtype=state_dtype
+    )
+    if conv_width != 4:
+        raise ValueError("CuTe DSL KDA replay requires conv_width=4")
+    batched_kda_replay_gate(
+        descriptors,
+        rows=accepted_length.numel() * draft_token_num,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        f_a_dim=f_a_dim,
+        f_a_stride=f_a_stride,
+        gate_stride=gate_stride,
+        lower_bound=lower_bound,
+    )
+    kda_batched_replay(
+        descriptors.view(torch.int64),
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        draft_token_num=draft_token_num,
+        num_heads=num_heads,
+        qkv_stride=qkv_stride,
+        conv_stride=conv_stride,
+        beta_stride=beta_stride,
+        state_stride=state_stride,
+        state_dtype=state_dtype,
+        gate_stride=gate_stride,
+    )
+    batched_kda_replay_conv_window(
+        descriptors,
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        draft_token_num=draft_token_num,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        qkv_stride=qkv_stride,
+        conv_stride=conv_stride,
+    )

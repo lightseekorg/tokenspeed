@@ -723,10 +723,46 @@ def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> N
         assert not kda_replay_commit_supported(torch.float32)
         batched = attention_ops.resolve_kda_batched_replay_commit()
         assert batched is not None
-        assert batched.name == "triton_nvidia_kda_batched_replay_commit"
+        assert batched.name == "cutedsl_nvidia_kda_batched_replay_commit"
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+def test_per_layer_replay_never_selects_an_all_layer_kernel(
+    monkeypatch, b300_platform
+) -> None:
+    """The all-layer replays outrank the per-layer one on GB300, and their
+    descriptor-table call cannot take per-layer tensors."""
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    real_select = attention_ops.select_kernel
+    chosen = []
+
+    def record(*args, **kwargs):
+        chosen.append(real_select(*args, **kwargs).name)
+        return lambda **_kwargs: None
+
+    monkeypatch.setattr(attention_ops, "select_kernel", record)
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    try:
+        Platform.override(b300_platform)
+        registry.clear_cache()
+        assert try_kda_replay_commit(
+            *([tensor] * 9),
+            state_pool=tensor,
+            state_out=tensor,
+            read_indices=tensor,
+            write_indices=tensor,
+            accepted_length=tensor,
+            num_heads=96,
+            head_dim=128,
+            draft_token_num=4,
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+    assert chosen == ["triton_nvidia_kda_replay_commit"]
 
 
 def test_batched_replay_call_contract() -> None:
@@ -782,6 +818,10 @@ def test_kda_split_verify_registration_traits() -> None:
         ("triton_nvidia_kda_replay_commit", {"flat_state": True}),
         (
             "triton_nvidia_kda_batched_replay_commit",
+            {"flat_state": True, "batched_layers": True},
+        ),
+        (
+            "cutedsl_nvidia_kda_batched_replay_commit",
             {"flat_state": True, "batched_layers": True},
         ),
     ],

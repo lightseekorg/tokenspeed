@@ -2381,28 +2381,14 @@ def batched_kda_commit_conv_window_kernel(
     tl.store(dst + 2, s2, mask=mask & (write_page >= 0))
 
 
-def batched_recurrent_kda_replay_commit(
+def check_batched_replay_args(
     addresses: torch.Tensor,
     group_indices: torch.Tensor,
-    read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
-    accepted_length: torch.Tensor,
     *,
-    draft_token_num: int,
-    num_heads: int,
     head_dim: int,
-    f_a_dim: int,
-    qkv_stride: int,
-    conv_stride: int,
-    f_a_stride: int,
-    beta_stride: int,
-    state_stride: int,
     state_dtype: torch.dtype,
-    gate_stride: int,
-    conv_width: int,
-    lower_bound: float,
 ) -> None:
-    """Commit descriptor-table KDA layers using an explicit cache-group map."""
+    """Validate the descriptor-table arguments every batched replay shares."""
     if state_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError("KDA replay requires FP32 or BF16 stored state")
     if head_dim != 128:
@@ -2418,8 +2404,21 @@ def batched_recurrent_kda_replay_commit(
         raise ValueError("group_indices and addresses must be on the same device")
     if not group_indices.is_contiguous():
         raise ValueError("group_indices must be contiguous")
-    batch = accepted_length.numel()
-    rows = batch * draft_token_num
+
+
+def batched_kda_replay_gate(
+    addresses: torch.Tensor,
+    *,
+    rows: int,
+    num_heads: int,
+    head_dim: int,
+    f_a_dim: int,
+    f_a_stride: int,
+    gate_stride: int,
+    lower_bound: float,
+) -> None:
+    """Fill every descriptor layer's gate scratch for ``rows`` window rows."""
+    layers = addresses.shape[0]
     # tl.dot needs 16 rows; tensor cores run this gate 5x faster than tl.sum.
     if rows >= 16:
         block_t, block_k = _gate_tiling_dot(rows, head_dim)
@@ -2450,6 +2449,85 @@ def batched_recurrent_kda_replay_commit(
         BT=block_t,
         num_warps=gate_warps,
     )
+
+
+def batched_kda_replay_conv_window(
+    addresses: torch.Tensor,
+    group_indices: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    *,
+    draft_token_num: int,
+    num_heads: int,
+    head_dim: int,
+    qkv_stride: int,
+    conv_stride: int,
+) -> None:
+    """Publish every layer's convolution window after the recurrence read it."""
+    layers = addresses.shape[0]
+    batch = accepted_length.numel()
+    # Swept 8192..64 at every batch size: 128 wins from batch 8 up (3x the
+    # whole-row block at 32) and ties the best within noise at batch 1, while
+    # 64 falls off a cliff. A fixed block beats sizing to the grid, which
+    # stopped narrowing while the wins were still there.
+    conv_dim = 3 * num_heads * head_dim
+    conv_block = 128
+    batched_kda_commit_conv_window_kernel[
+        (layers, batch, triton.cdiv(conv_dim, conv_block))
+    ](
+        addresses,
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        batch,
+        T=draft_token_num,
+        STRIDE_QKV=qkv_stride,
+        STRIDE_CONV=conv_stride,
+        CONV_DIM=conv_dim,
+        BLOCK=conv_block,
+        num_warps=1,
+    )
+
+
+def batched_recurrent_kda_replay_commit(
+    addresses: torch.Tensor,
+    group_indices: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    *,
+    draft_token_num: int,
+    num_heads: int,
+    head_dim: int,
+    f_a_dim: int,
+    qkv_stride: int,
+    conv_stride: int,
+    f_a_stride: int,
+    beta_stride: int,
+    state_stride: int,
+    state_dtype: torch.dtype,
+    gate_stride: int,
+    conv_width: int,
+    lower_bound: float,
+) -> None:
+    """Commit descriptor-table KDA layers using an explicit cache-group map."""
+    check_batched_replay_args(
+        addresses, group_indices, head_dim=head_dim, state_dtype=state_dtype
+    )
+    layers = addresses.shape[0]
+    batch = accepted_length.numel()
+    batched_kda_replay_gate(
+        addresses,
+        rows=batch * draft_token_num,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        f_a_dim=f_a_dim,
+        f_a_stride=f_a_stride,
+        gate_stride=gate_stride,
+        lower_bound=lower_bound,
+    )
     batched_recurrent_kda_replay_commit_kernel[(layers, batch, num_heads)](
         addresses,
         group_indices,
@@ -2473,27 +2551,17 @@ def batched_recurrent_kda_replay_commit(
         num_warps=1,
         num_stages=2,
     )
-    # Swept 8192..64 at every batch size: 128 wins from batch 8 up (3x the
-    # whole-row block at 32) and ties the best within noise at batch 1, while
-    # 64 falls off a cliff. A fixed block beats sizing to the grid, which
-    # stopped narrowing while the wins were still there.
-    conv_dim = 3 * num_heads * head_dim
-    conv_block = 128
-    batched_kda_commit_conv_window_kernel[
-        (layers, batch, triton.cdiv(conv_dim, conv_block))
-    ](
+    batched_kda_replay_conv_window(
         addresses,
         group_indices,
         read_indices,
         write_indices,
         accepted_length,
-        batch,
-        T=draft_token_num,
-        STRIDE_QKV=qkv_stride,
-        STRIDE_CONV=conv_stride,
-        CONV_DIM=conv_dim,
-        BLOCK=conv_block,
-        num_warps=1,
+        draft_token_num=draft_token_num,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        qkv_stride=qkv_stride,
+        conv_stride=conv_stride,
     )
 
 
