@@ -960,15 +960,12 @@ class _AttnResMixSpec:
     out_norm_eps: float
     num_valid_blocks: int
     block_write_idx: int
-    # The next layer's first input projection, applied to the mix while it
-    # gathers; None when the next layer projects its own input. A replicated
-    # weight (MLA q_a/kv_a) projects only the owned rows and gathers them.
+    # Next layer's projection applied while gathering, or None if it projects its own.
     next_weight: torch.Tensor | None
     gather_next_projection: bool
 
 
-# The row-sharded MoE tail mixes the next AttnRes input from this many rows;
-# below, its owned rows are too few for the replicated mix to cost much.
+# Below this, the replicated AttnRes mix costs too little to shard by rows.
 _K3_SHARDED_RESIDUAL_MIN_TOKENS = 1024
 
 
@@ -1991,11 +1988,9 @@ def _attnres_scratch(
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
-# A replicated residual through this many rows takes the Lamport two-shot reduce
-# and the column-parallel gather tail instead (graph replay, 8x MI350X).
+# Through this many rows a replicated residual takes the Lamport reduce and gather tail.
 _IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 64
-# Below this the row-sharded router/latent projection leaves most CUs idle and
-# loses to projecting every row on every rank (graph replay, 8x MI350X).
+# Below this, row-sharded router/latent projection idles CUs and loses (8x MI350X).
 _IRIS_MOE_ROW_INPUT_MIN_TOKENS = 4096
 
 
@@ -2616,10 +2611,7 @@ class KimiLinearMoE(nn.Module):
                 hidden_states, self.packed_input_projection_weight
             )
         ):
-            # Every rank holds the same decode rows: each projects its eighth
-            # of the replicated router and routed columns, and the blocks are
-            # gathered. The gfx950 A8W4 MoE takes the latent's FP8 copy from
-            # the gathering programs instead of quantizing it again.
+            # Project own columns and gather; A8W4 reuses the gathered FP8 latent.
             quantize = (
                 self.experts.plan.get("apply_kernel_name")
                 == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
@@ -2831,9 +2823,7 @@ class KimiLinearMoE(nn.Module):
             and self.packed_input_projection_weight is not None
             and not self.routed_expert_down_proj.narrowed
         ):
-            # The attention mix gathered these rows onto every rank: project the
-            # replicated router and latent columns once per row, then gather the
-            # routes and the E2M1 latent instead of recomputing them per rank.
+            # Project each row once on its owner; gather the routes and E2M1 latent.
             row_inputs = self.iris_state.moe_row_sharded_inputs(
                 hidden_states,
                 self.packed_input_projection_weight,
@@ -2879,8 +2869,7 @@ class KimiLinearMoE(nn.Module):
         # Its final gather completes before the next producer can reuse the input.
         up_proj = self.routed_expert_up_proj
         norm = self.routed_expert_norm
-        # Top-k slot rows (_situ_defer_topk_reduce) reduce into the producer's
-        # routed output, which the tail decision reads.
+        # Top-k slot rows reduce into the routed output the tail decision reads.
         slot_rows = routed.shape[0] != num_tokens
         gather_tail = (
             not prefix_is_sharded
@@ -2987,8 +2976,7 @@ class KimiLinearMoE(nn.Module):
                 norm.weight if norm is not None else None,
             )
         ):
-            # Decode rows: every rank projects its column block of the
-            # replicated weight and the blocks are gathered.
+            # Decode: each rank projects its weight column block, then gathers.
             return self.iris_state.moe_gather_tail(
                 routed,
                 shared,
@@ -3486,8 +3474,7 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             mla_cls = KimiLinearMLAAttention
             if config.is_dsa_layer(layer_id):
-                # Kimi-K3.1: the same gated NoPE MLA, attending its indexer's
-                # top-k. Imported here: kimi_k31 builds on this module.
+                # K3.1 sparse MLA; imported here because kimi_k31 imports this module.
                 from tokenspeed.runtime.models.kimi_k31 import KimiK31SparseMLAAttention
 
                 mla_cls = KimiK31SparseMLAAttention
@@ -4496,8 +4483,7 @@ class KimiLinearModel(nn.Module):
                     else prefix_sum.clone()
                 )
         if stream is not None and stream.activation is not None:
-            # The last MoE tail already applied the output mix and norm. The
-            # activation borrows collective storage; return a copy.
+            # Mix and norm already applied; the activation borrows collective storage.
             return stream.activation.clone(), aux_hidden_states
         if stream is not None:
             prefix_sum = stream.unshard(prefix_sum, block_residual)
@@ -5132,9 +5118,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         pp_start = self.model.pp_start_layer
         pp_end = self.model.pp_end_layer
         pp_windowed = not (pp_start == 0 and pp_end == config.num_hidden_layers)
-        # K3.1 DSA indexer tensors load 1:1; any the model does not consume
-        # (or any it expects and never sees) fails the load instead of serving
-        # an indexer with initialization values. K3 has no indexer.
+        # Indexer tensors load 1:1; a missing or extra one fails the load.
         strict_indexer = bool(config.dsa_layer_ids)
         unconsumed_indexer: list[str] = []
         loaded_indexer: set[str] = set()

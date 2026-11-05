@@ -1182,10 +1182,7 @@ class CacheGroupRouter(AttentionBackend):
             layer_id, token_to_kv_pool, group
         )
 
-    # ------------------------------------------------------------------
-    # DSA KVP prefill surface: the model's top-k over KVP pages tiles by the
-    # owned width the leaf planned for the forward.
-    # ------------------------------------------------------------------
+    # DSA KVP prefill: top-k over KVP pages tiles by the leaf's planned owned width.
 
     def prefill_index_columns(self) -> int | None:
         return self._sole_leaf("prefill_index_columns").prefill_index_columns()

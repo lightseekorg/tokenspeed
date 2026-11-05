@@ -192,10 +192,7 @@ def triton_minimax_sigmoid_bias_topk(
 #: behind by 1024. One row stays with the decode specialist, and the
 #: gfx1250 Gluon remains available on these rows for explicit selection;
 #: the packed registration wins automatic selection by priority.
-#: CDNA4 measured on MI350X under graph replay against the gfx950 Gluon row
-#: kernel: 4.0-4.5 us vs 7.8-8.2 us from 2 to 256 rows, 6.2 vs 8.2 us at
-#: 512, tying at 768 and behind from 1024 (60 vs 37 us at 8192). One row
-#: stays on the decode specialist, which ties packed there (4.0 us).
+#: CDNA4 (MI350X, graph replay): beats the gfx950 Gluon row kernel from 2 to 512 rows.
 _PACKED_ROWS_NVIDIA = range(1, 257)
 _PACKED_ROWS_CDNA4 = range(2, 513)
 _PACKED_ROWS_CDNA5 = range(2, 513)

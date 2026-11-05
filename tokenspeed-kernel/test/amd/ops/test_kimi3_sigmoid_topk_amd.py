@@ -372,9 +372,7 @@ def test_kimi_topk_prefill_selects_evenly_strided_winners(
 def test_sigmoid_topk_prefill_exhausts_a_lane_of_few_experts(
     experts: int, dtype: torch.dtype
 ) -> None:
-    # Top-8 routers of 64-384 experts (GLM, MiniMax, dots, Kimi-K2 shapes).
-    # The largest choices are the experts congruent to 0 mod 64, so one lane
-    # runs out of experts before the selection ends.
+    # The top experts are all 0 mod 64, so one lane runs out before top-8 completes.
     tokens = 600
     generator = torch.Generator(device="cuda").manual_seed(experts)
     logits = torch.randn(tokens, experts, device="cuda", generator=generator)

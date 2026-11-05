@@ -304,8 +304,7 @@ def _hybrid_kda_pool(
         field_layer_offset=field_layer_offset,
     )
     if isinstance(softmax_attn, DSAConfig):
-        # Kimi-K3.1: the MLA layers carry index-K planes, addressed in the
-        # DSA leaf's kernel pages.
+        # Kimi-K3.1: MLA layers carry index-K planes in the DSA leaf's kernel pages.
         return HybridKDADSATokenToKVPool(
             index_head_dim=softmax_attn.index_head_dim,
             index_k_page_size=dsa_kernel_page_size(config),

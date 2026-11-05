@@ -63,9 +63,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 # inside stage2/stage3 -- Gluon kernels cannot read plain Python globals, so the
 # layout literal and this launch constant are kept in sync by hand.
 _SCAN_NUM_WARPS = 4
-# Routes per vector step of the chunked histogram and scatter kernels (the
-# 4-warp layout width). It is fixed so one binary serves every prefill chunk;
-# kernels loop over their route chunk.
+# Routes per vector step (4-warp layout width), fixed so one binary serves every chunk.
 _ROUTE_TILE = 256
 
 
@@ -446,8 +444,7 @@ def gluon_moe_sorting(
     if not use_minimum_route_chunks:
         num_programs = max(E, num_programs)
     tokens_per_program = triton.cdiv(numel, num_programs)
-    # A single program holds at most 1024 routes (decode-sized batches, whose
-    # graphs compile their bucket); one vector beats looping over 256 there.
+    # A lone program holds at most 1024 routes, where one vector beats looping over 256.
     route_tile = (
         max(_ROUTE_TILE, triton.next_power_of_2(tokens_per_program))
         if num_programs == 1

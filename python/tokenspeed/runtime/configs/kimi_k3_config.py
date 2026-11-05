@@ -248,8 +248,7 @@ class KimiLinearConfig(PretrainedConfig):
         if self.linear_attn_config.get("kda_layers") is None:
             raise ValueError("linear_attn_config must provide 'kda_layers'")
 
-        # Kimi-K3.1 DSA lightning indexer on the full-attention layers. Absent
-        # (Kimi-K3) leaves every field None/empty and the MLA layers dense.
+        # Absent (Kimi-K3), the DSA fields stay None and the MLA layers dense.
         self.dsa_config = dsa_config
         self.index_topk: int | None = None
         self.index_head_dim: int | None = None
@@ -318,8 +317,7 @@ class KimiLinearConfig(PretrainedConfig):
         ]
 
 
-# Every ``dsa_config`` key the K3.1 checkpoint declares. Each one is checked:
-# an unknown key may change the indexer's semantics, so it fails the parse.
+# Unknown dsa_config keys fail the parse: they may change the indexer's semantics.
 _DSA_CONFIG_KEYS = frozenset(
     {
         "dsa_layers",

@@ -334,8 +334,7 @@ def main() -> None:
     backend.num_local_heads = 2
     backend.num_attention_heads = 2 * len(group)
     backend.slot_order = "selection"
-    # A target verify of three rows whose refresh published no causal
-    # lengths: the decode derives them from seq_lens_k.
+    # A three-row verify without causal lengths: decode derives them from seq_lens_k.
     backend.is_draft = False
     backend.spec_num_tokens = 3
     end_length = torch.tensor([129], device="cuda", dtype=torch.int32)
@@ -356,9 +355,7 @@ def main() -> None:
         logit_cap=0.0,
     )
     pool = SimpleNamespace(quant_method=None, get_key_buffer=lambda _: local_latent)
-    # The forward compacts each rank's owned slots, runs the Triton core over
-    # [0, owned count) and combines the partials over the KVP group. At 64
-    # the whole window sits in one page, so the other ranks' rows are empty.
+    # At 64 the whole window sits in one page, so the other ranks' rows are empty.
     for end in (129, 132, 128, 64):
         end_length.fill_(end)
         lengths.copy_(
@@ -409,9 +406,7 @@ def main() -> None:
             output, ref_out[:, rank * 2 : (rank + 1) * 2], rtol=0.01, atol=0.005
         )
     print(f"rank {rank}: DSA verify and re-anchor matched unsharded", flush=True)
-    # Kimi-K3.1 verify geometry: 32 index heads, topk 2048, 128-token blocks
-    # holding two 64-token index pages, 8-row windows. Per-forward metadata
-    # with one tile, three-row tiles and the unsharded plane must agree.
+    # K3.1 verify geometry: one-tile, three-row-tile and unsharded metadata must agree.
     from tokenspeed.runtime.layers.attention.dcp.indexer import (
         build_dcp_index_metadata,
     )

@@ -457,8 +457,7 @@ class IrisAllReduceResidualRMSNorm(object):
         self._rank_start = 0
         self._rank_stride = 1
         self._iris_rank = dist.get_rank()
-        # Translated peer pointers carry no alignment; each row of the heap
-        # buffer starts at a multiple of its row size.
+        # Peer pointers carry no alignment; heap rows start at row-size multiples.
         self._peer_load_hint = math.gcd(hidden_dim * dtype.itemsize, 16)
 
         self.persistent = persistent
@@ -499,8 +498,7 @@ class IrisAllReduceResidualRMSNorm(object):
             region = None
         else:
             region.view(torch.int32).fill_(-2147483648)
-        # Every rank takes the same path. The fill completes on every rank
-        # before any peer can push into this mailbox.
+        # This collective orders every rank's fill before any peer pushes here.
         allocated = torch.tensor([int(region is not None)], device=self.device)
         dist.all_reduce(allocated, op=dist.ReduceOp.MIN, group=self.group)
         if not allocated.item():

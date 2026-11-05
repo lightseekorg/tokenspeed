@@ -74,8 +74,7 @@ def _attention(
     if logit_cap != 0.0:
         raise ValueError("Prims-TS DSA does not support logit_cap")
     if not enable_pdl:
-        # Upstream owns the main/reducer PDL dependency and exposes no disable
-        # switch. Do not silently ignore an explicit request to turn PDL off.
+        # Upstream owns PDL with no off switch; reject rather than ignore the request.
         raise ValueError(
             "Prims-TS DSA requires PDL enabled; upstream owns its scheduling"
         )
@@ -128,8 +127,7 @@ def _attention(
         raise ValueError(
             "out must be contiguous BF16 on the query device with the output size"
         )
-    # The indexer already enforces causality. Physical selected slots, not the
-    # dense context extent, define this core's reads (as for TRTLLM D576).
+    # The indexer enforces causality; the selected slots alone define this core's reads.
     del max_seqlen_k, kv_seq_lens
     return sparse_attention(
         query,

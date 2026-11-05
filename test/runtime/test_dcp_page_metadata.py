@@ -455,8 +455,7 @@ def test_max_owned_index_pages_bounds_every_rank(degree, block_size, holes):
     # Every rank computes the same bound, and it is tight.
     assert len(bounds) == 1
     assert bounds == {reached}
-    # One owner (a capture dummy's ownership, [B, 0, ..., 0]): every page of
-    # the longest request.
+    # One owner ([B, 0, ..., 0], a capture dummy's): all pages of the longest request.
     one_owner = torch.full_like(table, subpages * (1 + degree))
     assert max_owned_index_pages(
         one_owner,

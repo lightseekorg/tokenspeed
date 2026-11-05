@@ -42,8 +42,7 @@ def virtual_block_to_local(block, DEGREE: tl.constexpr, RANK: tl.constexpr):
     return tl.where(owned, local, 0), owned
 
 
-# The slot count follows the batch (tokens, or a table's pages); unspecialized
-# so every count shares one binary.
+# The slot count follows the batch; unspecialized so every count shares one binary.
 @triton.jit(do_not_specialize=["count"])
 def _translate_virtual_slots(
     source,
@@ -151,8 +150,7 @@ def _compact_owned_slots(
     Lens,
     Out,
     Counts,
-    # The selection width and row strides follow the batch's top-k
-    # workspace; runtime so every batch shape shares one binary.
+    # Batch-dependent width and strides stay runtime: one binary for every batch shape.
     SSTRIDE,
     OSTRIDE,
     WIDTH,
@@ -162,8 +160,7 @@ def _compact_owned_slots(
     RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # One program walks its row in order, carrying the owned count across
-    # blocks, so owned slots keep their selection order.
+    # One program per row carries the owned count, so owned slots keep selection order.
     row = tl.program_id(0).to(tl.int64)
     if Lens is None:
         length = WIDTH
@@ -184,8 +181,7 @@ def _compact_owned_slots(
             mask=valid,
         )
         count += tl.sum(valid.to(tl.int32), axis=0)
-    # The padding is disjoint from the owned stores above, so the two loops
-    # need no ordering between the program's threads.
+    # Padding is disjoint from the owned stores, so the loops need no ordering.
     for start in range(0, WIDTH, BLOCK):
         col = start + tl.arange(0, BLOCK)
         tl.store(
@@ -278,9 +274,7 @@ def compact_owned_slots(
         cols = torch.arange(width, device=slots.device)
         if lengths is not None:
             owned &= cols < lengths.to(torch.int64).clamp(0, width).unsqueeze(1)
-        # A stable partition: owned entries keep their order, and every other
-        # entry takes one of the remaining, also unique, destinations, so the
-        # scatter writes each output element once.
+        # Stable partition onto unique destinations: each output is written once.
         prefix = owned.cumsum(1)
         counts.copy_(prefix[:, -1])
         destinations = torch.where(owned, prefix - 1, prefix[:, -1:] + cols - prefix)

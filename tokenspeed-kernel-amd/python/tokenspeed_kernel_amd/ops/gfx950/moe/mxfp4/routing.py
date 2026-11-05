@@ -561,8 +561,7 @@ def gluon_sigmoid_bias_topk_gfx950(
         mask=expert_mask,
         other=0.0,
     ).to(gl.float32)
-    # Order-preserving choice bits above an inverted expert id: one unsigned
-    # max picks the largest choice and, among equal choices, the smaller id.
+    # Order-preserving choice bits over an inverted id: ties in max go to the lower id.
     choice_bits = (scores.to(gl.float32) + bias).to(gl.uint32, bitcast=True)
     choice_bits ^= gl.where((choice_bits & 0x80000000) != 0, 0xFFFFFFFF, 0x80000000).to(
         gl.uint32
@@ -570,8 +569,7 @@ def gluon_sigmoid_bias_topk_gfx950(
     keys = (choice_bits.to(gl.uint64) << 32) | (ROWS * LANES - 1 - expert).to(gl.uint64)
     keys = gl.where(expert_mask, keys, 0)
 
-    # A lane holds at most LANE_EXPERTS experts; its heads past them stay
-    # empty, and a lane can give up six heads only if it holds six experts.
+    # Heads past a lane's experts stay empty; only LANE_EXPERTS > 5 can exhaust all six.
     LANE_EXPERTS: gl.constexpr = (E + LANES - 1) // LANES
     remaining = keys
     head_0 = gl.max(remaining, axis=0)

@@ -31,10 +31,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
 
 _INPUT_SIZE = gl.constexpr(7168)
 _BLOCK_N_SIZE = 16
-# Four-token projection tile width per output size. Three LDS buffers leave
-# room for one projection CTA per CU, and each width takes the narrowest
-# tile whose CTAs fit in one wave of MI350X's 256 CUs: 228 at 3648 columns,
-# 197 at 6288 (16-column tiles there need 393, a mostly idle second wave).
+# Four-token tile width: the narrowest whose CTAs fit one wave of 256 CUs, one per CU.
 _M4_BLOCK_N_SIZES = {3648: 16, 6288: 32}
 _BLOCK_N = gl.constexpr(_BLOCK_N_SIZE)
 _BLOCK_K = gl.constexpr(512)
@@ -44,8 +41,7 @@ _PARTIAL_BLOCK = gl.constexpr(8192)
 # Tokens the GEMV-projection launch takes: the decode GEMV's MFMA tile.
 _GEMV_TOKENS = range(5, gemv.MAX_M + 1)
 _GEMV_OUTPUT_SIZES = frozenset({6288})
-# Half of the hidden size padded to a power of two, and the 8 waves x 64
-# lanes x 8 elements the standalone Triton partial spreads it over.
+# Half the hidden size, padded to a power of two: 8 waves x 64 lanes x 8 elements.
 _HALF = gl.constexpr(4096)
 _HALF_WAVES = gl.constexpr(8)
 _HALF_ELEMENTS = gl.constexpr(8)
@@ -546,8 +542,7 @@ def launch_gluon_linear_attnres_partials_gfx950(
         _, _, block_n, block_k, _, num_warps = gemv._config(
             num_tokens, output_size, 7168, cus
         )
-        # Fewer, wider tiles leave a CU per AttnRes CTA; the tile's
-        # summation order depends on its constexprs, not on its row count.
+        # Wider tiles leave a CU per AttnRes CTA; row count never changes the sum order.
         rows = triton.cdiv(output_size, cus - num_tokens)
         if triton.next_power_of_2(rows) != block_n:
             raise ValueError(f"no single-wave GEMV tiling for {output_size} columns")

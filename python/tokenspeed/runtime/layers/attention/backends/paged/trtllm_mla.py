@@ -192,8 +192,7 @@ class TRTLLMMLADecodeMetadata:
     # kernel needs none); the dense leaf itself never reads them.
     _dsa_seq_lens_2d: torch.Tensor | None = None
     _dsa_plan: object | None = None
-    # DSA wrapper's per-token causal KV lengths (``[bs * spec_num_tokens]``
-    # int32) for the sparse decode core, kept with ``_dsa_seq_lens_2d``.
+    # Per-token causal KV lengths ([bs * spec_num_tokens] int32) for sparse decode.
     _dsa_kv_seq_lens: torch.Tensor | None = None
 
 

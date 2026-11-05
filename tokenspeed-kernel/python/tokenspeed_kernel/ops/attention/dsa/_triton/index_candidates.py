@@ -41,8 +41,7 @@ def _compact(
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # Row offsets are 64-bit throughout this module: strides fit int32, but
-    # row * stride need not (2049 rows of a 1M-wide decode table).
+    # 64-bit row offsets: row * stride overflows int32 on a 1M-wide decode table.
     row = tl.program_id(0).to(tl.int64)
     req = tl.load(Requests + row)
     length = tl.load(Causal + row)
@@ -69,8 +68,7 @@ def _compact_bounded(
     Positions,
     Lengths,
     Overflow,
-    # Table, output and request geometry follow the batch; runtime and
-    # unspecialized so every batch shape shares one binary.
+    # Runtime, unspecialized batch geometry: every batch shape shares one binary.
     ROWS,
     COLS,
     STRIDE,
@@ -78,11 +76,7 @@ def _compact_bounded(
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # One program walks its row's table BLOCK columns at a time, carrying the
-    # count of valid pages, so no table width selects a new binary. Only the
-    # first OUT_COLS valid pages are stored, and Lengths counts only their
-    # tokens: every consumer of Lengths (the scorer, the mask, the selector)
-    # then stays inside the row. Overflow counts the valid pages left out.
+    # Keep only the first OUT_COLS valid pages: Lengths covers them, Overflow the rest.
     row = tl.program_id(0).to(tl.int64)
     req = tl.load(Requests + row)
     length = tl.load(Causal + row)
@@ -167,8 +161,7 @@ def _mask_scores(
     row = tl.program_id(0).to(tl.int64)
     length = tl.load(Lengths + row)
     if MASK_TAIL:
-        # The full-width fallback needs the tail initialized, including
-        # after an empty graph replay: one program per block of the width.
+        # Full-width selection reads the tail: initialize it, even on an empty replay.
         _mask_block(
             Logits,
             Positions,
@@ -187,8 +180,7 @@ def _mask_scores(
             BLOCK,
         )
     else:
-        # Length-aware selection never reads the tail. The grid stays fixed
-        # for graph replay; each program strides over the valid prefix only.
+        # Selection never reads the tail; a replay-fixed grid strides the valid prefix.
         for start in range(
             tl.program_id(1) * BLOCK, length, tl.num_programs(1) * BLOCK
         ):
@@ -312,10 +304,7 @@ def compact_index_pages(
     return pages, positions, lengths
 
 
-# Scores per program iteration. The full-width mask runs one block per
-# program. The length-aware mask runs about eight programs per SM in total,
-# so a 512-row tile leaves a few programs per row; wider iterations keep
-# more loads in flight on long owned prefixes (128K at a 1M context).
+# Scores per iteration; the prefix mask has few programs per row, so it loads wider.
 _TAIL_MASK_BLOCK = 256
 _PREFIX_MASK_BLOCK = 1024
 
@@ -370,10 +359,7 @@ def mask_index_scores(
         block = _TAIL_MASK_BLOCK
         programs = triton.cdiv(logits.shape[1], block)
     else:
-        # Programs past a row's length would only exit early; on a 1M-wide
-        # decode table that is millions of empty CTAs. Size the grid to fill
-        # the device instead. It depends only on static shapes, so graph
-        # replay with new device lengths stays valid.
+        # Size the grid to the device, not the width; static shapes keep replay valid.
         block = _PREFIX_MASK_BLOCK
         target = triton.cdiv(8 * current_platform().sm_count, max(rows, 1))
         programs = min(max(target, 1), triton.cdiv(logits.shape[1], block))

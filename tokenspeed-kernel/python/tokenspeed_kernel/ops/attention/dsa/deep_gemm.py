@@ -220,8 +220,7 @@ def _dcp_ragged_rows(scores: torch.Tensor, topk: int) -> torch.Tensor | None:
     rows, width = scores.shape
     if rows == 0 or width < topk or scores.stride(1) != 1:
         return None
-    # Unlike _prepare_logits_for_topk, do not scrub: the mask already cleans
-    # each valid prefix and the kernel never reads the tail.
+    # No scrub: the mask already cleans each valid prefix and the kernel skips the tail.
     view = _widen_logits_rows(scores)
     row_stride = view.shape[1]
     if (
@@ -245,8 +244,7 @@ def _select_dcp_index_candidates(
     initial_tokens: int,
     local_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Length-aware selectors in preference order: DeepSelect (Hopper), the
-    # CUDA ragged top-k, then full-width torch.topk.
+    # Selector order: DeepSelect (Hopper), CUDA ragged top-k, full-width torch.topk.
     deep_select = _dcp_topk_supports_lengths(scores, topk)
     ragged_rows = None if deep_select else _dcp_ragged_rows(scores, topk)
     index_candidates.mask_index_scores(
@@ -275,8 +273,7 @@ def _select_dcp_index_candidates(
             cluster_size=cluster_size,
         )
     elif ragged_rows is not None:
-        # Reads each row's masked prefix only and pads short rows with -1;
-        # gathering below reads the selected scores and drops -inf.
+        # Reads masked prefixes only and pads short rows with -1; the gather drops -inf.
         offsets = torch.empty(
             (scores.shape[0], topk), dtype=torch.int32, device=scores.device
         )
@@ -560,8 +557,7 @@ if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None
             1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int32
         )
         seq_lens_per_token = (seq_lens.unsqueeze(1) + offsets).reshape(-1)
-        # Compact widened view with non-finite scores scrubbed; the
-        # length-aware CuTe DSL top-k below consumes it without a copy.
+        # Scrubbed compact view; the length-aware CuTe DSL top-k reads it in place.
         logits_full = _prepare_logits_for_topk(logits, seq_lens_per_token)
         mark_forced_initial_local_logits(
             logits_full,
@@ -710,8 +706,7 @@ if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None
                     num_groups,
                 ),
                 ((int(page_size) * row_bytes) // 4, num_groups, 1),
-                # as_strided's offset is relative to the allocation, not flat.
-                # Hybrid cache planes can start partway through an arena.
+                # as_strided offsets are storage-absolute; planes can start mid-arena.
                 (flat.storage_offset() + int(page_size) * hd) // 4,
             )
             slots = kv_workspace_slots.to(device=q.device, dtype=torch.long)
@@ -834,8 +829,7 @@ if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None
                 page_size,
             )
         else:
-            # plan_dsa_index_candidates compacted this table for these rows
-            # once, for every tile and layer of the forward.
+            # Compacted once per forward, shared by every tile and layer.
             pages, positions, lengths = pages.pages, pages.positions, pages.lengths
         q, weights = _pad_index_heads(q.contiguous(), weights)
         q_fp8, scale = quantize_fp8(

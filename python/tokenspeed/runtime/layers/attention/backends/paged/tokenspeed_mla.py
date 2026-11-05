@@ -697,11 +697,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         causal_mask = True
         if self.block_decode_active:
             q_len_per_req = q.shape[0] // bs if bs > 0 else 1
-            # The kernel takes the block on the query axis with one page table
-            # row and the block-end length per request; a causal block bounds
-            # query r at that end minus the block's remaining rows, as verify
-            # does. The metadata was expanded from rows [0, bs), which is what
-            # this query covers, so no extend offset applies on either layout.
+            # Causal row r ends at block end minus the rows after it; no extend offset.
             self._log_block_layout(layer.tp_q_head_num, q_len_per_req, window_left >= 0)
             if q_len_per_req == self.spec_num_tokens:
                 causal_mask = self.draft_block_causal

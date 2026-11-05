@@ -87,9 +87,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     ENABLE_PDL: tl.constexpr,
     o_k_ptr=None,
     o_v_ptr=None,
-    # Nonzero: write channels [0, K), [K, 2K) and [2K, dim) to the contiguous
-    # [cu_seqlen, K] o_ptr / o_k_ptr and [cu_seqlen, dim - 2K] o_v_ptr rows
-    # instead of one packed output. K and dim - 2K are multiples of BLOCK_N.
+    # K > 0: split channels at K, 2K into o_ptr, o_k_ptr, o_v_ptr (BLOCK_N multiples).
     SPLIT_KEY_DIM: tl.constexpr = 0,
 ):
     if ENABLE_PDL:

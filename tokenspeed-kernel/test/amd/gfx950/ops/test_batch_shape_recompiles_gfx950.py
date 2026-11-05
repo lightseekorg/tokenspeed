@@ -284,9 +284,7 @@ def test_mxfp4_moe_sorting_route_count():
         torch.testing.assert_close(sorted_weights[position], weights.flatten()[flat])
         assert torch.equal(block_experts[position // block], ids.flatten()[flat])
 
-    # Serving prefill chunks change routes per program (16 at a short tail to
-    # over 1024) and the padding block with the row tile; neither selects a
-    # binary. Program counts stay at the expert count through 8K rows here.
+    # Prefill sizes vary routes per program and the padding block; neither recompiles.
     sweep = (100, 300, 1033, 1100, 3000, 8000)
     run(1030)
     with assert_no_triton_compile(

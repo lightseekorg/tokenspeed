@@ -130,8 +130,7 @@ def test_trtllm_lse_matches_triton(heads, dtype, mode, width):
     _assert_out_close(out[~empty], ref_out[~empty], dtype)
     torch.testing.assert_close(lse, ref_lse.reshape(-1, heads), rtol=1e-3, atol=2e-3)
     assert torch.all(torch.isneginf(lse[empty]))
-    # The output without an LSE is unchanged by the LSE request (rows with
-    # slots; the LSE-free path never sees an empty row outside KVP).
+    # Requesting the LSE leaves the output unchanged; empty rows occur only under KVP.
     plain = _run(mode, TRT, *args, return_lse=False, width=width)
     torch.testing.assert_close(
         plain.reshape(-1, heads, RANK)[~empty], out[~empty], rtol=0, atol=0

@@ -690,8 +690,7 @@ def test_row_sharded_moe_inputs_feed_experts_and_tail(
     declined_tail = [] if accepted else (["join_shared"] if publishes else [])
     declined_tail += [] if accepted else ["reduce"]
     if row_inputs:
-        # A publishing shared GEMM replaces the plain one; the experts run beside
-        # its reduction, which any reduce other than the tail's first joins.
+        # Experts overlap a publishing shared GEMM's reduce; other reduces must join it.
         shared_down = "shared_down+reduce" if publishes else "shared_down"
         assert fork.events == [shared_down, "experts", "tail", *declined_tail]
         assert candidate.call_args.kwargs["shared_reduced"] is record
@@ -770,8 +769,7 @@ def test_replicated_decode_rows_prefer_the_gather_tail(
         moe, prefix, prefix, rows, rows, prefix_is_sharded=False
     )
 
-    # Through 64 rows the two-shot reduce and the column-parallel gather tail
-    # replace the row-sharded tail; the gather tail must take the shapes first.
+    # To 64 rows the gather tail replaces the row-sharded one, seeing the shapes first.
     if gathered:
         assert output is gathered_out
         moe.iris_state.moe_tail.assert_not_called()

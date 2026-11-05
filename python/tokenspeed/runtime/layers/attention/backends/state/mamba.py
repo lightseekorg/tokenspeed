@@ -2152,9 +2152,7 @@ class MambaAttnBackend(AttentionBackend):
                     prefill_metadata=self.forward_metadata.conv_prefill_metadata,
                 ).transpose(0, 1)[:seq_len]
                 if extend_seq_lens_cpu is not None:
-                    # The convolution allocates its output uninitialized and gives
-                    # the padded rows no work, so the rows a capacity scan reads
-                    # past the live tokens are zeroed again here.
+                    # The conv leaves padding rows unset; a capacity scan reads them.
                     self.forward_metadata.scrub_padding(mixed_qkv)
 
         key_split_dim = key_dim // attn_tp_size

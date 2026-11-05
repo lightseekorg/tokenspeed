@@ -285,13 +285,10 @@ def _select_direct_stage2_tiles(
 _SITU_INTERMEDIATE_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
 _A8W4_STAGE1_NUM_BUFFERS = 2
 _A8W4_STAGE2_NUM_WARPS = 1
-# A route-direct batch of 2..16 rows computes each repeated expert once (the
-# 4-row verify tokens of one request share ~28% of their routes).
+# 2..16-row route-direct batches run repeated experts once (verify routes overlap ~28%).
 _A8W4_STAGE1_DEDUP_MIN_M = 2
 _A8W4_STAGE1_DEDUP_MAX_M = 16
-# From two four-token verify requests, sorted expert tiles reuse each W13/W2
-# tile across routes at least as fast as the per-route decode; below that the
-# sort and padded tiles cost more than they save.
+# From two 4-token verify requests, sorted expert tiles beat the per-route decode.
 _A8W4_SORTED_MIN_CONCURRENCY = 2
 _A8W4_SORTED_MIN_DRAFT_TOKENS = 4
 _A8W4_SORTED_STAGE1_MIN_M = _A8W4_SORTED_MIN_CONCURRENCY * _A8W4_SORTED_MIN_DRAFT_TOKENS
@@ -766,8 +763,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             num_warps=sorted_stage2_num_warps,
         )
         if defer_topk_reduce:
-            # Without an EP shard every route names a local expert, so every
-            # slot row is written and the reduce's route mask keeps them all.
+            # Without EP all routes are local, so every slot row is written.
             return partial
         reduce_block_n = 256
         reduce_programs = M * triton.cdiv(N, reduce_block_n)
@@ -1705,9 +1701,7 @@ def _package_prefill_reduces(
     rows: int, *, activation_format: str, is_ep_shard: bool
 ) -> bool:
     """Whether the package's stage 2 writes partials for an FP32 reduction."""
-    # EP ranks own only a fraction of each token's routes. For TP E2M1,
-    # paired-column atomics avoid the partials/reduce cost through 2048
-    # rows. Larger outputs still favor scratch plus FP32 reduction.
+    # EP ranks own few routes; TP E2M1 paired atomics beat partials through 2048 rows.
     if is_ep_shard:
         return False
     return rows > (2048 if activation_format == "e2m1" else 64)

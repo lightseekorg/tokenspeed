@@ -2425,8 +2425,7 @@ def test_mla_token_count_needs_one_binary_per_token_tile():
         assert bytes_equal(out.query[..., :rank], q_nope)
         assert bytes_equal(cache[:count, 0, :rank], latent[:, :rank])
 
-    # Neither 1 nor a multiple of 16: the warm counts sit in the class the
-    # sweep below avoids except for these.
+    # Warm counts are neither 1 nor multiples of 16, a class the sweep never hits.
     warm = (33, 257, 449, 673, 897, 1121)
     sweep = (1, 16, 48, 208, 224, 256, 320, 432, 448, 512, 640, 672, 768, 880, 896)
     sweep += (960, 1088, 1120, 1280, 1536)

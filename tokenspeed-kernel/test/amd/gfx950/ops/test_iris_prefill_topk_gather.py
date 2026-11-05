@@ -81,8 +81,7 @@ def _topk_gather_worker(rank: int, port: int) -> None:
         dist.all_gather_into_tensor(gathered_lens, lens, group=group)
         return gathered, gathered_lens
 
-    # Full 8192-row chunks, a 768-row chunk, the 848-row tail's 112 rows, and
-    # the smallest split; the slow rank makes peers wait for its stores.
+    # Full, partial, tail and minimal chunks; peers must wait for a slow rank's stores.
     for local_rows in (1024, 96, 112, 8, 1024):
         gen.manual_seed(31 * local_rows + rank)
         selection = torch.randint(
@@ -112,9 +111,7 @@ def _topk_gather_worker(rank: int, port: int) -> None:
         torch.cuda.synchronize()
         dist.barrier()
 
-    # Back to back, as consecutive DSA layers: a rank past one call publishes
-    # the next while a slow peer may still pull the previous one. Rank 3's
-    # side-stream copies slow its pulls.
+    # Back to back, as DSA layers: a rank may publish while a slow peer still pulls.
     calls = []
     for call in range(40):
         gen.manual_seed(1000 + 31 * call + rank)

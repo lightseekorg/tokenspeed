@@ -227,8 +227,7 @@ def max_owned_index_pages(
             f"page table has {page_table_cpu.shape[0]} rows for "
             f"{seq_lens_cpu.numel()} requests"
         )
-    # Host arithmetic on small arrays, in numpy: once per forward, ahead of
-    # the device.
+    # Host arithmetic in numpy, once per forward ahead of the device.
     degree = len(placement.group)
     seq_lens = seq_lens_cpu.numpy().astype(np.int64)
     max_len = int(seq_lens.max()) if seq_lens.size else 0

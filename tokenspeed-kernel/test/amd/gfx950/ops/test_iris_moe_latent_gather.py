@@ -172,8 +172,7 @@ def _check_latent_gather(
         device=device,
         all_reduce=None,
     )
-    # The router and routed rows are replicated; the shared rows are each
-    # rank's own shard.
+    # Router and routed rows are replicated; shared rows are each rank's own shard.
     generator = torch.Generator(device=device).manual_seed(20261030)
     weight = (
         torch.randn((_PACKED, _HIDDEN), generator=generator, device=device) / 40

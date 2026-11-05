@@ -159,11 +159,7 @@ class IrisAllGather:
         return output
 
 
-# TP8 BF16, 84 programs, us at 1/2 subgroups per program (bench_colgather.py):
-# 896-wide shards, 256 rows (448 KiB) 36.3 / 40.6, 848 rows (1.5 MiB) 79.6 / 68.0,
-# 8192 rows 612.5 / 415.1; 512-wide 848 rows (848 KiB) 57.3 / 47.6; 288-wide
-# 848 rows (477 KiB) 38.3 / 44.9, 2048 rows (1.2 MiB) 68.5 / 63.6. Four or
-# eight subgroups were slower except at 8192 x 896 (388.6).
+# Measured TP8 BF16: two subgroups per program win from about 768 KiB per shard.
 _COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES = 768 << 10
 
 

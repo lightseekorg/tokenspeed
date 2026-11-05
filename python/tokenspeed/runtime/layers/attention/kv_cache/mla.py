@@ -177,8 +177,7 @@ class MLATokenToKVPool(CachePool):
         if sanitize is None:
             sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
-        # get_key_buffer waits for the layer's Host load: a tail hit loads the
-        # page these rows land in whole.
+        # get_key_buffer awaits the Host load; a tail hit loads these rows' whole page.
         if self.quant_method == "per_token_head":
             if write_mask is not None:
                 raise ValueError("Per-token quantized MLA writes do not support a mask")
@@ -190,9 +189,7 @@ class MLATokenToKVPool(CachePool):
                 sanitize=sanitize,
             )
         else:
-            # The arena stores FP8 rows as bytes. get_key_buffer gives the
-            # scatter kernel an FP8 view so its stores quantize mixed-dtype
-            # sources in place.
+            # An FP8 view of the byte arena lets the scatter quantize as it stores.
             set_mla_kv_buffer_triton(
                 self.get_key_buffer(layer_id),
                 loc,

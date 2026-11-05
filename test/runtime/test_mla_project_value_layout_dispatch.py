@@ -143,8 +143,7 @@ def test_k_major_absorbed_weights_keep_values(heads):
     w_kc, w_vc = _prepare_mla_kv_b_proj_weights(w, _Attn())
     k_major_kc, k_major_vc = _prepare_mla_kv_b_proj_weights(w, _KMajorAttn())
 
-    # Both bmm operands, w_kc.transpose(1, 2) [H, latent, nope] and
-    # w_vc.transpose(1, 2) [H, value, latent], keep the reduction dim inner.
+    # Both bmm operands (w_kc and w_vc transposed) keep the reduction dim innermost.
     assert k_major_kc.transpose(1, 2).is_contiguous()
     assert k_major_vc.transpose(1, 2).is_contiguous()
     assert torch.equal(k_major_kc, w_kc)

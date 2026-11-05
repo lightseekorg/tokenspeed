@@ -193,9 +193,7 @@ def test_packed_candidates_with_real_collectives_and_graph(tmp_path, use_pynccl)
 
 
 _OWNER_TOPK = 512
-# 96 columns of 64-token pages: a row's FP32 logits take 24 KiB, so this
-# budget scores three rows per tile, and a row-owner exchange (topk * 24
-# bytes per row) joins two tiles.
+# A row's FP32 logits take 24 KiB: three rows a tile, two tiles a row-owner exchange.
 _OWNER_COLUMNS = 96
 _OWNER_BUDGET = 3 * _OWNER_COLUMNS * 64 * 4
 
@@ -261,8 +259,7 @@ def _row_owner_worker(rank, degree, rendezvous):
         # PyNccl has no all-to-all: the exchange goes through torch.distributed.
         backend.configure(use_pynccl=False)
         set_global_backend(backend)
-        # Synthetic candidates in place of the scorer, so the exchange runs on
-        # any GPU; test_dsa_dcp_k31_indexer.py runs it behind the real scorer.
+        # Synthetic candidates replace the scorer so the exchange runs on any GPU.
         active = torch.ones((), dtype=torch.int32, device=device)
         indexer.dsa_index_candidates = partial(_owner_scorer, rank, degree, active)
         placement = CachePlacement(64, _OWNER_COLUMNS + 1, group, rank)
@@ -294,8 +291,7 @@ def _row_owner_worker(rank, degree, rendezvous):
             )
 
         def check(result, count, budget, active_ranks):
-            # Distinct scores: the row-owner merge selects exactly what the
-            # merge on every rank selects, in the same order.
+            # Distinct scores: the row-owner merge selects as replicated, in order.
             replicated = select(count, budget, False)
             for actual, expected in zip(result, replicated, strict=True):
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -308,10 +304,7 @@ def _row_owner_worker(rank, degree, rendezvous):
                 )
             _check_candidates(*result, parts, _OWNER_TOPK)
 
-        # With the budget: exchanges of 6, 6 and 5 rows of two tiles each,
-        # the last padded to whole rows per rank. Without: one 17-row tile,
-        # padded; one 16-row tile that splits evenly; one row, where rank 1
-        # owns only padding.
+        # Budgeted: exchanges of 6, 6, 5 rows; else 17 padded, 16 even, 1 (rank 1 pads).
         tile_rows = indexer._tile_rows(rows, _OWNER_COLUMNS, 64, _OWNER_BUDGET)
         exchange_rows = indexer._exchange_rows(
             rows, tile_rows, degree, _OWNER_TOPK, _OWNER_BUDGET, row_owner=True
@@ -328,8 +321,7 @@ def _row_owner_worker(rank, degree, rendezvous):
         with torch.cuda.graph(graph):
             captured = select(rows, _OWNER_BUDGET, True)
         original = causal.clone()
-        # New rows; one rank holding every candidate, as in the prefill
-        # graph's capture batch; no rank holding any; the captured rows.
+        # New rows; all candidates on one rank (as at capture); on none; captured rows.
         for shift, active_ranks in ((rows, group), (5, (0,)), (0, ()), (0, group)):
             causal.copy_(original + shift)
             active.fill_(int(rank in active_ranks))
@@ -506,8 +498,7 @@ def test_partial_exchange_with_real_collectives_and_graph(tmp_path):
     )
 
 
-# K3.1's sparse prefill under KVP: 12 TP heads per rank, 576-wide FP8 latent
-# rows in 128-token blocks, a 2048-slot selection.
+# K3.1's sparse prefill under KVP, on 576-wide FP8 latent rows.
 _RECORDS_HEADS = 12
 _RECORDS_BLOCK = 128
 _RECORDS_TOPK = 2048
@@ -563,8 +554,7 @@ def _records_leaf(dsa, group, rank, query_layout):
     """The DSA leaf's head-sharded KVP prefill state on an FP8 cache."""
     leaf = object.__new__(dsa.DSABackend)
     leaf.kernel_page_size = 64
-    # The records arm stands in for the Triton core only: pinned, as on
-    # Hopper, so that Blackwell's ordinary arm does not take trtllm-gen.
+    # Pinned to the Triton core, as on Hopper, so Blackwell does not take trtllm-gen.
     leaf.kernel_solution = "triton"
     leaf.prefill_kernel_plan = None
     leaf.slot_order = "selection"
@@ -581,8 +571,7 @@ def _records_leaf(dsa, group, rank, query_layout):
     leaf.num_attention_heads = _RECORDS_HEADS * len(group)
     leaf.num_local_heads = _RECORDS_HEADS
     leaf.kvp_prefill_query_layout = query_layout
-    # configure_runtime's probe on an FP8 cache: the Triton core
-    # (test_dcp_records_core_on_the_real_k31_selection).
+    # What configure_runtime's probe picks on an FP8 cache: the Triton records core.
     leaf._dcp_records_core = True
     leaf._dcp_padded_query = False
     return leaf
@@ -656,8 +645,7 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
             logit_cap=0.0,
         )
         with context:
-            # 1037 rows reach the records core; the Triton launch of 5 rows
-            # splits its keys, so the query layout falls back to the packed partials.
+            # 1037 rows use the records core; 5 split keys and use packed partials.
             for tokens, records_arm in ((1037, True), (5, False)):
                 slots, lengths = _records_selection(degree, tokens, device)
                 generator = torch.Generator().manual_seed(900 + rank)
@@ -696,9 +684,7 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
                 rank_major.permute(1, 0, 2, 3).reshape(token_major.shape),
                 token_major,
             )
-            # The padded gather holds the token-major gather's bytes in its
-            # leading heads and zeros after: 48 heads a rank gather to 96,
-            # which trtllm-gen runs as 128 (K3.1's 12 at KVP8).
+            # 48 heads x 2 ranks = 96, like K3.1's 12 x KVP8; trtllm-gen runs 96 as 128.
             wide_heads = 48
             gathered = wide_heads * degree
             q = torch.randn((7, wide_heads, 576), generator=generator)
@@ -709,9 +695,7 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
             assert torch.equal(padded[:, :gathered], token_major)
             assert not padded[:, gathered:].any()
             if current_platform().is_blackwell:
-                # Where the trtllm-gen core runs them, the query layout's
-                # padded query gives the leaf's own padding's partials, so
-                # the same output bit for bit.
+                # trtllm-gen: padded query layout matches the leaf's padding bitwise.
                 wide = SimpleNamespace(**{**vars(layer), "tp_q_head_num": wide_heads})
                 slots, lengths = _records_selection(degree, 1037, device)
                 q = torch.randn((1037, wide_heads, 576), generator=generator)

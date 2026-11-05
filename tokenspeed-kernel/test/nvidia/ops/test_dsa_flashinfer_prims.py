@@ -95,11 +95,7 @@ def _reference(q, kv, slots, lengths, k_scale):
             probabilities = logits.softmax(-1)
             outputs.append(probabilities @ selected[:, :512])
             lses.append(logits.logsumexp(-1))
-            # Native FP8 PV rounds probabilities before MMA. Bound the error
-            # by weighted absolute values, including E4M3 underflow and BF16
-            # output rounding. Relative error on a cancelled output is invalid.
-            # This is the upstream sparse-MLA FP8 numerical contract, evaluated
-            # from independent FP64 attention, not from the tested kernel.
+            # FP8 PV rounds P before the MMA: bound by P @ |V| plus E4M3 underflow.
             absolute_values = selected[:, :512].abs()
             sensitivity = probabilities @ absolute_values
             underflow = probabilities.amax(-1, keepdim=True) * absolute_values.sum(0)
@@ -136,8 +132,7 @@ def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_len
     slots = torch.stack(
         [torch.randperm(4096, device="cuda")[:2048] for _ in range(rows)]
     ).int()
-    # Include holes before a live entry, a fully empty row, and a prefix whose
-    # tail contains valid IDs that must still be ignored when lengths are given.
+    # Holes before live entries, an empty row, and valid IDs past the length to ignore.
     slots[0].fill_(-1)
     slots[1, :64] = -1
     lengths = torch.full((rows,), 2048, device="cuda", dtype=torch.int32)
@@ -298,8 +293,7 @@ def test_prims_rejects_disabled_pdl():
 
 
 def test_fp8_decode_with_lse_meets_the_reference_on_the_default_kernel():
-    # TRTLLM returns no LSE, so decode context parallelism selects Prims-TS
-    # when FlashInfer provides it and Triton otherwise.
+    # Decode CP needs an LSE: Prims-TS when FlashInfer provides it, Triton otherwise.
     torch.manual_seed(7)
     q = (torch.randn(12, 12, 576, device="cuda") * 0.5).to(torch.float8_e4m3fn)
     kv = (torch.randn(4096, 576, device="cuda") * 0.25).to(q.dtype)

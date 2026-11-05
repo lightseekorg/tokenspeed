@@ -193,8 +193,7 @@ def test_model_config_routes_dsa_on_the_kimi_k3_cache_family(tmp_path) -> None:
     ) == (2048, 128, 32)
     # BF16 projection weights do not require BF16 cache storage.
     assert model_config.index_k_format == "fp8_scaled"
-    # Every DSA operation sits in the one eager break that narrows a padded
-    # prefill-graph replay (KimiK31SparseMLAAttention._sparse_attention).
+    # All DSA ops sit in the one eager break that narrows a padded prefill-graph replay.
     assert model_config.dsa_padded_prefill_replay is True
     # The 64-wide unrotated slice stays part of the latent row.
     assert (model_config.kv_lora_rank, model_config.qk_rope_head_dim) == (512, 64)
@@ -226,8 +225,7 @@ def test_kvp_launch_passes_the_full_attention_dcp_check(tmp_path) -> None:
     )
 
 
-# An explicit prefill bucket list (--prefill-graph-capture-token-sizes): the
-# aggregated role's opt-in into the DSA padded prefill graph.
+# Named prefill buckets: the aggregated role's opt-in to the DSA padded prefill graph.
 _NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
 
 
@@ -251,8 +249,7 @@ _NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
             False,
             False,
         ),
-        # The PD decode role runs no prompt prefill: refused, interval or
-        # named buckets or not.
+        # The PD decode role runs no prompt prefill, so it is refused in every case.
         ({"disaggregation_mode": "decode"}, False, False),
         (
             {"disaggregation_mode": "decode", "disaggregation_layerwise_interval": 1},
@@ -260,16 +257,14 @@ _NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
             False,
         ),
         ({"disaggregation_mode": "decode", **_NAMED_BUCKETS}, False, False),
-        # The aggregated role is opt-in: a launch that names no buckets keeps
-        # its prefill eager, and a bucket cap alone names none.
+        # Opt-in only: naming no buckets stays eager, and a cap alone names none.
         ({"disaggregation_mode": "null"}, False, False),
         (
             {"disaggregation_mode": "null", "prefill_graph_max_tokens": 4096},
             False,
             False,
         ),
-        # Named buckets admit it; the role arms no transfer step counter, so
-        # the layerwise interval (default 1) does not veto it.
+        # Named buckets admit it; no transfer step counter, so the interval cannot veto.
         ({"disaggregation_mode": "null", **_NAMED_BUCKETS}, False, True),
         (
             {
@@ -335,16 +330,14 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
 
     model_config = _load_k31_model_config(tmp_path)
     server_args = ServerArgs(model=str(tmp_path))
-    # The launch defaults: the aggregated role, layerwise interval 1, no named
-    # prefill buckets and no mixed batch. The default stays eager.
+    # The launch defaults keep the aggregated role eager.
     assert server_args.disaggregation_mode == "null"
     assert server_args.disaggregation_layerwise_interval == 1
     assert server_args.prefill_graph_capture_sizes is None
     assert server_args.enable_mixed_batch is False
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
-    # Naming the buckets opts the aggregated role in, and the flag or a mixed
-    # batch opts it back out.
+    # Named buckets opt in; the disable flag or a mixed batch opts back out.
     server_args.prefill_graph_capture_sizes = [256, 4096]
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
@@ -411,8 +404,7 @@ def test_k31_layout_adds_one_index_k_plane_per_dsa_layer(draft_layers) -> None:
     for field in index_k:
         assert field.group_id == FULL_ATTENTION
         assert field.shape == (128, row_bytes)
-        # One 128-token page of keys per stride: the plane is a contiguous
-        # [slots, row_bytes] matrix.
+        # 128-token page strides make the plane a contiguous [slots, row_bytes] matrix.
         assert field.page_stride_bytes == 128 * row_bytes
     assert dict(layout.plane_bytes)[f"layer.{mla_layers[0]}.index_k"] == (
         12 * 128 * row_bytes
@@ -575,9 +567,7 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format) -> None
 
     deferred.set_index_k_buffer(3, slots, keys, write_mask=owned, key_norm=norm)
     if index_k_format == "fp8_scaled" and not current_platform().is_amd:
-        # The fused write's FP8 rounding; NVIDIA's quantize_fp8 may round a scale differently.
-        # On AMD the fused write divides exactly, like quantize_fp8; torch's "/ 448.0" multiplies
-        # by the reciprocal, one ulp off for some scales.
+        # Mirror the fused FP8 rounding; NVIDIA quantize_fp8 may differ, AMD's matches.
         normed = norm(keys).float()
         scale = normed.abs().amax(dim=1, keepdim=True).clamp_min(1e-10) / 448.0
         index_k_block_split_scatter(
@@ -722,9 +712,7 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
         return rows
 
     args["query_proj"] = query_proj
-    # Two attention-TP ranks without a process group: run rank 1 first and
-    # keep its gather inputs, then rank 0's k-th gather concatenates its own
-    # input with rank 1's k-th.
+    # Two TP ranks, no process group: rank 1 runs first, rank 0 gathers its inputs.
     attention.prefill_topk_tp_split = True
     sent = {0: [], 1: []}
 
@@ -893,8 +881,7 @@ def test_prefill_topk_split_reuses_rank_zero_kernels_on_other_ranks(
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
     attention.prefill_topk_tp_split = True
-    # 2502 rows over two ranks would give rank 1 an int32 row offset of
-    # 1251 * 4 bytes, which is not 16-byte aligned.
+    # Over two ranks, rank 1's int32 row offset (1251 * 4 bytes) is not 16-byte aligned.
     num_rows, prefix, slots = 2502, 3000, 6144
     row_ends_cpu = prefix + torch.arange(1, num_rows + 1, dtype=torch.int64)
     pool, _ = _k31_pool("cuda", num_lcm_blocks=4)
@@ -1273,8 +1260,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
     pool.set_index_k_buffer(3, slots, keys, write_mask=None)
     seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
     seq_lens_2d = seq_lens.repeat_interleave(q_len_per_req).unsqueeze(1).contiguous()
-    # The runtime reserves page-table capacity for the whole context, including
-    # at least topk candidates even when this request has a shorter history.
+    # The runtime sizes the page table for the whole context, at least topk candidates.
     page_table = torch.zeros(1, 32, dtype=torch.int32, device="cuda")
     kernel_pages = _kernel_page_table(block_ids, "cuda")
     page_table[:, : kernel_pages.shape[1]] = kernel_pages
@@ -1282,8 +1268,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
         _dsa_seq_lens_2d=seq_lens_2d,
         _dsa_plan=dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64),
     )
-    # The DSA leaf's surface the selection reads; building a whole leaf and
-    # router needs the serving stack.
+    # Only the leaf surface the selection reads; a real leaf needs the serving stack.
     ctx = SimpleNamespace(
         attn_backend=SimpleNamespace(
             forward_decode_metadata=metadata, cache_placement=lambda layer: None
@@ -1383,8 +1368,7 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
     pool, _ = _k31_pool("cuda", num_lcm_blocks=max(2, (num_blocks + 2 + 11) // 12))
     block_ids = list(range(2, 2 + num_blocks))[::-1]
     slots = _slots(block_ids, seq_len, "cuda")
-    # Bad keys only in the first positions: a row whose history exceeds topk
-    # by exactly the bad count selects exactly the good keys.
+    # Bad keys lead: a row past topk by the bad count selects exactly the good keys.
     bad = torch.arange(max(seq_len - topk, 0), device="cuda")
     u, keys = _separable_keys(seq_len, bad, "cuda")
     pool.set_index_k_buffer(3, slots, keys, write_mask=None)
@@ -1411,8 +1395,7 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
     attention._compute_prefill_topk_indices(
         _indexer_output(u, extend_len), ctx, extend_len
     )
-    # With the kernels compiled, the selection must not wait for the device:
-    # the host keeps its lead over a device still busy with earlier work.
+    # Once compiled, selection must not sync: the host stays ahead of a busy device.
     torch.cuda._sleep(1 << 30)
     earlier_work = torch.cuda.Event()
     earlier_work.record()
@@ -1450,8 +1433,7 @@ def _tiny_text_config(*, dsa: bool) -> KimiLinearConfig:
         num_key_value_heads=2,
         q_lora_rank=128,
         kv_lora_rank=128,
-        # Every layer dense (first_k_dense_replace covers them all); the
-        # loader still builds its expert plan from num_experts.
+        # All layers dense; the loader still builds its expert plan from num_experts.
         num_experts=4,
         first_k_dense_replace=4,
         attn_res_block_size=2,
@@ -1656,8 +1638,7 @@ def test_dsa_leaf_admits_prefill_graphs_only_under_padded_replay(
         if record.name in (dsa_logger, support_logger)
     ]
 
-    # The opt-in is per instance; the class keeps every other DSA model's
-    # prefill eager.
+    # The opt-in is per instance; the class keeps other DSA models' prefill eager.
     assert not DSABackend.cuda_graph_support.prefill_graph
     assert leaf.cuda_graph_support.prefill_graph is admits
     assert support.prefill_graph is admits
@@ -1843,8 +1824,7 @@ def _k31_attention_stack(
         components=(dsa, *recipe.attn_config.components[1:]),
     )
     groups, layout = kimi_layout(recipe)
-    # At least two LCM blocks: twelve full-attention blocks even in a BF16
-    # cache, and more for ``full_blocks`` past block 0.
+    # At least two LCM blocks: twelve full-attention ones in BF16, more for full_blocks.
     packing = dict(layout.group_packing)[FULL_ATTENTION]
     num_lcm_blocks = max(2, -(-(full_blocks + 1) // packing))
     spec = CachePoolSpec(
@@ -2097,8 +2077,7 @@ def _prefill_then_decode_twice(
         forward_mode=ForwardMode.DECODE,
         block_tables=blocks,
     )
-    # Run the eager step on the capture stream, as the CUDA-graph runner's
-    # warm-up does: a core may plan per stream (Prims-TS).
+    # Run eagerly on the capture stream, like graph warm-up: a core may plan per stream.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.no_grad(), torch.cuda.stream(stream):
@@ -2140,8 +2119,7 @@ def _prefill_then_decode_twice(
         # BF16 cache: the BF16 activations and probability tiles.
         (torch.bfloat16, 1, 1e-2),
         (torch.bfloat16, 4, 1e-2),
-        # FP8 E4M3 cache (the K3 serving recipe): the unit-scale latent rows
-        # and the FP8 query of the FP8 sparse cores.
+        # FP8 E4M3 cache (K3 serving recipe): unit-scale latent rows and FP8 query.
         (torch.float8_e4m3fn, 1, 8e-2),
     ],
 )
@@ -2187,9 +2165,7 @@ def test_k31_attention_matches_dense_mla_and_replays_in_a_decode_graph(
 def test_the_decode_chain_entry_attends_like_forward(
     monkeypatch, kv_cache_dtype
 ) -> None:
-    # The K3 TP8 decode chain enters each layer through ``o_proj_input`` with
-    # its own packed a-projection and applies the o-projection itself; a K3.1
-    # layer must still attend its indexer's top-k there.
+    # The K3 TP8 chain enters via o_proj_input; a K3.1 layer still attends its top-k.
     from tokenspeed_kernel.ops.gemm import kimi3_mla_qkv_gate_projection
 
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -2263,18 +2239,15 @@ def _extend_over_a_cached_prefix(stack, twin, hidden, *, prefix, blocks):
 @requires_gpu
 @pytest.mark.parametrize(
     "kv_cache_dtype, fraction",
-    # The two runs project different row counts, so BF16 roundings differ
-    # (and move some FP8 rows a step); an unwritten prefix errs by ~80%.
+    # Row counts differ, so BF16 rounding does too; an unwritten prefix errs by ~80%.
     [(torch.bfloat16, 1e-2), (torch.float8_e4m3fn, 3e-2)],
 )
 @pytest.mark.parametrize(
     "history, prefix, index_topk",
     [
-        # Below the 1200-row history: the extend's rows choose among the
-        # cached keys.
+        # Below the 1200-row history: the extend's rows choose among the cached keys.
         pytest.param(1200, 640, 512, id="short"),
-        # A 4851-token prompt resumed after its 4736-token checkpoint, at
-        # Kimi-K3.1's index_topk: the extend selects among far more keys.
+        # A 4851-token prompt resumed at its 4736-token checkpoint, K3.1's index_topk.
         pytest.param(4851, 4736, 2048, id="served"),
     ],
 )
@@ -2522,9 +2495,7 @@ def test_dsa_core_refuses_a_padded_replay_it_cannot_narrow(case, match) -> None:
 
 
 _PADDED_BUCKET = 128
-# (request slots, cached prefix lengths, new lengths, cache blocks). The first
-# request's new rows start mid-block behind a cached prefix; the bucket is
-# more than one 64-token kernel page past the live rows in every case.
+# (slots, prefix lens, new lens, blocks); buckets end over a page past the live rows.
 _PADDED_CASES = {
     "prefix_tail_mid_page": ([0], [40], [20], [5]),
     "two_requests": ([0, 1], [0, 0], [20, 15], [5, 6]),
@@ -2630,8 +2601,7 @@ def _capture_padded_prefill(router, pool, forward):
     hidden = torch.randn(_PADDED_BUCKET, 256, device="cuda", dtype=torch.bfloat16)
     dummy = _extend_ctx(router, pool, [3], [0], [_PADDED_BUCKET], [1])
     capture = BreakableCapture()
-    # The warmup runs where the capture will: on the capture stream, behind
-    # the buffers just written on this one.
+    # Warm up where the capture runs: on the capture stream, behind this one's writes.
     capture.stream.wait_stream(torch.cuda.current_stream())
     with torch.no_grad():
         with torch.cuda.stream(capture.stream):
@@ -2854,8 +2824,7 @@ def test_k31_decode_graph_replays_after_a_padded_prefill_capture_and_replay(
         forward_mode=ForwardMode.DECODE,
         block_tables=blocks,
     )
-    # Run the eager step on the capture stream, as the CUDA-graph runner's
-    # warm-up does: a core may plan per stream (Prims-TS).
+    # Run eagerly on the capture stream, like graph warm-up: a core may plan per stream.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.no_grad(), torch.cuda.stream(stream):
@@ -2873,8 +2842,7 @@ def test_k31_decode_graph_replays_after_a_padded_prefill_capture_and_replay(
         router, pool, forward
     )
 
-    # Request 1 on block 6 prefills 20 rows behind a 40-row cached prefix
-    # (request 0's slot is skipped: no prefix to prefill there).
+    # Request 1 on block 6 prefills 20 rows behind a 40-row cached prefix.
     prefix, new = 40, 20
     prefilling = torch.randn(prefix + new, 256, device="cuda", dtype=torch.bfloat16)
     prefilling_reference = _dense_gated_mla(attention, prefilling, heads)
@@ -2889,8 +2857,7 @@ def test_k31_decode_graph_replays_after_a_padded_prefill_capture_and_replay(
     assert torch.isfinite(output).all()
     _assert_close_to_reference(output[:new], prefilling_reference[prefix:], fraction)
 
-    # Request 0's next verify step replays the decode graph at its stable
-    # addresses, with only the decode refresh in between.
+    # Request 0's next verify replays the graph at stable addresses after a refresh.
     rows = slice(prompt + spec_width, total)
     step_hidden.copy_(decoding[rows])
     step_positions.copy_(torch.arange(prompt + spec_width, total, device="cuda"))

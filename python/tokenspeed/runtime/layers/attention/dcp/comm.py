@@ -126,8 +126,7 @@ def gather_query_heads_padded(
     src = gathered.view(torch.uint8).view(len(group), tokens, -1)
     width = src.shape[-1]
     if width % 8 == 0 and rows.shape[-1] % 8 == 0:
-        # Whole 8-byte words: a strided byte copy of an FP8 query runs at a
-        # fraction of the bandwidth.
+        # Copy whole 8-byte words: a strided byte copy of an FP8 query is far slower.
         rows, src, width = rows.view(torch.int64), src.view(torch.int64), width // 8
     rows[:, len(group) * width :].zero_()
     rows[:, : len(group) * width].view(tokens, len(group), width).copy_(

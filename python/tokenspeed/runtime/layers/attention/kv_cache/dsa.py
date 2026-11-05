@@ -184,8 +184,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         ``key_norm`` is a LayerNorm the keys still need; both planes apply it
         inside their write (a uint8 plane before quantizing).
         """
-        # Wait for the layer's Host load: a tail hit loads the page these rows
-        # land in whole.
+        # Wait for the layer's Host load: a tail hit loads these rows' whole page.
         buf = self.get_index_k_buffer(layer_id)
         if key_norm is not None:
             if buf.dtype == torch.bfloat16:

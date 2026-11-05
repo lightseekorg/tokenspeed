@@ -191,8 +191,7 @@ def _k3_latent_gather_row(
     PUBLISHED: gl.constexpr = ROUTER_LOCAL + LATENT_LOCAL // 2
     gl.static_assert(LANES * WORDS >= PUBLISHED)
     gl.static_assert(ROUTER_LOCAL % WORDS == 0 and 256 % WORDS == 0)
-    # Thread t polls WORDS consecutive words of slot t // LANES: one region,
-    # one Lamport tile, and a retry that votes with one lane mask.
+    # Thread t polls WORDS words of slot t // LANES; a retry votes with one lane mask.
     layout: gl.constexpr = gl.BlockedLayout([1, WORDS], [64, 1], [NUM_WARPS, 1], [1, 0])
     thread = gl.arange(0, 64 * NUM_WARPS, layout=gl.SliceLayout(1, layout))
     lane_word = gl.arange(0, WORDS, layout=gl.SliceLayout(0, layout))
@@ -210,8 +209,7 @@ def _k3_latent_gather_row(
     )
     mailbox = gl.multiple_of(base, WORDS)[:, None] + lane_word[None, :]
     words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
-    # Published words never have 0x8000 as their high half, so a word is
-    # empty exactly when it does.
+    # Published words never have 0x8000 as their high half; that marks an empty word.
     payload = gl.amd.cdna4.buffer_load(
         words_ptr, mailbox, mask=valid, other=0, cache=".cv"
     )
@@ -251,8 +249,7 @@ def _k3_latent_gather_row(
         gl.multiple_of(routed_base, WORDS)[:, None] + lane_word[None, :]
     ).to(gl.int32)
     gl.amd.cdna4.buffer_store(payload, routed_words, routed_index, mask=routed)
-    # Every subgroup has left its poll, so every local publisher has read this
-    # row's stages before publishing an own-slot word.
+    # All subgroups have left the poll, so local publishers have read this row's stages.
     gl.barrier()
     gl.store(epochs + row * 2, ((low_stage + 1) % 3).to(gl.int32))
     gl.store(epochs + row * 2 + 1, ((high_stage + 1) % 3).to(gl.int32))
@@ -481,8 +478,7 @@ def iris_k3moe_latent_input_gather(
     row = pid // PER_ROW
     job = pid % PER_ROW
     base = row * TOTAL_N
-    # The gathering programs are the last, so every publisher dispatches
-    # before any of them spins.
+    # Gathering programs come last so every publisher dispatches before they spin.
     if pid >= tokens * PER_ROW:
         _k3_latent_gather_row(
             region,

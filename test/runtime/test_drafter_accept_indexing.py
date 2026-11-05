@@ -444,10 +444,7 @@ class TestDrafterAcceptIndexing:
         assert (metadata._dsa_kv_seq_lens) is None
 
     def test_dsa_target_refresh_publishes_the_causal_kv_rows_in_place(self):
-        # The sparse decode core's per-token KV lengths come from the dense
-        # leaf's verify-clamped seq_lens_k (padded graph rows included), so
-        # they equal the core's own derivation; later rounds rewrite the same
-        # storage, which a captured graph replays.
+        # KV lengths are the leaf's clamped seq_lens_k, rewritten in place for replay.
         from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
         from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
             TRTLLMMLADecodeMetadata,

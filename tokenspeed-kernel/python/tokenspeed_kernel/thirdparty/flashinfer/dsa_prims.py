@@ -38,8 +38,7 @@ class _SparsePlan:
     full_lengths: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
-# Scratch belongs to a stream, not a layer or a request. Captured plans live
-# with their graph owners; eager geometries have a bounded process-wide LRU.
+# Scratch is per stream; captured plans live with their graphs, eager ones in an LRU.
 _plans: OrderedDict[tuple, _SparsePlan] = OrderedDict()
 _captured_plans: WeakValueDictionary[tuple, _SparsePlan] = WeakValueDictionary()
 _MAX_EAGER_PLANS = 64

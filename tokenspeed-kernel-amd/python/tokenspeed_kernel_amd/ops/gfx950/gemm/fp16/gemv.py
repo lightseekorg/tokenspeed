@@ -84,9 +84,7 @@ _MFMA_BLOCK_M = 16
 _MFMA_MIN_BLOCK_N = 16
 _MFMA_LONG_K = 8192
 _MFMA_LONG_K_WARPS = 8
-# (N, K) -> largest M whose MFMA tile ran faster as two 16-row programs per CU
-# than one 28-row program (MI350X, cold weights: 7168 x 768 at M = 4
-# 5.40 -> 4.64 us); larger M or other shapes were slower or even.
+# (N, K) -> largest M where two 16-row programs per CU beat one 28-row program.
 _HALF_TILE_MAX_M = {(7168, 768): 16, (7168, 1536): 4, (7168, 3584): 8}
 
 

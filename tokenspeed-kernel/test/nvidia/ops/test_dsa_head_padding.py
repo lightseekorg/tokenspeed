@@ -83,8 +83,7 @@ def test_sparse_attention_heads_match_independent_head_groups(
         )
 
     def reference():
-        # Each head is independent. These calls use only native head counts,
-        # without the adapter padding under test, at the same input precision.
+        # Heads are independent: native 64-head calls, unpadded, form the reference.
         return torch.cat(
             [run(part.contiguous(), None) for part in q.split(64, dim=-2)], dim=-2
         )

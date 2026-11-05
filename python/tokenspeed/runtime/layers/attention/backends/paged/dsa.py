@@ -95,9 +95,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Sparse-leaf configurations whose selection this process has logged
-# (DSABackend._log_sparse_leaves): one line per distinct configuration, not
-# per leaf, view or cache rebind.
+# Logged sparse-leaf configurations: one log line per distinct configuration.
 _LOGGED_SPARSE_LEAVES: set[tuple] = set()
 
 # Owned-width KVP index tiles span whole groups of this many pages, so tile widths take few values.
@@ -197,17 +195,9 @@ class DSABackend(PagedAttentionBackend):
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
     _make_dense_leaf = staticmethod(_make_dense_leaf)
 
-    # Prefill graphs stay off unless the model opts in. A breakable prefill
-    # replay hands each eager break the bucket's padded rows with
-    # ctx.input_num_tokens pinned to the bucket, so a consumer must run every
-    # DSA operation (index-K and latent writes, top-k, KVP collectives, the
-    # sparse cores) in an eager break that narrows the replay to its live
-    # rows. KPool (GLM-5.3-Flash) and DSAConfig.padded_prefill_replay
-    # (Kimi-K3.1) do; see __init__.
+    # Opt-in only: a padded replay needs all DSA ops in a break narrowing to live rows.
     cuda_graph_support = CudaGraphSupport(prefill_graph=False)
-    # Owner-masked latent and index-K writes, candidate exchange, and sparse
-    # cores merged over the KVP group (``dcp/``), so an MLA/KDA hybrid's DSA
-    # layers may shard their history too.
+    # Owner-masked writes and KVP-merged cores (dcp/) let hybrid DSA layers shard KV.
     supports_mla_dcp = True
 
     def __init__(self, config: AttnConfig, spec: DSAConfig, *, kernel_page_size: int):
@@ -314,17 +304,12 @@ class DSABackend(PagedAttentionBackend):
             )
         # Rank-major query gather with partials in the exchange layout; a pinned prefill plan keeps its own core.
         self.kvp_prefill_query_layout: bool = self.prefill_kernel_plan is None
-        # Whether the KVP prefill's ordinary selection runs the Triton core on
-        # an FP8 cache, which the qlayout lever replaces by its DCP records
-        # form; probed in configure_runtime, once a router's solution pin has
-        # landed.
+        # KVP prefill's Triton FP8 core, probed once a router's solution pin has landed.
         self._dcp_records_core: bool = False
-        # Whether that selection runs the trtllm-gen core instead, which the
-        # qlayout lever hands its padded query; probed with the records core.
+        # Whether that selection runs the trtllm-gen core, which takes a padded query.
         self._dcp_padded_query: bool = False
         self._prefill_page_table: torch.Tensor | None = None
-        # The current forward's owned width of the KVP index tiles, in kernel
-        # pages (prefill_index_columns), or None for the page table's width.
+        # Owned KVP index-tile width in kernel pages; None means the page table's width.
         self._prefill_index_columns: int | None = None
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
@@ -338,9 +323,7 @@ class DSABackend(PagedAttentionBackend):
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
         elif spec.padded_prefill_replay and platform.is_nvidia:
-            # Kimi-K3.1 keeps every DSA op in KimiK31SparseMLAAttention.
-            # _sparse_attention, and forward_dsa_core narrows a padded replay
-            # to current_valid_rows(). Only NVIDIA is validated.
+            # K3.1 narrows padded replays to live rows; validated on NVIDIA only.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
             padded_replay_opt_in = True
         if len(self.qcp_group) > 1:
@@ -354,9 +337,7 @@ class DSABackend(PagedAttentionBackend):
             prefill=self.prefill_kernel_plan, decode=self.decode_kernel_plan
         )
         if padded_replay_opt_in and self.cuda_graph_support.prefill_graph:
-            # Logged after the QCP and planned-core vetoes, on every rank, so a
-            # boot log shows only leaves that keep the opt-in and exposes a rank
-            # that decided otherwise.
+            # Logged after the vetoes on every rank, so a dissenting rank shows.
             logger.info("DSA prefill graph admitted (padded_prefill_replay)")
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
@@ -411,8 +392,7 @@ class DSABackend(PagedAttentionBackend):
             raise ValueError("DSA cache geometry does not match KVP topology")
         self.kvp_block_granularity = block_granularity
         self.kvp_virtual_block_count = virtual_block_count
-        # The leaf is final here (a router's solution pin lands after
-        # construction) and no forward has selected yet.
+        # Probed here: a router's solution pin lands after construction.
         self._dcp_records_core = self._probe_dcp_records_core()
         self._dcp_padded_query = self._probe_dcp_padded_query()
         self._log_sparse_leaves()
@@ -1094,9 +1074,7 @@ class DSABackend(PagedAttentionBackend):
                 + extend_seq_lens_cpu[:num_extends].to(torch.int64),
             )
 
-    # ------------------------------------------------------------------
     # KVP prefill: owned-width index tiles
-    # ------------------------------------------------------------------
 
     def _plan_prefill_index_columns(
         self, page_table_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
@@ -1549,20 +1527,14 @@ class DSABackend(PagedAttentionBackend):
         use_dcp = len(self.kvp_group) > 1
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         topk_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
-        # The gathered heads of a padded query, whose partials end with the
-        # padding heads'.
+        # Gathered heads of a padded query; its partials end with the padding heads'.
         live_heads = None
         if use_dcp:
-            # This rank's owned slots move to each row's front and their
-            # count becomes the row's length, so a core honouring topk_lens
-            # visits about topk / kvp entries instead of the whole width.
+            # Owned slots first with their count as length: ~topk/kvp entries per row.
             topk_slots, topk_lens = compact_owned_cache_slots(
                 topk_slots, topk_lens, self.cache_placement(layer)
             )
-            # Decided before the query gather, from boot configuration and
-            # host sizes every rank of the group shares (the live rows under
-            # a padded prefill-graph replay, which the model's DSA break
-            # narrows before this call).
+            # Decided before the query gather from inputs every rank shares.
             if (
                 not keep_all_heads
                 and self.kvp_prefill_query_layout
@@ -1671,8 +1643,7 @@ class DSABackend(PagedAttentionBackend):
             solution=self.kernel_solution,
             slot_order=self.slot_order,
         )
-        # The Triton core writes BF16 partials for an FP8 or BF16 query, the
-        # only queries the records op takes, and the combine keeps their dtype.
+        # The Triton core emits BF16 partials, which the combine keeps.
         return combine_attention_records(
             records,
             group=self.kvp_group,
@@ -1881,8 +1852,7 @@ class DSABackend(PagedAttentionBackend):
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         topk_slots = topk_indices.view(num_tokens, -1)
         if use_dcp:
-            # As in sparse prefill: owned local slots first, their count as
-            # the length (the full width when topk_lens is None).
+            # Owned slots first, counted as length (full width without topk_lens).
             topk_slots, topk_lens = compact_owned_cache_slots(
                 topk_slots, topk_lens, self.cache_placement(layer)
             )

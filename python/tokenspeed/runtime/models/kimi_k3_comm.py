@@ -73,8 +73,7 @@ _MULTIMEM_AR_MIN_TOKENS = 1024
 
 _IRIS_MAX_TOKENS = 8192
 _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS = 16
-# Through 64 rows the Lamport two-shot reduce, the replicated mix and the MoE's
-# gather tail beat the row-sharded mix and tail (graph replay, 8x MI350X).
+# Through 64 rows the replicated mix and gather tail beat row sharding (8x MI350X).
 _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 72
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
@@ -258,9 +257,7 @@ class K3AttnComm:
         producer_direct: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the residual and optional delta consumed by the AttnRes mixer."""
-        # The Lamport mailboxes read the partial where it lies, prepared or
-        # not, and reduce into owned storage, which remains valid as a
-        # residual after the next producer reuses its input.
+        # The reduce lands in owned storage, which outlives the producer's input reuse.
         reduced = (
             self.iris_state.reduce_attention(partial)
             if self.iris_state is not None

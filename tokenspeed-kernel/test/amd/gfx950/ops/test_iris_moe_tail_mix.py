@@ -333,8 +333,7 @@ def _check(rank: int, device: torch.device, group: dist.ProcessGroup) -> None:
                     assert residual.data_ptr() == blocks[write_idx, first].data_ptr()
                 torch.testing.assert_close(blocks, expected_blocks, atol=0, rtol=0)
                 if write_idx >= 0:
-                    # Peers' snapshot rows are stale here; later references
-                    # read every row, as after a gather.
+                    # Refresh stale peer rows: later checks read every row.
                     blocks[write_idx].copy_(output)
                 if prefix_is_sharded:
                     torch.testing.assert_close(

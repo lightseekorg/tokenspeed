@@ -1813,8 +1813,7 @@ if platform.is_amd:
         w._situ_input_fp8 = None
         rows = int(x[0].shape[0] if isinstance(x, tuple) else x.shape[0])
         if situ_linear_beta is not None and is_warming_up() and rows > 64:
-            # Serving prefill chunks select tiles by row count; the startup
-            # prefill reaches one. Its row count bounds the serving chunks.
+            # Serving chunks pick tiles by row count, up to this warmup prefill's rows.
             warm_gluon_mxfp4_situ_prefill_rows(
                 w.w13_weight_triton_tensor,
                 w.w2_weight_triton_tensor,

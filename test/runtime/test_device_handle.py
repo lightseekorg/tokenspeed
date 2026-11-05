@@ -97,8 +97,7 @@ def _execute(handle, plan, planned):
         ("DFLASH", True, False, False, False, False),
     ],
 )
-# Whether the checkpoint declares the DSA padded-replay contract (Kimi-K3.1):
-# only then does the aggregated role agree on its prefill graph plan.
+# Only a checkpoint with the DSA padded-replay contract runs the aggregated plan check.
 @pytest.mark.parametrize("declares_padded_replay", [True, False])
 def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch,
@@ -195,8 +194,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     )
     monkeypatch.setattr(registry, "create_attn_components", build)
     monkeypatch.setattr(cudagraph_memory, "probe_cudagraph_memory", probe)
-    # Kimi-K3.1's aggregated role agrees on the prefill graph plan like the
-    # prefill role: its eager DSA breaks run collectives too.
+    # The aggregated role checks the prefill plan too: eager DSA breaks run collectives.
     monkeypatch.setattr(
         prefill_graph,
         "check_rank_uniform_prefill_plan",
@@ -248,8 +246,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             max_batch_size=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
-    # Once, before tuning and any capture, where the checkpoint declares the
-    # contract; other models' aggregated boots run no agreement.
+    # Once, before tuning and capture, only where the checkpoint declares the contract.
     assert events.count(("plan-check",)) == int(declares_padded_replay)
     if declares_padded_replay:
         assert events[0] == ("plan-check",)

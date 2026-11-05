@@ -151,11 +151,7 @@ if current_platform().is_amd:
     def gluon_dsa_prefill_topk_standard_gfx950(*args, **kwargs):
         return _dsa_prefill_topk_standard_impl(*args, **kwargs)
 
-    # Multi-row scorers of the standard fp8_scaled pages with E4M3 queries
-    # (FP8 MFMA): a program shares each gathered key tile across a block of
-    # query rows (the bf16-plane scorers' structure), where the standard
-    # scorers above regather it per row. BF16 queries keep the standard
-    # scorers.
+    # E4M3 queries share each gathered key tile across rows; BF16 stays standard.
     @register_kernel(
         "attention",
         "dsa_decode_topk",
@@ -221,10 +217,7 @@ if current_platform().is_amd:
     def gluon_dsa_prefill_topk_fp8_rows_gfx950(*args, **kwargs):
         return _dsa_prefill_topk_fp8_rows_impl(*args, **kwargs)
 
-    # Scorers of a bf16 index-K plane (``[slots, head_dim]``, no scales) with
-    # BF16 queries. They read only planes, so they never declare
-    # ``index_k_workspace_rows``; their radix selection does not promise
-    # lowest-index ties, so they do not declare ``batch_invariant`` either.
+    # BF16 plane scorers; radix ties are not lowest-index, so not batch_invariant.
     @register_kernel(
         "attention",
         "dsa_decode_topk",

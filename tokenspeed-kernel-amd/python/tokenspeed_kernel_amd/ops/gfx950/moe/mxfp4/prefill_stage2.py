@@ -413,10 +413,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 pid_m = flat_tile // num_pid_n
                 pid_n = flat_tile % num_pid_n
             elif NUM_XCDS != 1:
-                # Keep an expert's M tiles for one N tile on one XCD so its
-                # weights stay in that L2. The grid covers the padded route
-                # capacity, so only tiles holding routes are remapped; the
-                # rest exit.
+                # Keep an expert's N-tile weights in one XCD's L2; empty tiles exit.
                 valid_pid_m = gl.minimum(
                     gl.cdiv(num_tokens_post_padded, BLOCK_M), num_pid_m
                 )

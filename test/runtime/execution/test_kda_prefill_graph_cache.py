@@ -641,8 +641,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     assert events == ([] if transfer else ["refresh"]) + [
         "inline" if expected == 2 else "ordinary"
     ]
-    # The route counters name the variant that replayed, and its first replay
-    # is logged whatever the interval (a short run still shows its routes).
+    # A variant's first replay logs whatever the interval, so short runs show routes.
     route = f"inline@{capture_bs}" if expected == 2 else "ordinary"
     assert owner._route_counts == {route: 1}
     assert f"prefill graph route first replayed: {route}" in [
@@ -713,8 +712,7 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
         forward_mode=ForwardMode.EXTEND,
         global_num_tokens=None,
     )
-    # The Host load runs on its own stream; record what the forward's
-    # stream is told to wait for, in order with the refresh and the replay.
+    # The Host load has its own stream; record the forward stream's waits in order.
     stream = SimpleNamespace(wait_event=lambda event: events.append(names[id(event)]))
     with (
         patch("torch.cuda.current_stream", return_value=stream),
@@ -1037,8 +1035,7 @@ def kimi_host_cache():
             torch.manual_seed(37)
             pool.arena.buffer.random_(0, 256)
             pool.get_component(kda_layer_id(pool), "recurrent_state")[1].normal_()
-            # The store below copies behind the execution stream, not behind
-            # the default stream that filled the arena.
+            # The store follows the execution stream, not the arena-filling stream.
             torch.cuda.synchronize()
             # Its plan also points the layerwise waits at no load again, so
             # the tests capture with none, as a server does.

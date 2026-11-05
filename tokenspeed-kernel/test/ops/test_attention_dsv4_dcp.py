@@ -165,8 +165,7 @@ def test_virtual_slot_translation_rejects_invalid_geometry():
 
 
 def _owned_selection(rows, width, *, rows_per_page, virtual_count, seed):
-    # Selected virtual slots with -1 holes, null-block, negative and
-    # past-capacity entries mixed in.
+    # Virtual slots with -1 holes and null-block, negative and past-capacity entries.
     generator = torch.Generator().manual_seed(seed)
     slots = torch.randint(
         -5,
@@ -259,8 +258,7 @@ def test_compact_owned_slots_partitions_selection(device, degree):
     rows, width, rows_per_page = 9, 2048, 128
     virtual_count = 1 + 24 * degree
     generator = torch.Generator().manual_seed(degree)
-    # Distinct owned-capacity slots, as a top-k selection holds them, with
-    # stale entries past each row's length.
+    # Distinct owned slots, as top-k selects them, with stale entries past each length.
     capacity = (virtual_count - 1) * rows_per_page
     slots = torch.stack(
         [
@@ -334,8 +332,7 @@ def test_compact_owned_slots_graph_replay():
         assert torch.equal(local.cpu(), expected)
         assert torch.equal(counts.cpu(), expected_counts)
 
-    # Row counts, widths and strides are runtime arguments: one binary per
-    # placement and lengths form serves every batch.
+    # Rows, widths and strides are runtime: one binary per placement and lengths form.
     compact_owned_slots(selection(4, 512, 7).cuda(), None, **geometry)
     with assert_no_triton_compile(triton_cache_placement._compact_owned_slots):
         for rows, width in ((1, 2048), (3, 2051), (16, 512), (33, 2048)):
@@ -595,9 +592,7 @@ def test_rank_major_merge_row_slices_match_full_merge(
         if not tied:
             torch.testing.assert_close(positions, full_positions[part], atol=0, rtol=0)
             continue
-        # Equal scores may be ordered, or cut at the topk-th, differently:
-        # the selected scores agree, and so do the sets of rows that select
-        # every valid candidate they have.
+        # Ties may order or cut differently; scores and fully-selected rows still agree.
         torch.testing.assert_close(
             selected_scores(positions),
             selected_scores(full_positions[part]),
@@ -615,8 +610,7 @@ def test_rank_major_merge_row_slices_match_full_merge(
 
 @requires_cuda
 def test_threshold_selection_ignores_which_tied_candidates_a_topk_chose():
-    # Two ranks of four candidates; three score 2.0 at the cutoff of a top-4,
-    # plus a -inf score, a NaN score and a negative offset that never count.
+    # Three 2.0s tie at the top-4 cutoff; -inf, NaN and negative offsets never count.
     ids = torch.tensor(
         [[[10, 11, 12, 13]], [[20, 21, -1, 23]]], device="cuda", dtype=torch.int32
     )
@@ -638,8 +632,7 @@ def test_threshold_selection_ignores_which_tied_candidates_a_topk_chose():
     ]
 
     for positions, counts in results:
-        # 9.0 and 5.0, plus the first two of the three candidates tied at
-        # 2.0 (offsets 10 and 20, not 23), all in candidate order.
+        # 9.0, 5.0 and the first two 2.0 ties (10, 20; not 23), in candidate order.
         torch.testing.assert_close(
             positions,
             torch.tensor([[10, 12, 20, 21]], device="cuda", dtype=torch.int32),

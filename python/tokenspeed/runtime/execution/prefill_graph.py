@@ -506,8 +506,7 @@ class PrefillGraph:
         self._encoder_handoff_storage: dict[HandoffSlot, torch.Tensor] = {}
         self._outputs: list[torch.Tensor] | None = None
         self._engaged_logged: set[str] = set()
-        # Replays per route ("ordinary", or "inline@<request capacity>"),
-        # logged by global rank 0 every PREFILL_ROUTE_LOG_INTERVAL replays.
+        # Replays per route, logged by rank 0 every PREFILL_ROUTE_LOG_INTERVAL replays.
         self._route_counts: dict[str, int] = {}
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None

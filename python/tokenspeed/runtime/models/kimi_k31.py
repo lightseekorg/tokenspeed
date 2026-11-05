@@ -81,8 +81,7 @@ if TYPE_CHECKING:
 
     from tokenspeed.runtime.execution.context import ForwardContext
 
-# The q_a + kv_a + RoPE-key width the Iris MoE tail can project ahead
-# (``allreduce_sharded.MLA_QKV_A_WIDTH``).
+# q_a + kv_a + RoPE-key width the Iris MoE tail projects ahead (MLA_QKV_A_WIDTH).
 _PRECOMPUTED_QKV_A_WIDTH = 2112
 
 # The checkpoint names no epsilon for the index-key LayerNorm; 1e-6 is DeepSeek-V3.2's.
@@ -129,8 +128,7 @@ class KimiK31Indexer(nn.Module):
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.index_head_dim, eps=_INDEX_K_NORM_EPS)
-        # ``[wk; weights_proj]``, stacked once loading finishes
-        # (fuse_key_weight_projections): one GEMM over the attention input.
+        # [wk; weights_proj] stacked after load: one GEMM over the attention input.
         self.wk_weights_proj_weight: torch.Tensor | None = None
 
     def fuse_key_weight_projections(self) -> None:
@@ -166,8 +164,7 @@ class KimiK31Indexer(nn.Module):
         """
         del positions
         if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-            # One GEMM over every row: a row's bits must not depend on how
-            # many rows share its projection.
+            # One GEMM over all rows: a row's bits must not depend on its batch.
             query, query_proj = self._project_query(q_lora), None
         else:
             query, query_proj = q_lora, self._project_query
@@ -175,8 +172,7 @@ class KimiK31Indexer(nn.Module):
             key = self.wk(hidden_states)[0]
             weights = self.weights_proj(hidden_states)[0]
         else:
-            # Row-strided views of one output; the top-k scorers take a
-            # strided head-weight row.
+            # Strided views of one output; the top-k scorers take strided weights.
             key, weights = mm(hidden_states, self.wk_weights_proj_weight).split(
                 (self.index_head_dim, self.index_n_heads), dim=-1
             )
@@ -276,15 +272,12 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         # Every K3.1 DSA layer computes its own top-k (index_topk_freq=1).
         self.is_nextn = False
         self.skip_indexer_topk = False
-        # The indexer is replicated on every attention-TP rank, so the ranks
-        # divide the prefill top-k rows and all-gather the selection.
+        # The replicated indexer lets ranks split prefill top-k rows and all-gather.
         self.prefill_topk_tp_split = True
-        # K-major w_kc/w_vc let both absorbed products take the grouped decode
-        # GEMM. A pinned bitwise absorption plan keeps the shared layout.
+        # K-major w_kc/w_vc take the grouped GEMM unless a bitwise plan is pinned.
         self.absorbed_weights_k_major = self.absorption_kernel_plan is None
         self.indexer = KimiK31Indexer(config, prefix=add_prefix("indexer", prefix))
-        # FP8 index queries over an fp8_scaled plane, where the platform
-        # registers scorers for them.
+        # FP8 index queries where the platform registers fp8_scaled scorers.
         self.index_query_fp8 = _scorers_take_fp8_index_queries(self.indexer)
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
@@ -413,8 +406,7 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         # Normalizes the latent in place and the q latent into q_norm.
         q_norm = torch.empty_like(q_a)
         self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
-        # A decode round gates in the value projection; an FP8 o_proj gates
-        # in its input quantization instead.
+        # Decode gates in the value projection; an FP8 o_proj gates in its input quant.
         fuse_value_gate = (
             gate is not None
             and ctx.num_extends == 0

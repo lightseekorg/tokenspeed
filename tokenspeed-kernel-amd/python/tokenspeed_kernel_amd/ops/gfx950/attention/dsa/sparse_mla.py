@@ -50,12 +50,9 @@ _ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
 _ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG = (8192, 8)
 _ONEBLOCK_DECODE_LONG_MANUAL_CONFIG = (8192, 4)
 _ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS = 65536
-# Indexer logits crowd a few sign/exponent prefixes, so the first decode pass
-# spreads each bucket over four counters; eight cost more to clear and sum
-# than the contention they remove.
+# Logits crowd a few exponent prefixes, so pass one spreads each bucket over 4 counters.
 _ONEBLOCK_DECODE_HIST_COPIES = 4
-# Decode rows whose 24-bit threshold bucket holds at most this many keys rank
-# them in LDS during the emit instead of a third pass over the row.
+# 24-bit threshold buckets this small rank in LDS during emit, skipping a third pass.
 _ONEBLOCK_DECODE_TIE_CAP = 64
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
 _ONEBLOCK_PREFILL_WIDE_SHORT_BLOCK_N = 8192
@@ -79,17 +76,9 @@ _PERSISTENT_NUM_BUCKETS = gl.constexpr(1 << 11)
 _PERSISTENT_NUM_PASSES = gl.constexpr(3)
 _PERSISTENT_COUNTER_STRIDE = gl.constexpr(32)
 _PERSISTENT_WORKSPACE_CACHE_MAXSIZE = 16
-# Decode rows up to _MULTI_CTA_MAX_ROWS spread each row over CTAs of
-# block_n columns, wider ones from _MULTI_CTA_WIDE_MIN_ROWS rows on: a
-# histogram kernel counts the rows' 12-bit key prefixes, then a select kernel
-# lists the keys of each row's threshold bucket and the row's last CTA
-# resolves them.
+# Decode batches up to this many rows may split each row over CTAs (histogram + select).
 _MULTI_CTA_MAX_ROWS = 32
-# Two launches cost ~1.8 us more than one, and the multi-CTA kernels overtake
-# the one-block kernel only on rows past ~9K candidates (~12K from 16 rows),
-# so decode logits of at most this many columns keep the one-block kernel:
-# averaged over row lengths, 12288 and 16384 columns lose ~0.5 us a call with
-# multi-CTA on MI350X, 20480 gain ~0.3 us and 49152 ~2.9 us.
+# The extra launch (~1.8 us) loses at or below this width; wider logits go multi-CTA.
 _MULTI_CTA_ONEBLOCK_MAX_COLS = 16384
 _MULTI_CTA_WIDE_MIN_ROWS = 9
 _MULTI_CTA_BLOCK_N = 2048
@@ -99,17 +88,12 @@ _MULTI_CTA_GRANULE = 64
 _MULTI_CTA_NUM_WARPS = 8
 _MULTI_CTA_NUM_BUCKETS = 4096
 _MULTI_CTA_ARRIVAL_STRIDE = 64
-# The last CTA of a row gathers the listed keys of the tiles covering
-# _MULTI_CTA_GATHER_COLS columns at once, _MULTI_CTA_GATHER slots split evenly
-# over them; the rest stream from a per-row overflow list.
+# The last CTA gathers these slots over these columns; the rest stream from overflow.
 _MULTI_CTA_GATHER = 4096
 _MULTI_CTA_GATHER_COLS = 65536
 # Threshold prefixes shared by at most this many listed keys rank them in LDS.
 _MULTI_CTA_TIE_CAP = 64
-# bf16 index-K scorers: a program shares each gathered key tile across its
-# query rows (MFMA rows = query rows x 32 heads), and warps split the rows.
-# Three 64-key stages plus a 4096-slot chunk take 64 KiB of LDS, so prefill
-# fits two programs per CU. Query rows per prefill program by head count:
+# BF16 prefill query rows per program, by head count; 64 KiB LDS fits two per CU.
 _BF16_PREFILL_ROWS = {32: 8, 64: 4}
 _BF16_PREFILL_BLOCK_N = 64
 _BF16_PREFILL_CHUNK_N = 4096
@@ -121,10 +105,7 @@ _BF16_DECODE_BLOCK_N = 64
 _BF16_DECODE_CHUNK_N = 256
 _BF16_DECODE_NUM_STAGES = 3
 _BF16_DECODE_NUM_WARPS = 4
-# fp8_scaled multi-row scorers with FP8 queries: 32-head prefill programs take
-# 128-key tiles over 2048-slot chunks (finer chunks even out the last wave over
-# long workspaces); decode programs keep two stages, and 32-head ones of up to
-# four rows four waves per SIMD (64 heads run twice as slow at four).
+# FP8-query scorers: small chunks even the last wave; 4 waves/SIMD suit 32 heads only.
 _FP8_ROWS_PREFILL_TILES = {32: (128, 2048)}
 _FP8_ROWS_DECODE_NUM_STAGES = 2
 _FP8_ROWS_DECODE_WAVES_PER_EU = 4
@@ -778,14 +759,12 @@ def _load_multi_cta_tile(
     BLOCK_N: gl.constexpr,
     GRANULE: gl.constexpr,
 ):
-    # Tile `tile` of `tiles` takes every tiles-th GRANULE-column run of the
-    # row, so keys crowded into a few runs spread over all of its CTAs.
+    # Interleave GRANULE-column runs over tiles so crowded keys spread over every CTA.
     gl.static_assert(BLOCK_N % GRANULE == 0, "a tile holds whole granules")
     local = gl.arange(0, BLOCK_N, layout=value_layout)
     offsets = (local // GRANULE) * (tiles * GRANULE) + tile * GRANULE + local % GRANULE
     offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
-    # Decode rows hold whole pages, so the rounded-up vector stays inside the
-    # row; lanes past candidate_len fail `valid`.
+    # Rows hold whole pages, so rounding up to a 4-vector stays in the row.
     vector_end = gl.cdiv(candidate_len, 4) * 4
     values = gl.amd.cdna4.buffer_load(
         ptr=row_logits,
@@ -803,10 +782,7 @@ def _multi_cta_tiles(
     GRANULE: gl.constexpr,
     TILE_GROUP: gl.constexpr,
 ):
-    # The row interleaves over the tiles its length fills, but at least one
-    # tile group, rather than over the logits width (max-model-len): the last
-    # CTA then gathers the listed keys of no more tiles than the row needs.
-    # Returns that interleave and the tiles holding a granule of the row.
+    # Interleave over the tiles the row fills (at least a group), not the logits width.
     tiles = gl.minimum(
         gl.maximum(gl.cdiv(candidate_len, BLOCK_N), TILE_GROUP), gl.num_programs(1)
     )
@@ -815,8 +791,7 @@ def _multi_cta_tiles(
 
 @gluon.jit
 def _physical_slots(block_table, req, block_table_cols, logical, mask, page_size):
-    # Buffer ops mask lanes through their offsets; masked global loads and
-    # stores branch per element and wait on every earlier access.
+    # Buffer ops mask by offset; masked global ops branch and wait on earlier accesses.
     block_idx = logical // page_size
     page = gl.amd.cdna4.buffer_load(
         ptr=block_table + req * block_table_cols,
@@ -827,8 +802,7 @@ def _physical_slots(block_table, req, block_table_cols, logical, mask, page_size
     return page * page_size + (logical - block_idx * page_size)
 
 
-# Inclusive int32 prefix sum over the 64 lanes of a wave (one value per lane)
-# on DPP row shifts and row broadcasts.
+# Inclusive int32 scan over a wave's 64 lanes via DPP row shifts and row broadcasts.
 _WAVE_SCAN_ASM = gl.constexpr(
     "s_nop 1\n"
     "v_mov_b32 $0, $1\n"
@@ -858,16 +832,13 @@ def _wave_inclusive_scan(x):
 
 @gluon.constexpr_function
 def _wave_bins_layout(num_warps, bins_per_lane):
-    # [64, bins_per_lane]: lane i holds bins [i * bins_per_lane, ...), and
-    # every wave holds a copy.
+    # Lane i holds bins [i * bins_per_lane, ...); every wave holds a full copy.
     return gl.BlockedLayout([1, bins_per_lane], [64, 1], [num_warps, 1], [1, 0])
 
 
 @gluon.jit
 def _select_bins_in_wave(counts, remaining):
-    # counts: [64, V] in _wave_bins_layout. The bin holding the remaining-th
-    # smallest key, the keys in lower bins, and the keys in the bin; every
-    # wave finds them on its own copy.
+    # Finds the remaining-th key's bin, keys below and in it; each wave on its own copy.
     V: gl.constexpr = counts.shape[1]
     layout: gl.constexpr = counts.type.layout
     lane_total = gl.sum(counts, axis=1)
@@ -895,9 +866,7 @@ def _load_wave_bins(shared_bins, V: gl.constexpr):
 
 @gluon.jit
 def _select_shared_digit(shared_histogram, remaining, NUM_BUCKETS: gl.constexpr):
-    # Threshold bin of a 4096-bin LDS histogram, the keys below it and in it:
-    # every thread sums 16 bins, the run of 64 bins comes from the run sums,
-    # then the bin within it.
+    # Threshold bin, keys below and in it: the 64-bin run from run sums, then the bin.
     gl.static_assert(NUM_BUCKETS == 4096, "64 runs of 64 bins")
     W: gl.constexpr = gl.num_warps()
     sum_layout: gl.constexpr = gl.BlockedLayout([1, 16], [16, 4], [W, 1], [1, 0])
@@ -920,9 +889,7 @@ def _select_shared_digit(shared_histogram, remaining, NUM_BUCKETS: gl.constexpr)
 
 @gluon.jit
 def _block_exclusive_ranks(x, V: gl.constexpr):
-    # x: [R * W * 64 * V] in BlockedLayout([V], [64], [W], [0]). Exclusive
-    # prefix sums in (wave, lane, repeat, vector) order, a bijection onto
-    # [0, total), and the total.
+    # x in BlockedLayout([V], [64], [W], [0]); ranks go (wave, lane, repeat, vector).
     W: gl.constexpr = gl.num_warps()
     R: gl.constexpr = x.shape[0] // (W * 64 * V)
     L4: gl.constexpr = gl.BlockedLayout(
@@ -955,9 +922,7 @@ def _block_exclusive_ranks(x, V: gl.constexpr):
 def _add_histogram_to_global(
     row_histogram, shared_histogram, NUM_BUCKETS: gl.constexpr
 ):
-    # Adds the bins, then the sums of each run of 64 bins after them.
-    # Device-scope atomics serialize per cache line within a wave, so adjacent
-    # lanes take adjacent buckets.
+    # Adds bins, then run sums; lanes take adjacent bins (atomics serialize per line).
     lane_layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     counts = shared_histogram.load(lane_layout)
     gl.atomic_add(
@@ -1002,9 +967,7 @@ def _dsa_multi_cta_histogram_kernel(
     GRANULE: gl.constexpr,
     TILE_GROUP: gl.constexpr,
 ):
-    # First radix level of the multi-CTA decode top-k: every CTA counts the
-    # 12-bit key prefixes of one BLOCK_N tile of its row into the row's
-    # global histogram.
+    # Radix level 1: each CTA counts a tile's 12-bit prefixes into the row histogram.
     row = gl.program_id(0)
     tile = gl.program_id(1)
     _, candidate_len = _multi_cta_decode_row(row, row_ends, q_len_per_req)
@@ -1057,8 +1020,7 @@ def _count_multi_cta_digits(
     DIGIT_MASK: gl.constexpr,
     SPILL: gl.constexpr,
 ):
-    # Unmatched lanes count into distinct spill bins past SPILL, so the LDS
-    # atomics need no per-lane branches.
+    # Unmatched lanes hit distinct spill bins, so the LDS atomics need no branches.
     spill = SPILL + gl.arange(0, keys.shape[0], layout=keys.type.layout) % SPILL
     shared_histogram.atomic_scatter_add(
         gl.full(keys.shape, 1, gl.int32, layout=keys.type.layout),
@@ -1086,10 +1048,7 @@ def _emit_multi_cta_listed(
     SHIFT: gl.constexpr,
     TIES: gl.constexpr,
 ):
-    # Listed keys whose top 32 - SHIFT bits fall below the threshold win at
-    # below_start onwards. Equal ones go to the tie buffers from equal_start
-    # (TIES) or fill outputs equal_start.. while fewer than equal_needed.
-    # Returns the counts of both.
+    # Below-threshold keys emit at below_start; ties buffer or fill up to equal_needed.
     compared = keys >> SHIFT
     below = listed & (compared < threshold)
     equal = listed & (compared == threshold)
@@ -1128,9 +1087,7 @@ def _visit_multi_cta_listed(
     PHASE: gl.constexpr,
     NUM_BUCKETS: gl.constexpr,
 ):
-    # PHASE 0 and 1 count the listed keys' second- and third-level digits
-    # under `prefix`; 2 emits against the 32-bit threshold `prefix`, 3
-    # against the 24-bit one with ties buffered. Returns the emitted counts.
+    # PHASE 0/1 count digits 2/3; 2 emits on the 32-bit prefix, 3 on 24-bit with ties.
     if PHASE == 0:
         _count_multi_cta_digits(
             shared_histogram, keys, listed, prefix, 20, 8, 0xFFF, NUM_BUCKETS
@@ -1172,9 +1129,7 @@ def _load_listed_group(
     TILE_GROUP: gl.constexpr,
     CHUNK: gl.constexpr,
 ):
-    # The listed keys of tiles [group_start, group_start + TILE_GROUP), each
-    # padded to CHUNK slots. Lanes take adjacent 4-key vectors, so every
-    # gather instruction reads whole cache lines.
+    # Each tile pads to CHUNK slots; adjacent 4-key lane vectors read whole cache lines.
     flat = gl.arange(0, TILE_GROUP * CHUNK, layout=gather_layout)
     tiles = group_start + flat // CHUNK
     positions = flat % CHUNK
@@ -1229,8 +1184,7 @@ def _load_spilled_listed(
     TILE_GROUP: gl.constexpr,
     CHUNK: gl.constexpr,
 ):
-    # Source i < extra_groups is tile group i + 1, later ones are chunks of
-    # the overflow list; sources past the end load nothing.
+    # Source i: tile group i + 1 below extra_groups, then overflow chunks, then nothing.
     if source < extra_groups:
         keys, slots, listed = _load_listed_group(
             row_counts,
@@ -1277,10 +1231,7 @@ def _visit_spilled_listed(
     CHUNK: gl.constexpr,
     NUM_BUCKETS: gl.constexpr,
 ):
-    # The listed keys outside the first tile group's gather: later tile
-    # groups, then the overflow list, each source loading while the previous
-    # one is visited. Emitting phases continue from below_start and
-    # equal_start.
+    # Later groups then overflow, each source loading while the previous one is visited.
     extra_groups = gl.cdiv(num_tiles, TILE_GROUP) - 1
     sources = extra_groups + gl.cdiv(overflow_count, TILE_GROUP * CHUNK)
     below_start += gl.full([], 0, gl.int32)
@@ -1347,8 +1298,7 @@ def _rank_multi_cta_ties(
     row_out,
     TIE_CAP: gl.constexpr,
 ):
-    # Rank the buffered keys sharing the 24-bit threshold prefix by key, then
-    # by buffer position, and emit the `needed` lowest-ranked ones.
+    # Rank tied keys by key, then buffer position, and emit the `needed` lowest.
     W: gl.constexpr = gl.num_warps()
     gl.static_assert(TIE_CAP == 64, "the tie ranking layout covers 64 keys")
     tie_layout: gl.constexpr = gl.BlockedLayout(
@@ -1410,13 +1360,7 @@ def _dsa_multi_cta_select_kernel(
     CHUNK: gl.constexpr,
     TIE_CAP: gl.constexpr,
 ):
-    # Second radix level. Every CTA finds the row's 12-bit threshold bucket in
-    # the first-level histogram, lists its tile's keys in that bucket with
-    # their KV slots (the first CHUNK in the tile's slots, the rest in the
-    # row's overflow list), and arrives on the row's counter with its count of
-    # keys below the bucket; the arrival order places those winners. The CTA
-    # arriving last resolves the threshold among the listed keys in two more
-    # levels and restores the row's histogram and counters to zero.
+    # Level 2: CTAs list bucket keys; the last to arrive resolves and re-zeroes the row.
     gl.static_assert(
         (BLOCK_N < 65536) & (TILE_GROUP * CHUNK < 65536),
         "the rank scans pack two 16-bit counts",
@@ -1484,8 +1428,7 @@ def _dsa_multi_cta_select_kernel(
     slots = _physical_slots(
         block_table, req, block_table_cols, offsets, valid, page_size
     )
-    # The run of 64 bins holding the threshold, from the run sums, then the
-    # bin within it.
+    # Find the threshold's 64-bin run from the run sums, then the bin within it.
     run, run_greater, _ = _select_bins_in_wave(
         gl.load(row_histogram + NUM_BUCKETS + runs), topk
     )
@@ -1537,9 +1480,7 @@ def _dsa_multi_cta_select_kernel(
             cache=".wt",
         )
     gl.store(row_counts + tile, gl.minimum(listed_count, CHUNK), cache_modifier=".wt")
-    # The listed keys and counts are written through to memory, so the
-    # arrival needs no cache writeback, only every wave's stores complete
-    # before it.
+    # Write-through stores: arrival needs no writeback, only every wave's stores done.
     _wait_vector_memory()
     gl.barrier()
     arrived = gl.atomic_add(
@@ -1551,8 +1492,7 @@ def _dsa_multi_cta_select_kernel(
     if (arrived & 0xFFF) != num_tiles - 1:
         return
 
-    # Every other CTA of the row has read the histogram and arrived; the
-    # listed keys load past the caches.
+    # Others have read the histogram and arrived; listed keys load past the caches.
     gl.atomic_xchg(row_arrival, 0, sem="relaxed", scope="gpu")
     overflow_count = gl.atomic_xchg(row_overflow_cursor, 0, sem="relaxed", scope="gpu")
     bucket_offsets = gl.arange(0, NUM_BUCKETS, layout=histogram_layout)
@@ -1572,8 +1512,7 @@ def _dsa_multi_cta_select_kernel(
     )
     gather_layout: gl.constexpr = gl.BlockedLayout([4], [64], [W], [0])
     remaining = topk - greater
-    # The first tile group's listed keys stay in registers; the rest stream
-    # once per level.
+    # The first tile group's keys stay in registers; the rest stream once per level.
     gathered_keys, gathered_slots, gathered = _load_listed_group(
         row_counts, row_keys, row_slots, 0, num_tiles, gather_layout, TILE_GROUP, CHUNK
     )
@@ -1617,8 +1556,7 @@ def _dsa_multi_cta_select_kernel(
     prefix = (bucket_prefix << 12) | digit.to(gl.uint32)
     remaining -= digit_greater
     if tie_count <= TIE_CAP:
-        # Few keys share the 24-bit threshold prefix: buffer them while the
-        # keys below it are emitted, then rank them in LDS.
+        # Few ties: buffer them while emitting the keys below, then rank them in LDS.
         below_count, equal_count = _emit_multi_cta_listed(
             gathered_keys,
             gathered_slots,
@@ -1699,8 +1637,7 @@ def _dsa_multi_cta_select_kernel(
         )
         threshold = (prefix << 8) | last.to(gl.uint32)
         remaining -= last_greater
-        # Listed keys below the 32-bit threshold all win; equal ones fill the
-        # last `remaining` outputs.
+        # Keys under the 32-bit threshold win; ties fill the last `remaining` outputs.
         below_count, equal_count = _emit_multi_cta_listed(
             gathered_keys,
             gathered_slots,
@@ -1787,8 +1724,7 @@ def _histogram_slots(
 ):
     slots = buckets.to(gl.int32)
     if HIST_COPIES > 1:
-        # Lanes of one LDS atomic spread over HIST_COPIES adjacent counters per
-        # bucket, so rows crowded into a few buckets do not serialize on one.
+        # Per-bucket HIST_COPIES counters stop crowded buckets serializing LDS atomics.
         load_elems: gl.constexpr = BLOCK_N // (64 * gl.num_warps())
         lane = gl.arange(0, BLOCK_N, layout=value_layout) // load_elems
         slots = slots * HIST_COPIES + lane % HIST_COPIES
@@ -1975,8 +1911,7 @@ def _emit_oneblock_ties_tile(
     PREFIX_SHIFT: gl.constexpr,
     IS_TAIL: gl.constexpr,
 ):
-    # Like _emit_oneblock_topk_tile, but every candidate sharing the
-    # threshold prefix goes to the LDS tie buffers for _resolve_oneblock_ties.
+    # _emit_oneblock_topk_tile, but threshold-prefix ties go to the LDS tie buffers.
     offsets, values, valid = _load_oneblock_tile(
         candidate_logits,
         tile_start,
@@ -2020,9 +1955,7 @@ def _resolve_oneblock_ties(
     out_stride: gl.constexpr,
     TIE_CAP: gl.constexpr,
 ):
-    # Rank each of the tie_count buffered candidates against the others (key
-    # order, then buffer order) and emit the `remaining` lowest-ranked ones
-    # after the count_greater definite winners.
+    # Rank ties by key, then buffer order; emit `remaining` of them after count_greater.
     gl.static_assert(TIE_CAP == 64, "the tie ranking layout covers 64 candidates")
     tie_layout: gl.constexpr = gl.BlockedLayout(
         [1, triton.cdiv(64, 4 * (gl.num_warps() // 4))],
@@ -2333,13 +2266,11 @@ def _dsa_oneblock_manual_radix_topk_kernel(
 
     row_offset = row * logits_stride
     if ALIGNED_ROWS:
-        # logits_stride stays unspecialized for prefill, so the 16-byte row
-        # alignment that lets the tiles load as dwordx4 is stated here.
+        # Unspecialized logits_stride hides the 16-byte alignment dwordx4 loads need.
         row_offset = gl.multiple_of(row_offset, 4)
     candidate_logits = logits + row_offset + candidate_start
     if ALIGNED_ROWS:
-        # Aligned decode rows hold whole pages, so the rounded-up vector stays
-        # inside the row; lanes past candidate_len fail `valid` downstream.
+        # Aligned rows hold whole pages, so rounding up to a 4-vector stays in the row.
         vector_end = gl.cdiv(candidate_len, 4) * 4
     else:
         vector_end = (candidate_len // 4) * 4
@@ -2359,8 +2290,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             radix_bits = RADIX2_BITS
             shift = 0
 
-        # Later passes count only the threshold bucket's spread-out digits, so
-        # only the first pass pays for the copies.
+        # Later passes see one bucket's spread-out digits; only pass one needs copies.
         pass_copies = HIST_COPIES if pass_index == 0 else 1
         if pass_index != 0:
             shared_histogram.slice(0, MAX_BUCKETS).store(histogram_zeros)
@@ -2561,8 +2491,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     gl.where(bucket_offsets == selected_bucket, counts, 0), axis=0
                 )
                 if tie_count <= TIE_CAP:
-                    # A few keys share the 24-bit threshold prefix: rank them
-                    # in LDS instead of streaming the row a third time.
+                    # Few ties: rank them in LDS instead of a third pass over the row.
                     count_greater = topk - remaining
                     emit_full_end = candidate_len & -BLOCK_N
                     for tile_start in range(0, emit_full_end, BLOCK_N):
@@ -2614,8 +2543,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                         out_stride,
                         TIE_CAP,
                     )
-                    # ``out`` was just written by other threads; the
-                    # compiler only orders shared-memory hazards.
+                    # Other threads wrote `out`; the compiler orders only LDS hazards.
                     gl.barrier()
                     logical_offsets = gl.load(
                         out + row * out_stride + output_offsets,
@@ -2894,8 +2822,7 @@ def _residency_safe_homogeneous_groups(
 
 
 def _whole_page_rows(logits: torch.Tensor, page_size: int) -> bool:
-    # Decode logits are [tokens, pages * page_size]; 16-byte aligned rows let
-    # the tiles load as dwordx4 up to the rounded-up row length.
+    # Aligned whole-page rows let tiles load dwordx4 up to the rounded-up row length.
     return (
         page_size % 4 == 0
         and logits.shape[1] % 4 == 0
@@ -2932,10 +2859,7 @@ def _dsa_topk_plan(
     if cols <= _ONEBLOCK_RADIX_MAX_COLS:
         return _oneblock_launch_plan(cols, is_decode=is_decode)
 
-    # Decode rows hold whole requests, so their one-block cost follows the
-    # context, not the max-model-len width; the persistent kernel's follows
-    # the width (MI350X, 1M columns, 128 rows at 64K/254K context: one-block
-    # 36/116 us, persistent 104/252 us).
+    # One-block decode cost follows context, the persistent kernel's the logits width.
     if (
         topk == _TUNED_PERSISTENT_TOPK
         and (is_decode or cols <= _TOPK2048_MIDRANGE_MAX_COLS)
@@ -3001,8 +2925,7 @@ def _allocate_persistent_topk_workspace(
 def _allocate_multi_cta_topk_workspace(
     row_bucket: int, device: torch.device
 ) -> tuple[torch.Tensor, ...]:
-    # Every row's first-level histogram and its 64 run sums, then its arrival
-    # counter and overflow cursor, each on its own cache line.
+    # Per row: histogram + run sums, then arrival and overflow counters on own lines.
     return (
         torch.zeros(
             (row_bucket, _MULTI_CTA_NUM_BUCKETS + 64), dtype=torch.int32, device=device
@@ -3035,8 +2958,7 @@ def _persistent_topk_workspace(
     if workspace is not None:
         return workspace
 
-    # Retaining a stream-local allocation keeps graph pointers alive and avoids
-    # cross-stream races. The kernel restores every touched word to zero.
+    # Per-stream caching keeps graph pointers alive; the kernel re-zeroes what it uses.
     workspace = allocate(row_bucket, device)
     with _persistent_topk_workspace_lock:
         existing = _persistent_topk_workspace_cache.get(key)
@@ -3213,8 +3135,7 @@ def _dsa_oneblock_topk_indices(
     if device_index is None:
         device_index = torch.cuda.current_device()
     waves_per_eu = 8 if logits.shape[0] > _device_compute_units(device_index) else 0
-    # Decode logits are [tokens, pages * page_size], so this is fixed per call
-    # site; prefill rows begin at runtime row_starts and are never aligned.
+    # Fixed per decode call site; prefill rows start at runtime row_starts, unaligned.
     aligned_rows = (
         is_decode
         and page_size % 4 == 0
@@ -4527,8 +4448,7 @@ def launch_gluon_dsa_decode_topk_bf16_gfx950(
     logits = torch.empty(
         (q.shape[0], max_candidates), dtype=torch.float32, device=q.device
     )
-    # One program per request covers its rows; bucket the row count so
-    # q_len_per_req stays a runtime argument.
+    # One program per request; bucket its rows so q_len_per_req stays runtime.
     rows = _next_power_of_two(q_len_per_req)
     warps_m = min(rows, _BF16_DECODE_NUM_WARPS)
     warps_n = _BF16_DECODE_NUM_WARPS // warps_m
@@ -4719,12 +4639,7 @@ def _fp8_rows_buffer_load(index_k_cache: torch.Tensor) -> bool:
 def _fp8_rows_decode_splits(
     requests: int, chunks: int, waves_per_eu: int, device: torch.device
 ) -> int:
-    # Programs per request. Up to _FP8_ROWS_DECODE_PROGRAMS_PER_CU programs a
-    # compute unit, one per chunk of the logits width (max-model-len): the
-    # ones past the context return at once. Wider grids spend more launching
-    # those than looping costs, so the requests share one residency wave, up
-    # to twice that once a program's share of the width passes 32 chunks,
-    # and each program scans an equal run of its request's real chunks.
+    # Programs per request: requests share one residency wave, two past 32 chunks each.
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()

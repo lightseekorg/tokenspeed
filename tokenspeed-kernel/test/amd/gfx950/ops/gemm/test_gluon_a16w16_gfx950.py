@@ -581,9 +581,7 @@ def test_qwen38_decode_gemm_matches_reference(shape: tuple[int, int, int]) -> No
         torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
 
 
-# Kimi K3.1 replicated indexer projections at ragged row counts: four
-# verify tokens per request at C1, C4 and C16, between bucket bounds
-# (wq_b's rows up to 16 take the GEMV).
+# K3.1 indexer verify row counts between buckets; wq_b up to 16 rows takes the GEMV.
 _K31_INDEXER_DECODE_CASES = [
     pytest.param((27, 4096, 1536), id="wq-b-32-row-tile"),
     pytest.param((61, 4096, 1536), id="wq-b-64-row-bucket"),

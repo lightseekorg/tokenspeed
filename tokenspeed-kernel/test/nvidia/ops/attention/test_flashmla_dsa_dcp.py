@@ -175,8 +175,7 @@ def test_flashmla_dsa_dcp_partials(phase, q_len, degree):
     assert torch.isneginf(graph_lse).all()
 
 
-# Kimi-K3.1 DCP geometry: 128-token ownership blocks over eight ranks, 96
-# gathered query heads, top-k 2048 and 8-row verify windows.
+# Kimi-K3.1 DCP geometry (96 gathered query heads); verify windows are 8 rows.
 K31_BLOCK = 128
 K31_DEGREE = 8
 K31_VIRTUAL_COUNT = 1 + 12 * K31_DEGREE
@@ -324,10 +323,7 @@ def test_dsa_dcp_compacted_partials_match_masked(
         masked_out, masked_lse = attend(
             caches[rank], torch.where(owned, local, -1), lengths
         )
-        # Compaction moves the online-softmax tile boundaries, so the BF16
-        # probabilities round differently and the error scales with V, not with
-        # the output (GB300: <=0.01% of elements, max 3.9e-3 abs). Use this
-        # file's kernel-vs-reference bound; a dropped slot is off by ~0.1-1.
+        # Moved softmax tiles round differently (max 3.9e-3); a dropped slot errs 0.1-1.
         torch.testing.assert_close(
             out.float(), masked_out.float(), atol=0.015, rtol=0.015
         )
@@ -634,8 +630,7 @@ def _padded_scores(rows, width):
 @requires_ragged_topk
 def test_dcp_ragged_select_gather(width, topk, ties, rows, monkeypatch):
     calls = _record_ragged_calls(monkeypatch)
-    # Long rows use cluster launches only up to 32 rows; 40 rows also cover
-    # the per-row kernel that serves wide verify batches.
+    # Long rows use cluster launches up to 32 rows; 40 rows reach the per-row kernel.
     pattern = [min(width, n) for n in (0, 1, topk - 1, topk, topk + 1, width)]
     lengths = [pattern[row % len(pattern)] for row in range(rows)]
     scores = _scores(len(lengths), width, ties=ties)
@@ -653,8 +648,7 @@ def test_dcp_ragged_select_gather(width, topk, ties, rows, monkeypatch):
 @pytest.mark.parametrize("rows", [6, 1024])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_dcp_length_aware_mask_leaves_tail_untouched(rows):
-    # Many rows shrink the grid below the row width, so each program strides
-    # over several blocks of its row.
+    # Many rows narrow the grid, so each program strides over several blocks of its row.
     width = 20000
     generator = torch.Generator(device="cuda").manual_seed(5)
     row_lengths = torch.randint(
@@ -678,9 +672,7 @@ def test_dcp_length_aware_mask_leaves_tail_untouched(rows):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_dcp_mask_and_gather_rows_past_int32_offsets(monkeypatch):
-    # Strides fit in int32, but the last row starts past 2**31 scores, as
-    # rows from 2048 on of a 1M-wide decode table do. Three narrow rows over
-    # an 8 GiB allocation reach that offset.
+    # Strides fit int32 but the last row starts past 2**31, as in a 1M-wide table.
     rows, width, topk = 3, 4096, 512
     stride = (1 << 30) + 256
     elements = (rows - 1) * stride + width
@@ -696,8 +688,7 @@ def test_dcp_mask_and_gather_rows_past_int32_offsets(monkeypatch):
         index_candidates.mask_index_scores(scores, *args, mask_tail=mask_tail)
         index_candidates.mask_index_scores(expected, *args, mask_tail=mask_tail)
         torch.testing.assert_close(scores, expected, atol=0, rtol=0, equal_nan=True)
-    # This layout falls back to torch.topk, whose gather also reads the last
-    # row past 2**31.
+    # This layout falls back to torch.topk, whose gather also reads past 2**31.
     monkeypatch.setattr(deep_gemm, "_dcp_deep_select", None)
     assert deep_gemm._dcp_ragged_rows(scores, topk) is None
     scores.copy_(raw)
@@ -948,8 +939,7 @@ def test_bounded_compact_matches_full_width_compact(cols):
             assert not overflow.any()
             torch.testing.assert_close(lengths, full[2].cpu(), rtol=0, atol=0)
 
-    # The longest row overflows a narrower output, and its stores stop at
-    # the output's end: a guard after the last row stays untouched.
+    # The longest row overflows a narrower output; stores must stop before the guard.
     columns = max(1, last - 1)
     rows = requests.numel()
     guard = 4096
@@ -1058,9 +1048,7 @@ def test_owned_width_candidates_match_full_width():
 
     heads, topk, cols = 32, 2048, 160
     generator = torch.Generator().manual_seed(53)
-    # Two requests' local tables: request 0 owns its first half and about a
-    # third of the rest (skewed), request 1 about a third; distinct local
-    # pages, foreign pages -1.
+    # Skewed ownership: request 0 owns its first half and more, request 1 about a third.
     owned = torch.rand((2, cols), generator=generator) < 0.35
     owned[0, : cols // 2] = True
     local = torch.randperm(2 * cols, generator=generator).reshape(2, cols) + 1
@@ -1111,8 +1099,7 @@ def test_owned_width_candidates_match_full_width():
     full = plan()
     assert full.overflow is None
     widest = int((full.pages > 0).sum(1).max())
-    # The runtime's width: the widest row, at least topk tokens, in groups of
-    # 16 pages.
+    # The runtime's width: widest row, at least topk tokens, rounded up to 16 pages.
     columns = -(-max(widest, topk // PAGE_SIZE) // 16) * 16
     assert widest <= columns < cols
     planned = plan(columns)
@@ -1129,8 +1116,7 @@ def test_owned_width_candidates_match_full_width():
             candidates(start, end, planned), candidates(start, end, full), topk
         )
 
-    # Too narrow a width: the long rows overflow, select only among their
-    # stored pages, and every row's count follows its stored tokens.
+    # Too narrow: long rows overflow and select only among the pages they stored.
     narrow = plan(16)
     assert narrow.overflow.any()
     logical, _ = candidates(0, rows, narrow)

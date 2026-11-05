@@ -114,8 +114,7 @@ def _select_through_threshold(
     TOPK_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # The lowest score of any exact top-k is the k-th largest, whichever tied
-    # candidates that top-k chose; everything above it is in every top-k.
+    # Any exact top-k has the k-th largest score as minimum and keeps all above it.
     row = tl.program_id(0).to(tl.int64)
     threshold = tl.full((), float("inf"), tl.float32)
     for start in range(0, TOPK, TOPK_BLOCK):
@@ -137,9 +136,7 @@ def _select_through_threshold(
             other=-float("inf"),
         )
         above += tl.sum((score > threshold).to(tl.int32))
-    # Keep every candidate above the threshold and the first tied ones in
-    # candidate order, writing them in candidate order: every rank merging
-    # the same records selects the same set in the same order.
+    # Keep scores above it plus the first ties, in candidate order, so all ranks agree.
     count = tl.full((), 0, tl.int32)
     tied = tl.full((), 0, tl.int32)
     for start in range(0, COLUMNS, BLOCK):

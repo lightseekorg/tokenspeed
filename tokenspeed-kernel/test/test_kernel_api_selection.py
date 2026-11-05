@@ -6378,8 +6378,7 @@ _CASES = [
             "cdna4",
             "attention",
             operation,
-            # FP8 queries take the multi-row scorers; BF16 queries the
-            # standard ones.
+            # FP8 queries take the multi-row scorers; BF16 queries the standard ones.
             f"gluon_{operation}_{'fp8_rows' if dtype == torch.float8_e4m3fn else 'standard'}"
             "_gfx950",
             lambda heads=heads, dtype=dtype, layout=layout, invoke=invoke: invoke(

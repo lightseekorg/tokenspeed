@@ -319,8 +319,7 @@ def _moe_shared_worker(rank: int, port: int) -> None:
                 actual = run(with_mix, True)
                 for got, want in zip(actual, expected, strict=True):
                     torch.testing.assert_close(got, want, atol=0, rtol=0)
-        # A tail that declines still orders the caller after the side reduction,
-        # and the ordinary reduction that follows sees the published rows.
+        # A declined tail still orders after the side reduce; the next reduce sees it.
         outputs = state.acquire_outputs(((rows, 3584), (rows, 7168)))
         record = k3_state.project_moe_shared(shared_input, down, outputs)
         outputs[0].copy_(routed_source)
@@ -437,8 +436,7 @@ def _deferred_gather_worker(rank: int, port: int) -> None:
         (packed, scales), weights, ids, shared = result
         return tuple(t.clone() for t in (packed, scales, weights, ids, shared))
 
-    # 8192 rows mix in the fused gather's kernel; 4096 rows with 8 blocks use
-    # the standalone mixer.
+    # 8192 rows mix in the fused gather; 4096 with 8 blocks use the standalone mixer.
     for rows, blocks in ((8192, 4), (8192, 8), (4096, 8), (4096, 3)):
         local = rows // 8
         gen.manual_seed(31 + rank + rows + blocks)

@@ -267,8 +267,7 @@ def _check_lamport_state(rank, device):
     state = _new_state(rank, device, 10 * 10752, torch.bfloat16)
     region = state.lamport.mailbox
     epochs = state.lamport.epochs
-    # The seven-row all-reduce window, wider than the decode MoE input
-    # gather's 64 rows of 1024 elements.
+    # Seven-row all-reduce window, wider than the MoE input gather's 64 rows of 1024.
     assert region.shape == (3, 8, 7 * 10752)
     assert epochs.shape == (147,)
     # Even rows from 8 take the two-shot through its own mailboxes.
@@ -359,8 +358,7 @@ def _check_lamport_state(rank, device):
                 output, torch.full_like(output, 36 * scale * index), atol=0, rtol=0
             )
 
-    # Attention partials share the MoE's mailboxes: one-shot below 8 rows,
-    # two-shot from 8, read from producer outputs and ordinary tensors alike.
+    # Attention partials share the MoE mailboxes, from producer or plain tensors.
     for rows, owned in (
         (8, True),
         (15, True),

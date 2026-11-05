@@ -210,8 +210,7 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
-    # A block draft whose queries attend causally within the block
-    # (block_draft_is_causal); otherwise every query sees the whole block.
+    # Causal within a block draft; otherwise every query sees the whole block.
     draft_block_causal: bool = False
     # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
     # of attention TP): one topology for target and continuation/MTP views;

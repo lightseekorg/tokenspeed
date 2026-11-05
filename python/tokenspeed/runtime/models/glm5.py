@@ -89,9 +89,7 @@ from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
-# Prefill chunks with fewer rows keep every rank selecting every row: there the
-# all-gather's fixed cost outweighs the saved scoring (TP8, 50K context, MI350X:
-# 320 rows 314 us whole vs 340 us split, 384 rows 387 vs 342).
+# Fewer rows: the all-gather costs more than split scoring saves (TP8 50K, MI350X).
 _PREFILL_TOPK_TP_SPLIT_MIN_ROWS = 384
 _PREFILL_TOPK_ROW_ALIGN = 16
 # Below this many rows every rank merges every KVP prefill row: the row-owner merge's two extra collectives cost more.
@@ -139,12 +137,9 @@ class GlmDsaIndexerOutput:
     query: torch.Tensor
     key: torch.Tensor
     weights: torch.Tensor
-    # When set, ``key`` is still pre-norm and the index-K write applies this
-    # LayerNorm (inside the scatter for a bf16 plane).
+    # When set, key is pre-norm and the index-K write applies this LayerNorm.
     key_norm: LayerNorm | None = None
-    # When set, ``query`` holds the query projection's input rows and this
-    # maps any of them to ``[rows, heads, head_dim]`` index queries, so ranks
-    # that split the prefill top-k project only their own rows.
+    # When set, query holds input rows and ranks project only their top-k share.
     query_proj: Callable[[torch.Tensor], torch.Tensor] | None = None
 
     def query_rows(self, start: int, end: int) -> torch.Tensor:
@@ -165,9 +160,7 @@ class GlmDsaPrefillTopK:
     row_starts: torch.Tensor | None = None
     row_ends: torch.Tensor | None = None
     candidate_lens_cpu: torch.Tensor | None = None
-    # Under a cache placement with owned-width index tiles: the forward's DCP
-    # index metadata (local table, row geometry, owned-width pages within the
-    # memory cap), so the next indexer layer of the same forward reuses it.
+    # DCP index metadata for owned-width tiles, reused by later indexer layers.
     dcp_index: DCPIndexMetadata | None = None
 
 
@@ -175,10 +168,7 @@ class GlmDsaPrefillTopK:
 class GlmDsaDecodeTopK:
     topk_indices: torch.Tensor
     topk_lens: torch.Tensor
-    # Under a cache placement: the forward's DCP index metadata, the decode
-    # metadata object it was built from, the query rows per request and
-    # whether it was built under CUDA-graph capture, so the next indexer
-    # layer of the same forward reuses it.
+    # DCP index metadata and its source, reused by the forward's later indexer layers.
     dcp_index: Any = None
     dcp_source: Any = None
     dcp_q_len: int = 0
@@ -548,9 +538,7 @@ class GlmDsaSparseAttentionMixin:
 
     @staticmethod
     def _check_decode_q_len_per_req(q_len_per_req: int) -> None:
-        # DSpark verifies seven draft tokens plus one bonus token. The indexer
-        # applies each row's causal bound. The kernel leaves handle these rows
-        # independently, as they do for shorter speculative chains.
+        # DSpark verifies 7 drafts plus a bonus; leaves handle each row's causal bound.
         if not 1 <= q_len_per_req <= 8:
             raise NotImplementedError(
                 "GLM DSA sparse decode supports 1-8 query tokens per request, "
@@ -950,9 +938,7 @@ class GlmDsaSparseAttentionMixin:
             or num_rows < _PREFILL_TOPK_TP_SPLIT_MIN_ROWS
         ):
             return select(slice(0, num_rows))
-        # Round each rank's slice to whole groups of 16 rows: the int32 row
-        # tensors then start 64-byte aligned on every rank, and Triton does not
-        # compile a second, unaligned specialization during serving.
+        # 16-row slices stay 64-byte aligned, so Triton never recompiles during serving.
         per_rank = -(-num_rows // (tp_size * _PREFILL_TOPK_ROW_ALIGN)) * (
             _PREFILL_TOPK_ROW_ALIGN
         )
@@ -992,8 +978,7 @@ class GlmDsaSparseAttentionMixin:
         # The int32 -> int16 cast keeps the low 16 bits, so -1 stays 0xFFFF.
         local = local.to(gather_dtype)
         if gather_dtype == torch.int16:
-            # NCCL has no int16; the gather only copies bytes, so ship the
-            # selection as bf16 bit patterns.
+            # NCCL has no int16; the gather copies bytes, so ship bf16 bit patterns.
             all_gather_single(
                 gathered.view(torch.bfloat16), local.view(torch.bfloat16), group
             )
@@ -1188,12 +1173,7 @@ class GlmDsaSparseAttentionMixin:
             raise ValueError("the DSA value projection gates decode rounds only")
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         num_attn_tokens = int(q_norm.shape[0])
-        # A padded prefill-graph replay hands this break the bucket's rows and
-        # pins ctx.input_num_tokens to the bucket. Narrow every token-shaped
-        # input to the live rows so write slots, top-k geometry, KVP
-        # collectives and the sparse cores see exactly the eager forward's
-        # rows; _land_in and the replay's tail scrub restore the bucket shape
-        # after the break.
+        # Narrow padded-replay inputs to live rows; _land_in restores the bucket shape.
         valid_rows = current_valid_rows()
         if valid_rows is not None and valid_rows < num_attn_tokens:
             if positions.dim() != 1:
@@ -1219,8 +1199,7 @@ class GlmDsaSparseAttentionMixin:
         # The round's KV write slots, by sub-mode: the extend span for the
         # prefill rows, the decode rows' verify window behind them. The
         # indexer's full-round index_k write consumes the concatenation
-        # (an eager break; under a padded replay the rows were narrowed
-        # above).
+        # (an eager break; under a padded replay the rows were narrowed above).
         backend = ctx.attn_backend
         # The forward's shared top-k: an indexer layer publishes, "shared"
         # layers (and the MTP head reusing the target's) consume.
@@ -1502,8 +1481,7 @@ class GlmMoeDsaAttention(GlmDsaSparseAttentionMixin, DeepseekV3AttentionMLA):
         )
         if q_lora_rank is None:
             raise ValueError("GLM DSA requires q_lora_rank.")
-        # Let process_weights choose DeepGEMM only after it has transformed
-        # FP8 block scales into the layout that kernel expects.
+        # process_weights picks DeepGEMM only after converting FP8 block scales for it.
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=1e-6)
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=1e-6)
         self.fused_qk_layernorm = FusedRMSNorm(
@@ -1514,9 +1492,7 @@ class GlmMoeDsaAttention(GlmDsaSparseAttentionMixin, DeepseekV3AttentionMLA):
         self.is_nextn = is_nextn
         # Every rank selects every prefill row (validated configuration).
         self.prefill_topk_tp_split = False
-        # NextN/MTP has its own indexer weights but may reuse the previous
-        # draft iteration's top-k. Shared target layers do not have usable
-        # indexer weights and must consume the context-carried top-k.
+        # NextN may reuse the prior draft's top-k; shared layers lack indexer weights.
         self.skip_indexer_topk = (
             True if is_nextn else _glm_dsa_skip_indexer_topk(config, layer_id)
         )
@@ -1563,11 +1539,7 @@ class GlmMoeDsaAttention(GlmDsaSparseAttentionMixin, DeepseekV3AttentionMLA):
             block_scale,
             torch.bfloat16,
         )
-        # The fused QKV-A weight may be zero-padded on its output dim to a
-        # multiple of 128 so the FP8 block-scale GEMM stays numerically valid
-        # (see GlmMoeDsaForCausalLM._pad_fused_qkv_a_proj_for_fp8_blockscale).
-        # Drop the padding columns before the split / comm. No-op when the
-        # projection output already matches the logical width.
+        # Drop the FP8 block-scale padding columns of the fused QKV-A output, if any.
         _qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
         if qkv.shape[-1] != _qkv_width:
             qkv = qkv[..., :_qkv_width]

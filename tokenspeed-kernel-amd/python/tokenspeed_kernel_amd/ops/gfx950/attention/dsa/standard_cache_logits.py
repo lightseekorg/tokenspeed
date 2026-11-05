@@ -1089,9 +1089,7 @@ def _load_query_group(
     NUM_WARPS: gl.constexpr,
     Q_FP8: gl.constexpr,
 ):
-    # MFMA row m = query row (m // 32) and head (head_offset + m % 32). An FP8
-    # query's positive per-head scale folds into its head weight:
-    # w * relu(s * x) = (w * s) * relu(x).
+    # Row m = query m // 32, head head_offset + m % 32; FP8 q scales (> 0) fold into w.
     layout_q: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],
         threads_per_warp=[64 // (HEAD_DIM // 16), HEAD_DIM // 16],
@@ -1154,8 +1152,7 @@ def _copy_key_tile(
     KEY_FP8: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
 ):
-    # Each lane copies 16 bytes of one key row: eight BF16 values, or sixteen
-    # FP8 values of an fp8_scaled page (keys first, then the page's scales).
+    # A lane copies 16 bytes of a key row; fp8_scaled pages put scales after the keys.
     vector: gl.constexpr = 16 if KEY_FP8 else 8
     blocked: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[vector, 1],
@@ -1166,8 +1163,7 @@ def _copy_key_tile(
     dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, blocked))[:, None]
     columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked))
     valid = (tile_start + columns < candidate_end)[None, :]
-    # Copies issued past the chunk are fully masked; keep their slot reads
-    # inside the slot buffer.
+    # Copies past the chunk are masked; clamp their slot reads into the slot buffer.
     slot_tile = gl.minimum(tile_id, CHUNK_N // BLOCK_N - 1)
     slots = slot_shared.gather(slot_tile * BLOCK_N + columns, axis=0)[None, :]
     if not USE_BUFFER_LOAD:
@@ -1203,9 +1199,7 @@ def _score_rows_key_tile(
     BLOCK_N: gl.constexpr,
     Q_FP8: gl.constexpr,
 ):
-    # Each query row owns one 32-row MFMA block, so every row's head sum runs
-    # in the same order as a one-row [32, BLOCK_N] tile: the scores are
-    # bitwise independent of ROWS and of the warp arrangement.
+    # A 32-row MFMA block per query row: scores bitwise independent of ROWS and warps.
     accumulator = gl.zeros([ROWS * 32, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
     if Q_FP8:
         head_scores = gl.amd.cdna4.mfma_scaled(
@@ -1262,11 +1256,7 @@ def _score_candidate_chunk(
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
 ):
-    # Scores candidates [candidate_start, candidate_end), at most one
-    # CHUNK_N chunk, for the rows of _multi_row_index_k_scores_body.
-    # The chunk's slots stay in LDS, so the per-tile slot reads never wait
-    # behind in-flight key copies (both would share the vector-memory
-    # counter).
+    # Slots stay in LDS so slot reads never queue behind key copies on the shared vmcnt.
     slot_positions = candidate_start + gl.arange(
         0, CHUNK_N, layout=gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     )
@@ -1293,8 +1283,7 @@ def _score_candidate_chunk(
         value=slot_values,
     )
     if KEY_FP8:
-        # The chunk's key scales sit in LDS beside its slots: a page's scales
-        # follow its PAGE_SIZE FP8 rows.
+        # A page's scales follow its PAGE_SIZE FP8 rows; the chunk's scales stay in LDS.
         scale_slots = slot_values
         if not USE_BUFFER_LOAD:
             scale_slots = scale_slots.to(gl.int64)
@@ -1318,8 +1307,7 @@ def _score_candidate_chunk(
             layout=gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0]),
             value=scale_values,
         )
-        # XOR-swizzling each key row's 16-byte chunks by the key index spreads
-        # the operand reads of 16 consecutive keys across all LDS banks.
+        # XOR-swizzled 16-byte chunks spread 16 consecutive keys over all LDS banks.
         key_layout: gl.constexpr = gl.SwizzledSharedLayout(
             vec=16, per_phase=1, max_phase=HEAD_DIM // 16, order=[0, 1]
         )
@@ -1355,8 +1343,7 @@ def _score_candidate_chunk(
     columns = gl.arange(0, BLOCK_N, layout=col_layout)
     for tile_id in tl.range(0, tile_count):
         tile_start = candidate_start + tile_id * BLOCK_N
-        # Every iteration issues one copy group (masked past the span), so
-        # NUM_STAGES - 2 younger groups may stay in flight.
+        # One copy group per iteration, masked or not, so NUM_STAGES - 2 stay in flight.
         gl.amd.cdna4.async_copy.wait_group(NUM_STAGES - 2)
         key = key_shared.index(tile_id % NUM_STAGES).load(layout=dot_b_layout)
         if KEY_FP8 and not Q_FP8:
@@ -1390,8 +1377,7 @@ def _score_candidate_chunk(
             key_scales = scale_shared.gather(tile_id * BLOCK_N + columns, axis=0)
             scores = scores * key_scales[None, :]
         positions = tile_start + columns
-        # A tile can run past the chunk; those columns belong to the next
-        # program.
+        # Columns past the chunk belong to the next program.
         valid = (
             (positions[None, :] >= starts[:, None])
             & (positions[None, :] < ends[:, None])
@@ -1454,15 +1440,7 @@ def _multi_row_index_k_scores_body(
     USE_BUFFER_STORE: gl.constexpr,
     CHUNK_LOOP: gl.constexpr,
 ):
-    # Program (i, j) scores up to ROWS query rows against candidates
-    # [j * CHUNK_N, (j + 1) * CHUNK_N): prefill row block i, or decode
-    # request i (its q_len_per_req rows). Every gathered key tile is shared
-    # by the program's rows; each row stores only its own span.
-    # With KEY_FP8 the keys come from fp8_scaled pages, and each key's
-    # positive scale multiplies its score after the head sum:
-    # relu(s * x) = s * relu(x). A BF16 query widens them to BF16 in registers
-    # (exact); an FP8 query (Q_FP8, fp8_scaled keys only) multiplies them as
-    # E4M3 on the FP8 MFMA.
+    # Program (i, j): rows i on chunk j; positive key scales apply after the head sum.
     NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
     row_block = gl.program_id(0)
     split = gl.program_id(1)
@@ -1524,9 +1502,7 @@ def _multi_row_index_k_scores_body(
     starts = gl.where(row_valid, starts, num_candidates)
     span_end = gl.max(ends, axis=0)
     if CHUNK_LOOP:
-        # Program j scans the j-th equal run of the chunks the rows' spans
-        # fill, so the grid follows the GPU rather than the logits width
-        # (max-model-len); each chunk is scored as its own program would.
+        # Program j scans chunk run j, so the grid tracks the GPU, not max-model-len.
         run = tl.cdiv(tl.cdiv(span_end, CHUNK_N), gl.num_programs(1)) * CHUNK_N
     else:
         run = CHUNK_N
@@ -1534,8 +1510,7 @@ def _multi_row_index_k_scores_body(
     candidate_start = gl.maximum(gl.min(starts, axis=0), split * run)
     candidate_end = gl.minimum(span_end, (split + 1) * run)
     candidate_start = gl.minimum(candidate_start, candidate_end)
-    # Chunks past every row's span (most of a decode grid as wide as
-    # max-model-len) store nothing, so they skip the query and slot loads.
+    # Chunks past every span store nothing; skip the query and slot loads.
     if candidate_start == candidate_end:
         return
 

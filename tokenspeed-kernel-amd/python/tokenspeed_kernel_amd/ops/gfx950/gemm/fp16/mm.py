@@ -1712,8 +1712,7 @@ _DECODE_CONFIGS: dict[
         32: (32, 16, 512, 4, 1, 2, 1, 8),
         64: (32, 32, 256, 2, 2, 3, 1, 8),
     },
-    # K3.1 indexer [wk; weights_proj] (replicated): ten 16-column tiles, so
-    # only split-K fills the CUs.
+    # K3.1 indexer [wk; weights_proj]: ten 16-column tiles, so only split-K fills CUs.
     (160, 7168): {
         4: (16, 16, 256, 2, 2, 4, 7, 8),
         8: (16, 16, 256, 2, 2, 4, 7, 8),
@@ -1916,8 +1915,7 @@ _GROUPED_DECODE_CONFIGS: dict[
         64: (32, 32, 512, 2, 2, 2, 2, 8),
         128: (32, 32, 64, 2, 2, 3, 4, 8),
     },
-    # Absorbed MLA query with 12 local heads: q_nope [M, 12, 128] against a
-    # K-major w_kc, one 512-wide latent per head.
+    # Absorbed MLA q_nope [M, 12, 128] against K-major w_kc: a 512-wide latent per head.
     (12, 512, 128): {
         4: (16, 32, 64, 2, 2, 2, 1, 8),
         8: (16, 32, 64, 2, 2, 2, 1, 8),
@@ -1925,8 +1923,7 @@ _GROUPED_DECODE_CONFIGS: dict[
         32: (32, 32, 64, 2, 2, 2, 1, 8),
         64: (32, 32, 64, 2, 2, 2, 1, 8),
     },
-    # Its value projection: the attended latent [M, 12, 512] against a K-major
-    # w_vc, 128 values per head.
+    # Its value projection: latent [M, 12, 512] by K-major w_vc, 128 values per head.
     (12, 128, 512): {
         4: (16, 16, 256, 2, 2, 2, 1, 8),
         8: (16, 16, 256, 2, 2, 2, 1, 8),

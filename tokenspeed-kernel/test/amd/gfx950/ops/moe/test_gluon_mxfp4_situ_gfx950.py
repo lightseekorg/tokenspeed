@@ -2872,8 +2872,7 @@ def test_dedup_stage1_matches_route_direct_gfx950(monkeypatch, tokens, expert_st
     x = 0.1 * torch.randn(
         tokens, 512, device="cuda", dtype=torch.bfloat16, generator=generator
     )
-    # Row t routes to window [2t, 2t + 4) of a random expert order, so each row
-    # repeats half of the previous row's experts, as verify tokens do.
+    # Each row reuses half the previous row's experts, as consecutive verify tokens do.
     order = torch.randperm(global_num_experts, device="cuda", generator=generator)
     window = 2 * torch.arange(tokens, device="cuda")[:, None] + torch.arange(
         top_k, device="cuda"

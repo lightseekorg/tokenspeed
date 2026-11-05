@@ -94,8 +94,7 @@ def host_cache(request, io_backend):
             self.src_pages = [[src] * len(groups)]
             self.dst_pages = [[dst] * len(groups)]
 
-    # The model-wide settings and scheduler limits of the families built
-    # here from an attention config.
+    # Model-wide settings and scheduler limits shared by the families built here.
     model_wide = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -225,10 +224,7 @@ def host_cache(request, io_backend):
             patch.object(ts.Cache, "WriteBackOp", WriteBackOp),
             patch.object(ts.Cache, "LoadBackOp", LoadBackOp),
         ):
-            # A first load and a layerwise wait for every layer of each view,
-            # so a held-back load below sets up no transfer tables and compiles
-            # no wait kernel: either would wait for the device, the held-back
-            # copy included.
+            # Warm-up: table setup or a wait-kernel compile below would sync the device.
             handle.execute(
                 ts.ExecutionPlan(),
                 None,
@@ -240,8 +236,7 @@ def host_cache(request, io_backend):
                         view.layerwise_load_tracker.wait_for_layer(layer_id)
             torch.manual_seed(37)
             arena.buffer.random_(0, 256)
-            # The store below copies behind the execution stream, not behind
-            # the default stream that filled the arena.
+            # The store follows the execution stream, not the arena-filling stream.
             torch.cuda.synchronize()
             # Its plan also points the layerwise waits at no load again.
             handle.execute(

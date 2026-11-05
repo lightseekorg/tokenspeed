@@ -365,8 +365,7 @@ def test_swiglu_quantize_layout_specialization_is_bit_exact_gfx950(
     # HSA_STATUS_ERROR_OUT_OF_RESOURCES, because the scale was reduced by a
     # single workgroup materialising next_power_of_2(numel) elements; 32 and 48
     # survived only by spilling, at up to 50x the cost of the small widths.
-    # 4 and 5 straddle the single-pass bound at hidden 3584 (padded 16,384
-    # against 32,768), so both quantizer strategies are covered.
+    # 4 and 5 straddle the single-pass bound at hidden 3584 (16,384 vs 32,768 padded).
     [1, 4, 5, 8, 16, 18, 19, 32, 48, 49, 64, 128, 1024],
 )
 def test_dynamic_fp8_quantize_scales_past_one_workgroup_gfx950(
@@ -427,8 +426,7 @@ def test_dynamic_fp8_quantize_single_pass_bound_matches_spill_cliff() -> None:
 
     # One request's EAGLE3 verify window keeps the one-launch form.
     assert _dynamic_fp8_use_single_pass(4 * routed_hidden)
-    # Two to four requests (M=8-16) pad to 32,768-65,536, where one workgroup
-    # streaming the tensor costs more than the two graph-replayed launches.
+    # 2-4 requests pad to 32,768-65,536, where one workgroup loses to two launches.
     assert not _dynamic_fp8_use_single_pass(5 * routed_hidden)
     assert not _dynamic_fp8_use_single_pass(16 * routed_hidden)
     assert not _dynamic_fp8_use_single_pass(32 * routed_hidden)

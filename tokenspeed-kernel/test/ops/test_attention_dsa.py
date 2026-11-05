@@ -1069,8 +1069,7 @@ def test_deep_gemm_index_candidates_empty_shard_large_batch(device, tokens):
 def _by_offset(
     candidates: tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Local selection leaves the candidate order unspecified; offsets are
-    # distinct apart from -1 padding, whose scores are all -inf.
+    # Candidate order is unspecified; offsets are unique but -1 padding, scored -inf.
     offsets, scores = candidates
     order = offsets.argsort(dim=1, stable=True)
     return offsets.gather(1, order), scores.gather(1, order)
@@ -1088,8 +1087,7 @@ def test_deep_gemm_index_candidates_precomputed_pages(device):
         pytest.skip("DeepGEMM requires Hopper or newer")
     torch.manual_seed(829)
     heads, page_size = 32, 64
-    # Global page order unrelated to the physical order, absent pages, partial
-    # tails, an unknown request and an empty row.
+    # Scrambled page order, absent pages, partial tails, unknown request, empty row.
     table = torch.tensor(
         [[5, -1, 8, 1, 6, 3, 4, -1, 9, 2], [7, 10, -1, -1, -1, -1, -1, -1, -1, -1]],
         dtype=torch.int32,
@@ -1183,8 +1181,7 @@ def test_deep_gemm_index_candidates_precomputed_pages(device):
             **kwargs,
         )
 
-    # One plan read by two candidate calls, as the indexer layers of a decode
-    # graph read the first layer's plan; replay refreshes it in place.
+    # Two calls read one captured plan, like decode indexer layers; replay refreshes it.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = plan()
@@ -1420,8 +1417,7 @@ def test_dsa_strided_pages_are_read_in_place(dtype, channel_stride, monkeypatch)
     torch.testing.assert_close(lse, lse2)
 
 
-# K3.1 under KVP: 576-wide FP8 latent rows on 64-token pages, a 2048-slot
-# selection of which a rank owns about 256 live entries per row.
+# K3.1 under KVP: FP8 576-wide rows on 64-token pages; a rank owns ~256 of 2048 slots.
 _RECORDS_PAGES = 64
 _RECORDS_TOPK = 2048
 _RECORDS_SCALE = 192**-0.5
@@ -1515,8 +1511,7 @@ def test_dsa_prefill_dcp_records_match_dispatch(tokens, degree, local_heads):
         tokens=tokens, heads=heads, topk=_RECORDS_TOPK
     )
     kwargs = _records_kwargs(cache, slots, lengths)
-    # Today's head-sharded arm: the token-major gather, the Triton core with
-    # its LSE, then the repack into the records the all-to-all sends.
+    # Reference: head-sharded prefill with LSE, repacked into the all-to-all records.
     out, lse = dsa_prefill(
         q=_token_major(q),
         sparse_kv_cache=None,
@@ -1529,8 +1524,7 @@ def test_dsa_prefill_dcp_records_match_dispatch(tokens, degree, local_heads):
     assert records.dtype == torch.int32 and records.is_contiguous()
     assert records.shape == (degree, tokens, local_heads, 257)
     assert torch.equal(records, expected)
-    # The empty and all-invalid rows are zero output with a -inf LSE, as the
-    # combine expects of an empty partial.
+    # Empty and all-invalid rows give zero output and -inf LSE, as the combine expects.
     empty = records[:, :2]
     assert not empty[..., :256].any()
     neg_inf_bits = torch.tensor(-torch.inf).view(torch.int32).item()
@@ -1540,8 +1534,7 @@ def test_dsa_prefill_dcp_records_match_dispatch(tokens, degree, local_heads):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_dsa_prefill_dcp_records_refuse_split_launches():
-    # dsa_prefill splits the keys of a grid below about one program per SM
-    # (_num_kv_splits); the single-split records would differ there.
+    # Under one program per SM, dsa_prefill splits keys and the records would differ.
     sm_count = current_platform().sm_count
     assert not dsa_prefill_dcp_records_supported(tokens=0, heads=16, topk=2048)
     assert not dsa_prefill_dcp_records_supported(tokens=1, heads=16, topk=2048)
@@ -1570,8 +1563,7 @@ def test_dsa_prefill_dcp_records_compile_once_across_tokens():
             q=rows, **_records_kwargs(cache, slots[:tokens], lengths[:tokens])
         )
 
-    # The token count is a runtime argument outside Triton's integer
-    # specialization: one binary serves every prefill size.
+    # Token count is not integer-specialized: one binary serves every prefill size.
     run(1024)
     with assert_no_triton_compile(dsa_triton._dsa_dense_kv_dcp_records_kernel):
         for tokens in (1025, 1040, 1999, 2048, most):

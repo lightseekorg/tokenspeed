@@ -203,8 +203,7 @@ def test_other_forward_inputs_rebuild(recorded, change):
     record = _decode_layer(_layer(), ctx, page_table, seq_lens, q_len)
     share = ctx.attn_backend.sparse_topk
     if change == "draft":
-        # A drafter carries the share across steps that advance the lengths
-        # in place; nothing ties its record to the live lengths.
+        # A drafter's lengths advance in place, so its record cannot be tied to them.
         ctx.attn_backend.is_draft = True
     elif change == "table_values":
         page_table = page_table.clone()
@@ -231,8 +230,7 @@ def test_other_forward_inputs_rebuild(recorded, change):
     elif change == "no_placement_record":
         share.decode = replace(record, dcp_index=None, dcp_source=None)
     elif change == "capture_state":
-        # A record from the other capture state (an eager warm-up step before
-        # a capture on the same metadata) is not baked into this build.
+        # A record from the other capture state (eager warm-up) is not reused.
         share.decode = replace(record, dcp_capturing=True)
     second = _decode_layer(_layer(), ctx, page_table, seq_lens, q_len)
 
@@ -387,8 +385,7 @@ def test_prefill_owned_width_pages_built_once_per_forward(owned_prefill):
     )
     assert metadata.page_table is page_table
 
-    # A wider bound than the table is the table's width; another forward's
-    # table plans again.
+    # A bound wider than the table clamps to its width; another forward's table replans.
     ctx = _prefill_ctx(96)
     _, _, record = _first_prefill_layer(ctx, _prefill_table(64), rows)
     assert record.dcp_index.columns == 64
@@ -399,15 +396,13 @@ def test_prefill_owned_width_pages_built_once_per_forward(owned_prefill):
 def test_prefill_owned_width_cache_respects_memory_cap(owned_prefill, columns, planned):
     plans, selects = owned_prefill
     rows = 16384
-    # Pages and positions take 8 bytes per row and column: 16384 rows at
-    # 2048 columns are the 256 MiB cap.
+    # Pages and positions take 8 bytes per row and column, so this is the 256 MiB cap.
     assert rows * 2048 * 8 == 256 << 20
     ctx = _prefill_ctx(columns)
     _, _, record = _first_prefill_layer(ctx, _prefill_table(4096), rows)
 
     metadata = record.dcp_index
-    # Past the cap the forward still shares the local table and the row
-    # geometry, and every tile plans its own pages at the owned width.
+    # Past the cap the table and row geometry stay shared; each tile plans its pages.
     assert metadata.columns == columns
     assert (metadata.pages is not None) == planned
     assert plans == ([(rows, columns)] if planned else [])

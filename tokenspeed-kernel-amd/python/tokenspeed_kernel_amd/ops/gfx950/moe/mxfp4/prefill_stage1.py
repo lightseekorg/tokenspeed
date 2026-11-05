@@ -963,9 +963,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     # physical BLOCK_N tile for each OUTPUT_BLOCK_N result tile; separate
     # layouts issue gate and up MFMAs for the same output tile.
     num_pid_n = gl.cdiv(I_r, OUTPUT_BLOCK_N)
-    # Keep each expert's M tiles and the N tiles of each M tile on one XCD so
-    # they share its L2. The grid covers the padded route capacity, so only
-    # tiles holding routes are spread over the XCDs.
+    # Keep an expert's tiles on one XCD for L2 reuse; only tiles with routes are spread.
     if NUM_XCDS != 1:
         valid_pid_m = gl.cdiv(gl.load(num_tokens_post_padded_ptr), BLOCK_M)
         grid_mn = gl.minimum(valid_pid_m, num_pid_m) * num_pid_n

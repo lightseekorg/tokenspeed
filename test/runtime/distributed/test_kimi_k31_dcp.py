@@ -231,8 +231,7 @@ def _worker(rank: int, rendezvous: str, case, kv_cache_dtype, spec_width, fracti
     global_server_args_dict.update(mapping=mapping, chunked_prefill_size=8192)
     initialize_comm_backend(use_pynccl=False)
     case(rank, kv_cache_dtype, spec_width, fraction)
-    # Shut NCCL down after a clean run only: a failure may leave a collective
-    # or capture pending, and exiting reports the error instead of waiting.
+    # Clean runs only: after a failure a pending collective would make teardown wait.
     dist.destroy_process_group()
 
 
@@ -253,8 +252,7 @@ def _spawn(tmp_path, case, kv_cache_dtype, spec_width, fraction):
     )
 
 
-# Tolerances as in the one-GPU test: BF16 activations and probability tiles;
-# FP8 rows and the FP8 query of the FP8 sparse cores.
+# One-GPU test tolerances: BF16 activations and probabilities; FP8 rows and queries.
 _DTYPES = [
     (torch.bfloat16, 1, 1e-2),
     (torch.bfloat16, 4, 1e-2),

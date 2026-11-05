@@ -86,9 +86,7 @@ def _selected_scores(records: torch.Tensor, positions, counts, row: int) -> list
 @pytest.mark.parametrize("degree", [2, 8])
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_cuda_merge_selects_the_same_tied_candidates_every_time(degree, topk):
-    # Eight distinct scores: the top-k cutoff always falls inside a tied group,
-    # where the radix kernel picks by atomic arrival order. Every KVP rank
-    # merges the same records and must keep the same candidates.
+    # Ties at the cutoff resolve by atomic order; every KVP rank must keep the same set.
     records = _records(degree, 16, topk, seed=degree + topk)
     generator = torch.Generator(device="cuda").manual_seed(topk)
     tied = torch.randint(

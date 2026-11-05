@@ -1308,8 +1308,7 @@ def _assert_layer_norm_rows(actual, keys, weight, bias, eps):
     expected = torch.nn.functional.layer_norm(
         keys.float(), (keys.shape[-1],), weight, bias, eps
     )
-    # Within one bf16 rounding of the FP32 reference: the FP32 reduction order
-    # differs from torch's, so a value on a rounding boundary can round either way.
+    # Within one bf16 rounding: FP32 sum order differs, so boundary values may flip.
     torch.testing.assert_close(actual.float(), expected, rtol=2**-7, atol=1e-5)
 
 
@@ -1450,8 +1449,7 @@ def test_index_k_layernorm_fp8_scatter_quantizes_layer_norm_rows(
         write_mask=None,
     )
 
-    # Reference: the bf16 LayerNorm rows, quantized per group by quantize_fp8's
-    # token_group arithmetic (max(amax, 1e-10) / 448, clamped quotient).
+    # Reference: quantize_fp8's token_group arithmetic on the bf16 LayerNorm rows.
     normed = torch.nn.functional.layer_norm(
         keys.float(), (head_dim,), weight, bias, eps
     ).to(torch.bfloat16)
@@ -1465,8 +1463,7 @@ def test_index_k_layernorm_fp8_scatter_quantizes_layer_norm_rows(
         .view(tokens, head_dim)
     )
     codes, scales, values = _read_fp8_rows(buf, loc, page_size, head_dim, ng)
-    # A LayerNorm output on a bf16 rounding boundary may round the other way
-    # (FP32 reduction order), moving its group's scale by one bf16 step.
+    # A boundary LayerNorm value may round either way, moving its scale one bf16 step.
     torch.testing.assert_close(scales, ref_scales, rtol=2**-7, atol=0)
     assert (codes == ref_codes).float().mean() > 0.99
     # E4M3 keeps 3 mantissa bits: at most half of 32/448 of the amax off.

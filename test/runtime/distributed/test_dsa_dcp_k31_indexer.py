@@ -81,20 +81,17 @@ register_cuda_ci(
 )
 
 _HEADS, _DIM, _TOPK, _PAGE, _BLOCK, _Q_LEN = 32, 128, 2048, 64, 128, 8
-# calc_padded_blocks(1048576 + 3 * 8, 64): the decode table of a 1M
-# max_model_len with the DSpark verify padding.
+# calc_padded_blocks(1048576 + 3 * 8, 64): the 1M decode table with verify padding.
 _WIDE_COLUMNS = 16386
 _SHORT_COLUMNS = 512
-# Spare tokens past each request's length, so in-place length edits stay
-# inside the request's allocated blocks.
+# Spare tokens past each length, so in-place length edits stay inside allocated blocks.
 _GROWTH = _BLOCK
 
 
 def _requests(columns: int, bs: int, generator: torch.Generator) -> list[int]:
     capacity = columns * _PAGE - 2 * _BLOCK
     longest = min(capacity, 131072 + 5)
-    # The longest request first (skewed ownership), then requests shorter than
-    # the verify window, a window ending on a page edge, and one past topk.
+    # Longest first (skews ownership), then sub-window, page-edge and past-topk lengths.
     special = [longest, 3, 7, 8, _PAGE + _Q_LEN, _TOPK + 3, 5 * _BLOCK]
     rest = torch.randint(
         _Q_LEN, min(capacity, 20000), (max(0, bs - len(special)),), generator=generator
@@ -296,8 +293,7 @@ def _assert_same_sets(actual, expected, causal, scorer=None):
 def _assert_matches_native(selected, lens, q, weights, plane, table, seq_lens):
     from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_plan
 
-    # The native top-k bounds rows by seq_len - 7 + j; it serves requests
-    # that hold their whole verify window.
+    # Native top-k bounds rows by seq_len - 7 + j: only requests holding a full window.
     keep = (seq_lens >= _Q_LEN).nonzero().flatten()
     if not keep.numel():
         return
@@ -382,9 +378,7 @@ def _worker(rank, degree, columns, rendezvous):
             initial_tokens=0,
             local_tokens=0,
         )
-        # 15 rows per tile on the 1M-wide table, as the old fixed budget gave,
-        # and 8 on the short one. At bs 64 the budget also bounds the
-        # exchanges: one per tile, or several tiles joined, by degree.
+        # 15 rows/tile at 1M width, 8 at 512; at bs 64 the budget bounds exchanges too.
         budget = (64 << 20) if columns == _WIDE_COLUMNS else (1 << 20)
         for bs in (1, 7, 64):
             # Every rank derives the same batch from the seed.
@@ -469,9 +463,7 @@ def _worker(rank, degree, columns, rendezvous):
                 max_logits_bytes=None,
                 **kwargs,
             )
-            # About 5% of bs-64 draws hold a row whose k-th score two tokens
-            # share bit for bit; the sharded merge and the unsharded
-            # selection may then keep different ones of them.
+            # ~5% of bs-64 draws tie at the k-th score; the kept tokens may differ.
             scorer = _index_scorer(q, weights, full, table, requests, causal, unsharded)
             _assert_same_sets(single, reference, causal, scorer)
             _assert_same_sets(planned_tiled, reference, causal, scorer)
@@ -484,8 +476,7 @@ def _worker(rank, degree, columns, rendezvous):
             )
         del full, scorer
 
-        # Capture the first indexer layer's build at bs 64 and two layers
-        # reading it: one tile, then the budget's tiles and exchanges.
+        # Capture one build at bs 64 read by two layers: one tile, then budgeted tiles.
         def step():
             requests, causal = _verify_rows(seq_lens)
             metadata = build_dcp_index_metadata(
@@ -592,8 +583,7 @@ def _owned_width_worker(rank, degree, rendezvous):
             initial_tokens=0,
             local_tokens=0,
         )
-        # A long cached prefix with a chunk, and a cold chunk; a small budget
-        # so both widths take several tiles and exchanges.
+        # Prefixed and cold chunks; a small budget forces several tiles and exchanges.
         prefix_lens, extend_lens = [20000, 0], [1500, 700]
         seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
         budget = 64 << 20
@@ -604,9 +594,7 @@ def _owned_width_worker(rank, degree, rendezvous):
             generator = torch.Generator().manual_seed(5200 + degree)
             placed, virtual_blocks = _place_blocks(seq_lens, degree, generator)
             if ownership == "one_owner":
-                # Every page on rank 0, as a prefill-graph capture's dummy
-                # places them: owned counts [B, 0, ...], the table's width.
-                # Distinct blocks keep the scores free of ties.
+                # Rank 0 owns all pages, as at capture; distinct blocks avoid ties.
                 first = 0
                 for request, blocks in enumerate(placed):
                     placed[request] = [
@@ -696,8 +684,7 @@ def _owned_width_worker(rank, degree, rendezvous):
             )
             _assert_same_sets(planned, full, causal)
             _assert_same_sets(per_tile, full, causal)
-            # "owned" with "merge": the owned-width tiles join row-owner
-            # exchanges, whose budget sizes the tiles too.
+            # Owned-width tiles join row-owner exchanges, whose budget sizes them too.
             for owned in (dict(metadata=metadata), dict(columns=columns)):
                 owner = select_dsa_topk(
                     q,
@@ -775,16 +762,11 @@ def test_k31_dcp_decode_topk_matches_unsharded(tmp_path, degree, columns):
     )
 
 
-# KVP prefill requests as (prefix, new rows): a long prefix whose blocks are
-# skewed onto rank 0, a cold request whose rows see fewer than topk tokens,
-# and a short one. The 1153 rows cross the row-owner merge's 1024-row gate.
+# Skewed long prefix, cold sub-topk request, short one; 1153 rows top the 1024 gate.
 _PREFILL = ((6000, 800), (0, 300), (2500, 53))
-# On the 512-column table this scores 128 rows per tile, and a row-owner
-# exchange (topk * 24 bytes per row) joins two tiles: five exchanges, the
-# last of 129 rows, two tiles padded to whole rows per rank.
+# 128 rows a tile on 512 columns, two tiles an exchange: five, the last of 129 rows.
 _PREFILL_BUDGET = 16 << 20
-# The prefill graph's capture batch: one request of a bucket's rows
-# without a prefix, every page column on one block.
+# Prefill capture batch: one prefix-free request, every page column on one block.
 _CAPTURE_ROWS = 2048
 
 
@@ -830,8 +812,7 @@ def _row_owner_worker(rank, degree, rendezvous):
         process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
         process_group_manager.register_process_group("gloo", group, coordination)
         backend = AutoBackend()
-        # PyNccl has no all-to-all: the row-owner exchange goes through
-        # torch.distributed.
+        # PyNccl has no all-to-all, so the row-owner exchange uses torch.distributed.
         backend.configure(use_pynccl=False)
         set_global_backend(backend)
 
@@ -875,10 +856,7 @@ def _row_owner_worker(rank, degree, rendezvous):
             results = [reference]
             for budget in (_PREFILL_BUDGET, None):
                 owner = select(sharded, local, budget, True)
-                # Selections may break FP8 score ties differently, so the
-                # paths compare as sets. Both merges read the same rank-major
-                # candidates; the unsharded selection may keep other tokens
-                # of a tie at the k-th score.
+                # Paths may break FP8 score ties differently, so they compare as sets.
                 _assert_same_sets(owner, select(sharded, local, budget, False), causal)
                 _assert_same_sets(owner, reference, causal, scorer)
                 results.append(owner)
@@ -895,8 +873,7 @@ def _row_owner_worker(rank, degree, rendezvous):
         exchange_rows = indexer._exchange_rows(
             rows, tile_rows, degree, _TOPK, _PREFILL_BUDGET, row_owner=True
         )
-        # At least three exchanges, the last of several tiles and not split
-        # evenly over the ranks.
+        # At least three exchanges; the last spans tiles and splits unevenly over ranks.
         assert rows > 2 * exchange_rows and rows % exchange_rows > tile_rows
         assert rows % exchange_rows % degree
         selections(table, virtual_blocks, requests, causal, 4300 + degree)
@@ -905,9 +882,7 @@ def _row_owner_worker(rank, degree, rendezvous):
             flush=True,
         )
 
-        # The capture batch: block 1, rank 0's, holds every page, so the other
-        # ranks have no candidates. Every row sees at most topk tokens and
-        # selects all of them.
+        # Capture batch: rank 0 holds every page, so each row selects all its tokens.
         capture_table = _page_table([[1] * (_SHORT_COLUMNS // 2)], _SHORT_COLUMNS)
         requests = torch.zeros(_CAPTURE_ROWS, dtype=torch.int32, device=device)
         causal = torch.arange(1, _CAPTURE_ROWS + 1, dtype=torch.int32, device=device)
@@ -1175,12 +1150,10 @@ def _padded_replay_worker(rank, degree, rendezvous):
         process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
         process_group_manager.register_process_group("gloo", group, coordination)
         comm_backend = AutoBackend()
-        # PyNccl has no all-to-all: the row-owner exchange goes through
-        # torch.distributed.
+        # PyNccl has no all-to-all, so the row-owner exchange uses torch.distributed.
         comm_backend.configure(use_pynccl=False)
         set_global_backend(comm_backend)
-        # The live prefills score several tiles and exchanges, the capture
-        # batch one.
+        # The live prefills take several tiles and exchanges, the capture batch one.
         budget_mb = _PREFILL_BUDGET >> 20
         global_server_args_dict[glm5._INDEXER_PREFILL_MAX_LOGITS_MB_ARG] = budget_mb
 
@@ -1199,9 +1172,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
         weights = torch.randn(rows, _HEADS, device=device, dtype=torch.bfloat16)
         for tensor in (keys, q, weights):
             dist.broadcast(tensor, 0)
-        # The capture batch (PrefillGraph.make_dummy_batch): one request of
-        # the bucket's rows without a prefix, every page column on block 1,
-        # rank 0's: owned pages [bucket pages, 0, ...], the table's width.
+        # PrefillGraph.make_dummy_batch's batch: every page on block 1, owned by rank 0.
         capture_prefill = ((0, _CAPTURE_ROWS),)
         capture_table = _page_table(
             [[1] * (_CAPTURE_ROWS // _BLOCK)], _CAPTURE_ROWS // _PAGE
@@ -1209,8 +1180,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
         capture_causal = _prefill_rows(capture_prefill, device)[1]
         visible = torch.arange(_TOPK, dtype=torch.int32, device=device)
         every_token = torch.where(visible < capture_causal.unsqueeze(1), visible, -1)
-        # Live prefills (prefill, host table, first row of q): above the
-        # row-owner merge's row gate, then below it (merged on every rank).
+        # Live prefills above the row-owner gate, then below it (merged on every rank).
         batches = (
             (_PREFILL, table, 0),
             (_PREFILL[1:], table[1:], _PREFILL[0][1]),
@@ -1229,8 +1199,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
             )
 
         def forward(positions, hidden_states, q_norm, latent_cache, ctx):
-            # Two DSA layers between captured token-shaped ops; the first
-            # break's handoff is consumed before the second break reuses it.
+            # The first break's handoff is consumed before the second break reuses it.
             hidden_states = hidden_states * 1
             q_norm = q_norm * 1
             first = sparse_attention(
@@ -1273,9 +1242,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
             for tensor in (static_hidden, static_q_norm):
                 dist.broadcast(tensor, 0)
 
-            # Capture as PrefillGraph._capture_bucket does: warm up on the
-            # capture stream, capture with the capture batch ambient, then
-            # replay it once unpadded.
+            # Capture as PrefillGraph._capture_bucket does, then replay once unpadded.
             backend.begin(capture_table, capture_prefill, device)
             dummy = extend_ctx(backend, pool, capture_prefill)
             capture = BreakableCapture()
@@ -1304,9 +1271,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
                     capture.replay()
             torch.cuda.synchronize()
             assert capture.num_segments == 5
-            # Both layers, at capture and at the unpadded replay: every row
-            # sees at most topk tokens and selects all of them, rank 0
-            # owning every page and the other ranks none.
+            # Both layers, both passes: every row selects all its tokens, on rank 0.
             assert len(records) == 4
             for record in records:
                 torch.testing.assert_close(
@@ -1341,9 +1306,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
                 latent = torch.zeros_like(static_latent[:live_rows])
                 causal = _prefill_rows(prefill, device)[1]
 
-                # The padded replay (PrefillGraph.replay): the live rows in
-                # the static buffers, filler after them, the live context
-                # ambient with its token count pinned to the bucket.
+                # Pad as PrefillGraph.replay: filler past live rows, bucket token count.
                 backend.begin(batch_table, prefill, device)
                 live = extend_ctx(backend, pool, prefill)
                 static_positions[:live_rows].copy_(positions)
@@ -1385,9 +1348,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
                 )
                 assert not bool(replayed_output[live_rows:].any())
                 if owned_width:
-                    # Planned once per forward, at the leaf's owned width
-                    # within the forward's table, and reused by the next
-                    # layer; no row's owned pages overflow it.
+                    # Planned once at the owned width; the next layer reuses it.
                     index = replayed[0].dcp_index
                     width = -(-max(p + n for p, n in prefill) // _PAGE)
                     assert replayed[1].dcp_index is index

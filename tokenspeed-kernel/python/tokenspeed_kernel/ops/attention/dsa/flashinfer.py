@@ -99,13 +99,7 @@ _dsa_sparse_workspace_buffers: dict[tuple[torch.device, bool], torch.Tensor] = {
 _dsa_sparse_counter_buffers: dict[torch.device, torch.Tensor] = {}
 _retired_dsa_sparse_counter_buffers: list[torch.Tensor] = []
 _DSA_SPARSE_WORKSPACE_BYTES = 384 * 1024 * 1024
-# With an LSE, FlashInfer first carves heads * batch * round_up(q_len, 256)
-# float2 softmax stats out of the workspace (q_len is 1 here, so 2 KiB per head
-# and query token: 4 GiB for a 16K-token chunk at 128 heads), and the multi-CTA
-# scratch takes the rest. LSE calls get a larger workspace of their own and run
-# in query-token chunks whose stats fill at most _DSA_LSE_STATS_BYTES of it:
-# 4096 tokens at 128 heads, so a 16K prefill chunk takes four passes through
-# FlashInfer's Python wrapper, whose host time per call rivals the kernel's.
+# LSE stats cost 2 KiB per head and token: LSE calls chunk tokens in a larger workspace.
 _DSA_LSE_STATS_SLOT_BYTES = 256 * 8
 _DSA_LSE_WORKSPACE_BYTES = 1536 * 1024 * 1024
 _DSA_LSE_STATS_BYTES = 1024 * 1024 * 1024
@@ -305,8 +299,7 @@ def _flashinfer_trtllm_dsa_impl(
     if kv_cache is None:
         raise RuntimeError("FlashInfer/TRTLLM sparse MLA requires kv_cache")
     if return_lse and qk_rope_head_dim == 0:
-        # The NoPE (KPool) slots carry a padding entry the LSE rows would have
-        # to exclude; only the RoPE layout is registered with an LSE.
+        # The NoPE slots include a padding entry the LSE would have to exclude.
         raise RuntimeError(
             "FlashInfer/TRTLLM NoPE sparse MLA does not support return_lse"
         )
@@ -323,9 +316,7 @@ def _flashinfer_trtllm_dsa_impl(
     num_heads = q_kernel.shape[2]
     kernel_heads = trtllm_sparse_mla_query_heads(num_heads)
     if kernel_heads != num_heads:
-        # Heads attend independently, so zero padding preserves the original
-        # heads and their KV selection. Keep scratch call-local for concurrent
-        # calls and independent graphs.
+        # Independent heads make zero padding exact; scratch stays call-local.
         padded_q = q_kernel.new_empty((num_tokens, 1, kernel_heads, q_kernel.shape[-1]))
         padded_q[:, :, num_heads:].zero_()
         padded_q[:, :, :num_heads].copy_(q_kernel)
@@ -362,8 +353,7 @@ def _flashinfer_trtllm_dsa_impl(
         if num_heads == kernel_heads:
             kernel_out = out.view(output_shape)
 
-    # Resolved once: an LSE call loops over query-token chunks, and each pass
-    # through the wrapper costs host time.
+    # Resolved once: an LSE call runs several chunks, each paying wrapper host time.
     workspace = _get_dsa_sparse_workspace(q.device, lse=return_lse)
     pdl = _resolve_enable_pdl(enable_pdl)
 
@@ -413,10 +403,7 @@ def _flashinfer_trtllm_dsa_impl(
         lse = torch.empty(
             (num_tokens, kernel_heads), dtype=torch.float32, device=q.device
         )
-        # The counter is sized once for a whole chunk, so a later (or captured)
-        # call never has to grow it. MLA decode tunes batches up to 8192
-        # regardless of the chunk, whose LSE stats no workspace here holds, so
-        # an LSE call takes the cached or heuristic tactic (as the MHA leaf).
+        # Tuning profiles 8192 rows, past the LSE workspace: take the cached tactic.
         with untuned("trtllm_batch_decode_mla"):
             for start in range(0, num_tokens, chunk):
                 stop = min(start + chunk, num_tokens)
@@ -425,10 +412,7 @@ def _flashinfer_trtllm_dsa_impl(
     if num_heads != kernel_heads:
         result = result[:, :num_heads]
     if lse is not None:
-        # A row with none of this rank's slots attended nothing: its LSE is
-        # the DCP reduction's identity, -inf, and both DCP combines read such a
-        # partial as empty whatever the kernel left in its output row, which
-        # is therefore not zeroed (a pass over every row for the few empty).
+        # Rows with no local slots get LSE -inf, so DCP combines ignore their output.
         lse = (
             lse.reshape(num_tokens, kernel_heads)[:, :num_heads]
             .masked_fill((seq_lens == 0)[:, None], -float("inf"))
@@ -440,8 +424,7 @@ def _flashinfer_trtllm_dsa_impl(
         result = out
     elif lse is None:
         result = result.contiguous()
-    # The DCP combines read strided heads, so a padded call's partials stay
-    # the padded rows' view.
+    # DCP combines read strided heads, so padded partials stay a view of padded rows.
     return (result, lse) if lse is not None else result
 
 

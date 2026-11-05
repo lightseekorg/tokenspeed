@@ -866,8 +866,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     # combine form.
     backend.num_attention_heads = 8
     backend.num_local_heads = 2
-    # A target verify of query_width rows whose refresh published no causal
-    # lengths: the decode derives them (_k_row_causal_lengths).
+    # A target verify publishing no causal lengths: _k_row_causal_lengths derives them.
     backend.is_draft = False
     backend.spec_num_tokens = query_width
     backend._dense_backend = SimpleNamespace(
@@ -903,8 +902,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
             kwargs["kv_seq_lens"],
             torch.arange(129 - query_width, 129, dtype=torch.int32),
         )
-        # The owned candidate (column ``rank``, local slot 64) moves to the
-        # front, and the owned count is the core's length.
+        # Owned local slot 64 moves first; the owned count is the core's length.
         expected = torch.full_like(slots, -1)
         expected[:, 0] = 64
         torch.testing.assert_close(kwargs["topk_slots"], expected)
@@ -941,8 +939,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     [
         # Query layout off, as under a pinned prefill plan.
         "query_layout_off",
-        # Query layout on, but the leaf's prefill selection is not the
-        # Triton core the records core stands in for.
+        # Query layout on, but the leaf's prefill selection is not the Triton core.
         "unprobed",
         # Query layout on a prefill whose Triton launch would split its keys.
         "split_size",
@@ -975,9 +972,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
     backend.query_shard_metadata = None
     backend.step_counter = None
     backend.kvp_prefill_query_layout = arm != "query_layout_off"
-    # configure_runtime's probe verdict, set directly: the probe admits only
-    # an FP8 cache (test_dcp_records_core_follows_the_ordinary_prefill_selection),
-    # and the forward reads only this flag, whatever the query dtype.
+    # The probe's verdict, set directly: the forward reads only this flag, any dtype.
     backend._dcp_records_core = arm != "unprobed"
     backend._dcp_padded_query = False
     # The attention-TP slice (2 of 8 heads): the sharded-head combine form.
@@ -1005,8 +1000,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
     sizes = []
 
     def check_selection(kwargs):
-        # Each rank's owned candidate is local slot 64 at the front; rank 3
-        # owns nothing live in the second row.
+        # Owned local slot 64 comes first; rank 3 owns nothing live in the second row.
         expected = torch.full_like(slots, -1)
         expected[:, 0] = 64
         expected_lens = torch.ones(2, dtype=torch.int32)
@@ -1037,8 +1031,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
         return out[:, rank * 2 : (rank + 1) * 2]
 
     def supported(*, tokens, heads, topk):
-        # Host sizes every rank shares: the rows, the gathered heads and the
-        # selection width.
+        # Host-side sizes every rank shares: rows, gathered heads, selection width.
         sizes.append((tokens, heads, topk))
         return arm == "records"
 
@@ -1207,8 +1200,7 @@ def test_select_dsa_topk_merges_every_tile_once(monkeypatch):
         return offsets, scores
 
     def gather(x, group, dim):
-        # x is this rank's [rows, topk * 2] (offset, score bits) records;
-        # synthesize the other ranks' records, interleaving their scores.
+        # x is [rows, topk * 2] (offset, score bits); fake the other ranks' records.
         assert group == placement.group and dim == -1
         gathers.append(x.shape[0])
         pairs = x.reshape(x.shape[0], -1, 2)
@@ -1323,8 +1315,7 @@ def test_select_dsa_topk_merges_every_tile_once(monkeypatch):
 def test_select_dsa_topk_tiles_stay_within_int32_logits():
     from tokenspeed.runtime.layers.attention.dcp import indexer
 
-    # The 1M decode table: 16386 columns of 64-token pages, whose logits rows
-    # DeepGEMM pads to 1048832 scores. Row 2047 would start past 2**31.
+    # DeepGEMM pads the 1M table's logits rows to 1048832; 2048 rows would pass 2**31.
     assert 2047 * 1048832 < 1 << 31 < 2048 * 1048832
     assert indexer._tile_rows(512, 16386, 64, None) == 512
     for budget in (None, 0):
@@ -1339,8 +1330,7 @@ def test_select_dsa_topk_tiles_stay_within_int32_logits():
 def test_select_dsa_topk_exchanges_stay_within_the_budget():
     from tokenspeed.runtime.layers.attention.dcp import indexer
 
-    # Kvp 8, topk 2048 and the default 512 MiB prefill budget fit 2730 rows
-    # of gathered records and merge scores (12 bytes per candidate).
+    # KVP 8, topk 2048, the default 512 MiB budget: 12 bytes per gathered candidate.
     budget = 512 << 20
     assert budget // (8 * 2048 * 12) == 2730
     # A prefix-free 16K chunk: 8192-row tiles, each exchanged by itself.
@@ -1356,9 +1346,7 @@ def test_select_dsa_topk_exchanges_stay_within_the_budget():
 def test_select_dsa_topk_row_owner_exchanges_stay_within_the_budget():
     from tokenspeed.runtime.layers.attention.dcp import indexer
 
-    # A row-owner exchange holds a rank's records twice (sent, then received
-    # for its own rows), its rows' merge scores and every row's selection:
-    # topk * 24 bytes per row at any degree, 10922 rows of the 512 MiB budget.
+    # Records sent and received, merge scores, selections: topk * 24 B/row at any KVP.
     budget = 512 << 20
     assert budget // (2048 * 24) == 10922
 
@@ -1368,8 +1356,7 @@ def test_select_dsa_topk_row_owner_exchanges_stay_within_the_budget():
         )
 
     for degree in (2, 8):
-        # A 16K chunk after 200K cached tokens: 620-row tiles at the full
-        # table width, 17 per exchange, so two exchanges instead of seven.
+        # 16K after 200K cached: 17 tiles of 620 per exchange, two exchanges, not seven.
         assert plan(16384, 620, degree, budget) == 10540
         assert plan(16384, 8192, degree, budget) == 8192
         assert plan(16384, 127, degree, budget) == 10922
@@ -1392,24 +1379,20 @@ def test_owned_width_tiles_keep_the_table_width_exchange():
             rows, columns, full, 64, 8, 2048, max_logits_bytes, row_owner=row_owner
         )
 
-    # 200K + 16K at KVP 8: 620-row tiles at the table's 3381 pages, 4854 rows
-    # at the 432 pages a rank owns, held to the 2730 rows one exchange fits.
+    # 200K + 16K at KVP 8: 3381 table pages, 432 owned, one exchange holding 2730 rows.
     assert indexer._tile_rows(16384, 3381, 64, budget) == 620
     assert indexer._tile_rows(16384, 432, 64, budget) == 4854
     assert owned(16384, 3381, 432) == 2730
     # Skewed ownership: owned tiles fit inside one exchange anyway.
     assert owned(16384, 3381, 2368) == indexer._tile_rows(16384, 2368, 64, budget)
-    # A cold 16K chunk: the table-width tile (8192 rows, one per exchange)
-    # bounds the owned tile.
+    # Cold 16K chunk: the 8192-row table-width tile bounds the owned tile.
     assert owned(16384, 256, 32) == 8192
     # Owned tiles never get narrower than the table-width ones.
     assert owned(16384, 3381, 3381) == 620
     for no_budget in (None, 0):
         assert owned(16384, 3381, 432, no_budget) == 16384
 
-    # With the row-owner merge ("merge" and "owned" together) an exchange
-    # fits 10922 rows, so the 200K tile keeps its 4854 owned-width rows:
-    # four tiles in two exchanges, where the table's width takes 27 tiles.
+    # Row-owner exchanges fit 10922 rows, so the owned tile keeps 4854: 4 tiles, not 27.
     tile = owned(16384, 3381, 432, row_owner=True)
     assert tile == 4854
     exchange = indexer._exchange_rows(16384, tile, 8, 2048, budget, row_owner=True)
@@ -1484,8 +1467,7 @@ def test_select_dsa_topk_plans_owned_width_tiles(monkeypatch):
         initial_tokens=0,
         local_tokens=0,
     )
-    # Three owned-width rows (two columns) or one table-width row of logits
-    # per tile; an exchange fits eight rows.
+    # A tile fits three owned-width rows (two columns) or one table-width row.
     budget = 3 * 2 * page_size * 4
     assert budget // (degree * topk * 12) == 8
 

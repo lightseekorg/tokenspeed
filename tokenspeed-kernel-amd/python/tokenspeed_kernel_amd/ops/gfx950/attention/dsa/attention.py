@@ -327,8 +327,7 @@ def _dsa_store_output(
     )
 
 
-# The split count and the strides of the split workspace follow the batch shape,
-# so they stay runtime values: one compiled object serves every split count.
+# Split count and workspace strides follow the batch, so one binary serves every split.
 @gluon.jit(
     do_not_specialize=(
         "stride_o_t",
@@ -1820,8 +1819,7 @@ def _run_dense_kv(
         _dsa_dense_mfma_kv_kernel[grid](
             *args,
             D_V=kv_lora_rank,
-            # Keep the compile-time matrix shape MFMA-compatible for no-RoPE
-            # models; HAS_ROPE removes its storage, loads, and score term.
+            # MFMA-legal shape for no-RoPE models; HAS_ROPE=False removes all RoPE work.
             D_ROPE=max(qk_rope_head_dim, 64),
             HAS_ROPE=qk_rope_head_dim > 0,
             CONVERT_INPUTS=convert_inputs,
@@ -1833,9 +1831,7 @@ def _run_dense_kv(
             BLOCK_H=16,
             TILE_K=64 if qk_rope_head_dim == 0 else 32,
             num_warps=4,
-            # Bound how far the SLP vectorizer moves instructions. Unbounded, it
-            # splits the in-loop KV prefetch around an LDS wait; with the bound,
-            # the default machine scheduler beats iterative-ilp for BF16 too.
+            # Unbounded SLP splits the in-loop KV prefetch around an LDS wait.
             llvm_cl_opts="slp-schedule-budget=100",
         )
     if num_kv_splits > 1:

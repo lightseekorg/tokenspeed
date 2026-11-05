@@ -564,17 +564,9 @@ _DYNAMIC_FP8_MIN_AMAX = 1.0e-12
 #
 # Below this the single launch is the cheapest option: the two-pass reduction
 # needs a second launch, and at these sizes the launch -- not the arithmetic --
-# is the whole cost. Decode runs these sizes under graph replay, where a launch
-# costs ~2 us rather than the ~10 us of an eager one, so one workgroup streaming
-# the whole tensor stops paying off early. Measured on MI350X under graph
-# replay at width 3584: 3.4 us single-pass against 4.3 us two-pass at 16,384
-# padded elements (4 rows), but 5.1 against 4.1-4.6 us at 32,768 (5-8 rows)
-# and 8.8 against 4.7 us at 65,536 (9-18 rows).
+# is the whole cost; under graph replay (~2 us a launch) two-pass wins from 32,768.
 #
-# One workgroup also breaks outright on large tensors: ~33 us at 131,072 padded
-# elements, 903 us at 262,144, and no dispatch past roughly 344k with
-# HSA_STATUS_ERROR_OUT_OF_RESOURCES, a threshold that moves with how loaded the
-# device is.
+# One workgroup fails to dispatch past ~344k elements; the limit moves with load.
 #
 # Beware when re-tuning: a tensor whose length is well under its power of two
 # looks artificially good, because the compiler can drop the masked tail. At

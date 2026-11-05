@@ -224,8 +224,7 @@ def _prefill_workspace(
 def test_bf16_plane_prefill_matches_fp32_reference(
     heads: int, weight_dtype: torch.dtype
 ) -> None:
-    # Ragged extends: a fresh short prompt, a chunk crossing top-k, and a
-    # chunk with a long cached prefix.
+    # Ragged extends: fresh short prompt, chunk crossing top-k, long cached prefix.
     prefix_lens, extend_lens = [0, 1990, 6000], [300, 120, 40]
     workspace_slots, row_starts, row_ends = _prefill_workspace(
         prefix_lens, extend_lens, num_pages=512, seed=heads
@@ -462,8 +461,7 @@ def test_bf16_plane_scorers_do_not_recompile_across_batches() -> None:
             slot_order="selection",
         )
 
-    # Warm each runtime-integer specialization class: q_len 1 and not, and
-    # table widths / workspace sizes divisible by 16 and not.
+    # Warm every int specialization: q_len 1 or not, widths divisible by 16 or not.
     decode([64 * 16], 1)
     decode([64 * 16 + 1], 4)
     decode([64 * 17], 1)

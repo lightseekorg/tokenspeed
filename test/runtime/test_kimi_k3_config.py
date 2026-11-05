@@ -67,8 +67,7 @@ class TestKimiK3ConfigTests:
         assert (cfg.vision_config.vt_hidden_size) == (512)
 
     def test_k31_materializes_its_subconfigs_through_from_dict(self):
-        # from_dict is the path from_pretrained takes; a subclass without its
-        # own __init__ left text_config a dict there.
+        # from_pretrained's path; a subclass without __init__ left text_config a dict.
         cfg = KimiK31Config.from_dict(
             {"model_type": "kimi_k31", "text_config": {"hidden_size": 4096}}
         )

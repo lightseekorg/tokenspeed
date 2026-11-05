@@ -45,11 +45,9 @@ MOE_INPUT_ROW_ALIGN = 8 * 32
 MOE_INPUT_GATHER_PROGRAMS = 64
 # A push gather that runs beside a GEMM leaves it most of the CUs.
 SIDE_GATHER_PROGRAMS = 32
-# 32 resident scatter workgroups leave the 256-CU GEMM 224 CUs: each of its rounds
-# then finishes exactly one 256-row tile of every owner (8 x 28 column tiles).
+# Leaves the 256-CU GEMM 224 CUs: one 256-row tile per owner per round (8 x 28 tiles).
 PUBLISHED_SCATTER_PROGRAMS = 32
-# One program per owned row of an 8192-row chunk: each row walks its AttnRes
-# sources serially, so the local mixes are bound by rows in flight.
+# One program per owned row of an 8192-row chunk: serial mixes need rows in flight.
 _MIX_ROWS_PROGRAMS = 1024
 # K3 MLA q_a + kv_a (+ RoPE key) rows, which the MoE tail can project ahead.
 MLA_QKV_A_WIDTH = 2112
@@ -339,8 +337,7 @@ def _push_owned_words(
     ``words`` is a multiple of 4, so every slice starts 16-byte aligned.
     """
     peers = _peer_words(local_ptr, heaps, RANK)
-    # Dropping two bits the caller guarantees are zero proves the 16-byte
-    # alignment of the runtime offset, which vectorizes the loads and stores.
+    # Clearing two known-zero bits proves 16-byte alignment, so accesses vectorize.
     words = words // 4 * 4
     first = RANK * words
     for tile in range(pid, gl.cdiv(words, BLOCK), NUM_PROGRAMS):
@@ -1225,9 +1222,7 @@ def _overlaps(tensor: torch.Tensor, buffer: torch.Tensor) -> bool:
 
 
 def _side_stream(device: torch.device) -> torch.cuda.Stream:
-    # A default-priority pool stream can share a hardware queue with the serving
-    # forward's pool stream, which runs the side kernels after the main stream's
-    # earlier kernels instead of beside them; high-priority streams have their own.
+    # High priority gets its own hardware queue, so side kernels run beside the forward.
     return torch.cuda.Stream(device=device, priority=-1)
 
 
@@ -1334,8 +1329,7 @@ class IrisAllReduceShardedState:
             (max_rows, MLA_QKV_A_WIDTH), dtype=inputs.dtype
         )
         self.qkv_gather_flags = peers.ctx.zeros((GATHER_PROGRAMS, 8), dtype=torch.int32)
-        # This rank's selection rows in two alternating slots; peers pull them
-        # into their own memory.
+        # Double-buffered selection rows that peers pull into their own memory.
         self.topk_publish = peers.ctx.empty(
             (2, max_rows // 8, PREFILL_TOPK), dtype=torch.int16
         )
@@ -1672,9 +1666,7 @@ class IrisAllReduceShardedState:
         rows = routed_partial.shape[0]
         local_rows = rows // 8
         output = self.output[:rows]
-        # A sharded prefix is disjoint from the result. Its owner can project into
-        # its output rows, then consume them before the gather overwrites them.
-        # A replicated prefix can already occupy the result and must be preserved.
+        # Sharded prefixes project in place; a replicated prefix may occupy the result.
         projected = (
             output[self.rank * local_rows : (self.rank + 1) * local_rows]
             if prefix_is_sharded

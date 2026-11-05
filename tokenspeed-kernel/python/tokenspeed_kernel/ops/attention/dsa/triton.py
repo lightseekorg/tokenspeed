@@ -263,11 +263,7 @@ def _dsa_dense_kv_attend(
     BLOCK_N: tl.constexpr,
     BLOCK_ROPE: tl.constexpr,
 ):
-    # The online softmax of one (token, head block, split) program over its
-    # share of the token's selected dense KV rows. Query row i of the block
-    # sits at ``q + rows[i] * head_dim``; the caller picks the layout and
-    # stores the returned (acc, m_i, l_i), so every caller computes the same
-    # values for the same query and selection.
+    # One online-softmax core, so every caller computes identical (acc, m_i, l_i).
     dims = tl.arange(0, kv_lora_rank)
 
     q_nope = tl.load(
@@ -426,13 +422,7 @@ def _dsa_dense_kv_dcp_records_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_ROPE: tl.constexpr,
 ):
-    # _dsa_dense_kv_kernel's single-split program over a rank-major query,
-    # storing the DCP partial records instead of the output and its LSE.
-    # Gathered head h of token t is local head h % GROUP_HEADS of rank
-    # h // GROUP_HEADS: it sits at [h // G, t, h % G] of the gathered query
-    # [ranks, tokens, G, head_dim], and its record goes to the same position
-    # of [ranks, tokens, G, record words], the layout
-    # dispatch_dcp_attention_partials writes for that head's owner rank.
+    # Head h of token t: [h // GROUP_HEADS, t, h % GROUP_HEADS] in query and records.
     token = tl.program_id(0).to(tl.int64)
     heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     split = tl.program_id(2)
@@ -465,9 +455,7 @@ def _dsa_dense_kv_dcp_records_kernel(
         BLOCK_N,
         BLOCK_ROPE,
     )
-    # A record is kv_lora_rank / 2 words of BF16 pairs, low half first (the
-    # little-endian BF16 view at twice the word index), then the FP32 LSE
-    # bits. The values are _dsa_store_output's single-split ones.
+    # Record: kv_lora_rank / 2 BF16-pair words (low half first), then the FP32 LSE bits.
     record_words: tl.constexpr = kv_lora_rank // 2 + 1
     dims = tl.arange(0, kv_lora_rank)
     result = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], 0.0)
@@ -688,9 +676,7 @@ def _run_dense_kv(
     )
 
 
-# Launch configuration of the DCP records core. It is _launch_dsa_kernel's, so
-# a record holds the bits of the unsplit dsa_prefill launch of the same heads;
-# a prefill-only retune changes this configuration alone (and those bits).
+# _launch_dsa_kernel's config, so records match an unsplit dsa_prefill bit for bit.
 _PREFILL_RECORDS_CONFIG = {"BLOCK_H": _BLOCK_H, "BLOCK_N": _BLOCK_N, "num_warps": 4}
 
 
@@ -1007,8 +993,7 @@ def triton_dsa_prefill_dcp_records(
     logit_cap: float = 0.0,
     k_scale: float = 1.0,
 ) -> torch.Tensor:
-    # triton_dsa_prefill's dense-KV core on a rank-major query; the scale
-    # product is _run_dsa's, so the kernels see the same FP32 scale.
+    # Same scale product as _run_dsa, so the kernels see the same FP32 scale.
     return _launch_dsa_dcp_records(
         q.contiguous(),
         kv_cache,

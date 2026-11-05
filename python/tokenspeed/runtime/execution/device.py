@@ -1496,25 +1496,13 @@ def build_device_side(
             draft_attn_backend=attention.draft_attn_backend,
             draft_token_to_kv_pool=views.draft_token_to_kv_pool,
         )
-    # The instances whose prefill graphs may have eager breaks that run
-    # collectives: the PD prefill role of every model, and the aggregated
-    # role of a model that declares the DSA padded-replay contract
-    # (Kimi-K3.1, whose KVP sparse prefill runs collectives in its DSA breaks
-    # on either role; configs/dsa.py dsa_padded_prefill_replay). Both are
-    # instance-wide facts, the role and the checkpoint, never a rank's graph
-    # decision, so every rank of the instance takes the same branches below.
-    # Other models' aggregated boots stay as they were: no plan agreement,
-    # no NCCL_GRAPH_MIXING_SUPPORT refusal and no post-capture release.
+    # Breaks of these graphs may run collectives; an instance-wide fact, so ranks agree.
     replays_prefill_graphs = server_args.disaggregation_mode == "prefill" or (
         server_args.disaggregation_mode == "null"
         and model_config.dsa_padded_prefill_replay
     )
     if replays_prefill_graphs:
-        # The graph-or-eager decision follows per-process arguments (Kimi-
-        # K3.1's DSA graph is opted in by them): every rank of the instance
-        # must plan the same graphs, or a rank running eager where its peers
-        # replay hangs them. Every rank enters the collective, graphs on or
-        # off.
+        # Ranks must plan alike: one rank eager while its peers replay hangs them.
         check_rank_uniform_prefill_plan(executor.prefill_graph, server_args)
     # Once per process, before the probe: a graph keeps its capture-time tactic.
     with (
@@ -1524,9 +1512,7 @@ def build_device_side(
     ):
         executor.autotune()
     if probing and current_platform().is_nvidia:
-        # The observer emptied the cache, so what the allocator still holds
-        # unallocated sits in segments a live buffer pins: residue the reserve
-        # charges without a tensor behind it.
+        # After empty_cache, reserved minus allocated is residue pinned by live buffers.
         device_module = torch.get_device_module(server_args.device)
         pinned = device_module.memory_reserved() - device_module.memory_allocated()
         logger.info(
@@ -1560,14 +1546,7 @@ def build_device_side(
     with startup_phase("graph.capture"):
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     if replays_prefill_graphs and not executor.prefill_graph.disable:
-        # The prefill warmups and capture-time breaks ran on the capture
-        # stream; the blocks they freed stay cached for that stream, which no
-        # serving forward runs on, and would hold back the headroom eager
-        # forwards above the largest bucket need (the aggregated role's 16K
-        # chunks as much as the prefill role's). The graphs' private pools,
-        # the decode ladder's included where the role captures one, are not
-        # returned by empty_cache: it releases only unused cached blocks, so
-        # no buffer a decode or prefill graph recorded moves.
+        # Release capture-stream cache no forward reuses; graph pools are not freed.
         device_module = torch.get_device_module(server_args.device)
         before = device_module.memory_reserved() - device_module.memory_allocated()
         device_module.empty_cache()

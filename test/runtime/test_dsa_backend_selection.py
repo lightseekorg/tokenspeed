@@ -173,8 +173,7 @@ def test_int8_cache_is_rejected_by_server_arguments():
     assert error.value.code == 2
 
 
-# What the sparse-leaf log reads of a Kimi-K3.1 DSA leaf (kvp 1, BF16 KV,
-# 8-token DSpark verify).
+# A K3.1 DSA leaf as the sparse-leaf log sees it: kvp 1, BF16 KV, 8-token DSpark verify.
 _K31_SPARSE_LEAF = dict(
     device="cpu",
     kernel_page_size=64,
@@ -304,8 +303,7 @@ def test_dsa_sparse_leaf_log_follows_fp8_kv_and_dcp(
         backend._log_sparse_leaves()
     (line,) = _sparse_leaf_records(caplog, logging.INFO)
     assert "kvp=4" in line
-    # The cores see the FP8 query the forward casts to and return the LSE the
-    # DCP combine merges.
+    # Cores take the forward's FP8 query and return the LSE that the DCP combine merges.
     cores = [call for call in calls if call[0] != "dsa_index_candidates"]
     assert [(mode, traits["q_len"]) for mode, _, traits, _ in cores] == [
         ("dsa_prefill", 1),
@@ -369,8 +367,7 @@ def test_dsa_sparse_leaf_log_names_planned_kernels(monkeypatch, caplog):
             f"dsa_decode(q_len={q_len}, return_lse=False)=planned_decode "
             "[PERFORMANT, planned]" in line
         )
-    # A plan fixes the kernel, as the facades take it without reselection,
-    # after the validation they run before every launch.
+    # Facades launch a plan's kernel without reselection, after validating each launch.
     assert not calls
     bf16 = format_signature(q=dense_tensor_format(torch.bfloat16))
     assert [(args[1], args[3]["q_len"]) for args in validations] == [
@@ -385,8 +382,7 @@ def test_dsa_sparse_leaf_log_names_planned_kernels(monkeypatch, caplog):
 
 
 def test_dsa_sparse_leaf_log_reports_plans_the_forward_rejects(monkeypatch, caplog):
-    # The plan was built for the model-dtype query, but FP8 KV hands the
-    # facade an FP8 query: the first forward's validation would raise.
+    # Planned for a model-dtype query, but FP8 KV passes FP8: the forward would raise.
     rejected = ValueError("Input contract changed for planned kernel planned")
     backend, calls = _sparse_leaf_backend(
         monkeypatch,
@@ -409,8 +405,7 @@ def test_dsa_sparse_leaf_log_reports_plans_the_forward_rejects(monkeypatch, capl
 
 
 def test_dsa_sparse_leaf_probes_widen_for_a_kpool_tail(monkeypatch, caplog):
-    # GLM-5.3-Flash: the cores receive index_topk + pool_size - 1 slots, the
-    # width its SPECIALIZED NoPE cores register (2051).
+    # GLM-5.3-Flash: cores take index_topk + pool_size - 1 slots, the registered 2051.
     backend, calls = _sparse_leaf_backend(
         monkeypatch,
         kpool_runtime=SimpleNamespace(pool_size=4),
@@ -473,8 +468,7 @@ class _SelectionProbe(Exception):
 @pytest.mark.parametrize("kvp", [1, 4])
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_dsa_sparse_leaf_probes_match_the_facade_selections(monkeypatch, kv_dtype, kvp):
-    # The forward's own calls reach the real facades, whose selection is
-    # recorded and stopped; the probes must ask for the same leaves.
+    # Record the forward's facade selections; the probes must ask for the same leaves.
     from tokenspeed_kernel.ops.attention import dsa as dsa_ops
 
     from tokenspeed.runtime.layers.attention.dcp.indexer import select_dsa_topk
@@ -553,8 +547,7 @@ def test_dsa_sparse_leaf_probes_match_the_facade_selections(monkeypatch, kv_dtyp
                 topk_lens=None,
             )
     if kvp > 1:
-        # The decode and prefill indexers' call, with the model-dtype index
-        # query and head weights.
+        # The decode and prefill indexers' call, with model-dtype query and weights.
         rows = backend.spec_num_tokens
         with pytest.raises(_SelectionProbe):
             select_dsa_topk(
@@ -580,9 +573,7 @@ def test_dsa_sparse_leaf_probes_match_the_facade_selections(monkeypatch, kv_dtyp
 
 
 def test_dsa_sparse_leaf_log_sees_a_router_factory_solution_pin(monkeypatch, caplog):
-    # A router's leaf factory may pin the solution after construction
-    # (dots3-note sets 'triton'); configure_runtime runs after it, so the
-    # probes select with the pinned solution.
+    # A leaf factory's solution pin precedes configure_runtime, so the probes honor it.
     from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
@@ -642,8 +633,7 @@ def test_dsa_sparse_leaf_log_sees_a_router_factory_solution_pin(monkeypatch, cap
 )
 @pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 def test_dsa_sparse_leaf_log_names_the_real_selection(monkeypatch, caplog, kv_dtype):
-    # K3.1 at KVP/DCP 8 against the real registry: every probe resolves, and
-    # each logged leaf is select_kernel's own choice.
+    # K3.1 at KVP 8 on the real registry: each probe resolves to select_kernel's pick.
     from tokenspeed_kernel.selection import select_kernel
 
     dsa = backends.dsa
@@ -729,8 +719,7 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
     if case in ("planned", "no_kvp", "bf16_cache"):
         assert not records
         return
-    # The probe runs before the startup log, and asks the records op what
-    # it asked the prefill selection.
+    # The probe precedes the startup log and asks the records op what it asked prefill.
     prefill, records_call = calls[:2]
     assert records == [records_call]
     assert prefill[0] == "dsa_prefill" and prefill[1:] == records_call[1:]
@@ -794,11 +783,7 @@ def test_trtllm_sparse_buffers_are_reserved_before_any_forward(monkeypatch, kvp)
 )
 @pytest.mark.parametrize("solution", [None, "triton", "flashmla"])
 def test_dcp_records_core_on_the_real_k31_selection(monkeypatch, solution):
-    # K3.1's FP8 cache at KVP8 against the real registry. On Blackwell the
-    # trtllm-gen leaf returns the LSE of an FP8 query and outranks the Triton
-    # core, so the records arm (a Triton core) stands down unless Triton is
-    # pinned; on Hopper the Triton core is the one such leaf and the qlayout
-    # lever applies. A FlashMLA pin (BF16 queries only) selects nothing.
+    # On Blackwell trtllm-gen outranks the Triton core; FlashMLA (BF16 only) gets none.
     dsa = backends.dsa
     backend = object.__new__(dsa.DSABackend)
     values = dict(

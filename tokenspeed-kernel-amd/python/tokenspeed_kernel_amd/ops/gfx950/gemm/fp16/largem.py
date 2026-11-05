@@ -520,8 +520,7 @@ def gluon_mm_a16w16_prefill_gfx950(
     )
 
 
-# The row tiles inside [SKIP_TILE, SKIP_TILE + SKIP_TILES) are left out; M, the
-# skipped range and GRID_MN follow the token count and stay runtime arguments.
+# M, GRID_MN and the skipped range follow the token count, so they stay runtime args.
 @gluon.jit(
     launch_metadata=_dense16_mm_launch_metadata,
     do_not_specialize=("M", "GRID_MN", "SKIP_TILE", "SKIP_TILES"),

@@ -225,8 +225,7 @@ def _check_gather_tail(
             routed, shared, prefix, weight, norm_weight=norm_weight, eps=_EPS
         )
 
-    # Reductions and gathers share the Lamport mailbox and its tile epochs, so
-    # interleave them at changing row counts, across both sender kernels.
+    # Reductions and gathers share mailbox tile epochs: interleave them at varied rows.
     row_counts = (4, 1, 3, 2, 8, 5, 16, 17, 4, 32, 64, 3, 47)
     for seed, rows in enumerate(row_counts):
         routed, shared = (t.clone() for t in reduce(rows, seed))
@@ -244,27 +243,21 @@ def _check_gather_tail(
         error = (result.double() - exact).abs().max()
         assert error <= (expected.double() - exact).abs().max() * 1.01 + 1e-6
         if 1 < rows <= 32:
-            # Like the fused MFMA add3, one rounding after both additions: only
-            # the FP32 summation order differs, so almost every bit matches.
-            # (One row's GEMV and the composed tail past 32 rows round the
-            # projection before adding.) Compared on Triton-normalized rows:
+            # 2-32 rows round once after both adds; only the FP32 sum order differs.
             normed = rmsnorm(routed, norm_weight, _EPS)
             assert state.can_moe_gather_tail(normed, shared, prefix, weight, None)
             projected = state.moe_gather_tail(
                 normed, shared, prefix, weight, norm_weight=None, eps=None
             )
             assert (_bf16_ulps(projected, expected) > 0).float().mean() < 0.002
-            # The fused norm sums squares in another order. A normalized
-            # element rounding the other way perturbs its whole row, so count
-            # rows: most keep every bit of the Triton-normalized projection.
+            # The fused norm's sum order can flip one element, perturbing its whole row.
             changed = (result != projected).any(dim=1).sum().item()
             assert changed <= rows // 4 + 1
         replicas = [torch.empty_like(result) for _ in range(8)]
         dist.all_gather(replicas, result, group=group)
         for replica in replicas:
             assert torch.equal(replica, result), "ranks must hold identical rows"
-        # A row's bits do not depend on how many rows share a sender kernel's
-        # launch: 1 to 4 rows take the GEMV senders, wider batches the MFMA.
+        # Row bits are independent of batch width, GEMV senders (1-4 rows) or MFMA.
         narrow = 1 if rows <= 4 else 5
         assert torch.equal(
             gathered(routed[:narrow], shared[:narrow], prefix[:narrow]),
@@ -284,9 +277,7 @@ def _check_gather_tail(
     torch.cuda.synchronize()
     dist.barrier(group=group, device_ids=[rank])
 
-    # Captured decode layers: alternate reductions and gathers with one rank
-    # late, at row counts sharing each kernel's one binary, without
-    # recompiling. Every row count runs once before capture.
+    # Captured layers alternate reduce and gather, one rank late, without recompiling.
     layer_rows = (4, 3, 8, 16, 32, 64, 13, 2)
     for rows in layer_rows:
         routed, shared = reduce(rows, 200 + rows)

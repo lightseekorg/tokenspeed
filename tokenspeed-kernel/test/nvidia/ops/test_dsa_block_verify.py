@@ -141,9 +141,7 @@ def test_block_verify_attention_matches_causal_reference(width, solution, dtype)
 
     actual = run(width)
     torch.testing.assert_close(actual, run(1), rtol=0, atol=0)
-    # Use the same-precision single-row output as the FP8 FlashInfer oracle.
-    # Its intermediate rounding differs from this FP32-softmax reference;
-    # the grouped result must still match q_len=1 bit for bit.
+    # FP8 FlashInfer rounds unlike the FP32 reference, so its oracle is the q_len=1 run.
     if dtype == torch.bfloat16 or solution == "triton":
         reference = torch_dsa_sparse_attention(
             q,

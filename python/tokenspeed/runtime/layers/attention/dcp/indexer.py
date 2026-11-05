@@ -44,9 +44,7 @@ from tokenspeed.runtime.layers.attention.dcp.placement import (
     resolve_cache_slots,
 )
 
-# Some candidate leaves offset logits rows in 32-bit arithmetic (the portable
-# Triton scorer, the CUDA ragged top-k), so one tile keeps its FP32 logits
-# below 2**31 elements, counting the 256-column row padding DeepGEMM adds.
+# Some leaves offset logits rows in int32: a tile's padded logits stay < 2**31.
 _MAX_TILE_LOGITS = 1 << 31
 _LOGITS_ROW_PADDING = 256
 
@@ -63,13 +61,9 @@ def _tile_rows(
     return min(rows, limit)
 
 
-# An exchange gathers every rank's candidates as 8-byte records and merges
-# them through FP32 scores of the same count.
+# Per candidate: an 8-byte gathered record plus a 4-byte FP32 merge score.
 _EXCHANGE_BYTES_PER_CANDIDATE = 12
-# A row-owner exchange holds this rank's candidates twice as 8-byte records
-# (the ones it sends, then the other ranks' for the rows it owns), merges its
-# rows through FP32 scores of the same count and gathers every row's 4-byte
-# selection, whatever the degree.
+# Row-owner: 8-byte records sent and received, FP32 score, int32 selection, any degree.
 _ROW_OWNER_EXCHANGE_BYTES_PER_CANDIDATE = 24
 # The int32 bits of FP32 -inf (0xFF800000): the score of a padding candidate.
 _NEG_INF_BITS = -(1 << 23)
@@ -239,9 +233,7 @@ def merge_index_candidates_row_owner(
         dtype=records.dtype,
         device=records.device,
     )
-    # Equal splits: the d-th slice of the rows goes to rank d, and this rank
-    # receives every rank's candidates of its own slice in rank order, the
-    # source-rank-major layout the merge reads.
+    # Equal splits: rank d gets slice d, laid out source-rank-major as the merge reads.
     all_to_all_single(received.flatten(), records.flatten(), group)
     positions, counts = dsa_merge_candidates(received, topk=topk, solution=None)
     all_positions = positions.new_empty((padded, topk))
@@ -277,10 +269,7 @@ class DCPIndexMetadata:
     columns: int | None = None
 
 
-# Owned-width pages planned once per forward (int32 pages and positions per
-# row and column) stay allocated through every indexer layer and the MoE
-# activation peaks between them. Past this a forward plans each tile's pages
-# instead, which keeps the owned-width tiles.
+# Above this, plan pages per tile: forward-wide pages stay live across MoE peaks.
 _MAX_FORWARD_PAGES_BYTES = 256 << 20
 _PAGES_BYTES_PER_COLUMN = 8
 
@@ -459,8 +448,7 @@ def select_dsa_topk(
             return metadata.pages.rows(start, end)
         if metadata.columns is None:
             return None
-        # Owned-width tiles plan their own pages: the leaf would compact, and
-        # size its logits by, the whole table.
+        # Plan this tile's pages, or the leaf would size its logits by the whole table.
         pages = plan_dsa_index_candidates(
             q[start:end],
             weights[start:end],
@@ -556,9 +544,7 @@ def _join_tiles(
         if records is None and not parts and _exchanges_packed_records(offsets, scores):
             records = _joined_records(rows, padded, offsets)
         if records is not None:
-            # Producers emit interleaved records, so packing is free; each
-            # tile is copied into the joined records and released before the
-            # next is scored, and the merge exchanges the joined views as is.
+            # Copy each tile in and free it before scoring the next; packing is free.
             records[start - first : end - first].copy_(
                 pack_index_candidates(offsets, scores)
             )

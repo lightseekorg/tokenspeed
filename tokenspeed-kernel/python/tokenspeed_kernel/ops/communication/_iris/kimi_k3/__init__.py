@@ -30,8 +30,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 
-# Decode rows whose MoE up-projection runs column-parallel and gathers: the
-# GEMV senders through 4 rows, the MFMA senders beyond.
+# Decode rows with a gathered column-parallel MoE up-projection; GEMV senders to 4 rows.
 _K3_GATHER_MAX_ROWS = 64
 _K3_GATHER_GEMV_MAX_ROWS = 4
 _K3_GATHER_LATENT = 3584
@@ -47,13 +46,10 @@ _K3_LATENT = 3584
 _K3_SHARED = 768
 _K3_PACKED_INPUT_ROWS = _K3_ROUTER + _K3_LATENT + 2 * _K3_SHARED
 _K3_LATENT_GEMM_NUM_WARPS = 2
-# The routed/shared all-reduce's one-shot Lamport window, which also sums the
-# MoE's top-k slot rows below 8 rows, and the decode MoE input gather's rows.
+# One-shot Lamport window (it also sums MoE top-k slots) and latent gather row limits.
 _K3_LAMPORT_MAX_ROWS = 7
 _K3_LATENT_GATHER_MAX_ROWS = 64
-# From 8 rows (where the MoE combines its top-k slots itself) the Lamport
-# two-shot all-reduce beats both the one-shot and the pull all-reduce; its
-# 1024-element tiles take even row counts.
+# From 8 rows the Lamport two-shot all-reduce wins; 1024-element tiles need even rows.
 _K3_TWO_SHOT_MIN_ROWS = 8
 _K3_TWO_SHOT_MAX_ROWS = 64
 _K3_TWO_SHOT_ALIGN = 8 * 128
@@ -155,8 +151,7 @@ class K3IrisState:
             if sharded_max_rows
             else None
         )
-        # [stage][reduce-scatter, all-gather][source rank][shard] mailboxes and
-        # one stage counter per two-shot program.
+        # [stage][scatter, gather][source][shard] mailboxes, one counter per program.
         two_shot = (
             _k3_two_shot_numel(all_reduce.producer_direct_max_numel)
             if self.lamport is not None and all_reduce.world_size == 8
@@ -179,8 +174,7 @@ class K3IrisState:
             self.two_shot_peer_addresses = tuple(
                 base + offset for base in peers.addresses[:8]
             )
-        # The latent gather's FP8 scale rendezvous: one empty (-1) row-maximum
-        # slot per row and a zero departure counter, as each launch leaves them.
+        # FP8 scale rendezvous: -1 row maxima, zero counter; every launch restores this.
         self._latent_fp8_sync = (
             torch.cat(
                 (
@@ -502,8 +496,7 @@ class K3IrisState:
                 **constants,
             )
         else:
-            # Per 16-row tile: one sender per 16 columns, then one reducer
-            # per 1024 elements of each slot.
+            # Per 16-row tile: a sender per 16 columns, a reducer per 1024 slot items.
             iris_k3moe_mfma_lamport_gather[
                 (-(-rows // 16) * (local_width // 16 + 16 * local_width // 1024),)
             ](*args, CHUNK=_K3_GATHER_MFMA_CHUNK, **constants)
@@ -593,9 +586,7 @@ class K3IrisState:
             (split_k, rows, _K3_PACKED_INPUT_ROWS), dtype=torch.float32, device=device
         )
         split_stride = rows * _K3_PACKED_INPUT_ROWS
-        # One rank's columns fill only 17 of the replicated launch's 128-wide
-        # tiles; narrower tiles spread them over more programs, and a column's
-        # split-K sum does not depend on its tile.
+        # Narrow tiles spread a rank's columns; split-K sums do not depend on the tile.
         gemm_block = 32 if rows <= small_batch._BLOCK_M else 64
         gemm_router_tiles = -(-router_local // gemm_block)
         gemm_latent_tiles = -(-latent_local // gemm_block)

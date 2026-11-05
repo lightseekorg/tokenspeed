@@ -438,9 +438,7 @@ if (
         q_kernel, actual_heads = _pad_prefill_query(q)
         kv = _flatten_regular_kv_cache(kv_cache, page_size)
         slots = _mask_sparse_slots(topk_slots, topk_lens)
-        # The kernel stops each row after its topk_length entries, so a DCP
-        # row compacted to its owned prefix costs that prefix, not the width.
-        # Columns past it are already -1, so the result is unchanged.
+        # topk_length stops each row at its owned prefix; its -1 tail adds nothing.
         topk_length = None
         if topk_lens is not None:
             topk_length = topk_lens.reshape(-1).clamp(0, slots.shape[-1])

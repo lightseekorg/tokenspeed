@@ -173,12 +173,7 @@ CANDIDATE_LENS_CPU_FEATURE = "candidate_lens_cpu"
 # at construction through :func:`select_dsa_prefill_topk_for_rows`.
 INDEX_K_WORKSPACE_ROWS_FEATURE = "index_k_workspace_rows"
 
-# Feature a ``dsa_index_candidates`` leaf declares when it takes the
-# ``pages`` keyword: compact owned pages planned once by
-# :func:`plan_dsa_index_candidates` for rows that every layer of a forward
-# scores against the same page table. The facade plans and hands pages to
-# declaring leaves only, by registry lookup; a leaf that declares the feature
-# must use the pages instead of compacting the table again.
+# Leaves declaring this get `pages` planned once per forward and must not recompact.
 INDEX_CANDIDATE_PAGES_FEATURE = "index_candidate_pages"
 
 # Storage of an index-key plane, read off its dtype (README, "Index-K plane
@@ -749,8 +744,7 @@ def dsa_prefill_dcp_records_supported(*, tokens: int, heads: int, topk: int) -> 
         True when the records hold the bits the Triton ``dsa_prefill`` plus
         ``dispatch_dcp_attention_partials`` would produce.
     """
-    # The one registered leaf answers for its own launch; selection has no
-    # notion of a size bound.
+    # The only registered leaf answers for its own launch; selection has no size bound.
     from tokenspeed_kernel.ops.attention.dsa.triton import (
         triton_dsa_prefill_dcp_records_supported,
     )
@@ -1059,8 +1053,7 @@ def plan_dsa_index_candidates(
 def _check_index_candidate_pages(
     pages: DSAIndexCandidatePages, *, rows: int, columns: int
 ) -> None:
-    # Full-width pages match the table; pages planned narrower (they carry
-    # an overflow count) fit inside it.
+    # Full-width pages match the table; narrower ones (with overflow) fit inside it.
     width = pages.pages.shape[-1]
     if (
         pages.pages.shape[0] != rows

@@ -468,8 +468,7 @@ def _ar_worker_main(
                 prepare_k3_communication,
             )
 
-            # The Lamport mailboxes reduce the partial before the row epilogue,
-            # through 32 rows; at most 16 the push one-shot is the oracle.
+            # Lamport path to 32 rows; up to 16 rows the push one-shot is its oracle.
             lamport_k3 = prepare_k3_communication(
                 group=dist.group.WORLD,
                 rank_in_group=rank,
@@ -765,8 +764,7 @@ def _check_all_reduce_residual_attnres(
             torch.testing.assert_close(
                 actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2
             )
-            # The Lamport reduction plus row epilogue matches the fused push
-            # one-shot bit for bit.
+            # Lamport plus row epilogue must equal the fused push one-shot bit for bit.
             if num_tokens > k3_state.attnres.max_rows:
                 continue
             fused_hidden, fused_residual = k3_state.attnres.run(

@@ -578,8 +578,7 @@ if platform.is_amd:
         signatures=_DENSE16_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
-            # Absorbed MLA query and value projection (12 local heads) against
-            # K-major w_kc / w_vc; other n/k pairings fall back to torch.bmm.
+            # Absorbed MLA q/v projections, K-major w_kc / w_vc; others use torch.bmm.
             "batch": frozenset({12}),
             "m": frozenset(range(1, 65)),
             "n": frozenset({128, 512}),
@@ -1478,8 +1477,7 @@ if platform.is_amd:
     def gluon_linear_attnres_partials_gfx950(**kwargs):
         return _linear_attnres_partials_impl(**kwargs)
 
-    # 5-16 tokens: the decode GEMV's tiles, so the projection and both
-    # partials match the unfused GEMV and attnres_partial_dual bit for bit.
+    # 5-16 tokens reuse the decode GEMV tiles, matching the unfused path bit for bit.
     @register_kernel(
         "gemm",
         "linear_attnres_partials",

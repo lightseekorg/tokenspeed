@@ -319,8 +319,7 @@ def _prefill_workspace(
 def test_fp8_pages_prefill_matches_fp32_reference(
     heads: int, weight_dtype: torch.dtype, page_pad: int
 ) -> None:
-    # Ragged extends: a fresh short prompt, a chunk crossing top-k, and a
-    # chunk with a long cached prefix.
+    # Ragged extends: fresh short prompt, chunk crossing top-k, long cached prefix.
     workspace = _prefill_workspace(
         [0, 1990, 6000], [300, 120, 40], num_pages=512, seed=heads + page_pad
     )
@@ -614,8 +613,7 @@ def test_fp8_pages_scorers_do_not_recompile_across_batches() -> None:
         rows = workspace[1].numel()
         _prefill(q[:rows], q_scales[:rows], weights[:rows], workspace, plane)
 
-    # Warm each runtime-integer specialization class: q_len 1 and not, and
-    # table widths / workspace sizes divisible by 16 and not.
+    # Warm every int specialization: q_len 1 or not, widths divisible by 16 or not.
     decode([64 * 16], 1)
     decode([64 * 16 + 1], 4)
     decode([64 * 17], 1)

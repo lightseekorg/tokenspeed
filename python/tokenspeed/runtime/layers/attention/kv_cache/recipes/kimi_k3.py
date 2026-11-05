@@ -207,9 +207,7 @@ class KimiK3Recipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        # A draft adds MLA planes of its own, and K3.1 adds index-K planes
-        # that a parent held by a KDA state group leaves empty; the
-        # target-only bound would reject the wider arena either implies.
+        # Draft MLA and K3.1 index-K planes widen the arena past the target-only bound.
         if self.num_draft_layers or self.num_index_k_planes:
             return float("inf")
         return 0.25
@@ -271,9 +269,7 @@ class KimiK3Recipe(CacheRecipe):
                 scatter_stored_dtype_name(config.kv_cache_dtype),
             )
             if isinstance(spec, DSAConfig):
-                # The DSA indexer's keys: a plane of their own (the latent
-                # plane's page stride must stay its payload), in the
-                # full-attention group so they live and move with the latent.
+                # Own plane (latent stride = payload), same group: moves with latent.
                 return (
                     latent,
                     index_k_field(config, self.prefix_granularity, layer_id),
@@ -302,8 +298,7 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
-        # The latent page of the first MLA layer: the bytes the KDA state
-        # rides beside in plane slot.0 (index-K planes hold no state).
+        # First MLA layer's latent page: KDA state rides beside it in plane slot.0.
         mla_page_bytes = sum(
             field.payload_bytes
             for field in fields_by_group[FULL_ATTENTION]

@@ -177,9 +177,7 @@ def configure_kimi_k31_attention(model_config, server_args: ServerArgs) -> None:
     """
     configure_dsa_attention(model_config, server_args)
     model_config.index_k_format = "fp8_scaled"
-    # Every DSA operation of K3.1 runs in KimiK31SparseMLAAttention.
-    # _sparse_attention, one eager break that narrows a padded prefill-graph
-    # replay to its live rows (GlmDsaSparseAttentionMixin.forward_dsa_core).
+    # K3.1 keeps all DSA ops in one eager break narrowing padded replays to live rows.
     model_config.dsa_padded_prefill_replay = True
 
 
@@ -501,8 +499,7 @@ _ATTENTION_FAMILY_SPECS = (
         default_backend="dsa",
     ),
     _AttentionFamilySpec(
-        # Kimi-K3.1: K3's MLA layers plus a DSA indexer. The hybrid resolver
-        # picks the "dsa" leaf under the KDA wrapper (layers/attention/registry.py).
+        # K3's MLA plus a DSA indexer: the hybrid resolver picks the dsa leaf under KDA.
         name="Kimi-K3.1",
         architectures=frozenset({"KimiK31ForConditionalGeneration"}),
         configure=configure_kimi_k31_attention,
@@ -903,13 +900,7 @@ class ModelConfig:
         # hook names it (configure_dsa_attention: "fp8_scaled"); None for a
         # model without an indexer, and DSAConfig refuses None.
         self.index_k_format: str | None = None
-        # Whether the DSA model keeps every DSA operation in one eager break
-        # that narrows a padded prefill-graph replay to its live rows, so its
-        # DSA leaf may admit breakable prefill graphs (DSAConfig's
-        # padded_prefill_replay, on the prefill and aggregated roles). Set by
-        # that model's configure-attention hook. A checkpoint fact, the same on
-        # every rank, so the aggregated role's boot keys its cross-rank prefill
-        # graph plan check on it (build_device_side).
+        # Rank-uniform: all DSA ops run in one eager break that narrows padded replays.
         self.dsa_padded_prefill_replay: bool = False
 
         # MLA/DSA families carry per-head dimension metadata that does not

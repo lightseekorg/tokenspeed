@@ -163,8 +163,7 @@ def _sanitize_for_store(x, MAX_FINITE: tl.constexpr):
     return tl.minimum(tl.maximum(x, -MAX_FINITE), MAX_FINITE)
 
 
-# The token count follows the batch: unspecialized, so a count of 1 or a
-# multiple of 16 reuses its token tile's binary.
+# num_tokens is unspecialized so counts of 1 or multiples of 16 share one binary.
 @triton.jit(do_not_specialize=["num_tokens"])
 def _mla_rope_set_kv_buffer_kernel(
     q_rope_ptr,

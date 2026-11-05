@@ -134,8 +134,7 @@ def _check_topk_reduce(
         assert state.can_reduce_moe_topk_partials(tuple(t.shape for t in outputs))
         return state.reduce_moe(outputs, routed_partials=slots)
 
-    # Plain and partial-summing reductions share the mailbox tiles: interleave
-    # them at changing row counts, one-shot (1-7 rows) and two-shot (even 8-64).
+    # Plain and partial-sum reduces share mailbox tiles: interleave one- and two-shot.
     for seed, rows in enumerate((4, 1, 8, 7, 64, 6, 16, 3, 2, 32, 5, 10, 4, 48)):
         expected = [t.clone() for t in separate(rows, seed)]
         result = fused(rows, seed)

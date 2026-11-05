@@ -301,8 +301,7 @@ _HYBRID_MAMBA2_ARCHITECTURES = {
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
-# Kimi-K3.1: the K3 layout (KDA linear layers, the kimi_k3 cache family) whose
-# full-attention layers run DSA sparse MLA instead of dense MLA.
+# Kimi-K3.1: the K3 layout with DSA sparse MLA on its full-attention layers.
 _HYBRID_KIMI_DSA_KDA_ARCHITECTURES = {
     "KimiK31ForConditionalGeneration",
 }
@@ -341,9 +340,7 @@ class _AttnSideProfile:
     # subset of ``is_kda`` that selects the DSA history consumer and the
     # glm53_flash cache family.
     is_dsa_kda: bool
-    # KDA hybrid on the kimi_k3 cache family whose full-attention layers are
-    # DSA (Kimi-K3.1); a subset of ``is_kda`` that selects the DSA history
-    # consumer only.
+    # Kimi-K3.1: subset of is_kda that selects only the DSA history consumer.
     is_kimi_dsa_kda: bool
     is_qwen4_exp: bool
     is_qsa: bool

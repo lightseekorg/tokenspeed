@@ -94,8 +94,7 @@ def _k3moe_gather_send(
     # One subgroup stages each K step of the latent, eight elements a lane.
     gl.static_assert(STEPS <= NUM_WARPS and BLOCK_K == 8 * 64)
 
-    # Issue the whole weight block first: the cold loads overlap the latent
-    # staging instead of serializing one K step at a time.
+    # Issue all weight loads first so the cold loads overlap the latent staging.
     weights = ()
     for step in gl.static_range(STEPS):
         weights += (
@@ -132,8 +131,7 @@ def _k3moe_gather_send(
     # OUTPUTS divides the 512-element tile, so one store never spans two stages.
     stage = gl.load(epochs + elements // 512, mask=valid, other=0).to(gl.uint32) % 3
 
-    # Stage the (normalized) BF16 latent rows in LDS once per program:
-    # subgroup s loads K step s of every row.
+    # Stage the BF16 latent rows in LDS once per program; subgroup s loads K step s.
     latent_layout: gl.constexpr = gl.BlockedLayout(
         [1, 1, 8], [1, 1, 64], [NUM_WARPS, 1, 1], [2, 1, 0]
     )
@@ -158,8 +156,7 @@ def _k3moe_gather_send(
         other=0.0,
     )
     if HAS_NORM:
-        # The same FP32 operations as the Triton RMSNorm: mean of squares,
-        # rsqrt, scale, weight, one BF16 rounding. Only the sum order differs.
+        # Triton RMSNorm's FP32 ops and one BF16 rounding; only the sum order differs.
         x = latent.to(gl.float32)
         inverse_rms = gl.rsqrt(gl.sum(gl.sum(x * x, axis=2), axis=0) / K + eps)
         weight_steps = gl.arange(
@@ -188,8 +185,7 @@ def _k3moe_gather_send(
         accumulator += x[:, None, :] * weights[step].to(gl.float32)[None, :, :]
     sums = gl.sum(accumulator, axis=2)
 
-    # Add the residual and the shared output before the one BF16 rounding, in
-    # the fused MFMA add3 epilogue's order.
+    # Add residual then shared output before one BF16 rounding, as the add3 epilogue.
     sums = gl.convert_layout(sums, store_layout)
     sums += prefix.to(gl.float32)
     sums += shared.to(gl.float32)
@@ -258,11 +254,7 @@ def _k3moe_mfma_send(
     dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=8)
     dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=8)
 
-    # The norm weight, latent and epilogue operands load first: they come from
-    # L2, and loads complete in order, so behind the weights the norm would
-    # wait for the whole block. Every row uses the same norm weight, so it is
-    # copied to LDS once (subgroup s copies K step s) and read back per step,
-    # where an operand-layout load would fetch it for each of the 16 rows.
+    # L2 operands load before the weights, as loads complete in order; norm via LDS.
     if HAS_NORM:
         norm_layout: gl.constexpr = gl.BlockedLayout(
             [1, 1, 8], [8, 1, 8], [1, 1, NUM_WARPS], [2, 1, 0]
@@ -286,8 +278,7 @@ def _k3moe_mfma_send(
                 n_offsets + step * NUM_WARPS * CHUNK,
             )
         gl.amd.cdna4.async_copy.commit_group()
-    # Every lane stores whole 32-bit words, so the reducers' empty test stays
-    # exact.
+    # Every lane stores whole 32-bit words, so the reducers' empty test stays exact.
     store_layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [16, 4], [NUM_WARPS, 1], [1, 0]
     )
@@ -313,15 +304,12 @@ def _k3moe_mfma_send(
         mask=valid,
         other=0.0,
     )
-    # The tile is one contiguous 256-element block of the slot, so each peer
-    # receives 512-byte stores; it lies within one 512-element Lamport tile.
+    # One contiguous 256-element tile: 512-byte stores per peer, in one Lamport tile.
     block = program * 256
     elements = block + tile_rows[:, None] * 16 + tile_columns[None, :]
     stage = gl.load(epochs + block // 512).to(gl.uint32) % 3
 
-    # A[s, m, k] is latent row first_row + m at the same K positions. It loads
-    # as whole 128-byte lines of eight rows and moves to the operand layout
-    # through LDS; operand-layout loads read half lines of sixteen rows.
+    # Load latent as whole 128-byte lines and move it to the operand layout through LDS.
     latent_layout: gl.constexpr = gl.BlockedLayout(
         [1, 1, 8], [1, 8, 8], [NUM_WARPS, 1, 1], [2, 1, 0]
     )
@@ -335,8 +323,7 @@ def _k3moe_mfma_send(
         0, CHUNK, layout=gl.SliceLayout(0, gl.SliceLayout(1, latent_layout))
     )
     k_offsets = a_slices[:, None, None] * CHUNK + a_k[None, None, :]
-    # Rows past M repeat row M - 1 rather than masking every element; their
-    # outputs are never stored, and rows do not mix in the projection.
+    # Rows past M repeat row M - 1 instead of masking; rows never mix or get stored.
     a_rows = gl.minimum(a_rows, M - 1)
     # Strides are multiples of eight elements, so row loads stay 16-byte vectors.
     a_offsets = (
@@ -351,10 +338,7 @@ def _k3moe_mfma_send(
     for step in gl.static_range(STEPS):
         operands += (gl.convert_layout(latent[step], dot_a),)
     latent = operands
-    # B[s, k, n] is weight row first_column + n at K step * NUM_WARPS * CHUNK
-    # + s * CHUNK + k. The whole block is copied to LDS before the norm runs:
-    # each copy instruction reads whole 128-byte lines of eight weight rows,
-    # where operand-layout loads would read half lines of sixteen.
+    # Copy the weight block to LDS in whole 128-byte lines before the norm runs.
     gl.static_assert(CHUNK == 64)
     copy_layout: gl.constexpr = gl.BlockedLayout(
         [1, 8, 1], [1, 8, 8], [NUM_WARPS, 1, 1], [1, 2, 0]
@@ -390,8 +374,7 @@ def _k3moe_mfma_send(
         gl.amd.cdna4.async_copy.commit_group()
 
     if HAS_NORM:
-        # The same FP32 operations as the Triton RMSNorm: mean of squares,
-        # rsqrt, scale, weight, one BF16 rounding. Only the sum order differs.
+        # Triton RMSNorm's FP32 ops and one BF16 rounding; only the sum order differs.
         gl.amd.cdna4.async_copy.wait_group(STEPS)
         gl.barrier()
         squares = gl.zeros((NUM_WARPS, 16), gl.float32, gl.SliceLayout(2, dot_a))
@@ -422,8 +405,7 @@ def _k3moe_mfma_send(
         accumulator = gl.amd.cdna4.mfma(latent[step], weights, accumulator)
     sums = gl.convert_layout(gl.sum(accumulator, axis=0), store_layout)
 
-    # Add the residual and the shared output before the one BF16 rounding, in
-    # the fused MFMA add3 epilogue's order.
+    # Add residual then shared output before one BF16 rounding, as the add3 epilogue.
     sums += prefix.to(gl.float32)
     sums += shared.to(gl.float32)
     values = _iris_sanitize_lamport_bf16(sums.to(gl.bfloat16))
@@ -463,8 +445,7 @@ def _k3moe_gather_reduce(
     gl.static_assert(ROW_STRIDE == 1024 and LOCAL_WIDTH <= ROW_STRIDE)
     SLOT_WORDS: gl.constexpr = ROW_STRIDE // 2
     WORDS: gl.constexpr = SLOT_WORDS // 64
-    # Thread t polls WORDS consecutive words of slot t // 64, so a retry
-    # checks its own registers and votes with one lane mask.
+    # Thread t polls WORDS words of slot t // 64, so a retry votes with one lane mask.
     layout: gl.constexpr = gl.BlockedLayout([1, WORDS], [64, 1], [NUM_WARPS, 1], [1, 0])
     thread = gl.arange(0, 64 * NUM_WARPS, layout=gl.SliceLayout(1, layout))
     word = gl.arange(0, WORDS, layout=gl.SliceLayout(0, layout))
@@ -484,8 +465,7 @@ def _k3moe_gather_reduce(
     )
     mailbox = gl.multiple_of(base, WORDS)[:, None] + word[None, :]
     words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
-    # Payloads never hold negative zero and 32-bit words are written whole, so
-    # a word is empty exactly when its high half is 0x8000.
+    # Payloads exclude -0.0 and words are whole, so a high half of 0x8000 means empty.
     payload = gl.amd.cdna4.buffer_load(
         words_ptr, mailbox, mask=valid, other=0, cache=".cv"
     )
@@ -506,8 +486,7 @@ def _k3moe_gather_reduce(
         (gl.multiple_of(out_base, WORDS)[:, None] + word[None, :]).to(gl.int32),
         mask=valid,
     )
-    # Every subgroup has left its poll, so every local sender has read this
-    # row's stages before pushing an own-slot word.
+    # All subgroups have left the poll, so local senders have read this row's stages.
     gl.barrier()
     gl.store(epochs + tile, ((low_stage + 1) % 3).to(gl.int32))
     gl.store(epochs + tile + 1, ((high_stage + 1) % 3).to(gl.int32))
@@ -536,9 +515,7 @@ def _k3moe_tile_gather_reduce(
     gl.static_assert(NUM_WARPS == WORLD_SIZE)
     gl.static_assert((16 * LOCAL_WIDTH) % 1024 == 0)
     REDUCERS_PER_ROW_TILE: gl.constexpr = 16 * LOCAL_WIDTH // 1024
-    # Thread t polls the 8 words (one 16-element tile row) of slot t // 64 at
-    # its own position, so a retry checks its own registers and votes with
-    # one lane mask.
+    # Thread t polls 8 words of slot t // 64, so a retry votes with one lane mask.
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [NUM_WARPS, 1], [1, 0])
     thread = gl.arange(0, 64 * NUM_WARPS, layout=gl.SliceLayout(1, layout))
     word = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
@@ -561,8 +538,7 @@ def _k3moe_tile_gather_reduce(
     )
     mailbox = gl.multiple_of(base, 8)[:, None] + word[None, :]
     words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
-    # Payloads never hold negative zero and 32-bit words are written whole, so
-    # a word is empty exactly when its high half is 0x8000.
+    # Payloads exclude -0.0 and words are whole, so a high half of 0x8000 means empty.
     payload = gl.amd.cdna4.buffer_load(
         words_ptr, mailbox, mask=valid, other=0, cache=".cv"
     )
@@ -583,8 +559,7 @@ def _k3moe_tile_gather_reduce(
         (gl.multiple_of(out_base, 8)[:, None] + word[None, :]).to(gl.int32),
         mask=valid,
     )
-    # Every subgroup has left its poll, so every local sender has read this
-    # block's stage before pushing an own-slot word.
+    # All subgroups have left the poll, so local senders have read this block's stage.
     gl.barrier()
     gl.store(epochs + tile, ((low_stage + 1) % 3).to(gl.int32))
     gl.store(epochs + tile + 1, ((high_stage + 1) % 3).to(gl.int32))
@@ -638,8 +613,7 @@ def iris_k3moe_gemv_lamport_gather(
     gl.static_assert(BLOCK_K % (64 * WAVES_PER_OUTPUT) == 0)
     gl.static_assert(BLOCK_M * ROW_STRIDE <= MAX_ELEMENTS)
     program = gl.program_id(0)
-    # The reducers are the last programs so every sender dispatches before
-    # any of them spins.
+    # Reducers are the last programs, so every sender dispatches before they spin.
     if program >= LOCAL_WIDTH // OUTPUTS:
         _k3moe_gather_reduce(
             region,
@@ -721,8 +695,7 @@ def iris_k3moe_mfma_lamport_gather(
     gl.static_assert(LOCAL_WIDTH % 32 == 0)
     senders = (LOCAL_WIDTH // 16) * ((M + 15) // 16)
     program = gl.program_id(0)
-    # The reducers are the last programs so every sender dispatches before
-    # any of them spins.
+    # Reducers are the last programs, so every sender dispatches before they spin.
     if program >= senders:
         _k3moe_tile_gather_reduce(
             region,

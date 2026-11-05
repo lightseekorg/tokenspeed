@@ -978,8 +978,7 @@ def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
 def test_dsa_decode_topk_orders_keys_sharing_the_threshold_prefix(
     tied_keys: int,
 ) -> None:
-    # The k-th largest value sits among `tied_keys` values one ulp apart, so
-    # 24 key bits leave them tied and only their low bits order the selection.
+    # The k-th value is among keys one ulp apart, tied on 24 bits, ordered by low bits.
     page_size = 64
     cols = 16384
     topk = 2048
@@ -1032,8 +1031,7 @@ def test_dsa_decode_topk_orders_keys_sharing_the_threshold_prefix(
     torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
 
 
-# Indexer logits crowd a few sign/exponent prefixes, so the first radix pass
-# piles most of a row into one or two buckets.
+# Indexer logits crowd few exponents, so the first radix pass fills one or two buckets.
 _DECODE_TOPK_DISTRIBUTIONS = {
     "spread": (1.0, 0.0),
     "crowded": (0.5, -30.0),
@@ -1051,8 +1049,7 @@ def test_dsa_decode_topk_selects_largest_values_on_ragged_rows(
     topk = 2048
     max_pages = 512
     cols = max_pages * page_size
-    # Exact tiles, a lone full tile before a tail, tails ending off a 4-element
-    # boundary, tail-only rows, and rows at or under topk.
+    # Exact tiles, tile plus tail, tails off a 4-element boundary, tail-only, <= topk.
     length_sets = (
         (32768, 24581, 16383, 8197, 4099, 2050),
         (32765, 16384, 24579, 12290, 8191, 2049),
@@ -1139,8 +1136,7 @@ def _multi_cta_topk_logits(
         # Exact ties everywhere, so many keys equal the k-th value.
         return torch.randint(0, 64, (rows, cols), device="cuda", generator=gen).float()
     if distribution == "ulp_ties":
-        # 3000 keys one ulp apart above a low floor: the k-th value shares its
-        # 24-bit prefix with a few others and only the low bits order them.
+        # Keys one ulp apart: the k-th shares a 24-bit prefix; low bits order them.
         logits = -3.0 - torch.rand((rows, cols), device="cuda", generator=gen)
         tied = (
             torch.randint(0, 200, (rows, 3000), device="cuda", generator=gen).int()
@@ -1210,9 +1206,7 @@ def _check_decode_topk_selection(
 def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
     rows: int, cols: int, distribution: str
 ) -> None:
-    # Rows up to _MULTI_CTA_MAX_ROWS spread over many CTAs. Every row must
-    # select the largest values, and the same columns as the one-block kernel
-    # unless the k-th value is tied.
+    # Multi-CTA rows match the one-block kernel's columns unless the k-th value is tied.
     page_size = 64
     topk = 2048
     q_len_per_req = 4 if rows % 4 == 0 else 1
@@ -1223,8 +1217,7 @@ def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
         rows, cols, topk, torch.device("cuda"), is_decode=True
     )
     assert plan.kind == "multi-cta"
-    # Full rows, rows past the first 65536 columns, crowded tails, and rows at
-    # or under topk.
+    # Full rows, rows past 65536 columns, crowded tails, and rows at or under topk.
     lengths = (cols, 50004, cols - 3, 32765, 8191, 4099, 2050, 2049)[:reqs]
     if reqs > len(lengths):
         lengths += tuple(
@@ -1300,9 +1293,7 @@ def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
 
 @pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
 def test_dsa_decode_topk_multi_cta_reuses_its_kernels_across_batches() -> None:
-    # Row counts within a width class and the per-row lengths are runtime
-    # values of the multi-CTA kernels; its workspace restores itself to zero
-    # after every call, so repeated calls keep selecting correctly.
+    # Rows and lengths are runtime values; the workspace re-zeroes after every call.
     page_size = 64
     topk = 2048
     cols = 65536
@@ -1362,8 +1353,7 @@ def test_dsa_decode_topk_multi_cta_reuses_its_kernels_across_batches() -> None:
 def test_dsa_decode_topk_short_logits_select_largest_values(
     rows: int, cols: int
 ) -> None:
-    # Short decode logits keep the one-block kernel even for small batches;
-    # every row, including rows at or under topk, selects its largest values.
+    # Short logits keep the one-block kernel at small batches, rows <= topk included.
     page_size = 64
     topk = 2048
     q_len_per_req = 4 if rows % 4 == 0 else 1
@@ -2376,8 +2366,7 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
     reason="the split dense kernel is specific to gfx950",
 )
 def test_dsa_dense_split_count_changes_reuse_one_binary() -> None:
-    # Off the tuned 16-head schedule, the generic occupancy heuristic picks a
-    # different split count for each of these batch sizes (32, 26, 16, 8, 4).
+    # Off the tuned 16-head schedule, each batch size here gets a different split count.
     device = "cuda"
     num_heads = 12
     num_slots = 4096
