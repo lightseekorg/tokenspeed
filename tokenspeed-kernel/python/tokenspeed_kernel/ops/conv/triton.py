@@ -146,13 +146,13 @@ def triton_causal_conv1d_prefill(
         Read-only program mapping built once with this forward's sequence
         boundaries and shared by all recurrent-attention layers.
 
-    out: same shape as `x`
+    out: same shape as `x`, with contiguous channels in each token row
     """
     enable_pdl = pdl_enabled()
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
+    out = torch.empty((x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device).T
     batch_ptr = prefill_metadata.batch_indices
     token_chunk_offset_ptr = prefill_metadata.chunk_offsets
     if batch_ptr.device != x.device or token_chunk_offset_ptr.device != x.device:

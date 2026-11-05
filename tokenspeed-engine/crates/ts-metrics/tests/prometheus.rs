@@ -77,12 +77,25 @@ fn run_scenario(directory: &Path) {
     engine.record_preemptions(2);
     engine.observe_request_queue_time(0.4);
     engine.observe_request_queue_time(9000.0);
+    engine.record_cache_occupancy(12, 8, 40, 647);
+    engine.record_prefill_queues(1, 2, 0);
+    engine.record_decode_queues(3, 4, 1);
+    engine.record_generation_tokens(25);
+    engine.record_request_tokens(100, 40);
+    engine.observe_time_to_first_token(0.25);
+    engine.observe_request_time(1.5);
+    engine.observe_decode_time(1.2);
+    engine.observe_time_per_output_token(0.02);
+    engine.record_completion_tokens(5);
+    engine.record_grammar_queue(2);
+    engine.record_prefix_hits(100, 40, 30, 10);
 
     let transfer = KvTransferMetrics::new(&exporter, "m", "");
     transfer.observe_latency(0.003);
     transfer.record_timeout("bootstrapping");
     transfer.record_timeout("waiting_for_input");
     transfer.record_failure();
+    transfer.record_size(4096);
 }
 
 #[test]

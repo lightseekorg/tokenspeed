@@ -368,3 +368,19 @@ def test_prometheus_only_ignores_optional_plugin_sink():
         registry.get_sample_value("tokenspeed:request_queue_time_seconds_count", LABELS)
         == 1
     )
+
+
+def test_memory_sampler_logs_unavailable_device(caplog):
+    from tokenspeed.runtime.engine.rust_host import MemoryMetricSampler, logger
+
+    sink = ListSink()
+    sampler = MemoryMetricSampler(
+        sink=sink, model_name="m", app_key="k", dp_rank=0, gpu_id=0, device="invalid"
+    )
+    logger.addHandler(caplog.handler)
+    try:
+        sampler.run()
+    finally:
+        logger.removeHandler(caplog.handler)
+    assert "Cannot initialize memory metrics for invalid" in caplog.text
+    assert not sink.events
