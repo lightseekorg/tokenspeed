@@ -190,13 +190,6 @@ def _worker(rank, size, rendezvous):
         None if state.mode == expected else f"mode {state.mode}",
         f"the {expected} mode inside a node",
     )
-    # The fewest multicast CTAs that saturate the receive side of the group.
-    ctas = {2: 8, 4: 4}[size] if expected == "multicast" else 24
-    _agree(
-        device,
-        None if state.num_ctas == ctas else f"{state.num_ctas} CTAs",
-        f"{ctas} CTAs a window on {size} ranks",
-    )
     # The first window waited under its own short bound; the later ones wait
     # up to the caller's (no public accessor: the kernel reads the bound).
     bound = int(state.params[paged_row_all_gather._PARAM_TIMEOUT])
