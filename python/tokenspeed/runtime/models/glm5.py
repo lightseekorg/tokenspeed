@@ -1147,6 +1147,8 @@ class GlmDsaSparseAttentionMixin:
         ctx: ForwardContext,
         comm_manager: CommManager,
         output_gate: torch.Tensor | None = None,
+        projected_q: torch.Tensor | None = None,
+        index_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """DSA sparse MLA after the a-projections: the indexer and its index-K
         write, the shared prefill/decode top-k, then the sparse prefill and
@@ -1164,6 +1166,10 @@ class GlmDsaSparseAttentionMixin:
             comm_manager: The layer's attention communication.
             output_gate: Optional raw ``[T, num_local_heads * v_head_dim]``
                 sigmoid gate the value projection applies; decode rounds only.
+            projected_q: Optional ``q_b_proj(q_norm)`` rows a caller projected
+                ahead; None projects them here.
+            index_query: Optional ``[T, index_heads, index_head_dim]`` index
+                query a caller projected ahead; None leaves the indexer's.
 
         Returns:
             ``[T, num_local_heads * v_head_dim]`` attention output before
@@ -1182,8 +1188,16 @@ class GlmDsaSparseAttentionMixin:
                 raise RuntimeError(
                     "padded DSA replay needs an identity pre-attention comm"
                 )
-            positions, q_norm, latent_cache, output_gate = slice_to_real_tokens(
-                valid_rows, positions, q_norm, latent_cache, output_gate
+            positions, q_norm, latent_cache, output_gate, projected_q, index_query = (
+                slice_to_real_tokens(
+                    valid_rows,
+                    positions,
+                    q_norm,
+                    latent_cache,
+                    output_gate,
+                    projected_q,
+                    index_query,
+                )
             )
             num_attn_tokens = valid_rows
         decode_window = self._resolve_decode_window(
@@ -1241,6 +1255,10 @@ class GlmDsaSparseAttentionMixin:
             if valid_rows is not None:
                 (hidden_states,) = slice_to_real_tokens(num_attn_tokens, hidden_states)
             indexer_output = self.indexer(hidden_states, q_norm, positions)
+            if index_query is not None:
+                indexer_output = replace(
+                    indexer_output, query=index_query, query_proj=None
+                )
             index_slots, index_mask = resolve_cache_slots(
                 out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
             )
@@ -1263,7 +1281,7 @@ class GlmDsaSparseAttentionMixin:
                     ctx,
                 )
 
-        q = self.q_b_proj(q_norm)[0]
+        q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
