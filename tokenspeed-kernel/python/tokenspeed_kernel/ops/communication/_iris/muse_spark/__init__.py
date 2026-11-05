@@ -101,11 +101,12 @@ _MUSE_TOPK = 8
 _MUSE_ROUTE_WIDTH = 4096
 _MUSE_EXPERTS = 256
 _MUSE_INTERMEDIATE = 4096
-# 8-rank gather of an 8192-token prefill's intermediate: 355 us with 48-64
-# programs, 575 us with 256 (more concurrent peer reads slowed the links).
+# In an 8-rank gather of an 8192-token prefill's intermediate, 48-64
+# programs were fastest; 256 were slower (more concurrent peer reads slowed
+# the links).
 _MUSE_INTERMEDIATE_GATHER_PROGRAMS = 64
-# The routed norm is latency bound: 256 programs were within 8% of the best
-# grid from 192 to 8192 tokens.
+# The routed norm is latency bound: 256 programs were close to the best grid
+# from 192 to 8192 tokens.
 _MUSE_COLUMN_NORM_PROGRAMS = 256
 # Most decode rows for the fused post-expert tail at TP8; it lost to the
 # replicated projection plus boundary at 16 rows in 8-rank graph replay.
