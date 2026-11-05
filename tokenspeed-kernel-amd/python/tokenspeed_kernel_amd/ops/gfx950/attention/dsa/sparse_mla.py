@@ -434,6 +434,18 @@ def _dsa_persistent_radix_topk_kernel(
             sem="relaxed",
             scope="gpu",
         )
+        # Every wave added to the row histogram, but one thread arrives for
+        # the whole program, and s_barrier does not wait for memory. So each
+        # wave first waits until its no-return atomics reach L2 (vmcnt counts
+        # them like stores).
+        gl.inline_asm_elementwise(
+            asm="s_waitcnt vmcnt(0)",
+            constraints="=r,~{memory}",
+            args=[],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
         gl.barrier()
 
         row_pass_arrival = pass_arrivals + row * _PERSISTENT_COUNTER_STRIDE
