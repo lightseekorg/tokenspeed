@@ -425,20 +425,28 @@ def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk
 @pytest.mark.parametrize("degree", [2, 3, 4, 8])
 @pytest.mark.parametrize("rows,q_len", [(1, 1), (7, 1), (64, 4)])
 @pytest.mark.parametrize("topk", [512, 2048])
-@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("band", ["uniform", "tied", "narrow", "single"])
 def test_owned_selection_is_each_ranks_share_of_the_merge(
-    solution, degree, rows, q_len, topk, tied
+    solution, degree, rows, q_len, topk, band
 ):
     table, virtual_blocks, positions, scores = _owned_candidates(
         degree, rows, q_len, topk, seed=degree * 1000 + rows + topk
     )
-    if tied:
+    if band == "tied":
         # The cutoff falls inside a tied group that spans the ranks.
         generator = torch.Generator(device="cuda").manual_seed(rows + topk)
         ties = torch.randint(
             0, 8, scores.shape, device="cuda", generator=generator
         ).float()
         scores = torch.where(positions < 0, scores, ties)
+    elif band == "narrow":
+        # Scores sharing their sign, exponent and leading mantissa bits,
+        # beside the mandatory, zero and NaN ones.
+        scores = torch.where(
+            scores.isfinite() & (scores > 0), 5 + scores * 1e-3, scores
+        )
+    elif band == "single":
+        scores = torch.where(positions < 0, scores, 2.5)
     expected = _merged_then_compacted(
         table, virtual_blocks, positions, scores, q_len, topk
     )
