@@ -20,7 +20,8 @@
 
 """DFLASH + DFlash2 under ``--enable-speculative-sampling``: the sparse draft q
 the walk records in ``RuntimeStates.future_draft_q``, its reset on admission,
-and the drafter's binding to the triton verifier."""
+and the drafter's binding to the triton verifier. DSpark, the other block
+drafter, keeps the step drafters' dense q and shared sampler."""
 
 from __future__ import annotations
 
@@ -43,10 +44,17 @@ from tokenspeed_kernel.ops.sampling.triton.common import (  # noqa: E402
     TOP_K_DISABLED,
 )
 
+from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.drafter.dflash import DFlash  # noqa: E402
 from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2  # noqa: E402
+from tokenspeed.runtime.execution.drafter.dspark import DSpark  # noqa: E402
+from tokenspeed.runtime.execution.drafter.speculative_sampling import (  # noqa: E402
+    DraftProposalSampler,
+)
 from tokenspeed.runtime.execution.input_buffer import InputBuffers  # noqa: E402
+from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor  # noqa: E402
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     SamplingBackendConfig,
     SpeculativeSamplingPools,
@@ -236,6 +244,9 @@ def test_base_dflash_refuses_the_flag_at_bind():
     # Base DFLASH (no candidate selector) proposes the argmax of every block
     # row; only the loaded checkpoint tells it apart from DFlash2.
     drafter = DFlash.__new__(DFlash)
+    drafter.runtime_states = RuntimeStates(
+        req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device="cpu"
+    )
     with pytest.raises(ValueError, match="needs a DFlash2 draft"):
         drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=True))
     drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=False))
@@ -294,6 +305,49 @@ def test_dflash2_without_the_flag_keeps_the_greedy_walk():
     assert states.future_draft_q is None
     assert drafter._draft_q is None
     assert drafter._walk_pools.top_k.tolist() == [1]
+
+
+def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
+    # DSpark samples its Markov steps from full-vocab logits through the
+    # shared draft sampler; only DFLASH (DFlash2) records a sparse q instead.
+    executor = ModelExecutor.__new__(ModelExecutor)
+    for spec_algo, dense in (("DFLASH", False), ("DSPARK", True)):
+        executor.runtime_states = RuntimeStates(
+            req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device="cpu"
+        )
+        # ModelExecutorConfig has no CPU-buildable instance; these are the
+        # fields the allocation reads.
+        config = SimpleNamespace(
+            enable_speculative_sampling=True,
+            spec_draft_tree=False,
+            spec_algo=spec_algo,
+            spec_reject_draft_prob_threshold=2.0,
+        )
+        executor._init_draft_probs(config, N)
+        assert (executor.runtime_states.draft_probs is not None) == dense
+
+    drafter = DSpark.__new__(DSpark)
+    BaseDrafter.__init__(
+        drafter,
+        spec_num_tokens=N,
+        runtime_states=executor.runtime_states,
+        input_buffers=InputBuffers(
+            max_bs=MAX_BS,
+            max_num_tokens=MAX_BS * N,
+            state_write_padding_pool_index=POOL,
+            device="cpu",
+        ),
+    )
+    drafter.logits_processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=VOCAB), do_argmax=True, dp_lm_head_tp=False
+    )
+
+    drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=True))
+
+    # Without the sampler the Markov steps would propose argmax blocks and
+    # record no q, so verify would reject every draft.
+    assert isinstance(drafter.draft_sampler, DraftProposalSampler)
+    assert not drafter.logits_processor.do_argmax
 
 
 if __name__ == "__main__":
