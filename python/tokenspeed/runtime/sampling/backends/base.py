@@ -69,7 +69,6 @@ class SpeculativeSamplingPools:
 
 @dataclass
 class SamplingBackendConfig:
-
     synthetic_acceptance_length: float | None
     # Draft-prob rejection sampling: verify gathers the drafter's recorded
     # distributions by pool index into a persistent [max_pad_bs, N, vocab]
@@ -254,6 +253,14 @@ class SamplingBackend(ABC):
         if self._HAS_POOL_STATE:
             pool_rows = config.max_req_pool_size + 1
             self._last_rid_per_slot: list[str | None] = [None] * pool_rows
+            # Batch-composition version: prepare_step bumps it whenever the
+            # serving batch's membership can change — a slot flip (new
+            # request in a slot) or a size change (a retraction departs
+            # without flipping anything). Batch-aggregate facts that depend
+            # only on the mix (the Triton route/pad) cache against it and
+            # recompute only on a bump.
+            self._batch_composition_epoch: int = 0
+            self._last_step_bs: int | None = None
 
         # Pool-indexed kernels (the Triton Gumbel-max routes, the FlashInfer
         # backends' per-request stream) take int32 pool indices and a
@@ -464,6 +471,8 @@ class SamplingBackend(ABC):
         )
 
         pool_rows = len(self._last_rid_per_slot)
+        batch_size = len(request_pool_indices)
+        membership_changed = batch_size != self._last_step_bs
         for rid, pool_idx, sp in zip(
             request_ids, request_pool_indices, sampling_params_list
         ):
@@ -473,6 +482,10 @@ class SamplingBackend(ABC):
             if self._last_rid_per_slot[pool_idx] != rid:
                 self._reset_slot(pool_idx, sp)
                 self._last_rid_per_slot[pool_idx] = rid
+                membership_changed = True
+        if membership_changed:
+            self._batch_composition_epoch += 1
+        self._last_step_bs = batch_size
 
         self._prepare_step_hook(
             num_tokens_per_req=num_tokens_per_req,
