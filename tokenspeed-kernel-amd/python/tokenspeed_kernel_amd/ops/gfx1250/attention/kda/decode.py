@@ -50,7 +50,7 @@ def _kda_value_splits(batch: int) -> int:
 
 
 def _kda_verify_panel_rows(value_splits: int) -> int:
-    """Value rows a verify program updates per step of its panel loop.
+    """Return the value rows a verify program updates per step of its panel loop.
 
     A program walks its panels in series, so each split owns one panel of
     its share of the head. A program that owns a whole head walks two 64-row
