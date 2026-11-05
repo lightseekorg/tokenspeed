@@ -208,3 +208,34 @@ def test_gluon_owned_page_scorer_grouped_rows_match_single_rows(heads, device):
         scores.copy_(scores.gather(1, order))
     for actual, expected in zip(grouped, single, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gluon_owned_page_scorer_writes_scores_into_a_send_buffer(device):
+    table, requests, lens, q, q_scales, weights, cache, _ = _inputs(32, 4, device)
+    rows, topk = requests.numel(), 256
+    kwargs = dict(
+        page_size=PAGE_SIZE,
+        topk=topk,
+        softmax_scale=0.1,
+        initial_tokens=0,
+        local_tokens=0,
+        solution=None,
+        q_scales=q_scales,
+        query_group_size=4,
+    )
+    offsets, scores = dsa_index_candidates(
+        q, weights, cache, table, requests, lens, **kwargs
+    )
+    # The scores' share of a wider send buffer, as a collective packs it.
+    buffer = torch.full((rows * topk + 64,), float("nan"), device=device)
+    scores_out = buffer[: rows * topk].view(rows, topk)
+
+    positions, written = dsa_index_candidates(
+        q, weights, cache, table, requests, lens, scores_out=scores_out, **kwargs
+    )
+
+    assert written.data_ptr() == scores_out.data_ptr()
+    assert positions.is_contiguous()
+    torch.testing.assert_close(positions, offsets, rtol=0, atol=0)
+    torch.testing.assert_close(written, scores, rtol=0, atol=0)
+    assert buffer[rows * topk :].isnan().all()

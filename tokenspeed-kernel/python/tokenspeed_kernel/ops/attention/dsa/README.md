@@ -144,6 +144,21 @@ finds the k-th largest score with the CUDA persistent-radix `persistent_topk`,
 whose atomics pick among tied scores in arrival order, and then keeps every
 candidate above that score and the first tied ones, in candidate order.
 
+When a rank needs only its own share of that selection as local cache slots,
+`dsa_select_owned_candidates` takes the ranks' gathered FP32 score planes
+(`[degree, rows, topk]`, which a declaring `dsa_index_candidates` leaf writes
+straight into a collective's send buffer through `scores_out`) and its own
+candidate positions. Every rank finds the same k-th largest score and tie
+quota from the same planes, keeps its own candidates above the score and its
+share of the first tied ones (ranks in order, then candidate order), and
+writes `local_page_table[request, position // page_size] * page_size +
+position % page_size` in candidate order, padded with -1, with the count per
+row. That is bit for bit the merge's selection compacted to the rank's
+slots, without exchanging positions. A score plane reads an invalid
+candidate off its score, so `scores_out` holds -inf for every -1 offset. The
+Triton leaf takes a `torch.topk` of the merged planes; on gfx950 (topk 512,
+1024 or 2048) the live radix top-k skips each rank's dead tail.
+
 ## Materialized Triton row top-k
 
 `triton_topk_from_logits(logits, topk, seq_lens=..., enable_pdl=...)` selects

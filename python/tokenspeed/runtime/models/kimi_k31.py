@@ -274,6 +274,9 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self.skip_indexer_topk = False
         # The replicated indexer lets ranks split prefill top-k rows and all-gather.
         self.prefill_topk_tp_split = True
+        # No K3.1 drafter reads the target's top-k, so KVP decode can select
+        # each rank's share as local slots.
+        self.owned_decode_topk = True
         # K-major w_kc/w_vc take the grouped GEMM unless a bitwise plan is pinned.
         self.absorbed_weights_k_major = self.absorption_kernel_plan is None
         self.indexer = KimiK31Indexer(config, prefix=add_prefix("indexer", prefix))

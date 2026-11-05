@@ -701,6 +701,7 @@ if current_platform().is_amd:
 
     from tokenspeed_kernel.ops.attention.dsa import (
         INDEX_CANDIDATE_PAGES_FEATURE,
+        INDEX_CANDIDATE_SCORES_OUT_FEATURE,
         DSAIndexCandidatePages,
     )
 
@@ -709,7 +710,7 @@ if current_platform().is_amd:
         "dsa_index_candidates",
         name="gluon_dsa_index_candidates_gfx950",
         solution="gluon",
-        features={INDEX_CANDIDATE_PAGES_FEATURE},
+        features={INDEX_CANDIDATE_PAGES_FEATURE, INDEX_CANDIDATE_SCORES_OUT_FEATURE},
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
             max_arch_version=ArchVersion(9, 5),
@@ -746,6 +747,7 @@ if current_platform().is_amd:
         pages: DSAIndexCandidatePages | None = None,
         q_scales: torch.Tensor | None = None,
         query_group_size: int = 1,
+        scores_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
             compact_index_pages,
@@ -804,7 +806,12 @@ if current_platform().is_amd:
             order = torch.topk(selected, topk, dim=1).indices
             offsets = offsets.gather(1, order)
         return gather_index_candidates(
-            offsets, scores, positions, page_size, lengths=lengths
+            offsets,
+            scores,
+            positions,
+            page_size,
+            lengths=lengths,
+            scores_out=scores_out,
         )
 
     @register_kernel(
@@ -850,3 +857,56 @@ if current_platform().is_amd:
         if rows * degree <= 4 * _device_compute_units(records.device.index):
             return select_through_threshold_by_source(records, scores, order, topk=topk)
         return select_through_threshold(records, scores, order, topk=topk)
+
+    @register_kernel(
+        "attention",
+        "dsa_select_owned_candidates",
+        name="gluon_dsa_select_owned_candidates_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {format_signature(scores=dense_tensor_format(torch.float32))}
+        ),
+        traits={"topk": frozenset({512, 1024, 2048})},
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_dsa_select_owned_candidates_gfx950(
+        scores: torch.Tensor,
+        positions: torch.Tensor,
+        local_page_table: torch.Tensor,
+        query_requests: torch.Tensor,
+        *,
+        rank: int,
+        topk: int,
+        page_size: int,
+        out: torch.Tensor | None = None,
+        lens_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``dsa_select_owned_candidates`` through the live top-k the merge
+        takes its threshold from."""
+        from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
+            rank_major_planar_scores,
+            select_owned_through_threshold,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+            gluon_dsa_live_logical_topk_gfx950,
+        )
+
+        merged, starts, ends = rank_major_planar_scores(scores)
+        order, _ = gluon_dsa_live_logical_topk_gfx950(merged, starts, ends, topk=topk)
+        return select_owned_through_threshold(
+            merged,
+            order,
+            positions,
+            local_page_table,
+            query_requests,
+            source=rank,
+            topk=topk,
+            page_size=page_size,
+            out=out,
+            lens_out=lens_out,
+        )

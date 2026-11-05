@@ -385,6 +385,7 @@ def mask_index_scores(
         "COLS",
         "OFFSET_STRIDE",
         "VALUE_STRIDE",
+        "SCORE_STRIDE",
     ]
 )
 def _gather_candidates(
@@ -394,6 +395,7 @@ def _gather_candidates(
     Lengths,
     Values,
     Records,
+    Scores,
     TOPK: tl.constexpr,
     # Table and logits geometry follows the batch; runtime so every batch
     # shape shares one binary.
@@ -403,6 +405,7 @@ def _gather_candidates(
     COLS,
     OFFSET_STRIDE,
     VALUE_STRIDE,
+    SCORE_STRIDE,
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -426,13 +429,23 @@ def _gather_candidates(
     page = tl.load(Positions + row * COLS + offset // PAGE, mask=valid, other=-1)
     valid = valid & (score > -float("inf"))
     logical = page * PAGE + offset % PAGE
-    base = (row * TOPK + col) * 2
-    tl.store(Records + base, tl.where(valid, logical, -1), mask=col < TOPK)
-    tl.store(
-        Records + base + 1,
-        tl.where(valid, score, -float("inf")).to(tl.int32, bitcast=True),
-        mask=col < TOPK,
-    )
+    if Scores is None:
+        base = (row * TOPK + col) * 2
+        tl.store(Records + base, tl.where(valid, logical, -1), mask=col < TOPK)
+        tl.store(
+            Records + base + 1,
+            tl.where(valid, score, -float("inf")).to(tl.int32, bitcast=True),
+            mask=col < TOPK,
+        )
+    else:
+        tl.store(
+            Records + row * TOPK + col, tl.where(valid, logical, -1), mask=col < TOPK
+        )
+        tl.store(
+            Scores + row * SCORE_STRIDE + col,
+            tl.where(valid, score, -float("inf")),
+            mask=col < TOPK,
+        )
 
 
 def candidate_topk_offsets(scores: torch.Tensor, topk: int) -> torch.Tensor:
@@ -459,14 +472,29 @@ def gather_index_candidates(
     *,
     lengths: torch.Tensor | None = None,
     selected_scores: torch.Tensor | None = None,
+    scores_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map local offsets to interleaved logical-position/FP32-score views.
 
     Optional lengths bound reads when the logits tail is uninitialized.
     Optional selected_scores reuse values already returned by the selector.
-    The two outputs share contiguous int32 records for candidate exchange.
+    The two outputs share contiguous int32 records for candidate exchange,
+    unless ``scores_out`` (FP32 ``[rows, topk]`` with contiguous rows, such
+    as a collective's send buffer) takes the scores: the positions are then
+    their own contiguous int32 matrix and ``scores_out`` is returned.
     """
-    records = torch.empty((*offsets.shape, 2), device=offsets.device, dtype=torch.int32)
+    if scores_out is None:
+        records = torch.empty(
+            (*offsets.shape, 2), device=offsets.device, dtype=torch.int32
+        )
+    else:
+        if (
+            scores_out.shape != offsets.shape
+            or scores_out.dtype != torch.float32
+            or scores_out.stride(1) != 1
+        ):
+            raise ValueError("candidate scores need an FP32 [rows, topk] output")
+        records = torch.empty(offsets.shape, device=offsets.device, dtype=torch.int32)
     _gather_candidates[(offsets.shape[0], triton.cdiv(offsets.shape[1], 256))](
         offsets,
         logits,
@@ -474,6 +502,7 @@ def gather_index_candidates(
         lengths,
         selected_scores,
         records,
+        scores_out,
         offsets.shape[1],
         logits.stride(0),
         logits.stride(1),
@@ -481,7 +510,10 @@ def gather_index_candidates(
         positions.shape[1],
         offsets.stride(0),
         0 if selected_scores is None else selected_scores.stride(0),
+        0 if scores_out is None else scores_out.stride(0),
         page_size,
         256,
     )
+    if scores_out is not None:
+        return records, scores_out
     return records[..., 0], records[..., 1].view(torch.float32)

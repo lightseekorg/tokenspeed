@@ -789,6 +789,9 @@ class DSABackend(PagedAttentionBackend):
             self.kvp_rank,
         )
 
+    def takes_owned_decode_topk(self, layer) -> bool:
+        return len(self.kvp_group) > 1
+
     def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
         # KPool's tail state is indexed by request-pool slot, and its
         # per-forward plan must not outlive the metadata build that
@@ -1446,6 +1449,7 @@ class DSABackend(PagedAttentionBackend):
         bs: int,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
+        topk_owned: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
@@ -1457,7 +1461,10 @@ class DSABackend(PagedAttentionBackend):
                 bs=bs,
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
+                topk_owned=topk_owned,
             )
+        if topk_owned:
+            raise ValueError("an owned decode top-k needs its slots")
         if len(self.kvp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
         metadata = self.forward_decode_metadata
@@ -1801,7 +1808,17 @@ class DSABackend(PagedAttentionBackend):
         bs: int,
         topk_indices: torch.Tensor,
         topk_lens: torch.Tensor | None,
+        topk_owned: bool = False,
     ) -> torch.Tensor:
+        """Sparse decode over ``topk_indices``: the whole selection as
+        scheduler slots, or with ``topk_owned`` (a sharded cache only) this
+        rank's share of it as local cache slots, ``topk_lens`` counting them.
+        """
+        if topk_owned and (len(self.kvp_group) == 1 or topk_lens is None):
+            raise ValueError(
+                "an owned decode top-k is one rank's share of a sharded "
+                "cache's selection, with its counts"
+            )
         if self.kernel_page_size != DSA_SPARSE_PAGE_SIZE:
             raise RuntimeError(
                 f"DSA sparse decode requires kernel_page_size="
@@ -1909,9 +1926,11 @@ class DSABackend(PagedAttentionBackend):
         topk_slots = topk_indices.view(num_tokens, -1)
         if use_dcp:
             # Owned slots first, counted as length (full width without topk_lens).
-            topk_slots, topk_lens = compact_owned_cache_slots(
-                topk_slots, topk_lens, self.cache_placement(layer)
-            )
+            # An owned top-k already is.
+            if not topk_owned:
+                topk_slots, topk_lens = compact_owned_cache_slots(
+                    topk_slots, topk_lens, self.cache_placement(layer)
+                )
             if not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(

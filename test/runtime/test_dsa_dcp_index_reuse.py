@@ -270,6 +270,110 @@ def test_unsharded_decode_keeps_no_dcp_record(monkeypatch):
     assert record.dcp_index is None and record.dcp_source is None
 
 
+# --- KVP decode: each rank's share as its local slots -------------------------
+
+
+@pytest.fixture
+def owned_selects(recorded, monkeypatch):
+    """Record what every owned selection receives; it fills its outputs."""
+    calls = []
+
+    def select_owned(q, weights, index_k_cache, *, metadata, out, lens_out, **kw):
+        calls.append((metadata, kw["query_group_size"], out, lens_out))
+        out.fill_(5)
+        lens_out.fill_(1)
+        return out, lens_out
+
+    monkeypatch.setattr(glm5, "select_owned_dsa_topk", select_owned)
+    return calls
+
+
+def _owned_ctx(seq_lens, q_len, *, takes=True):
+    ctx = _ctx(seq_lens, q_len)
+    ctx.attn_backend.takes_owned_decode_topk = lambda layer: takes
+    return ctx
+
+
+def _owned_layer():
+    layer = _layer()
+    layer.owned_decode_topk = True
+    return layer
+
+
+def test_owned_decode_topk_writes_this_ranks_local_slots(recorded, owned_selects):
+    builds, selects = recorded
+    seq_lens, page_table, q_len = _batch()
+    ctx = _owned_ctx(seq_lens, q_len)
+    record = _decode_layer(_owned_layer(), ctx, page_table, seq_lens, q_len)
+
+    assert not selects
+    [(metadata, group, out, lens_out)] = owned_selects
+    assert metadata is builds[0] is record.dcp_index
+    assert group == q_len
+    assert out.data_ptr() == record.topk_indices.data_ptr()
+    assert lens_out.data_ptr() == record.topk_lens.data_ptr()
+    assert (record.topk_indices == 5).all() and (record.topk_lens == 1).all()
+    assert record.owned_placement == _PLACEMENT
+
+
+@pytest.mark.parametrize("case", ["host", "backend"])
+def test_owned_decode_topk_needs_the_host_and_the_backend(
+    recorded, owned_selects, case
+):
+    _, selects = recorded
+    seq_lens, page_table, q_len = _batch()
+    ctx = _owned_ctx(seq_lens, q_len, takes=case != "backend")
+    layer = _layer() if case == "host" else _owned_layer()
+    record = _decode_layer(layer, ctx, page_table, seq_lens, q_len)
+
+    assert not owned_selects
+    assert len(selects) == 1
+    assert record.owned_placement is None
+
+
+def test_an_owned_decode_topk_is_read_under_its_placement_only():
+    record = glm5.GlmDsaDecodeTopK(
+        topk_indices=torch.arange(8, dtype=torch.int32).view(4, 2),
+        topk_lens=torch.arange(4, dtype=torch.int32),
+        owned_placement=_PLACEMENT,
+    )
+    take = glm5.GlmDsaSparseAttentionMixin._slice_decode_topk
+
+    indices, lens = take(record, 1, 3, owned_placement=_PLACEMENT)
+
+    torch.testing.assert_close(indices, record.topk_indices[1:3])
+    torch.testing.assert_close(lens, record.topk_lens[1:3])
+    for other in (None, replace(_PLACEMENT, rank=1)):
+        with pytest.raises(RuntimeError, match="another placement"):
+            take(record, 1, 3, owned_placement=other)
+    # The whole selection, as scheduler slots, is any reader's.
+    take(replace(record, owned_placement=None), 0, 4)
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_only_an_owned_decode_topk_reaches_attention_flagged(owned):
+    calls = []
+    layer = _layer()
+    layer.num_local_heads, layer.kv_lora_rank, layer.v_head_dim = 1, 2, 2
+    layer.attn_mqa = lambda Q, **kw: calls.append(kw) or torch.zeros(1, 2)
+    layer.project_latent_values = lambda attn_output, output, gate: None
+    topk = torch.zeros(1, _TOPK, dtype=torch.int32)
+
+    layer.forward_absorb_attn_v_proj(
+        torch.zeros(1, 2),
+        None,
+        torch.zeros(1, 2),
+        topk_indices=topk,
+        topk_lens=torch.ones(1, dtype=torch.int32),
+        topk_owned=owned,
+    )
+
+    [kwargs] = calls
+    assert kwargs["topk_indices"] is topk
+    assert kwargs.get("topk_owned", False) is owned
+    assert ("topk_owned" in kwargs) is owned
+
+
 # --- KVP prefill: owned-width index metadata ----------------------------------
 
 _PREFIX = 100
