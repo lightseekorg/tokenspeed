@@ -34,12 +34,8 @@ and a group tag stored only after a wait that covers its wave's mids stores.
 import re
 
 import pytest
-from moe_stream_helpers import DIVISIBLE, PHYS
-from tokenspeed_kernel_amd._triton import gluon, triton
+from moe_stream_helpers import compile_moe_stream
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_stream
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._stream_sync import (
-    stream_sync_compile_options,
-)
 
 _LOAD = re.compile(r"^(buffer|global)_load_\w+")
 _STORE = re.compile(r"^(buffer|global)_store_\w+")
@@ -52,45 +48,7 @@ VARIANTS = [
 
 
 def _compile(rows, tail):
-    fn = moe_stream.gluon_mxfp4_moe_stream_gfx950
-    const = dict(
-        ROWS=rows,
-        TOPK=8,
-        TAIL_NUM=tail[0],
-        TAIL_DEN=tail[1],
-        SWIGLU_ALPHA=1.0,
-        SWIGLU_LIMIT=0.0,
-        SWIGLU_BETA=0.0,
-        **PHYS,
-    )
-    types = dict(
-        epochs="*i64",
-        claims="*i64",
-        ids="*i32",
-        xq="*u8",
-        xs="*u8",
-        w13="*u8",
-        s13="*u8",
-        w2="*u8",
-        s2="*u8",
-        mids="*u8",
-        mids_s="*i32",
-        tags="*i32",
-        out="*bf16",
-    )
-    signature = {n: types.get(n, "i32") for n in fn.arg_names if n not in const}
-    attrs = {
-        (i,): [["tt.divisibility", 16]]
-        for i, n in enumerate(fn.arg_names)
-        if signature.get(n, "").startswith("*") or n in DIVISIBLE
-    }
-    source = gluon._runtime.GluonASTSource(fn, signature, constexprs=const, attrs=attrs)
-    target = triton.backends.compiler.GPUTarget("hip", "gfx950", 64)
-    return triton.compile(
-        source,
-        target=target,
-        options={"num_warps": 8, **stream_sync_compile_options()},
-    ).asm["amdgcn"]
+    return compile_moe_stream(rows, tail).asm["amdgcn"]
 
 
 def _instructions(assembly):
