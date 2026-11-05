@@ -838,6 +838,8 @@ which keeps it when recreating a session after a memory resume.
 | `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+| `--otlp-traces-endpoint` | OTLP/HTTP traces endpoint (a collector's `/v1/traces`, Jaeger, Langfuse). Each finished request exports one span built from its lifecycle timestamps. |
+| `--trace-sample-ratio` | The share of requests the OTLP endpoint traces (0..1). 0, the default, disables tracing. |
 
 Every `--decode-log-interval` decode rounds the scheduler's representative rank
 prints one `Decode batch.` line: `#running-req`, `avg_seq_len` (the mean of
@@ -946,6 +948,21 @@ retraction whose victim cannot be imaged aborts it instead — those are
 `tokenspeed:num_capacity_aborted_requests`, never preemptions. A forced
 retraction's victim refused after its pages were published is aborted and
 counts there too.
+
+### OTLP tracing
+
+`--otlp-traces-endpoint` exports one span per request to an OTLP/HTTP
+receiver, assembled at the request's release from the same timestamps the
+stats line prints — the serving loop never blocks on it, a full export
+queue drops spans and counts them, and `--trace-sample-ratio` bounds the
+share. A request that names a continual-prompting session
+(`session_params.id`) carries it as the `session.id` attribute, so a
+tracing UI groups one conversation's requests under the session. Trace ids derive from the request id, so a span, its `Req: … Finish!`
+line and its Prometheus samples cross-reference. The span carries the GenAI
+attribute conventions (`gen_ai.request.model`, prompt and completion tokens,
+finish reason) plus the cached prompt tokens and preemption counts, with the
+lifecycle points as time-stamped events. See
+[the tracing design](../design/tracing.md).
 
 ### Per-request stats
 
@@ -1220,12 +1237,21 @@ budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size its configured pinned
-allocator reserves. On CUDA/ROCm, the launcher defaults
-`pinned_max_round_threshold_mb:1024` before starting the ranks: allocations
-up to 1 GiB round to a power of two; larger buffers use their requested size.
-This avoids reserving 274.88 GB for a 140 GB L2 buffer. Explicit thresholds
-and other allocator options are preserved. To override the default, set
+headroom per rank. Available means the smaller of the host's free memory and
+what the process's memory cgroup still allows (its limit, `memory.max` or
+`memory.high` on cgroup v2, less its usage with page cache counted as free;
+the tightest limit over its cgroup and the ones above it, found through
+`/proc/self/mountinfo`), so a container or a Slurm step is sized against its
+own limit; the sizing warning and the refusal name which one was used.
+Each buffer counts at the size its configured pinned
+allocator reserves. When the CUDA/ROCm allocator supports it, the launcher sets
+`pinned_max_round_threshold_mb:1024` as the default before starting the ranks.
+Allocations up to 1 GiB round to a power of two; larger buffers use their
+requested size.
+This avoids reserving 274.88 GB for a 140 GB L2 buffer. Allocators without this
+option keep their native defaults. The capability probe has a 60-second timeout.
+Probe failures stop startup. Explicit thresholds and other allocator options
+are preserved. To override the default, set
 `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:<MiB>` before launch;
 the legacy `PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_HIP_ALLOC_CONF` variables
 take precedence, in that order. The check reads the effective allocator

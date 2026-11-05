@@ -2892,9 +2892,8 @@ def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
     width = logits.shape[1]
     logical_width = (width + block_size - 1) // block_size
     stride = (logical_width + alignment - 1) // alignment * alignment
-    scores = torch.empty(
-        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
-    )
+    dtype = logits.dtype if block_size == 1 and not pin_newest else torch.float32
+    scores = torch.empty((logits.shape[0], stride), dtype=dtype, device=logits.device)
     end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
     if block_size == 1 and not pin_newest:
         _prepare_dense[(logits.shape[0], triton.cdiv(stride, 1024))](
@@ -2939,7 +2938,7 @@ def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment)
     end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
     stride = (count * block_size + alignment - 1) // alignment * alignment
     scores = torch.empty(
-        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
+        (logits.shape[0], stride), dtype=logits.dtype, device=logits.device
     )
     # Small candidate sets fit their scores in the normalization CTA. Larger
     # sets need the separate tiled gather to retain memory-level parallelism.
@@ -3486,7 +3485,7 @@ def _block_maxima_kernel(
     blocks,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1) * TILE + tl.arange(0, TILE)
     col = block[:, None] * 8 + tl.arange(0, 8)[None, :]
     values = tl.load(
@@ -3579,7 +3578,7 @@ def _clean_block_maxima_kernel(
     workers,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     worker = tl.program_id(1)
     length = tl.minimum(tl.maximum(tl.load(Lengths + row * length_stride), 0), width)
     end = (length + 7) // 8
@@ -3613,7 +3612,7 @@ def _clean_block_maxima_kernel(
 def clean_block_maxima(
     scores: torch.Tensor, visible: torch.Tensor, table: torch.Tensor, num_pages: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Clean paged FP32 scores and reduce their visible eight-token blocks.
+    """Clean paged FP32/BF16 scores and return FP32 eight-token block maxima.
 
     ``table`` maps each row's logical 64-token pages to physical page IDs.
     Invalid pages inside the visible prefix are masked to -inf. Return fixed-
@@ -3625,7 +3624,7 @@ def clean_block_maxima(
         scores.ndim != 2
         or scores.shape[1] == 0
         or scores.stride(1) != 1
-        or scores.dtype != torch.float32
+        or scores.dtype not in (torch.float32, torch.bfloat16)
         or visible.ndim != 1
         or visible.numel() != scores.shape[0]
         or table.ndim != 2
@@ -3637,7 +3636,7 @@ def clean_block_maxima(
     # Enough independent tiles for long contexts; short rows exit on the GPU.
     workers = min(triton.cdiv(width, 1024), 256)
     cleaned = torch.empty((rows, width), device=scores.device, dtype=scores.dtype)
-    maxima = torch.empty((rows, blocks), device=scores.device, dtype=scores.dtype)
+    maxima = torch.empty((rows, blocks), device=scores.device, dtype=torch.float32)
     ends = torch.empty((rows,), device=scores.device, dtype=torch.int32)
     if rows:
         _clean_block_maxima_kernel[(rows, workers)](
@@ -3933,11 +3932,11 @@ def _clean_logits_output(
         or values.shape[0] != lengths.numel()
         or values.shape[1] < capacity
         or values.stride(1) != 1
-        or values.dtype != torch.float32
+        or values.dtype not in (torch.float32, torch.bfloat16)
     ):
-        raise RuntimeError("DeepGEMM returned incompatible FP32 score geometry")
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
     output = torch.empty(
-        (values.shape[0], capacity), dtype=torch.float32, device=values.device
+        (values.shape[0], capacity), dtype=values.dtype, device=values.device
     )
     if output.numel():
         _clean_logits[(values.shape[0], triton.cdiv(capacity, 1024))](
