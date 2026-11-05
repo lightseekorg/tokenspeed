@@ -209,6 +209,23 @@ class CachePool(ABC):
     # pools do not alias state, so reused pages need no sanitization.
     requires_page_zeroing: bool = False
 
+    # Whether every access a prefill graph replay makes to this view's layer
+    # fields, in a captured segment or an eager break, goes through an
+    # accessor that waits for the layer's Host load (``wait_for_layer`` on
+    # ``layerwise_load_tracker``). Only then may a replay wait before each
+    # captured segment for the layers its capture noted; otherwise it waits
+    # for the whole Host load before its first segment. Set it only on a pool
+    # whose accessors, and the code reaching them in a replay, were audited.
+    # A subclass does not inherit it (see __init_subclass__).
+    layer_accesses_wait_for_load: ClassVar[bool] = False
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # The audit behind layer_accesses_wait_for_load covers one class: a
+        # subclass adds or overrides accessors, so it declares it itself.
+        if "layer_accesses_wait_for_load" not in cls.__dict__:
+            cls.layer_accesses_wait_for_load = False
+
     def __init__(
         self,
         arena: CacheArena,

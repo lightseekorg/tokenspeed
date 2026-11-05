@@ -46,6 +46,19 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     #: paged MLA decode computes ``q·k`` before the causal mask.
     latent_write_sanitizes: ClassVar[bool] = True
 
+    #: A Kimi-K3 replay reaches the latent rows only through get_key_buffer
+    #: (the prologue's kv_write_target, the attention break's reads) and the
+    #: KDA State through get_component, both of which wait for the layer.
+    #: The accessor that does not wait is not reached: get_state_buffers has
+    #: callers only in tests.
+    #: In a mixed round with speculative decoding, the verify rows also reach
+    #: State through pointer tables built once, with no wait per layer (verify
+    #: seeding, replay descriptors, the post-acceptance commit). That is safe
+    #: because a Host load-back fills only freshly granted pages of an
+    #: extending request, never a decoding request's committed State page; a
+    #: load into running requests' pages would void this declaration.
+    layer_accesses_wait_for_load: ClassVar[bool] = True
+
     def __init__(
         self,
         *,

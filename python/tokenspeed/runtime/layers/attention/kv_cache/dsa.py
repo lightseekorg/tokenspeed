@@ -165,7 +165,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_k.dtype != self.model_dtype:
             index_k = index_k.to(self.model_dtype)
         index_k = index_k.view(-1, self.index_head_dim)
-        buf = self.index_k_buffer[layer_id]
+        # Wait for the layer's Host load: a tail hit loads the page these rows
+        # land in whole.
+        buf = self.get_index_k_buffer(layer_id)
         if buf.dtype == torch.bfloat16:
             rows = index_k.to(buf.dtype)
             slots = loc.to(torch.int64)
