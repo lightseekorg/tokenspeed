@@ -619,6 +619,76 @@ def test_pipelined_split_waits_for_prefetches_before_epilogue(monkeypatch) -> No
         _check_verify(gluon_mha_decode_gfx950(**inputs, window_left=-1), expected)
 
 
+def test_sliding_split_stores_reach_l2_before_arrival() -> None:
+    """Every wave's split partial reaches L2 before the split arrives.
+
+    All waves store the partial, and one thread bumps the row block's
+    counter, whose release waits only for its own wave. Compile without
+    launching and check that, on every path, each wave runs s_waitcnt
+    vmcnt(0) before the barrier preceding the counter atomic.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from utils import vmcnt_zero_before_barrier
+
+    fn = decode._mha_decode_sliding_split_atomic
+    pointers = {
+        "q_ptr": "*fp8e4nv",
+        "k_cache_ptr": "*fp8e4nv",
+        "v_cache_ptr": "*fp8e4nv",
+        "page_table_ptr": "*i32",
+        "cache_seqlens_ptr": "*i32",
+        "mid_o_ptr": "*fp32",
+        "mid_lse_ptr": "*fp32",
+        "out_ptr": "*bf16",
+        "sink_ptr": "*fp8e4nv",
+        "counters_ptr": "*i32",
+    }
+    # One TP8 rank of a 2048-token sliding window: 16 query heads over 2 KV
+    # heads, 8 verify positions per request, 4 waves.
+    constexprs = {
+        "Q_STRIDE_B": 1024,
+        "Q_STRIDE_H": 64,
+        "Q_STRIDE_D": 1,
+        "SM_SCALE": 0.125 * 1.4426950408889634,
+        "PAGE_TABLE_STRIDE": 4096,
+        "PAGE_SIZE": 64,
+        "NUM_KV_SPLITS": 8,
+        "MAX_SEQLEN_Q": 8,
+        "NUM_Q_HEADS": 16,
+        "NUM_KV_HEADS": 2,
+        "HEAD_DIM": 64,
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "NUM_WARPS": 4,
+        "WINDOW_LEFT": 2047,
+        "HAS_SINK": False,
+        "IS_FP8": True,
+        "NUM_STAGES": 2,
+    }
+    signature = dict(pointers, **{name: "constexpr" for name in constexprs})
+    signature = {name: signature[name] for name in fn.arg_names}
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn, signature, constexprs=constexprs, attrs=attrs
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 4, **sched_compile_options()},
+    )
+    arrivals = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"],
+        "_mha_decode_sliding_split_atomic",
+        r"\bglobal_atomic_add\w*\b",
+    )
+    assert arrivals, "the split must arrive with an atomic add"
+    assert all(waited for _, waited, _ in arrivals), arrivals
+
+
 # ===-----------------------------------------------------------------------===#
 # Balanced split schedule
 # ===-----------------------------------------------------------------------===#
@@ -857,73 +927,3 @@ def test_balanced_schedule_buffer_at_capacity_ignores_its_stale_tail() -> None:
     _check_verify(
         _balanced(inputs, schedule=buffer), _verify_reference(inputs, -1, None)
     )
-
-
-def test_sliding_split_stores_reach_l2_before_arrival() -> None:
-    """Every wave's split partial reaches L2 before the split arrives.
-
-    All waves store the partial, and one thread bumps the row block's
-    counter, whose release waits only for its own wave. Compile without
-    launching and check that, on every path, each wave runs s_waitcnt
-    vmcnt(0) before the barrier preceding the counter atomic.
-    """
-    from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
-    from utils import vmcnt_zero_before_barrier
-
-    fn = decode._mha_decode_sliding_split_atomic
-    pointers = {
-        "q_ptr": "*fp8e4nv",
-        "k_cache_ptr": "*fp8e4nv",
-        "v_cache_ptr": "*fp8e4nv",
-        "page_table_ptr": "*i32",
-        "cache_seqlens_ptr": "*i32",
-        "mid_o_ptr": "*fp32",
-        "mid_lse_ptr": "*fp32",
-        "out_ptr": "*bf16",
-        "sink_ptr": "*fp8e4nv",
-        "counters_ptr": "*i32",
-    }
-    # One TP8 rank of a 2048-token sliding window: 16 query heads over 2 KV
-    # heads, 8 verify positions per request, 4 waves.
-    constexprs = {
-        "Q_STRIDE_B": 1024,
-        "Q_STRIDE_H": 64,
-        "Q_STRIDE_D": 1,
-        "SM_SCALE": 0.125 * 1.4426950408889634,
-        "PAGE_TABLE_STRIDE": 4096,
-        "PAGE_SIZE": 64,
-        "NUM_KV_SPLITS": 8,
-        "MAX_SEQLEN_Q": 8,
-        "NUM_Q_HEADS": 16,
-        "NUM_KV_HEADS": 2,
-        "HEAD_DIM": 64,
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "NUM_WARPS": 4,
-        "WINDOW_LEFT": 2047,
-        "HAS_SINK": False,
-        "IS_FP8": True,
-        "NUM_STAGES": 2,
-    }
-    signature = dict(pointers, **{name: "constexpr" for name in constexprs})
-    signature = {name: signature[name] for name in fn.arg_names}
-    attrs = {
-        (index,): [["tt.divisibility", 16]]
-        for index, name in enumerate(fn.arg_names)
-        if name in pointers
-    }
-    kernel = triton.compile(
-        gluon._runtime.GluonASTSource(
-            fn, signature, constexprs=constexprs, attrs=attrs
-        ),
-        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": 4, **sched_compile_options()},
-    )
-    arrivals = vmcnt_zero_before_barrier(
-        kernel.asm["amdgcn"],
-        "_mha_decode_sliding_split_atomic",
-        r"\bglobal_atomic_add\w*\b",
-    )
-    assert arrivals, "the split must arrive with an atomic add"
-    assert all(waited for _, waited, _ in arrivals), arrivals
