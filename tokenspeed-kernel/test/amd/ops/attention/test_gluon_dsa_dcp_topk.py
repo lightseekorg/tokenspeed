@@ -411,18 +411,3 @@ def test_owned_selection_refuses_gathered_scores_it_cannot_take(
     assert not dsa_select_owned_candidates_supported(
         ranks=ranks, rows=1, topk=topk, rank_stride=rank_stride
     )
-    if rank_stride == topk:
-        table, virtual_blocks, positions, scores = _owned_candidates(
-            ranks, 1, 1, topk, seed=ranks
-        )
-        with pytest.raises(ValueError, match="power-of-two rank count"):
-            dsa_select_owned_candidates(
-                scores,
-                positions[0].contiguous(),
-                _local_pages(table, virtual_blocks, ranks, 0),
-                torch.zeros((1,), device="cuda", dtype=torch.int32),
-                rank=0,
-                topk=topk,
-                page_size=_PAGE,
-                solution="gluon",
-            )

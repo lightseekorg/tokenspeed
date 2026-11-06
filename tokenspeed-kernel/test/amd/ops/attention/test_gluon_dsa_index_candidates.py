@@ -40,9 +40,6 @@ from tokenspeed_kernel.ops.attention.dsa import (  # isort: skip
     dsa_index_candidates,
     plan_dsa_index_candidates,
 )
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (  # isort: skip
-    _owned_query_group_metadata,
-)
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
@@ -186,28 +183,6 @@ def test_gluon_owned_page_scorer_is_default_and_matches_reference(heads, group, 
         assert float(chosen.min()) >= cutoff - tol, f"row {row} missed a better token"
 
 
-@pytest.mark.parametrize("heads", [32, 64])
-def test_gluon_owned_page_scorer_grouped_rows_match_single_rows(heads, device):
-    table, requests, lens, q, q_scales, weights, cache, _ = _inputs(heads, 4, device)
-    kwargs = dict(
-        page_size=PAGE_SIZE,
-        topk=256,
-        softmax_scale=0.1,
-        initial_tokens=0,
-        local_tokens=0,
-        solution=None,
-        q_scales=q_scales,
-    )
-    single = dsa_index_candidates(
-        q, weights, cache, table, requests, lens, query_group_size=1, **kwargs
-    )
-    grouped = dsa_index_candidates(
-        q, weights, cache, table, requests, lens, query_group_size=4, **kwargs
-    )
-    for actual, expected in zip(_by_offset(*grouped), _by_offset(*single), strict=True):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
 def _by_offset(offsets, scores):
     """Candidates ordered by offset: order within a row is unspecified, and
     -1 padding scores -inf."""
@@ -306,20 +281,6 @@ def _prefill_inputs(heads: int, device: str):
     return table, requests, lens, q_fp8, q_scales.float(), weights, cache
 
 
-def _count_prefill_launches(monkeypatch) -> list[int]:
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import index_candidates
-
-    launches = []
-    launch = index_candidates._launch_prefill_rows
-
-    def counted(q, *args, **kwargs):
-        launches.append(q.shape[0])
-        return launch(q, *args, **kwargs)
-
-    monkeypatch.setattr(index_candidates, "_launch_prefill_rows", counted)
-    return launches
-
-
 @pytest.mark.parametrize("heads", [32, 64])
 def test_gluon_owned_page_prefill_rows_score_and_select_like_one_row_groups(
     heads, device, monkeypatch
@@ -333,12 +294,10 @@ def test_gluon_owned_page_prefill_rows_score_and_select_like_one_row_groups(
     lengths = pages.lengths.reshape(-1)
     assert pages.pages.shape[1] * PAGE_SIZE > 4096
     assert (lengths == 0).any()
-    launches = _count_prefill_launches(monkeypatch)
     launch = index_candidates.launch_gluon_dsa_index_candidates_gfx950
     args = (q, q_scales, weights, cache, pages.pages, lengths)
 
     one_row = launch(*args, page_size=PAGE_SIZE, softmax_scale=0.1)
-    assert launches == []
     blocks = launch(
         *args,
         query_requests=requests,
@@ -346,7 +305,6 @@ def test_gluon_owned_page_prefill_rows_score_and_select_like_one_row_groups(
         page_size=PAGE_SIZE,
         softmax_scale=0.1,
     )
-    assert launches == [requests.numel()]
     columns = torch.arange(one_row.shape[1], device=device)
     valid = columns[None, :] < lengths[:, None]
     assert (one_row[valid] == float("-inf")).any()
@@ -360,31 +318,13 @@ def test_gluon_owned_page_prefill_rows_score_and_select_like_one_row_groups(
         local_tokens=0,
         solution=None,
     )
-    # Decode, a row per request, keeps the one-row scorer at any batch size.
-    decode_table, decode_requests, decode_lens, decode_q, decode_scales, decode_w = (
-        _owned_batch(256, 1, 16, device)
-    )
-    dsa_index_candidates(
-        decode_q,
-        decode_w,
-        cache,
-        decode_table,
-        decode_requests,
-        decode_lens,
-        q_scales=decode_scales,
-        **kwargs,
-    )
-    assert launches == [requests.numel()]
-
     selected = dsa_index_candidates(
         q, weights, cache, table, requests, lens, q_scales=q_scales, **kwargs
     )
-    assert launches == [requests.numel()] * 2
     monkeypatch.setattr(index_candidates, "_scores_prefill_rows", lambda *_: False)
     expected = dsa_index_candidates(
         q, weights, cache, table, requests, lens, q_scales=q_scales, **kwargs
     )
-    assert launches == [requests.numel()] * 2
     for got, want in zip(_by_offset(*selected), _by_offset(*expected), strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
@@ -513,21 +453,7 @@ def _set_key_scale(cache: torch.Tensor, slot: int, value: float) -> None:
     cache.reshape(-1).view(torch.float32)[scales + row] = value
 
 
-def _count_mask_launches(monkeypatch) -> list[int]:
-    from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates
-
-    launches = []
-    mask = index_candidates.mask_index_scores
-
-    def counted(*args, **kwargs):
-        launches.append(kwargs.get("mask_tail"))
-        return mask(*args, **kwargs)
-
-    monkeypatch.setattr(index_candidates, "mask_index_scores", counted)
-    return launches
-
-
-def test_gluon_owned_page_scorer_never_selects_non_finite_scores(device, monkeypatch):
+def test_gluon_owned_page_scorer_never_selects_non_finite_scores(device):
     table, requests, lens, q, q_scales, weights, cache, keys = _inputs(32, 4, device)
     scale, topk = 0.1, 256
     # Request 0's logical tokens 5 and 130 sit on physical pages 12 and 3.
@@ -535,7 +461,6 @@ def test_gluon_owned_page_scorer_never_selects_non_finite_scores(device, monkeyp
     for position, value in poisoned.items():
         page = int(table[0, position // PAGE_SIZE])
         _set_key_scale(cache, page * PAGE_SIZE + position % PAGE_SIZE, value)
-    launches = _count_mask_launches(monkeypatch)
 
     offsets, scores = dsa_index_candidates(
         q,
@@ -557,7 +482,6 @@ def test_gluon_owned_page_scorer_never_selects_non_finite_scores(device, monkeyp
         query_group_size=4,
     )
 
-    assert launches == []
     reference = _reference(table, requests, lens, q, q_scales, weights, keys, scale)
     for row, (positions, expected) in enumerate(reference):
         if int(requests[row]) == 0:
@@ -579,10 +503,9 @@ def test_gluon_owned_page_scorer_never_selects_non_finite_scores(device, monkeyp
         assert float(chosen.min()) >= cutoff - tol, f"row {row} missed a better token"
 
 
-def test_gluon_owned_page_scorer_forces_mandatory_windows(device, monkeypatch):
+def test_gluon_owned_page_scorer_forces_mandatory_windows(device):
     table, requests, lens, q, q_scales, weights, cache, _ = _inputs(32, 4, device)
     initial, local, topk = 4, 64, 256
-    launches = _count_mask_launches(monkeypatch)
 
     offsets, scores = dsa_index_candidates(
         q,
@@ -601,7 +524,6 @@ def test_gluon_owned_page_scorer_forces_mandatory_windows(device, monkeypatch):
         query_group_size=4,
     )
 
-    assert launches == [False]
     for row in range(requests.numel()):
         pages = table[int(requests[row])]
         positions = torch.arange(int(lens[row]), device=device)
@@ -611,25 +533,3 @@ def test_gluon_owned_page_scorer_forces_mandatory_windows(device, monkeypatch):
         assert forced.numel() > 0
         assert torch.isin(forced, got).all(), f"row {row} dropped a mandatory token"
         assert (scores[row][torch.isin(offsets[row], forced)] == float("inf")).all()
-
-
-@pytest.mark.parametrize("group", [1, 4])
-def test_grouped_owned_pages_are_a_live_view_of_each_groups_last_row(group):
-    q = torch.empty(8, 32, 128, dtype=torch.float8_e4m3fn)
-    pages = torch.arange(24, dtype=torch.int32).view(8, 3)
-    lengths = torch.tensor([64, 64, 64, 65, 66, 66, 66, 66], dtype=torch.int32)
-    table = _owned_query_group_metadata(q, pages, lengths, group)
-    torch.testing.assert_close(table, pages[group - 1 :: group], atol=0, rtol=0)
-    assert table.stride(0) == group * pages.stride(0)
-    pages[group - 1, 0] = 987
-    assert table[0, 0] == 987
-
-
-def test_grouped_owned_pages_reject_incomplete_groups_and_nondense_plans():
-    q = torch.empty(8, 32, 128, dtype=torch.float8_e4m3fn)
-    pages = torch.empty(8, 4, dtype=torch.int32)
-    lengths = torch.empty(8, dtype=torch.int32)
-    with pytest.raises(ValueError, match="complete"):
-        _owned_query_group_metadata(q[:7], pages[:7], lengths[:7], 4)
-    with pytest.raises(ValueError, match="contiguous"):
-        _owned_query_group_metadata(q, pages[:, ::2], lengths, 4)

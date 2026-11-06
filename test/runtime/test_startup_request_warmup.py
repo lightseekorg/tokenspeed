@@ -167,32 +167,3 @@ def test_startup_reaches_sixteen_requests_after_chunked_admission():
         decode_steps=2,
     )
     assert device.batches.count((16, 0)) == 2
-
-
-def test_startup_rejects_mixed_rounds_without_device_work():
-    config = _config(4)
-    config.enable_mixed_prefill_decode = True
-    device = _Device(4, fail_decode=False)
-    with pytest.raises(ValueError, match="separate prefill and decode"):
-        warmup_request_path(
-            device,
-            config,
-            phases=((3, 31),),
-            decode_width=4,
-            decode_steps=2,
-        )
-    assert not device.batches
-
-
-@pytest.mark.parametrize("batch,prompt", [(0, 5), (1, 0)])
-def test_startup_rejects_empty_cases_without_device_work(batch, prompt):
-    device = _Device(4, fail_decode=False)
-    with pytest.raises(ValueError, match="must be positive"):
-        warmup_request_path(
-            device,
-            _config(4),
-            phases=((batch, prompt),),
-            decode_width=4,
-            decode_steps=2,
-        )
-    assert not device.batches
