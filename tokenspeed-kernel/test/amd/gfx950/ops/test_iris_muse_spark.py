@@ -2782,10 +2782,10 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
     Every rank writes the same sums, within one BF16 unit of the Lamport
     two-shot all-reduce plus the portable routed norm, and bit for bit when
     each token weights a single route. One graph runs two layers back to back
-    at each of 1, 8, 9 and 43 tokens, interleaved with the generic Lamport
-    one-shot and two-shot reductions; a zero route and negative zeros travel
-    as data, one rank is delayed in each replay, and the stage counters start
-    at the last stage so the replays wrap them.
+    at each of 1, 8, 9, 16, 32, and 43 tokens, interleaved with the generic
+    Lamport one-shot and two-shot reductions; a zero route and negative zeros
+    travel as data, one rank is delayed in each replay, and the stage counters
+    start at the last stage so the replays wrap them.
     """
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_arch_policy,

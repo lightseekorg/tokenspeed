@@ -75,8 +75,8 @@ peers finish reading its symmetric buffers.
 Batches below the reduce-scatter range complete their routes column-owned in
 one launch, with its own mailboxes and per-(token, owner) stages: rank q sums
 the partials of columns [512q, 512q + 512) of every route and publishes them
-with their partial sums of squares, then every rank normalizes, weights and
-sums all columns.
+with their partial sums of squares, then every rank normalizes, weights,
+and sums all columns.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
