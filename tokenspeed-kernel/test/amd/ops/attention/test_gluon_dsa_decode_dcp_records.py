@@ -262,6 +262,13 @@ def test_decode_records_read_a_query_riding_in_a_gathered_chunk(tokens):
     shifted = odd[:, : tokens * local_heads * 576].view(q.dtype).view(q.shape)
     shifted.view(torch.uint8).copy_(q.view(torch.uint8))
     assert torch.equal(dsa_decode_dcp_records(q=shifted, **kwargs), expected)
+    # So is an aligned one whose last rank starts past 2**31 bytes.
+    stride = (2**31 // (degree - 1) + 255) // 256 * 256
+    wide = torch.empty((degree, stride), device="cuda", dtype=torch.uint8)
+    far = wide[:, : tokens * local_heads * 576].view(q.dtype).view(q.shape)
+    far.view(torch.uint8).copy_(q.view(torch.uint8))
+    assert (degree - 1) * far.stride(0) >= 2**31
+    assert torch.equal(dsa_decode_dcp_records(q=far, **kwargs), expected)
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 48, 64])
@@ -315,6 +322,28 @@ def test_decode_records_serve_unsplit_launches(dtype):
     kwargs = _kwargs(cache, slots, lengths)
     assert torch.equal(dsa_decode_dcp_records(q=q, **kwargs), _dispatched(q, kwargs))
     assert not _supported(0, 96)
+
+
+def test_decode_records_refuse_sizes_past_their_32bit_offsets():
+    # One split at these sizes: 96 heads' records take 1028 bytes a token, a
+    # BF16 query 1152 and an FP8 one 576.
+    def supported(tokens, dtype):
+        return dsa_decode_dcp_records_supported(
+            tokens=tokens,
+            heads=96,
+            topk=TOPK,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+
+    for dtype in (torch.float8_e4m3fn, torch.bfloat16):
+        assert supported(2048, dtype)
+        assert not supported(65536, dtype)
+    # Records under 2**31 bytes, a BF16 query past it.
+    assert supported(20000, torch.float8_e4m3fn)
+    assert not supported(20000, torch.bfloat16)
 
 
 def test_decode_records_replay_in_a_graph_across_lengths():

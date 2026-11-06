@@ -134,6 +134,35 @@ def test_row_bounded_topk_without_starts_begins_every_row_at_column_zero(width):
     )
 
 
+def test_row_bounded_topk_reads_rows_past_int32_offsets():
+    # A max-model-len-wide buffer whose last rows start past 2**31 logits;
+    # the rows before them are empty and never read.
+    rows, width, topk, tail = 2112, 1 << 20, 2048, 4
+    generator = torch.Generator(device="cuda").manual_seed(31)
+    logits = torch.empty((rows, width), device="cuda")
+    logits[-tail:] = torch.rand((tail, width), device="cuda", generator=generator)
+    lengths = torch.zeros((rows,), device="cuda", dtype=torch.int32)
+    lengths[-tail:] = torch.tensor([topk - 3, 70000, 300000, width])
+    starts = torch.zeros_like(lengths)
+    assert (rows - tail) * logits.stride(0) > 2**31
+
+    offsets, counts = gluon_dsa_row_bounded_logical_topk_gfx950(
+        logits, starts, lengths, topk=topk
+    )
+
+    assert (counts[:-tail] == 0).all()
+    for row in range(rows - tail, rows):
+        count = int(counts[row])
+        length = int(lengths[row])
+        assert count == min(topk, length)
+        mine = offsets[row, :count].long()
+        assert bool(((mine >= 0) & (mine < length)).all())
+        assert torch.equal(
+            logits[row, mine].sort().values,
+            logits[row, :length].topk(count).values.sort().values,
+        )
+
+
 @pytest.mark.parametrize("rows", [1, 64])
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_live_topk_keeps_every_live_score_of_rows_holding_at_most_topk(rows, topk):
@@ -507,6 +536,38 @@ def test_owned_selection_writes_into_the_callers_rows():
     torch.testing.assert_close(lens_out[1 : rows + 1], counts, atol=0, rtol=0)
     assert (out[0] == 7).all() and (out[rows + 1] == 7).all()
     assert int(lens_out[0]) == 7 and int(lens_out[rows + 1]) == 7
+
+
+def test_owned_selection_reads_positions_past_int32_offsets():
+    # This rank's candidate positions in rows an int32 stride apart, the last
+    # row (one with candidates) past 2**31 elements.
+    degree, rows, topk = 2, 4, 2048
+    table, virtual_blocks, positions, scores = _owned_candidates(
+        degree, rows, 1, topk, seed=23
+    )
+    (slots, counts), *_ = _merged_then_compacted(
+        table, virtual_blocks, positions, scores, 1, topk
+    )
+    assert int(counts[-1]) > 0
+    stride = (2**31 // (rows - 1) + 64) // 64 * 64
+    storage = torch.empty((rows - 1) * stride + topk, device="cuda", dtype=torch.int32)
+    far = storage.as_strided((rows, topk), (stride, 1))
+    far.copy_(positions[0])
+    assert (rows - 1) * far.stride(0) > 2**31
+
+    local_slots, local_counts = dsa_select_owned_candidates(
+        scores,
+        far,
+        _local_pages(table, virtual_blocks, degree, 0),
+        torch.arange(rows, device="cuda", dtype=torch.int32),
+        rank=0,
+        topk=topk,
+        page_size=_PAGE,
+        solution="gluon",
+    )
+
+    torch.testing.assert_close(local_slots, slots, atol=0, rtol=0)
+    torch.testing.assert_close(local_counts, counts, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(

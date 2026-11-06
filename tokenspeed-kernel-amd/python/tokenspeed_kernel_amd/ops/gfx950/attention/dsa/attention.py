@@ -2491,12 +2491,27 @@ def gluon_dsa_decode_dcp_records_supported_gfx950(
     decode of this size: the dense matrix core, whose one-split rows store
     their records and whose reduction merges the others'. Host values
     only."""
-    del heads, topk
-    return tokens > 0 and _use_dense_mfma_core(
+    if tokens <= 0 or not _use_dense_mfma_core(
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+    ):
+        return False
+    # The core's buffer loads and stores and the reduction keep int32 offsets
+    # into the query and the split workspace; a decode's are tens of MB.
+    query_bytes = tokens * heads * (kv_lora_rank + qk_rope_head_dim) * q_dtype.itemsize
+    return query_bytes < 2**31 and (
+        gluon_dsa_decode_dcp_records_workspace_bytes_gfx950(
+            tokens=tokens,
+            heads=heads,
+            topk=topk,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        < 2**31
     )
 
 
@@ -2616,11 +2631,14 @@ def launch_gluon_dsa_decode_dcp_records_gfx950(
             )
     dim = q.shape[3]
     # The query's direct-to-LDS copy needs a 16-byte-aligned base and
-    # 16-element-aligned row offsets.
+    # 16-element-aligned row offsets, and its buffer loads a span under 2**31
+    # bytes.
     if (
         q.stride()[1:] != (local_heads * dim, dim, 1)
         or q.stride(0) % 16
         or q.data_ptr() % 16
+        or ((ranks - 1) * q.stride(0) + tokens * local_heads * dim) * q.element_size()
+        >= 2**31
     ):
         q = q.contiguous()
     return _run_dense_kv(

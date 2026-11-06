@@ -150,7 +150,9 @@ def _select_owned_from_gathered_kernel(
     own_tie = (own == threshold) & own_live
     tie_rank = tied_before + gl.cumsum(own_tie.to(gl.int32), 0) - 1
     keep = ((own > threshold) | (own_tie & (tie_rank < quota))) & own_live
-    position = gl.load(positions + row * position_stride + local, mask=keep, other=0)
+    position = gl.load(
+        positions + row.to(gl.int64) * position_stride + local, mask=keep, other=0
+    )
     request = gl.load(query_requests + row).to(gl.int64)
     page = gl.load(
         local_page_table + request * table_stride + position // PAGE,
