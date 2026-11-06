@@ -37,6 +37,12 @@ leaves them installed. Use a fresh cu129 venv instead of mixing the two
 stacks, because constraints cannot remove unrelated CUDA 13 packages left in
 an old environment.
 
+The one exception is `nvidia-cutlass-dsl-libs-cu13==4.8.0`, required by
+cuDNN frontend through `nvidia-cutlass-dsl[cu13]`. This DSL companion library
+can coexist with the cu12 DSL libraries; its presence does not select the
+CUDA 13 runtime. The recipe pins this exception and accepts it on subsequent
+installation runs while continuing to reject CUDA 13 runtime packages.
+
 DeepEP follows the same pinned installation path as the other native packages.
 The dependency remains `tokenspeed-deepep==2.1.0.post20260810`; pending upstream
 DeepEP changes are maintained separately from TokenSpeed. If a temporary build
