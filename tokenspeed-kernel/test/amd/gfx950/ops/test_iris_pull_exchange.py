@@ -23,6 +23,7 @@ Triton combine's), back to back and replayed."""
 
 import socket
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -401,3 +402,24 @@ def test_pull_combine_matches_nccl_all_to_all_then_combine():
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_combine_worker, args=(port,), nprocs=8, join=True)
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="requires CDNA4")
+@pytest.mark.parametrize("world, largest", [(2, 2**31 - 16), (8, 2**30 - 16)])
+def test_pull_exchange_refuses_buffers_past_its_32bit_offsets(world, largest):
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
+
+    # A stand-in for the Iris group: the bound holds before any heap
+    # allocation, and the buffer here is a meta tensor.
+    peers = SimpleNamespace(
+        world_size=world,
+        device="cpu",
+        ctx=SimpleNamespace(
+            zeros=lambda shape, dtype: torch.empty(shape, dtype=dtype, device="meta")
+        ),
+    )
+    assert IrisPullExchange(peers, largest).max_bytes == largest
+    with pytest.raises(ValueError, match="32-bit offsets"):
+        IrisPullExchange(peers, largest + 16)

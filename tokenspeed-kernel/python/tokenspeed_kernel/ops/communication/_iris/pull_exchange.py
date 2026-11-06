@@ -352,8 +352,17 @@ class IrisPullExchange:
                 "Iris pull exchanges need two to eight CDNA4 ranks, got "
                 f"{peers.world_size}"
             )
+        # The kernels keep int32 offsets: buffer loads and stores reach 2**31
+        # bytes past their base, and an output places each peer's words at
+        # peer * words. A decode exchange is tens of MB.
+        words = _words(max_bytes)
+        if words * 4 >= 2**31 or peers.world_size * words >= 2**31:
+            raise ValueError(
+                f"an Iris pull exchange of {max_bytes} bytes over "
+                f"{peers.world_size} ranks exceeds its 32-bit offsets"
+            )
         self.peers = peers
-        self.buffer = peers.ctx.zeros((_words(max_bytes),), dtype=torch.int32)
+        self.buffer = peers.ctx.zeros((words,), dtype=torch.int32)
         self.ready = peers.ctx.zeros((peers.world_size,), dtype=torch.int32)
         self.done = peers.ctx.zeros((peers.world_size,), dtype=torch.int32)
         # The last call's epoch, then the current call's finished programs.

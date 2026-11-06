@@ -2327,7 +2327,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     shared_histogram.store(slot_zeros)
     shared_output_counters.store(output_counter_zeros)
 
-    row_offset = row * logits_stride
+    row_offset = row.to(gl.int64) * logits_stride
     if ALIGNED_ROWS:
         # Unspecialized logits_stride hides the 16-byte alignment dwordx4 loads need.
         row_offset = gl.multiple_of(row_offset, 4)
