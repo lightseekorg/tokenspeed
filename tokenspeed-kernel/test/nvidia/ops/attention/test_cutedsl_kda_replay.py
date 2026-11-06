@@ -22,7 +22,9 @@
 
 The selected all-layer replay must commit what ``accepted_length`` ordinary
 decode steps produce, ignore the rejected suffix, leave a zero-accept page
-untouched, start fresh pages from zero, and skip unwritten pages.
+untouched, start fresh pages from zero, and skip unwritten pages. Its gate
+column holds the BF16 raw gate the fused verify writes, so the reference
+takes that raw gate through an identity gate projection.
 """
 
 import pytest
@@ -36,9 +38,9 @@ if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3
     pytest.skip("CuTe DSL KDA replay targets sm100/sm103", allow_module_level=True)
 
 from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
+    kda_batched_replay_uses_raw_gate,
     resolve_kda_batched_replay_commit,
 )
-from tokenspeed_kernel.registry import KernelRegistry  # noqa: E402
 
 HV, K, D_FA = 4, 128, 128
 P = HV * K
@@ -63,8 +65,8 @@ def _layer(n, t, seed, state_dtype):
         A_log=rnd(HV, dtype=torch.float32, scale=0.5),
         dt_bias=rnd(P, dtype=torch.float32),
         state=rnd(PAGES, HV, K, K, dtype=torch.float32).to(state_dtype),
-        gate=torch.empty(n * t, P, device="cuda", dtype=torch.float32),
     )
+    layer["gate"] = layer["f_a"] @ layer["w_fb"].t()
     layer["conv"][ZERO_PAGE].zero_()
     layer["state"][ZERO_PAGE].zero_()
     return layer
@@ -111,8 +113,8 @@ def _reference(x, reads, t, accepted):
         x["conv"],
         x["state"],
         reads,
-        x["w_fb"],
-        x["f_a"],
+        torch.eye(P, device="cuda"),
+        x["gate"],
         x["A_log"],
         x["dt_bias"],
         x["beta"],
@@ -134,6 +136,7 @@ def kernel():
     selected = resolve_kda_batched_replay_commit()
     assert selected is not None
     assert selected.name == "cutedsl_nvidia_kda_batched_replay_commit"
+    assert kda_batched_replay_uses_raw_gate()
     return selected
 
 
@@ -172,22 +175,25 @@ def test_replay_matches_sequential_decode(kernel, t):
         torch.testing.assert_close(x["conv"][others], conv0[others], atol=0, rtol=0)
 
 
-def test_bf16_state_matches_the_triton_replay(kernel):
-    """BF16 storage: both replays round the same FP32 recurrence once."""
+def test_bf16_state_rounds_the_sequential_decode_once(kernel):
+    """BF16 storage: the FP32 recurrence is rounded once, on the final write."""
     n, t = 5, 4
     layers = [_layer(n, t, seed=40 + i, state_dtype=torch.bfloat16) for i in range(2)]
-    triton_layers = [{k: v.clone() for k, v in x.items()} for x in layers]
     reads = _pages([[1, 2, 3, 4, 5]])
     writes = _pages([[13, 14, 15, 16, 17]])
     accepted = _pages([4, 0, 2, 3, 1])
     _replay(kernel, layers, [0, 0], reads, writes, accepted, t)
-    triton = KernelRegistry.get().get_impl("triton_nvidia_kda_batched_replay_commit")
-    _replay(triton, triton_layers, [0, 0], reads, writes, accepted, t)
-    for x, y in zip(layers, triton_layers, strict=True):
-        torch.testing.assert_close(x["conv"], y["conv"], atol=0, rtol=0)
-        torch.testing.assert_close(
-            x["state"], y["state"], atol=1e-6, rtol=torch.finfo(torch.bfloat16).eps
-        )
+    for x in layers:
+        windows, states = _reference(x, reads[0], t, accepted)
+        for i in range(n):
+            w = int(writes[0, i])
+            torch.testing.assert_close(x["conv"][w].float(), windows[i], atol=0, rtol=0)
+            torch.testing.assert_close(
+                x["state"][w].transpose(-1, -2).float(),
+                states[i],
+                atol=1e-5,
+                rtol=torch.finfo(torch.bfloat16).eps,
+            )
 
 
 def test_rejected_suffix_and_zero_accept_commit_in_place(kernel):
@@ -199,7 +205,7 @@ def test_rejected_suffix_and_zero_accept_commit_in_place(kernel):
     perturbed = {k: v.clone() for k, v in base.items()}
     for i, a in enumerate(accepted.tolist()):
         rows = slice(i * t + a, (i + 1) * t)
-        for name in ("qkv", "f_a", "beta"):
+        for name in ("qkv", "gate", "beta"):
             perturbed[name][rows] = perturbed[name][rows] * 3 + 1
     before = base["state"][2].clone(), base["conv"][2].clone()
     _replay(kernel, [base], [0], pages, pages, accepted, t)

@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuteDSL KDA adapters: the chunked prefill scan and the batched replay.
+"""CuteDSL KDA adapters: the chunked prefill scan, the speculative verify and
+the batched replay.
 
 States use the native ``[N, HV, V, K]`` convention, matching the NVIDIA
 cache and the CuteDSL ABI. The dispatch facade adapts other cache layouts;
@@ -77,6 +78,7 @@ __all__ = [
     "cutedsl_kda_chunk_prefill",
     "cutedsl_kda_supported",
     "cutedsl_nvidia_kda_batched_replay_commit",
+    "cutedsl_nvidia_kda_fused_paged_verify",
 ]
 
 
@@ -296,6 +298,115 @@ def cutedsl_kda_chunk_prefill(
 
 @register_kernel(
     "attention",
+    "kda_fused_paged_verify",
+    name="cutedsl_nvidia_kda_fused_paged_verify",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=_DENSE_BF16_SIGNATURES,
+    # Outranks the Triton split verify (SPECIALIZED + 1). Same coverage as the
+    # raw-gate batched replay below, which reads the payload only this verify
+    # writes.
+    priority=Priority.SPECIALIZED + 2,
+    traits={
+        "head_dim": frozenset({128}),
+        "paged_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({False}),
+        "store_states": frozenset({False}),
+    },
+)
+def cutedsl_nvidia_kda_fused_paged_verify(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_scratch: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_scratch: torch.Tensor | None,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+    replay_mixed_qkv: torch.Tensor,
+    replay_gate: torch.Tensor,
+    replay_beta: torch.Tensor,
+) -> torch.Tensor:
+    """Run target verify and fill the raw-gate replay payload; no rollback states.
+
+    The gate GEMM writes the raw gate into ``replay_gate``; one persistent
+    CuTe DSL kernel then convolves the raw projections from the committed
+    window, runs the recurrence per draft position, writes the output and
+    copies the raw QKV and beta rows into the payload. Per-position conv
+    windows and states are not materialized (``conv_scratch``,
+    ``state_scratch`` and ``write_indices`` are unused): the batched replay
+    recomputes the accepted prefix.
+
+    Args:
+        mixed_qkv: ``[batch * draft_token_num, >= 3 * P]`` raw projections.
+        conv_weights: ``[3 * P, 4]`` convolution taps.
+        conv_states: ``[pages, 3 * P, 3]`` committed convolution windows.
+        conv_scratch: Unused.
+        f_a_out: Low-rank gate activation.
+        f_b_weight: Second gate projection.
+        beta_logits: Raw beta.
+        A_log: Per-head FP32 decay parameter.
+        dt_bias: FP32 gate bias.
+        state_pool: ``[pages, num_heads, 128, 128]`` V-major states.
+        state_scratch: Unused.
+        read_indices: ``[batch]`` committed pages (-1 = fresh request).
+        write_indices: Unused.
+        num_heads: Local KDA heads.
+        head_dim: 128.
+        draft_token_num: Draft window tokens per request.
+        lower_bound: Safe-gate lower bound.
+        replay_mixed_qkv: Payload view for the raw QKV rows.
+        replay_gate: BF16 payload view for the raw gate.
+        replay_beta: Payload view for the raw beta.
+
+    Returns:
+        ``[1, batch * draft_token_num, num_heads, 128]`` attention output.
+    """
+    from tokenspeed_kernel.ops.attention.kda._cute_dsl.verify import (
+        kda_fused_verify,
+    )
+
+    if head_dim != 128:
+        raise ValueError("CuTe DSL KDA verify requires head_dim=128")
+    if lower_bound is None:
+        raise ValueError("CuTe DSL KDA verify requires a safe-gate bound")
+    return kda_fused_verify(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool,
+        read_indices,
+        replay_mixed_qkv,
+        replay_gate,
+        replay_beta,
+        num_heads=num_heads,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    ).view(1, -1, num_heads, head_dim)
+
+
+@register_kernel(
+    "attention",
     "kda_replay_commit",
     name="cutedsl_nvidia_kda_batched_replay_commit",
     solution="cute_dsl",
@@ -309,7 +420,9 @@ def cutedsl_kda_chunk_prefill(
     traits={
         "batched_layers": frozenset({True}),
         "flat_state": frozenset({True}),
+        "head_dim": frozenset({128}),
         "recurrent_layout": frozenset({"v_major"}),
+        "replay_raw_gate": frozenset({True}),
     },
 )
 def cutedsl_nvidia_kda_batched_replay_commit(
@@ -335,9 +448,10 @@ def cutedsl_nvidia_kda_batched_replay_commit(
 ) -> None:
     """Replay every KDA layer described by stable device pointer tables.
 
-    Same contract as ``triton_nvidia_kda_batched_replay_commit``: the gate
-    precompute and the convolution-window publication are the shared Triton
-    launches; the recurrence runs as one persistent CuTe DSL kernel.
+    Raw-gate contract: the gate descriptor column holds the BF16 raw gate that
+    ``cutedsl_nvidia_kda_fused_paged_verify`` wrote, and the recurrence applies
+    the decay gate in-kernel as one persistent CuTe DSL kernel. The
+    convolution-window publication is the shared Triton launch.
 
     Args:
         descriptors: Device pointers for every layer's inputs, weights, and state.
@@ -348,14 +462,14 @@ def cutedsl_nvidia_kda_batched_replay_commit(
         draft_token_num: Maximum number of draft tokens in the replay window.
         num_heads: Number of local KDA value heads.
         head_dim: Per-head key and value dimension (128).
-        f_a_dim: Width of the low-rank gate projection.
+        f_a_dim: Unused (the raw gate is already projected).
         qkv_stride: Token stride of the packed QKV payload.
         conv_stride: Page stride of the convolution state.
-        f_a_stride: Token stride of the low-rank gate payload.
+        f_a_stride: Unused.
         beta_stride: Token stride of beta.
         state_stride: Page stride of the recurrent state.
         state_dtype: Storage dtype of every recurrent-state descriptor.
-        gate_stride: Token stride of the gate scratch tensor.
+        gate_stride: Token stride of the raw-gate payload.
         conv_width: Width of the depthwise convolution kernel (4).
         lower_bound: Lower bound used by the KDA decay gate.
 
@@ -367,7 +481,6 @@ def cutedsl_nvidia_kda_batched_replay_commit(
     )
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         batched_kda_replay_conv_window,
-        batched_kda_replay_gate,
         check_batched_replay_args,
     )
 
@@ -376,16 +489,6 @@ def cutedsl_nvidia_kda_batched_replay_commit(
     )
     if conv_width != 4:
         raise ValueError("CuTe DSL KDA replay requires conv_width=4")
-    batched_kda_replay_gate(
-        descriptors,
-        rows=accepted_length.numel() * draft_token_num,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        f_a_dim=f_a_dim,
-        f_a_stride=f_a_stride,
-        gate_stride=gate_stride,
-        lower_bound=lower_bound,
-    )
     kda_batched_replay(
         descriptors.view(torch.int64),
         group_indices,
@@ -400,6 +503,7 @@ def cutedsl_nvidia_kda_batched_replay_commit(
         state_stride=state_stride,
         state_dtype=state_dtype,
         gate_stride=gate_stride,
+        lower_bound=lower_bound,
     )
     batched_kda_replay_conv_window(
         descriptors,

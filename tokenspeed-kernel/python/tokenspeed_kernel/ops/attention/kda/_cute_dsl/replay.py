@@ -21,9 +21,10 @@
 """Batched KDA replay recurrence for Blackwell.
 
 Persistent CTAs walk (layer, request, head) items. Each item's state tile and
-its convolution, key, value, gate and beta inputs are prefetched into a
+its convolution, key, value, raw gate and beta inputs are prefetched into a
 double-buffered shared-memory stage one item ahead (bulk copies completing on
-an mbarrier). Within an item, warp ``w`` owns V rows ``[32w, 32w + 32)`` and
+an mbarrier). The decay gate ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
+is applied in-kernel to the BF16 raw gate the verify wrote into the payload. Within an item, warp ``w`` owns V rows ``[32w, 32w + 32)`` and
 lane ``4g + q`` owns rows ``32w + g + 8c`` and the K chunks ``q + 4j`` (eight
 elements each), so a token's contraction over K is in-thread packed FMAs plus
 a two-step butterfly across the four lanes of a row group. The per-token math
@@ -47,7 +48,7 @@ __all__ = ["kda_batched_replay"]
 HEAD_DIM = 128
 CTAS_PER_SM = 2
 # Descriptor columns: qkv, conv_w, conv_pool, f_a, f_b, beta, A, dt, state, gate.
-_QKV, _CONV_W, _CONV, _BETA, _STATE, _GATE = 0, 1, 2, 5, 8, 9
+_QKV, _CONV_W, _CONV, _BETA, _A_LOG, _DT_BIAS, _STATE, _GATE = 0, 1, 2, 5, 6, 7, 8, 9
 _GMEM = cute.AddressSpace.gmem
 
 
@@ -62,6 +63,7 @@ class KdaBatchedReplay:
         beta_stride: int,
         state_stride: int,
         gate_stride: int,
+        lower_bound: float,
     ):
         self.T = draft_tokens
         self.HV = num_heads
@@ -72,6 +74,7 @@ class KdaBatchedReplay:
         self.s_beta = beta_stride
         self.s_state = state_stride
         self.s_gate = gate_stride
+        self.lb = lower_bound
 
     @cute.jit
     def __call__(
@@ -147,6 +150,8 @@ class KdaBatchedReplay:
         sWk,
         sWv,
         sBeta,
+        sBias,
+        sAlog,
         beta_atom,
         mbar,
         tid: Int32,
@@ -163,7 +168,7 @@ class KdaBatchedReplay:
                 a_w = Int64(mAddr[layer, _CONV_W])
                 a_gate = Int64(mAddr[layer, _GATE])
                 bar = mbar + b
-                inputs = T * (2 * K * 2 + K * 4) + 2 * K * 4 * 2
+                inputs = T * (3 * K * 2) + 2 * K * 4 * 2 + K * 4
                 if read_page >= 0:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar, inputs + K * K * self.esz + 2 * K * 3 * 2
@@ -224,14 +229,21 @@ class KdaBatchedReplay:
                         bar,
                     )
                     self._bulk(
-                        Float32,
-                        K * 4,
-                        a_gate + (row * self.s_gate + Int64(hv * K)) * 4,
+                        BFloat16,
+                        K * 2,
+                        a_gate + (row * self.s_gate + Int64(hv * K)) * 2,
                         sG[b, i, None],
                         bar,
                     )
-            # Beta rows are too narrow for a bulk copy: one 4 B cp.async per
-            # token, counted on the same mbarrier.
+                self._bulk(
+                    Float32,
+                    K * 4,
+                    Int64(mAddr[layer, _DT_BIAS]) + Int64(hv * K * 4),
+                    sBias[b, None],
+                    bar,
+                )
+            # Beta rows and A_log are too narrow for a bulk copy: one 4 B
+            # cp.async each, counted on the same mbarrier.
             if tid < T:
                 row = nl * T + tid
                 src = cute.make_tensor(
@@ -245,6 +257,22 @@ class KdaBatchedReplay:
                     cute.make_layout(2),
                 )
                 cute.copy(beta_atom, src, sBeta[b, tid, None])
+                cute.arch.cp_async_mbarrier_arrive_noinc(mbar + b)
+            if tid == T:
+                src = cute.make_tensor(
+                    cute.make_ptr(
+                        BFloat16,
+                        Int64(mAddr[layer, _A_LOG]) + Int64(hv * 4),
+                        _GMEM,
+                        assumed_align=4,
+                    ),
+                    cute.make_layout(2),
+                )
+                dst = cute.make_tensor(
+                    cute.recast_ptr(sAlog.iterator + b, dtype=BFloat16),
+                    cute.make_layout(2),
+                )
+                cute.copy(beta_atom, src, dst)
                 cute.arch.cp_async_mbarrier_arrive_noinc(mbar + b)
 
     @cute.kernel
@@ -298,9 +326,15 @@ class KdaBatchedReplay:
             byte_alignment=16,
         )
         sG = smem.allocate_tensor(
-            Float32,
+            BFloat16,
             cute.make_layout((2, T, K), stride=(T * K, K, 1)),
             byte_alignment=16,
+        )
+        sBias = smem.allocate_tensor(
+            Float32, cute.make_layout((2, K), stride=(K, 1)), byte_alignment=16
+        )
+        sAlog = smem.allocate_tensor(
+            Float32, cute.make_layout((2, 1), stride=(1, 1)), byte_alignment=16
         )
         sCk = smem.allocate_tensor(
             BFloat16, cute.make_layout((2, K * 3), stride=(K * 3, 1)), byte_alignment=16
@@ -341,14 +375,16 @@ class KdaBatchedReplay:
         )
 
         if tid == 0:
-            # One expect-tx arrival plus one cp.async arrival per beta row.
-            cute.arch.mbarrier_init(mbar, 1 + T)
-            cute.arch.mbarrier_init(mbar + 1, 1 + T)
+            # One expect-tx arrival, one cp.async arrival per beta row and one
+            # for A_log.
+            cute.arch.mbarrier_init(mbar, 2 + T)
+            cute.arch.mbarrier_init(mbar + 1, 2 + T)
             cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
         self._prefetch(
             cta, Int32(0), total, batch, inv_batch, mAddr, mGroup, mRead, sState,
-            sXk, sXv, sG, sCk, sCv, sWk, sWv, sBeta, beta_atom, mbar, tid,
+            sXk, sXv, sG, sCk, sCv, sWk, sWv, sBeta, sBias, sAlog, beta_atom, mbar,
+            tid,
         )  # fmt: skip
 
         it = Int32(0)
@@ -356,7 +392,8 @@ class KdaBatchedReplay:
             b = it % 2
             self._prefetch(
                 item + ctas, 1 - b, total, batch, inv_batch, mAddr, mGroup, mRead,
-                sState, sXk, sXv, sG, sCk, sCv, sWk, sWv, sBeta, beta_atom, mbar, tid,
+                sState, sXk, sXv, sG, sCk, sCv, sWk, sWv, sBeta, sBias, sAlog,
+                beta_atom, mbar, tid,
             )  # fmt: skip
             layer, n, hv = self._decode(item, batch, inv_batch)
             row = mGroup[layer] * batch + n
@@ -382,6 +419,8 @@ class KdaBatchedReplay:
                 s0 = sCk[b, tid * 3 + 0].to(Float32)
                 s1 = sCk[b, tid * 3 + 1].to(Float32)
                 s2 = sCk[b, tid * 3 + 2].to(Float32)
+            exp_a = cute.math.exp(sAlog[b, 0], fastmath=True)
+            bias = sBias[b, tid]
             rX = cute.make_rmem_tensor(T, Float32)
             rS = cute.make_rmem_tensor(T, Float32)
             for i in cutlass.range_constexpr(T):
@@ -397,7 +436,15 @@ class KdaBatchedReplay:
                 s2 = x
                 rX[i] = act
                 rS[i] = cute.arch.warp_reduction_sum(act * act)
-                fA[i, tid] = cute.math.exp(sG[b, i, tid], fastmath=True)
+                decay = self.lb * cute.math.div(
+                    Float32(1.0),
+                    Float32(1.0)
+                    + cute.math.exp(
+                        -(exp_a * (sG[b, i, tid].to(Float32) + bias)), fastmath=True
+                    ),
+                    full=True,
+                )
+                fA[i, tid] = cute.math.exp(decay, fastmath=True)
             if lane == 0:
                 for i in cutlass.range_constexpr(T):
                     sSS[warp, i] = rS[i]
@@ -562,13 +609,14 @@ def kda_batched_replay(
     state_stride: int,
     state_dtype: torch.dtype,
     gate_stride: int,
+    lower_bound: float,
 ) -> None:
     """Replay the accepted window prefix of every descriptor layer.
 
     Reads each item's committed state and convolution window, replays
     ``accepted_length`` tokens and writes the state to ``write_indices``.
-    The gate scratch must already hold the precomputed decay gate; the
-    convolution windows are published by a separate launch.
+    The gate column holds the BF16 raw gate; the convolution windows are
+    published by a separate launch.
 
     Args:
         addresses: ``[layers, 10]`` device pointer descriptors (int64 view).
@@ -582,6 +630,7 @@ def kda_batched_replay(
         qkv_stride, conv_stride, beta_stride, state_stride, gate_stride:
             Row or page strides (elements) shared by every layer.
         state_dtype: ``torch.bfloat16`` or ``torch.float32`` state storage.
+        lower_bound: Safe-gate lower bound.
     """
     batch = accepted_length.numel()
     layers = addresses.shape[0]
@@ -606,6 +655,7 @@ def kda_batched_replay(
         beta_stride,
         state_stride,
         gate_stride,
+        float(lower_bound),
     )
     ptrs = (
         make_ptr(Int64, addresses.data_ptr(), _GMEM, assumed_align=8),
@@ -629,6 +679,7 @@ def kda_batched_replay(
             beta_stride,
             state_stride,
             gate_stride,
+            float(lower_bound),
         )
         compiled = cute.compile(
             kernel, *ptrs, Int32(layers), Int32(batch), Int32(ctas), stream

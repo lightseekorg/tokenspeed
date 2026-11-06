@@ -46,8 +46,13 @@ class _Harness:
         seed: int = 0,
         max_bs: int = 8,
         usable_pages: int = 24,
+        exact_gate: bool = False,
     ):
         torch.manual_seed(seed)
+        # One-hot f_a rows make the gate projection exact in BF16, so a
+        # raw-gate replay (BF16 gate payload) and the scratch verify (FP32
+        # in-kernel gate) see the same gate.
+        self.exact_gate = exact_gate
         self.pool = _make_kimi_pool(DEV, usable_pages=usable_pages)
         self.contract = self.pool.arena.runtime_contract
         spec = SimpleNamespace(
@@ -99,9 +104,15 @@ class _Harness:
         def rnd(*shape):
             return torch.randn(*shape, generator=generator).to(DEV, torch.bfloat16)
 
+        mixed_qkv = rnd(bs * T, CONV_DIM)
+        if self.exact_gate:
+            hot = torch.randint(D_FA, (bs * T,), generator=generator)
+            f_a_out = torch.nn.functional.one_hot(hot, D_FA).to(DEV, torch.bfloat16)
+        else:
+            f_a_out = rnd(bs * T, D_FA)
         return {
-            "mixed_qkv": rnd(bs * T, CONV_DIM),
-            "f_a_out": rnd(bs * T, D_FA),
+            "mixed_qkv": mixed_qkv,
+            "f_a_out": f_a_out,
             "beta_raw": rnd(bs * T, H),
         }
 
@@ -408,8 +419,8 @@ def test_packed_qkv_views_match_materialized_split_across_commits():
 
 def test_eager_replay_matches_scratch_over_multiple_rounds_and_layers():
     """Absolute oracle: independent scratch and replay arms evolve identically."""
-    replay = _Harness(eager_replay=True, seed=17)
-    scratch = _Harness(eager_replay=False, seed=17)
+    replay = _Harness(eager_replay=True, seed=17, exact_gate=True)
+    scratch = _Harness(eager_replay=False, seed=17, exact_gate=True)
     rpis = [0, 1, 2]
     pages = {
         group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
@@ -650,9 +661,14 @@ def test_uneven_state_groups_bind_batched_replay():
     assert expected.count(0) != expected.count(1)
 
 
-def test_verify_scratch_cannot_grow_after_preallocation():
+def test_verify_scratch_cannot_grow_after_preallocation(monkeypatch):
     """Scratch is allocated once; any later capacity overrun fails loudly."""
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.backends.state.kda.kda_batched_replay_uses_raw_gate",
+        lambda dtype, **kwargs: False,
+    )
     harness = _Harness(eager_replay=True)
+    assert not harness.backend._replay_uses_raw_gate
     harness.backend.preallocate_verify_workspace(harness.backend.max_bs, T)
     capacity = next(iter(harness.backend._verify_scratch.values()))[0].shape[0]
     with pytest.raises(RuntimeError, match="preallocated scratch holds"):

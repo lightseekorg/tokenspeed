@@ -587,7 +587,7 @@ def test_kda_verify_conv_update_resolves_registered_producer(monkeypatch) -> Non
 @pytest.mark.parametrize(
     "dtype,expected",
     [
-        (torch.bfloat16, "triton_nvidia_kda_fused_paged_verify_split"),
+        (torch.bfloat16, "cutedsl_nvidia_kda_fused_paged_verify"),
         (torch.float16, "triton_nvidia_kda_fused_paged_verify_no_store"),
     ],
 )
@@ -596,9 +596,10 @@ def test_no_store_verify_resolves_by_priority_not_by_the_caller(
 ) -> None:
     """Callers ask for store_states only; the registry picks the producers.
 
-    The split variant outranks its inline-producer twin, so bf16 gets it
-    without naming it, and fp16 -- which the split producer cannot read --
-    falls back instead of losing the fused verify altogether.
+    On B300 the CuTe DSL verify outranks the Triton ones, so bf16 gets it
+    without naming it, and fp16 -- which neither it nor the split producer
+    reads -- falls back to the inline-producer twin instead of losing the
+    fused verify altogether.
     """
     registry = KernelRegistry.get()
     real_platform = Platform.get()
@@ -822,7 +823,21 @@ def test_kda_split_verify_registration_traits() -> None:
         ),
         (
             "cutedsl_nvidia_kda_batched_replay_commit",
-            {"flat_state": True, "batched_layers": True},
+            {
+                "flat_state": True,
+                "batched_layers": True,
+                "head_dim": 128,
+                "replay_raw_gate": True,
+            },
+        ),
+        (
+            "cutedsl_nvidia_kda_fused_paged_verify",
+            {
+                "head_dim": 128,
+                "paged_state": True,
+                "split_producers": False,
+                "store_states": False,
+            },
         ),
     ],
 )
