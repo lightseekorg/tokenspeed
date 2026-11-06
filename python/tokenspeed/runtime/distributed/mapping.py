@@ -570,9 +570,9 @@ def _resolve_lm_head_tp_size(
     """Resolve the LM-head TP width against the attention layout.
 
     The default is today's layout: the attention TP width without attention
-    DP, replicated (1) with it. An explicit width under attention DP needs
-    attention TP 1 (the logits path gathers whole rows from each rank) and
-    must tile the stage world; without DP it must equal the attention TP.
+    DP, replicated (1) with it. An explicit width under attention DP must
+    tile the stage world and align with attention TP groups; without DP it
+    must equal the attention TP.
     """
     if lm_head_tp_size is None:
         return 1 if attn.has_dp else attn.tp_size
@@ -590,16 +590,13 @@ def _resolve_lm_head_tp_size(
                 f"attn_tp_size={attn.tp_size}"
             )
         return lm_head_tp_size
-    if lm_head_tp_size > 1 and attn.tp_size != 1:
-        raise ValueError(
-            "LM head TP under attention DP needs attention TP 1, got "
-            f"attn_tp_size={attn.tp_size}"
-        )
     if attn.world_size % lm_head_tp_size:
         raise ValueError(
             f"LM head TP size {lm_head_tp_size} must divide the stage world "
             f"size {attn.world_size}"
         )
+    if max(lm_head_tp_size, attn.tp_size) % min(lm_head_tp_size, attn.tp_size):
+        raise ValueError("LM head and attention TP groups must tile each other")
     return lm_head_tp_size
 
 

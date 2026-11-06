@@ -171,6 +171,7 @@ def _check_shared_head_layout(target_model, draft_model) -> None:
         target.tp_group == draft.tp_group
         and target.tp_size == draft.tp_size
         and target.dp_lm_head_tp == draft.dp_lm_head_tp
+        and (not target.dp_lm_head_tp or target.attn_tp_size == draft.attn_tp_size)
     ):
         return
     raise ValueError(

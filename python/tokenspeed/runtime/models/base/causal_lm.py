@@ -312,6 +312,7 @@ class BaseCausalLM(nn.Module):
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
+            attn_tp_size=self.mapping.attn.tp_size,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 

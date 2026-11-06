@@ -223,7 +223,12 @@ class TestLmHeadResolution:
     def test_processor_flag_needs_a_sharded_head_under_skip_all_gather(self):
         config = SimpleNamespace(model_type="t", vocab_size=8)
         with pytest.raises(ValueError, match="dp_lm_head_tp"):
-            LogitsProcessor(config, skip_all_gather=True, dp_lm_head_tp=True)
+            LogitsProcessor(
+                config,
+                skip_all_gather=True,
+                attn_tp_size=1,
+                dp_lm_head_tp=True,
+            )
         with pytest.raises(ValueError, match="dp_lm_head_tp"):
             LogitsProcessor(
                 config,
@@ -231,6 +236,7 @@ class TestLmHeadResolution:
                 tp_rank=0,
                 tp_size=2,
                 tp_group=(0, 1),
+                attn_tp_size=1,
                 dp_lm_head_tp=True,
             )
 

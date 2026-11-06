@@ -253,6 +253,7 @@ def test_mtp_shares_complete_quantized_lm_head(monkeypatch, tied):
 
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="qwen3_5", vocab_size=4),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     hidden_states = torch.ones((1, 4), dtype=torch.bfloat16)

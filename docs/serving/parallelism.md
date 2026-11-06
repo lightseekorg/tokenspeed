@@ -131,10 +131,17 @@ path:
 A prefill row reaching the attention is then an invariant violation and
 raises, not a configuration the operator can hit.
 
-`--lm-head-tp-size` under attention DP gathers the ranks' logits rows,
+`--lm-head-tp-size` under attention DP gathers distinct DP groups' logits rows,
 runs the vocab-shard GEMM and transposes the shards back to each rank's own
 rows (`[T_own, V]`), so sampling and logprobs downstream see the same
-full-vocab rows as a replicated head. On the decode path the row counts come
+full-vocab rows as a replicated head. With attention TP greater than one,
+only one peer writes each DP slot into a zeroed hidden-state buffer, which
+is all-reduced across the LM-head group. The vocabulary shards are gathered
+and each attention TP peer reads its DP slot. This avoids multiplying the
+LM-head GEMM rows by attention TP. Head and attention TP widths must tile
+each other; for example, DP4/TP2 supports an explicit LM-head TP8 while its
+default stays replicated. A shared MTP head uses the same row layout.
+On the decode path the row counts come
 from the per-rank token tables (every rank's logits rows are its decode
 tokens, or the live rows a narrowing draft step reported), so the step has
 no host sync. The shapes without a table -- a prefill's one row per request
@@ -146,6 +153,13 @@ TokenSpeed refuses the others with a clear error). It cannot combine with
 (`logprob_start_len`): that path pushes the prompt rows through the LM head
 in per-request chunks, a per-rank number of row exchanges the group cannot
 agree on.
+
+LM-head vocabulary gathering uses a separate communication buffer sized for
+sampling and speculative verification rows, rather than the attention prefill
+chunk. With attention DP, its capacity covers the global request limit times
+the number of speculative verification tokens (at least 128 rows). Larger
+batches, including prompt-logprob batches, fall back to NCCL without growing
+the persistent multicast buffer.
 
 `--tp-batch-invariant` replaces the two reduce-scatters of these layouts
 (after `o_proj`, after the dense `down_proj`) with column-parallel GEMMs on

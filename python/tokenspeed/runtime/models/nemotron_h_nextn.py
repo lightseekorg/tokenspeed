@@ -162,6 +162,7 @@ class NemotronHForCausalLMNextN(nn.Module):
             tp_rank=attn.tp_rank,
             tp_size=attn.tp_size,
             tp_group=attn.tp_group,
+            attn_tp_size=attn.tp_size,
             dp_lm_head_tp=False,
         )
 

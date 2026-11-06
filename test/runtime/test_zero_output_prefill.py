@@ -319,6 +319,7 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
     output = forward(
         SimpleNamespace(
             config=SimpleNamespace(vocab_size=32),
+            attn_tp_size=1,
             dp_lm_head_tp=False,
             _query_shard=lambda metadata: None,
         ),
