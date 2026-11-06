@@ -602,7 +602,9 @@ o-projection shard). Each layer then does the following:
    with the block snapshots (AttnRes), reading a MoE layer's output row
    straight from the tail's ring.
 2. Run the packed input projection as a split-K GEMM with per-batch tactics.
-3. Run the attention core as usual.
+3. Run the attention core as usual, through the attention's `o_proj_input`
+   (Kimi-K3.1's DSA layers select their indexer's top-k there, as in their
+   `forward`).
 4. Multiply by this rank's o-projection shard and multicast the partial;
    a consumer kernel sums the partials, updates the prefix, and applies the
    post-attention AttnRes. Above 32 rows each rank sums its column share and

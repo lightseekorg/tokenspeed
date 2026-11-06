@@ -22,7 +22,6 @@ from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.decoder_layer import (
     BaseDecoderLayer,
     BaseMoEDecoderLayer,
-    CompiledDecoderLayer,
 )
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 
@@ -30,6 +29,5 @@ __all__ = [
     "BaseCausalLM",
     "BaseDecoderLayer",
     "BaseMoEDecoderLayer",
-    "CompiledDecoderLayer",
     "BaseTransformerModel",
 ]
