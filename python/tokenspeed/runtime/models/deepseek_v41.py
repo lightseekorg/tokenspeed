@@ -65,7 +65,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import re
 from collections import Counter
@@ -152,6 +151,10 @@ from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
+from tokenspeed.runtime.layers.rotary_embedding import (
+    yarn_find_correction_range,
+    yarn_linear_ramp_mask,
+)
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -493,27 +496,12 @@ class DeepseekV41RotaryEmbedding(nn.Module):
             scaling = config.rope_scaling
             original = scaling["original_max_position_embeddings"]
             factor = scaling["factor"]
-            fast, slow = scaling["beta_fast"], scaling["beta_slow"]
-            low = max(
-                math.floor(
-                    self.dim
-                    * math.log(original / (fast * 2 * math.pi))
-                    / (2 * math.log(base))
-                ),
-                0,
+            low, high = yarn_find_correction_range(
+                scaling["beta_fast"], scaling["beta_slow"], self.dim, base, original
             )
-            high = min(
-                math.ceil(
-                    self.dim
-                    * math.log(original / (slow * 2 * math.pi))
-                    / (2 * math.log(base))
-                ),
-                self.dim - 1,
+            ramp = yarn_linear_ramp_mask(
+                low, high, self.dim // 2, dtype=torch.float32, device=None
             )
-            ramp = (
-                (torch.arange(self.dim // 2, dtype=torch.float32) - low)
-                / max(high - low, 1e-3)
-            ).clamp(0, 1)
             smooth = 1 - ramp
             freqs = freqs / factor * (1 - smooth) + freqs * smooth
         self.register_buffer("inv_freq", freqs, persistent=False)
