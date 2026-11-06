@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi35x-1gpu-test
+    - amd-mi355-1gpu
 env:
   CI: "true"
 install:
