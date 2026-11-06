@@ -298,6 +298,8 @@ class DeepseekV41Recipe(CacheRecipe):
         BF16 KV rows for an entire prefill at once. Candidate/top-k ids still
         live for every scheduled query across Reindex/Reuse layers.
         """
+        from tokenspeed_kernel.ops.attention.dsv41 import index_logit_rows
+
         max_bs = self.attn_config.max_bs
         horizon = (1 + self.overlap_schedule_depth) * self.decode_input_tokens
         tables = (
@@ -331,8 +333,7 @@ class DeepseekV41Recipe(CacheRecipe):
         )
         # BF16 current SWA and compact [T,128+512] indices coexist with that KV.
         compact_metadata = queries * (V41_HEAD_DIM * 2 + (128 + 512) * 4)
-        # Prefill bounds its logits tile; paged decode scores the whole batch.
-        # Reserve native BF16 logits plus cleaning and selection copies.
+        # Packed index Q (32 global heads, one packed row each).
         index_queries = queries * 32 * (128 * 2 + rows.index_row_bytes)
         score_columns = (self.attn_config.context_len + 63) // 64 * 64
         decode_columns = (
@@ -341,24 +342,60 @@ class DeepseekV41Recipe(CacheRecipe):
             ]
             * 64
         )
+        # A P role never decodes and a D role never prefills
+        # (docs/design/scheduler.md), so each charges only its own scorers.
+        role = self.server_args.disaggregation_mode
+        prefills = role != "decode"
+        decodes = role != "prefill"
+        decode_rows = max_bs * self.decode_input_tokens
+        # Blackwell dense prefill batches request windows within index_logit_rows
+        # (TOKENSPEED_PREFILL_INDEX_LOGITS_MB) and selects from the MQA logits in
+        # place, so one BF16 matrix peaks.
+        dense_scores = (
+            min(queries, index_logit_rows(score_columns)) * score_columns * 2
+            if prefills
+            else 0
+        )
+        # Reindex layers (index source != KV owner) score every row of a prefill
+        # or decode batch in one call: BF16 logits over the candidate rows plus
+        # two int32 [rows, blocks] candidate maps.
+        has_reindex = any(
+            source >= 0 and source != owner
+            for owner, source in zip(spec.kv_owners, spec.index_sources)
+        )
+        sparse_scores = (
+            (queries if prefills else decode_rows)
+            * spec.candidate_topk
+            * (spec.candidate_block_size * 2 + 2 * 4)
+            if has_reindex
+            else 0
+        )
         # Paged scoring produces [rows, capacity] BF16 logits and the cleaned
         # copy beside them, whatever the caller's tile is; a window-less prefill
-        # takes that path with the 256-row prefill tile. One such buffer at a
-        # 1M-token context is 512 MiB, and the whole tile measured 1,041 MiB
-        # against 384 MiB from the old 128 MiB prefill cap alone. `3 *` below
-        # still covers the logits, the cleaned copy and the selection scratch.
-        paged_prefill = min(queries, 256) * score_columns * 2
-        score_scratch = max(
-            min(128 << 20, min(queries, 1024) * score_columns * 4),
-            paged_prefill,
-            max_bs * self.decode_input_tokens * decode_columns * 2,
+        # takes that path with the 256-row prefill tile and decode scores its
+        # whole batch. One such buffer at a 1M-token context is 512 MiB. Hopper
+        # tiles FP32 logits within 128 MiB for broadcast prefill and 32 MiB for
+        # paged rows. `3 *` below covers the logits, the cleaned copy and the
+        # selection scratch.
+        paged_scores = max(
+            (min(128 << 20, min(queries, 1024) * score_columns * 4) if prefills else 0),
+            min(queries, 256) * score_columns * 2 if prefills else 0,
+            min(32 << 20, decode_rows * decode_columns * 4) if decodes else 0,
+            decode_rows * decode_columns * 2 if decodes else 0,
         )
         block_k = max(32, 1 << (min(2048, max(1, score_columns // 8)) - 1).bit_length())
         # Sixteen portable partitions plus bounded TopK merge temporaries.
         portable_scratch = min(queries, 256) * 24 * (512 + block_k) * 12
+        # One scorer runs at a time, so its peak bounds the scratch. Dense
+        # prefill also packs one gathered history per request in the call.
+        packed_histories = (
+            min(max_bs, queries) * score_columns * rows.index_row_bytes
+            if prefills
+            else 0
+        )
         index_selection = (
-            max(3 * score_scratch, portable_scratch)
-            + score_columns * rows.index_row_bytes
+            max(dense_scores, sparse_scores, 3 * paged_scores, portable_scratch)
+            + packed_histories
         )
         # Ratio-2 pooling returns T FP32 rows, including inactive (-1) positions.
         compressor_output = queries * V41_HEAD_DIM * 4
