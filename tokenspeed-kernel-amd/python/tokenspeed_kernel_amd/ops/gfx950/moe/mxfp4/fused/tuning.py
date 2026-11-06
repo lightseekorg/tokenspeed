@@ -72,9 +72,13 @@ _GROUPED_MOE_CONFIGS = {
 
 
 class _RouteTileStage(NamedTuple):
-    """One route-tiled GEMM's output and K tile widths, how many K tiles'
-    loads it keeps in flight ahead of the MFMA (``PREFETCH_TILES``) and its
-    waves per program."""
+    """Tile widths, prefetch depth and wave count of one route-tiled GEMM.
+
+    ``block_n`` and ``block_k`` are the output and K tile widths.
+    ``prefetch_tiles`` (``PREFETCH_TILES``) is how many K tiles' loads it
+    keeps in flight ahead of the MFMA. ``num_warps`` is the launch's
+    ``num_warps``, which on gfx950 counts waves (wavefronts) per program.
+    """
 
     block_n: int
     block_k: int
