@@ -817,7 +817,7 @@ def test_executor_input_capacity_covers_decode_capture(
         max_req_pool_size=5,
         pp_size=pp_size,
         overlap_schedule_depth=depth,
-        vocab_size=VOCAB_SIZE,
+        vocabulary=VocabularySpec(input_size=VOCAB_SIZE, output_size=VOCAB_SIZE),
         output_length=width,
         enable_nan_detection=False,
         enable_speculative_sampling=False,

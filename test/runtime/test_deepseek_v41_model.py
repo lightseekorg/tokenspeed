@@ -395,6 +395,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
     adapter.mapping = _mapping(rank, tp_size, world_size)
+    adapter.vocabulary = VocabularySpec.from_hf_config(config, is_draft=False)
     adapter.encoder_only = False
     adapter.vision = None
     adapter.model = nn.Module()
