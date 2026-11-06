@@ -424,6 +424,7 @@ def test_window_attention_matches_dense_reference():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        fused_decode_groups=None,
         key_rows=None,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
@@ -502,6 +503,7 @@ def test_window_attention_kernel_matches_reference():
         swa_rope_cache=rotary.cos_sin_cache,
         swa_norm_weight=None,
         swa_norm_eps=config.rms_norm_eps,
+        fused_decode_groups=None,
         key_rows=None,
     )
     actual = backend.forward_v41(q, swa, **kwargs)
