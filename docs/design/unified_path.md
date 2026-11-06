@@ -663,8 +663,7 @@ over the target and draft `child_backends()` trees once
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` disables the prefill graph (rationale on the class) unless its
 consumer narrows a padded replay to the live rows in an eager break: a KPool
-instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, opted in
-by an explicit `--prefill-graph-capture-token-sizes` without
+instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, without
 `--enable-mixed-batch`, on the aggregated role
 (`DSAConfig.padded_prefill_replay`).
 That instance declaration follows launch arguments, so the prefill role and

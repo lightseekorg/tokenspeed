@@ -642,9 +642,8 @@ Notes:
   and output projection TP subgroups at startup.
 - On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
   breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
-  and on the aggregated role when `--prefill-graph-capture-token-sizes` names
-  the buckets and `--enable-mixed-batch` is off; elsewhere prefill runs eager.
-  `--disable-prefill-graph` turns them off.
+  and on the aggregated role unless `--enable-mixed-batch` is on; elsewhere
+  prefill runs eager. `--disable-prefill-graph` turns them off.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes 7 tokens per step, so it takes
   `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
@@ -665,10 +664,7 @@ start each one with the command below plus
 `<rank>` is the node's rank (`0` on the first node, `1` on the second) and
 `<first-node>:<port>` is the first node's address and a free port on it. Drop
 the 4 speculative flags to serve without the draft. The context length is the
-checkpoint's 1,048,576 tokens. `--prefill-graph-capture-token-sizes` turns on
-the prefill CUDA graphs (see the notes above); without it prefill runs eager
-and a short prompt's first token takes about 0.5 s longer. The graphs take
-about 4.5 GB more per GPU, which comes out of the KV cache.
+checkpoint's 1,048,576 tokens.
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
@@ -679,7 +675,6 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --mm-encoder-tp-mode data \
   --moe-backend flashinfer_trtllm \
   --max-num-seqs 64 \
-  --prefill-graph-capture-token-sizes 128 256 512 1024 2048 4096 8192 \
   --speculative-algorithm DSPARK \
   --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
   --speculative-num-draft-tokens 8 \
