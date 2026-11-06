@@ -1453,7 +1453,7 @@ class GlmDsaSparseAttentionMixin:
                 decode_topk = self._compute_decode_topk_indices(
                     indexer_output,
                     ctx,
-                    **({} if query_rider is None else {"query_rider": query_rider}),
+                    query_rider=query_rider,
                 )
                 if decode_topk is not None and decode_topk.gathered_query is not None:
                     gathered_query = decode_topk.gathered_query
