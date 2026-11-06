@@ -134,6 +134,7 @@ from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
 from tokenspeed_kernel.ops.transform import (
     hadamard_transform as kernel_hadamard_transform,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
@@ -7694,17 +7695,18 @@ def test_attn_merge_state_routes_to_triton_on_cdna4(
 
 
 @pytest.mark.parametrize(
-    ("entrypoint_name", "implementation_name"),
+    ("entrypoint_name", "implementation_name", "forwards_warmup"),
     [
-        ("gluon_dsa_prefill_gfx950", "_dsa_prefill_impl"),
-        ("gluon_dsa_prefill_fp8_dense_gfx950", "_dsa_prefill_impl"),
-        ("gluon_dsa_prefill_gfx1250", "_dsa_prefill_gfx1250_impl"),
-        ("gluon_dsa_prefill_fp8_dense_gfx1250", "_dsa_prefill_gfx1250_impl"),
+        ("gluon_dsa_prefill_gfx950", "_dsa_prefill_impl", True),
+        ("gluon_dsa_prefill_fp8_dense_gfx950", "_dsa_prefill_impl", True),
+        ("gluon_dsa_prefill_gfx1250", "_dsa_prefill_gfx1250_impl", False),
+        ("gluon_dsa_prefill_fp8_dense_gfx1250", "_dsa_prefill_gfx1250_impl", False),
     ],
 )
 def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     entrypoint_name: str,
     implementation_name: str,
+    forwards_warmup: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entrypoint = getattr(_attention_gluon_dsa, entrypoint_name, None)
@@ -7722,10 +7724,15 @@ def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     monkeypatch.setattr(_attention_gluon_dsa, implementation_name, fake_impl)
 
     marker = object()
-    result = entrypoint(marker=marker, kv_seq_lens=object())
+    for warming_up in (False, True):
+        forwarded.clear()
+        with kernel_warmup(enabled=warming_up):
+            result = entrypoint(marker=marker, kv_seq_lens=object())
 
-    assert result is expected
-    assert forwarded == {"marker": marker}
+        assert result is expected
+        # The gfx950 launcher prepares its split variants during warmup.
+        warmup = {"warm_split_variants": warming_up} if forwards_warmup else {}
+        assert forwarded == {"marker": marker, **warmup}
 
 
 @pytest.mark.parametrize(
