@@ -1631,9 +1631,9 @@ def _extend(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Launch the extend variant this batch selects, or compile them all.
 
-    Picks the query tile, K/V pipeline depth, grid layout and split count
+    Picks the query tile, K/V pipeline depth, grid layout, and split count
     from the batch, then launches that variant and returns its output (and
-    the LSE with ``return_lse``). With ``compile_all_variants`` it instead
+    the LSE with ``return_lse``). With ``compile_all_variants``, it instead
     compiles every variant any batch can select and returns None. Other
     arguments are as for ``launch_gluon_mha_extend_gfx950``.
     """
