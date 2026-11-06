@@ -23,17 +23,14 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cache, wraps
+from functools import cache
 from weakref import WeakValueDictionary
 
 import torch
-from cuda.bindings import driver
 from flashinfer.attention.prims_ts.decode import (
     suggest_q_token_kv_block_sparse_group_size,
 )
-from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
     get_q_token_kv_block_sparse_workspace_size,
@@ -41,40 +38,6 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
 from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata, QSAWorkspace
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens, is_autotuning
 from tokenspeed_kernel.workspace import retain_for_capture
-
-
-def _cache_cluster_occupancy(query: Callable[[int], int]) -> Callable[[int], int]:
-    """Cache the hardware query independently of each QSA launch geometry."""
-
-    @cache
-    def cached(device_index: int, context: int, cluster_size: int) -> int:
-        # Device and context belong to the key; FlashInfer reads the current context.
-        return query(cluster_size)
-
-    @wraps(query)
-    def current_context(cluster_size: int) -> int:
-        if not torch.cuda.is_available():
-            return query(cluster_size)
-        try:
-            # Match FlashInfer's context initialization before using its query.
-            torch.cuda.init()
-            torch.empty(0, device="cuda")
-            status, context = driver.cuCtxGetCurrent()
-        except RuntimeError:
-            return query(cluster_size)
-        if status != driver.CUresult.CUDA_SUCCESS or int(context) == 0:
-            return query(cluster_size)
-        return cached(torch.cuda.current_device(), int(context), cluster_size)
-
-    return current_context
-
-
-# FlashInfer 0.7.2 creates HardwareInfo for each new launch specification; that
-# recompiles CuTe's occupancy-query kernel. Capacity depends on the CUDA
-# context and cluster size, so all eager plans can share this query cache.
-fmha_decode_config.get_max_active_clusters_for_cluster_size = _cache_cluster_occupancy(
-    fmha_decode_config.get_max_active_clusters_for_cluster_size
-)
 
 
 def _tensor_layout(tensor: torch.Tensor) -> tuple:
@@ -315,6 +278,7 @@ class _PrimTSQSARunner:
             offsets = _group_offsets(metadata.query_start_loc, group_size)
             qo_indptr = torch.tensor(offsets, dtype=torch.int32, device=self._device)
             max_kv = metadata.block_table.shape[1] * page_size
+            # Completed current blocks compete for top-k; only a partial tail is appended.
             size = get_q_token_kv_block_sparse_workspace_size(
                 q,
                 k,
@@ -323,10 +287,11 @@ class _PrimTSQSARunner:
                 max_seq_len_kv=max_kv,
                 o_data_type=q.dtype,
                 qo_indptr=qo_indptr,
-                seq_len_q=group_size,
+                group_size=group_size,
                 kv_block_size=metadata.block_size,
                 split_kv=False,
                 share_pattern_across_kv_heads=True,
+                count_current_block_in_topk=True,
             )
             if size > self._workspace.numel():
                 # Older plans retain their allocation, including plans owned
@@ -342,7 +307,6 @@ class _PrimTSQSARunner:
             wrapper = QTokenKvBlockSparsePagedTSWrapper()
             wrapper.plan(
                 len(offsets) - 1,
-                group_size,
                 q.shape[1],
                 k.shape[1],
                 q.shape[2],
@@ -352,9 +316,11 @@ class _PrimTSQSARunner:
                 max_kv,
                 device=self._device,
                 workspace_buffer=self._workspace,
+                group_size=group_size,
                 use_packed_q=True,
                 split_kv=False,
                 share_pattern_across_kv_heads=True,
+                count_current_block_in_topk=True,
                 mask_type="causal",
                 q_data_type=q.dtype,
                 kv_data_type=k.dtype,

@@ -566,3 +566,243 @@ def test_pipelined_split_waits_for_prefetches_before_epilogue(monkeypatch) -> No
     expected = _verify_reference(inputs, -1, None)
     for _ in range(10):
         _check_verify(gluon_mha_decode_gfx950(**inputs, window_left=-1), expected)
+
+
+# ===-----------------------------------------------------------------------===#
+# Balanced split schedule
+# ===-----------------------------------------------------------------------===#
+
+
+def _balanced(inputs: dict, sinks=None, schedule=None) -> torch.Tensor:
+    """The balanced decode, with a schedule of the current lengths unless one
+    is given."""
+    if schedule is None:
+        schedule = decode.launch_gluon_mha_decode_schedule_gfx950(
+            inputs["q"],
+            inputs["k_cache"],
+            inputs["cache_seqlens"],
+            max_seqlen_q=inputs["max_seqlen_q"],
+            window_left=-1,
+            out=None,
+        )
+    return decode.launch_gluon_mha_decode_balanced_gfx950(
+        **inputs, sinks=sinks, schedule=schedule
+    )
+
+
+@pytest.mark.parametrize("with_sinks", [False, True], ids=["no-sinks", "sinks"])
+@pytest.mark.parametrize(
+    "max_seqlen_q,q_heads,kv_heads,head_dim",
+    [
+        pytest.param(VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, id="64-rows"),
+        pytest.param(1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, id="decode"),
+        pytest.param(3, 12, 2, 64, id="18-rows"),
+        pytest.param(16, 8, 1, 64, id="128-rows"),
+        pytest.param(VERIFY_TOKENS, 8, 1, 128, id="head-dim-128"),
+    ],
+)
+def test_balanced_rows_match_reference_and_replay(
+    max_seqlen_q: int, q_heads: int, kv_heads: int, head_dim: int, with_sinks: bool
+) -> None:
+    """A few long requests among padding ones (one page each), as a padded
+    graph batch holds them: the long ones take most splits, a split may end
+    mid-page, and the last split runs to the request's end. The captured
+    graph computes the schedule, so a replay balances its own lengths."""
+    # Each request's pages cover both steps; the captured step and the
+    # replayed one give different requests the long lengths.
+    first = [1500 * PAGE_SIZE + 33, max_seqlen_q, max_seqlen_q, 300 * PAGE_SIZE + 5]
+    first += [max_seqlen_q, PAGE_SIZE + max_seqlen_q - 1]
+    second = [max_seqlen_q, 700 * PAGE_SIZE + 9, max_seqlen_q, max_seqlen_q]
+    second += [1200 * PAGE_SIZE + 61, max_seqlen_q]
+    inputs = _verify_inputs(
+        [max(a, b) for a, b in zip(first, second)],
+        max_seqlen_q,
+        q_heads,
+        kv_heads,
+        head_dim,
+        21,
+    )
+    inputs["cache_seqlens"].copy_(torch.tensor(first, dtype=torch.int32))
+    sinks = (
+        torch.randn(
+            q_heads,
+            dtype=torch.float32,
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(17),
+        )
+        if with_sinks
+        else None
+    )
+    _check_verify(_balanced(inputs, sinks), _verify_reference(inputs, -1, sinks))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = _balanced(inputs, sinks)
+    inputs["cache_seqlens"].copy_(torch.tensor(second, dtype=torch.int32))
+    inputs["q"].mul_(-0.75)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_verify(replayed, _verify_reference(inputs, -1, sinks))
+
+
+@pytest.mark.parametrize("max_seqlen_q", [1, VERIFY_TOKENS], ids=["decode", "verify"])
+def test_balanced_stale_schedule_covers_grown_lengths(max_seqlen_q: int) -> None:
+    """A drafter's steps grow the lengths after the step's schedule was
+    computed; each split is bounded by the live lengths and a request's last
+    split runs to its end, so the older schedule still covers every key."""
+    grown = [1000 * PAGE_SIZE + 33, 3 * PAGE_SIZE + 9, 17 * PAGE_SIZE, 640 * PAGE_SIZE]
+    inputs = _verify_inputs(
+        grown, max_seqlen_q, VERIFY_Q_HEADS, VERIFY_KV_HEADS, HEAD_DIM, 43
+    )
+    shorter = torch.tensor(
+        [max(max_seqlen_q, length - 500 * PAGE_SIZE) for length in grown],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    stale = decode.launch_gluon_mha_decode_schedule_gfx950(
+        inputs["q"],
+        inputs["k_cache"],
+        shorter,
+        max_seqlen_q=max_seqlen_q,
+        window_left=-1,
+        out=None,
+    )
+    _check_verify(
+        _balanced(inputs, schedule=stale), _verify_reference(inputs, -1, None)
+    )
+
+
+def test_balanced_batch_past_one_schedule_chunk() -> None:
+    """Work-groups find their request 64 schedule rows per load; 80 requests
+    of mixed lengths take two chunks."""
+    cache_lens = [(i % 7) * 37 * PAGE_SIZE + 1 + i for i in range(80)]
+    inputs = _verify_inputs(cache_lens, 1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, 3)
+    _check_verify(_balanced(inputs), _verify_reference(inputs, -1, None))
+
+
+def test_balanced_rows_without_keys_merge_to_the_sink() -> None:
+    """A request without keys stores only empty partials (lse = -inf); its
+    rows merge to the sink alone, a zero output, not NaN."""
+    inputs = _verify_inputs(
+        [0, 900 * PAGE_SIZE + 7], 1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, 29
+    )
+    sinks = torch.randn(VERIFY_Q_HEADS, dtype=torch.float32, device="cuda")
+    out = _balanced(inputs, sinks).float()
+    assert torch.equal(out[0], torch.zeros_like(out[0]))
+    reference = _verify_reference(
+        {
+            **inputs,
+            "q": inputs["q"][1:],
+            "cache_seqlens": inputs["cache_seqlens"][1:],
+            "page_table": inputs["page_table"][1:],
+        },
+        -1,
+        sinks,
+    )
+    _check_verify(out[1:], reference)
+
+
+def test_public_ops_select_the_balanced_path_only_with_a_schedule(tmp_path) -> None:
+    """Verify calls take a schedule and plain decode and sliding windows none;
+    mha_decode_with_kvcache keeps the split grid without a schedule and takes
+    the balanced kernels with one."""
+    import json
+
+    from tokenspeed_kernel.ops.attention.mha import (
+        mha_decode_schedule,
+        mha_decode_takes_schedule,
+        mha_decode_with_kvcache,
+    )
+    from tokenspeed_kernel.profiling import ShapeCapture
+
+    plain = _verify_inputs(
+        [900 * PAGE_SIZE + 3, 1, 1, 1], 1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, 37
+    )
+    plain_call = dict(q=plain["q"], k_cache=plain["k_cache"], v_cache=plain["v_cache"])
+    assert not mha_decode_takes_schedule(max_seqlen_q=1, **plain_call)
+    assert (
+        mha_decode_schedule(
+            cache_seqlens=plain["cache_seqlens"], max_seqlen_q=1, **plain_call
+        )
+        is None
+    )
+
+    inputs = _verify_inputs(
+        [900 * PAGE_SIZE + 3, VERIFY_TOKENS, VERIFY_TOKENS, VERIFY_TOKENS],
+        VERIFY_TOKENS,
+        VERIFY_Q_HEADS,
+        VERIFY_KV_HEADS,
+        64,
+        37,
+    )
+    call = dict(
+        q=inputs["q"],
+        k_cache=inputs["k_cache"],
+        v_cache=inputs["v_cache"],
+        max_seqlen_q=VERIFY_TOKENS,
+    )
+    assert mha_decode_takes_schedule(**call)
+    assert not mha_decode_takes_schedule(window_left=511, **call)
+    assert (
+        mha_decode_schedule(
+            cache_seqlens=inputs["cache_seqlens"], window_left=511, **call
+        )
+        is None
+    )
+    schedule = mha_decode_schedule(cache_seqlens=inputs["cache_seqlens"], **call)
+
+    ShapeCapture.reset()
+    ShapeCapture.get().enabled = True
+    try:
+        expected = _verify_reference(inputs, -1, None)
+        for passed in (None, schedule):
+            _check_verify(
+                mha_decode_with_kvcache(
+                    page_table=inputs["page_table"],
+                    cache_seqlens=inputs["cache_seqlens"],
+                    max_seqlen_k=1 << 20,
+                    schedule=passed,
+                    **call,
+                ),
+                expected,
+            )
+        ShapeCapture.get().dump(tmp_path / "shapes.json")
+    finally:
+        ShapeCapture.reset()
+    names = [
+        record["kernel_name"]
+        for record in json.loads((tmp_path / "shapes.json").read_text())
+        if record["mode"] == "mha_decode_with_kvcache"
+    ]
+    assert names == ["gluon_mha_decode_gfx950", "gluon_mha_decode_balanced_gfx950"]
+
+
+def test_balanced_grid_past_512_items() -> None:
+    """300 requests of two row blocks take more items than the 512 target:
+    every (request, row block) still gets its split."""
+    cache_lens = [(i % 5) * 9 * PAGE_SIZE + 1 + i for i in range(300)]
+    inputs = _verify_inputs(cache_lens, 1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, 41)
+    _check_verify(_balanced(inputs), _verify_reference(inputs, -1, None))
+
+
+def test_balanced_schedule_buffer_at_capacity_ignores_its_stale_tail() -> None:
+    """A persistent schedule buffer sized for the largest batch keeps the
+    rows of earlier, larger batches past this batch's; the kernels read only
+    this batch's rows. Padding requests (one page) take one split each."""
+    cache_lens = [800 * PAGE_SIZE + 3, 1, 1, 1]
+    inputs = _verify_inputs(cache_lens, 1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, 31)
+    buffer = torch.full((33, 2), 1 << 20, dtype=torch.int32, device="cuda")
+    schedule = decode.launch_gluon_mha_decode_schedule_gfx950(
+        inputs["q"],
+        inputs["k_cache"],
+        inputs["cache_seqlens"],
+        max_seqlen_q=1,
+        window_left=-1,
+        out=buffer,
+    )
+    assert schedule is buffer
+    assert buffer[2:5, 1].tolist() == [1, 1, 1]
+    assert buffer[5:].eq(1 << 20).all()
+    _check_verify(
+        _balanced(inputs, schedule=buffer), _verify_reference(inputs, -1, None)
+    )

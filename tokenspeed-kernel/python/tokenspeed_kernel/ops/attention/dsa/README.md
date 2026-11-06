@@ -34,15 +34,12 @@ optional LSE is FP32 in natural-log units. Empty selections produce zero
 output and negative-infinite LSE. Negative slots inside a visible prefix are
 masked. Omitting lengths inspects the full selected-slot width.
 
-Install a FlashInfer build containing PR #7984 (tested source revision
-`335e25d0b8d95bf42709d6851c569dddc26577d6`) and compatible CUTLASS DSL
-libraries. Select `solution="flashinfer_prims"` in the kernel API, or set
+The pinned FlashInfer 0.7.3 provides the Prims-TS sparse MLA wrapper. Select
+`solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
 and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`
 for serving. TRTLLM keeps its higher default priority, and also returns the
-LSE that decode context parallelism merges. The solution registers only when
-the installed FlashInfer provides the Prims-TS sparse MLA wrapper; otherwise
-such calls fall back to Triton. The indexer is unchanged.
+LSE that decode context parallelism merges. The indexer is unchanged.
 
 The upstream plan owns PDL scheduling. This adapter requires PDL enabled and
 rejects an explicit disable request. The caller prepares Q and the selected
@@ -326,6 +323,14 @@ DeepGEMM index scoring registers for 16, 32, or 64 index heads. The
 16-head case pads queries and weights to its native 32-head ABI with zeros;
 caller-provided scoring scales and forced initial/local candidate policies
 remain unchanged. Kernel traits exclude other head counts.
+
+DeepGEMM's FP8 logits kernels take no query scale, so
+`quantize_index_query_weights` quantizes each (token, head) query to E4M3
+with the 1x128 token-group quantizer's arithmetic and folds that scale and
+`softmax_scale` into the head weights in one launch, bit-exact with NVIDIA's
+`quantize_fp8` followed by `combine_topk_weights`. Before the decode top-k,
+`scrub_nonfinite_logits` reads the per-request lengths and derives each
+verify row's causal candidate count itself.
 
 FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
 also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`

@@ -275,10 +275,9 @@ def test_upstream_dispatch_and_caches_are_unchanged():
         assert inspect.signature(private[name]) == inspect.signature(
             getattr(core, name)
         )
-    factory = private.get("_get_trtllm_moe_sm100_module_impl")
-    if factory is not None:
-        assert isinstance(factory, functools._lru_cache_wrapper)
-        assert factory is not core._get_trtllm_moe_sm100_module_impl
+    factory = private["_get_trtllm_moe_sm100_module_impl"]
+    assert isinstance(factory, functools._lru_cache_wrapper)
+    assert factory is not core._get_trtllm_moe_sm100_module_impl
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

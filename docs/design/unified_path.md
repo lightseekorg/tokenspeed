@@ -543,6 +543,10 @@ Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional
 FlashInfer tactic profiling. Pipeline parallelism skips this traversal.
+The dummy extend has no cached prefix, so the MHA backend, which sends such
+an extend to its prefill kernel, also runs its cached-prefix extend kernel on
+the same rows during this traversal; that kernel compiles every variant a
+later batch can pick.
 
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
@@ -1169,10 +1173,14 @@ computes, the rest reuse, and nothing outlives its forward; the
 drafter's in-loop seq_lens edits are not a new forward and leave the share
 alone — the drafter itself
 hands each draft step the top-k it reuses (or clears it) through the draft
-backend, and starts from the target backend's. `ForwardContext` carries
-none of this. What unification still can NOT test: mempool reuse and
-hostfunc semantics — the e2e regression matrix keeps graph-on and graph-off
-configurations for this reason.
+backend, and starts from the target backend's. The MHA leaf's decode
+split schedule (`decode_schedule_buf`, read by gfx950 verify) is the same
+kind of memo: its decode refresh marks it stale, the first verify layer
+computes it from the forward's lengths (inside the graph under replay),
+and the rest reuse it. `ForwardContext` carries none of this. What
+unification still can NOT test: mempool reuse and hostfunc semantics — the
+e2e regression matrix keeps graph-on and graph-off configurations for this
+reason.
 
 ## Backend package layout
 
