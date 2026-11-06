@@ -212,6 +212,7 @@ def test_pool_scatter_quantizes_without_materializing_fp8_sources(monkeypatch):
     pool.dtype = torch.float8_e4m3fn
     pool.store_dtype = torch.uint8
     pool.latent_write_sanitizes = False
+    pool.layerwise_load_tracker = None
     storage = torch.empty(8, TOTAL_DIM, device="cuda", dtype=torch.uint8)
     pool.kv_buffer = [storage]
     k_nope = torch.randn(2, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)

@@ -91,6 +91,7 @@ __all__ = [
     "rope_inplace",
     "rope_weights_inplace",
     "rope_pad_query",
+    "rope_quantize_fp8_grouped",
     "dspark_rows",
     "dspark_anchors",
     "dspark_block",
@@ -913,6 +914,35 @@ def rope_pad_query(
         solution=solution,
     )
     return kernel(values, positions, cos_sin_cache)
+
+
+def rope_quantize_fp8_grouped(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    groups: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate each head's interleaved RoPE tail and FP8-quantize grouped heads.
+
+    Args:
+        values: BF16 [T,H,512], unit channel stride, arbitrary token/head
+            strides; H divisible by groups.
+        positions: Int32/int64 [T]; negative positions use table row 0.
+        cos_sin_cache: FP32 [max_positions,64], cosine then sine halves, applied
+            with rope_inplace's formula (pass the inverse table to undo RoPE).
+        groups: Number of output head groups, each D = H/groups*512 wide.
+
+    Returns:
+        codes: FP8 E4M3 [T,groups,D], a view of contiguous [groups,T,D].
+        scales: Int32 [T,groups,D/128], MN-major and TMA-aligned (strides
+            (1, D/128*aligned_T, aligned_T), aligned_T = ceil(T/4)*4). Each
+            element packs four UE8M0 exponents of 32-channel groups, byte j
+            for group 4w+j, matching DeepGEMM's SM100 scale layout. The rotated
+            values are rounded to BF16 before quantizing.
+    """
+    return _kernel("rope_quantize_fp8_grouped", values)(
+        values, positions, cos_sin_cache, groups
+    )
 
 
 def dspark_rows(
