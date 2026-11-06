@@ -29,7 +29,7 @@ use bytes::Bytes;
 use ts_wire::{
     control::{
         FlushCacheReqOutput, GetInternalStateReqOutput, PauseSchedulerReqInput, ProfileReq,
-        UpdateWeightsFromDistributedReqInput, PROFILE_START,
+        UpdateWeightsFromDistributedReqInput, UpdateWeightsFromMooncakeReqInput, PROFILE_START,
     },
     decode_frames, encode_frames,
     handshake::STATUS_HELLO,
@@ -354,6 +354,24 @@ fn check_control_output(name: &str, expected: ControlOutput) {
 
 #[test]
 fn control_requests() {
+    check_control(
+        "control_update_mooncake",
+        ControlRequest::UpdateWeightsFromMooncake(UpdateWeightsFromMooncakeReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            version: 7,
+            flush_cache: true,
+            weight_version: Some(s("7")),
+            snapshot: Some(Value::Map(vec![
+                ("format_version".into(), int(1)),
+                ("version".into(), int(7)),
+                (
+                    "publishers".into(),
+                    Value::Array(vec![Value::Map(vec![("key".into(), "weights/7".into())])]),
+                ),
+            ])),
+        }),
+    );
     check_control(
         "control_pause",
         ControlRequest::PauseScheduler(PauseSchedulerReqInput {

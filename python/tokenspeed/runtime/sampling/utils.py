@@ -21,9 +21,9 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.sampling import vocab_parallel_logprobs
+from tokenspeed_kernel.ops.sampling import blockwise_logprobs
 
-from tokenspeed.runtime.configs.numerics import MEGATRON_VOCAB_BLOCK
+from tokenspeed.runtime.configs.numerics import BLOCKWISE_VOCAB_BLOCK
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -90,18 +90,29 @@ def gather_token_logprobs(
     Args:
         logits: ``[rows, vocab]`` logits.
         tokens: ``[rows]`` integer token ids.
-        logprob_order: ``"torch"`` for ``torch.log_softmax``; ``"megatron"``
-            for the trainer's vocab-parallel cross-entropy order over fixed
-            32768-wide vocab blocks (``--logprob-order``, validated by
-            ServerArgs).
+        logprob_order: "torch" uses torch.log_softmax; "blockwise" uses
+            fixed 32768-wide blocks and negative cross-entropy;
+            "blockwise-direct" uses the same blocks and direct subtraction.
 
     Returns:
         ``[rows]`` fp32 log probabilities.
+
+    Raises:
+        ValueError: If ``logprob_order`` is unknown.
     """
-    if logprob_order == "megatron":
-        return vocab_parallel_logprobs(
-            logits, tokens.to(torch.int64), vocab_block=MEGATRON_VOCAB_BLOCK
+    if logprob_order in ("blockwise", "blockwise-direct"):
+        return blockwise_logprobs(
+            logits,
+            tokens.to(torch.int64),
+            vocab_block=BLOCKWISE_VOCAB_BLOCK,
+            form=(
+                "direct"
+                if logprob_order == "blockwise-direct"
+                else "negative-cross-entropy"
+            ),
         )
+    if logprob_order != "torch":
+        raise ValueError(f"Unknown logprob order: {logprob_order!r}")
     return gather_token_logprobs_torch(logits, tokens)
 
 
