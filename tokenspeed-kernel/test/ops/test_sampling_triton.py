@@ -992,6 +992,43 @@ def test_dspark_block_greedy_breaks_ties_toward_the_lowest_token(device: str) ->
     assert torch.equal(out[:, 0].long(), torch.argmax(base[:, 0], dim=-1))
 
 
+@pytest.mark.parametrize("all_masked", [False, True])
+def test_dspark_block_greedy_ignores_padding_only_shards(device: str, all_masked: bool):
+    rows, block, local, vocab, rank = 3, 4, 32, 5, 16
+    embedding = torch.zeros(64, rank, device=device, dtype=torch.bfloat16)
+    projection = torch.zeros(local, rank, device=device, dtype=torch.bfloat16)
+    valid_base = torch.full((rows, block, local), 1e6, device=device)
+    valid_base[..., :vocab] = (
+        -torch.inf if all_masked else torch.arange(vocab, device=device).float()
+    )
+    empty_base = torch.full_like(valid_base, 1e6)
+    anchors = torch.tensor([0, 5, 63], device=device, dtype=torch.int32)
+    tiles = dspark_block_candidate_tiles(local)
+    candidates = torch.empty(2, rows, tiles, device=device, dtype=torch.int64)
+    partials = torch.empty_like(candidates)
+    out = torch.empty(rows, block, device=device, dtype=torch.int32)
+    for step in range(block):
+        for shard, (base, num_valid) in enumerate(
+            ((valid_base, vocab), (empty_base, 0))
+        ):
+            dspark_block_greedy_step(
+                base,
+                step,
+                anchors,
+                candidates,
+                embedding,
+                projection,
+                shard * local,
+                num_valid,
+                partials[shard],
+                out,
+            )
+        assert torch.all(partials[1] == torch.iinfo(torch.int64).min)
+        candidates.copy_(partials)
+    dspark_block_greedy_resolve(candidates, out, block - 1)
+    torch.testing.assert_close(out.long(), valid_base[..., :vocab].argmax(-1))
+
+
 def test_dspark_block_greedy_clamps_out_of_range_anchors(device: str) -> None:
     vocab, rank, rows = 512, 16, 4
     embedding = torch.randn(vocab, rank, device=device).to(torch.bfloat16)

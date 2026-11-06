@@ -35,6 +35,7 @@ from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -53,12 +54,26 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=60, suite="runtime-2gpu")
 
 
-def _check_compact_head(rank, output_size, device):
+def _check_compact_head(rank, output_size, device, *, attention_dp):
     config = _draft_config()
     config.vocab_size = 512
     config.output_vocab_size = output_size
     config = DeepseekV41Config(text_config=vars(config))
-    mapping = _mapping(rank, 2, 2)
+    mapping = (
+        Mapping(
+            rank=rank,
+            world_size=2,
+            attn_tp_size=1,
+            attn_dp_size=2,
+            dense_tp_size=1,
+            dense_dp_size=2,
+            moe_tp_size=1,
+            moe_ep_size=2,
+            moe_dp_size=1,
+        )
+        if attention_dp
+        else _mapping(rank, 2, 2)
+    )
     # Only the unused MoE backbone's hardware setup is stubbed. The model's
     # head construction, weight loaders, projections and sampling are real.
     with pytest.MonkeyPatch.context() as patch, set_default_torch_dtype(torch.bfloat16):
@@ -87,13 +102,15 @@ def _check_compact_head(rank, output_size, device):
     adapter.lm_head.to(device)
     adapter.model.markov_head.to(device)
     logits = adapter.model.local_base_logits(hidden.to(device), adapter.lm_head.weight)
-    valid = adapter.lm_head.shard_indices.num_org_elements
+    valid = adapter.model.markov_projection.shard_indices.num_org_elements
     # Padding must lose even when its base logits are much larger than every
     # real token. output_size=1 leaves rank 1 with no valid output columns.
     logits[..., valid:] = 1000000
     anchors = torch.tensor([511, 0, 510], dtype=torch.int32, device=device)
     output = torch.empty(3, 5, dtype=torch.int32, device=device)
-    candidates, partials = dspark_greedy_workspace(2, 3, logits.shape[-1], device)
+    candidates, partials = dspark_greedy_workspace(
+        mapping.lm_head.tp_size, 3, logits.shape[-1], device
+    )
     for all_masked in (False, True):
         reference_logits = hidden.float() @ head.float().T
         if all_masked:
@@ -109,7 +126,7 @@ def _check_compact_head(rank, output_size, device):
             logits,
             anchors,
             adapter.model.markov_head,
-            adapter.lm_head,
+            adapter.model.markov_projection,
             mapping.lm_head.tp_group,
             candidates,
             partials,
@@ -126,8 +143,11 @@ def _worker(rank, init_method):
     pg_manager.init_process_group((0, 1), backend="nccl")
     set_global_backend(NcclBackend())
     try:
-        for output_size in (256, 257, 1):
-            _check_compact_head(rank, output_size, device)
+        for attention_dp in (False, True):
+            for output_size in (256, 257, 1):
+                _check_compact_head(
+                    rank, output_size, device, attention_dp=attention_dp
+                )
     finally:
         dist.destroy_process_group()
 

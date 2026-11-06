@@ -237,6 +237,40 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     assert not drafter.candidate_topk.enabled
 
 
+def test_block_draft_dist_argmax_rejects_a_wider_physical_head(monkeypatch):
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setitem(global_server_args_dict, "numerics", "default")
+    drafter = DFlash.__new__(DFlash)
+    drafter.spec_num_tokens = 3
+    drafter.input_buffers = InputBuffers(2, 4, 3, device="cpu")
+    drafter.lm_head = ParallelLMHead(
+        16384,
+        2,
+        params_dtype=torch.float32,
+        padding_size=64,
+        tp_rank=0,
+        tp_size=4,
+        tp_group=(0, 1, 2, 3),
+    )
+    drafter.logits_processor = LogitsProcessor(
+        8192,
+        tp_rank=0,
+        tp_size=4,
+        tp_group=(0, 1, 2, 3),
+        dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
+    )
+    # This padding-free, 4096-column shard is large enough for the fast path.
+    # A logical-width mismatch must reject it before the collective rendezvous;
+    # no process group or GPU is needed for that config-uniform decision.
+    assert drafter._probe_dist_argmax_state(torch.float32, torch.device("cpu")) is None
+
+
 @pytest.mark.parametrize("storage_vocab", [5, 8])
 @pytest.mark.parametrize("precompute", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])

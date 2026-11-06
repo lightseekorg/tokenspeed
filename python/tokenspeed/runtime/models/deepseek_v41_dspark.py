@@ -265,6 +265,12 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
     ):
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 DSpark requires PP=1")
+        if mapping.attn.has_dp and mapping.lm_head.has_tp:
+            # Draft rows are local to each DP request batch. A sharded head
+            # needs row gathering and redistribution before candidate reduction.
+            raise NotImplementedError(
+                "V4.1 DSpark requires a replicated LM head under attention DP"
+            )
         stages = int(config.dspark_num_stages)
         block_size = int(config.dspark_block_size)
         taps = tuple(config.dspark_target_layer_ids)
@@ -340,9 +346,9 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             ),
             quant_config=None,
             prefix=add_prefix("markov_projection", prefix),
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+            tp_rank=mapping.lm_head.tp_rank,
+            tp_size=mapping.lm_head.tp_size,
+            tp_group=mapping.lm_head.tp_group,
             use_presharded_weights=False,
         )
         self.markov_head = DSparkVanillaMarkov(

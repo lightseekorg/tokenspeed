@@ -112,7 +112,7 @@ class DeepseekV41DSpark(BaseDrafter):
             (max_bs,), dtype=torch.int64, device=self.device
         )
         self.candidates, self.partials = dspark_greedy_workspace(
-            int(self.draft_model.mapping.attn.tp_size),
+            int(self.draft_model.mapping.lm_head.tp_size),
             max_bs,
             int(self.model.markov_projection.num_embeddings_per_partition),
             self.device,

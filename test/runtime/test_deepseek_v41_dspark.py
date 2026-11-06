@@ -1199,11 +1199,13 @@ class TestDSparkBaseLogits:
         assert_fp32_head_math(logits)
 
 
-@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "attn_tp_size, rank", [(1, 0), (1, 1), (2, 0), (2, 1), (2, 2), (2, 3)]
+)
 @pytest.mark.parametrize("mode", ["prefill", "decode", "null"])
 @pytest.mark.parametrize("output_vocab_size", [None, 65])
-def test_tp1_ep2_draft_checkpoint_and_idle_schedule(
-    monkeypatch, rank, mode, output_vocab_size
+def test_dp_draft_checkpoint_and_idle_schedule(
+    monkeypatch, attn_tp_size, rank, mode, output_vocab_size
 ):
     from test.runtime.test_deepseek_v41_model import _mock_loader_hardware
 
@@ -1214,18 +1216,18 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(
 
     mapping = Mapping(
         rank=rank,
-        world_size=2,
-        attn_tp_size=1,
+        world_size=2 * attn_tp_size,
+        attn_tp_size=attn_tp_size,
         attn_dp_size=2,
-        dense_tp_size=1,
+        dense_tp_size=attn_tp_size,
         dense_dp_size=2,
         moe_tp_size=1,
         moe_ep_size=2,
-        moe_dp_size=1,
-        vision_tp_size=1,
+        moe_dp_size=attn_tp_size,
+        vision_tp_size=attn_tp_size,
         vision_dp_size=1,
-        linear_attn_tp_size=1,
-        nprocs_per_node=2,
+        linear_attn_tp_size=attn_tp_size,
+        nprocs_per_node=2 * attn_tp_size,
         nnodes=1,
     )
     _mock_loader_hardware(monkeypatch, mapping)
@@ -1252,7 +1254,7 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(
         token_to_kv_pool=None,
         runtime_states=None,
         input_buffers=InputBuffers(3, 1024, 8, device="cpu"),
-        vocab_size=adapter.model.config.vocab_size,
+        vocab_size=VocabularySpec.from_hf_config(config, is_draft=True).output_size,
     )
     drafter = DeepseekV41DSpark(**kwargs)
     # Idle and active ranks must perform the same number of block forwards.
@@ -1275,4 +1277,26 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(
         adapter.lm_head.weight.shape[0]
         == adapter.model.markov_projection.weight.shape[0]
     )
+    assert drafter.partials is None
+    assert drafter.candidates.shape[1] == 1
     assert adapter.checkpoint_load_report["loaded"] > 0
+
+
+def test_dp_dspark_rejects_a_head_sharded_across_requests():
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.deepseek_v41_dspark import DeepseekV41DSparkModel
+
+    config = _draft_config()
+    mapping = Mapping(
+        rank=0, world_size=2, attn_tp_size=1, attn_dp_size=2, lm_head_tp_size=2
+    )
+    with pytest.raises(
+        NotImplementedError, match="replicated LM head under attention DP"
+    ):
+        DeepseekV41DSparkModel(
+            config,
+            mapping,
+            _quant(),
+            "",
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        )

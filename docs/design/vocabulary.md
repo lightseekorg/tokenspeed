@@ -20,9 +20,15 @@ argmax shortcuts require the physical and logical widths to match.
 
 DSpark's Markov embedding covers input tokens; its projection and checkpoint
 rows cover output tokens. This applies to replicated generic/K3/MiniMax heads
-and V4.1 heads that use the same vocabulary shards as the LM head. Previous
-tokens are bounded by the input embedding, independently of output width.
-Padding-only shards contribute no candidate but still join every TP gather.
+and V4.1 heads that use the same vocabulary shards as the LM head. In the
+replicated drafter, previous tokens are bounded by the input embedding,
+independently of output width. V4.1 draft anchors come from target outputs
+and remain in the output domain.
+Under attention DP, V4.1 requires a replicated LM head: sharding the head
+across different request batches needs a row redistribution path that its
+block sampler does not implement. The Markov projection and workspace use
+the head's group, independently of the attention TP width. Padding-only
+shards contribute no candidate but still join every TP gather.
 
 Every model constructor receives the resolved `vocabulary` explicitly.
 `ModelExecutorConfig` and `RuntimeStates` retain that value, without legacy
