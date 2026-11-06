@@ -267,6 +267,9 @@ def vocab_shard_topk(
     logit_scale: float | None,
     vocab_start: int,
     out: _torch.Tensor,
+    *,
+    softcap: float | None,
+    vocab_mask: _torch.Tensor | None,
 ) -> None:
     """One vocab shard's ``k`` best logits and their global ids, packed for
     the all-gather ``vocab_topk_merge`` reads.
@@ -281,13 +284,23 @@ def vocab_shard_topk(
         out: ``[M, 2 * k]`` fp32: the values, then the global ids as exact
             fp32 integers, in descending value order (lowest column first
             among equal values).
+        softcap: Final logit softcapping ``c`` in ``c * tanh(x / c)``, applied
+            after the scale and rounded to the logits' dtype before the
+            selection (as the logits processor writes softcapped logits), or
+            None. ``vocab_topk_merge`` can instead cap the kept values.
+        vocab_mask: Contiguous int32 ``[M, ceil(V / 32)]`` whole-vocabulary
+            token bitmask (bit ``t % 32`` of word ``t // 32`` set when token
+            ``t`` is allowed, the xgrammar layout); disallowed logits become
+            ``-inf`` before the selection. None for no mask.
     """
     kernel = select_kernel(
         "sampling",
         "vocab_shard_topk",
         format_signature(logits=dense_tensor_format(logits.dtype)),
     )
-    kernel(logits, k, logit_scale, vocab_start, out)
+    kernel(
+        logits, k, logit_scale, vocab_start, out, softcap=softcap, vocab_mask=vocab_mask
+    )
 
 
 def vocab_topk_merge(
@@ -305,8 +318,8 @@ def vocab_topk_merge(
         k: Candidates kept per row.
         softcap: Final logit softcapping ``c`` in ``c * tanh(x / c)`` applied
             to the kept values, or None.
-        ids_out: Contiguous ``[M, k]`` int64 global ids, descending value
-            order, lowest rank-major slot first among equal values.
+        ids_out: Contiguous ``[M, k]`` int64 or int32 global ids, descending
+            value order, lowest rank-major slot first among equal values.
         values_out: Contiguous ``[M, k]`` fp32 values, in the same order.
     """
     kernel = select_kernel(

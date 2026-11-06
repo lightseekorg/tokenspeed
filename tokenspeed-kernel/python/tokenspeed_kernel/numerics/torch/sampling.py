@@ -507,10 +507,22 @@ def torch_vocab_shard_topk(
     logit_scale: float | None,
     vocab_start: int,
     out: torch.Tensor,
+    *,
+    softcap: float | None,
+    vocab_mask: torch.Tensor | None,
 ) -> None:
     """Reference ``vocab_shard_topk``: a stable descending sort, so equal
     values keep the lowest column first."""
-    scaled = (logits if logit_scale is None else logits * logit_scale).float()
+    scaled = logits if logit_scale is None else logits * logit_scale
+    if softcap is not None:
+        # Rounded to the logits' dtype, as the logits processor writes it.
+        scaled = (softcap * torch.tanh(scaled.float() / softcap)).to(logits.dtype)
+    scaled = scaled.float()
+    if vocab_mask is not None:
+        tokens = vocab_start + torch.arange(scaled.shape[1], device=scaled.device)
+        words = vocab_mask[:, tokens // 32]
+        allowed = (words >> (tokens % 32).to(words.dtype)) & 1
+        scaled = scaled.masked_fill(allowed == 0, float("-inf"))
     order = torch.sort(scaled, dim=-1, descending=True, stable=True).indices[:, :k]
     out[:, :k] = torch.gather(scaled, 1, order)
     out[:, k:] = (order + vocab_start).float()
@@ -540,5 +552,5 @@ def torch_vocab_topk_merge(
     kept = torch.gather(values, 1, order)
     if softcap is not None:
         kept = softcap * torch.tanh(kept / softcap)
-    ids_out.copy_(torch.gather(ids, 1, order).long())
+    ids_out.copy_(torch.gather(ids, 1, order).to(ids_out.dtype))
     values_out.copy_(kept)

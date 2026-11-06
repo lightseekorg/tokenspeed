@@ -61,10 +61,12 @@ def test_shard_topk_keeps_the_best_values_lowest_column_first(
     logits = _logits(rows, 7, device, levels)
     out = torch.full((rows, 2 * k), -1.0, device=device)
 
-    vocab_shard_topk(logits, k, scale, _VOCAB_START, out)
+    vocab_shard_topk(logits, k, scale, _VOCAB_START, out, softcap=None, vocab_mask=None)
 
     expected = torch.empty_like(out)
-    torch_vocab_shard_topk(logits, k, scale, _VOCAB_START, expected)
+    torch_vocab_shard_topk(
+        logits, k, scale, _VOCAB_START, expected, softcap=None, vocab_mask=None
+    )
     assert torch.equal(out, expected)
 
 
@@ -72,9 +74,9 @@ def test_shard_topk_handles_a_shard_narrower_than_its_block(device: str) -> None
     # 1000 columns pad to a 1024-wide block; the padding never wins.
     logits = -torch.rand(3, 1000, device=device).to(torch.bfloat16) - 1
     out = torch.empty(3, 8, device=device)
-    vocab_shard_topk(logits, 4, None, 0, out)
+    vocab_shard_topk(logits, 4, None, 0, out, softcap=None, vocab_mask=None)
     expected = torch.empty_like(out)
-    torch_vocab_shard_topk(logits, 4, None, 0, expected)
+    torch_vocab_shard_topk(logits, 4, None, 0, expected, softcap=None, vocab_mask=None)
     assert torch.equal(out, expected)
 
 
@@ -119,11 +121,21 @@ def test_row_counts_and_shard_offsets_never_recompile(device: str) -> None:
     values_out = torch.empty(24, k, device=device)
     # Warm both integer classes of every runtime scalar.
     for rows, start in ((16, 0), (7, 3 * _SHARD)):
-        vocab_shard_topk(logits[:rows], k, 0.5, start, out[:rows])
+        vocab_shard_topk(
+            logits[:rows], k, 0.5, start, out[:rows], softcap=20.0, vocab_mask=None
+        )
         vocab_topk_merge(pairs[:, :rows], k, 20.0, ids_out[:rows], values_out[:rows])
     with assert_no_triton_compile(_vocab_shard_topk_kernel, _vocab_topk_merge_kernel):
         for rows, start in ((1, 7 * _SHARD), (14, _SHARD), (24, 0)):
-            vocab_shard_topk(logits[:rows], k, 0.1767766952966369, start, out[:rows])
+            vocab_shard_topk(
+                logits[:rows],
+                k,
+                0.1767766952966369,
+                start,
+                out[:rows],
+                softcap=30.0,
+                vocab_mask=None,
+            )
             vocab_topk_merge(
                 pairs[:, :rows], k, 30.0, ids_out[:rows], values_out[:rows]
             )

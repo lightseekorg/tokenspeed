@@ -37,7 +37,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers import vocab_parallel_topk as topk_module  # noqa: E402
+from tokenspeed.runtime.layers import sampled_vocab_shard as shard_module  # noqa: E402
 from tokenspeed.runtime.layers.vocab_parallel_topk import (  # noqa: E402
     VocabParallelTopK,
 )
@@ -223,7 +223,7 @@ def test_a_quantized_head_picks_candidates_through_the_padding_slice(
     peer_packed = torch.cat((peer_values, (peer_ids + shard).float()), dim=-1)
 
     monkeypatch.setattr(
-        topk_module, "all_gather_single", _gather_with_peers(peer_packed)
+        shard_module, "all_gather_single", _gather_with_peers(peer_packed)
     )
     candidate_ids, _ = selector(hidden_states)
 
@@ -261,7 +261,7 @@ def test_shard_local_topk_picks_what_a_whole_vocabulary_topk_would(
 
     calls = []
     monkeypatch.setattr(
-        topk_module, "all_gather_single", _gather_with_peers(peer_packed, calls)
+        shard_module, "all_gather_single", _gather_with_peers(peer_packed, calls)
     )
     candidate_ids, values = selector(hidden_states)
 
@@ -290,7 +290,7 @@ def test_a_later_rank_packs_global_ids_beside_its_values(monkeypatch) -> None:
     selector = _selector(head, 2, top_k, rows, 2 * shard)
     sent = []
     monkeypatch.setattr(
-        topk_module,
+        shard_module,
         "all_gather_single",
         _gather_with_peers(torch.zeros(rows, 2 * top_k, device=weight.device), sent),
     )
@@ -334,7 +334,7 @@ def test_a_bf16_shard_ships_its_best_scaled_logits_lowest_column_first(
     )
     sent = []
     monkeypatch.setattr(
-        topk_module, "all_gather_single", _gather_with_peers(peer, sent)
+        shard_module, "all_gather_single", _gather_with_peers(peer, sent)
     )
 
     candidate_ids, values = selector(hidden_states)

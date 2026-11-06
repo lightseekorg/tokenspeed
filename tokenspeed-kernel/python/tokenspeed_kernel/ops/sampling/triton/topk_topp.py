@@ -386,39 +386,56 @@ def _top_k_top_p_gumbel_stage2_kernel(
     top_logits = tl.full((TOPK_PAD,), float("-inf"), tl.float32)
     top_ids = tl.full((TOPK_PAD,), 2147483647, tl.int32)
 
-    # Stage 1 writes a sorted top-K list per vocab block. Merge those per-block
-    # lists directly instead of repeatedly scanning the full candidate scratch.
-    # Ranks at or past the row's top_k are never kept, so the merge stops there.
-    for rank in tl.range(0, tl.minimum(top_k, TOPK_PAD)):
-        pos = block_offsets * TOPK_PAD + block_cursors
-        active_blocks = block_mask & (block_cursors < TOPK_PAD)
-        head_logits = tl.load(
-            candidate_logits_ptr + row * candidate_row_stride + pos,
-            mask=active_blocks,
+    if num_blocks == 1:
+        # One sorted list (a vocabulary of one block, or candidates merged
+        # across vocab shards): the merge that follows would copy its first
+        # min(top_k, TOPK_PAD) entries, so load them in one step.
+        in_list = rank_offsets < tl.minimum(top_k, TOPK_PAD)
+        top_logits = tl.load(
+            candidate_logits_ptr + row * candidate_row_stride + rank_offsets,
+            mask=in_list,
             other=float("-inf"),
         ).to(tl.float32)
-        head_ids = tl.load(
-            candidate_ids_ptr + row * candidate_row_stride + pos,
-            mask=active_blocks,
+        top_ids = tl.load(
+            candidate_ids_ptr + row * candidate_row_stride + rank_offsets,
+            mask=in_list,
             other=2147483647,
         )
+    else:
+        # Stage 1 writes a sorted top-K list per vocab block. Merge those
+        # per-block lists directly instead of repeatedly scanning the full
+        # candidate scratch. Ranks at or past the row's top_k are never kept,
+        # so the merge stops there.
+        for rank in tl.range(0, tl.minimum(top_k, TOPK_PAD)):
+            pos = block_offsets * TOPK_PAD + block_cursors
+            active_blocks = block_mask & (block_cursors < TOPK_PAD)
+            head_logits = tl.load(
+                candidate_logits_ptr + row * candidate_row_stride + pos,
+                mask=active_blocks,
+                other=float("-inf"),
+            ).to(tl.float32)
+            head_ids = tl.load(
+                candidate_ids_ptr + row * candidate_row_stride + pos,
+                mask=active_blocks,
+                other=2147483647,
+            )
 
-        best_logit = tl.max(head_logits, axis=0)
-        best_id = tl.min(
-            tl.where(head_logits == best_logit, head_ids, 2147483647), axis=0
-        )
-        best_block = tl.min(
-            tl.where(
-                (head_logits == best_logit) & (head_ids == best_id),
-                block_offsets,
-                2147483647,
-            ),
-            axis=0,
-        )
+            best_logit = tl.max(head_logits, axis=0)
+            best_id = tl.min(
+                tl.where(head_logits == best_logit, head_ids, 2147483647), axis=0
+            )
+            best_block = tl.min(
+                tl.where(
+                    (head_logits == best_logit) & (head_ids == best_id),
+                    block_offsets,
+                    2147483647,
+                ),
+                axis=0,
+            )
 
-        top_logits = tl.where(rank_offsets == rank, best_logit, top_logits)
-        top_ids = tl.where(rank_offsets == rank, best_id, top_ids)
-        block_cursors += tl.where(block_offsets == best_block, 1, 0)
+            top_logits = tl.where(rank_offsets == rank, best_logit, top_logits)
+            top_ids = tl.where(rank_offsets == rank, best_id, top_ids)
+            block_cursors += tl.where(block_offsets == best_block, 1, 0)
 
     scaled_logits = top_logits / temperature
     max_logit = tl.max(scaled_logits, axis=0)
@@ -923,6 +940,255 @@ def verify_rows_top_k_top_p_from_pools(
         K_PAD=triton.next_power_of_2(num_candidates),
         COIN_SALT=COIN_OFFSET_SALT,
         num_warps=stage2_num_warps,
+        num_stages=3,
+    )
+
+
+def _check_sorted_candidates(
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    vocab_size: int,
+    num_tokens_per_req: int,
+) -> tuple[int, int]:
+    """Validate presorted candidate lists; return ``(rows, top_k_pad)``."""
+    if candidate_ids.ndim != 2 or candidate_ids.shape != candidate_logits.shape:
+        raise ValueError(
+            "candidate_ids and candidate_logits must be 2D tensors of one shape, "
+            f"got {tuple(candidate_ids.shape)} and {tuple(candidate_logits.shape)}"
+        )
+    if candidate_ids.dtype != torch.int32 or candidate_logits.dtype != torch.float32:
+        raise ValueError("candidates must be int32 ids and fp32 logits")
+    if candidate_ids.stride(-1) != 1 or candidate_logits.stride(-1) != 1:
+        raise ValueError("candidate tensors require a stride-1 last dimension")
+    if candidate_ids.stride(0) != candidate_logits.stride(0):
+        raise ValueError("candidate tensors must share their row stride")
+    rows, top_k_pad = candidate_ids.shape
+    if top_k_pad & (top_k_pad - 1):
+        raise ValueError("candidate lists must hold a power-of-two count")
+    if vocab_size <= 0 or num_tokens_per_req <= 0:
+        raise ValueError("vocab_size and num_tokens_per_req must be positive")
+    if rows % num_tokens_per_req or req_pool_indices.shape[0] != (
+        rows // num_tokens_per_req
+    ):
+        raise ValueError(
+            f"{rows} candidate rows do not match {req_pool_indices.shape[0]} "
+            f"requests of {num_tokens_per_req} rows"
+        )
+    if req_pool_indices.dtype != torch.int32:
+        raise ValueError("req_pool_indices must be int32")
+    if out.dtype != torch.int32 or out.ndim != 1 or out.shape[0] < rows:
+        raise ValueError(f"out must be an int32 vector of at least {rows} rows")
+    return rows, top_k_pad
+
+
+def gumbel_sample_top_k_top_p_from_candidates(
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_k_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    vocab_size: int,
+    num_tokens_per_req: int,
+) -> torch.Tensor:
+    """``gumbel_sample_top_k_top_p_from_pools`` on each row's best candidates.
+
+    For logits that never exist whole on one device (a vocabulary-parallel
+    head): the caller selects each row's ``top_k_pad`` best logits across the
+    shards. Given the same candidates, the stage-1 lists of the whole row
+    would merge into, the sample is bitwise the same token.
+
+    Args:
+        candidate_ids: ``[rows, top_k_pad]`` int32 token ids, descending
+            logit order, lowest id first among equal logits.
+        candidate_logits: ``[rows, top_k_pad]`` fp32 logits in that order.
+        req_pool_indices: ``[rows / num_tokens_per_req]`` int32 pool slots.
+        temperature_pool: ``[pool]`` fp32 temperature.
+        top_k_pool: ``[pool]`` int32 top-k; at most ``top_k_pad`` are kept.
+        top_p_pool: ``[pool]`` fp32 top-p.
+        seed_pool: ``[pool]`` int64 seed.
+        offsets_pool: ``[pool]`` int64 sampling offset of each slot's row 0.
+        out: int32 ``[>= rows]`` sampled token destination.
+        vocab_size: Tokens in the whole vocabulary.
+        num_tokens_per_req: Rows per request.
+
+    Returns:
+        ``out[:rows]``.
+    """
+    rows, top_k_pad = _check_sorted_candidates(
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        out,
+        vocab_size=vocab_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    if rows == 0:
+        return out[:0]
+    _launch_presorted_stage2(
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        seed_pool,
+        offsets_pool,
+        out,
+        None,
+        vocab_size=vocab_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    return out[:rows]
+
+
+def verify_rows_top_k_top_p_from_candidates(
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_k_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    candidates: torch.Tensor,
+    q: torch.Tensor,
+    q_ids: torch.Tensor,
+    slot: torch.Tensor,
+    pos: torch.Tensor,
+    row_accept: torch.Tensor,
+    row_token: torch.Tensor,
+    *,
+    vocab_size: int,
+    num_tokens_per_req: int,
+) -> None:
+    """``verify_rows_top_k_top_p_from_pools`` on each row's best candidates.
+
+    The rejection-sampling verify of the presorted lists
+    ``gumbel_sample_top_k_top_p_from_candidates`` takes; given the candidates
+    the whole row's stage-1 lists would merge into, every decision and token
+    is bitwise the same.
+
+    Args:
+        candidate_ids: ``[bs * N, top_k_pad]`` int32 token ids, descending
+            logit order, lowest id first among equal logits.
+        candidate_logits: ``[bs * N, top_k_pad]`` fp32 logits in that order.
+        req_pool_indices, temperature_pool, top_k_pool, top_p_pool, seed_pool,
+        offsets_pool, candidates, q, q_ids, slot, pos, row_accept, row_token:
+            As for ``verify_rows_top_k_top_p_from_pools``.
+        vocab_size: Tokens in the whole vocabulary.
+        num_tokens_per_req: Verify window width ``N``.
+
+    Returns:
+        None; ``row_accept`` and ``row_token`` are written in place.
+    """
+    rows, top_k_pad = _check_sorted_candidates(
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        row_token,
+        vocab_size=vocab_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    num_candidates = check_draft_q_inputs(
+        fn_name="verify_rows_top_k_top_p_from_candidates",
+        rows=rows,
+        num_tokens_per_req=num_tokens_per_req,
+        req_pool_indices=req_pool_indices,
+        candidates=candidates,
+        q=q,
+        q_ids=q_ids,
+        slot=slot,
+        pos=pos,
+        row_accept=row_accept,
+        row_token=row_token,
+    )
+    if rows == 0:
+        return
+    _launch_presorted_stage2(
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        seed_pool,
+        offsets_pool,
+        row_token,
+        (row_accept, candidates, slot, pos, q, q_ids, num_candidates),
+        vocab_size=vocab_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+
+
+def _launch_presorted_stage2(
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_k_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    out: torch.Tensor,
+    draft_q: tuple | None,
+    *,
+    vocab_size: int,
+    num_tokens_per_req: int,
+) -> None:
+    """Stage 2 over one presorted list per row, with or without the draft q.
+
+    ``draft_q`` is ``(row_accept, candidates, slot, pos, q, q_ids,
+    num_candidates)`` for the rejection verify. One warp, as stage 2 of the
+    1024-column blocks runs, so the sampling math reduces in the same order.
+    """
+    rows, top_k_pad = candidate_ids.shape
+    has_q = draft_q is not None
+    if has_q:
+        row_accept, candidates, slot, pos, q, q_ids, num_candidates = draft_q
+    else:
+        row_accept = candidates = slot = pos = q = q_ids = None
+        num_candidates = 1
+    _top_k_top_p_gumbel_stage2_kernel[(rows,)](
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        None,
+        seed_pool,
+        offsets_pool,
+        out,
+        row_accept,
+        candidates,
+        slot,
+        pos,
+        q,
+        q_ids,
+        candidate_row_stride=candidate_ids.stride(0),
+        num_blocks=1,
+        vocab_size=vocab_size,
+        TOPK_PAD=top_k_pad,
+        NUM_BLOCKS_PAD=1,
+        NUM_TOKENS_PER_REQ=num_tokens_per_req,
+        HAS_DRAFT_Q=has_q,
+        verify_candidates_row_stride=candidates.stride(0) if has_q else 0,
+        verify_candidates_col_stride=candidates.stride(1) if has_q else 0,
+        slot_pool_stride=slot.stride(0) if has_q else 0,
+        q_pool_stride=q.stride(0) if has_q else 0,
+        q_slot_stride=q.stride(1) if has_q else 0,
+        NUM_CANDIDATES=num_candidates,
+        K_PAD=triton.next_power_of_2(num_candidates),
+        COIN_SALT=COIN_OFFSET_SALT if has_q else 0,
+        num_warps=1,
         num_stages=3,
     )
 
