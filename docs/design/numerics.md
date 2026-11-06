@@ -709,3 +709,20 @@ runtime behavior on other platforms and widths. Tests preserve the old formula
 independently and compare weights/IDs byte-for-byte on ties, cutoff ties, bias,
 identity candidates, near ties, batch packing/reordering and CUDA graph replay.
 This does not promise cross-version PyTorch tie compatibility.
+
+## Input and output vocabularies
+
+The runtime uses `ModelConfig.input_vocab_size` for input token bounds and
+`ModelConfig.vocab_size` for the output vocabulary. The checkpoint convention
+is unchanged: its `vocab_size` is the embedding size and its optional
+`output_vocab_size` is the head size. A missing or null `output_vocab_size`
+means the two sizes are equal. Both must be positive integers, and the output
+vocabulary must fit within the input vocabulary for subsequent decoding.
+The original Hugging Face config is not rewritten.
+
+Input buffer clamps, n-gram token validation and multimodal draft substitute
+validation use `input_vocab_size`. Sampling, draft probability tensors,
+grammar masks, logit bias and prompt-logprob validation keep using `vocab_size`.
+An input-only token can reach the model without becoming a valid output token
+or prompt-logprob target. Models or plugins with a reduced head must construct
+the embedding and head for their respective checkpoint sizes.
