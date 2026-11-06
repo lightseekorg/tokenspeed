@@ -52,7 +52,10 @@ from tokenspeed.runtime.execution.drafter.speculative_sampling import (  # noqa:
     DraftProposalSampler,
 )
 from tokenspeed.runtime.execution.input_buffer import InputBuffers  # noqa: E402
-from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
+from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
+    ModelExecutor,
+    ModelExecutorConfig,
+)
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor  # noqa: E402
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
@@ -307,6 +310,40 @@ def test_dflash2_without_the_flag_keeps_the_greedy_walk():
     assert drafter._walk_pools.top_k.tolist() == [1]
 
 
+def _executor_config(spec_algo: str) -> ModelExecutorConfig:
+    """A chain-drafting executor config with speculative sampling on."""
+    return ModelExecutorConfig(
+        max_req_pool_size=POOL,
+        output_length=N,
+        enforce_eager=True,
+        prefix_granularity=1,
+        max_num_seqs=MAX_BS,
+        chunked_prefill_size=MAX_BS * N,
+        vocab_size=VOCAB,
+        context_len=N,
+        physical_context_len=N,
+        device="cpu",
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=None,
+        disable_cuda_graph_padding=False,
+        spec_topk=1,
+        max_cudagraph_capture_size=MAX_BS,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        decode_only_attention=False,
+        prefill_graph_capture_batch_sizes=None,
+        input_logprob_chunk_tokens=N,
+        enable_speculative_sampling=True,
+        query_shard_size=1,
+        query_shard_rank=0,
+        enable_memory_saver=False,
+        spec_algo=spec_algo,
+        spec_num_tokens=N,
+    )
+
+
 def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     # DSpark samples its Markov steps from full-vocab logits through the
     # shared draft sampler; only DFLASH (DFlash2) records a sparse q instead.
@@ -315,14 +352,7 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
         executor.runtime_states = RuntimeStates(
             req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device="cpu"
         )
-        # ModelExecutorConfig has no CPU-buildable instance; these are the
-        # fields the allocation reads.
-        config = SimpleNamespace(
-            enable_speculative_sampling=True,
-            spec_draft_tree=False,
-            spec_algo=spec_algo,
-            spec_reject_draft_prob_threshold=2.0,
-        )
+        config = _executor_config(spec_algo)
         executor._init_draft_probs(config, N)
         assert (executor.runtime_states.draft_probs is not None) == dense
 
