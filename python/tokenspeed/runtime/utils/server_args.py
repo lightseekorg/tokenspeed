@@ -4314,8 +4314,9 @@ class ServerArgs:
             "the same reduction, returning target - log(sum_exp). "
             "Requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
-            "logprobs only, never the sampled tokens. Defaults to blockwise under "
-            "--numerics rl-bitwise, preserving an explicit blockwise-direct choice.",
+            "logprobs only, never the sampled tokens. Folded to blockwise by "
+            "--numerics rl-bitwise, overriding an explicit torch; an explicit "
+            "blockwise-direct is preserved.",
         )
         parser.add_argument(
             "--moe-combine-order",

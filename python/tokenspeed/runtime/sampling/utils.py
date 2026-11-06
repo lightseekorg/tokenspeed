@@ -96,6 +96,9 @@ def gather_token_logprobs(
 
     Returns:
         ``[rows]`` fp32 log probabilities.
+
+    Raises:
+        ValueError: If ``logprob_order`` is unknown.
     """
     if logprob_order in ("blockwise", "blockwise-direct"):
         return blockwise_logprobs(
@@ -108,6 +111,8 @@ def gather_token_logprobs(
                 else "negative-cross-entropy"
             ),
         )
+    if logprob_order != "torch":
+        raise ValueError(f"Unknown logprob order: {logprob_order!r}")
     return gather_token_logprobs_torch(logits, tokens)
 
 

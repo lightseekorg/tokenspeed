@@ -55,6 +55,14 @@ def _logits(rows: int) -> torch.Tensor:
     return torch.randn(rows, VOCAB, generator=torch.Generator().manual_seed(1)) * 3
 
 
+@pytest.mark.parametrize("order", ["megatron", "blockwise-typo", ""])
+def test_gather_rejects_unknown_order(order):
+    logits = torch.tensor([[1.0, 2.0]])
+    tokens = torch.tensor([1], dtype=torch.int64)
+    with pytest.raises(ValueError, match="Unknown logprob order"):
+        gather_token_logprobs(logits, tokens, logprob_order=order)
+
+
 def test_gather_dispatches_on_the_order():
     logits = _logits(3)
     tokens = torch.tensor([5, 60000, 123], dtype=torch.int32)

@@ -539,10 +539,13 @@ logprob either -- the admission probe is capped at `logprob_start_len`
 (`scheduler.md` §1) so every scored position is actually recomputed.
 
 The current trainer defaults to negative cross-entropy, `-(log(sum_exp) - target)`,
-yielding `-0.0` for a certain token; `rl-bitwise` defaults to `blockwise` to match
-these bits. This corrects the previous assumption that the trainer defaults to
+yielding `-0.0` for a certain token; `rl-bitwise` folds `torch` to `blockwise` to
+match these bits and preserves either explicit blockwise choice. This corrects
+the previous assumption that the trainer defaults to
 positive zero. `blockwise-direct` uses `target - log(sum_exp)` for trainers that
-require `+0.0`. Both use the same reduction; `torch` is unchanged.
+require `+0.0`. Both use the same reduction; `torch` is unchanged. The shared
+logprob dispatcher rejects unknown orders, including the old `megatron` name,
+so programmatic callers cannot silently switch arithmetic after the rename.
 
 ## Prefix hits resume at any token: KV bitwise, recurrent state within tolerance
 
@@ -680,9 +683,9 @@ equals the trainer's sharded sum bitwise when the in-block tree is pairwise
 over its tiles. The in-tree `torch_block_sumexp` sits at `Priority.PORTABLE`;
 the vendor leaf registers above it (any higher band), so plain selection
 takes it wherever it is installed and no host code names the vendor.
-The final subtraction is `target - log(sum_exp)`, preserving positive zero
-for a token whose rounded probability is one. Negating the equivalent NLL
-would produce negative zero and fail a bit-pattern comparison with the trainer.
+The final subtraction follows the explicit form: `blockwise` negates the NLL
+and `blockwise-direct` subtracts `log(sum_exp)` from the target. Their signed-zero
+contract is described in the logprobs section above.
 
 The pins above cover only the paths a verified model takes, so the
 verification is recorded per model and enforced at startup
