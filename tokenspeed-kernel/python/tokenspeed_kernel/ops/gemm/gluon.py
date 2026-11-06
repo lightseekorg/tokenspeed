@@ -119,6 +119,9 @@ if platform.is_amd:
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        gluon_fp32_router_gemv_num_counters_gfx950 as _fp32_router_gemv_counters,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         launch_gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
@@ -235,10 +238,16 @@ if platform.is_amd:
         counters: torch.Tensor,
         enable_pdl: bool,
     ) -> torch.Tensor:
-        """Dispatch decode-sized FP32 router GEMV to the gfx950 kernel."""
-        # Split-K counters belong to the portable kernel; this one keeps no state.
+        """Dispatch FP32 router projections to the gfx950 GEMV or split-K GEMM."""
+        # The caller's counters are sized for the portable kernel's column
+        # blocks; the split-K GEMM counts arrivals per row-and-column tile.
         del counters
-        return _fp32_router_gemv_impl(x, weight, multiplier, enable_pdl)
+        tile_counters = zeroed_state(
+            _fp32_router_gemv_counters(x.shape[0], weight.shape[0], x.shape[1]),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        return _fp32_router_gemv_impl(x, weight, multiplier, tile_counters, enable_pdl)
 
     try:
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
