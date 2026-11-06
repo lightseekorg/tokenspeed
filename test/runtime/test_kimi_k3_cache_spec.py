@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from test.ci_system.ci_register import register_cuda_ci
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
@@ -10,6 +11,8 @@ from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
 
 import pytest
 import torch
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
 def _plan(num_lcm_blocks: int, *, tp_size: int = 8):

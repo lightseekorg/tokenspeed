@@ -37,6 +37,7 @@ plan maps the row to.
 from __future__ import annotations
 
 import socket
+from test.ci_system.ci_register import register_cuda_ci
 from test.runtime.dsa_index_k_test_utils import (
     expected_index_k_rows,
     index_k_pool,
@@ -63,6 +64,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
+
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 WORLD = 4
 PAGE = 2  # kernel page size
