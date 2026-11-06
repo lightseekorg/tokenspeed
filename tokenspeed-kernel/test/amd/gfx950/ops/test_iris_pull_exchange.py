@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
-from utils import is_amd
+from utils import assert_no_triton_compile, is_amd
 
 pytestmark = pytest.mark.skipif(not is_amd(), reason="Iris requires AMD ROCm")
 
@@ -62,6 +62,7 @@ def _exchange_worker(rank: int, port: int) -> None:
     )
     from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
         IrisPullExchange,
+        _iris_pull_exchange,
     )
 
     ctx = get_or_create_context(heap_size=1 << 28)
@@ -108,6 +109,18 @@ def _exchange_worker(rank: int, port: int) -> None:
             assert torch.equal(out, expected)
             torch.cuda.synchronize()
             dist.barrier()
+
+    # Those sizes warmed every launch shape; other batches' shares reuse them.
+    with assert_no_triton_compile(_iris_pull_exchange):
+        for rows in (2, 3, 5, 24, 33, 40, 56):
+            for gather, nbytes in zip((True, False), (rows * 15104, rows * 98688)):
+                data = produce(nbytes, 50 + rows)
+                expected = reference(data, gather)
+                out = torch.empty_like(expected)
+                run(data, gather, out)
+                assert torch.equal(out, expected)
+    torch.cuda.synchronize()
+    dist.barrier()
 
     # Back to back, as a DSA layer's gather and records exchange: each call's
     # producer overwrites the buffer a slow peer would still pull without the
@@ -242,6 +255,7 @@ def _combine_worker(rank: int, port: int) -> None:
     )
     from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
         IrisPullExchange,
+        _iris_pull_combine_records,
     )
 
     ctx = get_or_create_context(heap_size=1 << 28)
@@ -276,6 +290,16 @@ def _combine_worker(rank: int, port: int) -> None:
         assert _same_bits(combined, expected)
         torch.cuda.synchronize()
         dist.barrier()
+
+    # Those token counts warmed both launch shapes; other batches reuse them.
+    with assert_no_triton_compile(_iris_pull_combine_records):
+        for tokens in (2, 3, 5, 24, 33, 40):
+            records = _records(tokens, rank, device, 50 + tokens)
+            expected = reference(records)
+            combined = exchange.combine_records(lend(records), head_dim=HEAD_DIM)
+            assert _same_bits(combined, expected)
+    torch.cuda.synchronize()
+    dist.barrier()
 
     # Between gathers, as a DSA layer's records follow its score gather: each
     # producer overwrites the buffer the previous call's slow peer pulled.
