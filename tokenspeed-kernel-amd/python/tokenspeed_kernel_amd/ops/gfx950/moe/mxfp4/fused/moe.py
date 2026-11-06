@@ -82,6 +82,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
     _ROUTE_TILE_MAX_M,
     _RouteTileConfig,
+    _select_direct_stage1_prefetch_tiles,
     _select_grouped_moe_config,
     _select_route_tile_config,
 )
@@ -1415,6 +1416,13 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         top_k,
         expert_start,
         q_inter_scale,
+        prefetch_tiles=_select_direct_stage1_prefetch_tiles(
+            hidden_dim=hidden_dim,
+            inter_dim=inter_dim,
+            num_local_experts=local_experts,
+            num_experts=global_num_experts,
+            top_k=top_k,
+        ),
         BLOCK_N=stage1_block_n,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
