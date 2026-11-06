@@ -237,9 +237,12 @@ def _draft_checkpoint(model):
     ).view(torch.float8_e8m0fnu)
     weights["mtp.0.main_norm.weight"] = torch.ones(h, dtype=torch.bfloat16)
     weights["mtp.2.norm.weight"] = torch.ones(h, dtype=torch.bfloat16)
-    for name in ("embed", "head"):
+    for name, size in (
+        ("embed", config.vocab_size),
+        ("head", getattr(config, "output_vocab_size", None) or config.vocab_size),
+    ):
         weights[f"mtp.2.markov_head.{name}.weight"] = torch.full(
-            (config.vocab_size, config.dspark_markov_rank), 0.125, dtype=torch.bfloat16
+            (size, config.dspark_markov_rank), 0.125, dtype=torch.bfloat16
         )
     weights["mtp.2.confidence_head.proj.weight"] = torch.ones(
         (1, h + config.dspark_markov_rank), dtype=torch.bfloat16
@@ -308,6 +311,67 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
         )
     with pytest.raises(ValueError, match="Unexpected"):
         model.load_weights([("mtp.3.norm.weight", torch.ones(config.hidden_size))])
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+@pytest.mark.parametrize("output_vocab_size", [1, 65, 256, 257])
+def test_compact_draft_checkpoint_loads_input_and_output_domains(
+    monkeypatch, rank, output_vocab_size
+):
+    from test.runtime.test_deepseek_v41_model import _mock_loader_hardware
+
+    from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+
+    config = _draft_config()
+    config.vocab_size = 512
+    config.output_vocab_size = output_vocab_size
+    config.dspark_noise_token_id = 511
+    config = DeepseekV41Config(text_config=vars(config))
+    mapping = _mapping(rank, 4, 4)
+    _mock_loader_hardware(monkeypatch, mapping)
+    with set_default_torch_dtype(torch.bfloat16):
+        adapter = DeepseekV41ForCausalLMDSpark(
+            config,
+            mapping,
+            _quant(),
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        )
+    weights = _draft_checkpoint(adapter.model)
+    embedding = weights["mtp.2.markov_head.embed.weight"]
+    projection = weights["mtp.2.markov_head.head.weight"]
+    embedding.copy_(torch.arange(512).view(-1, 1) % 7)
+    projection.copy_(torch.arange(output_vocab_size).view(-1, 1) % 5)
+    adapter.load_weights(weights.items())
+
+    # Input-only tokens keep their own Markov rows, while the strict loader
+    # partitions the compact output checkpoint exactly like the target head.
+    torch.testing.assert_close(
+        adapter.model.markov_embedding(torch.tensor([511])), embedding[511:512]
+    )
+    shard = adapter.lm_head.shard_indices
+    local = adapter.model.markov_projection.weight
+    valid = shard.num_org_elements
+    torch.testing.assert_close(
+        local[:valid],
+        projection[shard.org_vocab_start_index : shard.org_vocab_end_index],
+    )
+    assert torch.count_nonzero(local[valid:]) == 0
+    with torch.no_grad():
+        adapter.lm_head.weight.zero_()
+    hidden = torch.zeros(1, 5, config.hidden_size, dtype=torch.bfloat16)
+    logits = adapter.model.local_base_logits(hidden, adapter.lm_head.weight)
+    bias = embedding[511:512].float() @ local.float().T
+    # This addition is the operation the sampler must perform without a
+    # width mismatch, including ranks whose entire shard is padding.
+    corrected = logits + bias.unsqueeze(1)
+    expected = embedding[511:512].float() @ projection.float().T
+    torch.testing.assert_close(
+        corrected[0, :, :valid],
+        expected[:, shard.org_vocab_start_index : shard.org_vocab_end_index].expand(
+            5, -1
+        ),
+    )
 
 
 def _paged_slots(positions, rows_per_page):
@@ -1137,7 +1201,10 @@ class TestDSparkBaseLogits:
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("mode", ["prefill", "decode", "null"])
-def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
+@pytest.mark.parametrize("output_vocab_size", [None, 65])
+def test_tp1_ep2_draft_checkpoint_and_idle_schedule(
+    monkeypatch, rank, mode, output_vocab_size
+):
     from test.runtime.test_deepseek_v41_model import _mock_loader_hardware
 
     from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
@@ -1163,13 +1230,14 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
     )
     _mock_loader_hardware(monkeypatch, mapping)
     monkeypatch.delitem(global_server_args_dict, "disaggregation_mode", raising=False)
+    config = _draft_config()
+    config.output_vocab_size = output_vocab_size
+    config = DeepseekV41Config(text_config=vars(config))
     adapter = DeepseekV41ForCausalLMDSpark(
-        DeepseekV41Config(text_config=vars(_draft_config())),
+        config,
         mapping,
         _quant(),
-        vocabulary=VocabularySpec.from_hf_config(
-            DeepseekV41Config(text_config=vars(_draft_config())), is_draft=True
-        ),
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
     )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
     # The runner's GPU initialization is outside this CPU checkpoint test.

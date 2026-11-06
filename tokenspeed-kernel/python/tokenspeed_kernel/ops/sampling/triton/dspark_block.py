@@ -253,6 +253,7 @@ def dspark_block_greedy_step(
             row ``v`` belongs to token ``vocab_start + v``.
         vocab_start: First token id of this rank's shard.
         num_valid: Shard columns that are real tokens; the rest are padding.
+            Zero contributes no candidate while still joining the TP gather.
         partials: ``[rows, n_tiles]`` int64 destination for this rank's packed
             candidates.
         output: ``[rows, block]`` int32 block tokens; column ``step - 1``
@@ -286,9 +287,9 @@ def dspark_block_greedy_step(
         raise ValueError("embedding and projection must be BF16")
     if not (embedding.is_contiguous() and projection.is_contiguous()):
         raise ValueError("embedding and projection must be contiguous")
-    if not 0 < num_valid <= local_vocab or num_valid > projection.shape[0]:
+    if not 0 <= num_valid <= local_vocab or num_valid > projection.shape[0]:
         raise ValueError(
-            f"num_valid {num_valid} must lie in (0, {local_vocab}] and fit the "
+            f"num_valid {num_valid} must lie in [0, {local_vocab}] and fit the "
             f"projection shard of {projection.shape[0]} rows"
         )
     if anchor_ids.shape != (rows,) or anchor_ids.dtype not in (

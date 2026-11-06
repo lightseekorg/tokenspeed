@@ -18,6 +18,10 @@ directly must intersect both original and added token ranges with the logical
 output domain, including shards containing no output tokens. Distributed
 argmax shortcuts require the physical and logical widths to match.
 
+DSpark's Markov embedding covers input tokens; its projection and checkpoint
+rows cover output tokens and use the same vocabulary shards as the LM head.
+Padding-only shards contribute no candidate but still join every TP gather.
+
 Every model constructor receives the resolved `vocabulary` explicitly.
 `ModelExecutorConfig` and `RuntimeStates` retain that value, without legacy
 `vocab_size` aliases or per-layer defaults. `LogitsProcessor` takes an explicit

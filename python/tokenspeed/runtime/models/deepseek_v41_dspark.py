@@ -260,7 +260,9 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             logits = flat.float() @ head.float().T
         return logits.view(*hidden_states.shape[:-1], head.shape[0])
 
-    def __init__(self, config, mapping, quant_config, prefix):
+    def __init__(
+        self, config, mapping, quant_config, prefix, *, vocabulary: VocabularySpec
+    ):
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 DSpark requires PP=1")
         stages = int(config.dspark_num_stages)
@@ -277,7 +279,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             or taps[-1] >= config.num_hidden_layers
         ):
             raise ValueError("Invalid V4.1 DSpark stage/block/capture configuration")
-        if not 0 <= config.dspark_noise_token_id < config.vocab_size:
+        if not 0 <= config.dspark_noise_token_id < vocabulary.input_size:
             raise ValueError("DSpark noise token must belong to the target vocabulary")
         if config.dspark_markov_rank < 1:
             raise ValueError("DSpark requires a positive Markov rank")
@@ -315,10 +317,10 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             v41_mxfp8_config(quant_config),
             add_prefix("context_wkv", prefix),
         )
-        # The bigram table is replicated so the block sampler gathers rows
-        # locally; the projection shares the LM head's vocabulary shards.
+        # The bigram table covers input tokens and is replicated for local
+        # lookups; the projection shares the LM head's output vocabulary shards.
         self.markov_embedding = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
+            num_embeddings=vocabulary.input_size,
             embedding_dim=config.dspark_markov_rank,
             params_dtype=torch.bfloat16,
             org_num_embeddings=None,
@@ -327,12 +329,15 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             prefix=add_prefix("markov_embedding", prefix),
         )
         self.markov_projection = ParallelLMHead(
-            num_embeddings=config.vocab_size,
+            num_embeddings=vocabulary.output_size,
             embedding_dim=config.dspark_markov_rank,
             bias=False,
             params_dtype=torch.bfloat16,
             org_num_embeddings=None,
-            padding_size=64,
+            # ReplicatedLinear target heads under attention DP are not padded.
+            padding_size=(
+                1 if mapping.attn.has_dp and not mapping.lm_head.has_tp else 64
+            ),
             quant_config=None,
             prefix=add_prefix("markov_projection", prefix),
             tp_rank=mapping.attn.tp_rank,
@@ -479,6 +484,7 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
             mapping,
             quant_config,
             add_prefix("model", prefix),
+            vocabulary=self.vocabulary,
         )
 
     @classmethod
