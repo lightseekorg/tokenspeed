@@ -132,9 +132,9 @@ public:
     }
     void RegisterFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                             std::uint64_t access_epoch, std::int32_t first_slot = 0) {
-        BlockTable::PublishWindow window = allocator_.BlocksToPublish(table, first_slot, keys.size());
-        index_.RegisterFullBlocks(pool, window.Blocks(), keys, access_epoch, first_slot, CacheBoundaryKind::kChunk,
-                                  /*newly_cached=*/nullptr, /*session=*/nullptr);
+        index_.RegisterFullBlocks(pool, allocator_.BlocksToPublish(table, first_slot, keys.size()), keys, access_epoch,
+                                  first_slot, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
+                                  /*session=*/nullptr);
     }
 
     bool ContainsCachedBlock(const BlockPool& pool, const CacheKey& key) const { return index_.Contains(pool, key); }

@@ -50,12 +50,24 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    request->Apply(fsm::AbortEvent{&coordinator_});
+    abortRequest(*request);
+}
+
+void Scheduler::handleEvent(const pd::TransferStoppedEvent& event) {
+    Request* request = findRequest(event.request_id);
+    if (request != nullptr && request->Is<fsm::PdTransferring>()) {
+        request->Apply(fsm::TransferStoppedEvent{&coordinator_});
+    }
 }
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     Request* request = findRequest(event.request_id);
     if (request == nullptr || request->IsAnyOf<fsm::Finishing, fsm::Finished>()) {
+        return;
+    }
+    if (request->Is<fsm::PdTransferring>()) {
+        // The transfer completed before the request's end stopped it.
+        request->Apply(fsm::TransferStoppedEvent{&coordinator_});
         return;
     }
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
@@ -80,6 +92,11 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
         return;
     }
+    if (request->Is<fsm::PdTransferring>()) {
+        // The transfer completed before the request's end stopped it.
+        request->Apply(fsm::TransferStoppedEvent{&coordinator_});
+        return;
+    }
     if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::Finished>()) {
         return;
     }
@@ -89,6 +106,9 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 
 void Scheduler::handleEvent(const forward::Finish& event) {
     if (Request* request = findRequest(event.request_id)) {
+        if (request->Is<fsm::PdTransferring>()) {
+            return;  // it ended already; only its transfer is still stopping
+        }
         if (pdTransferInFlight(*request)) {
             throw std::logic_error("PD Finish received while transfer pages are pinned");
         }
@@ -110,9 +130,10 @@ void Scheduler::settleFinishedRequests() {
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
     fsm::CacheProgress progress = request.CacheProgress();
-    // The frontier is final: every forward has landed, so the live state slot
-    // holds the state after the last consumed token and the KV rows below it
-    // are complete.
+    // The frontier is final: every forward has landed, so the State slot the
+    // last kept token's forward wrote holds the state after it (slot 1, or
+    // slot 0 behind a first decode that ran as a padding row:
+    // CompletedPages::state_slot) and the KV rows below it are complete.
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     RequestProgress completed = AdvanceRequestProgress(
         request, progress, num_computed_tokens, coordinator_.PrefixGranularity(),
@@ -259,7 +280,16 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
-        request->Apply(fsm::AbortEvent{&coordinator_});
+        abortRequest(*request);
+    }
+}
+
+void Scheduler::abortRequest(Request& request) {
+    if (pdTransferInFlight(request)) {
+        // The transport stops the transfer; the pages wait for it.
+        request.Apply(fsm::StopPdTransferEvent{});
+    } else {
+        request.Apply(fsm::AbortEvent{&coordinator_});
     }
 }
 

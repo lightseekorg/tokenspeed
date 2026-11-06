@@ -2631,15 +2631,17 @@ TEST_F(SharedImagePagesSuite, VictimsPinAnInFlightStoresBlocksAndWaitForItsAck) 
     SendForwardDone("r2", {44});
 
     // Plan 6 retracts r2: the shared page is still on the pinned store, so
-    // r2 pins the same ticket block and waits for the same op.
+    // r2 pins the same ticket block and waits for the same op. Its replay
+    // page, recomputed, is a private duplicate of r1's: the pool carries it.
     const ExecutionPlan p6 = PlanOnce();
     ASSERT_EQ(scheduler_->RetractedSize(), 2u);
     const TierTransferManager::WriteBackStats both_images = scheduler_->GetHostCacheStats().retraction_stores;
-    EXPECT_EQ(both_images.in_flight, 8u) << "r2's two prompt pages ride the same pinned store";
+    EXPECT_EQ(both_images.in_flight, 6u) << "r2's shared first prompt page rides the same pinned store";
     EXPECT_EQ(both_images.ops, 2u);
     EXPECT_EQ(both_images.blocks, (std::vector<std::uint64_t>{2, 2}));
     const SnapshotStoreBatch* r2_tail = FindSnapshotStore(p6);
     ASSERT_NE(r2_tail, nullptr);
+    EXPECT_EQ(r2_tail->src_pages.at(0).size(), 2u) << "the recomputed replay page stays private in both groups";
     AckImageStores(p3);
     AckImageStores(p4);
     AckImageStores(p5);

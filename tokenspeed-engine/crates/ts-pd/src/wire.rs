@@ -124,6 +124,35 @@ pub fn preallocation_route(frames: &[Bytes]) -> Result<(u64, String), WireError>
     Ok((room, session_id))
 }
 
+/// A Decode rank stopped receiving a room: every Prefill rank fails it and
+/// reports `Failed` once its writes to the room stopped.
+pub fn cancel_frames(room: u64, session_id: &str) -> Vec<Bytes> {
+    vec![Bytes::from_static(CANCEL), ascii(room), ascii(session_id)]
+}
+
+const CANCEL: &[u8] = b"Cancel";
+
+/// Whether `frames` are a [`cancel_frames`] message.
+pub fn is_cancel(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|header| header.as_ref() == CANCEL)
+}
+
+/// A cancellation's room and Decode session.
+pub fn cancel_route(frames: &[Bytes]) -> Result<(u64, String), WireError> {
+    if frames.len() != 3 || !is_cancel(frames) {
+        return Err(error("CachePD cancellation requires exactly 3 frames"));
+    }
+    let room = parse_uint(&frames[1], MAX_ROOM)
+        .ok_or_else(|| error("CachePD room must be canonical unsigned ASCII"))?;
+    let session_id = text(&frames[2], "CachePD session")?;
+    if session_id.is_empty() || session_id.len() > 512 {
+        return Err(error("CachePD cancellation requires a Decode session"));
+    }
+    Ok((room, session_id))
+}
+
 /// A Prefill rank's report on one room.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusMessage {
@@ -295,5 +324,60 @@ mod tests {
         let bad = [ascii("042"), ascii("s"), Bytes::new()];
         assert!(preallocation_route(&bad).is_err());
         assert_eq!(session_port("[::1]:5000"), Some(5000));
+    }
+
+    #[test]
+    fn a_cancellation_round_trips_and_is_never_a_preallocation() {
+        let frames = cancel_frames(42, "10.0.0.1:5000");
+        assert!(is_cancel(&frames));
+        assert!(!is_registration(&frames));
+        assert_eq!(cancel_route(&frames), Ok((42, "10.0.0.1:5000".to_owned())));
+        // A pre-allocation starts with its room, a registration with "None":
+        // neither is taken for a cancellation.
+        let preallocation = preallocation_frames(42, "10.0.0.1:5000", None);
+        assert!(!is_cancel(&preallocation));
+        assert!(cancel_route(&preallocation).is_err());
+        let registration =
+            registration_frames("10.0.0.1", 4000, "10.0.0.1:5000", 0x1000, b"L", 4, 2);
+        assert!(!is_cancel(&registration));
+        assert!(cancel_route(&registration).is_err());
+        assert!(!is_cancel(&[]));
+        assert!(cancel_route(&[]).is_err());
+    }
+
+    #[test]
+    fn a_malformed_cancellation_is_rejected() {
+        let short = cancel_frames(1, "s");
+        assert!(cancel_route(&short[..2]).is_err());
+        let mut long = cancel_frames(1, "s");
+        long.push(Bytes::new());
+        assert!(cancel_route(&long).is_err());
+        // The room is a canonical unsigned integer at most `MAX_ROOM`.
+        let room = |frame: &[u8]| {
+            cancel_route(&[
+                Bytes::from_static(CANCEL),
+                Bytes::copy_from_slice(frame),
+                ascii("s"),
+            ])
+        };
+        assert!(room(b"01").is_err());
+        assert!(room(b"-1").is_err());
+        assert!(room(b"").is_err());
+        assert!(room(b"9223372036854775808").is_err());
+        assert_eq!(room(b"9223372036854775807"), Ok((MAX_ROOM, "s".to_owned())));
+        // The Decode session must be a non-empty ASCII text frame.
+        let session = |frame: &[u8]| {
+            cancel_route(&[
+                Bytes::from_static(CANCEL),
+                ascii(3),
+                Bytes::copy_from_slice(frame),
+            ])
+        };
+        assert!(session(b"").is_err());
+        assert!(session(&[0xff]).is_err());
+        assert!(session(&[b's'; 513]).is_err());
+        assert_eq!(session(b"s"), Ok((3, "s".to_owned())));
+        // Another header is a pre-allocation, not a cancellation.
+        assert!(cancel_route(&[Bytes::from_static(b"Cancel "), ascii(1), ascii("s")]).is_err());
     }
 }

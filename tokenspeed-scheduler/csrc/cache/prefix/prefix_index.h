@@ -215,18 +215,19 @@ public:
         }
     }
 
-    // Registers blocks[j] under keys[j]. blocks is the caller's own storage
-    // (GroupAllocator::BlocksToPublish for a request table): a block that
-    // dedupes against an existing canonical entry is replaced in place.
+    // Registers blocks[j] under keys[j]. The caller keeps its references: a
+    // block whose key already has a canonical entry stays the caller's
+    // private duplicate, so publication never moves a request off the blocks
+    // its forwards and PD transfers address.
     // first_logical_block is the logical prefix position of blocks[0].
-    void RegisterFullBlocks(const BlockPool& pool, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
-                            std::uint64_t access_epoch, std::int32_t first_logical_block,
-                            CacheBoundaryKind boundary_kind,
+    void RegisterFullBlocks(const BlockPool& pool, std::span<const CacheBlockRef> blocks,
+                            std::span<const CacheKey> keys, std::uint64_t access_epoch,
+                            std::int32_t first_logical_block, CacheBoundaryKind boundary_kind,
                             std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached, SessionCacheOwner session) {
         _assert(first_logical_block >= 0, "first_logical_block must be >= 0");
         _assert(blocks.size() == keys.size(), "one key per published block");
         for (std::size_t j = 0; j < keys.size(); ++j) {
-            CacheBlockRef& block_ref = blocks[j];
+            CacheBlockRef block_ref = blocks[j];
             if (!block_ref) {
                 continue;
             }

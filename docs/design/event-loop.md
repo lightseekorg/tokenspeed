@@ -761,6 +761,18 @@ bootstrap timeout is dropped, and the decode ranks that pre-allocated for it
 are told it failed. A decode room whose KV lands without the request's first
 token fails: the first decode feeds on it.
 
+A transfer that fails, or whose request the loop aborts (`TransferPeer::cancel`),
+is reported `Failed` at once but frees no pages until its peer reports
+`Stopped`: every member agrees that no reader or writer touches the room any
+more, and the scheduler then releases the request it parked
+(`pd::TransferStoppedEvent`). A prefill rank counts each room's queued and
+running chunks and tells the room's decode ranks it failed only after the last
+one returns, so a decode rank takes each prefill rank's `Success` or `Failed`
+as proof that it writes no more; a decode rank whose receive fails after its
+manifest went out sends those ranks `Cancel` and waits for that proof. A write
+that errors gives no proof that its DMA stopped: that room's decode ranks are
+never told, and they keep its pages.
+
 **EPD prefill** (`--disaggregation-mode prefill` with encode nodes). A
 request whose images an encode node embeds is staged at admission; each
 round the replica MIN-reduces which staged requests' embeddings landed on

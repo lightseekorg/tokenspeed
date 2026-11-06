@@ -205,10 +205,10 @@ enum class OwnerTail {
     // place.
     kFinal,
     // The owner keeps writing past the point (a prompt end followed by
-    // decode): its blocks are registered without taking another request's
-    // canonical block into the table, and the admission moves off every one
-    // it registered into the copy-in block the request holds for its slot,
-    // copying the published bytes into it.
+    // decode): its blocks are registered, and the admission moves off every
+    // one the index took into the copy-in block the request holds for its
+    // slot, copying the published bytes into it. A block whose key another
+    // request published first stays the owner's to write.
     kCopiedIn,
     // The owner keeps writing past a point whose KV is cached already (a
     // chunk end cut at a junction): its blocks stay unpublished, and only the
@@ -236,10 +236,14 @@ struct CompletedPages {
     OwnerTail owner_tail{OwnerTail::kFinal};
     // This point is a natural checkpoint of the recurrent state (prompt end,
     // finish, retraction, a junction-cut chunk end): every State group
-    // publishes slot 1 -- the block the forward that ended here wrote --
+    // publishes the block the forward that ended here wrote (state_slot)
     // under the point's hash (the chain hash when aligned, the tail hash
     // otherwise). Ordinary chunk ends and decode steps publish no state.
     bool publish_state{false};
+    // The State slot holding that block: slot 1, unless the first decode
+    // rotated it into slot 0 and kept no token, having run as a padding row
+    // behind a finish at the prompt end (CacheProgress::prompt_end_rotated).
+    std::int32_t state_slot{1};
     // An in-forward State checkpoint an earlier forward wrote at the page
     // boundary prefix_hashes[state_checkpoint_pages - 1]: every State group
     // publishes its block from state_checkpoint_blocks (indexed by group, null
@@ -247,7 +251,7 @@ struct CompletedPages {
     // behind that boundary is an endpoint's regardless of boundary_kind. Zero
     // pages means none.
     std::int32_t state_checkpoint_pages{0};
-    std::span<CacheBlockRef> state_checkpoint_blocks{};
+    std::span<const CacheBlockRef> state_checkpoint_blocks{};
     // Which kind of boundary the publication ends on (eviction provenance).
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // Prefill streams newly published history and state to Host. Decode

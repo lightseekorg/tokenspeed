@@ -428,6 +428,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::FailedEvent::request_id);
 
+    nb::class_<tokenspeed::pd::TransferStoppedEvent>(pd, "TransferStoppedEvent")
+        .def(nb::init<std::string>(), nb::arg("request_id"))
+        .def_ro("request_id", &tokenspeed::pd::TransferStoppedEvent::request_id);
+
     nb::class_<tokenspeed::pd::SucceededEvent>(pd, "SucceededEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::SucceededEvent::request_id);

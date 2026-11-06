@@ -418,9 +418,9 @@ public:
                                                            std::int32_t num_tokens) const;
     // The same slots once `progress` has been published as well: the entries
     // that exist now plus the slots CacheCompletedBlocks(progress) would
-    // register (the single publication rule, completedBlockRanges), each on
-    // the block the publication leaves it on: a key the Device index holds
-    // already re-points the slot to that entry's block. The victim probe
+    // register (the single publication rule, completedBlockRanges). A slot
+    // whose key the Device index holds already under another block stays the
+    // request's private duplicate and is not added. The victim probe
     // reads the image's L2/pool split off this before the retraction
     // publishes. Without completed pages it is PublishedDataSlots.
     std::vector<std::vector<ImageSlot>> PublishedDataSlotsAfter(std::span<const BlockTable> tables,
@@ -506,11 +506,11 @@ public:
 
     // Registers an exact range, used for transferred prefix blocks and tests.
     // Runtime publication during Admit follows each group's boundary contract.
-    void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
+    void CacheFullBlocks(std::span<const BlockTable> tables, std::span<const std::string> content_hashes,
                          std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
     // Publication without admission, for finish, retraction and remote
     // completion. progress.completed_pages must be present.
-    void CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
+    void CacheCompletedBlocks(std::span<const BlockTable> tables, const RequestProgress& progress,
                               std::uint64_t access_epoch);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
@@ -1111,16 +1111,17 @@ private:
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     template <CacheTier Tier>
-    void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
+    void cacheFullBlocksForGroup(std::size_t group_index, const BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     // Registers blocks[j] under keys[j] (logical block first_logical_block + j)
     // and reports and streams what was newly cached; cacheFullBlocksForGroup
     // passes a table window, an in-forward State checkpoint its own block.
     template <CacheTier Tier>
-    void cacheBlocksForGroup(std::size_t group_index, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
-                             std::int32_t first_logical_block, std::uint64_t access_epoch,
-                             CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+    void cacheBlocksForGroup(std::size_t group_index, std::span<const CacheBlockRef> blocks,
+                             std::span<const CacheKey> keys, std::int32_t first_logical_block,
+                             std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
+                             bool stream_completed_to_host);
     // One run of table slots a publication registers in a group, the key of
     // each (keys[j] is slot first_cache_block + j), and the boundary kind it
     // registers them under.
@@ -1140,10 +1141,10 @@ private:
     // its page's chain hash below the full pages, the tail hash from there on.
     CacheKey historyBlockKey(std::size_t group_index, const CompletedPages& completed, std::int32_t block) const;
     template <CacheTier Tier>
-    void cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
+    void cacheCompletedBlocksForGroup(std::size_t group_index, const BlockTable& table, const CompletedPages& completed,
                                       std::uint64_t access_epoch);
-    void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
-                                            std::uint64_t access_epoch);
+    void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const BlockTable& table,
+                                            const CompletedPages& completed, std::uint64_t access_epoch);
     // Records a published tail in the tail table and evicts the tail the
     // per-prior cap dropped, on both tiers.
     void recordPublishedTail(const CompletedPages& completed);

@@ -67,8 +67,10 @@ struct CacheProgress {
     std::vector<CacheBlockRef> state_checkpoint_blocks;
     // The blocks of the checkpoint the latest publication point published,
     // held until the next one so the publication's spans stay valid; the
-    // index keeps them cached. A retraction drops them once its publication
-    // is applied (a Retracted request holds no Device block).
+    // index keeps them cached, unless another request published the
+    // checkpoint first and these are the request's private copies. A
+    // retraction drops them once its publication is applied (a Retracted
+    // request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
     // One aligned input checkpoint and its non-replayable sliding windows.
     // Kept while the request runs: restricted State cannot publish a decode
@@ -81,6 +83,12 @@ struct CacheProgress {
     // resumed at or below it, which every admission of the prompt and its
     // first decode read alike (Scheduler::promptEndCheckpoint).
     std::int32_t resume_tokens{0};
+    // Whether the first decode published the prompt end and rotated the
+    // State slots (PublicationPoint::kOwnerContinues). Until a forward past
+    // the prompt end lands, the state there sits in slot 0, and slot 1 is a
+    // block no forward wrote: a finish at the prompt end, whose first decode
+    // ran as a padding row, publishes slot 0 (CompletedPages::state_slot).
+    bool prompt_end_rotated{false};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,

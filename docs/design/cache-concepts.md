@@ -269,11 +269,9 @@ again each round was most of a control-thread round. The id cannot go stale on
 its own: a parent's group binding, and with it the packing the id follows,
 holds while any reference keeps the parent occupied, and the block's own pool
 resolves it, so Host and Device packing may differ. Every write to a table
-goes through `GroupAllocator`, which keeps the ids in step. The one write
-from outside, a prefix index replacing a published block with the key's
-canonical block, goes through the allocator's publish window, which resolves
-its slots again when it closes. Debug builds (no `NDEBUG`) check each
-exported row against a fresh resolution.
+goes through `GroupAllocator`, which keeps the ids in step; publication only
+reads a table. Debug builds (no `NDEBUG`) check each exported row against a
+fresh resolution.
 
 Operations borrow their scheduled request's tables only until their batch is
 built. A request selected for that build cannot be retracted or scheduled
@@ -337,9 +335,13 @@ nothing, and keeps no token. (Pipeline parallelism serves only the prefill
 role, which neither decodes nor overlaps, so its stages, which do not sample,
 never run a forward behind a stopped request.) The finish checkpoint is thus the state before
 the stop token under every schedule ([Scheduler
-§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)); a finish
-dispatched as a rotating first decode publishes at the prompt end, where the
-prompt-end checkpoint it still holds in slot 0 is the canonical block.
+§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)). A finish
+behind a rotating first decode that ran as a padding row publishes at the
+prompt end from slot 0, the block the prefill wrote: slot 1 is the fresh
+block the padding row never wrote (`CompletedPages::state_slot`). Slot 0 is
+the request's own block even when another request published the prompt end
+first, so the finish publishes the prompt-end state again if that first copy
+was evicted in the meantime.
 
 State groups may additionally restrict reusable checkpoints with
 `checkpoint_granularity`: intermediate prefill forwards end on its multiples,
@@ -850,12 +852,13 @@ The conversion is `GroupGeometry` in the coordinator layer:
 Where reclaim needs to know whether a block is still cached, it takes the
 group's `PrefixCacheIndex` as an explicit read-only parameter — the
 dependency is visible in the signature, not hidden in shared state. The
-reverse direction is symmetric: publishing a table's completed blocks may
-replace one with the key's existing canonical block, and that write goes
-through a mutable window the allocator hands out
-(`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`;
-the window keeps the table's page ids current when it closes.
-The index never sees a `BlockTable`; the allocator remains its only mutator.
+reverse direction is symmetric: publishing a table's completed blocks reads
+a window the allocator hands out (`GroupAllocator::BlocksToPublish`) and
+passes it to `PrefixCacheIndex::RegisterFullBlocks`. A block whose key the
+index already holds under another block stays the request's private
+duplicate: publication never moves a request off the blocks its forwards and
+PD transfers address. The index never sees a `BlockTable`; the allocator
+remains its only mutator.
 
 ## The coordinator layer (`csrc/cache/coordinator/`)
 

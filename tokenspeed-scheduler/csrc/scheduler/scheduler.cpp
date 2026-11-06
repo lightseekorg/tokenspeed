@@ -132,10 +132,11 @@ Request* Scheduler::findRequest(const std::string& request_id) {
 bool Scheduler::pdTransferInFlight(const Request& request) const {
     switch (config_.role) {
         case Role::kD:
-            return request.Is<fsm::RemotePrefilling>();
+            return request.IsAnyOf<fsm::RemotePrefilling, fsm::PdTransferring>();
         case Role::kP:
-            // Every page-holding state but Finishing: SucceededEvent moves a
-            // request there once the peer has read its pages.
+            // Every page-holding state but Finishing, PdTransferring
+            // included: SucceededEvent moves a request to Finishing once the
+            // peer has read its pages.
             return request.HoldsPages() && !request.Is<fsm::Finishing>();
         case Role::kFused:
             return false;

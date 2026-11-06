@@ -845,11 +845,9 @@ raise (`--retraction-snapshot-host-gb` / `--retraction-snapshot-ratio`,
 entries and whether copies are in flight). The same site aborts a chosen
 victim whose image its own publication left without room, which the probe does
 not foresee: a tail that publication drops under the per-prior cap takes its
-Host entries along; under the write-back policy the segment step ranks Host
-victims by what the Device holds, which the publication adds to; and under KV
-parallelism a slot the publication re-points to the Device entry already
-holding its key rides the snapshot pool in that entry's bucket, not the one
-the probe counted. The split made after the publication can then fall short.
+Host entries along; and under the write-back policy the segment step ranks
+Host victims by what the Device holds, which the publication adds to. The
+split made after the publication can then fall short.
 Waiting instead would deadlock once every resident needs a page; charging
 worst-case host room at admission would cost concurrency on every request to
 protect against a rare shortfall.
@@ -968,8 +966,8 @@ except in the empty-round retraction below. Excluded by state: `Retracted`,
 **Empty-round retraction.** The exemption trusts the admission reserve to cover
 all growth, and a sliding-window group's does not always: it prepays only
 against pages other requests hold at the admission (§1). A page that becomes
-shared after the admission (a later prefix hit on it, or publish-time dedup of
-identical prompt pages) frees nothing when it slides out, and a sequence still
+shared after the admission (a later prefix hit on it) frees nothing when it
+slides out, and a sequence still
 shorter than the window, or a prompt whose next chunk still reads its
 lookback, has nothing to recycle yet. When no resident can be retracted under
 the exemption and the round built nothing — no forward, restore, remote
@@ -1085,11 +1083,24 @@ prompt whose KV is mid-transfer would strand the decode side.
 The PD pin is not recorded anywhere; it is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
 pinned — the peer's decode reads the pages from the first scheduled chunk until
-the PD ACK finishes or aborts the request. On the D role the pin is exactly
-`RemotePrefilling`: the peer's prefill is writing the destination pages, and
-`RemotePrefillDone` ends it by leaving that state. A fused engine never
-transfers. Because the pin is the state, no event handler can forget to clear
-it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
+the PD ACK finishes the request. On the D role the pin is `RemotePrefilling`:
+the peer's prefill is writing the destination pages, and `RemotePrefillDone`
+ends it by leaving that state. A fused engine never transfers. Because the pin
+is the state, no event handler can forget to clear it.
+
+A transfer reads and writes pages through the page IDs its operations
+exported, so while the pin holds, a pinned table loses no block a transfer may
+still address: publication never moves a request onto another request's
+canonical block (a duplicate stays private), and the owner copy-in, the one
+move off a published block, runs only on the fused role, which never
+transfers.
+
+A pinned request that ends — an abort, or a failed transfer — does not free
+its pages: the transfer may still be reading or writing them. It parks whole in
+`PdTransferring`, which is pinned on both roles, until the transport reports
+`pd::TransferStoppedEvent` once every reader and writer on every rank stopped
+(or the transfer's success lands first). Nothing is scheduled, published or
+retracted from that state.
 
 **Restore: n/a.** Nothing on this role is ever `Retracted`, so the restore
 phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.

@@ -97,17 +97,16 @@ public:
         ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(released), page_ids.end());
     }
 
-    // The table window handed to PrefixCacheIndex::RegisterFullBlocks. The
-    // index owns no table: publishing a completed block may dedupe it against
-    // the key's existing canonical block, and the table must then hold that
-    // canonical reference, so the mutable window is issued here, by the one
-    // component allowed to change a table. The window's page ids follow the
-    // references the index leaves when it closes.
-    BlockTable::PublishWindow BlocksToPublish(BlockTable& table, std::int32_t first_slot, std::size_t count) const {
+    // The table window handed to PrefixCacheIndex::RegisterFullBlocks.
+    // Publication reads it only: a duplicate of an existing canonical block
+    // stays in the table, so a PD transfer reading the table's blocks never
+    // loses one to publication.
+    std::span<const CacheBlockRef> BlocksToPublish(const BlockTable& table, std::int32_t first_slot,
+                                                   std::size_t count) const {
         _assert(first_slot >= 0, "first_slot must be >= 0");
         _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(count) <= table.NumBlocks(),
                 "publish window exceeds table size");
-        return BlockTable::PublishWindow{group_id_, table, static_cast<std::size_t>(first_slot), count};
+        return table.Blocks().subspan(static_cast<std::size_t>(first_slot), count);
     }
 
     void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {

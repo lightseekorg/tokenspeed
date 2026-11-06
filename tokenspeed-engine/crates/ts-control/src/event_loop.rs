@@ -721,6 +721,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // The forward-result feedback point: everything committed this round
         // reaches the scheduler before the next round plans.
         if !events.is_empty() {
+            // An ended request's transfer stops; its pages wait for that
+            // (PdEvent::Stopped) unless it succeeds first.
+            if let Some(transfer) = self.transfer.as_mut() {
+                for event in &events {
+                    if event.kind == ForwardEventKind::Abort {
+                        transfer.cancel(&event.request_id);
+                    }
+                }
+            }
             self.scheduler
                 .advance(&events)
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
@@ -2073,9 +2082,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     absorb(self.outputs.finish_prefill(&rid), events, outputs, released);
                 }
                 PdEvent::Failed(rid) => {
-                    // The scheduler releases the request on the event itself.
+                    // The scheduler ends the request on the event; its pages
+                    // wait for the transfer to stop.
                     events.push(pd_event(ForwardEventKind::PdFailed, &rid, -1));
                     absorb(self.outputs.fail_transfer(&rid), events, outputs, released);
+                }
+                PdEvent::Stopped(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdTransferStopped, &rid, -1));
                 }
                 PdEvent::RemotePrefillDone(done) => {
                     let rid = done.rid.clone();
