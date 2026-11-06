@@ -25,7 +25,10 @@ from unittest import mock
 
 import pytest
 import torch
+from torch import nn
 
+from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
@@ -33,9 +36,7 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensor
     CompressedTensorsConfig,
 )
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
-from tokenspeed.runtime.models.base.decoder_layer import CompiledMoEDecoderLayer
-from tokenspeed.runtime.models.base.module_spec import ModuleKind
-from tokenspeed.runtime.models.base.placement import ParallelGroup, Replicate
+from tokenspeed.runtime.models.gpt_oss import GptOssDecoderLayer
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -126,18 +127,36 @@ def test_gluon_petit_cli_backend_names() -> None:
     assert All2AllBackend(args.all2all_backend) is All2AllBackend.GLUON_PETIT
 
 
-def test_gluon_petit_compiled_moe_owns_ep_communication() -> None:
-    layer = CompiledMoEDecoderLayer.__new__(CompiledMoEDecoderLayer)
+class _PetitMoE(nn.Module):
+    """Stands in for Petit's MegaMoE, which needs gfx950 and process groups."""
 
-    with mock.patch(
-        "tokenspeed.runtime.models.base.decoder_layer.get_all2all_backend",
-        return_value=All2AllBackend.GLUON_PETIT,
-    ):
-        spec = layer.mlp_spec()
+    owns_ep_communication = True
 
-    assert spec.kind == ModuleKind.MOE
-    assert spec.input_placement == Replicate(ParallelGroup.ATTN_TP)
-    assert spec.output_placement is None
+    def forward(self, hidden_states, num_global_tokens, max_num_tokens_per_gpu):
+        return hidden_states * num_global_tokens + max_num_tokens_per_gpu
+
+
+def test_gluon_petit_gpt_oss_moe_takes_rank_local_rows() -> None:
+    mapping = Mapping(
+        rank=0, world_size=2, attn_tp_size=1, attn_dp_size=2, moe_ep_size=2
+    )
+    layer = GptOssDecoderLayer.__new__(GptOssDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.mlp = _PetitMoE()
+    layer.comm_manager = CommManager(
+        mapping=mapping,
+        layer_id=1,
+        is_moe=True,
+        prev_is_moe=True,
+        dense_batch_invariant=False,
+        query_sharded=False,
+    )
+    hidden_states = torch.randn(3, 8)
+
+    # With no forward context or process group, any CommManager leg would raise.
+    out = layer.forward_mlp(hidden_states, hidden_states, None, 8, 5)
+
+    torch.testing.assert_close(out, hidden_states * 8 + 5, atol=0, rtol=0)
 
 
 def test_gluon_petit_requires_matching_backend_pair() -> None:

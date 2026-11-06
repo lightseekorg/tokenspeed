@@ -1539,36 +1539,58 @@ def _gated_fp8_quantize_kernel(
     tl.store(scale_ptr + row * groups + group, scale, valid_group)
 
 
-@triton.jit(do_not_specialize=["X0"])
+@triton.jit(do_not_specialize=["M", "X0"])
 def _rmsnorm_fp8_group32_ue8m0(
     X,
     W,
     N,
     Q,
     S,
+    M,
     X0,
     K: tl.constexpr,
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
+    SWIZZLED: tl.constexpr,
+    PADDED_GROUPS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    # Padding-only programs wait too: the scale buffer may reuse memory the
+    # upstream kernel still reads.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, BLOCK)
-    x = tl.load(X + row * X0 + col, col < K, 0).to(tl.float32)
-    w = tl.load(W + col, col < K, 0).to(tl.float32)
-    inv = tl.rsqrt(tl.sum(x * x, 0) / K + EPS)
-    normalized = (x * inv * w).to(N.dtype.element_ty)
-    tl.store(N + row * K + col, normalized, col < K)
-    values = tl.reshape(normalized.to(tl.float32), (BLOCK // 32, 32))
-    raw = tl.maximum(tl.max(tl.abs(values), 1), 1e-4) * (1.0 / 448.0)
-    bits = raw.to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    quantized = tl.reshape(
-        values * (1.0 / (exponent << 23).to(tl.float32, bitcast=True))[:, None],
-        (BLOCK,),
-    ).to(tl.float8e4nv)
-    tl.store(Q + row * K + col, quantized, col < K)
     groups = tl.arange(0, BLOCK // 32)
-    tl.store(S + row * (K // 32) + groups, exponent.to(tl.uint8), groups < K // 32)
+    k_tiles: tl.constexpr = (K + 127) // 128
+    if row < M:
+        x = tl.load(X + row * X0 + col, col < K, 0).to(tl.float32)
+        w = tl.load(W + col, col < K, 0).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(x * x, 0) / K + EPS)
+        normalized = (x * inv * w).to(N.dtype.element_ty)
+        tl.store(N + row * K + col, normalized, col < K)
+        values = tl.reshape(normalized.to(tl.float32), (BLOCK // 32, 32))
+        raw = tl.maximum(tl.max(tl.abs(values), 1), 1e-4) * (1.0 / 448.0)
+        bits = raw.to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        quantized = tl.reshape(
+            values * (1.0 / (exponent << 23).to(tl.float32, bitcast=True))[:, None],
+            (BLOCK,),
+        ).to(tl.float8e4nv)
+        tl.store(Q + row * K + col, quantized, col < K)
+        if SWIZZLED:
+            offsets = _fp8_swizzled_scale_offset(row, groups, k_tiles)
+        else:
+            offsets = row * (K // 32) + groups
+        tl.store(S + offsets, exponent.to(tl.uint8), groups < K // 32)
+    if SWIZZLED:
+        # The grid covers every row of the last 128-row tile. Padding rows and
+        # the scale columns past K/32 read as zero; each program owns its row.
+        padded = tl.arange(0, PADDED_GROUPS)
+        padding = (padded < k_tiles * 4) & ((padded >= K // 32) | (row >= M))
+        offsets = _fp8_swizzled_scale_offset(row, padded, k_tiles)
+        tl.store(S + offsets, tl.zeros((PADDED_GROUPS,), tl.uint8), padding)
 
 
 @register_kernel(
@@ -1658,8 +1680,14 @@ def triton_rmsnorm_fp8_group32_ue8m0(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    *,
+    swizzled_scales: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return BF16 normalized rows, E4M3 codes and canonical group-32 scales."""
+    """Return BF16 normalized rows, E4M3 codes and group-32 UE8M0 scales.
+
+    The scales are canonical ``[M, K/32]``, or with ``swizzled_scales`` the
+    1-D F8_128x4 layout ``mm(prepacked_scales=True)`` reads directly.
+    """
     if (
         x.ndim != 2
         or not x.is_cuda
@@ -1677,20 +1705,33 @@ def triton_rmsnorm_fp8_group32_ue8m0(
     m, k = x.shape
     normalized = torch.empty_like(x, memory_format=torch.contiguous_format)
     quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
-    scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
+    if swizzled_scales:
+        rows = triton.cdiv(m, 128) * 128
+        scales = torch.empty(
+            (rows * triton.cdiv(k, 128) * 4,), dtype=torch.uint8, device=x.device
+        )
+    else:
+        rows = m
+        scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
     if m:
-        _rmsnorm_fp8_group32_ue8m0[(m,)](
+        enable_pdl = pdl_enabled()
+        _rmsnorm_fp8_group32_ue8m0[(rows,)](
             x,
             weight,
             normalized,
             quantized,
             scales,
+            m,
             x.stride(0),
             k,
             eps,
             triton.next_power_of_2(k),
+            swizzled_scales,
+            triton.next_power_of_2(triton.cdiv(k, 128) * 4),
+            enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return normalized, quantized, scales
 
@@ -1794,7 +1835,11 @@ def _fp8_group32_ue8m0_quantize_swizzled(
     K: tl.constexpr,
     GROUPS: tl.constexpr,
     ZERO_BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid = tl.program_id(0).to(tl.int64)
     k_tiles = tl.cdiv(K, 128)
     if pid * GROUPS < M * (K // 32):
@@ -1854,6 +1899,7 @@ def _quantize_fp8_group32_swizzled(
         programs = max(
             triton.cdiv(m * (k // 32), groups), triton.cdiv(scale_count, zero_block)
         )
+        enable_pdl = pdl_enabled()
         kernel_launcher(_fp8_group32_ue8m0_quantize_swizzled, (programs,))(
             x,
             quantized,
@@ -1863,8 +1909,10 @@ def _quantize_fp8_group32_swizzled(
             k,
             groups,
             zero_block,
+            enable_pdl,
             num_warps=4,
             num_stages=1,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return quantized, scales
 

@@ -17,7 +17,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.model_config import _apply_block_spec_widths
+from tokenspeed.runtime.configs.model_config import (
+    ModelConfig,
+    _apply_block_spec_widths,
+)
+from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
@@ -34,9 +38,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
     resolve_speculative_num_tokens,
 )
-from tokenspeed.runtime.layers.attention.configs.mla import (
-    resolve_mla_kv_cache_dtype,
-)
+from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.transformer_model import (
@@ -80,21 +82,41 @@ def test_attention_query_width_matches_algorithm(
     assert resolve_speculative_num_tokens(args, is_draft) == expected
 
 
-def test_k3_dspark_draft_cache_stays_bf16_when_target_cache_is_fp8() -> None:
-    args = SimpleNamespace(kv_cache_dtype="fp8_e4m3", speculative_algorithm="DSPARK")
-    config = SimpleNamespace(hf_config=SimpleNamespace(model_type="k3_dspark"))
-    assert resolve_mla_kv_cache_dtype(args, config, is_draft=True) == torch.bfloat16
-    assert (
-        resolve_mla_kv_cache_dtype(args, config, is_draft=False) == torch.float8_e4m3fn
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"),
+    [
+        ("fp8", torch.float8_e4m3fn),
+        ("bfloat16", torch.bfloat16),
+        ("auto", torch.bfloat16),
+    ],
+)
+def test_k3_dspark_draft_cache_follows_target(tmp_path, cache_dtype, expected) -> None:
+    path = _write_config(tmp_path, model_type="k3_dspark")
+    args = ServerArgs(
+        model=path,
+        device="cpu",
+        dtype="bfloat16",
+        kv_cache_dtype=cache_dtype,
+        attention_backend="mla",
+        drafter_attention_backend="mla",
+        speculative_algorithm="DSPARK",
+        speculative_draft_model_path=path,
+        speculative_num_steps=7,
+        speculative_num_draft_tokens=8,
     )
-
-
-def test_other_mla_drafts_keep_the_requested_cache_dtype() -> None:
-    args = SimpleNamespace(kv_cache_dtype="fp8_e4m3", speculative_algorithm="DSPARK")
-    config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other"))
-    assert (
-        resolve_mla_kv_cache_dtype(args, config, is_draft=True) == torch.float8_e4m3fn
+    args.mapping.rank = 0
+    model = ModelConfig(
+        model_path=path,
+        trust_remote_code=False,
+        model_override_args="{}",
+        dtype=args.dtype,
+        context_length=4096,
+        is_draft_worker=True,
+        server_args=args,
     )
+    target = MLAConfig.generate(args, model, is_draft=False)
+    draft = MLAConfig.generate(args, model, is_draft=True)
+    assert target.kv_cache_dtype == draft.kv_cache_dtype == expected
 
 
 # --------------------------------------------------------------------------
@@ -533,11 +555,20 @@ def test_taps_shift_by_one_and_sort_for_positional_concat() -> None:
 
 
 class _TapLayer(nn.Module):
-    """Taps the residual stream entering it, then adds ``layer_id + 1``."""
+    """Taps the residual stream entering it, then adds ``layer_id + 1``; its
+    CommManager runs the stack's final norm, as every stack layer's does."""
 
     def __init__(self, config, layer_id, mapping, quant_config, prefix) -> None:
         super().__init__()
         self.increment = float(layer_id + 1)
+        self.comm_manager = CommManager(
+            mapping=mapping,
+            layer_id=layer_id,
+            is_moe=False,
+            prev_is_moe=False,
+            dense_batch_invariant=False,
+            query_sharded=False,
+        )
 
     def forward(self, positions, hidden_states, ctx, residual, aux_hidden_states):
         stream = hidden_states if residual is None else hidden_states + residual

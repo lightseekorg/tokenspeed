@@ -567,7 +567,83 @@ if platform.is_amd:
         output = _bmm_a16w16_impl(A, B, out_dtype, alpha=alpha, out=out)
         if output is not None:
             return output
+        return _torch_bmm_a16w16(A, B, out_dtype, alpha=alpha, out=out)
 
+    @register_kernel(
+        "gemm",
+        "bmm",
+        name="gluon_grouped_bmm_a16w16_decode_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_DENSE16_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Absorbed MLA q/v projections, K-major w_kc / w_vc; others use torch.bmm.
+            "batch": frozenset({12}),
+            "m": frozenset(range(1, 65)),
+            "n": frozenset({128, 512}),
+            "k": frozenset({128, 512}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_n_stride_one": frozenset({False}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "out_inner_stride_one": frozenset({True}),
+        },
+    )
+    def gluon_grouped_bmm_a16w16_decode_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``A @ B.T`` per batch entry as one grouped decode GEMM over the batch.
+
+        Fall back to torch.bmm for operands the grouped launch cannot take.
+        """
+        if A_scales is not None or B_scales is not None:
+            raise ValueError("dense16 Gluon BMM does not accept quantization scales")
+        if block_size is not None:
+            raise ValueError("dense16 Gluon BMM does not accept block_size")
+
+        x = A.transpose(0, 1)
+        batch, m, k = A.shape
+        n = B.shape[1]
+        if (
+            alpha is not None
+            or A.dtype != out_dtype
+            or B.dtype != A.dtype
+            or (out is not None and out.dtype != out_dtype)
+            or not B.is_contiguous()
+            or x.stride(0) % 8
+            or x.stride(1) % 8
+            or x.data_ptr() % 16
+            or not _supports_grouped_decode(m, batch, n, k)
+        ):
+            return _torch_bmm_a16w16(A, B, out_dtype, alpha=alpha, out=out)
+        counters = zeroed_state(
+            _grouped_decode_counters(m, batch, n, k), dtype=torch.int32, device=A.device
+        )
+        result = _grouped_decode_impl(
+            x,
+            B,
+            counters=counters,
+            quantize=False,
+            out=None if out is None else out.transpose(0, 1),
+        )
+        return result.transpose(0, 1) if out is None else out
+
+    def _torch_bmm_a16w16(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
         weight = B.transpose(1, 2)
         if out is not None and out_dtype == A.dtype:
             output = torch.bmm(A, weight, out=out)
@@ -1401,11 +1477,47 @@ if platform.is_amd:
     def gluon_linear_attnres_partials_gfx950(**kwargs):
         return _linear_attnres_partials_impl(**kwargs)
 
+    # 5-16 tokens reuse the decode GEMV tiles, matching the unfused path bit for bit.
+    @register_kernel(
+        "gemm",
+        "linear_attnres_partials",
+        name="gluon_linear_attnres_partials_gemv_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                    blocks=dense_tensor_format(torch.bfloat16),
+                    score_weight_a=dense_tensor_format(torch.bfloat16),
+                    score_weight_b=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "tokens": frozenset(range(5, 17)),
+            "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
+            "output_size": frozenset({KIMI3_QKVFAB_SIZE}),
+            "num_blocks": frozenset(range(1, 12)),
+            "inputs_contiguous": frozenset({True}),
+        },
+    )
+    def gluon_linear_attnres_partials_gemv_gfx950(**kwargs):
+        return _linear_attnres_partials_impl(**kwargs)
+
 else:
 
     def gluon_linear_attnres_partials_gfx950(**kwargs):
         raise ImportError(
             "gluon_linear_attnres_partials_gfx950 requires tokenspeed-kernel-amd"
+        )
+
+    def gluon_linear_attnres_partials_gemv_gfx950(**kwargs):
+        raise ImportError(
+            "gluon_linear_attnres_partials_gemv_gfx950 requires tokenspeed-kernel-amd"
         )
 
 
@@ -1526,5 +1638,6 @@ __all__ = [
     "gluon_grouped_bf16_projection_gfx1250",
     "gluon_grouped_bf16_projection_fp8_gfx1250",
     "gluon_linear_attnres_partials_gfx950",
+    "gluon_linear_attnres_partials_gemv_gfx950",
     "gluon_linear_attnres_partials_gfx1250",
 ]

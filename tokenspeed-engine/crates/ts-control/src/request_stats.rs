@@ -69,6 +69,19 @@ impl RequestTimings {
         }
     }
 
+    /// The lifecycle points and preemptions a trace carries, zero until
+    /// reached: scheduled, prefill done, first token, preemption count and
+    /// the seconds decode waited behind other requests' prefill.
+    pub fn trace_points(&self) -> (f64, f64, f64, i64, f64) {
+        (
+            self.scheduled,
+            self.prefill_done,
+            self.first_token,
+            self.preempt_count,
+            self.preempt_time,
+        )
+    }
+
     /// A decode step took `step` seconds; `prefilling_others` when other
     /// requests prefilled in it. Each run of such steps counts once.
     pub fn record_decode_step(&mut self, step: f64, prefilling_others: bool) {

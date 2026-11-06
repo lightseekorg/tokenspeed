@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +42,8 @@ class SkinnyGemmConfig:
 
 
 def _cutedsl_available() -> bool:
+    if importlib.util.find_spec("quack") is None:
+        return False
     try:
         import cutlass  # noqa: F401
         import cutlass.cute  # noqa: F401

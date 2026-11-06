@@ -331,6 +331,19 @@ mod ffi {
         cleanup_dropped_backup_keys: u64,
     }
 
+    /// Prefix-cache hits by tier, cumulative since start (`HostCacheStats`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct PrefixHitView {
+        /// Prompt tokens of every admitted request.
+        prompt_tokens: u64,
+        /// Tokens served from the Device prefix cache (L1).
+        device_hit_tokens: u64,
+        /// Tokens the Host loads (L2 including anything L3 supplied).
+        host_hit_tokens: u64,
+        /// Token spans of successful storage keys (L3), counted per cache group.
+        l3_hit_tokens: u64,
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     /// Snapshot in physical allocator units. The curve is a conservative
     /// fresh-request bound from the scheduler's own multi-group capacity model.
@@ -403,7 +416,7 @@ mod ffi {
         #[namespace = "tokenspeed"]
         type ExecutionPlan;
 
-        fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]);
+        fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]) -> Result<()>;
         fn next_execution_plan(scheduler: Pin<&mut Scheduler>) -> UniquePtr<ExecutionPlan>;
         fn advance(scheduler: Pin<&mut Scheduler>, events: &[ForwardEvent]) -> Result<()>;
         fn advance_head(
@@ -428,6 +441,7 @@ mod ffi {
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
+        fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
@@ -448,9 +462,9 @@ mod ffi {
 
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, RequestSpec, SchedulerAbortView,
-    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
-    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
+    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefixHitView, RequestSpec,
+    SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView,
+    StorageOpKind, StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -548,9 +562,10 @@ impl Scheduler {
         unsafe { self.raw.as_ref() }
     }
 
-    /// Queue requests for admission.
-    pub fn submit_requests(&mut self, specs: &[RequestSpec]) {
-        ffi::submit_requests(self.pinned(), specs);
+    /// Queue requests for admission. Validation errors reject the entire
+    /// batch without inserting any request.
+    pub fn submit_requests(&mut self, specs: &[RequestSpec]) -> Result<(), cxx::Exception> {
+        ffi::submit_requests(self.pinned(), specs)
     }
 
     /// Plan the next round.
@@ -634,6 +649,11 @@ impl Scheduler {
     /// The scheduler's storage observations.
     pub fn storage_stats(&self) -> StorageStatsView {
         ffi::storage_stats(self.get())
+    }
+
+    /// Cumulative prefix-cache hits by tier.
+    pub fn prefix_hit_stats(&self) -> PrefixHitView {
+        ffi::prefix_hit_stats(self.get())
     }
 
     /// The prefix-cache mutations since the last drain, in order; empty

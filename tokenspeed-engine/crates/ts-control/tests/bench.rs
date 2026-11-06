@@ -92,7 +92,15 @@ fn result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
 fn bench_commit_decode() {
     let bs = 256;
     let run = Duration::from_secs(2);
-    let mut p = OutputProcessor::new(None, 1, Some(1 << 24), Role::Plain, NO_FINISH_LOG);
+    let mut p = OutputProcessor::new(
+        None,
+        1,
+        Some(1 << 24),
+        Role::Plain,
+        NO_FINISH_LOG,
+        false,
+        None,
+    );
     let mut rids: Vec<String> = Vec::with_capacity(bs);
     for i in 0..bs {
         let rid = format!("r{i}");
@@ -410,6 +418,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             },
         },
         kv_total_pages: pages as i64,
+        kv_token_capacity: (pages * shape.page) as i64,
         ngram_context_len: 0,
         request_token_history: false,
         controls: ControlConfig {
@@ -451,6 +460,8 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             Some(1 << 24),
             Role::Plain,
             NO_FINISH_LOG,
+            false,
+            None,
         ),
         config,
         ranks,
@@ -512,6 +523,152 @@ fn bench_round_churn() {
             accepted: 1,
             warmup_rounds: 200,
             rounds: 2000,
+        },
+    );
+}
+
+/// [`bench_round_churn`]'s steady twin: the same 256 rows of 512-token
+/// prompts, no request finishing, so `churn` minus this is the cost of the
+/// four admissions and finishes a round.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_decode_short() {
+    bench_rounds(
+        "round, decode, 512",
+        RoundShape {
+            rows: 256,
+            prompt: 512,
+            page: 64,
+            generate: 0,
+            verify_width: 1,
+            accepted: 1,
+            warmup_rounds: 200,
+            rounds: 1000,
+        },
+    );
+}
+
+/// [`bench_round_churn`] under a burst of short requests: each request
+/// generates four tokens, so a quarter of the 256 rows finishes every round
+/// and 64 new requests are admitted beside decoding the rest. The admission
+/// rate, not the context, is what the round's cost tracks here.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_admit_burst() {
+    bench_rounds(
+        "round, admit burst",
+        RoundShape {
+            rows: 256,
+            prompt: 512,
+            page: 64,
+            generate: 4,
+            verify_width: 1,
+            accepted: 1,
+            warmup_rounds: 200,
+            rounds: 2000,
+        },
+    );
+}
+
+/// [`bench_round_admit_burst`] with long prompts: 8K tokens per request and
+/// eight admissions a round, so the part of admission that walks the prompt
+/// dominates and cannot hide behind the per-request fixed cost.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_admit_long() {
+    bench_rounds(
+        "round, admit long",
+        RoundShape {
+            rows: 64,
+            prompt: 8192,
+            page: 64,
+            generate: 8,
+            verify_width: 1,
+            accepted: 1,
+            warmup_rounds: 100,
+            rounds: 1000,
+        },
+    );
+}
+
+/// [`bench_round_admit_long`]'s steady twin: the same 64 rows of 8K-token
+/// prompts, no request finishing, so `admit_long` minus this is the cost of
+/// the eight admissions a round.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_decode_mid() {
+    bench_rounds(
+        "round, decode, 8K",
+        RoundShape {
+            rows: 64,
+            prompt: 8192,
+            page: 64,
+            generate: 0,
+            verify_width: 1,
+            accepted: 1,
+            warmup_rounds: 100,
+            rounds: 1000,
+        },
+    );
+}
+
+/// [`bench_round_admit_long`] with one 8K admission a round instead of eight:
+/// the same 8K prefill tokens a round, spread over one request, so the pair
+/// separates a per-request admission cost from a per-token one.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_prefill_long() {
+    bench_rounds(
+        "round, prefill 8K x1",
+        RoundShape {
+            rows: 64,
+            prompt: 8192,
+            page: 64,
+            generate: 64,
+            verify_width: 1,
+            accepted: 1,
+            warmup_rounds: 100,
+            rounds: 1000,
+        },
+    );
+}
+
+/// [`bench_round_prefill_long`]'s twin with 1K prompts: eight admissions a
+/// round, the same 8K prefill tokens a round, eight times the requests.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_prefill_short() {
+    bench_rounds(
+        "round, prefill 1K x8",
+        RoundShape {
+            rows: 64,
+            prompt: 1024,
+            page: 64,
+            generate: 8,
+            verify_width: 1,
+            accepted: 1,
+            warmup_rounds: 100,
+            rounds: 1000,
+        },
+    );
+}
+
+/// [`bench_round_prefill_short`]'s steady twin: 1K-token prompts, nothing
+/// finishing.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_decode_1k() {
+    bench_rounds(
+        "round, decode, 1K",
+        RoundShape {
+            rows: 64,
+            prompt: 1024,
+            page: 64,
+            generate: 0,
+            verify_width: 1,
+            accepted: 1,
+            warmup_rounds: 100,
+            rounds: 1000,
         },
     );
 }

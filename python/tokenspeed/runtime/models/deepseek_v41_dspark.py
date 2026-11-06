@@ -39,6 +39,8 @@ from types import SimpleNamespace
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
@@ -247,7 +249,11 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 f"{tuple(head.shape)} {head.dtype} for {hidden_states.dtype}."
             )
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-        if flat.is_cuda:
+        if flat.is_cuda and current_platform().is_cdna5:
+            logits = dsv4_linear_fp32(flat, head, override=None, solution=None)
+        elif flat.is_cuda:
+            # dsv4_linear_fp32's NVIDIA kernels are router GEMMs sized for
+            # expert counts, not a vocabulary shard.
             logits = torch.mm(flat, head.T, out_dtype=torch.float32)
         else:
             logits = flat.float() @ head.float().T

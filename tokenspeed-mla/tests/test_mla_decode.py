@@ -1442,19 +1442,25 @@ class TestGPU:
         )
 
     @pytest.mark.parametrize(
-        "case,variable_kv",
+        "case,variable_kv,min_split_kv",
         [
-            (_Case(1, 1024, 128, 1), False),
-            (_Case(1, 1024, 16, 4), False),
-            (_Case(4, 385, 96, 8), True),
-            (_Case(1, 16384, 96, 1), False),
-            (_Case(128, 128, 16, 4), False),
+            (_Case(1, 1024, 128, 1), False, 1),
+            (_Case(1, 1024, 16, 4), False, 1),
+            (_Case(4, 385, 96, 8), True, 1),
+            (_Case(1, 16384, 96, 1), False, 1),
+            (_Case(128, 128, 16, 4), False, 1),
+            # FP32 partials cross the 256 MiB bit-offset overflow boundary.
+            (_Case(64, 5, 64, 4), False, 8),
+            (_Case(64, 1024, 64, 4), True, 8),
+            (_Case(32, 8, 64, 8), False, 16),
         ],
         ids=lambda value: value.name if isinstance(value, _Case) else None,
     )
-    def test_bf16_decode_accuracy_and_cuda_graph(self, case, variable_kv):
+    def test_bf16_decode_accuracy_and_cuda_graph(self, case, variable_kv, min_split_kv):
         # BF16 partials are always acc_dtype; the fp16 flag is FP8-only.
-        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "bf16", False, 1), 180)
+        _run_gpu_check(
+            _check_decode_gpu, (case, variable_kv, "bf16", False, min_split_kv), 180
+        )
 
     def test_packed_q_outputs_lse_tails_and_folded_paths(self):
         _run_gpu_check(_check_packed_gpu, (), 600)

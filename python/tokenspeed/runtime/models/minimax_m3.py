@@ -29,7 +29,6 @@ from collections.abc import Iterable, Sequence
 import torch
 from tokenspeed_kernel.ops.attention.prologue import qk_norm_rope
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
@@ -42,10 +41,10 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SwigluOAI
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
+from tokenspeed.runtime.layers.dense.fp8 import prepare_fp8_linear_weight_scales
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -59,6 +58,7 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.moe.block import MoEBlock, MoEBlockFusion
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
@@ -75,8 +75,6 @@ from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
-from tokenspeed.runtime.models.base.comm_ops import FinalNormOp
-from tokenspeed.runtime.models.base.placement import ParallelGroup
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
@@ -88,12 +86,11 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
 )
 from tokenspeed.runtime.utils import add_prefix, make_layers
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 logger = logging.getLogger(__name__)
 
 
-class MiniMaxM3SparseMoeBlock(nn.Module):
+class MiniMaxM3SparseMoeBlock(MoEBlock):
     """MiniMax-M3 routed experts plus one unconditional shared expert."""
 
     _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
@@ -107,14 +104,12 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        super().__init__()
-        self.stream_fork = StreamFork(alt_stream)
         if mapping.moe.tp_ep_size > config.num_local_experts:
             raise ValueError(
                 f"MoE parallel size {mapping.moe.tp_ep_size} exceeds {config.num_local_experts} experts."
             )
 
-        self.gate = ReplicatedLinear(
+        gate = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=False,
@@ -122,12 +117,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             params_dtype=torch.float32,
             prefix=add_prefix("gate", prefix),
         )
-        self.use_dsv3_router_gemm = (
-            current_platform().is_hopper_plus
-            and self.gate.weight.dtype in (torch.bfloat16, torch.float32)
-            and config.hidden_size in self._DSV3_ROUTER_GEMM_HIDDEN
-        )
-        self.routing_bias = nn.Parameter(
+        routing_bias = nn.Parameter(
             torch.zeros(config.num_local_experts, dtype=torch.float32)
         )
 
@@ -136,10 +126,10 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             "topk_group": 1,
             "routed_scaling_factor": config.routed_scaling_factor,
             "normalize_topk_weights": True,
-            "correction_bias": self.routing_bias,
+            "correction_bias": routing_bias,
             "routing_method_type": RoutingMethodType.MiniMax2,
         }
-        self.experts = MoELayer(
+        experts = MoELayer(
             top_k=config.num_experts_per_tok,
             num_experts=config.num_local_experts,
             hidden_size=config.hidden_size,
@@ -158,18 +148,18 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             w13_input_layout="concatenated",
             routing_config=routing_config,
         )
-        self.topk = TopK(
+        topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
             use_grouped_topk=True,
             num_expert_group=1,
             topk_group=1,
-            correction_bias=self.routing_bias,
+            correction_bias=routing_bias,
             routed_scaling_factor=config.routed_scaling_factor,
-            output_format=self.experts.topk_output_format,
+            output_format=experts.topk_output_format,
         )
         # The routed+shared sum is reduced once over the MoE tp_ep group.
-        self.shared_experts = GatedMLP.tensor_parallel(
+        shared_experts = GatedMLP.tensor_parallel(
             hidden_size=config.hidden_size,
             intermediate_size=config.shared_intermediate_size,
             activation=SwigluOAI(config.swiglu_alpha, config.swiglu_limit),
@@ -181,65 +171,30 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
         )
+        super().__init__(
+            gate,
+            topk,
+            experts,
+            shared_experts,
+            alt_stream,
+            fusions=(MoEBlockFusion.FINALIZE_ADD_SHARED,),
+        )
+        self.routing_bias = routing_bias
+        self.use_dsv3_router_gemm = (
+            current_platform().is_hopper_plus
+            and gate.weight.dtype in (torch.bfloat16, torch.float32)
+            and config.hidden_size in self._DSV3_ROUTER_GEMM_HIDDEN
+        )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
-    ) -> torch.Tensor:
-        num_tokens = hidden_states.size(0)
-
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
-            if self.use_dsv3_router_gemm and num_tokens > 0:
-                router_logits = dsv3_router_gemm(
-                    hidden_states,
-                    self.gate.weight,
-                    out_dtype=torch.float32,
-                )
-            else:
-                router_logits, _ = self.gate(hidden_states.to(torch.float32))
-
-            if num_tokens > 0:
-                topk_output = self.topk(hidden_states, router_logits)
-            else:
-                topk_output = self.topk.empty_topk_output(
-                    hidden_states.device,
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                )
-
-            deferred_finalize = self.experts.supports_deferred_cuda_finalize
-            routed_output = self.experts(
-                hidden_states=hidden_states,
-                topk_output=topk_output,
-                num_global_tokens=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                do_finalize=not deferred_finalize,
+    def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_dsv3_router_gemm and hidden_states.shape[0] > 0:
+            return dsv3_router_gemm(
+                hidden_states,
+                self.gate.weight,
+                out_dtype=torch.float32,
             )
-
-            shared_output = None
-            with fork.branch():
-                if num_tokens > 0:
-                    shared_output = self.shared_experts(hidden_states)
-
-        if deferred_finalize:
-            gemm2_out, expert_weights, expanded_idx = routed_output
-            output = moe_finalize_fuse_shared(
-                gemm2_out,
-                expanded_idx,
-                expert_weights,
-                shared_output,
-                top_k=self.topk.topk_config.top_k,
-                hidden_dim=hidden_states.shape[-1],
-            )
-        else:
-            output = (
-                routed_output
-                if shared_output is None
-                else routed_output + shared_output
-            )
-        return output
+        router_logits, _ = self.gate(hidden_states.to(torch.float32))
+        return router_logits
 
 
 class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
@@ -628,7 +583,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.layer_id = layer_id
-        self.is_final_layer = layer_id == config.num_hidden_layers - 1
         self.is_moe_layer = config.mlp_layer_types[layer_id] == "sparse"
         previous_is_moe_layer = (
             layer_id > 0 and config.mlp_layer_types[layer_id - 1] == "sparse"
@@ -715,18 +669,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
-        # In all-reduce mode the model's FinalNormOp reduces the last layer's
-        # MLP output, fused with the norm or not, so this layer must not reduce
-        # it as well. Idle forwards skip the final norm and keep this collective.
-        defer_to_final_norm = (
-            self.is_final_layer
-            and not ctx.forward_mode.is_idle()
-            and self.comm_manager.use_all_reduce(self.is_moe_layer)
+        hidden_states, residual = self.comm_manager.post_mlp_fused(
+            hidden_states, residual, ctx
         )
-        if not defer_to_final_norm:
-            hidden_states, residual = self.comm_manager.post_mlp_fused(
-                hidden_states, residual, ctx
-            )
         return hidden_states, residual
 
 
@@ -771,21 +716,6 @@ class MiniMaxM3Model(BaseTransformerModel):
     ) -> None:
         super().__init__(config, mapping, quant_config, prefix)
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        last_layer = self.layers[-1]
-        group_type = (
-            ParallelGroup.MOE_TP_EP
-            if last_layer.is_moe_layer
-            else ParallelGroup.DENSE_TP
-        )
-        self._final_norm_op = FinalNormOp(
-            mapping=mapping,
-            group_type=group_type,
-            norm_module=self.norm,
-            use_all_reduce_mode=last_layer.comm_manager.use_all_reduce(
-                last_layer.is_moe_layer
-            ),
-            lm_head_group_type=ParallelGroup.ATTN_TP,
-        )
 
 
 class MiniMaxM3SparseForCausalLM(BaseCausalLM):
@@ -899,7 +829,19 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        self.post_load_weights()
         return loaded_params
+
+    def post_load_weights(self) -> None:
+        # MXFP8 linears read weight scales prepared once from the loaded ones;
+        # rebuild them in place after every complete load or weight update.
+        prepare_fp8_linear_weight_scales(self)
+
+    def post_quant_warmup(self) -> None:
+        # Every loader calls this once the loaded state is final. The sharded
+        # state loader post-processes modules before copying the saved state
+        # in, so scales prepared earlier are stale there.
+        self.post_load_weights()
 
     @classmethod
     def get_model_config_for_expert_location(

@@ -30,6 +30,7 @@ order of the startup steps -- not the shape of the production source.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from contextlib import nullcontext
@@ -58,8 +59,15 @@ from tokenspeed_kernel.selection import (  # noqa: E402
     kernel_override,
 )
 
+from tokenspeed.runtime.configs.model_config import ModelConfig  # noqa: E402
 from tokenspeed.runtime.execution import model_executor as executor_module  # noqa: E402
-from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
+from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
+    ModelExecutor,
+    ModelExecutorConfig,
+)
+from tokenspeed.runtime.execution.prefill_graph import (  # noqa: E402
+    get_prefill_token_buckets,
+)
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan  # noqa: E402
 from tokenspeed.runtime.execution.workspace import (  # noqa: E402
     reset_workspace_pools,
@@ -88,6 +96,128 @@ def _tap(monkeypatch, module, name, record):
 # ---------------------------------------------------------------------------
 # ModelExecutor.autotune doubles
 # ---------------------------------------------------------------------------
+
+
+def _role_config(
+    tmp_path,
+    *,
+    role,
+    attention_tp_size,
+    head_tp_size,
+    disabled,
+    disable_prefill_graph,
+    prefill_graph_max_tokens,
+):
+    """Resolve real startup configuration without loading weights or devices."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            dict(
+                model_type="qwen3",
+                architectures=["Qwen3ForCausalLM"],
+                torch_dtype="bfloat16",
+                vocab_size=128,
+                hidden_size=256,
+                intermediate_size=512,
+                num_hidden_layers=2,
+                num_attention_heads=16,
+                num_key_value_heads=8,
+                head_dim=16,
+                max_position_embeddings=256,
+            )
+        )
+    )
+    dp_size = 16 // attention_tp_size
+    args = ServerArgs(
+        model=str(tmp_path),
+        device="cpu",
+        dtype="bfloat16",
+        disaggregation_mode=role,
+        world_size=16,
+        nprocs_per_node=16,
+        attn_tp_size=attention_tp_size,
+        attn_head_tp_size=head_tp_size,
+        data_parallel_size=dp_size,
+        kv_parallel_size=1,
+        ep_size=16,
+        moe_tp_size=1,
+        lm_head_tp_size=8 if attention_tp_size == 1 else None,
+        max_num_seqs=8 * dp_size,
+        chunked_prefill_size=128,
+        max_total_tokens=256,
+        disable_autotune=disabled,
+        disable_prefill_graph=disable_prefill_graph,
+        prefill_graph_max_tokens=prefill_graph_max_tokens,
+        prefill_graph_capture_sizes=[16, 32, 64],
+        disable_pdl=True,
+        disable_kvstore=True,
+    )
+    args.mapping.rank = 0
+    model_config = ModelConfig(
+        str(tmp_path),
+        model_override_args="{}",
+        dtype="bfloat16",
+        server_args=args,
+    )
+    return ModelExecutorConfig.from_server_args(
+        args,
+        model_config,
+        torch.nn.Identity(),
+        max_req_pool_size=16,
+        gpu_id=0,
+        global_rank=0,
+        prefix_granularity=128,
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "attention_tp_size", "head_tp_size"),
+    [
+        ("decode", 1, None),
+        ("decode", 8, None),
+        ("decode", 1, 8),
+        ("prefill", 8, None),
+        ("null", 8, None),
+    ],
+)
+@pytest.mark.parametrize("disabled", [False, True])
+@pytest.mark.parametrize("disable_prefill_graph", [False, True])
+@pytest.mark.parametrize("prefill_graph_max_tokens", [None, 64])
+def test_engine_role_selects_warmup_and_prefill_buckets(
+    tmp_path,
+    role,
+    attention_tp_size,
+    head_tp_size,
+    disabled,
+    disable_prefill_graph,
+    prefill_graph_max_tokens,
+):
+    config = _role_config(
+        tmp_path,
+        role=role,
+        attention_tp_size=attention_tp_size,
+        head_tp_size=head_tp_size,
+        disabled=disabled,
+        disable_prefill_graph=disable_prefill_graph,
+        prefill_graph_max_tokens=prefill_graph_max_tokens,
+    )
+    assert config.attention_tp_size == attention_tp_size
+    assert config.data_parallel_size == 16 // attention_tp_size
+    assert config.decode_only_attention is (role == "decode")
+    assert config.prefill_only is (role == "prefill")
+    assert config.disable_autotune is disabled
+    if role == "decode":
+        assert config.prefill_graph_max_tokens == 0
+        assert get_prefill_token_buckets(config) == []
+    else:
+        assert config.prefill_graph_max_tokens == (
+            128 if prefill_graph_max_tokens is None else prefill_graph_max_tokens
+        )
+        expected = [16, 32, 64]
+        if prefill_graph_max_tokens is None:
+            expected.append(128)
+        assert get_prefill_token_buckets(config) == (
+            [] if disable_prefill_graph else expected
+        )
 
 
 @dataclass
@@ -408,10 +538,19 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize("disabled", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize(
+    ("attention_tp_size", "head_tp_size"), [(1, None), (8, None), (1, 8)]
+)
 def test_decode_only_attention_tunes_on_a_decode_step(
-    monkeypatch, tmp_path, speculative, disabled, failure
+    monkeypatch,
+    tmp_path,
+    speculative,
+    disabled,
+    failure,
+    attention_tp_size,
+    head_tp_size,
 ):
-    """Head TP serves decode rows only: no extend-shaped dummy is built; the
+    """A Decode worker serves decode rows only: no extend dummy is built; the
     traversal is one decode step at the largest batch, draft experts included."""
     events = []
 
@@ -436,10 +575,14 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         raise AssertionError("no extend inputs on a decode-only layout")
 
     executor = _AutotuneExecutor(
-        config=_AutotuneConfig(
-            autotune_cache_key={},
-            decode_only_attention=True,
-            disable_autotune=disabled,
+        config=_role_config(
+            tmp_path,
+            role="decode",
+            attention_tp_size=attention_tp_size,
+            head_tp_size=head_tp_size,
+            disabled=disabled,
+            disable_prefill_graph=False,
+            prefill_graph_max_tokens=64,
         ),
         forward=forward,
         input_buffers=_InputBuffersDouble(
@@ -457,6 +600,8 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         model_input_kwargs=no_extend_inputs,
         events=events,
     )
+    # No distributed group is initialized in these CPU-side policy tests.
+    monkeypatch.setattr(executor_module, "pg_manager", _ProcessGroupManagerDouble(None))
     monkeypatch.setattr(
         executor_module, "autotune_cache_path", lambda key: str(tmp_path / "cache.json")
     )

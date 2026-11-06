@@ -486,6 +486,9 @@ requested pull request. The generated `srun` steps name that variable in
 `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`. That pin and the
 in-tree package carry the same version, so pip keeps the wheel and an unreleased
 in-tree kernel change never runs.
+Tests of unreleased MLA implementation behavior, such as KV packing compilation
+reuse, import the in-tree package in a subprocess with an explicit `PYTHONPATH`.
+This keeps those checks independent of the installed wheel used by API tests.
 
 The job gets the node exclusively by default so another job cannot contend for
 its GPU or fixed service ports. Runtime cleanup is

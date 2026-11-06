@@ -30,6 +30,8 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     validate_k3_dspark_config,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.configs.base import block_draft_is_causal
+from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
 from tokenspeed.runtime.models import kimi_k3_dspark as dspark_model_module
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
 
@@ -149,6 +151,124 @@ def test_non_yarn_rope_yields_no_scaling() -> None:
     )
     assert config.rope_scaling_dict() is None
     assert config.resolved_rope_theta() == 10000.0
+
+
+# The published Inferact/Kimi-K3.1-Pro-DSpark-preview config.json.
+INFERACT_K31_CONFIG = {
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "bos_token_id": 163584,
+    "eos_token_id": 163586,
+    "head_dim": 64,
+    "hidden_act": "silu",
+    "hidden_size": 7168,
+    "initializer_range": 0.02,
+    "intermediate_size": 14336,
+    "kv_lora_rank": 512,
+    "layer_types": [
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+    ],
+    "num_attention_heads": 96,
+    "num_hidden_layers": 5,
+    "num_key_value_heads": 96,
+    "pad_token_id": 163839,
+    "q_lora_rank": 1536,
+    "qk_head_dim": 192,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "rms_norm_eps": 1e-05,
+    "rope_interleave": True,
+    "rope_parameters": {
+        "rope_type": "yarn",
+        "rope_theta": 1000000.0,
+        "factor": 32.0,
+        "original_max_position_embeddings": 32768,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "mscale_all_dim": 0.0,
+        "attn_factor": 0.7426255848312643,
+    },
+    "sliding_window": None,
+    "tie_word_embeddings": False,
+    "use_cache": True,
+    "use_sliding_window": False,
+    "v_head_dim": 128,
+    "vocab_size": 163840,
+    "architectures": ["K3DSparkModel"],
+    "model_type": "k3_dspark",
+    "max_position_embeddings": 1048576,
+    "rope_theta": 1000000.0,
+    "num_target_layers": 5,
+    "target_hidden_size": 7168,
+    "target_num_hidden_layers": 93,
+    "target_layer_ids": [75, 79, 83, 87, 91],
+    "mask_token_id": 163839,
+    "markov_rank": 512,
+    "markov_head_type": "vanilla",
+    "enable_confidence_head": True,
+    "confidence_head_with_markov": True,
+    "sample_from_anchor": True,
+    "block_size": 7,
+    "sliding_window_non_causal": False,
+    "full_attention_causal": True,
+    "dflash_config": {"causal": True},
+    "draft_vocab_size": 163840,
+    "torch_dtype": "bfloat16",
+}
+
+
+def test_k31_published_config_validates() -> None:
+    config = KimiK3DSparkConfig(**INFERACT_K31_CONFIG)
+    validate_k3_dspark_config(config)
+    assert config.qk_head_dim == 192
+    assert config.kv_latent_dim == 576
+
+
+def test_k31_block_attends_causally_and_k3_block_does_not() -> None:
+    assert block_draft_is_causal(KimiK3DSparkConfig(**INFERACT_K31_CONFIG))
+    assert not block_draft_is_causal(make_config())
+
+
+def test_block_causality_is_declared_by_is_causal_then_dflash_config() -> None:
+    config = SimpleNamespace(is_causal=False, dflash_config={"causal": True})
+    assert not block_draft_is_causal(config)
+    assert block_draft_is_causal(SimpleNamespace(dflash_config={"causal": True}))
+    # Sliding layers bound the window, not the block's causality (DFlash2).
+    sliding = SimpleNamespace(layer_types=["sliding_attention"] * 2)
+    assert not block_draft_is_causal(sliding)
+
+
+def test_k31_yarn_attn_factor_keeps_unit_rope_magnitude() -> None:
+    """K3.1 pairs mscale_all_dim 0 with attn_factor 0.743, so the cos/sin cache
+    is unscaled; dropping attn_factor would scale it by yarn_get_mscale(32)."""
+    scaling = KimiK3DSparkConfig(**INFERACT_K31_CONFIG).rope_scaling_dict()
+    assert scaling["attn_factor"] == pytest.approx(0.7426255848312643)
+    magnitude = (
+        yarn_get_mscale(scaling["factor"], scaling["mscale"])
+        / yarn_get_mscale(scaling["factor"], scaling["mscale_all_dim"])
+        * scaling["attn_factor"]
+    )
+    assert magnitude == pytest.approx(1.0, abs=1e-6)
+
+
+def test_k31_qk_head_dim_must_be_the_sum_of_its_parts() -> None:
+    with pytest.raises(ValueError, match="qk_head_dim=191"):
+        KimiK3DSparkConfig(**{**INFERACT_K31_CONFIG, "qk_head_dim": 191})
+
+
+def test_a_draft_rotating_half_split_rope_is_rejected() -> None:
+    with pytest.raises(ValueError, match="rope_interleave"):
+        KimiK3DSparkConfig(**{**INFERACT_K31_CONFIG, "rope_interleave": False})
+
+
+def test_a_draft_not_sampling_from_its_anchor_is_rejected() -> None:
+    with pytest.raises(ValueError, match="sample_from_anchor"):
+        KimiK3DSparkConfig(**{**INFERACT_K31_CONFIG, "sample_from_anchor": False})
 
 
 # --------------------------------------------------------------------------

@@ -33,6 +33,8 @@ from tokenspeed_kernel.platform import current_platform
 ATTNRES_WORLD_SIZE = 8
 ATTNRES_HIDDEN_SIZE = 7168
 ATTNRES_MAX_ROWS = 16
+# Rows the reduced-row epilogue serves after a Lamport all-reduce.
+ATTNRES_EPILOGUE_MAX_ROWS = 32
 _NUM_SUBGROUPS = 16
 _ELEMENTS_PER_THREAD = 8
 
@@ -46,6 +48,7 @@ def attnres_supported(
     *,
     world_size: int,
     device: torch.device,
+    max_rows: int = ATTNRES_MAX_ROWS,
 ) -> bool:
     """Check the fused tensor contract without allocating a state."""
     m, s, acc = scratch
@@ -55,7 +58,7 @@ def attnres_supported(
         current_platform().is_cdna4
         and world_size == ATTNRES_WORLD_SIZE
         and partial.is_cuda
-        and 0 < rows <= ATTNRES_MAX_ROWS
+        and 0 < rows <= max_rows
         and partial.shape == residual.shape == acc.shape == (rows, hidden)
         and score_weight.shape == output_weight.shape == (hidden,)
         and m.shape == s.shape == (rows,)
@@ -163,6 +166,129 @@ class IrisAttnResState:
             WAIT_VMEM=self._arch.wait_vmem,
         )
         return hidden, residual_out
+
+    def epilogue(
+        self,
+        reduced: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Finish ``run`` from an already reduced BF16 partial, bit for bit."""
+        assert attnres_supported(
+            reduced,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            world_size=self.world_size,
+            device=self.device,
+            max_rows=ATTNRES_EPILOGUE_MAX_ROWS,
+        )
+        assert eps > 0.0
+        m, s_, acc = scratch
+        hidden = torch.empty_like(reduced)
+        residual_out = torch.empty_like(residual)
+        iris_k3attn_attnres_rows[(reduced.shape[0],)](
+            reduced,
+            residual,
+            score_weight,
+            output_weight,
+            m,
+            s_,
+            acc,
+            hidden,
+            residual_out,
+            HIDDEN=ATTNRES_HIDDEN_SIZE,
+            BLOCK=triton.next_power_of_2(ATTNRES_HIDDEN_SIZE),
+            EPS=eps,
+            ELEMENTS_PER_THREAD=_ELEMENTS_PER_THREAD,
+            NUM_WARPS=_NUM_SUBGROUPS,
+            SUBGROUP_SIZE=64,
+            num_warps=_NUM_SUBGROUPS,
+        )
+        return hidden, residual_out
+
+
+@gluon.jit
+def iris_k3attn_attnres_rows(
+    reduced_ptr,
+    residual_ptr,
+    score_weight_ptr,
+    output_weight_ptr,
+    scratch_m_ptr,
+    scratch_s_ptr,
+    scratch_acc_ptr,
+    hidden_ptr,
+    residual_out_ptr,
+    HIDDEN: gl.constexpr,
+    BLOCK: gl.constexpr,
+    EPS: gl.constexpr,
+    ELEMENTS_PER_THREAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    SUBGROUP_SIZE: gl.constexpr,
+):
+    """``iris_k3attn_push_oneshot``'s epilogue for one row of a BF16 reduction.
+
+    The same operations as ``_iris_attnres_epilogue``, with every operand
+    loaded up front: none depends on the reduction.
+    """
+    row = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [ELEMENTS_PER_THREAD], [SUBGROUP_SIZE], [NUM_WARPS], [0]
+    )
+    element = gl.arange(0, BLOCK, layout=layout)
+    mask = element < HIDDEN
+    row_offsets = (row * HIDDEN + element).to(gl.int32)
+    weight_offsets = element.to(gl.int32)
+    reduced = gl.amd.cdna4.buffer_load(reduced_ptr, row_offsets, mask=mask, other=0.0)
+    residual = gl.amd.cdna4.buffer_load(residual_ptr, row_offsets, mask=mask, other=0.0)
+    score_weight = gl.amd.cdna4.buffer_load(
+        score_weight_ptr, weight_offsets, mask=mask, other=0.0
+    )
+    block_acc = gl.amd.cdna4.buffer_load(
+        scratch_acc_ptr, row_offsets, mask=mask, other=0.0
+    )
+    output_weight = gl.amd.cdna4.buffer_load(
+        output_weight_ptr, weight_offsets, mask=mask, other=0.0
+    )
+    block_m = gl.load(scratch_m_ptr + row)
+    block_s = gl.load(scratch_s_ptr + row)
+    prefix = (reduced.to(gl.float32) + residual.to(gl.float32)).to(gl.bfloat16)
+    gl.amd.cdna4.buffer_store(
+        prefix.to(residual_out_ptr.dtype.element_ty),
+        residual_out_ptr,
+        row_offsets,
+        mask=mask,
+    )
+    prefix = prefix.to(gl.float32)
+    square_sum = gl.sum(gl.where(mask, prefix * prefix, 0.0), axis=0)
+    dot = gl.sum(gl.where(mask, prefix * score_weight.to(gl.float32), 0.0), axis=0)
+    prefix_logit = dot * gl.rsqrt(square_sum / HIDDEN + EPS)
+    maximum = gl.maximum(block_m, prefix_logit)
+    block_correction = gl.exp(block_m - maximum)
+    prefix_weight = gl.exp(prefix_logit - maximum)
+    inverse_sum = 1.0 / (block_s * block_correction + prefix_weight)
+    mixed = (
+        (
+            (block_acc.to(gl.float32) * block_correction + prefix_weight * prefix)
+            * inverse_sum
+        )
+        .to(gl.bfloat16)
+        .to(gl.float32)
+    )
+    output_square_sum = gl.sum(gl.where(mask, mixed * mixed, 0.0), axis=0)
+    inverse_rms = gl.rsqrt(output_square_sum / HIDDEN + EPS)
+    gl.amd.cdna4.buffer_store(
+        (mixed * inverse_rms * output_weight.to(gl.float32)).to(
+            hidden_ptr.dtype.element_ty
+        ),
+        hidden_ptr,
+        row_offsets,
+        mask=mask,
+    )
 
 
 @gluon.jit

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MegaMoE input staging widens int32 router ids into its int64 buffer."""
+"""MegaMoE input staging: UE8M0 FP8 hidden states and widened router ids."""
 
 import pytest
 import torch
@@ -28,8 +28,10 @@ if not is_nvidia():
     pytest.skip("NVIDIA GPU required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (  # noqa: E402
+    _stage_mxfp4_mega_moe_inputs_kernel,
     stage_mxfp4_mega_moe_inputs,
 )
+from utils import assert_no_triton_compile  # noqa: E402
 
 
 def _stage(hidden, weights, ids):
@@ -40,7 +42,7 @@ def _stage(hidden, weights, ids):
         torch.full((tokens, ids.shape[1]), -1, device="cuda", dtype=torch.int64),
         torch.empty(tokens, ids.shape[1], device="cuda", dtype=torch.float32),
     )
-    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out)
+    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, None, None)
     return out
 
 
@@ -56,3 +58,142 @@ def test_int32_ids_stage_like_int64_ids(tokens):
     assert torch.equal(narrow[2], ids.long())
     for got, want in zip(narrow, wide):
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+def _reference(hidden, weights, ids):
+    """Group-32 UE8M0 FP8 codes and per-128-column packed exponents."""
+    tokens, size = hidden.shape
+    groups = hidden.float().view(tokens, size // 32, 32)
+    amax = groups.abs().amax(-1).clamp_min(1.0e-4)
+    bits = (amax / 448.0).view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()
+    exponent = exponent.clamp(1, 254)
+    scale = (exponent << 23).view(torch.float32)
+    codes = (groups * (1.0 / scale)[..., None]).view(tokens, size)
+    packed = (
+        exponent.view(tokens, size // 128, 4).long()
+        << torch.arange(0, 32, 8, device=hidden.device)
+    ).sum(-1)
+    # Four bytes reinterpreted as one int32 word.
+    packed = torch.where(packed >= 2**31, packed - 2**32, packed)
+    return (
+        codes.to(torch.float8_e4m3fn),
+        packed.to(torch.int32),
+        ids.long(),
+        weights,
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 37, 63, 64, 65, 255, 1023, 1024, 1500])
+@pytest.mark.parametrize("size", [512, 5120])
+def test_stage_matches_reference(tokens, size):
+    torch.manual_seed(tokens * size)
+    hidden = torch.randn(tokens, size, device="cuda", dtype=torch.bfloat16)
+    hidden[0, :32] = 0.0
+    hidden[-1, 32:64] = 1.0e-7
+    weights = torch.rand(tokens, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (tokens, 6), device="cuda", dtype=torch.int32)
+
+    for got, want in zip(
+        _stage(hidden, weights, ids), _reference(hidden, weights, ids)
+    ):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+def test_stage_token_count_does_not_recompile():
+    hidden = torch.randn(2048, 512, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(2048, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (2048, 6), device="cuda", dtype=torch.int32)
+    for tokens in (1, 64, 1024):
+        _stage(hidden[:tokens], weights[:tokens], ids[:tokens])
+    with assert_no_triton_compile(_stage_mxfp4_mega_moe_inputs_kernel):
+        for tokens in (2, 17, 63, 65, 200, 1023, 1025, 2048):
+            _stage(hidden[:tokens], weights[:tokens], ids[:tokens])
+
+
+def test_stage_reads_rows_past_int32_offsets():
+    # Two rows 2**31 elements apart: the second row's offset needs int64.
+    stride = 2**31
+    base = torch.zeros(stride + 128, device="cuda", dtype=torch.bfloat16)
+    hidden = base.as_strided((2, 128), (stride, 1))
+    hidden[1].copy_(torch.randn(128, device="cuda", dtype=torch.bfloat16))
+    weights = torch.rand(2, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (2, 6), device="cuda", dtype=torch.int32)
+
+    got = _stage(hidden, weights, ids)
+    want = _reference(hidden.contiguous(), weights, ids)
+    for a, b in zip(got, want):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _shared_rows(tokens, block_m):
+    """Rows of the shared expert's MN-major scales: grouped by BLOCK_M, UTCCP within 128."""
+    rows = []
+    aligned = (block_m + 127) // 128 * 128
+    for token in range(tokens):
+        m = token % block_m
+        rows.append(
+            token // block_m * aligned + m // 128 * 128 + m % 32 * 4 + m % 128 // 32
+        )
+    return torch.tensor(rows, device="cuda")
+
+
+def _shared_scales(size):
+    """A shared-expert scale buffer, MN-major like DeepGEMM's, filled with a sentinel.
+
+    Its row count is fixed, as the symmetric buffer's is, so its stride is too.
+    """
+    return torch.full((size // 128, 1024), -1, device="cuda", dtype=torch.int32).t()
+
+
+@pytest.mark.parametrize("tokens,block_m", [(1, 16), (37, 16), (200, 64), (300, 192)])
+def test_shared_scales_land_in_block_m_rows(tokens, block_m):
+    torch.manual_seed(tokens + block_m)
+    hidden = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(tokens, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (tokens, 6), device="cuda", dtype=torch.int32)
+    plain = _stage(hidden, weights, ids)
+    shared = _shared_scales(512)
+    out = (
+        torch.empty_like(plain[0]),
+        torch.empty_like(plain[1]),
+        torch.empty_like(plain[2]),
+        torch.empty_like(plain[3]),
+    )
+    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, shared, block_m)
+
+    for got, want in zip(out, plain):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    rows = _shared_rows(tokens, block_m)
+    assert torch.equal(shared[rows], plain[1])
+    untouched = torch.ones(shared.shape[0], dtype=torch.bool, device="cuda")
+    untouched[rows] = False
+    assert (shared[untouched] == -1).all()
+
+
+def test_shared_block_m_does_not_recompile():
+    hidden = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(512, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (512, 6), device="cuda", dtype=torch.int32)
+
+    def stage(tokens, block_m):
+        out = (
+            torch.empty(tokens, 512, device="cuda", dtype=torch.float8_e4m3fn),
+            torch.empty(tokens, 4, device="cuda", dtype=torch.int32),
+            torch.empty(tokens, 6, device="cuda", dtype=torch.int64),
+            torch.empty(tokens, 6, device="cuda", dtype=torch.float32),
+        )
+        stage_mxfp4_mega_moe_inputs(
+            hidden[:tokens],
+            weights[:tokens],
+            ids[:tokens],
+            *out,
+            _shared_scales(512),
+            block_m,
+        )
+
+    for tokens in (1, 64, 300):
+        stage(tokens, 16)
+    with assert_no_triton_compile(_stage_mxfp4_mega_moe_inputs_kernel):
+        for tokens, block_m in ((2, 32), (65, 48), (300, 192), (512, 128)):
+            stage(tokens, block_m)

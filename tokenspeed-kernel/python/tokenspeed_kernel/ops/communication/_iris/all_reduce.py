@@ -808,19 +808,16 @@ def _iris_wait_lamport_peers(
 
 
 @gluon.jit
-def iris_lamport_allreduce(
-    input_sym_ptr,
+def _iris_lamport_exchange_tile(
+    local,
     region_sym_ptr,
     output_ptr,
     epochs,
-    region_0,
-    region_1,
-    region_2,
-    region_3,
-    region_4,
-    region_5,
-    region_6,
-    region_7,
+    regions,
+    generation,
+    pack,
+    offsets,
+    mask,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     TOTAL_ELEMENTS: gl.constexpr,
@@ -828,38 +825,13 @@ def iris_lamport_allreduce(
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
-    """All-reduce BF16 tiles across eight ranks using data as the ready signal.
+    """Push this rank's sanitized BF16 tile, reduce every rank's, and retire it.
 
-    Push input_sym_ptr into each peer's rotating mailbox and wait until the
-    local mailbox contains every peer's contribution. Sum in FP32 rank order
-    and write BF16 output_ptr. Clear consumed mailboxes and advance the tile's
-    counter; negative zero is replaced with zero to preserve the empty marker.
+    Sum in FP32 rank order and write BF16 output_ptr. Clear the consumed
+    mailboxes and advance the tile's counter.
     """
-    gl.static_assert(WORLD_SIZE == 8)
-    gl.static_assert(TOTAL_ELEMENTS % 512 == 0)
-    gl.static_assert(TOTAL_ELEMENTS <= MAX_ELEMENTS)
-    gl.static_assert(NUM_STAGES >= 3)
-    layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
-    pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
-    element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
-    offsets = pack[:, None] * 8 + element[None, :]
-    mask = offsets < TOTAL_ELEMENTS
-    generation = (
-        gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
-    )
+    layout: gl.constexpr = local.type.layout
     stride: gl.constexpr = WORLD_SIZE * MAX_ELEMENTS
-    local = gl.amd.cdna4.buffer_load(input_sym_ptr, offsets, mask=mask, other=0.0)
-    local = _iris_sanitize_lamport_bf16(local)
-    regions = (
-        region_0,
-        region_1,
-        region_2,
-        region_3,
-        region_4,
-        region_5,
-        region_6,
-        region_7,
-    )
     published = ()
     for _ in gl.static_range(1, WORLD_SIZE):
         published += (local,)
@@ -913,6 +885,75 @@ def iris_lamport_allreduce(
         )
     gl.barrier()
     gl.store(epochs + gl.program_id(0), ((generation + 1) % NUM_STAGES).to(gl.int32))
+
+
+@gluon.jit
+def iris_lamport_allreduce(
+    input_sym_ptr,
+    region_sym_ptr,
+    output_ptr,
+    epochs,
+    region_0,
+    region_1,
+    region_2,
+    region_3,
+    region_4,
+    region_5,
+    region_6,
+    region_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    TOTAL_ELEMENTS: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """All-reduce BF16 tiles across eight ranks using data as the ready signal.
+
+    Push input_sym_ptr into each peer's rotating mailbox and wait until the
+    local mailbox contains every peer's contribution. Sum in FP32 rank order
+    and write BF16 output_ptr. Clear consumed mailboxes and advance the tile's
+    counter; negative zero is replaced with zero to preserve the empty marker.
+    """
+    gl.static_assert(WORLD_SIZE == 8)
+    gl.static_assert(TOTAL_ELEMENTS % 512 == 0)
+    gl.static_assert(TOTAL_ELEMENTS <= MAX_ELEMENTS)
+    gl.static_assert(NUM_STAGES >= 3)
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
+    pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
+    element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
+    offsets = pack[:, None] * 8 + element[None, :]
+    mask = offsets < TOTAL_ELEMENTS
+    generation = (
+        gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
+    )
+    local = gl.amd.cdna4.buffer_load(input_sym_ptr, offsets, mask=mask, other=0.0)
+    _iris_lamport_exchange_tile(
+        _iris_sanitize_lamport_bf16(local),
+        region_sym_ptr,
+        output_ptr,
+        epochs,
+        (
+            region_0,
+            region_1,
+            region_2,
+            region_3,
+            region_4,
+            region_5,
+            region_6,
+            region_7,
+        ),
+        generation,
+        pack,
+        offsets,
+        mask,
+        RANK,
+        WORLD_SIZE,
+        TOTAL_ELEMENTS,
+        MAX_ELEMENTS,
+        NUM_STAGES,
+        PEER_SIGNAL_STORE_CACHE,
+    )
 
 
 @gluon.jit
@@ -1663,6 +1704,7 @@ def iris_pull_oneshot_rmsnorm(
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     EPS: tl.constexpr,
+    PEER_LOAD_HINT: tl.constexpr = None,
 ):
     """All-reduce each row, add its residual, and apply weighted RMSNorm.
 
@@ -1690,8 +1732,57 @@ def iris_pull_oneshot_rmsnorm(
             heap_bases,
             mask=mask,
             other=0.0,
+            hint=PEER_LOAD_HINT,
         ).to(tl.float32)
 
+    residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
+    residual_out = acc + residual
+
+    res_out_dtype = residual_out_ptr.type.element_ty
+    tl.store(
+        residual_out_ptr + row_offsets,
+        residual_out.to(res_out_dtype),
+        mask=mask,
+    )
+
+    variance = tl.sum(residual_out * residual_out, axis=0) / HIDDEN_SIZE
+    scale = tl.rsqrt(variance + EPS)
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    norm = residual_out * scale * weight
+
+    norm_dtype = norm_out_ptr.type.element_ty
+    tl.store(
+        norm_out_ptr + row_offsets,
+        norm.to(norm_dtype),
+        mask=mask,
+    )
+
+
+@triton.jit
+def iris_residual_rmsnorm_rows(
+    reduced_ptr,  # local FP32 (M, HIDDEN_SIZE) all-reduced rows
+    residual_ptr,  # local (M, HIDDEN_SIZE)
+    weight_ptr,  # local (HIDDEN_SIZE,)
+    norm_out_ptr,  # local (M, HIDDEN_SIZE)
+    residual_out_ptr,  # local (M, HIDDEN_SIZE)
+    M,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """``iris_pull_oneshot_rmsnorm``'s residual add and norm of reduced rows.
+
+    With the same launch shape, rows match that kernel bit for bit when
+    reduced_ptr holds its FP32 rank-order sum.
+    """
+    row = tl.program_id(0)
+    if row >= M:
+        return
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < HIDDEN_SIZE
+    row_offsets = row * HIDDEN_SIZE + offsets
+    acc = tl.load(reduced_ptr + row_offsets, mask=mask, other=0.0)
     residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
     residual_out = acc + residual
 
@@ -1731,6 +1822,7 @@ def iris_pull_oneshot_rmsnorm_persistent(
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     EPS: tl.constexpr,
+    PEER_LOAD_HINT: tl.constexpr = None,
 ):
     """Process several all-reduce/residual/RMSNorm rows per workgroup.
 
@@ -1763,6 +1855,7 @@ def iris_pull_oneshot_rmsnorm_persistent(
                 heap_bases,
                 mask=mask,
                 other=0.0,
+                hint=PEER_LOAD_HINT,
             ).to(tl.float32)
 
         residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
@@ -2108,13 +2201,15 @@ def iris_lamport_bf16_allreduce(
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    OUTPUT_FP32: gl.constexpr = False,
 ):
     """All-reduce BF16 tiles across the group using rotating sentinel mailboxes.
 
     Push input_sym_ptr to the peer addresses in regions, wait for incoming data
     in region_sym_ptr, and write a rank-ordered FP32 sum rounded to BF16 at
-    output_ptr. Clear consumed mailboxes and advance epochs for each tile.
-    Replace negative zero with zero so data cannot match the empty marker.
+    output_ptr, or with ``OUTPUT_FP32`` the unrounded sum. Clear consumed
+    mailboxes and advance epochs for each tile. Replace negative zero with zero
+    so data cannot match the empty marker.
     """
     gl.static_assert(WORLD_SIZE == 4 or WORLD_SIZE == 8)
     gl.static_assert(MAX_ELEMENTS % 512 == 0)
@@ -2165,9 +2260,12 @@ def iris_lamport_bf16_allreduce(
             accumulator = term.to(gl.float32)
         else:
             accumulator += term.to(gl.float32)
-    gl.amd.cdna4.buffer_store(
-        accumulator.to(gl.bfloat16), output_ptr, offsets, mask=mask
-    )
+    if OUTPUT_FP32:
+        gl.amd.cdna4.buffer_store(accumulator, output_ptr, offsets, mask=mask)
+    else:
+        gl.amd.cdna4.buffer_store(
+            accumulator.to(gl.bfloat16), output_ptr, offsets, mask=mask
+        )
 
     # Clear only this tile's consumed generation. Skipped tiles keep their
     # own epochs, so mixed row counts need no global counter or tail clearing.
@@ -2186,55 +2284,28 @@ def iris_lamport_bf16_allreduce(
     gl.store(epochs + gl.program_id(0), ((generation + 1) % NUM_STAGES).to(gl.int32))
 
 
-@gluon.jit(do_not_specialize=["total_elements"])
-def iris_lamport_twoshot_bf16_allreduce(
-    input_ptr,
+@gluon.jit
+def _iris_lamport_twoshot_tile(
+    chunks,
     region_sym_ptr,
     output_ptr,
     epochs,
     regions,
+    offsets,
+    shard,
+    stage,
+    layout: gl.constexpr,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    total_elements,
     MAX_SHARD_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
-    """Reduce-scatter then all-gather BF16 through sentinel mailboxes.
-
-    Each rank owns one contiguous 1/WORLD_SIZE shard of input_ptr. Program t
-    pushes tile t of every peer's shard to that peer, sums its own shard tile in
-    FP32 rank order, rounds once to BF16, and pushes the result to every peer.
-    regions are the peers' region_sym_ptr addresses. A region holds
-    [stage][reduce-scatter, all-gather][source rank][MAX_SHARD_ELEMENTS]
-    mailboxes, indexed by program, so epochs[t] belongs to program t for every
-    payload size. Negative zero becomes zero in inputs and in reduced values,
-    which every rank receives from the shard owner.
-    """
-    gl.static_assert(WORLD_SIZE == 8)
-    # One subgroup of 4-byte packs per program spreads pushes over more CUs.
-    VECTOR: gl.constexpr = 2
-    TILE: gl.constexpr = 64 * VECTOR
-    gl.static_assert(MAX_SHARD_ELEMENTS % TILE == 0)
-    gl.static_assert(NUM_STAGES >= 3)
-    layout: gl.constexpr = gl.BlockedLayout([1, VECTOR], [64, 1], [1, 1], [0, 1])
-    pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
-    element = gl.arange(0, VECTOR, layout=gl.SliceLayout(0, layout))
-    offsets = pack[:, None] * VECTOR + element[None, :]
-    total_elements = gl.multiple_of(total_elements, WORLD_SIZE * TILE)
-    shard = gl.multiple_of(total_elements // WORLD_SIZE, TILE)
-    stage = gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
+    """The two-shot exchange of one program's tiles once ``chunks[delta]``
+    holds this rank's tile of shard ``(RANK + delta) % WORLD_SIZE``,
+    sanitized."""
     PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
     slots = stage * (2 * PHASE)
-    # chunks[delta] is this rank's tile of shard (RANK + delta) % WORLD_SIZE.
-    chunks = ()
-    for delta in gl.static_range(WORLD_SIZE):
-        owner = (RANK + delta) % WORLD_SIZE
-        chunks += (
-            _iris_sanitize_lamport_bf16(
-                gl.amd.cdna4.buffer_load(input_ptr + owner * shard, offsets)
-            ),
-        )
     _iris_lamport_push(
         chunks[1:],
         regions,
@@ -2313,6 +2384,71 @@ def iris_lamport_twoshot_bf16_allreduce(
     # Order the sentinel restores before this program's stage advance.
     gl.barrier()
     gl.store(epochs + gl.program_id(0), ((stage + 1) % NUM_STAGES).to(gl.int32))
+
+
+@gluon.jit(do_not_specialize=["total_elements"])
+def iris_lamport_twoshot_bf16_allreduce(
+    input_ptr,
+    region_sym_ptr,
+    output_ptr,
+    epochs,
+    regions,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    total_elements,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Reduce-scatter then all-gather BF16 through sentinel mailboxes.
+
+    Each rank owns one contiguous 1/WORLD_SIZE shard of input_ptr. Program t
+    pushes tile t of every peer's shard to that peer, sums its own shard tile in
+    FP32 rank order, rounds once to BF16, and pushes the result to every peer.
+    regions are the peers' region_sym_ptr addresses. A region holds
+    [stage][reduce-scatter, all-gather][source rank][MAX_SHARD_ELEMENTS]
+    mailboxes, indexed by program, so epochs[t] belongs to program t for every
+    payload size. Negative zero becomes zero in inputs and in reduced values,
+    which every rank receives from the shard owner.
+    """
+    gl.static_assert(WORLD_SIZE == 8)
+    # One subgroup of 4-byte packs per program spreads pushes over more CUs.
+    VECTOR: gl.constexpr = 2
+    TILE: gl.constexpr = 64 * VECTOR
+    gl.static_assert(MAX_SHARD_ELEMENTS % TILE == 0)
+    gl.static_assert(NUM_STAGES >= 3)
+    layout: gl.constexpr = gl.BlockedLayout([1, VECTOR], [64, 1], [1, 1], [0, 1])
+    pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
+    element = gl.arange(0, VECTOR, layout=gl.SliceLayout(0, layout))
+    offsets = pack[:, None] * VECTOR + element[None, :]
+    total_elements = gl.multiple_of(total_elements, WORLD_SIZE * TILE)
+    shard = gl.multiple_of(total_elements // WORLD_SIZE, TILE)
+    stage = gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
+    # chunks[delta] is this rank's tile of shard (RANK + delta) % WORLD_SIZE.
+    chunks = ()
+    for delta in gl.static_range(WORLD_SIZE):
+        owner = (RANK + delta) % WORLD_SIZE
+        chunks += (
+            _iris_sanitize_lamport_bf16(
+                gl.amd.cdna4.buffer_load(input_ptr + owner * shard, offsets)
+            ),
+        )
+    _iris_lamport_twoshot_tile(
+        chunks,
+        region_sym_ptr,
+        output_ptr,
+        epochs,
+        regions,
+        offsets,
+        shard,
+        stage,
+        layout,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        NUM_STAGES,
+        PEER_SIGNAL_STORE_CACHE,
+    )
 
 
 @gluon.jit(do_not_specialize=["numel"])

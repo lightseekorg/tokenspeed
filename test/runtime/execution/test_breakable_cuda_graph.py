@@ -800,6 +800,7 @@ class TestPrefillGraphMaxTokensResolution:
     @staticmethod
     def _args(**overrides):
         base = dict(
+            disaggregation_mode="null",
             prefill_graph_max_tokens=None,
             chunked_prefill_size=8192,
             max_total_tokens=None,

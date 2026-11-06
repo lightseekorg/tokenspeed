@@ -40,10 +40,13 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import gl, gluon, libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.gdn import (
+    GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES,
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
+    GdnChainVerifyForm,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
     GdnStateCheckpoints,
+    gdn_chain_verify_form,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -72,7 +75,9 @@ from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     fused_qkv_split_gdn_prefill,
     pack_gdn_projection,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
+    ArchVersion,
     CapabilityRequirement,
     current_platform,
     pdl_enabled,
@@ -82,6 +87,22 @@ from tokenspeed_kernel.signature import format_signatures
 
 # The payload stores take ptxas to 172 registers, a CTA per SM fewer; 168 keeps three CTAs.
 _TREE_VERIFY_REPLAY_MAX_REGISTERS = 168
+
+
+# Process-wide cache of the constant chain ancestor bitmasks, keyed by device
+# and batch geometry, so they are built once instead of on every verify call.
+_CHAIN_ANCESTORS: dict[tuple[torch.device, int, int], torch.Tensor] = {}
+
+
+def _chain_ancestors(q: torch.Tensor) -> torch.Tensor:
+    batch, tokens = q.shape[:2]
+    key = (q.device, batch, tokens)
+    ancestors = _CHAIN_ANCESTORS.get(key)
+    if ancestors is None:
+        steps = torch.arange(tokens, device=q.device, dtype=torch.int64)
+        ancestors = ((1 << (steps + 1)) - 1).repeat(batch, 1)
+        _CHAIN_ANCESTORS[key] = ancestors
+    return ancestors
 
 
 @register_kernel(
@@ -470,12 +491,14 @@ def _launch_fused_gdn_decode_update(
     intermediate_states_buffer: torch.Tensor | None,
     per_token_output_state_indices: torch.Tensor | None,
     tree_ancestors: torch.Tensor | None,
+    compile_only: bool,
 ) -> torch.Tensor:
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
     [B, T, HV]; initial_state is the K-last [pool_size, HV, V, K] SSM state
     pool (the shared runtime contract -- see module docstring); output_state
     is the K-last pool the output-state indices address (None: initial_state).
+    ``compile_only`` prepares the specialization without launching it.
     """
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
@@ -500,7 +523,7 @@ def _launch_fused_gdn_decode_update(
     assert NK == 1, "NK > 1 is not supported yet"
 
     grid = (NK, NV, B * HV)
-    _fused_gdn_decode_update_kernel[grid](
+    arguments = dict(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -543,6 +566,10 @@ def _launch_fused_gdn_decode_update(
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
+    if compile_only:
+        _fused_gdn_decode_update_kernel.warmup(**arguments, grid=grid)
+    else:
+        _fused_gdn_decode_update_kernel[grid](**arguments)
     return o
 
 
@@ -556,7 +583,10 @@ def _launch_fused_gdn_decode_update(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
-    traits={"strided_qkv": frozenset({False, True})},
+    traits={
+        "strided_qkv": frozenset({False, True}),
+        "padding_safe": frozenset({False, True}),
+    },
 )
 def triton_gdn_decode_step(
     q: torch.Tensor,
@@ -596,6 +626,7 @@ def triton_gdn_decode_step(
         intermediate_states_buffer=None,
         per_token_output_state_indices=None,
         tree_ancestors=None,
+        compile_only=False,
     )
 
 
@@ -809,6 +840,7 @@ def _launch_gdn_tree_verify_chunked(
     use_qk_l2norm: bool,
     tree_ancestors: torch.Tensor,
     replay_payload: torch.Tensor | None,
+    compile_only: bool,
 ) -> torch.Tensor:
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
@@ -832,7 +864,7 @@ def _launch_gdn_tree_verify_chunked(
     if BV >= 32 and triton.cdiv(V, BV // 2) * B * HV <= 2 * current_platform().sm_count:
         BV //= 2
     T_BLOCK = triton.next_power_of_2(GDN_TREE_VERIFY_CHUNKED_MAX_NODES)
-    _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](
+    arguments = dict(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -875,6 +907,17 @@ def _launch_gdn_tree_verify_chunked(
             else {}
         ),
     )
+    if compile_only or is_warming_up():
+        # Include the wide and half-width tiles reachable at later batches.
+        tiles = {min(triton.next_power_of_2(V), width) for width in (64, 128)}
+        tiles |= {tile // 2 for tile in tiles if tile >= 32}
+        for tile in sorted(tiles):
+            _gdn_tree_verify_chunked_kernel.warmup(
+                **{**arguments, "BV": tile},
+                grid=(triton.cdiv(V, tile), B * HV),
+            )
+    if not compile_only:
+        _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](**arguments)
     return o
 
 
@@ -889,6 +932,8 @@ def _launch_gdn_tree_verify_chunked(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "tree": frozenset({False, True}),
+        "padding_safe": frozenset({False, True}),
         "separate_output_state": frozenset({False, True}),
         "strided_qkv": frozenset({False, True}),
     },
@@ -921,6 +966,68 @@ def triton_gdn_decode_mtp(
     ``replay_payload``, the others step by step.
     """
     if (
+        tree_ancestors is None
+        and disable_state_update
+        and intermediate_states_buffer is None
+        and output_state_indices is None
+        and output_state is None
+    ):
+        form = gdn_chain_verify_form(
+            q.shape[1], q.shape[0] * v.shape[2], initial_state.dtype, chain_form=False
+        )
+        if (
+            is_warming_up()
+            and form is GdnChainVerifyForm.STEP
+            and gdn_chain_verify_form(
+                q.shape[1],
+                GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES,
+                initial_state.dtype,
+                chain_form=False,
+            )
+            is GdnChainVerifyForm.TREE
+        ):
+            _launch_gdn_tree_verify_chunked(
+                q,
+                k,
+                v,
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                b=b,
+                initial_state=initial_state,
+                initial_state_indices=initial_state_indices,
+                scale=scale,
+                use_qk_l2norm=use_qk_l2norm,
+                # Compile-only warmup needs the mask's pointer type, not its data.
+                tree_ancestors=torch.empty(1, dtype=torch.int64, device=q.device),
+                replay_payload=replay_payload,
+                compile_only=True,
+            )
+        if form is GdnChainVerifyForm.TREE:
+            if is_warming_up() and replay_payload is None:
+                # A smaller serving batch can select the step form instead.
+                _launch_fused_gdn_decode_update(
+                    q,
+                    k,
+                    v,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    initial_state=initial_state,
+                    initial_state_indices=initial_state_indices,
+                    output_state=None,
+                    scale=scale,
+                    use_qk_l2norm=use_qk_l2norm,
+                    disable_state_update=True,
+                    output_state_indices=None,
+                    intermediate_states_buffer=None,
+                    per_token_output_state_indices=None,
+                    tree_ancestors=None,
+                    compile_only=True,
+                )
+            tree_ancestors = _chain_ancestors(q)
+    if (
         tree_ancestors is not None
         and output_state_indices is None
         and intermediate_states_buffer is None
@@ -939,6 +1046,7 @@ def triton_gdn_decode_mtp(
             use_qk_l2norm=use_qk_l2norm,
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
+            compile_only=False,
         )
     if replay_payload is not None:
         raise ValueError("only a chunked ReplaySSM tree verify fills replay_payload")
@@ -960,6 +1068,84 @@ def triton_gdn_decode_mtp(
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
         tree_ancestors=tree_ancestors,
+        compile_only=False,
+    )
+
+
+@register_kernel(
+    "attention",
+    "gdn_decode_mtp",
+    name="triton_gdn_decode_mtp_chain",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 7),
+    ),
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.SPECIALIZED + 1,
+    traits={
+        "chunked_chain": frozenset({True}),
+        "verify_tokens": frozenset(range(2, 17)),
+        "output_only": frozenset({True}),
+        "tree": frozenset({False}),
+        "replay_payload": frozenset({False}),
+        "strided_qkv": frozenset({False, True}),
+        "separate_output_state": frozenset({False}),
+    },
+)
+def triton_gdn_decode_mtp_chain(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None,
+    disable_state_update: bool,
+    use_qk_l2norm: bool,
+    intermediate_states_buffer: torch.Tensor | None,
+    output_state_indices: torch.Tensor | None,
+    output_state: torch.Tensor | None,
+    tree_ancestors: torch.Tensor | None,
+    replay_payload: torch.Tensor | None,
+) -> torch.Tensor:
+    """Chunked chain candidate for the common MTP output-only contract.
+
+    Tensor arguments and scaling follow ``gdn_decode_mtp``. State updates must
+    be disabled; intermediate states, output destinations, tree masks and a
+    replay-payload destination must be absent. Returns ``[B, T, HV, V]`` in
+    the query dtype without writing the committed state.
+    """
+    if not disable_state_update or any(
+        x is not None
+        for x in (
+            intermediate_states_buffer,
+            output_state_indices,
+            output_state,
+            tree_ancestors,
+            replay_payload,
+        )
+    ):
+        raise ValueError("the chunked chain kernel requires output-only chains")
+    return launch_gdn_chain_verify(
+        q,
+        k,
+        v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm,
     )
 
 

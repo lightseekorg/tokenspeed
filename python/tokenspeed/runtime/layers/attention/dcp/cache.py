@@ -303,8 +303,7 @@ def plan_prefix_history_gather(
     chunk_kv_indices_list: Sequence[torch.Tensor],
     *,
     page_table_cpu: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
-    chunk_len: int,
+    chunk_bounds_cpu: torch.Tensor,
     page_size: int,
     placement: CachePlacement,
 ) -> tuple[PrefixHistoryWindow, ...]:
@@ -321,19 +320,18 @@ def plan_prefix_history_gather(
             order (``chunk.get_chunks_paged``), identical on every rank.
         page_table_cpu: ``[requests, columns]`` host kernel-page table of the
             extend requests.
-        prefix_lens_cpu: ``[requests]`` host cached-prefix lengths.
-        chunk_len: Prefix rows every request contributes to one loop.
+        chunk_bounds_cpu: ``[loops + 1, requests]`` host prefix positions.
         page_size: Tokens per kernel page.
         placement: The MLA history group's page ownership.
 
     Returns:
         The windows, in loop order.
     """
+    if chunk_bounds_cpu.shape[0] != len(chunk_kv_indices_list) + 1:
+        raise ValueError("prefix boundaries must delimit every history loop")
     counts = owned_prefix_chunk_rows(
         page_table_cpu,
-        prefix_lens_cpu,
-        chunk_len=chunk_len,
-        num_chunks=len(chunk_kv_indices_list),
+        chunk_bounds_cpu,
         page_size=page_size,
         placement=placement,
     )
@@ -419,8 +417,7 @@ class PrefixHistoryGather:
         # once the first read planned them.
         self._chunk_kv_indices_list: Sequence[torch.Tensor] = ()
         self._page_table_cpu: torch.Tensor | None = None
-        self._prefix_lens_cpu: torch.Tensor | None = None
-        self._chunk_len = 0
+        self._chunk_bounds_cpu: torch.Tensor | None = None
         self._windows: tuple[PrefixHistoryWindow, ...] | None = None
         self._launched: dict[tuple[int, int], _LaunchedGather] = {}
         # Ascending ids of the layers sharing this history, learned from the
@@ -441,8 +438,7 @@ class PrefixHistoryGather:
         chunk_kv_indices_list: Sequence[torch.Tensor],
         *,
         page_table_cpu: torch.Tensor | None,
-        prefix_lens_cpu: torch.Tensor,
-        chunk_len: int,
+        chunk_bounds_cpu: torch.Tensor,
     ) -> None:
         """Record a forward's prefix-chunk loops; plans nothing yet.
 
@@ -452,8 +448,7 @@ class PrefixHistoryGather:
                 every rank.
             page_table_cpu: ``[requests, columns]`` host kernel-page table of
                 the extend requests; required when there are loops.
-            prefix_lens_cpu: ``[requests]`` host cached-prefix lengths.
-            chunk_len: Prefix rows every request contributes to one loop.
+            chunk_bounds_cpu: ``[loops + 1, requests]`` host prefix positions.
         """
         # A forward that stopped before draining its reads leaves gathers in
         # flight; the current stream waits on them before they are dropped.
@@ -467,8 +462,7 @@ class PrefixHistoryGather:
             )
         self._chunk_kv_indices_list = chunk_kv_indices_list
         self._page_table_cpu = page_table_cpu
-        self._prefix_lens_cpu = prefix_lens_cpu
-        self._chunk_len = chunk_len
+        self._chunk_bounds_cpu = chunk_bounds_cpu
         # A forward without prefix loops has nothing to gather.
         self._windows = None if chunk_kv_indices_list else ()
 
@@ -480,8 +474,7 @@ class PrefixHistoryGather:
             self._windows = plan_prefix_history_gather(
                 self._chunk_kv_indices_list,
                 page_table_cpu=self._page_table_cpu,
-                prefix_lens_cpu=self._prefix_lens_cpu,
-                chunk_len=self._chunk_len,
+                chunk_bounds_cpu=self._chunk_bounds_cpu,
                 page_size=self._page_size,
                 placement=self._placement,
             )

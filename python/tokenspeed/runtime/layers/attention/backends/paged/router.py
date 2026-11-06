@@ -696,9 +696,11 @@ class CacheGroupRouter(AttentionBackend):
         expands the device tables), so a leaf that gathers history by page
         owner can split the gather without a device sync. A page-sharded
         group's leaf gets the mirror for an extend with a prefix too, to split
-        its prefix-chunk gathers the same way. Bounded native prefill also uses
-        it for cold batches to keep the receive pages within the scheduler's
-        budget; other forwards read nothing from the mirror.
+        its prefix-chunk gathers the same way, and for any pure extend, to
+        bound the pages each rank owns (the DSA leaf's owned-width index
+        tiles). Bounded native prefill also uses it for cold batches to keep
+        the receive pages within the scheduler's budget; other forwards read
+        nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
@@ -744,7 +746,10 @@ class CacheGroupRouter(AttentionBackend):
                 page_table_cpu=(
                     self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
                     if sharded
-                    or (extend_with_prefix and gid in self._page_sharded_groups)
+                    or (
+                        gid in self._page_sharded_groups
+                        and (extend_with_prefix or forward_mode.is_extend())
+                    )
                     or (num_extends > 0 and leaf.prefill_needs_host_page_table)
                     else None
                 ),
@@ -1176,6 +1181,11 @@ class CacheGroupRouter(AttentionBackend):
         return self._sole_leaf("gather_history_index_k").gather_history_index_k(
             layer_id, token_to_kv_pool, group
         )
+
+    # DSA KVP prefill: top-k over KVP pages tiles by the leaf's planned owned width.
+
+    def prefill_index_columns(self) -> int | None:
+        return self._sole_leaf("prefill_index_columns").prefill_index_columns()
 
     # ------------------------------------------------------------------
     # DSA KPool surface (GLM-5.3-Flash): the model drives the leaf's pooled

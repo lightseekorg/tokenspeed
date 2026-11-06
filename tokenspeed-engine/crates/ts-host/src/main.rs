@@ -173,6 +173,41 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
     })
 }
 
+/// Load once at startup; Python is called only by the background exporter.
+fn trace_provider(config: &Bound<'_, PyAny>) -> PyResult<Option<ts_control::trace::TraceProvider>> {
+    let callback = config.getattr("trace_provider")?;
+    if callback.is_none() {
+        return Ok(None);
+    }
+    if !callback.is_callable() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "trace provider must be callable",
+        ));
+    }
+    let callback = callback.unbind();
+    Ok(Some(Arc::new(move |rid| {
+        Python::attach(|py| {
+            match callback
+                .call1(py, (rid,))
+                .and_then(|value| value.extract::<Option<(String, Option<String>)>>(py))
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(%error, "trace provider failed; retaining native context");
+                    None
+                }
+            }
+        })
+    })))
+}
+
+/// OTLP tracing as the Python server args carry it.
+struct TraceConfig {
+    endpoint: String,
+    sample_ratio: f64,
+    provider: Option<ts_control::trace::TraceProvider>,
+}
+
 /// What `rust_host.HostConfig` carries.
 struct HostConfig {
     handshake_address: String,
@@ -186,6 +221,8 @@ struct HostConfig {
     request_token_history: bool,
     physical_context_len: i64,
     kv_total_pages: i64,
+    /// Effective token capacity of the usable KV pool.
+    kv_token_capacity: i64,
     rank: usize,
     replica_ranks: Vec<usize>,
     pp_ranks: Option<Vec<usize>>,
@@ -195,6 +232,8 @@ struct HostConfig {
     metrics: Metrics,
     batch_log: BatchLogConfig,
     finish_log: FinishLog,
+    /// OTLP tracing: the endpoint and sample ratio, when tracing is on.
+    trace: Option<TraceConfig>,
     /// The scheduler records KV cache events.
     kv_events: bool,
     /// Where this rank publishes them, if it does.
@@ -401,6 +440,7 @@ impl HostConfig {
             request_token_history: config.getattr("request_token_history")?.extract()?,
             physical_context_len: config.getattr("physical_context_len")?.extract()?,
             kv_total_pages: config.getattr("kv_total_pages")?.extract()?,
+            kv_token_capacity: config.getattr("kv_token_capacity")?.extract()?,
             rank: config.getattr("rank")?.extract()?,
             replica_ranks: config.getattr("replica_ranks")?.extract()?,
             pp_ranks: config.getattr("pp_ranks")?.extract()?,
@@ -445,6 +485,17 @@ impl HostConfig {
             finish_log: FinishLog {
                 enabled: config.getattr("finish_log")?.extract()?,
                 request_stats: config.getattr("log_request_stats")?.extract()?,
+            },
+            trace: match config
+                .getattr("otlp_traces_endpoint")?
+                .extract::<Option<String>>()?
+            {
+                Some(endpoint) => Some(TraceConfig {
+                    endpoint,
+                    sample_ratio: config.getattr("trace_sample_ratio")?.extract()?,
+                    provider: trace_provider(config)?,
+                }),
+                None => None,
             },
             kv_events: config.getattr("kv_events")?.extract()?,
             kv_events_publisher: {
@@ -625,17 +676,48 @@ fn serve(args: &Args) -> Result<(), HostError> {
     }
     let data_plane =
         PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
+    let metrics = exporter
+        .as_ref()
+        .filter(|_| config.metrics.engine)
+        .map(|exporter| EngineMetrics::new(exporter, &config.metrics.labels));
+    let trace = config
+        .trace
+        .as_ref()
+        .filter(|trace| {
+            if trace.sample_ratio <= 0.0 {
+                tracing::warn!(
+                    endpoint = %trace.endpoint,
+                    "--otlp-traces-endpoint without --trace-sample-ratio traces nothing"
+                );
+            }
+            trace.sample_ratio > 0.0
+        })
+        .and_then(|trace| {
+            // The reporting rank alone traces: the finish line's rank, so a
+            // replicated engine exports one span per request, not one per rank.
+            (config.finish_log.enabled).then(|| {
+                ts_control::trace::TracePublisher::new(
+                    trace.endpoint.clone(),
+                    trace.sample_ratio,
+                    config.metrics.labels.model_name.clone(),
+                    trace.provider.clone(),
+                )
+            })
+        });
     let outputs = OutputProcessor::new(
         config.spec_num_tokens,
         config.stream_interval,
         Some(config.physical_context_len),
         role,
         config.finish_log,
+        metrics.is_some(),
+        trace,
     );
     let loop_config = LoopConfig {
         in_flight_depth: config.in_flight_depth,
         limits: config.limits,
         kv_total_pages: config.kv_total_pages,
+        kv_token_capacity: config.kv_token_capacity,
         ngram_context_len: config.ngram_context_len,
         request_token_history: config.request_token_history,
         controls: config.controls.clone(),
@@ -653,10 +735,6 @@ fn serve(args: &Args) -> Result<(), HostError> {
         in_flight_depth = config.in_flight_depth,
         "serving"
     );
-    let metrics = exporter
-        .as_ref()
-        .filter(|_| config.metrics.engine)
-        .map(|exporter| EngineMetrics::new(exporter, &config.metrics.labels));
     // The L3 tier's executor connects its store before serving starts.
     let l3 = config.l3.as_ref().map(ts_l3::Settings::start).transpose()?;
     let grammars = config
@@ -744,6 +822,45 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::parse_args;
+
+    #[test]
+    fn python_trace_provider_loads_and_falls_back_on_error() {
+        use pyo3::{prelude::*, types::PyModule};
+        use std::ffi::CString;
+        Python::initialize();
+        Python::attach(|py| {
+            let code = CString::new(
+                r#"
+def resolve(rid):
+    if rid == 'error': raise ValueError('bad context')
+    if rid == 'none': return None
+    if rid == 'wrong': return 123
+    if rid == 'root': return ('1' * 32, None)
+    return ('1' * 32, '2' * 16)
+trace_provider = resolve
+"#,
+            )
+            .unwrap();
+            let module =
+                PyModule::from_code(py, &code, c"ts_context_test.py", c"ts_context_test").unwrap();
+            let modules = py.import("sys").unwrap().getattr("modules").unwrap();
+            modules.set_item("ts_context_test", &module).unwrap();
+            let provider = super::trace_provider(module.as_any()).unwrap().unwrap();
+            assert_eq!(
+                provider("valid"),
+                Some(("1".repeat(32), Some("2".repeat(16))))
+            );
+            assert_eq!(provider("root"), Some(("1".repeat(32), None)));
+            assert_eq!(provider("none"), None);
+            assert_eq!(provider("error"), None);
+            assert_eq!(provider("wrong"), None);
+            module.setattr("trace_provider", 123).unwrap();
+            assert!(super::trace_provider(module.as_any()).is_err());
+            module.setattr("trace_provider", py.None()).unwrap();
+            assert!(super::trace_provider(module.as_any()).unwrap().is_none());
+            modules.del_item("ts_context_test").unwrap();
+        });
+    }
 
     #[test]
     fn logging_mode_is_explicit_and_validated() {

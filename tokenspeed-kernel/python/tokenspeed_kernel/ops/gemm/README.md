@@ -110,3 +110,23 @@ converts canonical FP32 1x128 activation and 128x128 weight scales to the
 required layout without UE8M0 rounding. Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported
 forced calls fail explicitly. It does not claim batch-invariant numerics.
+
+## Grouped FP8 projection
+
+`grouped_fp8_projection` computes `einsum('tgk,gnk->tgn')` from E4M3
+activations and weights that both carry one UE8M0 scale per 32 K channels
+(DeepSeek V4.1's grouped `wo_a`). `prepare_grouped_fp8_projection` re-lays the
+canonical `[groups * N, K / 32]` weight scales out once for the serving kernel
+and returns None where no kernel serves the weights, so callers keep their
+dequantized BF16 path. `has_grouped_fp8_projection` answers the same question
+from the device and shape alone, before any weight is loaded. The DeepGEMM
+kernel (SM100/SM103) takes activation scales packed four per int32, MN-major
+and TMA-aligned, which is what `dsv41.rope_quantize_fp8_grouped` writes.
+`grouped_fp8_projection_quantize_fp8` instead writes E4M3 codes of the
+BF16-rounded result with packed scales in that same layout, which
+`fp8_projection` (a dense E4M3 GEMM, `prepare_fp8_projection` for its weight
+scales) reads directly, so no quantization kernel runs between the two.
+
+DeepGEMM picks a tile configuration from the token count (one per 16 tokens)
+and JIT-compiles each on first use. `warmup_fp8_projections` launches every
+configuration up to a token bound at startup so serving never compiles.

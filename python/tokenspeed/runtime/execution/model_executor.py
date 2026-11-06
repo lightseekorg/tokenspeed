@@ -193,11 +193,15 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 8192
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
     """Largest prefill-graph bucket: explicit value, or min(8192, chunk, kv budget).
 
-    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
-    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
-    receive counts come back to the host, and a host sync cannot be captured.
+    Returns 0 on a disaggregated Decode worker, which never executes Prefill,
+    or when the MoE all-to-all backend is DeepEP: an extend-shaped forward
+    takes DeepEP's normal dispatch, whose per-expert receive counts come back
+    to the host, and a host sync cannot be captured.
     """
-    if server_args.all2all_backend == "deepep":
+    if (
+        server_args.disaggregation_mode == "decode"
+        or server_args.all2all_backend == "deepep"
+    ):
         return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
@@ -390,9 +394,8 @@ class ModelExecutorConfig:
     # it never runs a decode/verify step of its own, so the decode graph is
     # never captured there while the prefill graph keeps its ordinary gating.
     prefill_only: bool
-    # The mirror image: an attention layout that serves decode rows only
-    # (head TP under attention DP), so startup never runs an extend-shaped
-    # dummy forward and tunes on a decode-shaped one instead.
+    # The mirror image: a disaggregated Decode worker, including ordinary
+    # TP and attention DP, never executes Prefill. Startup warms Decode.
     decode_only_attention: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
@@ -527,7 +530,7 @@ class ModelExecutorConfig:
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
-            decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
+            decode_only_attention=server_args.disaggregation_mode == "decode",
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             enable_memory_saver=server_args.enable_memory_saver,
@@ -1056,8 +1059,8 @@ class ModelExecutor:
         ib = self.input_buffers
         # The one traversal that discovers each operator is shaped like the
         # forwards this engine runs: an extend over the prefill budget, or,
-        # for an attention layout that serves decode rows only (head TP), a
-        # decode step at the largest batch -- the shape capture records later.
+        # on a disaggregated Decode worker, a decode step at the largest batch
+        # -- the shape capture records later.
         decode_only = self.config.decode_only_attention
         if decode_only:
             num_tokens = (
@@ -1117,7 +1120,7 @@ class ModelExecutor:
                     batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
                 )
                 if decode_only:
-                    # No extend forward exists on this layout; the decode step
+                    # This role never runs an extend forward; the decode step
                     # reaches the target and, through the speculative forward,
                     # the draft.
                     if self.drafter is not None:
@@ -2320,11 +2323,14 @@ class ModelExecutor:
                     contract=self._cache_runtime_contract,
                     num_requests=bs,
                     validate_page_ids=self._validate_page_ids,
+                    # Only an extend plans from host tables.
+                    host_tables=num_extends > 0,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
-                block_tables_cpu = dict(
-                    cache_metadata.tables_cpu(active_forward_op=forward_op)
-                )
+                if num_extends > 0:
+                    block_tables_cpu = dict(
+                        cache_metadata.tables_cpu(active_forward_op=forward_op)
+                    )
             # What the batch fixes on its own is staged while a pending round still drafts.
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,

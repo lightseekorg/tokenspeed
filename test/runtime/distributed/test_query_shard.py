@@ -215,10 +215,7 @@ def test_sharded_models_read_their_rows_from_tensors_not_the_chunk_count():
     """``ctx.input_num_tokens`` is the scheduler's whole chunk; a model under
     query context parallelism sizes its rows from its tensors or
     ``ctx.query_shard``. Only collective sizing may read the chunk count."""
-    allowed = {
-        RUNTIME / "distributed" / "comm_manager.py",
-        RUNTIME / "models" / "base" / "comm_ops.py",
-    }
+    allowed = {RUNTIME / "distributed" / "comm_manager.py"}
     for path in (
         RUNTIME / "models" / "longcat_flash.py",
         RUNTIME / "models" / "base" / "causal_lm.py",

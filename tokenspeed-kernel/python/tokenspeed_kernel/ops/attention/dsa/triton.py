@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
+    merge_packed_index_candidates,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -237,17 +240,15 @@ def _dsa_packed_kv_kernel(
 
 
 @triton.jit
-def _dsa_dense_kv_kernel(
+def _dsa_dense_kv_attend(
     q,
+    rows,
+    head_mask,
     kv,
     topk_indices,
     topk_lens,
-    out,
-    partial_out,
-    partial_lse,
-    lse,
-    RETURN_LSE: tl.constexpr,
-    num_heads: tl.constexpr,
+    token,
+    split,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
     qk_rope_head_dim: tl.constexpr,
@@ -262,11 +263,7 @@ def _dsa_dense_kv_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_ROPE: tl.constexpr,
 ):
-    token = tl.program_id(0).to(tl.int64)
-    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-    split = tl.program_id(2)
-    head_mask = heads < num_heads
-    rows = token * num_heads + heads
+    # One online-softmax core, so every caller computes identical (acc, m_i, l_i).
     dims = tl.arange(0, kv_lora_rank)
 
     q_nope = tl.load(
@@ -327,7 +324,63 @@ def _dsa_dense_kv_kernel(
         m_i, l_i, acc = _dsa_softmax_update(
             scores, valid, latent, m_i, l_i, acc, softmax_scale
         )
+    return acc, m_i, l_i
 
+
+@triton.jit
+def _dsa_dense_kv_kernel(
+    q,
+    kv,
+    topk_indices,
+    topk_lens,
+    out,
+    partial_out,
+    partial_lse,
+    lse,
+    RETURN_LSE: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    kv_lora_rank: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,
+    page_stride,
+    token_stride,
+    channel_stride,
+    PAGE_SIZE: tl.constexpr,
+    topk: tl.constexpr,
+    softmax_scale,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    split = tl.program_id(2)
+    head_mask = heads < num_heads
+    rows = token * num_heads + heads
+    acc, m_i, l_i = _dsa_dense_kv_attend(
+        q,
+        rows,
+        head_mask,
+        kv,
+        topk_indices,
+        topk_lens,
+        token,
+        split,
+        head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        page_stride,
+        token_stride,
+        channel_stride,
+        PAGE_SIZE,
+        topk,
+        softmax_scale,
+        NUM_SPLITS,
+        BLOCK_H,
+        BLOCK_N,
+        BLOCK_ROPE,
+    )
     _dsa_store_output(
         out,
         partial_out,
@@ -342,6 +395,79 @@ def _dsa_dense_kv_kernel(
         split,
         kv_lora_rank,
         NUM_SPLITS,
+    )
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
+def _dsa_dense_kv_dcp_records_kernel(
+    q,
+    kv,
+    topk_indices,
+    topk_lens,
+    record_values,
+    record_lse,
+    num_tokens,
+    num_heads: tl.constexpr,
+    GROUP_HEADS: tl.constexpr,
+    head_dim: tl.constexpr,
+    kv_lora_rank: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,
+    page_stride,
+    token_stride,
+    channel_stride,
+    PAGE_SIZE: tl.constexpr,
+    topk: tl.constexpr,
+    softmax_scale,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+):
+    # Head h of token t: [h // GROUP_HEADS, t, h % GROUP_HEADS] in query and records.
+    token = tl.program_id(0).to(tl.int64)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    split = tl.program_id(2)
+    head_mask = heads < num_heads
+    rows = (
+        (heads // GROUP_HEADS).to(tl.int64) * (num_tokens * GROUP_HEADS)
+        + token * GROUP_HEADS
+        + heads % GROUP_HEADS
+    )
+    acc, m_i, l_i = _dsa_dense_kv_attend(
+        q,
+        rows,
+        head_mask,
+        kv,
+        topk_indices,
+        topk_lens,
+        token,
+        split,
+        head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        page_stride,
+        token_stride,
+        channel_stride,
+        PAGE_SIZE,
+        topk,
+        softmax_scale,
+        1,
+        BLOCK_H,
+        BLOCK_N,
+        BLOCK_ROPE,
+    )
+    # Record: kv_lora_rank / 2 BF16-pair words (low half first), then the FP32 LSE bits.
+    record_words: tl.constexpr = kv_lora_rank // 2 + 1
+    dims = tl.arange(0, kv_lora_rank)
+    result = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], 0.0)
+    tl.store(
+        record_values + rows[:, None] * (2 * record_words) + dims[None, :],
+        result.to(record_values.dtype.element_ty),
+        mask=head_mask[:, None],
+    )
+    tl.store(
+        record_lse + rows * record_words + (record_words - 1),
+        tl.where(l_i > 0.0, (m_i + tl.log2(l_i)) * 0.6931471805599453, -float("inf")),
+        mask=head_mask,
     )
 
 
@@ -504,6 +630,26 @@ def _run_packed_kv(
     )
 
 
+def _dense_kv_layout(
+    kv_cache: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """The dense cache as ``[slots, dim]`` or ``[pages, page_size, dim]``, read
+    in place, and the dense kernels' (page, token, channel) strides and page
+    size."""
+    if kv_cache.dim() == 4:
+        kv_cache = (
+            kv_cache.squeeze(1) if kv_cache.shape[1] == 1 else kv_cache.squeeze(2)
+        )
+    elif kv_cache.dim() == 3 and kv_cache.shape[1] == 1:
+        kv_cache = kv_cache.squeeze(1)
+    return kv_cache, (
+        kv_cache.stride(0),
+        kv_cache.stride(-2),
+        kv_cache.stride(-1),
+        kv_cache.shape[1] if kv_cache.dim() == 3 else 1,
+    )
+
+
 def _run_dense_kv(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -515,22 +661,12 @@ def _run_dense_kv(
     qk_rope_head_dim: int,
     return_lse: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if kv_cache.dim() == 4:
-        kv_cache = (
-            kv_cache.squeeze(1) if kv_cache.shape[1] == 1 else kv_cache.squeeze(2)
-        )
-    elif kv_cache.dim() == 3 and kv_cache.shape[1] == 1:
-        kv_cache = kv_cache.squeeze(1)
+    kv_cache, kv_layout_args = _dense_kv_layout(kv_cache)
     return _launch_dsa_kernel(
         _dsa_dense_kv_kernel,
         q,
         (kv_cache,),
-        (
-            kv_cache.stride(0),
-            kv_cache.stride(-2),
-            kv_cache.stride(-1),
-            kv_cache.shape[1] if kv_cache.dim() == 3 else 1,
-        ),
+        kv_layout_args,
         topk_indices,
         topk_lens,
         softmax_scale=softmax_scale,
@@ -538,6 +674,95 @@ def _run_dense_kv(
         qk_rope_head_dim=qk_rope_head_dim,
         return_lse=return_lse,
     )
+
+
+# _launch_dsa_kernel's config, so records match an unsplit dsa_prefill bit for bit.
+_PREFILL_RECORDS_CONFIG = {"BLOCK_H": _BLOCK_H, "BLOCK_N": _BLOCK_N, "num_warps": 4}
+
+
+def triton_dsa_prefill_dcp_records_supported(
+    *, tokens: int, heads: int, topk: int
+) -> bool:
+    """Whether ``triton_dsa_prefill_dcp_records`` serves a launch of this size.
+
+    The records core runs one split per (token, head block), the launch
+    ``triton_dsa_prefill`` makes for a grid of at least about one program per
+    SM (``_num_kv_splits``); a smaller grid splits the keys there, so its
+    records would not hold that launch's bits.
+
+    Args:
+        tokens: Query rows.
+        heads: Gathered query heads, every rank's.
+        topk: Selected-slot width.
+
+    Returns:
+        True when the ``dsa_prefill`` launch of these sizes runs one split.
+    """
+    if tokens <= 0 or heads <= 0:
+        return False
+    head_blocks = triton.cdiv(heads, _BLOCK_H)
+    return _num_kv_splits(tokens * head_blocks, topk) == 1
+
+
+def _launch_dsa_dcp_records(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_lens: torch.Tensor,
+    *,
+    softmax_scale: float,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    config: dict,
+) -> torch.Tensor:
+    degree, tokens, group_heads, head_dim = q.shape
+    heads = degree * group_heads
+    topk = topk_indices.shape[1]
+    if not triton_dsa_prefill_dcp_records_supported(
+        tokens=tokens, heads=heads, topk=topk
+    ):
+        # NUM_SPLITS == 1: a split launch would merge differently.
+        raise ValueError(
+            f"the DSA records core runs one split; {tokens} rows of {heads} "
+            f"heads over {topk} slots split their keys (check "
+            "dsa_prefill_dcp_records_supported before the launch)"
+        )
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn) or kv_lora_rank % 2:
+        raise ValueError(
+            "DSA records hold BF16 pairs: the query must be BF16 or FP8 E4M3 "
+            f"and the latent rank even, got {q.dtype} and {kv_lora_rank}"
+        )
+    records = torch.empty(
+        (degree, tokens, group_heads, kv_lora_rank // 2 + 1),
+        dtype=torch.int32,
+        device=q.device,
+    )
+    kv_cache, kv_layout_args = _dense_kv_layout(kv_cache)
+    grid = (tokens, triton.cdiv(heads, config["BLOCK_H"]), 1)
+    _dsa_dense_kv_dcp_records_kernel[grid](
+        q,
+        kv_cache,
+        topk_indices,
+        topk_lens,
+        records.view(torch.bfloat16),
+        records.view(torch.float32),
+        tokens,
+        heads,
+        group_heads,
+        head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        *kv_layout_args,
+        topk,
+        float(softmax_scale),
+        BLOCK_H=config["BLOCK_H"],
+        BLOCK_N=config["BLOCK_N"],
+        BLOCK_ROPE=max(16, triton.next_power_of_2(qk_rope_head_dim)),
+        num_warps=config["num_warps"],
+        # AMD uses single-stage loops, like the grouped Triton decode kernel.
+        num_stages=1 if current_platform().is_amd else 2,
+    )
+    return records
 
 
 def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
@@ -619,7 +844,7 @@ def _run_dsa(
         }
     ),
     traits={
-        "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+        "q_len": frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
         "qk_nope_head_dim": frozenset({128, 192, 256}),
         "kv_lora_rank": frozenset({128, 512}),
         "qk_rope_head_dim": frozenset({0, 64}),
@@ -729,6 +954,55 @@ def triton_dsa_prefill(
         k_scale=k_scale,
         out=out,
         return_lse=return_lse,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsa_prefill_dcp_records",
+    name="triton_dsa_prefill_dcp_records",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(q=dense_tensor_format(torch.bfloat16)),
+            format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
+        }
+    ),
+    traits={
+        "qk_nope_head_dim": frozenset({128, 192, 256}),
+        "kv_lora_rank": frozenset({128, 512}),
+        "qk_rope_head_dim": frozenset({0, 64}),
+        "page_size": frozenset({64}),
+        "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
+        "topk_layout": frozenset({"global_slots"}),
+        "logit_cap": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_dsa_prefill_dcp_records(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+) -> torch.Tensor:
+    # Same scale product as _run_dsa, so the kernels see the same FP32 scale.
+    return _launch_dsa_dcp_records(
+        q.contiguous(),
+        kv_cache,
+        topk_slots.contiguous(),
+        topk_lens.contiguous(),
+        softmax_scale=float(softmax_scale) * float(k_scale),
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        config=_PREFILL_RECORDS_CONFIG,
     )
 
 
@@ -959,6 +1233,21 @@ def triton_dsa_index_candidates(
     scores = logits.gather(1, offsets.clamp_min(0).long())
     valid = (offsets >= 0) & (scores > -float("inf"))
     return torch.where(valid, offsets, -1), torch.where(valid, scores, -float("inf"))
+
+
+@register_kernel(
+    "attention",
+    "dsa_merge_candidates",
+    name="triton_dsa_merge_candidates",
+    solution="triton",
+    signatures=frozenset({format_signature(records=dense_tensor_format(torch.int32))}),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def triton_dsa_merge_candidates(
+    records: torch.Tensor, *, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return merge_packed_index_candidates(records, topk=topk)
 
 
 @register_kernel(

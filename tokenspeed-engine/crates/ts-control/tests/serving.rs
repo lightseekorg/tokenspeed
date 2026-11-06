@@ -1220,6 +1220,8 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    /// Override the ingress context limit to exercise native capacity errors.
+    context_limit: Option<i64>,
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
     /// PD: the engine's role and its peer's wire.
@@ -1273,7 +1275,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             vocab_size: 100_000,
             eos_token_ids: Vec::new(),
             top_k_exclusive_max: Some(ts_control::sampling::TOP_K_FUSED_MAX),
-            max_model_len: 4096,
+            max_model_len: setup.context_limit.unwrap_or(4096),
             max_req_input_len: 4000,
             enable_output_logprobs: setup.logprobs,
             requires_bootstrap: pd.is_some(),
@@ -1290,6 +1292,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             },
         },
         kv_total_pages: 512,
+        kv_token_capacity: 512 * 16,
         ngram_context_len: setup.ngram_context_len,
         request_token_history: setup.request_token_history,
         controls: ControlConfig {
@@ -1370,6 +1373,8 @@ fn run_rank<F: Frontend>(
             enabled: true,
             request_stats: true,
         },
+        false,
+        None,
     );
     let transfer = pd.map(|pd| {
         Box::new(FakePeer {
@@ -1599,6 +1604,7 @@ struct ScriptedFrontend {
     replies: Arc<Mutex<Vec<ControlOutput>>>,
     /// The requests that finished, with their reasons.
     finished: Arc<Mutex<Vec<(String, String)>>>,
+    outputs: Arc<Mutex<Vec<StreamedOutput>>>,
 }
 
 impl Frontend for ScriptedFrontend {
@@ -1614,6 +1620,7 @@ impl Frontend for ScriptedFrontend {
 
     fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
         self.reacted.extend((self.react)(&outputs));
+        self.outputs.lock().unwrap().extend(outputs.iter().cloned());
         self.finished
             .lock()
             .unwrap()
@@ -1635,6 +1642,8 @@ struct ScriptedRank {
     /// Its engine's control replies, on the engine's first rank.
     replies: Vec<ControlOutput>,
     finished: Vec<(String, String)>,
+    outputs: Vec<StreamedOutput>,
+    released: Vec<(String, i32)>,
     cache_ops: Vec<CacheOpKind>,
     idle_forwards: usize,
 }
@@ -1644,6 +1653,7 @@ struct ScriptedRank {
 /// the ranks stop by themselves.
 fn run_scripted(
     layout: Layout,
+    in_flight_depth: usize,
     tiers: Tiers,
     setup: Setup,
     scripts: Vec<Script>,
@@ -1651,7 +1661,7 @@ fn run_scripted(
 ) -> Vec<ScriptedRank> {
     let (world, tp_size, num_engines) = layout.sizes();
     assert_eq!(scripts.len(), num_engines);
-    let config = loop_config(0, matches!(layout, Layout::Pp(_)), &setup);
+    let config = loop_config(in_flight_depth, matches!(layout, Layout::Pp(_)), &setup);
     let stop = Arc::new(AtomicBool::new(false));
     let (mesh_listeners, addresses) = mesh_listeners(world);
     let mut scripts = scripts.into_iter();
@@ -1664,12 +1674,15 @@ fn run_scripted(
             let (plans, idle_forwards) = (device.plans.clone(), device.idle_forwards.clone());
             let replies = Arc::new(Mutex::new(Vec::new()));
             let finished = Arc::new(Mutex::new(Vec::new()));
+            let outputs = Arc::new(Mutex::new(Vec::new()));
+            let released = device.released.clone();
             let frontend = (rank % tp_size == 0).then(|| ScriptedFrontend {
                 script: scripts.next().unwrap().into(),
                 react,
                 reacted: Vec::new(),
                 replies: replies.clone(),
                 finished: finished.clone(),
+                outputs: outputs.clone(),
             });
             let spec = RankSpec {
                 rank,
@@ -1687,7 +1700,15 @@ fn run_scripted(
                 done.send(rank).unwrap();
                 outcome
             });
-            (thread, replies, finished, plans, idle_forwards)
+            (
+                thread,
+                replies,
+                finished,
+                outputs,
+                released,
+                plans,
+                idle_forwards,
+            )
         })
         .collect();
     for _ in 0..world {
@@ -1699,10 +1720,12 @@ fn run_scripted(
     ranks
         .into_iter()
         .map(
-            |(thread, replies, finished, plans, idle_forwards)| ScriptedRank {
+            |(thread, replies, finished, outputs, released, plans, idle_forwards)| ScriptedRank {
                 outcome: thread.join().unwrap(),
                 replies: replies.lock().unwrap().clone(),
                 finished: finished.lock().unwrap().clone(),
+                outputs: outputs.lock().unwrap().clone(),
+                released: released.lock().unwrap().clone(),
                 cache_ops: plans
                     .lock()
                     .unwrap()
@@ -1732,6 +1755,302 @@ fn budget(max_new_tokens: i64) -> SamplingParams {
     SamplingParams {
         max_new_tokens: Some(max_new_tokens),
         ..Default::default()
+    }
+}
+
+fn assert_scripted_tokens(rank: &ScriptedRank, rid: &str, count: i32) {
+    assert_eq!(rank.outcome, Ok(()));
+    let outputs: Vec<_> = rank
+        .outputs
+        .iter()
+        .filter(|output| output.rid == rid)
+        .collect();
+    let tokens: Vec<_> = outputs
+        .iter()
+        .flat_map(|output| output.output_ids.iter().copied())
+        .collect();
+    assert_eq!(tokens, (1000..1000 + count).collect::<Vec<_>>());
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.finish_reason.is_some())
+            .count(),
+        1
+    );
+    assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
+    assert_eq!(outputs.last().unwrap().completion_tokens, i64::from(count));
+}
+
+#[test]
+fn duplicate_submissions_preserve_the_original_stream_on_every_rank() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        for depth in 0..=2 {
+            let mut script: Script = vec![Vec::new(); 30];
+            script[0] = vec![
+                EngineRequest::Add(Box::new(request("original", 16, budget(8)))),
+                EngineRequest::Add(Box::new(request("original", 20, budget(2)))),
+                EngineRequest::Add(Box::new(request("healthy", 16, budget(3)))),
+            ];
+            // Ingress would normally send this malformed request a final error.
+            script[1].push(EngineRequest::Add(Box::new(request(
+                "original",
+                0,
+                budget(2),
+            ))));
+            script[2].push(EngineRequest::Add(Box::new(request(
+                "original",
+                20,
+                budget(2),
+            ))));
+            let ranks = run_scripted(
+                layout,
+                depth,
+                Tiers::DeviceOnly,
+                Setup::default(),
+                vec![script],
+                no_reaction,
+            );
+            assert_scripted_tokens(&ranks[0], "original", 8);
+            assert_scripted_tokens(&ranks[0], "healthy", 3);
+            assert!(ranks[0]
+                .outputs
+                .iter()
+                .filter(|output| output.rid == "original")
+                .all(|output| output.prompt_tokens == 16));
+            for rank in ranks {
+                assert_eq!(rank.outcome, Ok(()));
+                assert_eq!(
+                    rank.released
+                        .iter()
+                        .filter(|(rid, _)| rid == "original")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_submissions_cannot_replace_a_request_being_aborted() {
+    for depth in 0..=2 {
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0].push(EngineRequest::Add(Box::new(request(
+            "aborted",
+            16,
+            budget(20),
+        ))));
+        script[1] = vec![
+            EngineRequest::Abort(vec!["aborted".to_owned()]),
+            EngineRequest::Add(Box::new(request("aborted", 20, budget(2)))),
+            EngineRequest::Add(Box::new(request("healthy", 16, budget(3)))),
+        ];
+        let ranks = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![script],
+            no_reaction,
+        );
+        assert_scripted_tokens(&ranks[0], "healthy", 3);
+        assert_eq!(
+            ranks[0]
+                .released
+                .iter()
+                .filter(|(rid, _)| rid == "aborted")
+                .count(),
+            1
+        );
+        assert!(!ranks[0].finished.iter().any(|(rid, _)| rid == "aborted"));
+    }
+}
+
+#[test]
+fn duplicate_submissions_after_final_output_refuse_a_retiring_id() {
+    fn retry(outputs: &[StreamedOutput]) -> Vec<EngineRequest> {
+        if outputs
+            .iter()
+            .any(|output| output.rid == "retiring" && output.finish_reason == Some("length"))
+        {
+            vec![
+                EngineRequest::Add(Box::new(request("retiring", 20, budget(3)))),
+                EngineRequest::Add(Box::new(request("healthy", 16, budget(3)))),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+    for depth in 0..=2 {
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0].push(EngineRequest::Add(Box::new(request(
+            "retiring",
+            16,
+            budget(2),
+        ))));
+        let ranks = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![script],
+            retry,
+        );
+        assert_scripted_tokens(&ranks[0], "healthy", 3);
+        let finals: Vec<_> = ranks[0]
+            .outputs
+            .iter()
+            .filter(|output| output.rid == "retiring" && output.finish_reason.is_some())
+            .collect();
+        assert_eq!(finals.len(), 2);
+        assert_eq!(finals[0].finish_reason, Some("length"));
+        assert_eq!(finals[1].finish_reason, Some("abort"));
+        assert_eq!(finals[1].completion_tokens, 0);
+        assert_eq!(
+            finals[1]
+                .finish_details
+                .as_ref()
+                .unwrap()
+                .get(&"status_code".to_owned()),
+            Some(&Value::from(409i64)),
+        );
+        // The refused request was never admitted or released on the data plane.
+        assert_eq!(
+            ranks[0]
+                .released
+                .iter()
+                .filter(|(rid, _)| rid == "retiring")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn duplicate_submissions_while_paused_keep_the_first_admission() {
+    let mut script: Script = vec![Vec::new(); 30];
+    script[0] = vec![
+        EngineRequest::Control(Box::new(pause("freeze"))),
+        EngineRequest::Add(Box::new(request("withheld", 16, budget(5)))),
+        EngineRequest::Control(Box::new(pause("freeze"))),
+        EngineRequest::Add(Box::new(request("withheld", 20, budget(2)))),
+    ];
+    script[1].push(EngineRequest::Add(Box::new(request(
+        "withheld",
+        20,
+        budget(2),
+    ))));
+    script[3].push(EngineRequest::Control(Box::new(resume())));
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![script],
+        no_reaction,
+    );
+    assert_scripted_tokens(&ranks[0], "withheld", 5);
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.released.len(), 1);
+    }
+}
+
+#[test]
+fn duplicate_submissions_can_reuse_an_id_after_scheduler_retirement() {
+    for depth in 0..=2 {
+        let mut script: Script = vec![Vec::new(); 40];
+        script[0].push(EngineRequest::Add(Box::new(request(
+            "reused",
+            16,
+            budget(2),
+        ))));
+        script[20].push(EngineRequest::Add(Box::new(request(
+            "reused",
+            20,
+            budget(3),
+        ))));
+        let ranks = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![script],
+            no_reaction,
+        );
+        assert_eq!(ranks[0].outcome, Ok(()));
+        let finals: Vec<_> = ranks[0]
+            .outputs
+            .iter()
+            .filter(|output| output.finish_reason.is_some())
+            .collect();
+        assert_eq!(finals.len(), 2);
+        assert_eq!(
+            (finals[0].prompt_tokens, finals[0].completion_tokens),
+            (16, 2)
+        );
+        assert_eq!(
+            (finals[1].prompt_tokens, finals[1].completion_tokens),
+            (20, 3)
+        );
+        assert!(finals
+            .iter()
+            .all(|output| output.finish_reason == Some("length")));
+    }
+}
+
+#[test]
+fn scheduler_submission_errors_release_the_rejected_batch_and_keep_serving() {
+    for depth in 0..=2 {
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0] = vec![
+            EngineRequest::Add(Box::new(request("batch-peer", 16, budget(2)))),
+            EngineRequest::Add(Box::new(request("oversized", 16, budget(10000)))),
+        ];
+        script[1].push(EngineRequest::Add(Box::new(request(
+            "healthy",
+            16,
+            budget(3),
+        ))));
+        let ranks = run_scripted(
+            Layout::Tp(2),
+            depth,
+            Tiers::DeviceOnly,
+            Setup {
+                context_limit: Some(16384),
+                ..Setup::default()
+            },
+            vec![script],
+            no_reaction,
+        );
+        assert_scripted_tokens(&ranks[0], "healthy", 3);
+        for rid in ["batch-peer", "oversized"] {
+            let refused: Vec<_> = ranks[0]
+                .outputs
+                .iter()
+                .filter(|output| output.rid == rid)
+                .collect();
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].finish_reason, Some("abort"));
+            assert!(refused[0].output_ids.is_empty());
+            let message = refused[0]
+                .finish_details
+                .as_ref()
+                .unwrap()
+                .get(&"message".to_owned());
+            assert!(
+                matches!(message, Some(Value::Str(message)) if message.contains("exceeds cache capacity"))
+            );
+        }
+        for rank in ranks {
+            assert_eq!(rank.outcome, Ok(()));
+            assert_eq!(rank.released.len(), 3);
+            assert!(rank
+                .released
+                .iter()
+                .filter(|(rid, _)| rid != "healthy")
+                .all(|(_, generated)| *generated == 0));
+        }
     }
 }
 
@@ -4311,6 +4630,7 @@ fn an_engine_stops_once_its_frontend_is_gone() {
     )))]];
     for (rank, outcome) in run_scripted(
         Layout::Tp(2),
+        0,
         Tiers::DeviceOnly,
         Setup::default(),
         vec![script],
@@ -4345,6 +4665,7 @@ fn a_frozen_data_parallel_rank_keeps_its_rebalance_in_step() {
     second[60].push(EngineRequest::Control(Box::new(resume())));
     let ranks = run_scripted(
         Layout::Dp(2),
+        0,
         Tiers::DeviceOnly,
         Setup {
             eplb: Some(eplb_config),
@@ -4395,6 +4716,7 @@ fn a_flush_under_a_keep_pause_runs_once_the_cache_work_did() {
     )));
     let ranks = run_scripted(
         Layout::Single,
+        0,
         Tiers::HostL2,
         Setup::default(),
         vec![script],

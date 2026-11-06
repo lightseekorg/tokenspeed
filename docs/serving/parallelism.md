@@ -333,7 +333,7 @@ python -m tokenspeed.cli serve \
   --attn-tp-size 1 --data-parallel-size 16 --dense-tp-size 1 \
   --moe-tp-size 1 --expert-parallel-size 16 \
   --all2all-backend flashinfer --moe-backend flashinfer_trtllm \
-  --attention-backend tokenspeed_mla --kda-backend cutedsl_kda \
+  --attention-backend tokenspeed_mla --kda-backend cudnn \
   --dist-init-addr HEAD_NODE:29500 \
   --max-num-seqs 256 --max-model-len 4096 \
   --chunked-prefill-size 1024 --max-prefill-tokens 1024 \

@@ -63,7 +63,7 @@ use ts_scheduler::{
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
-    ControlOutput, ControlRequest, EngineRequest,
+    ControlOutput, ControlRequest, EngineRequest, StrOrList,
 };
 
 use crate::{
@@ -446,6 +446,8 @@ pub struct LoopConfig {
     pub limits: IngressLimits,
     /// Usable cache pages, reported with the load.
     pub kv_total_pages: i64,
+    /// Effective token capacity of the usable KV pool.
+    pub kv_token_capacity: i64,
     /// Predecessors Engram reads per token; 0 for a model without Engram.
     pub ngram_context_len: usize,
     /// The model reads each request's committed token history, which the
@@ -513,6 +515,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     l3_metrics: Option<L3Metrics>,
     /// Admissions waiting for their grammars to compile, in arrival order.
     grammar_queue: Vec<(Submission, GrammarKey, Instant)>,
+    /// The last cumulative prefix-hit counters reported, for deltas.
+    last_prefix_hits: ts_scheduler::PrefixHitView,
     batch_logger: BatchLogger,
     /// The token-history rows' owners, for a model that reads them.
     history: Option<HistoryRows>,
@@ -583,6 +587,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             eplb: subsystems.eplb,
             grammars: subsystems.grammars,
             grammar_queue: Vec::new(),
+            last_prefix_hits: Default::default(),
             in_flight: VecDeque::new(),
             cache_ops: CacheOps::new(),
             withheld: Vec::new(),
@@ -834,6 +839,52 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.config.kv_total_pages,
                 iteration_tokens,
             );
+            let total_pages = self.config.kv_total_pages;
+            metrics.record_cache_occupancy(
+                total_pages - i64::from(sizes.empty_lcm_blocks),
+                i64::from(active_pages),
+                total_pages,
+                self.config.kv_token_capacity,
+            );
+            match self.outputs.role() {
+                crate::output::Role::Prefill => metrics.record_prefill_queues(
+                    sizes.bootstrapping as i64,
+                    sizes.pd_transfer as i64,
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Decode => metrics.record_decode_queues(
+                    sizes.bootstrapping as i64,
+                    sizes.pd_transfer as i64,
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Plain => {}
+            }
+            metrics.record_generation_tokens(self.outputs.take_generated_tokens());
+            let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
+            metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
+            let request = self.outputs.take_request_metrics();
+            for seconds in request.ttft_seconds {
+                metrics.observe_time_to_first_token(seconds);
+            }
+            for seconds in request.request_seconds {
+                metrics.observe_request_time(seconds);
+            }
+            for seconds in request.decode_seconds {
+                metrics.observe_decode_time(seconds);
+            }
+            for seconds in request.tpot_seconds {
+                metrics.observe_time_per_output_token(seconds);
+            }
+            metrics.record_completion_tokens(request.completion_tokens);
+            metrics.record_grammar_queue(self.grammar_queue.len() as i64);
+            let hits = self.scheduler.prefix_hit_stats();
+            let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
+            metrics.record_prefix_hits(
+                delta.prompt_tokens,
+                delta.device_hit_tokens,
+                delta.host_hit_tokens,
+                delta.l3_hit_tokens,
+            );
         }
 
         let dp = self.dp_round(forward.as_ref(), stop)?;
@@ -994,7 +1045,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 Some(_) => admitted.push(submission),
             }
         }
-        self.submit(admitted)
+        self.submit(admitted, outputs, released)
     }
 
     /// Give a request its grammar's matcher, or fail it if the grammar
@@ -1243,7 +1294,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.withheld.extend(submissions);
             return Ok(());
         }
-        self.submit(submissions)
+        self.submit(submissions, outputs, released)
     }
 
     /// EPD: admit the staged requests whose embeddings landed on every rank
@@ -1329,28 +1380,46 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.withheld.extend(admitted);
             return Ok(());
         }
-        self.submit(admitted)
+        self.submit(admitted, outputs, released)
     }
 
     /// Hand admitted requests to the scheduler: a disaggregated request's
     /// transfer starts only now, as it must not finish before the scheduler
     /// knows the request.
-    fn submit(&mut self, submissions: Vec<Submission>) -> Result<(), LoopError> {
+    fn submit(
+        &mut self,
+        submissions: Vec<Submission>,
+        outputs: &mut Vec<StreamedOutput>,
+        released: &mut Vec<String>,
+    ) -> Result<(), LoopError> {
         if submissions.is_empty() {
             return Ok(());
         }
-        let mut specs = Vec::with_capacity(submissions.len());
-        let now = std::time::Instant::now();
-        for submission in submissions {
-            self.outputs.mark_submitted(&submission.rid, now);
-            if let (Some(transfer), Some(bootstrap)) =
-                (self.transfer.as_mut(), &submission.bootstrap)
-            {
-                transfer.register(&submission.rid, bootstrap)?;
+        let (specs, requests): (Vec<_>, Vec<_>) = submissions
+            .into_iter()
+            .map(|submission| (submission.spec, (submission.rid, submission.bootstrap)))
+            .unzip();
+        if let Err(error) = self.scheduler.submit_requests(&specs) {
+            // SubmitRequests validates the whole batch before inserting it.
+            // No transfer may start for requests the scheduler rejected.
+            let reason = format!("Scheduler submission failed: {}", error.what());
+            for (rid, bootstrap) in requests {
+                if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), bootstrap) {
+                    transfer.abort_room(&rid, bootstrap.room);
+                }
+                let failed = self.outputs.fail_unscheduled(&rid, &reason, Some(400));
+                outputs.extend(failed.outputs);
+                released.extend(failed.released);
             }
-            specs.push(submission.spec);
+            return Ok(());
         }
-        self.scheduler.submit_requests(&specs);
+        let now = std::time::Instant::now();
+        for (rid, bootstrap) in requests {
+            self.outputs.mark_submitted(&rid, now);
+            if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), &bootstrap) {
+                transfer.register(&rid, bootstrap)?;
+            }
+        }
         Ok(())
     }
 
@@ -2181,6 +2250,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
         let mut admissions = Vec::new();
+        let mut seen = HashSet::new();
         for message in received {
             match message {
                 EngineRequest::Abort(rids) => {
@@ -2202,8 +2272,37 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     }
                 }
                 EngineRequest::Add(request) => {
+                    if let Some(StrOrList::One(rid)) = &request.rid {
+                        // The wire routes outputs by rid alone: an error for a
+                        // duplicate would terminate the original stream too.
+                        // Check before ingress, which can itself emit errors.
+                        if !seen.insert(rid.clone()) || self.outputs.state(rid).is_some() {
+                            tracing::warn!(
+                                rid,
+                                "dropping duplicate request id; original request retained"
+                            );
+                            continue;
+                        }
+                    }
                     match ingress::admit(*request, &self.config.limits) {
-                        Some(Admitted::Run(admission)) => admissions.push(*admission),
+                        Some(Admitted::Run(mut admission)) => {
+                            if self.scheduler.request_token_size(&admission.rid) >= 0 {
+                                // Final output precedes scheduler retirement.
+                                // No old output state remains, so this refusal
+                                // can safely answer the new request.
+                                admission.state.abort(
+                                    "Request id is still retiring; retry with a new request id",
+                                    true,
+                                    Some(409),
+                                );
+                                outputs.extend(self.outputs.publish_finished_at_admission(
+                                    &admission.rid,
+                                    admission.state,
+                                ));
+                            } else {
+                                admissions.push(*admission);
+                            }
+                        }
                         Some(Admitted::Refused { rid, state }) => {
                             outputs
                                 .extend(self.outputs.publish_finished_at_admission(&rid, *state));
@@ -2273,9 +2372,37 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 }
 
+fn prefix_hit_delta(
+    previous: &mut ts_scheduler::PrefixHitView,
+    hits: ts_scheduler::PrefixHitView,
+) -> ts_scheduler::PrefixHitView {
+    let last = std::mem::replace(previous, hits);
+    ts_scheduler::PrefixHitView {
+        prompt_tokens: hits.prompt_tokens.saturating_sub(last.prompt_tokens),
+        device_hit_tokens: hits
+            .device_hit_tokens
+            .saturating_sub(last.device_hit_tokens),
+        host_hit_tokens: hits.host_hit_tokens.saturating_sub(last.host_hit_tokens),
+        l3_hit_tokens: hits.l3_hit_tokens.saturating_sub(last.l3_hit_tokens),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_prefix_sample_includes_admissions_and_unchanged_counters_add_nothing() {
+        let mut previous = ts_scheduler::PrefixHitView::default();
+        let hits = ts_scheduler::PrefixHitView {
+            prompt_tokens: 48,
+            device_hit_tokens: 16,
+            host_hit_tokens: 8,
+            l3_hit_tokens: 4,
+        };
+        assert_eq!(prefix_hit_delta(&mut previous, hits), hits);
+        assert_eq!(prefix_hit_delta(&mut previous, hits), Default::default());
+    }
 
     #[test]
     fn the_active_page_count_is_reused_while_fresh_and_requests_run() {

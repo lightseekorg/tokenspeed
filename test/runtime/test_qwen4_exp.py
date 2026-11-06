@@ -33,18 +33,23 @@ from tokenspeed_kernel.ops.ple import (
     ple_page_gather_pair,
     prepare_ngram_reciprocals,
 )
+from transformers import PretrainedConfig
 
+import tokenspeed.runtime.distributed.comm_manager as comm_module
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
 import tokenspeed.runtime.layers.attention.qsa.metadata as qsa_metadata_module
+import tokenspeed.runtime.layers.logits_processor as logits_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_qwen4_exp
 from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.factory import _check_shared_head_layout
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention import registry as attention_registry
@@ -100,6 +105,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
@@ -115,10 +121,12 @@ from tokenspeed.runtime.layers.qwen4_exp_ple import (
     qwen4_exp_ple_conv_field,
 )
 from tokenspeed.runtime.models import qwen4_exp_nextn
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     _qwen4_exp_uses_sigmoid_output_gate,
     _qwen4_exp_uses_sparse_moe,
+    _Qwen4ExpDecoderMixin,
     _Qwen4ExpRMSNormGated,
     load_qwen4_exp_weights,
 )
@@ -1541,33 +1549,134 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
         torch.testing.assert_close(got, expected)
 
 
-def test_qwen4_exp_nextn_head_matches_attention_dp_layout(monkeypatch) -> None:
-    calls = []
+class _EmbeddingOnlyDraft(torch.nn.Module):
+    """CPU stand-in for transformer weights; real heads handle the logits."""
 
-    def fake_replicated(*args, **kwargs):
-        calls.append(("replicated", args, kwargs))
-        return object()
+    def __init__(self, config, mapping, quant_config, prefix):
+        super().__init__()
+        self.qsa_indexers = []
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
 
-    def fake_parallel(*args, **kwargs):
-        calls.append(("parallel", args, kwargs))
-        return object()
 
-    monkeypatch.setattr(qwen4_exp_nextn, "ReplicatedLinear", fake_replicated)
-    monkeypatch.setattr(qwen4_exp_nextn, "ParallelLMHead", fake_parallel)
-    config = SimpleNamespace(hidden_size=16, vocab_size=128)
-    attn = SimpleNamespace(has_dp=True, tp_rank=0, tp_size=2, tp_group=object())
+class _HeadOnlyTarget(BaseCausalLM):
+    model_cls = _EmbeddingOnlyDraft
 
-    qwen4_exp_nextn._build_mtp_lm_head(
-        config, SimpleNamespace(attn=attn), None, "draft"
+
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("attn_tp", [1, 2, 4])
+def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
+    mapping = Mapping(
+        rank=rank, world_size=8, attn_tp_size=attn_tp, attn_dp_size=8 // attn_tp
     )
-    attn.has_dp = False
-    qwen4_exp_nextn._build_mtp_lm_head(
-        config, SimpleNamespace(attn=attn), None, "draft"
+    config = PretrainedConfig(
+        hc_count=4,
+        hidden_size=4,
+        vocab_size=8,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
     )
+    # The GPU transformer and CUDA cache management are outside this test;
+    # the head, logits processors and factory layout check are real classes.
+    monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = _HeadOnlyTarget(config, mapping)
+    with torch.no_grad():
+        target.lm_head.weight.copy_(
+            torch.arange(target.lm_head.weight.numel()).reshape_as(
+                target.lm_head.weight
+            )
+            / 100
+            - 0.16
+        )
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping)
+    _check_shared_head_layout(target, draft)
+    draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
 
-    assert [kind for kind, _, _ in calls] == ["replicated", "parallel"]
-    assert calls[0][1] == (16, 128)
-    assert calls[1][1] == (128, 16)
+    hidden = (
+        torch.arange(3 * config.hidden_size, dtype=torch.float32).reshape(3, -1) / 7
+    )
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    actual = draft.logits_processor._get_logits(
+        hidden, draft.lm_head, metadata, require_full_vocab=False
+    )
+    expected = torch.nn.functional.linear(hidden, target.lm_head.weight)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
+    mapping = Mapping(
+        rank=rank, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=2
+    )
+    config = PretrainedConfig(
+        hc_count=4,
+        hidden_size=4,
+        vocab_size=128,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = _HeadOnlyTarget(config, mapping)
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping)
+    _check_shared_head_layout(target, draft)
+    full_weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4) / 100
+    width = target.lm_head.weight.shape[0]
+    start = mapping.lm_head.tp_rank * width
+    with torch.no_grad():
+        target.lm_head.weight.copy_(full_weight[start : start + width])
+    draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
+    rows = [1 + r % 3 for r in range(8)]
+    hidden = [
+        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r
+        for r, n in enumerate(rows)
+    ]
+
+    # Only the distributed transport is simulated on CPU. The real target and
+    # draft heads, layout validation, and logits GEMM handle distinct DP rows
+    # and vocabulary shards; the peer contributes its independently computed shard.
+    def gather(local, group, counts):
+        return torch.cat(
+            [
+                (local if r == rank else hidden[r])[:count]
+                for r, count in zip(group, counts)
+            ]
+        )
+
+    def transpose(local_logits, group, *, input_split_sizes):
+        offset = sum(input_split_sizes[: group.index(rank)])
+        return torch.cat(
+            [
+                (
+                    local_logits[offset : offset + rows[rank]]
+                    if r == rank
+                    else torch.nn.functional.linear(
+                        hidden[rank], full_weight[i * width : (i + 1) * width]
+                    )
+                )
+                for i, r in enumerate(group)
+            ],
+            dim=1,
+        )
+
+    monkeypatch.setattr(logits_module, "token_all_gather", gather)
+    monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.DECODE,
+        query_shard=None,
+        global_num_tokens=rows,
+        all_decode_or_idle=True,
+    )
+    actual = draft.logits_processor._get_logits(
+        hidden[rank], draft.lm_head, metadata, require_full_vocab=False
+    )
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(hidden[rank], full_weight)
+    )
 
 
 def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:
@@ -3783,3 +3892,178 @@ def test_ple_host_table_skips_device_allocation(
 
     table_bytes = embedding.lookup.ngram_embedding.weight.numel() * 2
     assert growth < table_bytes // 4
+
+
+class _SharedHeadDraftTransformer(torch.nn.Module):
+    """CPU substitute for the GPU transformer; head construction remains real."""
+
+    def __init__(self, config, mapping, quant_config, prefix):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+        self.qsa_indexers = []
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_qwen4_exp_nextn_shares_unquantized_target_head(monkeypatch, attention_dp):
+    from tokenspeed.runtime.layers.linear import ReplicatedLinear
+    from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+    from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+
+    monkeypatch.setattr(
+        qwen4_exp_nextn, "Qwen4ExpDraftModel", _SharedHeadDraftTransformer
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    config = PretrainedConfig(
+        hidden_size=128,
+        vocab_size=128,
+        hc_count=4,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    mapping = Mapping(
+        rank=0,
+        world_size=2 if attention_dp else 1,
+        attn_tp_size=1,
+        attn_dp_size=2 if attention_dp else 1,
+    )
+    quant = Nvfp4Config(
+        exclude_modules=["lm_head", "mtp.fc_embedding", "mtp.fc_hidden"]
+    )
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping, quant)
+    target_head = ReplicatedLinear(
+        128,
+        128,
+        bias=False,
+        quant_config=quant,
+        prefix="lm_head",
+        params_dtype=torch.bfloat16,
+    )
+    with torch.no_grad():
+        target_head.weight.copy_(torch.randn_like(target_head.weight))
+    embed = torch.nn.Embedding(128, 128, dtype=torch.bfloat16).weight
+    draft.set_embed_and_head_module(embed, target_head)
+    hidden = torch.randn(3, 128, dtype=torch.bfloat16)
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    actual = draft.logits_processor._get_logits(
+        hidden,
+        draft.lm_head,
+        metadata,
+        require_full_vocab=False,
+    )
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(hidden, target_head.weight)
+    )
+    assert draft.lm_head is target_head
+    assert draft.model.embed_tokens.weight is embed
+
+
+class _HyperConnectionAttentionTail(_Qwen4ExpDecoderMixin, torch.nn.Module):
+    def __init__(self, mapping, layer_id, is_moe, prev_is_moe):
+        super().__init__()
+        self.comm_manager = CommManager(
+            mapping,
+            layer_id,
+            is_moe,
+            prev_is_moe,
+            dense_batch_invariant=False,
+            query_sharded=False,
+        )
+        config = HyperConnectionConfig(
+            hc_count=4,
+            hidden_size=8,
+            hc_lowrank=4,
+            params_dtype=torch.float32,
+        )
+        self.attn_hyper_connection = GatedResidualSimple(config).cuda()
+        self.mlp_hyper_connection = GatedResidualSimple(config).cuda()
+
+
+@_requires_cuda
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("rows", [1, 7, 8])
+@pytest.mark.parametrize(
+    "layer_id,is_moe,prev_is_moe",
+    [
+        (0, True, True),
+        (1, True, True),
+        (1, True, False),
+        (1, False, True),
+        (1, False, False),
+    ],
+)
+def test_hyperconnection_attention_residual_rows(
+    monkeypatch,
+    rank,
+    rows,
+    layer_id,
+    is_moe,
+    prev_is_moe,
+):
+    mapping = Mapping(
+        rank=rank,
+        world_size=8,
+        attn_tp_size=2,
+        attn_dp_size=4,
+        dense_tp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=8,
+        lm_head_tp_size=1,
+    )
+    layer = _HyperConnectionAttentionTail(mapping, layer_id, is_moe, prev_is_moe)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        input_num_tokens=rows,
+        forward_mode=ForwardMode.EXTEND,
+        output_layout=None,
+        global_num_tokens=[rows] * 8,
+    )
+    hyper_input = torch.randn(rows, 32, device="cuda")
+    output = torch.randn(rows, 8, device="cuda")
+    _, residuals = layer.attn_hyper_connection.mix(hyper_input, normalized=None)
+    counts = layer.comm_manager.attn_tp_group_scattered_num_tokens(ctx)
+    start = sum(counts[:rank])
+    selected = slice(start, start + counts[rank])
+
+    # Emulate only the absent TP peers; HC and communication layout logic are real.
+    def reduce_scatter(value, *, group, scattered_num_tokens):
+        assert group == mapping.attn.tp_group
+        assert scattered_num_tokens == counts
+        return (value * 2)[selected]
+
+    def reduce(value, group):
+        assert group == mapping.attn.tp_group
+        return value * 2
+
+    monkeypatch.setattr(comm_module, "token_reduce_scatter", reduce_scatter)
+    monkeypatch.setattr(comm_module, "all_reduce", reduce)
+
+    def gather(value, *, group, scattered_num_tokens):
+        assert group == mapping.attn.tp_group
+        assert scattered_num_tokens == counts
+        torch.testing.assert_close(value, hyper_input[selected])
+        # A real collective allocates new storage, requiring fresh HC normalization.
+        return hyper_input.clone()
+
+    monkeypatch.setattr(comm_module, "token_all_gather", gather)
+
+    expected_rows = selected if is_moe else slice(None)
+    reference_residuals = tuple(value[expected_rows] for value in residuals)
+    combined, normalized = layer.mlp_hyper_connection.combine_norm(
+        (output * 2)[expected_rows],
+        reference_residuals,
+    )
+    expected, expected_residuals = layer.mlp_hyper_connection.mix(
+        combined,
+        normalized=normalized,
+    )
+    actual, actual_residuals = layer._finish_attention(output, residuals, ctx)
+    torch.testing.assert_close(actual, expected)
+    for actual_value, expected_value in zip(
+        actual_residuals, expected_residuals, strict=True
+    ):
+        torch.testing.assert_close(actual_value, expected_value)

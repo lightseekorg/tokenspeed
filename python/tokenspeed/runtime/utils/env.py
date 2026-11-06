@@ -43,6 +43,9 @@ global_server_args_dict: dict = {
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
     "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
     "numerics": ServerArgs.numerics,
+    "speculative_rejection_sample_method": (
+        ServerArgs.speculative_rejection_sample_method
+    ),
     "yarn_ramp_mask_device": ServerArgs.yarn_ramp_mask_device,
     "yarn_frequency_device": ServerArgs.yarn_frequency_device,
     "mla_lora_scale": ServerArgs.mla_lora_scale,
@@ -107,6 +110,9 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
             "batch_invariant_collectives": server_args.batch_invariant_collectives,
             "numerics": server_args.numerics,
+            "speculative_rejection_sample_method": (
+                server_args.speculative_rejection_sample_method
+            ),
             "yarn_ramp_mask_device": server_args.yarn_ramp_mask_device,
             "yarn_frequency_device": server_args.yarn_frequency_device,
             "mla_lora_scale": server_args.mla_lora_scale,

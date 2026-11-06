@@ -172,6 +172,7 @@ def mla_project_value_prefers_contiguous_weight(
         "kv_lora_rank": latent_dim,
         "gate_kind": "sigmoid" if gated else "none",
         "inputs_contiguous": True,
+        "weight_k_major": False,
     }
     try:
         select_kernel("attention", "mla_project_value", signature, traits=traits)
@@ -285,6 +286,8 @@ def mla_project_value(
             and (gate is None or gate.stride(-1) == 1)
             and out.is_contiguous()
         ),
+        # [heads, value_dim, latent_dim] contiguous: the reduction dim is inner.
+        "weight_k_major": weight.transpose(1, 2).is_contiguous(),
     }
     if plan is not None:
         plan.validate(

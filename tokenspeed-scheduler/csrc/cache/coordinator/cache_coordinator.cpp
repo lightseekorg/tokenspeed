@@ -3076,10 +3076,11 @@ CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const Prompt
         probeHostSuffix(candidate, *local.group_keys, match_order_, local_tokens, &possible, device, probe);
         _assert(probe.num_common_tokens == candidate.max_tokens, "an optimistic candidate must match completely");
         std::vector<CacheKey> additional;
+        std::vector<std::int32_t> additional_tokens;
         std::unordered_set<CacheKey, CacheKeyHash> distinct;
         bool fits = true;
         forEachStorageDependency(
-            probe, *local.group_keys, device.full_page_tokens, [&](const CacheKey& key, std::int32_t) {
+            probe, *local.group_keys, device.full_page_tokens, [&](const CacheKey& key, std::int32_t logical_block) {
                 if (!fits || ContainsHostCachedBlock(key) || selected.contains(key) || !distinct.insert(key).second)
                     return;
                 if (additional.size() == max_keys - query.keys.size()) {
@@ -3087,11 +3088,15 @@ CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const Prompt
                     return;
                 }
                 additional.push_back(key);
+                const auto grain =
+                    GroupIsState(key.group_id) ? prefix_granularity_ : geometry_[key.group_id].BlockGranularity();
+                additional_tokens.push_back(std::min(grain, candidate.max_tokens - logical_block * grain));
             });
         if (!fits) continue;
         query.max_tokens = std::max(query.max_tokens, candidate.max_tokens);
         selected.insert(additional.begin(), additional.end());
         query.keys.insert(query.keys.end(), additional.begin(), additional.end());
+        query.key_tokens.insert(query.key_tokens.end(), additional_tokens.begin(), additional_tokens.end());
         if (query.keys.size() == max_keys) break;
     }
     return query;

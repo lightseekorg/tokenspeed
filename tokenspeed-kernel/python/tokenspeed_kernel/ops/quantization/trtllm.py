@@ -32,7 +32,9 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 _HAS_TRTLLM_KERNEL = (
-    platform.is_nvidia and importlib.util.find_spec("trtllm_kernel") is not None
+    platform.is_nvidia
+    and importlib.util.find_spec("trtllm_kernel") is not None
+    and importlib.util.find_spec("deep_ep") is not None
 )
 __all__ = []
 
@@ -42,7 +44,8 @@ def _per_token_group_quant_8bit(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not _HAS_TRTLLM_KERNEL:
         raise RuntimeError(
-            "TRT-LLM FP8 quantization requires a compatible trtllm_kernel package"
+            "TRT-LLM FP8 quantization requires a compatible trtllm_kernel package "
+            "and deep_ep"
         )
     if group_size != 128:
         raise ValueError(

@@ -829,3 +829,38 @@ def test_mla_dcp_checks_backend_capability(monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match="supports_mla_dcp=False"):
         attention_registry._validate_mla_dcp_backend("flashmla", AttentionArch.MLA)
+
+
+def test_named_trace_context_provider_and_registration_rollback():
+    def generate_context(rid):
+        return ("a" * 32, None) if rid == "ordinary-request" else None
+
+    with pytest.raises(RuntimeError, match="rollback provider"):
+        with registry.recording():
+            registry.register_trace_provider("test-root-trace", generate_context)
+            provider = registry.get_trace_provider("test-root-trace")
+            assert provider("ordinary-request") == ("a" * 32, None)
+            assert provider("other") is None
+            with pytest.raises(ValueError, match="already registered"):
+                registry.register_trace_provider("test-root-trace", generate_context)
+            raise RuntimeError("rollback provider")
+    with pytest.raises(ValueError, match="Unknown trace provider"):
+        registry.get_trace_provider("test-root-trace")
+
+
+def test_trace_context_provider_rejects_async_and_generators():
+    async def async_provider(rid):
+        return ("a" * 32, None)
+
+    def generator_provider(rid):
+        yield ("a" * 32, None)
+
+    class AsyncProvider:
+        async def __call__(self, rid):
+            return ("a" * 32, None)
+
+    for provider in (async_provider, generator_provider, AsyncProvider()):
+        with pytest.raises(TypeError, match="synchronous"):
+            registry.register_trace_provider("test-async-trace", provider)
+    with pytest.raises(ValueError, match="Unknown trace provider"):
+        registry.get_trace_provider("test-async-trace")
