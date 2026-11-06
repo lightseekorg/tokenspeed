@@ -200,7 +200,15 @@ def _k3moe_gather_send(
     for _ in gl.static_range(1, WORLD_SIZE):
         published += (values,)
     _iris_lamport_push(
-        published, regions, 0, offsets, valid, RANK, WORLD_SIZE, PEER_SIGNAL_STORE_CACHE
+        published,
+        regions,
+        0,
+        offsets,
+        valid,
+        gl.program_id(0),
+        RANK,
+        WORLD_SIZE,
+        PEER_SIGNAL_STORE_CACHE,
     )
     # Write through: the reducer may poll the own slot from another XCD.
     own = gl.multiple_of(regions[RANK].to(gl.pointer_type(gl.bfloat16)), 16)
@@ -419,7 +427,15 @@ def _k3moe_mfma_send(
     for _ in gl.static_range(1, WORLD_SIZE):
         published += (values,)
     _iris_lamport_push(
-        published, regions, 0, offsets, valid, RANK, WORLD_SIZE, PEER_SIGNAL_STORE_CACHE
+        published,
+        regions,
+        0,
+        offsets,
+        valid,
+        gl.program_id(0),
+        RANK,
+        WORLD_SIZE,
+        PEER_SIGNAL_STORE_CACHE,
     )
     # Write through: the reducer may poll the own slot from another XCD.
     own = gl.multiple_of(regions[RANK].to(gl.pointer_type(gl.bfloat16)), 16)
