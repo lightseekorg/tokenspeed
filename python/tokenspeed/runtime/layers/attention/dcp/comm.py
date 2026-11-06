@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
 )
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_exchange_input,
     all_gather,
     all_gather_single,
     all_reduce,
@@ -66,6 +67,33 @@ def gather_query_heads(query: torch.Tensor, group: tuple[int, ...]) -> torch.Ten
     # capacity needs the symmetric buffers managed in one place first.
     gathered = all_gather(_query_payload(query), group, dim=-1).view(query.dtype)
     return gathered.reshape(tokens, heads * len(group), dim)
+
+
+def gather_query_heads_lent(
+    query: torch.Tensor, group: tuple[int, ...]
+) -> torch.Tensor:
+    """:func:`gather_query_heads` through the group's exchange input.
+
+    The rows are copied into ``acquire_exchange_input``'s storage, gathered
+    rank-major (pulled in place where the backend lends its buffer) and laid
+    out token-major in 8-byte words: the same bytes at the same places.
+    Only for callers whose ``query`` does not live in that storage.
+    """
+    if len(group) == 1:
+        return query
+    tokens, heads, dim = query.shape
+    payload = _query_payload(query)
+    send = acquire_exchange_input(payload.nbytes, query, group)
+    send = send.view(payload.dtype).view(payload.shape)
+    send.copy_(payload)
+    gathered = payload.new_empty((len(group) * tokens, payload.shape[1]))
+    all_gather_single(gathered, send, group)
+    rows = gathered.view(torch.uint8).view(len(group), tokens, -1)
+    if rows.shape[-1] % 8 == 0:
+        # Copy whole 8-byte words: a strided byte copy of an FP8 query is far slower.
+        rows = rows.view(torch.int64)
+    token_major = rows.transpose(0, 1).contiguous().view(torch.uint8)
+    return token_major.view(query.dtype).view(tokens, heads * len(group), dim)
 
 
 def gather_query_heads_rank_major(
@@ -184,6 +212,23 @@ def combine_attention_records(
     )
 
 
+def _lent_records(
+    partials: torch.Tensor, degree: int, group: tuple[int, ...]
+) -> torch.Tensor:
+    """Storage for ``dispatch_dcp_attention_partials``' records of
+    ``partials``, borrowed from the group's exchange input."""
+    tokens, heads, dim = partials.shape
+    shape = (
+        degree,
+        tokens,
+        heads // degree,
+        -(-dim * partials.element_size() // 4) + 1,
+    )
+    nbytes = shape[0] * shape[1] * shape[2] * shape[3] * 4
+    lent = acquire_exchange_input(nbytes, partials, group)
+    return lent.view(torch.int32).view(shape)
+
+
 def combine_attention_partials(
     local_output: torch.Tensor,
     local_lse: torch.Tensor,
@@ -192,6 +237,7 @@ def combine_attention_partials(
     rank: int,
     sink: torch.Tensor | None,
     keep_all_heads: bool,
+    lend_records: bool = False,
 ) -> torch.Tensor:
     """Combine partials across context shards, returning the requested heads.
 
@@ -213,6 +259,11 @@ def combine_attention_partials(
             sink yet. Both forms split heads by the group's degree, so
             ``heads % len(group) == 0`` holds
             for either.
+        lend_records: Pack the head-sharded form's records into the group's
+            exchange input (``acquire_exchange_input``), so a backend that
+            pulls it in place exchanges and combines them in one step
+            (``try_combine_records``). Only for callers whose inputs do not
+            live in that storage and who start no other exchange in between.
 
     Returns:
         Original-dtype output [tokens, heads, head_dim] -- the TP-local heads,
@@ -236,7 +287,10 @@ def combine_attention_partials(
         and (sink is None or local_output.dtype != torch.float32)
     ):
         packed = dispatch_dcp_attention_partials(
-            local_output, local_lse.float(), degree=degree
+            local_output,
+            local_lse.float(),
+            degree=degree,
+            out=_lent_records(local_output, degree, group) if lend_records else None,
         )
         return combine_attention_records(
             packed,
