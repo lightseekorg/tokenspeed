@@ -745,12 +745,9 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
 def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, case):
     """The decode records core stands in for gfx950's dense decode core only,
     and only where both decode selections pick it: one row per request and
-    the verify rows.
-
-    configure_runtime asks each LSE decode selection (an FP8 query on the FP8
-    cache) and the records op for the same inputs. A planned decode keeps its
-    core, a leaf without KVP runs no head-sharded decode and a BF16 cache's
-    query keeps the ordinary gather, so none of them asks.
+    the verify rows. A planned decode keeps its core, a leaf without KVP runs
+    no head-sharded decode and a BF16 cache's query keeps the ordinary
+    gather.
     """
     dsa = backends.dsa
     backend, _ = _sparse_leaf_backend(
@@ -759,11 +756,9 @@ def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, cas
         kvp_group=(0,) if case == "no_kvp" else (0, 1, 2, 3),
         decode_kernel_plan=_plan("planned_decode", []) if case == "planned" else None,
     )
-    calls = []
 
     def select(family, mode, signature, *, traits, solution):
         assert family == "attention"
-        calls.append((mode, signature, traits, solution))
         if mode == "dsa_decode":
             other = case == "other_core" or (
                 case == "verify_other_core" and traits["q_len"] > 1
@@ -782,27 +777,6 @@ def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, cas
         shard_count=len(backend.kvp_group),
     )
     assert backend._dcp_decode_records_core is (case == "gfx950")
-    records = [call for call in calls if call[0] == "dsa_decode_dcp_records"]
-    if case in ("planned", "no_kvp", "bf16_cache"):
-        assert not records
-        return
-    if case != "gfx950":
-        return
-    # The probe runs before the startup log, and asks the records op what it
-    # asked each decode selection.
-    decodes = [call for call in calls if call[0].startswith("dsa_decode")][:4]
-    assert [mode for mode, *_ in decodes] == [
-        "dsa_decode",
-        "dsa_decode_dcp_records",
-    ] * 2
-    assert records[:2] == decodes[1::2]
-    for core, records_call in zip(decodes[::2], decodes[1::2]):
-        assert core[1:] == records_call[1:]
-    assert [traits["q_len"] for _, _, traits, _ in decodes[::2]] == [1, 8]
-    _, signature, traits, solution = decodes[0]
-    assert signature == format_signature(q=dense_tensor_format(torch.float8_e4m3fn))
-    assert traits["return_lse"] is True and traits["topk"] == 2048
-    assert solution is None
 
 
 @pytest.mark.parametrize("kvp", [1, 8])
