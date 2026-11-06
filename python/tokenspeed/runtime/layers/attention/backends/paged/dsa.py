@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_prefill,
     dsa_prefill_dcp_records,
     dsa_prefill_dcp_records_supported,
+    dsa_select_owned_candidates_supported,
     select_dsa_prefill_topk_for_rows,
 )
 from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
@@ -415,6 +416,9 @@ class DSABackend(PagedAttentionBackend):
         # Whether every KVP decode selection runs gfx950's dense core on an
         # FP8 cache, whose DCP records form the head-sharded decode runs.
         self._dcp_decode_records_core: bool = False
+        # Whether a KVP decode selects each rank's top-k share from gathered
+        # scores (dsa_select_owned_candidates) instead of merging them.
+        self._owned_decode_topk: bool = False
         self._prefill_page_table: torch.Tensor | None = None
         # Owned KVP index-tile width in kernel pages; None means the page table's width.
         self._prefill_index_columns: int | None = None
@@ -509,6 +513,14 @@ class DSABackend(PagedAttentionBackend):
         self._dcp_records_core = self._probe_dcp_records_core()
         self._dcp_padded_query = self._probe_dcp_padded_query()
         self._dcp_decode_records_core = self._probe_dcp_decode_records_core()
+        self._owned_decode_topk = len(
+            self.kvp_group
+        ) > 1 and dsa_select_owned_candidates_supported(
+            ranks=len(self.kvp_group),
+            rows=1,
+            topk=self.index_topk,
+            rank_stride=self.index_topk,
+        )
         self._log_sparse_leaves()
         self._reserve_trtllm_sparse_buffers()
 
@@ -897,7 +909,7 @@ class DSABackend(PagedAttentionBackend):
         )
 
     def takes_owned_decode_topk(self, layer) -> bool:
-        return len(self.kvp_group) > 1
+        return self._owned_decode_topk
 
     def dcp_decode_query_rider(self, layer, q: torch.Tensor) -> torch.Tensor | None:
         """This rank's decode query heads as the bytes an owned top-k's

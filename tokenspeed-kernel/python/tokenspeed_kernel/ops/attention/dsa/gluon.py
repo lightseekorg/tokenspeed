@@ -861,50 +861,6 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
-        "dsa_merge_candidates",
-        name="gluon_dsa_merge_candidates_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset(
-            {format_signature(records=dense_tensor_format(torch.int32))}
-        ),
-        traits={"topk": frozenset({512, 1024, 2048})},
-        priority=Priority.SPECIALIZED,
-    )
-    def gluon_dsa_merge_candidates_gfx950(
-        records: torch.Tensor, *, topk: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``dsa_merge_candidates`` with the one-block radix top-k of the
-        live candidates. Only its lowest score is used: the selection is
-        redone from it deterministically, as every KVP rank must select the
-        same tied candidates. Rows with at most ``topk`` live candidates,
-        such as a decode graph's padding rows, keep them all."""
-        from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
-            rank_major_scores_with_bounds,
-            select_through_threshold,
-            select_through_threshold_by_source,
-        )
-        from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-            _device_compute_units,
-            gluon_dsa_live_logical_topk_gfx950,
-        )
-
-        scores, starts, ends = rank_major_scores_with_bounds(records)
-        rows = scores.shape[0]
-        order, _ = gluon_dsa_live_logical_topk_gfx950(scores, starts, ends, topk=topk)
-        # Measured on MI350X: the per-source programs halve the selection up
-        # to about four waves of them and lose beyond eight.
-        degree = records.shape[0]
-        if rows * degree <= 4 * _device_compute_units(records.device.index):
-            return select_through_threshold_by_source(records, scores, order, topk=topk)
-        return select_through_threshold(records, scores, order, topk=topk)
-
-    @register_kernel(
-        "attention",
         "dsa_select_owned_candidates",
         name="gluon_dsa_select_owned_candidates_gfx950",
         solution="gluon",
@@ -932,41 +888,23 @@ if current_platform().is_amd:
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``dsa_select_owned_candidates`` in one launch over the gathered
-        scores where they fit it, else through the live top-k the merge
-        takes its threshold from."""
-        from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
-            rank_major_planar_scores,
-            select_owned_through_threshold,
-        )
+        scores, for sizes ``dsa_select_owned_candidates_supported`` admits."""
         from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
             gathered_owned_selection_fits,
             gluon_dsa_select_owned_from_gathered_gfx950,
         )
-        from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-            gluon_dsa_live_logical_topk_gfx950,
-        )
 
-        if gathered_owned_selection_fits(scores, topk):
-            return gluon_dsa_select_owned_from_gathered_gfx950(
-                scores,
-                positions,
-                local_page_table,
-                query_requests,
-                rank=rank,
-                topk=topk,
-                page_size=page_size,
-                out=out,
-                lens_out=lens_out,
+        if not gathered_owned_selection_fits(scores, topk):
+            raise ValueError(
+                "gfx950 owned selection takes a power-of-two rank count, a "
+                "full top-k of candidates per rank and contiguous rows"
             )
-        merged, starts, ends = rank_major_planar_scores(scores)
-        order, _ = gluon_dsa_live_logical_topk_gfx950(merged, starts, ends, topk=topk)
-        return select_owned_through_threshold(
-            merged,
-            order,
+        return gluon_dsa_select_owned_from_gathered_gfx950(
+            scores,
             positions,
             local_page_table,
             query_requests,
-            source=rank,
+            rank=rank,
             topk=topk,
             page_size=page_size,
             out=out,

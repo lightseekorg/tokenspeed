@@ -936,8 +936,9 @@ def _decode_arm_backend(*, num_attention_heads: int, attn_tp_size: int):
     backend.max_context_len = 512
     backend.num_attention_heads = num_attention_heads
     backend.num_local_heads = num_attention_heads // attn_tp_size
-    # configure_runtime's probe verdict on a BF16 cache.
+    # configure_runtime's probe verdicts on a BF16 cache.
     backend._dcp_decode_records_core = False
+    backend._owned_decode_topk = False
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128
@@ -1067,11 +1068,9 @@ def test_an_owned_decode_topk_needs_a_sharded_cache_and_its_counts():
         topk_indices=torch.zeros(1, 512, dtype=torch.int32),
         topk_owned=True,
     )
-    assert backend.takes_owned_decode_topk(arguments["layer"])
     with pytest.raises(ValueError, match="with its counts"):
         backend.forward_sparse_decode(topk_lens=None, **arguments)
     backend.kvp_group, backend.kvp_rank = (1,), 0
-    assert not backend.takes_owned_decode_topk(arguments["layer"])
     with pytest.raises(ValueError, match="sharded cache"):
         backend.forward_sparse_decode(
             topk_lens=torch.ones(1, dtype=torch.int32), **arguments

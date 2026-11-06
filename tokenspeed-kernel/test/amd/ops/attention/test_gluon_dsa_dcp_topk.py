@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """GFX950 DCP selection: the row-bounded logical top-k over owned rows of a
-table-wide buffer, and the Gluon candidate merge against the portable one."""
+table-wide buffer, and each rank's owned share of the merged selection."""
 
 from __future__ import annotations
 
@@ -33,19 +33,12 @@ if not is_cdna4():
     )
 
 from tokenspeed_kernel.ops.attention.dsa import (  # isort: skip
-    dsa_merge_candidates,
     dsa_select_owned_candidates,
+    dsa_select_owned_candidates_supported,
 )
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (  # isort: skip
-    _extract_rank_major_scores,
-    _rank_major_planar_scores,
-    _select_owned_through_threshold,
-    _select_source_through_threshold,
-    _select_through_threshold,
     rank_major_scores,
-    rank_major_scores_with_bounds,
     select_through_threshold,
-    select_through_threshold_by_source,
 )
 from tokenspeed_kernel.ops.attention.dsa.triton import (  # isort: skip
     local_topk_to_global_slots,
@@ -54,16 +47,10 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (  # isort: ski
     compact_owned_slots,
     virtual_slots_to_local,
 )
-from tokenspeed_kernel.selection import select_kernel  # isort: skip
-from tokenspeed_kernel.signature import (  # isort: skip
-    dense_tensor_format,
-    format_signature,
-)
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (  # isort: skip
     _select_owned_from_gathered_kernel,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
-    gluon_dsa_live_logical_topk_gfx950,
     gluon_dsa_logical_topk_gfx950,
     gluon_dsa_row_bounded_logical_topk_gfx950,
 )
@@ -163,205 +150,6 @@ def test_row_bounded_topk_reads_rows_past_int32_offsets():
         )
 
 
-@pytest.mark.parametrize("rows", [1, 64])
-@pytest.mark.parametrize("topk", [512, 2048])
-def test_live_topk_keeps_every_live_score_of_rows_holding_at_most_topk(rows, topk):
-    # Merged candidate rows: padding rows with no live score, short
-    # histories with fewer live scores than topk, live scores scattered
-    # among -inf ones, and mandatory +inf ones.
-    width = 8 * topk
-    generator = torch.Generator(device="cuda").manual_seed(rows + topk)
-    logits = torch.rand((rows, width), device="cuda", generator=generator)
-    live_counts = torch.randint(
-        0, width, (rows,), device="cuda", generator=generator
-    ).tolist()
-    live_counts[: min(rows, 4)] = [0, topk - 5, topk, topk + 1][:rows]
-    starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
-    ends = torch.full((rows,), width, device="cuda", dtype=torch.int32)
-    live = torch.zeros((rows, width), device="cuda", dtype=torch.bool)
-    for row, count in enumerate(live_counts):
-        columns = torch.randperm(width, device="cuda", generator=generator)
-        live[row, columns[:count]] = True
-    logits[~live] = -torch.inf
-    if rows > 4:
-        logits[3, live[3].nonzero()[:3, 0]] = torch.inf
-        # A row narrower than topk.
-        starts[4], ends[4] = 100, 100 + topk // 2
-        live[4, :100] = False
-        live[4, 100 + topk // 2 :] = False
-
-    offsets, counts = gluon_dsa_live_logical_topk_gfx950(
-        logits, starts, ends, topk=topk
-    )
-
-    for row in range(rows):
-        live_columns = live[row].nonzero()[:, 0]
-        count = int(counts[row])
-        assert count == min(topk, live_columns.numel())
-        assert (offsets[row, count:] == -1).all()
-        mine = offsets[row, :count].long()
-        assert len(set(mine.tolist())) == count
-        assert bool(live[row, mine].all())
-        if live_columns.numel() <= topk:
-            assert sorted(mine.tolist()) == live_columns.tolist()
-        else:
-            assert torch.equal(
-                logits[row, mine].sort().values,
-                logits[row, live_columns].topk(topk).values.sort().values,
-            )
-
-
-def _records(degree: int, rows: int, topk: int, seed: int) -> torch.Tensor:
-    """Every rank's local candidates as the all-gather lays them out, with
-    the invalid, mandatory and short rows a DCP step produces."""
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    ids = torch.randperm(1 << 24, device="cuda", generator=generator)
-    ids = ids[: degree * rows * topk].int().view(degree, rows, topk)
-    scores = torch.rand((degree, rows, topk), device="cuda", generator=generator)
-    # Row 0: invalid offsets and scores, mandatory windows, a signed zero.
-    ids[:, 0, :3] = -1
-    scores[:, 0, 3:8] = torch.tensor(
-        [torch.nan, -torch.inf, torch.inf, torch.inf, -0.0], device="cuda"
-    )
-    if rows > 2:
-        # A short history: fewer valid candidates in all than topk.
-        scores[:, 1, topk // 4 :] = -torch.inf
-        # A request whose history no rank owns.
-        ids[:, 2] = -1
-    return torch.stack((ids, scores.view(torch.int32)), dim=-1)
-
-
-def _selected_scores(records: torch.Tensor, positions, counts, row: int) -> list:
-    ids, bits = records[:, row].reshape(-1, 2).unbind(-1)
-    score = dict(zip(ids.tolist(), bits.view(torch.float32).tolist()))
-    return sorted(score[p] for p in positions[row, : int(counts[row])].tolist())
-
-
-def test_gluon_merge_is_the_default_gfx950_merge():
-    signature = format_signature(records=dense_tensor_format(torch.int32))
-    for topk in (512, 1024, 2048):
-        kernel = select_kernel(
-            "attention", "dsa_merge_candidates", signature, traits={"topk": topk}
-        )
-        assert kernel.name == "gluon_dsa_merge_candidates_gfx950"
-
-
-@pytest.mark.parametrize("degree", [2, 4, 8])
-@pytest.mark.parametrize("rows", [1, 7, 64])
-@pytest.mark.parametrize("topk", [512, 2048])
-def test_gluon_merge_selects_the_portable_merges_candidates(degree, rows, topk):
-    records = _records(degree, rows, topk, seed=degree * 100 + rows)
-
-    positions, counts = dsa_merge_candidates(records, topk=topk, solution="gluon")
-    expected, expected_counts = dsa_merge_candidates(
-        records, topk=topk, solution="triton"
-    )
-
-    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
-    for row in range(rows):
-        count = int(counts[row])
-        assert sorted(positions[row, :count].tolist()) == sorted(
-            expected[row, :count].tolist()
-        )
-        assert (positions[row, count:] == -1).all()
-    if rows > 2:
-        assert int(counts[2]) == 0
-
-
-@pytest.mark.parametrize("degree", [2, 8])
-@pytest.mark.parametrize("topk", [512, 2048])
-def test_gluon_merge_selects_the_same_tied_candidates_every_time(degree, topk):
-    # Eight distinct scores: the top-k cutoff always falls inside a tied
-    # group. Every KVP rank merges the same records and must keep the same
-    # candidates.
-    records = _records(degree, 16, topk, seed=degree + topk)
-    generator = torch.Generator(device="cuda").manual_seed(topk)
-    tied = torch.randint(
-        0, 8, records.shape[:3], device="cuda", generator=generator
-    ).float()
-    records[..., 1] = tied.view(torch.int32)
-
-    positions, counts = dsa_merge_candidates(records, topk=topk, solution="gluon")
-
-    for _ in range(10):
-        again, again_counts = dsa_merge_candidates(records, topk=topk, solution="gluon")
-        torch.testing.assert_close(again, positions, atol=0, rtol=0)
-        torch.testing.assert_close(again_counts, counts, atol=0, rtol=0)
-    one, one_count = dsa_merge_candidates(
-        records[:, 3:4].contiguous(), topk=topk, solution="gluon"
-    )
-    torch.testing.assert_close(one[0], positions[3], atol=0, rtol=0)
-    torch.testing.assert_close(one_count[0], counts[3], atol=0, rtol=0)
-    expected, expected_counts = dsa_merge_candidates(
-        records, topk=topk, solution="triton"
-    )
-    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
-    for row in range(16):
-        assert _selected_scores(records, positions, counts, row) == _selected_scores(
-            records, expected, expected_counts, row
-        )
-
-
-@pytest.mark.parametrize("degree", [2, 4, 8])
-@pytest.mark.parametrize("rows", [1, 7, 64])
-@pytest.mark.parametrize("topk", [512, 2048])
-@pytest.mark.parametrize("tied", [False, True])
-def test_per_source_selection_matches_per_row_selection(degree, rows, topk, tied):
-    records = _records(degree, rows, topk, seed=degree * 1000 + rows + topk)
-    if tied:
-        generator = torch.Generator(device="cuda").manual_seed(rows)
-        ties = torch.randint(
-            0, 8, records.shape[:3], device="cuda", generator=generator
-        )
-        records[..., 1] = ties.float().view(torch.int32)
-    scores = rank_major_scores(records)
-    order, _ = gluon_dsa_logical_topk_gfx950(
-        scores,
-        torch.zeros((rows,), device="cuda", dtype=torch.int32),
-        torch.full((rows,), scores.shape[1], device="cuda", dtype=torch.int32),
-        topk=topk,
-    )
-
-    positions, counts = select_through_threshold_by_source(
-        records, scores, order, topk=topk
-    )
-    expected, expected_counts = select_through_threshold(
-        records, scores, order, topk=topk
-    )
-
-    torch.testing.assert_close(positions, expected, atol=0, rtol=0)
-    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("degree", [2, 8])
-@pytest.mark.parametrize("rows", [1, 64])
-def test_rank_major_scores_with_bounds_cover_every_candidate(degree, rows):
-    records = _records(degree, rows, 1024, seed=degree + rows)
-
-    scores, starts, ends = rank_major_scores_with_bounds(records)
-
-    torch.testing.assert_close(scores, rank_major_scores(records), atol=0, rtol=0)
-    assert (starts == 0).all()
-    assert (ends == degree * 1024).all()
-
-
-def test_gluon_merge_launches_one_specialization_across_batch_rows():
-    # Small batches select per source, large ones per row.
-    for rows in (1, 16, 600):
-        dsa_merge_candidates(
-            _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
-        )
-    with assert_no_triton_compile(
-        _extract_rank_major_scores,
-        _select_through_threshold,
-        _select_source_through_threshold,
-    ):
-        for rows in (3, 8, 37, 64, 513, 700):
-            dsa_merge_candidates(
-                _records(2, rows, 2048, seed=rows), topk=2048, solution="gluon"
-            )
-
-
 # K3.1's cache geometry: 64-token index pages inside 128-token cache blocks,
 # block ``b`` on rank ``(b - 1) % degree``.
 _PAGE, _BLOCK = 64, 128
@@ -420,14 +208,13 @@ def _local_pages(table, virtual_blocks: int, degree: int, rank: int):
 
 def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk):
     """Every rank's local slots through the full exchange: the merge's
-    selection by source, its scheduler slots, then each rank's owned share."""
+    selection (``cuda_dsa_merge_candidates``' threshold selection over an
+    exact top-k), its scheduler slots, then each rank's owned share."""
     degree = positions.shape[0]
     records = torch.stack((positions, scores.view(torch.int32)), dim=-1)
     merged = rank_major_scores(records)
     order = torch.topk(merged, topk, dim=-1).indices
-    selected, counts = select_through_threshold_by_source(
-        records, merged, order, topk=topk
-    )
+    selected, counts = select_through_threshold(records, merged, order, topk=topk)
     slots, lens = local_topk_to_global_slots(
         local_topk_offsets=selected,
         block_table=table,
@@ -448,15 +235,13 @@ def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk
     ]
 
 
-@pytest.mark.parametrize("solution", ["gluon", "triton"])
-# Three ranks are outside the one-launch gfx950 selection's power-of-two
-# layout and take the merged path.
-@pytest.mark.parametrize("degree", [2, 3, 4, 8])
+# Eight ranks, 16 requests of 4 verify rows, top-2048: K3.1's KVP8 decode.
+@pytest.mark.parametrize("degree", [2, 4, 8])
 @pytest.mark.parametrize("rows,q_len", [(1, 1), (7, 1), (64, 4)])
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize("band", ["uniform", "tied", "narrow", "single"])
 def test_owned_selection_is_each_ranks_share_of_the_merge(
-    solution, degree, rows, q_len, topk, band
+    degree, rows, q_len, topk, band
 ):
     table, virtual_blocks, positions, scores = _owned_candidates(
         degree, rows, q_len, topk, seed=degree * 1000 + rows + topk
@@ -496,7 +281,7 @@ def test_owned_selection_is_each_ranks_share_of_the_merge(
             rank=rank,
             topk=topk,
             page_size=_PAGE,
-            solution=solution,
+            solution="gluon",
         )
 
         torch.testing.assert_close(local_slots, slots, atol=0, rtol=0)
@@ -570,22 +355,15 @@ def test_owned_selection_reads_positions_past_int32_offsets():
     torch.testing.assert_close(local_counts, counts, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize(
-    "degree,kernels",
-    [
-        (2, (_select_owned_from_gathered_kernel,)),
-        (3, (_rank_major_planar_scores, _select_owned_through_threshold)),
-    ],
-)
-def test_owned_selection_launches_one_specialization_across_batch_rows(degree, kernels):
+def test_owned_selection_launches_one_specialization_across_batch_rows():
     def select(rows):
         table, virtual_blocks, positions, scores = _owned_candidates(
-            degree, rows, 1, 2048, seed=rows
+            2, rows, 1, 2048, seed=rows
         )
         dsa_select_owned_candidates(
             scores,
             positions[1].contiguous(),
-            _local_pages(table, virtual_blocks, degree, 1),
+            _local_pages(table, virtual_blocks, 2, 1),
             torch.arange(rows, device="cuda", dtype=torch.int32),
             rank=1,
             topk=2048,
@@ -594,46 +372,45 @@ def test_owned_selection_launches_one_specialization_across_batch_rows(degree, k
         )
 
     select(1)
-    with assert_no_triton_compile(*kernels):
+    with assert_no_triton_compile(_select_owned_from_gathered_kernel):
         for rows in (3, 8, 37, 64):
             select(rows)
 
 
-def test_owned_selection_selects_from_kvp8_gathered_scores_in_one_launch(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "ranks,topk,rank_stride",
+    [
+        # Not a power of two.
+        (3, 2048, 2048),
+        (6, 1024, 1024),
+        # Every rank's share of a row past the registers.
+        (16, 2048, 2048),
+        # Rank chunks read past 32-bit offsets.
+        (8, 2048, 2**31 // 7),
+    ],
+)
+def test_owned_selection_refuses_gathered_scores_it_cannot_take(
+    ranks, topk, rank_stride
 ):
-    # K3.1's KVP8 decode: 16 requests of 4 verify rows, top-2048.
-    degree, rows, q_len, topk = 8, 64, 4, 2048
-    table, virtual_blocks, positions, scores = _owned_candidates(
-        degree, rows, q_len, topk, seed=17
+    # Such KVP decodes keep the merge.
+    assert dsa_select_owned_candidates_supported(
+        ranks=2, rows=1, topk=topk, rank_stride=topk
     )
-    expected = _merged_then_compacted(
-        table, virtual_blocks, positions, scores, q_len, topk
+    assert not dsa_select_owned_candidates_supported(
+        ranks=ranks, rows=1, topk=topk, rank_stride=rank_stride
     )
-    requests = (torch.arange(rows, device="cuda") // q_len).int()
-    from tokenspeed_kernel.ops.attention.dsa._triton import candidate_exchange
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import sparse_mla
-
-    def merged_path(*args, **kwargs):
-        raise AssertionError("the gathered scores went through the merged path")
-
-    for module, name in (
-        (candidate_exchange, "rank_major_planar_scores"),
-        (candidate_exchange, "select_owned_through_threshold"),
-        (sparse_mla, "gluon_dsa_live_logical_topk_gfx950"),
-    ):
-        monkeypatch.setattr(module, name, merged_path)
-
-    for rank, (slots, counts) in enumerate(expected):
-        local_slots, local_counts = dsa_select_owned_candidates(
-            scores,
-            positions[rank].contiguous(),
-            _local_pages(table, virtual_blocks, degree, rank),
-            requests,
-            rank=rank,
-            topk=topk,
-            page_size=_PAGE,
-            solution="gluon",
+    if rank_stride == topk:
+        table, virtual_blocks, positions, scores = _owned_candidates(
+            ranks, 1, 1, topk, seed=ranks
         )
-        torch.testing.assert_close(local_slots, slots, atol=0, rtol=0)
-        torch.testing.assert_close(local_counts, counts, atol=0, rtol=0)
+        with pytest.raises(ValueError, match="power-of-two rank count"):
+            dsa_select_owned_candidates(
+                scores,
+                positions[0].contiguous(),
+                _local_pages(table, virtual_blocks, ranks, 0),
+                torch.zeros((1,), device="cuda", dtype=torch.int32),
+                rank=0,
+                topk=topk,
+                page_size=_PAGE,
+                solution="gluon",
+            )
