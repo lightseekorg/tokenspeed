@@ -350,6 +350,23 @@ trainer-side contract below) when that matters.
 
 ### Mooncake weight updates
 
+The runtime includes the independent WeightStore receiver at
+`tokenspeed.runtime.execution.weight_store`. Select it with
+`--model-update-sdk-module tokenspeed.runtime.execution.weight_store` and
+`--model-update-engine-type TOKENSPEED`, supply the standalone SDK's flat
+`backend=weight_store` configuration and use `--model-update-draft-weights retain`.
+This optional path requires the independent `weight_store` and `data_dist_hub`
+packages in the scheduler environment. It does not import a rollout framework or
+the previous weight-update SDK.
+
+The update request carries a complete publication directory in `snapshot`,
+encoded as `{version, zlib_base64}`. Tensor contents remain in the Store.
+The receiver validates the publication version, declares the target's logical HF
+regions and calls the standalone SDK on the Store device's current CUDA stream.
+The SDK reads and assembles the tensors; the native loader owns physical TP/EP
+layout and the surrounding weight-update session owns finalization. This path
+supports one unquantized target and retains draft checkpoint weights.
+
 `UpdateWeightsFromMooncakeReqInput` loads one committed checkpoint version
 that the RL trainer published to a Mooncake weight store through the Model
 Updater SDK. Fields: `version` (an integer), `flush_cache` (default true),
