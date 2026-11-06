@@ -51,3 +51,23 @@ def torch_advance_accepted_frontier(
     deltas = torch.cat([input_lengths[:num_extends], accept_lengths[num_extends:]])
     deltas = torch.where(req_pool_indices != padding_index, deltas, 0).to(torch.int32)
     valid_cache_lengths.index_add_(0, req_pool_indices, deltas)
+
+
+@register_kernel(
+    "metadata",
+    "expand_block_table_rows",
+    name="torch_expand_block_table_rows",
+    solution="torch",
+    signatures=format_signatures("rows", "dense", {torch.int32}),
+    priority=Priority.REFERENCE,
+)
+def torch_expand_block_table_rows(
+    rows: torch.Tensor, values: torch.Tensor, out: torch.Tensor
+) -> None:
+    """Fill each block-table row of ``out`` from its span, one row at a time:
+    null holes (0) before the span, its ``values``, then padding (-1)."""
+    for offset, width, start, end, source in rows.tolist():
+        row = out[offset : offset + width]
+        row[:start] = 0
+        row[start:end] = values[source : source + end - start]
+        row[end:] = -1
