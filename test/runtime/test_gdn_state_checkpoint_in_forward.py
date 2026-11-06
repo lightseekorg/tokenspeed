@@ -612,7 +612,9 @@ def test_a_checkpoint_row_compiles_no_new_state_input_kernel():
             validate=False,
             group_id="linear_attention",
         )
-        prepare_prefill_state_inputs(conv, recurrent, state_in, state_out)
+        prepare_prefill_state_inputs(
+            conv, recurrent, state_in, state_out, dtype=recurrent.dtype
+        )
 
     prepare([2, 3])
     with helper.assert_no_triton_compile(_prepare_prefill_state_inputs_kernel):

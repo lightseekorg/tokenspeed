@@ -318,9 +318,9 @@ class TestTritonRouteSelection:
         assert (self.backend._top_k_top_p_pad) == (64)
 
         self.backend.prepare_step(
-            request_ids=["a"],
+            request_ids=["b"],
             request_pool_indices=[1],
-            sampling_params_list=[_sp("a", top_k=127, top_p=0.9)],
+            sampling_params_list=[_sp("b", top_k=127, top_p=0.9)],
         )
         assert (self.backend._top_k_top_p_pad) == (128)
 
@@ -399,9 +399,9 @@ class TestTritonRouteSelection:
         )
 
         self.backend.prepare_step(
-            request_ids=["a"],
+            request_ids=["b"],
             request_pool_indices=[1],
-            sampling_params_list=[_sp("a", top_k=-1, top_p=0.9)],
+            sampling_params_list=[_sp("b", top_k=-1, top_p=0.9)],
             num_tokens_per_req=4,
         )
         assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
@@ -409,9 +409,9 @@ class TestTritonRouteSelection:
         )
 
         self.backend.prepare_step(
-            request_ids=["a"],
+            request_ids=["c"],
             request_pool_indices=[1],
-            sampling_params_list=[_sp("a", top_k=50, top_p=1.0)],
+            sampling_params_list=[_sp("c", top_k=50, top_p=1.0)],
             num_tokens_per_req=4,
         )
         assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
@@ -419,9 +419,9 @@ class TestTritonRouteSelection:
         )
 
         self.backend.prepare_step(
-            request_ids=["a"],
+            request_ids=["d"],
             request_pool_indices=[1],
-            sampling_params_list=[_sp("a", top_k=50, top_p=0.9)],
+            sampling_params_list=[_sp("d", top_k=50, top_p=0.9)],
             num_tokens_per_req=4,
         )
         assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
@@ -1113,9 +1113,9 @@ class TestTritonFullIndependentState:
         )
 
         self.backend.prepare_step(
-            request_ids=["a"],
+            request_ids=["b"],
             request_pool_indices=[1],
-            sampling_params_list=[_sp("a", top_k=64, top_p=0.9, min_p=0.05)],
+            sampling_params_list=[_sp("b", top_k=64, top_p=0.9, min_p=0.05)],
             num_tokens_per_req=4,
         )
         assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (

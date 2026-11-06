@@ -18,9 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Each PDL-enabled kernel must call ``gdc_wait()`` before it reads anything an
-upstream kernel wrote, since ``launch_pdl=True`` lets its CTAs be scheduled
-before that upstream kernel retires.
+"""Tests that PDL-enabled kernels wait for upstream writes before reading.
+
+Each must call ``gdc_wait()`` before it reads anything an upstream kernel
+wrote, since ``launch_pdl=True`` lets its CTAs be scheduled before that
+upstream kernel retires.
 
 Every case below races a synthetic slow producer against the kernel under
 test on the same stream, with no host sync in between. Like the production
@@ -36,10 +38,14 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsv41 import rope_quantize_fp8_grouped
 from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
     stage_mxfp4_mega_moe_inputs,
 )
-from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
+from tokenspeed_kernel.ops.quantization.triton import (
+    _quantize_fp8_group32_swizzled,
+    triton_rmsnorm_fp8_group32_ue8m0,
+)
 from tokenspeed_kernel.ops.residual.triton import (
     mhc_pre_layer_norm_hc4,
     mhc_pre_mix_hc4,
@@ -122,8 +128,9 @@ def _poison_like(real: torch.Tensor) -> torch.Tensor:
 
 
 def _publish_with_delay(real: torch.Tensor, dst: torch.Tensor, delay_ns: int) -> None:
-    """Copy ``real``'s bytes into ``dst`` after a delay, letting the next
-    kernel launch before the copy lands.
+    """Copy ``real``'s bytes into ``dst`` after a delay.
+
+    The next kernel can launch before the copy lands.
     """
     assert real.shape == dst.shape and real.dtype == dst.dtype
     assert real.is_contiguous() and dst.is_contiguous()
@@ -236,8 +243,39 @@ def _case_quantize_fp8_group32_swizzled():
     return real, run
 
 
-def _case_stage_mxfp4_mega_moe_inputs():
+def _case_rmsnorm_fp8_group32_swizzled():
+    torch.manual_seed(106)
+    rows, hidden = 32, 1536
+    real = torch.randn(rows, hidden, dtype=torch.bfloat16, device=DEVICE)
+    weight = torch.randn(hidden, dtype=torch.bfloat16, device=DEVICE)
+
+    def run(x):
+        return triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, swizzled_scales=True)
+
+    return real, run
+
+
+def _case_rope_quantize_fp8_grouped():
     torch.manual_seed(107)
+    # 37 tokens: programs past T (aligned to 4) only zero padding scale rows,
+    # and they must wait too.
+    tokens, heads = 37, 64
+    real = torch.randn(tokens, heads, 512, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE) * 3
+    angles = torch.arange(4096, device=DEVICE)[:, None].float() * torch.exp(
+        -torch.arange(32, device=DEVICE).float() / 4
+    )
+    cache = torch.cat((angles.cos(), -angles.sin()), dim=-1)
+
+    def run(values):
+        codes, scales = rope_quantize_fp8_grouped(values, positions, cache, 8)
+        return (codes, scales.contiguous())
+
+    return real, run
+
+
+def _case_stage_mxfp4_mega_moe_inputs():
+    torch.manual_seed(108)
     tokens, hidden, top_k = 64, 5120, 6
     real = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=DEVICE)
     weights = torch.rand(tokens, top_k, dtype=torch.float32, device=DEVICE)
@@ -261,6 +299,8 @@ _CASES = {
     "mhc_pre_mix_hc4": _case_mhc_pre_mix,
     "mhc_pre_layer_norm_hc4": _case_mhc_pre_layer_norm,
     "fp8_group32_ue8m0_quantize_swizzled": _case_quantize_fp8_group32_swizzled,
+    "rmsnorm_fp8_group32_ue8m0": _case_rmsnorm_fp8_group32_swizzled,
+    "dsv41_rope_quantize_fp8_grouped": _case_rope_quantize_fp8_grouped,
     "stage_mxfp4_mega_moe_inputs": _case_stage_mxfp4_mega_moe_inputs,
 }
 

@@ -883,6 +883,8 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         self.index_topk = config.index_topk
         self.index_kpool = config.index_kpool
         self.is_nextn = False
+        # Every rank selects every prefill row (validated configuration).
+        self.prefill_topk_tp_split = False
         self.skip_indexer_topk = config.indexer_types[layer_id] == "shared"
         self.indexer = (
             None

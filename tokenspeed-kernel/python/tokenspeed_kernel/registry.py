@@ -43,6 +43,7 @@ __all__ = [
     "load_builtin_kernels",
     "register_kernel",
     "describe_kernel",
+    "priority_band_name",
 ]
 
 
@@ -140,6 +141,13 @@ class Priority(IntEnum):
 def _band_for(value: int) -> Priority:
     """Return the band that contains ``value`` (the largest band start ≤ value)."""
     return max((b for b in Priority if int(b) <= value), key=int)
+
+
+def priority_band_name(value: int) -> str:
+    """Spell a priority as its band plus offset: ``PORTABLE``, ``SPECIALIZED+1``."""
+    band = _band_for(value)
+    offset = int(value) - int(band)
+    return band.name if offset == 0 else f"{band.name}+{offset}"
 
 
 def _validate_priority(value: int | Priority) -> int:
@@ -466,9 +474,7 @@ def describe_kernel(name: str) -> str:
     if not spec:
         return f"Kernel '{name}' not found"
 
-    band = _band_for(spec.priority)
-    offset = spec.priority - int(band)
-    band_str = band.name if offset == 0 else f"{band.name}+{offset}"
+    band_str = priority_band_name(spec.priority)
     lines = [
         f"Kernel: {spec.name}",
         f"  Operator: {spec.family}.{spec.mode}",
