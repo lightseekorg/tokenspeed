@@ -129,7 +129,8 @@ def _make_moe(fork: _SpyFork, *, num_tokens: int) -> SimpleNamespace:
         ),
         # None keeps this on the separate per-module projections, which is the
         # composition whose fork structure these tests pin.
-        _latent_input_projections=lambda hs, shared_out=None: None,
+        _latent_input_projections=lambda hs, shared_out=None, **kwargs: None,
+        packed_input_projection_weight=None,
         shared_experts=lambda hs, down_out=None: hs,
         routed_expert_down_proj=lambda hs: (hs, None),
         experts=SimpleNamespace(_situ_output_buffer=None),
@@ -254,6 +255,7 @@ def _make_amd_moe(fork, *, routed, shared, projection, norm, mapping):
     moe.shared_experts = mock.Mock(return_value=shared)
     moe._routed_experts = mock.Mock(return_value=routed)
     moe._forward_amd = KimiLinearMoE._forward_amd.__get__(moe)
+    moe._replicated_moe_experts = KimiLinearMoE._replicated_moe_experts.__get__(moe)
     return moe
 
 
@@ -350,6 +352,9 @@ def test_row_sharded_moe_tail_selection_and_fallback(
         moe_tail=candidate,
         all_reduce=SimpleNamespace(owns_outputs=lambda tensors: producer_direct),
         reduce_moe=lambda tensors: joined(tensors, group),
+        can_moe_gather_tail=lambda *args: False,
+        can_reduce_moe_topk_partials=lambda shapes: False,
+        can_latent_input_gather=lambda *args: False,
     )
     monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
     monkeypatch.setattr(mod, "all_reduce", joined)
@@ -381,6 +386,7 @@ def test_row_sharded_moe_tail_selection_and_fallback(
             prefix_is_sharded=False,
             norm_weight=norm.weight if has_norm else None,
             eps=norm.variance_epsilon if has_norm else None,
+            shared_reduced=None,
         )
     else:
         candidate.assert_not_called()
@@ -491,6 +497,9 @@ def test_sharded_attention_residual_is_gathered_before_moe_fallback(
         moe_tail=candidate,
         all_reduce=SimpleNamespace(owns_outputs=lambda tensors: producer_direct),
         reduce_moe=lambda tensors: joined(tensors, group),
+        can_moe_gather_tail=lambda *args: False,
+        can_reduce_moe_topk_partials=lambda shapes: False,
+        can_latent_input_gather=lambda *args: False,
     )
     monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
     monkeypatch.setattr(mod, "all_gather", gather)
@@ -525,6 +534,323 @@ def test_sharded_attention_residual_is_gathered_before_moe_fallback(
             routed, full, shared
         )
         assert fork.events == ["fork", "join", "gather", "reduce", "project"]
+
+
+@pytest.mark.parametrize("gathering", [False, True])
+@pytest.mark.parametrize("publishes", [False, True])
+@pytest.mark.parametrize(
+    "rows,declined,accepted",
+    [
+        (4096, False, True),
+        (8192, False, False),
+        (4096, True, True),
+        (2048, False, True),
+    ],
+)
+def test_row_sharded_moe_inputs_feed_experts_and_tail(
+    monkeypatch, rows, declined, accepted, publishes, gathering
+):
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    group = tuple(range(8))
+    attempted = rows >= mod._IRIS_MOE_ROW_INPUT_MIN_TOKENS
+    row_inputs = attempted and not declined
+    routed = torch.empty((rows, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
+    shard = torch.empty((rows // 8, 7168), dtype=torch.bfloat16, device="meta")
+    full = torch.empty_like(shared)
+    expected = torch.empty_like(shared)
+    fork = _SpyFork()
+    moe = _make_amd_moe(
+        fork,
+        routed=routed,
+        shared=shared,
+        projection=SimpleNamespace(
+            narrowed=False,
+            solution="auto",
+            weight=torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta"),
+            forward_add3=mock.Mock(return_value=expected),
+        ),
+        norm=None,
+        mapping=SimpleNamespace(
+            pp_size=1,
+            attn=SimpleNamespace(dp_size=1, tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+        ),
+    )
+    moe.packed_input_projection_weight = torch.empty(
+        (6016, 7168), dtype=torch.bfloat16, device="meta"
+    )
+    packed = (torch.empty((rows, 1792), dtype=torch.uint8, device="meta"), None)
+    weights = torch.empty((rows, 16), device="meta")
+    ids = torch.empty((rows, 16), dtype=torch.int32, device="meta")
+    shared_input = torch.empty((rows, 768), dtype=torch.bfloat16, device="meta")
+    if row_inputs:
+        moe.routed_expert_down_proj = SimpleNamespace(narrowed=False)
+        moe.shared_experts = SimpleNamespace(
+            act_fn=SimpleNamespace(beta=4.0, linear_beta=25.0),
+            down_proj=SimpleNamespace(weight=torch.empty(7168, 768, device="meta")),
+        )
+    else:
+        moe.shared_experts = mock.Mock(
+            return_value=shared, act_fn=SimpleNamespace(beta=4.0, linear_beta=25.0)
+        )
+        moe.routed_expert_down_proj = mock.Mock(
+            return_value=(full, None), narrowed=False
+        )
+
+    def project_shared(rows_in, weight, *, out):
+        assert rows_in is shared_input and out is shared
+        fork.events.append("shared_down")
+        return out
+
+    def experts(rows_in, topk_output, *args, **kwargs):
+        fork.events.append("experts")
+        if row_inputs:
+            assert rows_in is packed
+            assert topk_output.topk_weights is weights
+            assert topk_output.topk_ids is ids
+        return routed
+
+    def tail(*args, **kwargs):
+        assert not fork.inside_scope
+        fork.events.append("tail")
+        return expected if accepted else None
+
+    candidate = mock.Mock(side_effect=tail)
+
+    def reduce_moe(tensors):
+        fork.events.append("reduce")
+        return (routed, shared)
+
+    def project_moe_shared(rows_in, weight, outputs):
+        assert rows_in is shared_input and outputs == (routed, shared)
+        assert weight is moe.shared_experts.down_proj.weight
+        if record is not None:
+            fork.events.append("shared_down+reduce")
+        return record
+
+    record = object() if publishes else None
+    joined = mock.Mock(side_effect=reduce_moe)
+    moe._routed_experts = mock.Mock(side_effect=experts)
+    moe.iris_state = SimpleNamespace(
+        moe_tail=candidate,
+        project_moe_shared=mock.Mock(side_effect=project_moe_shared),
+        join_moe_shared=mock.Mock(
+            side_effect=lambda *args: fork.events.append("join_shared")
+        ),
+        join_gather=mock.Mock(),
+        moe_row_sharded_inputs=mock.Mock(
+            return_value=(packed, weights, ids, shared_input) if row_inputs else None
+        ),
+        all_reduce=SimpleNamespace(owns_outputs=lambda tensors: True),
+        reduce_moe=joined,
+        can_moe_gather_tail=lambda *args: False,
+        can_reduce_moe_topk_partials=lambda shapes: False,
+        can_latent_input_gather=lambda *args: False,
+    )
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
+    monkeypatch.setattr(mod, "kimi3_shared_down_projection", project_shared)
+    monkeypatch.setattr(mod, "all_gather", mock.Mock(return_value=full))
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: False)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: False)
+    monkeypatch.setattr(mod, "can_acquire_all_reduce_outputs", lambda *args: True)
+    monkeypatch.setattr(
+        mod, "acquire_all_reduce_outputs", lambda *args: (routed, shared)
+    )
+    monkeypatch.setattr(mod, "_amd_moe_join_lane", lambda *args: None)
+
+    pending = object() if gathering else None
+    result = KimiLinearMoE.forward(
+        moe, full, shard, rows, rows, prefix_is_sharded=True, attention_gather=pending
+    )
+
+    if not attempted:
+        moe.iris_state.moe_row_sharded_inputs.assert_not_called()
+        # Every row is read below: the attention gather joins first.
+        if gathering:
+            moe.iris_state.join_gather.assert_called_once_with(pending)
+        else:
+            moe.iris_state.join_gather.assert_not_called()
+        assert fork.events == ["fork", "experts", "join", "tail"]
+        return
+    call = moe.iris_state.moe_row_sharded_inputs.call_args
+    assert call.args == (full, moe.packed_input_projection_weight)
+    # The row-sharded projection joins the gather itself after the owned rows.
+    assert call.kwargs["attention_gather"] is pending
+    moe.iris_state.join_gather.assert_not_called()
+    assert call.kwargs["beta"] == 4.0 and call.kwargs["linear_beta"] == 25.0
+    # The router allocates its outputs; the gather copies the (weights, ids) pair.
+    route = call.kwargs["route"]
+    routed_rows = torch.empty(rows // 8, 7168, device="meta")
+    moe.topk = mock.Mock(return_value=mod.StandardTopKOutput(weights, ids, None))
+    assert route(routed_rows, full) == (weights, ids)
+    assert moe.topk.call_args.args == (routed_rows, full)
+    assert "out" not in moe.topk.call_args.kwargs
+    declined_tail = [] if accepted else (["join_shared"] if publishes else [])
+    declined_tail += [] if accepted else ["reduce"]
+    if row_inputs:
+        # Experts overlap a publishing shared GEMM's reduce; other reduces must join it.
+        shared_down = "shared_down+reduce" if publishes else "shared_down"
+        assert fork.events == [shared_down, "experts", "tail", *declined_tail]
+        assert candidate.call_args.kwargs["shared_reduced"] is record
+        if publishes and not accepted:
+            moe.iris_state.join_moe_shared.assert_called_once_with(record, shared)
+    else:
+        assert fork.events == ["fork", "experts", "join", "tail", *declined_tail[-1:]]
+        moe.shared_experts.assert_called_once_with(full, down_out=shared)
+        moe.iris_state.project_moe_shared.assert_not_called()
+        assert candidate.call_args.kwargs["shared_reduced"] is None
+    assert candidate.call_args.kwargs["prefix_is_sharded"] is True
+    if accepted:
+        assert result is expected
+        joined.assert_not_called()
+    else:
+        joined.assert_called_once_with((routed, shared))
+        assert result._base is expected
+
+
+@pytest.mark.parametrize(
+    "rows,gather_tail_available,gathered",
+    [(40, True, True), (48, True, True), (64, True, True), (48, False, False)]
+    + [(72, True, False)],
+)
+def test_replicated_decode_rows_prefer_the_gather_tail(
+    monkeypatch, rows, gather_tail_available, gathered
+):
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    group = tuple(range(8))
+    routed = torch.empty((rows, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
+    prefix = torch.empty_like(shared)
+    row_sharded, gathered_out = torch.empty_like(shared), torch.empty_like(shared)
+    projection = SimpleNamespace(
+        narrowed=False,
+        solution="auto",
+        weight=torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta"),
+        forward_add3=mock.Mock(side_effect=AssertionError("replicated projection")),
+    )
+    moe = _make_amd_moe(
+        _SpyFork(),
+        routed=routed,
+        shared=shared,
+        projection=projection,
+        norm=None,
+        mapping=SimpleNamespace(
+            pp_size=1,
+            attn=SimpleNamespace(dp_size=1, tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+        ),
+    )
+    can_gather = mock.Mock(
+        side_effect=lambda routed_rows, *args: gather_tail_available
+        and routed_rows.shape[0] <= 64
+    )
+    moe.iris_state = SimpleNamespace(
+        moe_tail=mock.Mock(return_value=row_sharded),
+        all_reduce=SimpleNamespace(owns_outputs=lambda tensors: True),
+        reduce_moe=mock.Mock(return_value=(routed, shared)),
+        can_moe_gather_tail=can_gather,
+        moe_gather_tail=mock.Mock(return_value=gathered_out),
+        can_reduce_moe_topk_partials=lambda shapes: False,
+        can_latent_input_gather=lambda *args: False,
+    )
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: True)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: True)
+    monkeypatch.setattr(mod, "can_acquire_all_reduce_outputs", lambda *args: True)
+    monkeypatch.setattr(
+        mod, "acquire_all_reduce_outputs", lambda *args: (routed, shared)
+    )
+    monkeypatch.setattr(mod, "_amd_moe_join_lane", lambda *args: None)
+
+    output = KimiLinearMoE.forward(
+        moe, prefix, prefix, rows, rows, prefix_is_sharded=False
+    )
+
+    # To 64 rows the gather tail replaces the row-sharded one, seeing the shapes first.
+    if gathered:
+        assert output is gathered_out
+        moe.iris_state.moe_tail.assert_not_called()
+        moe.iris_state.reduce_moe.assert_called_once_with((routed, shared))
+    else:
+        assert output is row_sharded
+        moe.iris_state.moe_tail.assert_called_once()
+        moe.iris_state.moe_gather_tail.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "rows,gathered", [(8, True), (32, True), (64, True), (48, False)]
+)
+def test_decode_top_k_slot_rows_reduce_in_the_moe_all_reduce(
+    monkeypatch, rows, gathered
+):
+    """Where the MoE all-reduce sums the top-k slot rows, the experts return
+    them unreduced: the tail decision reads the producer's routed output, the
+    row-sharded tail never takes slot rows, and the reduction gets them."""
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    group = tuple(range(8))
+    routed = torch.empty((rows, 3584), dtype=torch.bfloat16, device="meta")
+    slots = torch.empty((rows * 16, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
+    prefix = torch.empty_like(shared)
+    gathered_out = torch.empty_like(shared)
+    projection = SimpleNamespace(
+        narrowed=False,
+        solution="auto",
+        weight=torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta"),
+        forward_add3=mock.Mock(return_value=prefix),
+    )
+    moe = _make_amd_moe(
+        _SpyFork(),
+        routed=routed,
+        shared=shared,
+        projection=projection,
+        norm=None,
+        mapping=SimpleNamespace(
+            pp_size=1,
+            attn=SimpleNamespace(dp_size=1, tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+        ),
+    )
+    moe._routed_experts = mock.Mock(return_value=slots)
+    can_gather = mock.Mock(
+        side_effect=lambda routed_rows, *args: gathered and routed_rows.shape[0] <= 64
+    )
+    moe.iris_state = SimpleNamespace(
+        moe_tail=mock.Mock(side_effect=AssertionError("row-sharded tail")),
+        all_reduce=SimpleNamespace(owns_outputs=lambda tensors: True),
+        reduce_moe=mock.Mock(return_value=(routed, shared)),
+        can_moe_gather_tail=can_gather,
+        moe_gather_tail=mock.Mock(return_value=gathered_out),
+        can_reduce_moe_topk_partials=lambda shapes: True,
+        can_latent_input_gather=lambda *args: False,
+    )
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: True)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: True)
+    monkeypatch.setattr(mod, "can_acquire_all_reduce_outputs", lambda *args: True)
+    monkeypatch.setattr(
+        mod, "acquire_all_reduce_outputs", lambda *args: (routed, shared)
+    )
+    monkeypatch.setattr(mod, "_amd_moe_join_lane", lambda *args: None)
+
+    output = KimiLinearMoE.forward(
+        moe, prefix, prefix, rows, rows, prefix_is_sharded=False
+    )
+
+    assert moe.experts._situ_defer_topk_reduce is True
+    assert all(call.args[0] is routed for call in can_gather.call_args_list)
+    moe.iris_state.reduce_moe.assert_called_once_with(
+        (routed, shared), routed_partials=slots
+    )
+    moe.iris_state.moe_tail.assert_not_called()
+    if gathered:
+        assert output is gathered_out
+    else:
+        projection.forward_add3.assert_called_once()
 
 
 @pytest.mark.parametrize("rows", [32, 64])
