@@ -65,6 +65,7 @@ from contextlib import AbstractContextManager, contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
 
+import numpy as np
 import torch
 import tqdm
 
@@ -1209,13 +1210,24 @@ class PrefillGraph:
                 group_id: table.cpu().numpy()
                 for group_id, table in group_tables.items()
             }
-            dummy_forward_op = SimpleNamespace(block_tables_arrays=lambda: arrays)
+            # A span covering the whole row is exact for any table.
+            spans = {
+                group_id: np.tile(
+                    np.array([0, array.shape[1]], dtype=np.int32),
+                    (array.shape[0], 1),
+                )
+                for group_id, array in arrays.items()
+            }
+            dummy_forward_op = SimpleNamespace(
+                block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+            )
             cache_metadata = CacheBatchMetadata.from_forward_op(
                 dummy_forward_op,
                 device=self.config.device,
                 contract=self.token_to_kv_pool.arena.runtime_contract,
                 num_requests=bs,
                 validate_page_ids=True,
+                host_tables=True,
             )
             group_tables = dict(
                 cache_metadata.tables(active_forward_op=dummy_forward_op)

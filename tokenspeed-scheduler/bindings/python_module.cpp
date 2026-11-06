@@ -497,6 +497,20 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  }
                  return out;
              })
+        .def("block_table_spans",
+             [](nb::handle self) {
+                 // Zero-copy [rows, 2] int32 (released, pages) views parallel
+                 // to block_tables_arrays; `self` keeps the batch alive too.
+                 auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                 nb::dict out;
+                 for (auto& [gid, buf] : op.block_table_spans) {
+                     const std::size_t rows = op.request_ids.size();
+                     tokenspeed::FatalCheck(buf.size() == 2 * rows, "block-table spans must cover every row");
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, 2}, self);
+                 }
+                 return out;
+             })
         .def("num_extends", &tokenspeed::ForwardBatch::NumExtends);
 
     // ─── CacheOperation (attached to the Cache submodule) ──────────

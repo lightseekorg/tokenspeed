@@ -25,22 +25,26 @@ from tokenspeed_kernel.platform import pdl_enabled
 _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE = 128
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "shared_block_m"])
 def _stage_mxfp4_mega_moe_inputs_kernel(
     hidden_states,
     x_fp8,
     x_sf,
+    shared_x_sf,
     topk_ids,
     topk_weights,
     topk_idx_out,
     topk_weights_out,
     num_tokens,
+    shared_block_m,
     hidden_stride_m: tl.constexpr,
     hidden_stride_k: tl.constexpr,
     x_stride_m: tl.constexpr,
     x_stride_k: tl.constexpr,
     x_sf_stride_m: tl.constexpr,
     x_sf_stride_k: tl.constexpr,
+    shared_x_sf_stride_m: tl.constexpr,
+    shared_x_sf_stride_k: tl.constexpr,
     topk_ids_stride_m: tl.constexpr,
     topk_ids_stride_k: tl.constexpr,
     topk_weights_stride_m: tl.constexpr,
@@ -55,6 +59,7 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_K: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ) -> None:
     # The outputs live in the MegaMoE symmetric buffer, which the previous
@@ -107,6 +112,21 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
         packed_scale,
         mask=token_mask,
     )
+    if HAS_SHARED:
+        # The fused shared expert reads the same scales MN-major, rows grouped
+        # by the MegaMoE BLOCK_M and transposed within each 128 for UTCCP.
+        m_block = token_ids // shared_block_m
+        m_in_block = token_ids % shared_block_m
+        shared_rows = m_block * ((shared_block_m + 127) // 128 * 128) + (
+            m_in_block // 128 * 128 + m_in_block % 32 * 4 + m_in_block % 128 // 32
+        )
+        tl.store(
+            shared_x_sf
+            + shared_rows * shared_x_sf_stride_m
+            + k_block_id * shared_x_sf_stride_k,
+            packed_scale,
+            mask=token_mask,
+        )
 
     if k_block_id == 0:
         topk_offsets = tl.arange(0, BLOCK_TOPK)
@@ -156,8 +176,18 @@ def stage_mxfp4_mega_moe_inputs(
     x_sf: torch.Tensor,
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
+    shared_x_sf: torch.Tensor | None,
+    shared_block_m: int | None,
 ) -> None:
+    """Write MegaMoE's FP8 inputs and routing into its symmetric buffer.
+
+    ``shared_x_sf`` and ``shared_block_m``, both given or both None, add the
+    scale view a fused shared expert reads; ``shared_block_m`` is the BLOCK_M
+    MegaMoE runs this token count with.
+    """
     num_tokens, hidden_size = hidden_states.shape
+    if (shared_x_sf is None) != (shared_block_m is None):
+        raise ValueError("shared_x_sf and shared_block_m go together")
     if num_tokens == 0:
         return
     if hidden_size % _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE != 0:
@@ -180,17 +210,21 @@ def stage_mxfp4_mega_moe_inputs(
         hidden_states,
         x_fp8,
         x_sf,
+        shared_x_sf,
         topk_ids,
         topk_weights,
         topk_idx_out,
         topk_weights_out,
         num_tokens,
+        shared_block_m or 1,
         hidden_states.stride(0),
         hidden_states.stride(1),
         x_fp8.stride(0),
         x_fp8.stride(1),
         x_sf.stride(0),
         x_sf.stride(1),
+        shared_x_sf.stride(0) if shared_x_sf is not None else 0,
+        shared_x_sf.stride(1) if shared_x_sf is not None else 0,
         topk_ids.stride(0),
         topk_ids.stride(1),
         topk_weights.stride(0),
@@ -205,6 +239,7 @@ def stage_mxfp4_mega_moe_inputs(
         BLOCK_K=block_k,
         GROUP_K=32,
         BLOCK_TOPK=block_topk,
+        HAS_SHARED=shared_x_sf is not None,
         ENABLE_PDL=enable_pdl,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),

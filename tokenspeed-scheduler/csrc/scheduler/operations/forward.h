@@ -118,6 +118,11 @@ struct ForwardBatch {
     // (null hole = 0, no compaction); there is no base-offset companion.
     // One owned row-major buffer per group, exposed zero-copy to Python.
     std::map<std::string, std::vector<std::int32_t>> block_tables_contig;
+    // Per-group row spans parallel to block_tables_contig: [num_reqs, 2]
+    // (released, pages). A row's columns before `released` are the released
+    // prefix's null holes and its columns from `pages` on are -1 padding, so
+    // a consumer can move [released, pages) and rebuild the rest unread.
+    std::map<std::string, std::vector<std::int32_t>> block_table_spans;
     explicit ForwardBatch(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
@@ -160,12 +165,17 @@ struct ForwardBatch {
             const std::size_t columns = group_columns.second;
             auto& contiguous = block_tables_contig[gid];
             contiguous.reserve(request_ids.size() * columns);
+            auto& spans = block_table_spans[gid];
+            spans.reserve(2 * request_ids.size());
             for (const auto& op : ops) {
                 std::visit(
                     [&](const auto& inner) {
+                        std::int32_t released = 0;
                         std::size_t pages = 0;
                         if (const auto it = inner.block_tables.find(gid); it != inner.block_tables.end()) {
                             const auto& source = it->second;
+                            // The prefix AppendBlockTablePageIds writes as null holes.
+                            released = source.table.ReclaimedPrefixBlocks();
                             source.allocator.AppendBlockTablePageIds(source.table, contiguous);
                             if (source.checkpoint_page_id != 0) {
                                 contiguous.push_back(source.checkpoint_page_id);
@@ -173,6 +183,8 @@ struct ForwardBatch {
                             pages = source.NumPages();
                         }
                         contiguous.insert(contiguous.end(), columns - pages, -1);
+                        spans.push_back(released);
+                        spans.push_back(static_cast<std::int32_t>(pages));
                     },
                     op);
             }
