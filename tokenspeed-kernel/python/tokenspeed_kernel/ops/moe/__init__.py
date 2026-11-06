@@ -64,6 +64,10 @@ __all__ = [
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
     "prepare_sm90_fp8_moe",
+    "moe_sorted_down",
+    "moe_sorted_gate_up",
+    "prepare_moe_sorted_down_weight",
+    "warmup_moe_sorted_prefill",
 ]
 
 
@@ -1013,6 +1017,12 @@ from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
     gather_moe_routes,
     routed_input_scale_rmsnorm_sum,
     routed_input_scale_rmsnorm_sum_gathered,
+)
+from tokenspeed_kernel.ops.moe.sorted_prefill import (  # noqa: E402
+    moe_sorted_down,
+    moe_sorted_gate_up,
+    prepare_moe_sorted_down_weight,
+    warmup_moe_sorted_prefill,
 )
 
 
