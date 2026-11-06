@@ -153,6 +153,11 @@ def bounded_group_slots(
     return out
 
 
+# Columns per load, and about how many programs a copy launches in all.
+_COPY_BLOCK = 1024
+_COPY_PROGRAMS = 8192
+
+
 @triton.jit(
     do_not_specialize=[
         "live_rows",
@@ -174,13 +179,15 @@ def _copy_page_table_kernel(
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    value = tl.load(
-        Source + row * source_stride + col,
-        (row < live_rows) & (col < source_cols),
-        other=0,
-    )
-    tl.store(Out + row * out_stride + col, value, col < out_cols)
+    source = Source + row.to(tl.int64) * source_stride
+    out = Out + row.to(tl.int64) * out_stride
+    live = row < live_rows
+    # A row's programs stride over its blocks: a capacity-wide table (the
+    # max model length) needs no program per block.
+    for block in range(tl.program_id(1), tl.cdiv(out_cols, BLOCK), tl.num_programs(1)):
+        col = block * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(source + col, live & (col < source_cols), other=0)
+        tl.store(out + col, value, col < out_cols)
 
 
 def copy_page_table(source: torch.Tensor, out: torch.Tensor, live_rows: int) -> None:
@@ -204,7 +211,9 @@ def copy_page_table(source: torch.Tensor, out: torch.Tensor, live_rows: int) -> 
         out[:live_rows, : source.shape[1]].copy_(source[:live_rows])
         return
     if out.numel():
-        _copy_page_table_kernel[(out.shape[0], triton.cdiv(out.shape[1], 256))](
+        blocks = triton.cdiv(out.shape[1], _COPY_BLOCK)
+        programs = min(blocks, max(1, triton.cdiv(_COPY_PROGRAMS, out.shape[0])))
+        _copy_page_table_kernel[(out.shape[0], programs)](
             source,
             out,
             live_rows,
@@ -212,5 +221,5 @@ def copy_page_table(source: torch.Tensor, out: torch.Tensor, live_rows: int) -> 
             source.stride(0),
             out.shape[1],
             out.stride(0),
-            BLOCK=256,
+            BLOCK=_COPY_BLOCK,
         )
