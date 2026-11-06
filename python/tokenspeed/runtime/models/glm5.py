@@ -1799,6 +1799,57 @@ def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
     proj.weight = padded
 
 
+def load_fused_indexer_projection(
+    name: str,
+    loaded_weight: torch.Tensor,
+    *,
+    params_dict: dict[str, torch.Tensor],
+    modules_dict: dict[str, nn.Module],
+    pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
+    loaded_shards: dict[str, set[int]],
+    weight_block_size: list[int] | None,
+) -> None:
+    """Copy an indexer ``wk`` / ``weights_proj`` checkpoint tensor into shard
+    0 / 1 of the bf16 fused ``wk_weights_proj``.
+
+    An FP8 ``wk`` and its ``weight_scale_inv`` wait in ``pending_fp8_wk`` for
+    each other, then load block-dequantized. Once both shards of a module have
+    loaded, its indexer switches to the fused projection.
+    """
+    if ".indexer.weights_proj.weight" in name:
+        module_name, shard_id = name.rsplit(".weights_proj.weight", 1)[0], 1
+    elif ".indexer.wk." in name:
+        module_name, shard_id = name.rsplit(".wk.", 1)[0], 0
+        is_fp8_weight = name.endswith(".weight") and loaded_weight.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        )
+        if is_fp8_weight or "weight_scale_inv" in name:
+            entry = pending_fp8_wk.setdefault(module_name, {})
+            entry["weight" if is_fp8_weight else "scale"] = loaded_weight
+            if len(entry) < 2 or weight_block_size is None:
+                return
+            del pending_fp8_wk[module_name]
+            loaded_weight = block_dequant(
+                entry["weight"], entry["scale"], list(weight_block_size)
+            ).to(torch.bfloat16)
+        elif not name.endswith(".weight"):
+            return
+    else:
+        return
+
+    param = params_dict.get(f"{module_name}.wk_weights_proj.weight")
+    if param is None:
+        return
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    weight_loader(param, loaded_weight, shard_id)
+    shards = loaded_shards.setdefault(module_name, set())
+    shards.add(shard_id)
+    module = modules_dict.get(module_name)
+    if shards == {0, 1} and isinstance(module, GlmDsaIndexer):
+        module.set_wk_weights_proj_loaded()
+
+
 class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
     model_cls = GlmMoeDsaModel
 
@@ -1856,144 +1907,6 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
             )
         super().end_weight_update()
 
-    def _record_fused_indexer_projection_shard(
-        self,
-        *,
-        module_name: str,
-        shard_id: int,
-        loaded_shards: dict[str, set[int]],
-        modules_dict: dict[str, nn.Module],
-    ) -> None:
-        shards = loaded_shards.setdefault(module_name, set())
-        shards.add(int(shard_id))
-        if shards != {0, 1}:
-            return
-
-        module = modules_dict.get(module_name)
-        if isinstance(module, GlmDsaIndexer):
-            module.set_wk_weights_proj_loaded()
-
-    def _load_fused_indexer_projection_shard(
-        self,
-        *,
-        module_name: str,
-        shard_id: int,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        loaded_shards: dict[str, set[int]],
-    ) -> bool:
-        param = params_dict.get(f"{module_name}.wk_weights_proj.weight")
-        if param is None:
-            return False
-
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, loaded_weight, shard_id)
-        self._record_fused_indexer_projection_shard(
-            module_name=module_name,
-            shard_id=shard_id,
-            loaded_shards=loaded_shards,
-            modules_dict=modules_dict,
-        )
-        return True
-
-    def _flush_fused_indexer_fp8_wk(
-        self,
-        *,
-        module_name: str,
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        loaded_shards: dict[str, set[int]],
-    ) -> None:
-        entry = pending_fp8_wk.get(module_name)
-        if not entry or "weight" not in entry or "scale" not in entry:
-            return
-        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
-        if weight_block_size is None:
-            return
-
-        weight_fp8 = entry["weight"]
-        scale = entry["scale"]
-        weight_bf16 = block_dequant(
-            weight_fp8,
-            scale,
-            list(weight_block_size),
-        ).to(torch.bfloat16)
-        if self._load_fused_indexer_projection_shard(
-            module_name=module_name,
-            shard_id=0,
-            loaded_weight=weight_bf16,
-            params_dict=params_dict,
-            modules_dict=modules_dict,
-            loaded_shards=loaded_shards,
-        ):
-            del pending_fp8_wk[module_name]
-
-    def _try_load_fused_indexer_projection(
-        self,
-        *,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
-        loaded_shards: dict[str, set[int]],
-    ) -> None:
-        if ".indexer.wk_weights_proj." in name:
-            return
-
-        if ".indexer.weights_proj.weight" in name:
-            module_name = name.rsplit(".weights_proj.weight", 1)[0]
-            self._load_fused_indexer_projection_shard(
-                module_name=module_name,
-                shard_id=1,
-                loaded_weight=loaded_weight,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if ".indexer.wk." not in name:
-            return
-
-        module_name = name.rsplit(".wk.", 1)[0]
-        if name.endswith(".weight") and loaded_weight.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            pending_fp8_wk.setdefault(module_name, {})["weight"] = loaded_weight
-            self._flush_fused_indexer_fp8_wk(
-                module_name=module_name,
-                pending_fp8_wk=pending_fp8_wk,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if name.endswith(".weight"):
-            self._load_fused_indexer_projection_shard(
-                module_name=module_name,
-                shard_id=0,
-                loaded_weight=loaded_weight,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if "weight_scale_inv" in name:
-            pending_fp8_wk.setdefault(module_name, {})["scale"] = loaded_weight
-            self._flush_fused_indexer_fp8_wk(
-                module_name=module_name,
-                pending_fp8_wk=pending_fp8_wk,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
@@ -2022,13 +1935,16 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded.add(param_names[id(param)])
-                self._try_load_fused_indexer_projection(
-                    name=name,
-                    loaded_weight=loaded_weight,
+                load_fused_indexer_projection(
+                    name,
+                    loaded_weight,
                     params_dict=params_dict,
                     modules_dict=modules_dict,
                     pending_fp8_wk=pending_fp8_wk,
                     loaded_shards=loaded_fused_indexer_shards,
+                    weight_block_size=getattr(
+                        self.quant_config, "weight_block_size", None
+                    ),
                 )
 
         loaded |= super().load_weights(base_weights())
