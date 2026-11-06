@@ -66,10 +66,12 @@ over the `(S - 1) * K`-key lane window (below). There is no size-dependent
 second path.
 
 The `mha` leaf (the AMD path) runs the same cascade with a portable prefix
-half: the Triton extend, causal over `q_len = R` rows with its log-sum-exp
-(scaled to base 2 for the merge). It is pinned to Triton because its causal
-mask keeps row `r` at key `P - R + r` even when `P < R`, which the window
-kernel's merge assumes.
+half: the Triton decode, causal over `q_len = R` rows with its log-sum-exp
+(scaled to base 2 for the merge). It folds a request's `R` rows and the query
+heads of each KV head into one program per key split, so the prefix keys are
+read once per request rather than once per row. It is pinned to Triton
+because its causal mask keeps row `r` at key `P - R + r` even when `P < R`,
+which the window kernel's merge assumes.
 
 Lanes that carry per-row tables (`TreeCascadeRows.row_page_table`) let a
 sliding-window draft layer see in every lane row the window frozen at the

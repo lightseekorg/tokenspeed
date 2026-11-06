@@ -48,7 +48,10 @@ import os
 import sys
 
 import torch
-from tokenspeed_kernel.ops.attention.mha import mha_extend_with_kvcache
+from tokenspeed_kernel.ops.attention.mha import (
+    mha_decode_with_kvcache,
+    mha_extend_with_kvcache,
+)
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_decode_with_kv_cache,
 )
@@ -107,7 +110,8 @@ def attention_samples(
     sliding window decodes each row alone over the window ending there) plus
     its ``window``-key tree window. The prefix half is the one
     ``attention_backend`` serves with: ``trtllm`` the trtllm-gen decode,
-    ``mha`` the Triton extend (``MHAAttnBackend._tree_cascade``).
+    ``mha`` the Triton decode, or the Triton extend for a sliding window
+    (``MHAAttnBackend._tree_cascade``).
 
     Serving forwards all ``rows`` whatever the round's width, so one timing
     per context stands for every swept width.
@@ -183,8 +187,26 @@ def attention_samples(
         )
 
         def prefix_half() -> tuple[torch.Tensor, torch.Tensor]:
-            if not trtllm:
+            if not trtllm and causal:
                 # Pinned to Triton as serving pins it (MHAAttnBackend._tree_cascade).
+                out, lse = mha_decode_with_kvcache(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    page_table=tables,
+                    cache_seqlens=prefix_lens,
+                    max_seqlen_k=context_stop + window,
+                    max_seqlen_q=q_len,
+                    window_left=-1,
+                    logit_cap=0.0,
+                    sinks=None,
+                    return_lse=True,
+                    softmax_scale=scale,
+                    solution="triton",
+                )
+                # The window kernel merges in base 2.
+                return out, lse * 1.4426950408889634
+            if not trtllm:
                 out, lse = mha_extend_with_kvcache(
                     q=q,
                     cu_seqlens_q=cu_seqlens_q,

@@ -161,7 +161,7 @@ def triton_mha_extend_with_kvcache(
     priority=Priority.PORTABLE,
     traits={
         "logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False}),
+        "return_lse": frozenset({False, True}),
         "sinks": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
     },
@@ -183,7 +183,7 @@ def triton_mha_decode_with_kvcache(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     enable_pdl: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _triton_mha_decode_with_kvcache_impl(
         q=q,
         k_cache=k_cache,
