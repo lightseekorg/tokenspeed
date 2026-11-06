@@ -29,6 +29,7 @@ import math
 
 import torch
 import torch.distributed
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import (
     CommBackend,
@@ -196,7 +197,15 @@ class NcclBackend(CommBackend):
         self.all_gather_single(output_tensor, tensor, group)
         if dim == 0:
             return output_tensor
-        return _interleave_rank_chunks(output_tensor, ws, input_size, dim)
+        if current_platform().is_amd:
+            return _interleave_rank_chunks(output_tensor, ws, input_size, dim)
+
+        output_tensor = output_tensor.reshape((ws,) + input_size)
+        output_tensor = output_tensor.movedim(0, dim)
+        output_tensor = output_tensor.reshape(
+            input_size[:dim] + (ws * input_size[dim],) + input_size[dim + 1 :]
+        )
+        return output_tensor
 
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.distributed.comm_backend import iris as iris_module
+from tokenspeed.runtime.distributed.comm_backend import nccl as nccl_module
 from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
     Collective,
@@ -307,7 +308,14 @@ def _bytes(tensor: torch.Tensor) -> torch.Tensor:
         ((2, 3), torch.float32, 0),
     ],
 )
-def test_nccl_all_gather_concatenates_the_ranks_inputs_along_dim(shape, dtype, dim):
+# AMD relayouts in 8-byte words, elsewhere through movedim.
+@pytest.mark.parametrize("is_amd", [True, False])
+def test_nccl_all_gather_concatenates_the_ranks_inputs_along_dim(
+    monkeypatch, shape, dtype, dim, is_amd
+):
+    monkeypatch.setattr(
+        nccl_module, "current_platform", lambda: SimpleNamespace(is_amd=is_amd)
+    )
     group = (0, 1, 2, 3)
     backend = NcclBackend()
     backend._resources[group] = {
