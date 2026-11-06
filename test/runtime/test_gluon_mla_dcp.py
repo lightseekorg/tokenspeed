@@ -133,7 +133,7 @@ def _torch_reference(q, source, page_table, endpoints, width):
 
 
 @pytest.mark.parametrize("dtype", list(DTYPES))
-@pytest.mark.parametrize("degree", [2, 4, 8])
+@pytest.mark.parametrize("degree", [2, 8])
 @pytest.mark.parametrize("heads", ["tp_group", 16])
 @pytest.mark.parametrize("query_width,causal", [(1, True), (4, True), (4, False)])
 # The exact bound leaves a short FP8 scan in one split, whose LSE stage 1

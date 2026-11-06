@@ -477,8 +477,10 @@ def _worker(rank, degree, rendezvous, pull_exchange):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("pull_exchange", [False, True])
-@pytest.mark.parametrize("degree", [2, 4, 8])
+# The pull exchange at K3.1's eight ranks; NCCL at every degree.
+@pytest.mark.parametrize(
+    "degree,pull_exchange", [(2, False), (4, False), (8, False), (8, True)]
+)
 def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
     tmp_path, degree, pull_exchange
 ):

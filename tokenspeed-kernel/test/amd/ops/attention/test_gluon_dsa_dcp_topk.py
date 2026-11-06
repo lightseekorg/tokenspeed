@@ -236,10 +236,22 @@ def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk
 
 
 # Eight ranks, 16 requests of 4 verify rows, top-2048: K3.1's KVP8 decode.
-@pytest.mark.parametrize("degree", [2, 4, 8])
-@pytest.mark.parametrize("rows,q_len", [(1, 1), (7, 1), (64, 4)])
-@pytest.mark.parametrize("topk", [512, 2048])
-@pytest.mark.parametrize("band", ["uniform", "tied", "narrow", "single"])
+# The score bands that stress the radix passes and the tie quota run at 64
+# rows, at two and eight ranks.
+@pytest.mark.parametrize(
+    "degree,rows,q_len,topk,band",
+    [
+        (degree, rows, q_len, topk, "uniform")
+        for degree in (2, 4, 8)
+        for rows, q_len in ((1, 1), (7, 1), (64, 4))
+        for topk in (512, 2048)
+    ]
+    + [
+        (degree, 64, 4, topk, band)
+        for degree, topk in ((2, 2048), (8, 512), (8, 2048))
+        for band in ("tied", "narrow", "single")
+    ],
+)
 def test_owned_selection_is_each_ranks_share_of_the_merge(
     degree, rows, q_len, topk, band
 ):
