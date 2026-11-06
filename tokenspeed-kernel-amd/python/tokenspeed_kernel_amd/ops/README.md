@@ -1425,14 +1425,13 @@ to `mha_decode_with_kvcache`, which then selects
 - The reduce finds a row's partials from its request's first slot and split
   count, stored next to each other, and loads them 16 bytes per lane in one
   tile of 16 or 64 splits. A row without keys merges to its sink alone.
-- The choice is by shape only: calls whose rows of one KV head take a
-  multi-wave workgroup (e.g. speculative verify) take the schedule. There it
+- The choice is by shape only: calls whose rows of one KV head take a multi-wave
+  workgroup (for example, speculative verify) take the schedule. There it
   matched or beat the split grid at every batch (1-64 requests) and length
-  (8k-190k, uniform and mixed) measured on MI355X, counting the 4-7 us
-  schedule once per step; one-wave workgroups (plain decode) lost up to
-  ~20% on uniform batches of 4 or more requests and keep the split grid.
-  Batch sizes and lengths are runtime values: the kernels compile once per
-  layer shape.
+  (8k-190k, uniform and mixed) measured on MI355X, counting the 4-7 us schedule
+  once per step; one-wave workgroups (plain decode) lost up to ~20% on uniform
+  batches of 4 or more requests and keep the split grid. Batch sizes and lengths
+  are runtime values: the kernels compile once per layer shape.
 
 ### gfx950 MHA prefill
 
