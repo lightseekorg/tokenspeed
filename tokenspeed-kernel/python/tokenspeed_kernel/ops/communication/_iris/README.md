@@ -54,6 +54,13 @@ and the receiver polls until no marker remains, restores the markers, and
 advances a three-stage counter. Fusions sharing the one-shot mailbox keep its
 per-512-element stage counters; the TP8 two-shot owns its mailboxes and
 counters.
+The TP8 two-shot's phases are device functions taking the stage, so a fused
+kernel that produces the partials itself reuses its mailbox layout and
+reduction. Muse's sliding attention tail does this: in one launch, attention
+splits compute the rows, o_proj senders push straight into the
+reduce-scatter slots, and other workgroups reduce, all-gather and finish the
+attention boundary. The tail uses its own region, with each workgroup's epoch
+as the stage.
 
 Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950; its own
 ordinary all-reduces use the same `reduce_ordinary` policy. Its pre-expert
