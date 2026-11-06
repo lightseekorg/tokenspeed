@@ -27,6 +27,8 @@ from __future__ import annotations
 import pathlib
 import sys
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -56,7 +58,7 @@ def _config(
         prefix_granularity=128,
         max_num_seqs=max_num_seqs,
         chunked_prefill_size=4096,
-        vocab_size=32,
+        vocabulary=VocabularySpec(input_size=32, output_size=32),
         context_len=4096,
         physical_context_len=4096,
         device="cpu",

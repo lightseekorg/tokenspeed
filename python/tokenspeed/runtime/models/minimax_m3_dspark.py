@@ -34,6 +34,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.activation import SwigluOAI
@@ -181,12 +182,15 @@ class DSparkMiniMaxDraftModel(DSparkDraftModel):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            vocabulary=vocabulary,
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

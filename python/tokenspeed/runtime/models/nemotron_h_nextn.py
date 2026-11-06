@@ -36,6 +36,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -91,7 +92,10 @@ class NemotronHForCausalLMNextN(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         del prefix
         require_single_tp_group(mapping)
@@ -150,19 +154,22 @@ class NemotronHForCausalLMNextN(nn.Module):
             hidden, eps, mapping, config.num_hidden_layers + len(block_types)
         )
         self.lm_head = ParallelLMHead(
-            config.vocab_size,
+            self.vocabulary.output_size,
             hidden,
             tp_rank=attn.tp_rank,
             tp_size=attn.tp_size,
             tp_group=attn.tp_group,
         )
         self.logits_processor = LogitsProcessor(
-            config,
+            self.vocabulary.output_size,
             skip_all_gather=False,
             tp_rank=attn.tp_rank,
             tp_size=attn.tp_size,
             tp_group=attn.tp_group,
             dp_lm_head_tp=False,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self) -> None:

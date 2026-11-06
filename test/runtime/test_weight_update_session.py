@@ -39,6 +39,7 @@ import pytest
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.model_loader.weight_utils import bind_or_copy
 from tokenspeed.runtime.models import deepseek_nextn
 from tokenspeed.runtime.models.base import BaseCausalLM
@@ -75,7 +76,10 @@ class _TinyLM(BaseCausalLM):
 
     def __init__(self) -> None:
         super().__init__(
-            config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
+            vocabulary=VocabularySpec(input_size=1, output_size=1),
+            config=SimpleNamespace(),
+            mapping=SimpleNamespace(),
+            encoder_only=True,
         )
         self.layers = nn.ModuleList([_TinyAttention(), _TinyAttention()])
         self.post_load_calls = 0
@@ -450,7 +454,12 @@ def nextn() -> DeepseekV3ForCausalLMNextN:
         attn=attn, lm_head=lm_head, moe=SimpleNamespace(ep_rank=0, ep_size=1)
     )
     with mock.patch.object(deepseek_nextn, "DeepseekModelNextN", _DraftModel):
-        return DeepseekV3ForCausalLMNextN(config, mapping, None)
+        return DeepseekV3ForCausalLMNextN(
+            config,
+            mapping,
+            None,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        )
 
 
 def _a_proj_pair(seed: int):

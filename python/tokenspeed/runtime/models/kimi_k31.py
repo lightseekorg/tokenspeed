@@ -56,6 +56,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
@@ -471,12 +472,14 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
 class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
     """Kimi-K3.1 top-level model: the K3 model over a DSA text config."""
 
-    def __init__(self, config, mapping: Mapping, **kwargs) -> None:
+    def __init__(
+        self, config, mapping: Mapping, *, vocabulary: VocabularySpec, **kwargs
+    ) -> None:
         if not config.text_config.dsa_layer_ids:
             raise ValueError(
                 "KimiK31ForConditionalGeneration requires text_config.dsa_config"
             )
-        super().__init__(config, mapping, **kwargs)
+        super().__init__(config, mapping, **kwargs, vocabulary=vocabulary)
 
     def load_weights(self, weights) -> None:
         super().load_weights(weights)

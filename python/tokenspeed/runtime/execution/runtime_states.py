@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 import torch
 from tokenspeed_kernel.ops.metadata import apply_stop_conditions
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
 from tokenspeed.runtime.execution.slot_state import (
     pack_slot_rows,
@@ -65,18 +66,12 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
-        vocab_size: int,
+        vocabulary: VocabularySpec,
         output_length: int,
         device: str = "cuda",
-        *,
-        output_vocab_size: int | None = None,
     ):
         self.device = device
-        self.vocab_size = vocab_size
-        # An omitted head size preserves the existing shared vocabulary.
-        self.output_vocab_size = (
-            vocab_size if output_vocab_size is None else output_vocab_size
-        )
+        self.vocabulary = vocabulary
         self.ngram_accepted_tokens: torch.Tensor | None = None
         self.ngram_needs_seed: torch.Tensor | None = None
         self.ngram_request_ids: list[str | None] = []
@@ -156,7 +151,7 @@ class RuntimeStates:
         pool_size = self.valid_cache_lengths.shape[0]
         self.draft_probs_sentinel = float(reject_threshold) + 1.0
         self.draft_probs = torch.full(
-            (pool_size, spec_num_tokens, self.output_vocab_size),
+            (pool_size, spec_num_tokens, self.vocabulary.output_size),
             self.draft_probs_sentinel,
             dtype=torch.float32,
             device=self.device,

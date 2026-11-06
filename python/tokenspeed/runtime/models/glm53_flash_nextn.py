@@ -28,6 +28,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -143,7 +144,10 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         del prefix
         self.config = config.text_config
@@ -159,12 +163,12 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
         if mapping.attn.has_dp:
             self.lm_head = ReplicatedLinear(
                 self.config.hidden_size,
-                self.config.vocab_size,
+                self.vocabulary.output_size,
                 bias=False,
             )
         else:
             self.lm_head = ParallelLMHead(
-                self.config.vocab_size,
+                self.vocabulary.output_size,
                 self.config.hidden_size,
                 quant_config=quant_config,
                 tp_rank=mapping.attn.tp_rank,
@@ -172,13 +176,18 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
                 tp_group=mapping.attn.tp_group,
             )
         self.logits_processor = LogitsProcessor(
-            self.config,
+            self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
+            final_logit_softcapping=getattr(
+                self.config, "final_logit_softcapping", None
+            ),
+            use_fused_lm_head=(getattr(self.config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(self.config, "tie_word_embeddings", False),
         )
 
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:

@@ -34,6 +34,7 @@ from collections.abc import Iterable
 import torch
 
 from tokenspeed.runtime.configs.qwen3_vision_config import Qwen3VLVisionConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
@@ -173,12 +174,19 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         quant_config: QuantizationConfig | None = None,
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         self.omni_config = config
         self.thinker_config = _get_thinker_config(config)
         text_config = self.thinker_config.text_config
         _ensure_layer_types(text_config)
-        super().__init__(config=text_config, mapping=mapping, quant_config=quant_config)
+        super().__init__(
+            config=text_config,
+            mapping=mapping,
+            quant_config=quant_config,
+            vocabulary=vocabulary,
+        )
 
         self.is_multimodal_active = is_multimodal_active
         self.multimodal_embedder = (

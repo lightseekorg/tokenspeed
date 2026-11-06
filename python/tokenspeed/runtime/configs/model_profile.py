@@ -28,6 +28,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -45,6 +46,7 @@ class ModelProfile:
     omits a fact is a construction error, never a silent fallback.
 
     Attributes:
+        vocabulary: Resolved logical input and output sizes for this checkpoint.
         configure_attention: Writes the attention geometry onto the
             ``ModelConfig`` (``attention_arch``, head dimensions, scaling,
             a DSA model's ``index_k_format``), e.g. ``configure_mla_attention``
@@ -74,6 +76,7 @@ class ModelProfile:
             unlisted envelope is refused.
     """
 
+    vocabulary: VocabularySpec
     configure_attention: Callable[[ModelConfig, ServerArgs], None]
     cache_family: str
     linear_attention: str | None
@@ -85,6 +88,8 @@ class ModelProfile:
     numerics_envelopes: frozenset[str]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.vocabulary, VocabularySpec):
+            raise TypeError("ModelProfile.vocabulary must be a VocabularySpec")
         if not self.cache_family:
             raise ValueError("ModelProfile.cache_family must name a cache family")
         if self.linear_attention == "":

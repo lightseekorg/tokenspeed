@@ -30,6 +30,8 @@ from __future__ import annotations
 import os
 import sys
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 # The CI runner executes each registered test file as a standalone script.
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
@@ -542,7 +544,10 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
     inputs = _inputs()
     _, reference_states = _reference(inputs, 24)
     runtime = RuntimeStates(
-        req_pool_size=8, vocab_size=1024, output_length=width, device="cuda"
+        req_pool_size=8,
+        vocabulary=VocabularySpec(input_size=1024, output_size=1024),
+        output_length=width,
+        device="cuda",
     )
     commit = _Commit()
     prompt = list(range(4))

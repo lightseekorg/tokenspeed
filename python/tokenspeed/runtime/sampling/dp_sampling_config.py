@@ -189,9 +189,7 @@ def setup_dp_sampling(
         tp_size=processor.tp_size,
         tp_group=processor.tp_group,
         skip_all_gather=processor.skip_all_gather,
-        tie_word_embeddings=bool(
-            getattr(processor.config, "tie_word_embeddings", False)
-        ),
+        tie_word_embeddings=processor.tie_word_embeddings,
     )
     support = resolve_dp_sampling_support(
         requested=requested,

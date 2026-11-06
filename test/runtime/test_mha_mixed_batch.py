@@ -31,6 +31,7 @@ import sys
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -386,7 +387,12 @@ def _block_runtime():
     drafter = DFlash2.__new__(DFlash2)
     drafter.spec_num_tokens = drafter.draft_query_width = 16
     drafter.input_buffers = InputBuffers(4, 64, 16, device="cpu")
-    drafter.runtime_states = RuntimeStates(16, 32, 16, device="cpu")
+    drafter.runtime_states = RuntimeStates(
+        16,
+        VocabularySpec(input_size=32, output_size=32),
+        16,
+        device="cpu",
+    )
     drafter.draft_seq_lens_buf = torch.zeros(4, dtype=torch.int32)
     drafter.block_ids_buf = torch.ones((4, 16), dtype=torch.int32)
     drafter.block_positions_buf = torch.zeros((4, 16), dtype=torch.int64)

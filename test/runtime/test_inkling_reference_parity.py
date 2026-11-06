@@ -27,6 +27,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test.runtime.models.inkling_fixtures import (  # noqa: E402
     INKLING_BF16,
@@ -70,7 +72,11 @@ def _build_replica():
     with torch.device("cuda"):
         torch.set_default_dtype(torch.bfloat16)
         try:
-            model = InklingForConditionalGeneration(config, mapping)
+            model = InklingForConditionalGeneration(
+                config,
+                mapping,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+            )
         finally:
             torch.set_default_dtype(torch.float32)
     initialize_dummy_weights(model)

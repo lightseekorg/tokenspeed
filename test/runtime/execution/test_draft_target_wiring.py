@@ -87,7 +87,7 @@ def _head_layout(**overrides) -> SimpleNamespace:
     """The LM-head layout the factory compares between a target and the draft
     sharing its head (``_check_shared_head_layout``): the logits processor's
     group, width and attention-DP flag. Default: one replicated head."""
-    layout = dict(tp_group=None, tp_size=1, dp_lm_head_tp=False)
+    layout = dict(tp_group=None, tp_size=1, dp_lm_head_tp=False, output_vocab_size=128)
     layout.update(overrides)
     return SimpleNamespace(**layout)
 
@@ -255,6 +255,38 @@ def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
 
     assert draft_model.shared == ("EMBED", lm_head)
     assert draft_model.legacy is None
+
+
+@pytest.mark.parametrize("share_module", [False, True])
+def test_shared_head_rejects_a_different_output_domain(share_module):
+    head = torch.nn.Linear(4, 64, bias=False)
+    head.quant_method = None
+    target = _target_runner(
+        SimpleNamespace(
+            lm_head=head,
+            get_embed_and_head=lambda: (torch.zeros(128, 4), head.weight),
+            logits_processor=_head_layout(output_vocab_size=64),
+        )
+    )
+    draft = _ModuleSharingDraft() if share_module else _HeadAliasingDraft()
+    with pytest.raises(ValueError, match="matching output vocabulary sizes"):
+        factory._share_target_embed_and_head(target, draft)
+
+
+def test_reduced_draft_keeps_its_own_output_domain():
+    head = torch.nn.Linear(4, 64, bias=False)
+    head.quant_method = None
+    target = _target_runner(
+        SimpleNamespace(
+            lm_head=head,
+            get_embed_and_head=lambda: (torch.zeros(128, 4), head.weight),
+            logits_processor=_head_layout(output_vocab_size=64),
+        )
+    )
+    draft = _WeightSharingDraft()
+    draft.logits_processor = _head_layout(output_vocab_size=32)
+    factory._share_target_embed_and_head(target, draft)
+    assert draft.get_embed_and_head()[1] == "DRAFT_HEAD"
 
 
 def test_wire_mtp_module_sharing_requires_target_lm_head():
@@ -781,7 +813,7 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
     drafter.token_to_kv_pool = SimpleNamespace(
         layer_num=1, head_num=1, head_dim=8, dtype=torch.bfloat16
     )
-    processor = SimpleNamespace(do_argmax=True, config=SimpleNamespace(vocab_size=50))
+    processor = SimpleNamespace(do_argmax=True, output_vocab_size=50)
     drafter.draft_model_runner = SimpleNamespace(
         model=SimpleNamespace(logits_processor=processor)
     )

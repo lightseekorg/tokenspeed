@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from torch import nn
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -136,7 +137,10 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         mapping: Mapping,
         quant_config=None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         nn.Module.__init__(self)
 
         if hasattr(config, "text_config"):
@@ -169,14 +173,14 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
                 self.lm_head = ReplicatedLinear(
                     config.hidden_size,
-                    config.vocab_size,
+                    self.vocabulary.output_size,
                     bias=False,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
             else:
                 self.lm_head = ParallelLMHead(
-                    config.vocab_size,
+                    self.vocabulary.output_size,
                     config.hidden_size,
                     quant_config=quant_config,
                     tp_rank=self.mapping.lm_head.tp_rank,
@@ -188,13 +192,16 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         # The shared target head follows mapping.lm_head. Under attention DP
         # its replicated vocabulary can differ from the attention TP layout.
         self.logits_processor = LogitsProcessor(
-            config,
+            self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
             do_argmax=True,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self):

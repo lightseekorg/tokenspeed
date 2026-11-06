@@ -36,6 +36,7 @@ from transformers import PretrainedConfig as _PretrainedConfig
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
 from tokenspeed.runtime.execution.context import ForwardContext as _ForwardContext
@@ -962,6 +963,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         _ensure_longcat_config(config)
         super().__init__(
@@ -969,6 +972,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            vocabulary=vocabulary,
         )
 
     def post_init(self) -> None:

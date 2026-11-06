@@ -54,6 +54,7 @@ from tokenspeed.runtime.configs.inkling_config import (
     InklingModelConfig,
     inkling_mtp_text_config,
 )
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -214,7 +215,10 @@ class InklingForConditionalGenerationNextN(nn.Module):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         del is_multimodal_active, mm_attention_backend  # draft is text-only
         super().__init__()
         self.config = config
@@ -247,12 +251,19 @@ class InklingForConditionalGenerationNextN(nn.Module):
         )
         # do_argmax off (as base model): the distributed-argmax path skips the padded-vocab masking below.
         self.logits_processor = LogitsProcessor(
-            self.text_config,
+            self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
+            final_logit_softcapping=getattr(
+                self.text_config, "final_logit_softcapping", None
+            ),
+            use_fused_lm_head=(
+                getattr(self.text_config, "model_type", None) == "kimi_k2"
+            ),
+            tie_word_embeddings=getattr(self.text_config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self):

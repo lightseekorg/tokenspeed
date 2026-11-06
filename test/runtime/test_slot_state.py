@@ -45,6 +45,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -127,7 +129,7 @@ HIDDEN = 8
 def _runtime_states(*, draft_probs: bool, trees: bool, history: bool) -> RuntimeStates:
     states = RuntimeStates(
         req_pool_size=MAX_REQ_POOL_SIZE,
-        vocab_size=VOCAB,
+        vocabulary=VocabularySpec(input_size=VOCAB, output_size=VOCAB),
         output_length=SPEC_TOKENS,
         device="cpu",
     )

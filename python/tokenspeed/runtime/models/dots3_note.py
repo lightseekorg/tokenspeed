@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -598,6 +599,7 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
         *,
         is_multimodal_active=False,
         mm_attention_backend=None,
+        vocabulary: VocabularySpec,
     ):
         if is_multimodal_active:
             raise NotImplementedError(
@@ -618,7 +620,13 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
             or config.rope_scaling is not None
         ):
             raise ValueError("Unsupported dots3-note attention configuration")
-        super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            vocabulary=vocabulary,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())

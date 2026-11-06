@@ -45,6 +45,7 @@ from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from tokenspeed_kernel.thirdparty.flashinfer import trtllm_bf16_moe
 
 from tokenspeed.runtime.configs import model_config as model_config_module
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.loader import MoECheckpointLoader
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
@@ -106,7 +107,12 @@ def _moe(mapping=None, config=None, cls=None):
 
 def _model(quant_config=None, mapping=None, config=None):
     return beam.BeamForCausalLM(
-        config or tiny_config(), mapping or Mapping(rank=0, world_size=1), quant_config
+        config or tiny_config(),
+        mapping or Mapping(rank=0, world_size=1),
+        quant_config,
+        vocabulary=VocabularySpec.from_hf_config(
+            config or tiny_config(), is_draft=False
+        ),
     )
 
 

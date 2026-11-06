@@ -28,6 +28,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -55,7 +56,10 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         self.config = config
         self.mapping = mapping
@@ -81,6 +85,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             text_config,
             mapping=mapping,
             quant_config=quant_config,
+            vocabulary=vocabulary,
         )
         if is_multimodal_active:
             self.audio_tower = Qwen3AudioEncoder(

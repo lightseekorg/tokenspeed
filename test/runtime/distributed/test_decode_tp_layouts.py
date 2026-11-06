@@ -296,12 +296,15 @@ def _worker_lm_head(rank: int, rendezvous: str) -> None:
         config = SimpleNamespace(model_type="test", vocab_size=vocab)
 
         processor = LogitsProcessor(
-            config,
+            getattr(config, "vocab_size", None),
             skip_all_gather=True,
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
             dp_lm_head_tp=True,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
         shard = padded_vocab // WORLD
         lm_head = SimpleNamespace(weight=weight[rank * shard : (rank + 1) * shard])

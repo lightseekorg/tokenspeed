@@ -38,6 +38,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
@@ -100,12 +101,15 @@ class DSparkDraftModel(DFlashDraftModel):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            vocabulary=vocabulary,
         )
         markov_rank, markov_head_type = _get_markov_params(config)
         if markov_rank <= 0:

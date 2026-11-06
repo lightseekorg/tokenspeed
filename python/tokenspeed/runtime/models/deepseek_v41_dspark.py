@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_PREFILL_QUERY_TILE,
 )
@@ -462,13 +463,14 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
         del target_config
         target_model.set_dspark_layers_to_capture(list(self.model.target_layer_ids))
 
-    def __init__(self, config, mapping, quant_config):
+    def __init__(self, config, mapping, quant_config, *, vocabulary: VocabularySpec):
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             is_multimodal_active=False,
             mm_attention_backend=None,
+            vocabulary=vocabulary,
         )
 
     def resolve_model(self, config, mapping, quant_config, prefix):

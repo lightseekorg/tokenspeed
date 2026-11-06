@@ -48,6 +48,7 @@ from tokenspeed.runtime.configs.beam_config import (
     BeamConfig,
 )
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.entrypoints import engine as engine_module
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
@@ -720,7 +721,12 @@ def _beam(monkeypatch, max_model_len, draft_tokens=None, device="cpu"):
         global_server_args_dict, "speculative_num_draft_tokens", draft_tokens
     )
     with torch.device(device):
-        return BeamForCausalLM(tiny_config(), Mapping(rank=0, world_size=1), None)
+        return BeamForCausalLM(
+            tiny_config(),
+            Mapping(rank=0, world_size=1),
+            None,
+            vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
+        )
 
 
 def _rope_table(model):
@@ -741,8 +747,20 @@ def test_the_draft_rope_table_covers_speculation_past_the_context(monkeypatch):
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        checkpoint = DFlash2DraftModel(_drafter_config(128), mapping)
-        draft = DFlash2BeamDraftModel(_drafter_config(128), mapping)
+        checkpoint = DFlash2DraftModel(
+            _drafter_config(128),
+            mapping,
+            vocabulary=VocabularySpec.from_hf_config(
+                _drafter_config(128), is_draft=True
+            ),
+        )
+        draft = DFlash2BeamDraftModel(
+            _drafter_config(128),
+            mapping,
+            vocabulary=VocabularySpec.from_hf_config(
+                _drafter_config(128), is_draft=True
+            ),
+        )
     finally:
         torch.set_num_threads(threads)
     attention = draft.layers[0].self_attn
@@ -760,7 +778,11 @@ def test_without_max_model_len_the_drafter_refuses_a_longer_target_context(
     """A synthetic shorter drafter refuses the target context; a covered
     context is served. Small tables exercise the same bounds as 1M serving."""
     monkeypatch.setitem(global_server_args_dict, "max_model_len", None)
-    draft = DFlash2BeamDraftModel(_drafter_config(128), Mapping(rank=0, world_size=1))
+    draft = DFlash2BeamDraftModel(
+        _drafter_config(128),
+        Mapping(rank=0, world_size=1),
+        vocabulary=VocabularySpec.from_hf_config(_drafter_config(128), is_draft=True),
+    )
     target = _beam(monkeypatch, None)
     raw = tiny_config().to_dict()
     with pytest.raises(
@@ -783,7 +805,11 @@ def test_the_drafter_serves_the_max_model_len_its_table_covers(
     monkeypatch, max_model_len, rows
 ):
     target = _beam(monkeypatch, max_model_len)
-    draft = DFlash2BeamDraftModel(_drafter_config(128), Mapping(rank=0, world_size=1))
+    draft = DFlash2BeamDraftModel(
+        _drafter_config(128),
+        Mapping(rank=0, world_size=1),
+        vocabulary=VocabularySpec.from_hf_config(_drafter_config(128), is_draft=True),
+    )
     assert draft.layers[0].self_attn.rotary_emb.cos_sin_cache.shape[0] == rows
     draft.configure_target(
         target,

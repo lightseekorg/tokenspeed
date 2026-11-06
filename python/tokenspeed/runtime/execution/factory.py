@@ -107,6 +107,7 @@ def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None
             raise ValueError(
                 "Draft model requires the target's complete lm_head module."
             )
+        _check_shared_output_domain(model_runner.model, draft_model)
         module_setter(draft_model, embed, lm_head)
     else:
         if head is None:
@@ -115,6 +116,19 @@ def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None
         _refuse_aliased_quantized_head(model_runner.model, draft_model, head)
     if embed is None:
         _require_draft_embedding(draft_model)
+    if module_setter is None and draft_model.get_embed_and_head()[1] is head:
+        _check_shared_output_domain(model_runner.model, draft_model)
+
+
+def _check_shared_output_domain(target_model, draft_model) -> None:
+    target_size = target_model.logits_processor.output_vocab_size
+    draft_size = draft_model.logits_processor.output_vocab_size
+    if draft_size != target_size:
+        raise ValueError(
+            f"A shared LM head requires matching output vocabulary sizes: "
+            f"target={target_size}, draft={draft_size}. Resolve the draft vocabulary "
+            "from its model profile or output_vocab_size before constructing it."
+        )
 
 
 def _refuse_aliased_quantized_head(target_model, draft_model, head) -> None:
@@ -315,7 +329,7 @@ def create_model_executor(
         max_draft_tokens_per_req=max_draft_tokens_per_req,
         device=config.device,
         max_req_pool_size=config.max_req_pool_size,
-        vocab_size=config.output_vocab_size,
+        vocab_size=config.vocabulary.output_size,
         # Same TP group as LogitsProcessor.
         tp_group=model_runner.mapping.attn.tp_group,
     )

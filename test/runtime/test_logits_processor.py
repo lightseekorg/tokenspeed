@@ -62,12 +62,15 @@ def test_cpu_tp_logits_do_not_query_an_accelerator_capture(monkeypatch, do_argma
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", cuda_query)
     monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
     processor = LogitsProcessor(
-        config=PretrainedConfig(vocab_size=8),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=do_argmax,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     hidden = torch.tensor([[1, 2], [-2, 1]], dtype=torch.bfloat16)
     head = ParallelLMHead(
@@ -108,11 +111,14 @@ def test_dist_argmax_ineligibility_uses_the_device_collective(monkeypatch, tmp_p
         )
         monkeypatch.setattr(LogitsProcessor, "_LOGITS_DIST_ARGMAX_STATES", {})
         processor = LogitsProcessor(
-            config=PretrainedConfig(vocab_size=8192),
+            output_vocab_size=8192,
             tp_rank=0,
             tp_size=2,
             tp_group=(0, 1),
             dp_lm_head_tp=False,
+            final_logit_softcapping=None,
+            use_fused_lm_head=False,
+            tie_word_embeddings=False,
         )
         head = ParallelLMHead(
             8192,
@@ -151,7 +157,11 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
     )
 
     non_kimi = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=2), dp_lm_head_tp=False
+        output_vocab_size=2,
+        dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     non_kimi(
         input_ids=None,
@@ -162,7 +172,11 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
     assert calls["fused"] == 0
 
     kimi = LogitsProcessor(
-        config=SimpleNamespace(model_type="kimi_k2", vocab_size=2), dp_lm_head_tp=False
+        output_vocab_size=2,
+        dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=True,
+        tie_word_embeddings=False,
     )
     kimi(
         input_ids=None,
@@ -175,11 +189,14 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
 
 def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=6),
+        output_vocab_size=6,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     hidden_states = torch.empty((0, 2), dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.ones((3, 2), dtype=torch.float32))
@@ -213,7 +230,7 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
 @pytest.mark.parametrize("cached", [False, True])
 def test_tp_logits_gather_preserves_dtype(monkeypatch, nvidia_logits, dtype, cached):
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=16),
+        output_vocab_size=16,
         skip_all_gather=False,
         do_argmax=False,
         logit_scale=None,
@@ -221,6 +238,9 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, nvidia_logits, dtype, cac
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     state = object()
     if cached:
@@ -280,7 +300,7 @@ def test_tp_logits_collective_gather_lays_rank_shards_side_by_side(monkeypatch, 
     rank order, bit for bit (NaN payloads and signed zeros included)."""
     tp, rows, shard = 3, 5, 8
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=tp * shard),
+        output_vocab_size=tp * shard,
         skip_all_gather=False,
         do_argmax=False,
         logit_scale=None,
@@ -288,6 +308,9 @@ def test_tp_logits_collective_gather_lays_rank_shards_side_by_side(monkeypatch, 
         tp_size=tp,
         tp_group=(0, 1, 2),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     processor._all_gather_state = None  # no multicast gather: the collective path
     words = torch.int16 if dtype.itemsize == 2 else torch.int32
@@ -340,11 +363,14 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
         ),
     )
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
 
     assert getattr(processor, initializer_name)(*args) is None
@@ -374,11 +400,14 @@ def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
 ):
     _set_fabric(monkeypatch, False)
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=64),
+        output_vocab_size=64,
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     lm_head = SimpleNamespace(
         weight=torch.ones((8, 2), dtype=torch.float32), num_embeddings_per_partition=8
@@ -415,11 +444,14 @@ def test_a_strided_tp_group_smaller_than_one_host_is_still_probed(monkeypatch):
     """
     _set_fabric(monkeypatch, False)
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=64),
+        output_vocab_size=64,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 4),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     assert not processor._tp_group_multicast_reachable()
 
@@ -439,11 +471,14 @@ def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch)
         lambda ranks: False,
     )
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=64),
+        output_vocab_size=64,
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     assert not processor._tp_group_multicast_reachable()
 
@@ -452,11 +487,14 @@ def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkey
     """An NVLink domain can span hosts, so fabric decides, not the host count."""
     _set_fabric(monkeypatch, True)
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=64),
+        output_vocab_size=64,
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     lm_head = SimpleNamespace(
         weight=torch.ones((8, 2), dtype=torch.float32), num_embeddings_per_partition=8
@@ -488,11 +526,14 @@ def test_logits_gather_state_spans_the_vocab_of_a_transposed_quantized_head(
     # An FP8 head keeps its weight as [hidden, vocab shard] after loading.
     _set_fabric(monkeypatch, True)
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=64),
+        output_vocab_size=64,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     lm_head = SimpleNamespace(
         weight=torch.ones((4, 32), dtype=torch.float8_e4m3fn),
@@ -558,11 +599,14 @@ def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
         logits_processor_module, "try_create_dist_argmax_state", failing_create
     )
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        output_vocab_size=8192,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 4),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     lm_head = SimpleNamespace(
         weight=torch.ones((4096, 2), dtype=torch.float32),
@@ -619,11 +663,14 @@ def test_dist_argmax_state_cache_separates_logits_dtypes(monkeypatch):
     )
     monkeypatch.setattr(LogitsProcessor, "_LOGITS_DIST_ARGMAX_STATES", {})
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        output_vocab_size=8192,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     lm_head = SimpleNamespace(
         weight=torch.ones((4096, 2), dtype=torch.bfloat16),
@@ -704,12 +751,15 @@ def test_dist_argmax_state_serves_the_bf16_logits_of_a_transposed_quantized_head
         )
     monkeypatch.setattr(LogitsProcessor, "_LOGITS_DIST_ARGMAX_STATES", {})
     proc = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=2 * shard),
+        output_vocab_size=2 * shard,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     lm_head = SimpleNamespace(
         weight=torch.ones((hidden, shard), dtype=torch.float8_e4m3fn),
@@ -784,11 +834,14 @@ def test_fused_softcap_handles_large_logits_without_nan():
 def test_argmax_routes_sharded_to_kernel(monkeypatch):
     """Sharded logits (tp shards reconstruct vocab) hit the fused kernel."""
     proc = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     proc._dist_argmax_state = DistArgmaxPrepared(
         states={torch.float32: object()},  # prepared for the shard's dtype
@@ -813,11 +866,14 @@ def test_argmax_falls_back_without_state(monkeypatch):
     """No fused state (e.g. EAGLE3 draft vocab != target, or gate failed):
     _argmax falls back to a plain argmax instead of routing to the kernel."""
     proc = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=100),
+        output_vocab_size=100,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     proc._dist_argmax_state = None  # gate failed (draft vocab != target vocab)
 
@@ -837,14 +893,15 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch, nvidia_log
     """do_argmax + active state keeps logits sharded (no all-gather)."""
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     proc = LogitsProcessor(
-        config=SimpleNamespace(
-            model_type="test", vocab_size=8, final_logit_softcapping=None
-        ),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     monkeypatch.setattr(
         proc, "_init_dist_argmax_state", lambda lm_head, logits_dtype: object()
@@ -874,12 +931,15 @@ def test_startup_prepares_shared_head_before_first_forward(monkeypatch, mode, ve
         torch.cuda, "is_current_stream_capturing", lambda: capturing["active"]
     )
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8),
+        output_vocab_size=8,
         do_argmax=True,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     language = torch.nn.Module()
     language.lm_head = torch.nn.Linear(2, 4, bias=False)
@@ -924,12 +984,15 @@ def test_prepared_argmax_reuses_weight_updates_and_rebinds_padded_head(monkeypat
         lambda device: capturing["active"],
     )
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8),
+        output_vocab_size=8,
         do_argmax=True,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     head = torch.nn.Linear(2, 4, bias=False)
     head.num_embeddings_per_partition = 4
@@ -978,8 +1041,11 @@ def test_inactive_argmax_preserves_weightless_quantized_head():
             self.qweight = torch.nn.Parameter(torch.eye(2))
 
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=2),
+        output_vocab_size=2,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     model = torch.nn.Module()
     model.logits_processor = processor
@@ -1000,14 +1066,15 @@ def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch)
     full-vocab gather explicitly; the draft model keeps constructing with
     do_argmax=True and no global flag is consulted."""
     proc = LogitsProcessor(
-        config=SimpleNamespace(
-            model_type="test", vocab_size=8, final_logit_softcapping=None
-        ),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     assert proc.do_argmax
     proc.require_full_vocab_logits()
@@ -1044,14 +1111,15 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
     gate still rendezvouses lazily.
     """
     proc = LogitsProcessor(
-        config=SimpleNamespace(
-            model_type="test", vocab_size=8, final_logit_softcapping=None
-        ),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     monkeypatch.setattr(
         logits_processor_module,
@@ -1117,14 +1185,15 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch, nvidia_logits):
     softcap is applied to full-vocab logits (then a plain argmax runs)."""
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     proc = LogitsProcessor(
-        config=SimpleNamespace(
-            model_type="test", vocab_size=8, final_logit_softcapping=30.0
-        ),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
         dp_lm_head_tp=False,
+        final_logit_softcapping=30.0,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     # Fused state is otherwise eligible; softcap must still force the gather.
     monkeypatch.setattr(
@@ -1218,8 +1287,11 @@ def test_input_logprobs_match_the_output_logprob_arithmetic(chunk_tokens):
     lm_head = SimpleNamespace(weight=weight)
     rows, targets = [1, 2, 3], [5, 2, 3]
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        output_vocab_size=vocab,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     metadata = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,
@@ -1255,7 +1327,11 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
     hidden = torch.randn(6, 4, device=device)  # 4 prefill rows + 2 decode rows
     weight = torch.randn(vocab, 4, device=device)
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=vocab), dp_lm_head_tp=False
+        output_vocab_size=vocab,
+        dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     seen = []
     original = processor._get_logits
@@ -1294,7 +1370,11 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
 def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():
     device = _logprob_device()
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=4), dp_lm_head_tp=False
+        output_vocab_size=4,
+        dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, device=device))
     rows = _input_logprob_rows(
@@ -1347,14 +1427,15 @@ def test_input_logprobs_bypass_the_sharded_argmax_shortcut(monkeypatch, nvidia_l
     """A ``do_argmax`` head keeps sampled logits TP-sharded for the fused
     argmax; the prompt-logprob gather needs the whole vocabulary."""
     proc = LogitsProcessor(
-        config=SimpleNamespace(
-            model_type="test", vocab_size=8, final_logit_softcapping=None
-        ),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     monkeypatch.setattr(
         proc, "_init_dist_argmax_state", lambda lm_head, logits_dtype: object()
@@ -1407,13 +1488,14 @@ def test_input_logprob_chunks_never_take_the_multicast_gather(
     through the NCCL collective into a private tensor, while the sampled rows
     keep the multicast path."""
     proc = LogitsProcessor(
-        config=SimpleNamespace(
-            model_type="test", vocab_size=8, final_logit_softcapping=None
-        ),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     multicast_state = object()
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: multicast_state)
@@ -1466,13 +1548,14 @@ def _sharded_processor(monkeypatch, size: int, rank: int) -> LogitsProcessor:
     the identity on a full-vocab head (each rank holds the whole head here);
     the shard's row gathers are recorded by the test."""
     proc = LogitsProcessor(
-        config=SimpleNamespace(
-            model_type="test", vocab_size=8, final_logit_softcapping=None
-        ),
+        output_vocab_size=8,
         tp_rank=rank,
         tp_size=size,
         tp_group=tuple(range(size)),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: None)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -1714,11 +1797,14 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
             ),
         )
     wide = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8),
+        output_vocab_size=8,
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     with pytest.raises(ValueError, match="vocab-shard group"):
         wide(
@@ -1732,12 +1818,15 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
             ),
         )
     replicated = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8),
+        output_vocab_size=8,
         skip_all_gather=True,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     with pytest.raises(ValueError, match="replicated LM head"):
         replicated(
@@ -1768,12 +1857,15 @@ def test_rocm_keeps_the_portable_sharded_argmax(monkeypatch):
     )
     monkeypatch.setattr(logits_processor_module, "all_gather_single", forbidden)
     processor = LogitsProcessor(
-        PretrainedConfig(vocab_size=8),
+        8,
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     hidden = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     head = torch.nn.Linear(2, 4, bias=False).requires_grad_(False)
@@ -1786,3 +1878,27 @@ def test_rocm_keeps_the_portable_sharded_argmax(monkeypatch):
         require_full_vocab=False,
     )
     torch.testing.assert_close(actual, hidden @ head.weight.T, rtol=0, atol=0)
+
+
+def test_compact_output_domain_excludes_physical_head_padding():
+    processor = LogitsProcessor(
+        output_vocab_size=5,
+        dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
+    )
+    head = ParallelLMHead(
+        5,
+        2,
+        params_dtype=torch.float32,
+        padding_size=8,
+    )
+    hidden = torch.tensor([[1.0, 2.0]])
+    with torch.no_grad():
+        head.weight[:5].copy_(torch.arange(10).reshape(5, 2))
+        head.weight[5:].fill_(1000)
+    processor.prepare_communication(head)
+    logits = processor._get_logits(hidden, head, None, require_full_vocab=True)
+    torch.testing.assert_close(logits, hidden @ head.weight[:5].T)
+    assert logits.argmax(-1).item() == 4

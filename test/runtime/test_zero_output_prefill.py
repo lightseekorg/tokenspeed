@@ -34,6 +34,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor_output import (
@@ -318,7 +319,7 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
     # join the row exchange with no rows.)
     output = forward(
         SimpleNamespace(
-            config=SimpleNamespace(vocab_size=32),
+            output_vocab_size=32,
             dp_lm_head_tp=False,
             _query_shard=lambda metadata: None,
         ),
@@ -501,8 +502,7 @@ def test_idle_graph_grammar_adds_an_identity_batch():
         input_buffers=buffers,
         runtime_states=SimpleNamespace(
             valid_cache_lengths=torch.zeros(1),
-            vocab_size=32,
-            output_vocab_size=32,
+            vocabulary=VocabularySpec(input_size=32, output_size=32),
         ),
         device="cpu",
         default_stream=None,
@@ -569,8 +569,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
             future_input_map=future_inputs,
             valid_cache_lengths=torch.zeros(6, dtype=torch.int32),
             mark_spec_candidates_drafted=lambda rows: drafted.extend(rows.tolist()),
-            vocab_size=64,
-            output_vocab_size=64,
+            vocabulary=VocabularySpec(input_size=64, output_size=64),
         ),
         input_buffers=SimpleNamespace(
             state_write_req_pool_indices_buf=torch.tensor([4, 2, 5, 1]),

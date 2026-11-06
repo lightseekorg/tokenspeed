@@ -33,6 +33,8 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
@@ -83,7 +85,11 @@ def _build_model(
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device(device):
-            return LlamaForCausalLMEagle4(config, mapping)
+            return LlamaForCausalLMEagle4(
+                config,
+                mapping,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+            )
     finally:
         torch.set_default_dtype(old_dtype)
 
@@ -122,7 +128,9 @@ def _static_tree_drafter(model: LlamaForCausalLMEagle4, topk: int) -> Eagle4:
         ),
         runtime_states=RuntimeStates(
             req_pool_size=max_bs,
-            vocab_size=model.config.vocab_size,
+            vocabulary=VocabularySpec(
+                input_size=model.config.vocab_size, output_size=model.config.vocab_size
+            ),
             output_length=nodes,
             device="cuda",
         ),

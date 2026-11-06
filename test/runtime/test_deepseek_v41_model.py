@@ -62,6 +62,7 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enable
 from torch import nn
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -2162,7 +2163,10 @@ class _TinyFp8Model(BaseCausalLM):
 
     def __init__(self):
         super().__init__(
-            config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
+            vocabulary=VocabularySpec(input_size=1, output_size=1),
+            config=SimpleNamespace(),
+            mapping=SimpleNamespace(),
+            encoder_only=True,
         )
         self.proj = ReplicatedLinear(
             input_size=128,
@@ -2232,7 +2236,12 @@ class _TinyFp8WoAModel(BaseCausalLM):
 
     def __init__(self, config):
         mapping = _mapping(0, 1, 1)
-        super().__init__(config=SimpleNamespace(), mapping=mapping, encoder_only=True)
+        super().__init__(
+            vocabulary=VocabularySpec(input_size=1, output_size=1),
+            config=SimpleNamespace(),
+            mapping=mapping,
+            encoder_only=True,
+        )
         layer = nn.Module()
         layer.attn = DeepseekV41Attention(
             config,
@@ -2533,6 +2542,9 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
             _quant(),
             is_multimodal_active=False,
             mm_attention_backend=None,
+            vocabulary=VocabularySpec.from_hf_config(
+                SimpleNamespace(text_config=config), is_draft=False
+            ),
         )
     weights = _checkpoint(config)
     adapter.load_weights(_bind_engram_tables(adapter, weights, tmp_path).items())
@@ -3154,6 +3166,9 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
                 _quant(),
                 is_multimodal_active=False,
                 mm_attention_backend=None,
+                vocabulary=VocabularySpec.from_hf_config(
+                    SimpleNamespace(text_config=config), is_draft=False
+                ),
             )
         adapter.load_weights(
             _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
@@ -3288,6 +3303,7 @@ def _loader_model(monkeypatch, config, rank, device):
             _quant(),
             is_multimodal_active=False,
             mm_attention_backend=None,
+            vocabulary=VocabularySpec.from_hf_config(wrapper, is_draft=False),
         )
 
 
@@ -3427,6 +3443,7 @@ def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only)
             quant_config=_quant(),
             is_multimodal_active=active,
             mm_attention_backend="triton_attn",
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
         )
     weights = {} if encoder_only else _checkpoint(text_config)
     if active:
@@ -4149,6 +4166,9 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 _quant(),
                 is_multimodal_active=False,
                 mm_attention_backend=None,
+                vocabulary=VocabularySpec.from_hf_config(
+                    SimpleNamespace(text_config=config), is_draft=False
+                ),
             )
         adapter.load_weights(
             _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()

@@ -33,6 +33,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci
 
@@ -71,7 +73,12 @@ def _executor(*, enabled, drafter):
     )
     executor.tree_spec = None
     executor.drafter = drafter
-    executor.runtime_states = RuntimeStates(POOL, VOCAB, 1, device="cuda")
+    executor.runtime_states = RuntimeStates(
+        POOL,
+        VocabularySpec(input_size=VOCAB, output_size=VOCAB),
+        1,
+        device="cuda",
+    )
     # The input buffers' rows this step reads.
     executor.input_buffers = SimpleNamespace(
         state_write_req_pool_indices_buf=torch.tensor([3, 5], device="cuda"),

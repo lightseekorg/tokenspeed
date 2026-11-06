@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
@@ -417,12 +418,15 @@ class DFlash2DraftModel(DFlashDraftModel):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            vocabulary=vocabulary,
         )
         dtype = self.fc.weight.dtype
         self.input_embedding_scale = float(
@@ -431,7 +435,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.block_size = int(_dflash2_config_value(config, "block_size"))
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
-            vocab_size=int(config.vocab_size),
+            vocab_size=vocabulary.output_size,
             rank=int(_dflash2_config_value(config, "selector_rank")),
             top_k=int(_dflash2_config_value(config, "selector_top_k")),
             params_dtype=dtype,

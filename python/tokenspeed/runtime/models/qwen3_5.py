@@ -36,6 +36,7 @@ from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5TextConfig,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 # Distributed
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -1176,6 +1177,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ):
         super().__init__(
             config=config.text_config,
@@ -1183,6 +1186,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             quant_config=quant_config,
             prefix=prefix,
             encoder_only=getattr(config, "encoder_only", False),
+            vocabulary=vocabulary,
         )
 
         rope_config = get_rope_parameters(self.config)
@@ -1517,6 +1521,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config=config,
@@ -1525,6 +1531,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             prefix=prefix,
             is_multimodal_active=is_multimodal_active,
             mm_attention_backend=mm_attention_backend,
+            vocabulary=vocabulary,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -1656,6 +1663,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         if not hasattr(config, "text_config"):
             archs = list(getattr(config, "architectures", None) or [])
@@ -1667,6 +1676,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
             quant_config=quant_config,
             prefix=prefix,
             is_multimodal_active=False,
+            vocabulary=vocabulary,
         )
 
     def resolve_model(

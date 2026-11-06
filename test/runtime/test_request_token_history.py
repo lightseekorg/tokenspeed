@@ -24,6 +24,8 @@ seeds are ``ts-control``'s (``HistoryRows``)."""
 import os
 import sys
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -49,7 +51,10 @@ def test_seeds_must_be_aligned() -> None:
 
 def _runtime_states(capacity: int) -> RuntimeStates:
     states = RuntimeStates(
-        req_pool_size=2, vocab_size=32, output_length=1, device="cpu"
+        req_pool_size=2,
+        vocabulary=VocabularySpec(input_size=32, output_size=32),
+        output_length=1,
+        device="cpu",
     )
     states.init_request_token_history(capacity)
     return states
@@ -142,7 +147,10 @@ def test_graph_layout_masks_padding_rows() -> None:
 
 def _draft_states() -> RuntimeStates:
     states = RuntimeStates(
-        req_pool_size=4, vocab_size=100, device="cpu", output_length=1
+        req_pool_size=4,
+        vocabulary=VocabularySpec(input_size=100, output_size=100),
+        device="cpu",
+        output_length=1,
     )
     states.init_request_token_history(16)
     return states

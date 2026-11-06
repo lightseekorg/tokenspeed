@@ -47,6 +47,7 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashTextConfig,
     Glm53FlashVisionConfig,
 )
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -1706,7 +1707,10 @@ class Glm53FlashForConditionalGeneration(nn.Module):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         self.config = config
         self.mapping = mapping
@@ -1720,6 +1724,7 @@ class Glm53FlashForConditionalGeneration(nn.Module):
                 config.text_config,
                 mapping=mapping,
                 quant_config=quant_config,
+                vocabulary=vocabulary,
             )
         )
         if is_multimodal_active:

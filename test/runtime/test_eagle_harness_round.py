@@ -39,6 +39,8 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 import tokenspeed_scheduler as ts  # noqa: E402
@@ -203,7 +205,7 @@ class _DraftModel:
     def __init__(self, mapping: Mapping) -> None:
         self.config = LlamaConfig(vocab_size=VOCAB, hidden_size=HIDDEN)
         self.logits_processor = Eagle4CandidateLogitsProcessor(
-            self.config,
+            self.config.vocab_size,
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
@@ -381,7 +383,10 @@ def _rounds(
     data at ``root``; ``late`` times its policy's launches (None: as served)."""
     nodes = shape.nodes
     states = RuntimeStates(
-        req_pool_size=POOL, vocab_size=VOCAB, output_length=nodes, device="cuda"
+        req_pool_size=POOL,
+        vocabulary=VocabularySpec(input_size=VOCAB, output_size=VOCAB),
+        output_length=nodes,
+        device="cuda",
     )
     states.init_draft_trees(nodes)
     buffers = InputBuffers(

@@ -30,6 +30,7 @@ import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed import comm_manager as comm_module
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -235,7 +236,12 @@ def test_amd_fp8_layer_keeps_checkpoint_codes_and_channel_scales(
 
 def test_amd_fp8_loader_retains_resident_fp8_weights(server, amd_platform):
     server("triton")
-    model = beam.BeamForCausalLM(tiny_config(), Mapping(rank=0, world_size=1), ct())
+    model = beam.BeamForCausalLM(
+        tiny_config(),
+        Mapping(rank=0, world_size=1),
+        ct(),
+        vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
+    )
     checkpoint, _ = fp8_checkpoint()
     assert model.load_weights(checkpoint.items()) == checkpoint.keys()
     experts = model.model.layers[1].mlp.experts
@@ -275,7 +281,12 @@ def test_amd_fp8_checkpoint_partitions_codes_and_scales(
     mapping = Mapping(
         rank=rank, world_size=world, moe_ep_size=world if expert_parallel else 1
     )
-    model = beam.BeamForCausalLM(config, mapping, ct())
+    model = beam.BeamForCausalLM(
+        config,
+        mapping,
+        ct(),
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+    )
     assert model.load_weights(checkpoint.items()) == checkpoint.keys()
     experts = model.model.layers[1].mlp.experts
     local_experts = 8 // world if expert_parallel else 8
@@ -393,7 +404,10 @@ def test_amd_fp8_moe_partial_takes_one_shared_allreduce(
     config = tiny_config()
     config.moe_intermediate_size = 512
     model = beam.BeamForCausalLM(
-        config, Mapping(rank=3, world_size=4, moe_ep_size=ep_size), ct()
+        config,
+        Mapping(rank=3, world_size=4, moe_ep_size=ep_size),
+        ct(),
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
     )
     reductions = []
 
@@ -493,7 +507,10 @@ def test_unfused_beam_boundaries_keep_the_owned_depth_scale_pair(
     server("triton")
     monkeypatch.setitem(global_server_args_dict, "layer_boundary_norm", "unfused")
     model = beam.BeamForCausalLM(
-        tiny_config(), Mapping(rank=0, world_size=1), None
+        tiny_config(),
+        Mapping(rank=0, world_size=1),
+        None,
+        vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
     ).model
     layer = model.layers[0 if boundary == "first" else 1]
     norm = model.norm if boundary == "final" else layer.input_layernorm

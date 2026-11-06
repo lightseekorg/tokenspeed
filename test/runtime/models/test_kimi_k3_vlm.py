@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.models import kimi_k3
 from tokenspeed.runtime.models.kimi_k3 import (
@@ -80,6 +81,7 @@ def _build_model(monkeypatch, mapping: Mapping | None = None):
         _tiny_config(),
         mapping=mapping or Mapping(rank=0, world_size=1),
         mm_attention_backend="triton_attn",
+        vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=False),
     )
 
 
@@ -199,6 +201,7 @@ def test_kimi_k3_encoder_only_skips_language_model(monkeypatch):
         config,
         mapping=Mapping(rank=0, world_size=1),
         mm_attention_backend="triton_attn",
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
     )
 
     assert model.language_model is None
@@ -226,6 +229,7 @@ def test_kimi_k3_encoder_only_drains_stream_and_loads_all_vision_weights(
         config,
         mapping=Mapping(rank=0, world_size=1),
         mm_attention_backend="triton_attn",
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
     )
     vision_weights, expected = _vision_checkpoint_weights(model)
     midpoint = len(vision_weights) // 2

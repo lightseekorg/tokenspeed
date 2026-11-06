@@ -223,15 +223,29 @@ class TestLmHeadResolution:
     def test_processor_flag_needs_a_sharded_head_under_skip_all_gather(self):
         config = SimpleNamespace(model_type="t", vocab_size=8)
         with pytest.raises(ValueError, match="dp_lm_head_tp"):
-            LogitsProcessor(config, skip_all_gather=True, dp_lm_head_tp=True)
+            LogitsProcessor(
+                getattr(config, "vocab_size", None),
+                skip_all_gather=True,
+                dp_lm_head_tp=True,
+                final_logit_softcapping=getattr(
+                    config, "final_logit_softcapping", None
+                ),
+                use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+                tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            )
         with pytest.raises(ValueError, match="dp_lm_head_tp"):
             LogitsProcessor(
-                config,
+                getattr(config, "vocab_size", None),
                 skip_all_gather=False,
                 tp_rank=0,
                 tp_size=2,
                 tp_group=(0, 1),
                 dp_lm_head_tp=True,
+                final_logit_softcapping=getattr(
+                    config, "final_logit_softcapping", None
+                ),
+                use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+                tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             )
 
 

@@ -40,8 +40,10 @@ use crate::{
 /// What the engine fixed at startup and every admission checks against.
 #[derive(Debug, Clone)]
 pub struct IngressLimits {
-    /// Token ids represented by the output head.
-    pub vocab_size: i64,
+    /// Exclusive upper bound for ordinary input token IDs.
+    pub input_vocab_size: i64,
+    /// Token IDs represented by the output head, excluding parallel padding.
+    pub output_vocab_size: i64,
     /// The model's EOS ids, which end every request not ignoring EOS.
     pub eos_token_ids: Vec<i32>,
     /// The selected sampler's exclusive finite top-k bound; `None` when
@@ -118,8 +120,8 @@ impl LogprobServability {
             .any(|&id| id < 0 || i64::from(id) >= vocab_size);
         outside.then(|| {
             format!(
-                "prompt logprobs need every prompt token id inside the vocabulary \
-                 [0, {vocab_size}); input_ids contains one outside it."
+                "prompt logprobs need every scored target token id inside the vocabulary \
+                 [0, {vocab_size}); a score target is outside it."
             )
         })
     }
@@ -479,6 +481,16 @@ fn refusal(
             limits.max_req_input_len
         ));
     }
+    // Multimodal prompts also contain hashed placeholders, outside the embedding
+    // vocabulary, which the multimodal input adapter replaces before execution.
+    if input_ids.iter().any(|&id| {
+        id < 0 || (!request.has_multimodal_inputs && i64::from(id) >= limits.input_vocab_size)
+    }) {
+        return Some(format!(
+            "input_ids must be in [0, {}); got an invalid input token ID",
+            limits.input_vocab_size
+        ));
+    }
     if request.return_logprob {
         if !limits.enable_output_logprobs {
             return Some(
@@ -511,12 +523,11 @@ fn refusal(
             ));
         }
         if start >= 0 && start < input_len - 1 {
-            // Only prompt logprobs need every id inside the vocabulary, so
-            // the ids are walked here and not on admission's common path.
+            // Score targets must also belong to the smaller output domain.
             if let Some(reason) = limits.logprobs.prompt_logprobs_refusal(
-                input_ids,
+                &input_ids[start as usize + 1..],
                 request.has_multimodal_inputs,
-                limits.vocab_size,
+                limits.output_vocab_size,
             ) {
                 return Some(reason);
             }
@@ -544,7 +555,8 @@ fn refusal(
                 .to_owned(),
         );
     }
-    sampling::verify_with_top_k_limit(params, limits.vocab_size, limits.top_k_exclusive_max).err()
+    sampling::verify_with_top_k_limit(params, limits.output_vocab_size, limits.top_k_exclusive_max)
+        .err()
 }
 
 /// More stop tokens than the sampler's stop table holds.
@@ -576,7 +588,8 @@ mod tests {
 
     fn limits() -> IngressLimits {
         IngressLimits {
-            vocab_size: 1000,
+            input_vocab_size: 1000,
+            output_vocab_size: 1000,
             eos_token_ids: vec![2],
             top_k_exclusive_max: Some(sampling::TOP_K_FUSED_MAX),
             max_model_len: 100,
@@ -921,9 +934,24 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_inputs_use_the_input_domain() {
+        let limits = IngressLimits {
+            input_vocab_size: 128,
+            output_vocab_size: 64,
+            ..limits()
+        };
+        let valid = request("valid", vec![1, 100], SamplingParams::default());
+        assert!(matches!(admit(valid, &limits), Some(Admitted::Run(_))));
+        for id in [-1, 128] {
+            let invalid = request("invalid", vec![1, id], SamplingParams::default());
+            assert!(refused_message(admit(invalid, &limits).unwrap()).contains("[0, 128)"));
+        }
+    }
+
+    #[test]
     fn input_only_tokens_are_not_output_logprob_targets() {
         let limits = IngressLimits {
-            vocab_size: 64,
+            output_vocab_size: 64,
             enable_output_logprobs: true,
             ..limits()
         };
@@ -946,6 +974,20 @@ mod tests {
             ..request("scoreable", vec![1, 63], SamplingParams::default())
         };
         assert!(matches!(admit(scoreable, &limits), Some(Admitted::Run(_))));
+        // Input-only IDs before the first score target remain valid context.
+        let context_only = TokenizedGenerateReqInput {
+            return_logprob: true,
+            logprob_start_len: 1,
+            ..request(
+                "context-only",
+                vec![100, 100, 63],
+                SamplingParams::default(),
+            )
+        };
+        assert!(matches!(
+            admit(context_only, &limits),
+            Some(Admitted::Run(_))
+        ));
     }
 
     #[test]
@@ -1031,12 +1073,12 @@ mod tests {
         };
         assert!(
             refused_message(admit(prompt("d", vec![1, 5000]), &limits).unwrap())
-                .contains("inside the vocabulary")
+                .contains("invalid input token ID")
         );
         // An id outside the vocabulary with both prompt ends inside it.
         assert!(
             refused_message(admit(prompt("d2", vec![1, 5000, 2]), &limits).unwrap())
-                .contains("inside the vocabulary")
+                .contains("invalid input token ID")
         );
         let narrowing = IngressLimits {
             logprobs: LogprobServability {

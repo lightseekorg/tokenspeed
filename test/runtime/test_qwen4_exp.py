@@ -46,6 +46,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -1590,7 +1591,9 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
             / 100
             - 0.16
         )
-    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping)
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
+        config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
+    )
     _check_shared_head_layout(target, draft)
     draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
 
@@ -1622,7 +1625,9 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     target = _HeadOnlyTarget(config, mapping)
-    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping)
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
+        config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
+    )
     _check_shared_head_layout(target, draft)
     full_weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4) / 100
     width = target.lm_head.weight.shape[0]
@@ -3931,7 +3936,12 @@ def test_qwen4_exp_nextn_shares_unquantized_target_head(monkeypatch, attention_d
     quant = Nvfp4Config(
         exclude_modules=["lm_head", "mtp.fc_embedding", "mtp.fc_hidden"]
     )
-    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping, quant)
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
+        config,
+        mapping,
+        quant,
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+    )
     target_head = ReplicatedLinear(
         128,
         128,

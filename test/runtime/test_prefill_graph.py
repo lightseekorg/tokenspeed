@@ -19,6 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -143,7 +145,7 @@ class TestPrefillCaptureArgsTest:
             prefix_granularity=128,
             max_num_seqs=4,
             chunked_prefill_size=4096,
-            vocab_size=32,
+            vocabulary=VocabularySpec(input_size=32, output_size=32),
             context_len=4096,
             physical_context_len=4096,
             device="cpu",
@@ -1362,7 +1364,7 @@ class TestPrefillRoleGraphsTest:
             prefix_granularity=128,
             max_num_seqs=4,
             chunked_prefill_size=4096,
-            vocab_size=32,
+            vocabulary=VocabularySpec(input_size=32, output_size=32),
             context_len=4096,
             physical_context_len=4096,
             device="cpu",

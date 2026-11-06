@@ -37,6 +37,7 @@ from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3Config,
     MiniMaxM3VisionConfig,
 )
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
@@ -1373,6 +1374,8 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         self.vl_config = config
         self.is_multimodal_active = is_multimodal_active
@@ -1381,6 +1384,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            vocabulary=vocabulary,
         )
 
         if not is_multimodal_active:

@@ -34,6 +34,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpTextConfig,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -799,9 +800,13 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         text_config = getattr(config, "text_config", config)
-        super().__init__(text_config, mapping, quant_config, prefix)
+        super().__init__(
+            text_config, mapping, quant_config, prefix, vocabulary=vocabulary
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return load_qwen4_exp_weights(
@@ -835,6 +840,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config,
@@ -843,6 +850,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             prefix,
             is_multimodal_active,
             mm_attention_backend,
+            vocabulary=vocabulary,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

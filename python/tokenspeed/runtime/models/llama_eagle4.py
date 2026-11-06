@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.sampling.triton.candidate_head import gather_dot
 from torch import nn
 from transformers import LlamaConfig
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_ops import all_gather
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -509,10 +510,13 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
     """
 
     def __init__(
-        self, config: LlamaConfig, *, tp_rank: int, tp_size: int, tp_group
+        self, output_vocab_size: int, *, tp_rank: int, tp_size: int, tp_group
     ) -> None:
         super().__init__(
-            config,
+            output_vocab_size,
+            final_logit_softcapping=None,
+            use_fused_lm_head=False,
+            tie_word_embeddings=False,
             do_argmax=True,
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -612,9 +616,11 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         validate_draft_config(config)
-        super().__init__(config, mapping, quant_config, prefix)
+        super().__init__(config, mapping, quant_config, prefix, vocabulary=vocabulary)
         head = config.efficient_lm_head_config
         self.efficient_lm_head_down_proj = ReplicatedLinear(
             config.hidden_size,
@@ -623,7 +629,7 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
             prefix=add_prefix("efficient_lm_head_down_proj", prefix),
         )
         self.efficient_lm_head = ParallelLMHead(
-            config.vocab_size,
+            self.vocabulary.output_size,
             head["rank"],
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
@@ -632,14 +638,14 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
         )
         self.num_candidates = head["num_candidates"]
         # A padded shard's zero rows could outscore every real token's.
-        shard_vocab = config.vocab_size // mapping.lm_head.tp_size
+        shard_vocab = vocabulary.output_size // mapping.lm_head.tp_size
         if any(
-            h.weight.shape[0] * mapping.lm_head.tp_size != config.vocab_size
+            h.weight.shape[0] * mapping.lm_head.tp_size != vocabulary.output_size
             for h in (self.lm_head, self.efficient_lm_head)
         ):
             raise ValueError(
                 "the candidate head scores unpadded vocab shards: vocab_size "
-                f"{config.vocab_size} must split into {mapping.lm_head.tp_size} "
+                f"{vocabulary.output_size} must split into {mapping.lm_head.tp_size} "
                 "shards the LM heads do not pad"
             )
         if not eagle4_candidate_supports(
@@ -654,7 +660,7 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
                 f"vocab shards of {shard_vocab}"
             )
         self.logits_processor = Eagle4CandidateLogitsProcessor(
-            config,
+            vocabulary.output_size,
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,

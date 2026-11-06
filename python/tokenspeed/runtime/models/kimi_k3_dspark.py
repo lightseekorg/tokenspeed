@@ -49,6 +49,7 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     k3_dspark_inactive_features,
     validate_k3_dspark_config,
 )
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -328,7 +329,10 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         validate_k3_dspark_config(config)
         for note in k3_dspark_inactive_features(config):

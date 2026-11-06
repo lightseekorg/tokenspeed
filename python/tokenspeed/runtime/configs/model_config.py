@@ -35,6 +35,7 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
 from tokenspeed.runtime.plugins import ensure_loaded
@@ -971,21 +972,21 @@ class ModelConfig:
                 )
                 if nextn_layers is not None and nextn_layers > 0:
                     self.num_attention_layers = nextn_layers
-        self.input_vocab_size = self.hf_text_config.vocab_size
-        output_vocab_size = getattr(self.hf_text_config, "output_vocab_size", None)
-        self.output_vocab_size = (
-            self.input_vocab_size if output_vocab_size is None else output_vocab_size
+        self.vocabulary = (
+            self.model_profile.vocabulary
+            if self.model_profile is not None
+            else VocabularySpec.from_hf_config(
+                self.hf_text_config, is_draft=bool(is_draft_worker)
+            )
         )
-        for name, size in (
-            ("input", self.input_vocab_size),
-            ("output", self.output_vocab_size),
+
+        if (
+            not is_draft_worker
+            and self.vocabulary.output_size > self.vocabulary.input_size
         ):
-            if type(size) is not int or size <= 0:
-                raise ValueError(
-                    f"The {name} vocabulary size must be a positive integer"
-                )
-        # Retain the checkpoint meaning for callers that build input embeddings.
-        self.vocab_size = self.input_vocab_size
+            raise ValueError(
+                "Target output vocabulary must be a prefix of the input vocabulary"
+            )
 
         # Verify quantization
         self._verify_quantization()

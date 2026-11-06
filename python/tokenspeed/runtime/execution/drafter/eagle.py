@@ -211,7 +211,7 @@ class Eagle(BaseDrafter):
         self.tree_vocab_size = (
             self.hot_token_ids.numel()
             if self.hot_token_ids is not None
-            else logits_processor.config.vocab_size
+            else logits_processor.output_vocab_size
         )
         self.tree_spec = tree_spec
         self.draft_tree = DraftTree(

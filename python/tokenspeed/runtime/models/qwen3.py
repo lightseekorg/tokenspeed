@@ -30,6 +30,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 from tokenspeed.runtime.configs.utils import get_rope_theta
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -350,11 +351,14 @@ class Qwen3ForCausalLM(BaseCausalLM):
         config: Qwen3Config,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
+            vocabulary=vocabulary,
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:

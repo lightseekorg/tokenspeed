@@ -32,6 +32,7 @@ from collections.abc import Iterable
 import torch
 
 from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -65,8 +66,11 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
         **kwargs,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         self.config = config
         self.mapping = mapping
@@ -84,6 +88,7 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
                     if isinstance(quant_config, (ModelSlimConfig, QuarkConfig))
                     else ""
                 ),
+                vocabulary=vocabulary,
             )
 
         if is_multimodal_active:

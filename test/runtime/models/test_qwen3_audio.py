@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.models.qwen3_audio import (
     Qwen3AudioEncoder,
     pack_qwen3_audio_features,
@@ -202,6 +203,7 @@ def test_tiny_asr_wrapper_loads_audio_and_language_roots():
             config,
             Mapping(rank=0, world_size=1),
             mm_attention_backend="triton_attn",
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
         ).eval()
 
     qkv = model.language_model.model.layers[0].self_attn.qkv_proj.weight
@@ -233,7 +235,11 @@ def test_asr_wrapper_rejects_audio_text_dimension_mismatch():
     config = _tiny_asr_config()
     config.thinker_config.audio_config.output_dim = 8
     with pytest.raises(ValueError, match="output_dim"):
-        Qwen3ASRForConditionalGeneration(config, Mapping(rank=0, world_size=1))
+        Qwen3ASRForConditionalGeneration(
+            config,
+            Mapping(rank=0, world_size=1),
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="audio tower needs CUDA")

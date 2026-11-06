@@ -97,16 +97,16 @@ class DFlash2(DFlash):
         # The target's LM-head layout, so a vocab-sharded head under attention
         # DP (--lm-head-tp-size) transposes its logits back the same way.
         self.candidate_logits_processor = LogitsProcessor(
-            self.model.config,
+            self.logits_processor.output_vocab_size,
             skip_all_gather=self.logits_processor.skip_all_gather,
             logit_scale=self.output_multiplier,
             tp_rank=self.logits_processor.tp_rank,
             tp_size=self.logits_processor.tp_size,
             tp_group=self.logits_processor.tp_group,
             dp_lm_head_tp=self.logits_processor.dp_lm_head_tp,
-        )
-        self.candidate_logits_processor.final_logit_softcapping = (
-            self.final_logit_softcapping if self.final_logit_softcapping > 0 else None
+            final_logit_softcapping=(self.final_logit_softcapping or None),
+            use_fused_lm_head=False,
+            tie_word_embeddings=self.logits_processor.tie_word_embeddings,
         )
         processor = self.candidate_logits_processor
         self.candidate_topk = VocabParallelTopK(
@@ -114,7 +114,7 @@ class DFlash2(DFlash):
             tp_size=processor.tp_size,
             tp_rank=processor.tp_rank,
             tp_group=processor.tp_group,
-            vocab_size=self.model.config.vocab_size,
+            vocab_size=self.logits_processor.output_vocab_size,
             top_k=self.selector_top_k,
             max_rows=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
             logit_scale=processor.logit_scale,
@@ -159,7 +159,7 @@ class DFlash2(DFlash):
         anchor_token_ids = (
             block_ids[:, 0]
             .to(torch.int64)
-            .clamp(0, int(self.model.config.vocab_size) - 1)
+            .clamp(0, self.logits_processor.output_vocab_size - 1)
         )
         scores = self.candidate_selector(
             candidate_ids,
@@ -168,5 +168,5 @@ class DFlash2(DFlash):
             anchor_token_ids,
         )
         _walk_greedy_path(candidate_ids, scores, anchor_token_ids, next_tokens)
-        next_tokens.clamp_(min=0, max=int(self.model.config.vocab_size) - 1)
+        next_tokens.clamp_(min=0, max=self.logits_processor.output_vocab_size - 1)
         return next_tokens

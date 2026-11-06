@@ -28,6 +28,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -152,7 +153,10 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         config: PretrainedConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         nn.Module.__init__(self)
         self.config = config
         self.mapping = mapping
@@ -178,12 +182,12 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         if self.mapping.attn.has_dp:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
-                config.vocab_size,
+                self.vocabulary.output_size,
                 bias=False,
             )
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
+                self.vocabulary.output_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 tp_rank=self.mapping.attn.tp_rank,
@@ -191,13 +195,16 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
                 tp_group=self.mapping.attn.tp_group,
             )
         self.logits_processor = LogitsProcessor(
-            config,
+            self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
             dp_lm_head_tp=False,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
 
     prepare_dsa_topk_for_mtp_decode = staticmethod(_prepare_dsa_topk_for_mtp_decode)

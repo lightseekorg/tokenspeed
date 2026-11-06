@@ -13,6 +13,7 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -79,7 +80,11 @@ def _build_model(
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("meta"):
-            return LlamaForCausalLMEagle3(config, mapping)
+            return LlamaForCausalLMEagle3(
+                config,
+                mapping,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+            )
     finally:
         torch.set_default_dtype(old_dtype)
 

@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -106,6 +107,9 @@ class TestQwen3MoeConfig:
         model = Qwen3MoeForCausalLM(
             _tiny_qwen3_moe_config(),
             mapping=_single_rank_mapping(),
+            vocabulary=VocabularySpec.from_hf_config(
+                _tiny_qwen3_moe_config(), is_draft=False
+            ),
         )
 
         assert isinstance((model.model.layers[0].mlp), (Qwen3_5MoeSparseMoeBlock))
@@ -119,6 +123,9 @@ class TestQwen3MoeConfig:
         model = Qwen3MoeForCausalLM(
             _tiny_qwen3_moe_config(),
             mapping=_single_rank_mapping(),
+            vocabulary=VocabularySpec.from_hf_config(
+                _tiny_qwen3_moe_config(), is_draft=False
+            ),
         )
         weights = []
         for expert_id in range(4):
@@ -154,6 +161,9 @@ class TestQwen3MoeConfig:
         model = Qwen3MoeForCausalLM(
             _tiny_qwen3_moe_config(),
             mapping=_ep_rank_mapping(rank=0),
+            vocabulary=VocabularySpec.from_hf_config(
+                _tiny_qwen3_moe_config(), is_draft=False
+            ),
         )
         model.load_weights(
             [
@@ -198,6 +208,9 @@ class TestQwen3MoeConfig:
         model = Qwen3MoeForCausalLM(
             _tiny_qwen3_moe_config(),
             mapping=_single_rank_mapping(),
+            vocabulary=VocabularySpec.from_hf_config(
+                _tiny_qwen3_moe_config(), is_draft=False
+            ),
         )
         model.model.layers = nn.ModuleList([IdleLayer()])
         ctx = ForwardContext(

@@ -18,6 +18,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
@@ -191,8 +193,7 @@ class TestIdleReplayScrubTest:
             ),
             runtime_states=SimpleNamespace(
                 valid_cache_lengths=torch.zeros(8, dtype=torch.int32),
-                vocab_size=32,
-                output_vocab_size=32,
+                vocabulary=VocabularySpec(input_size=32, output_size=32),
             ),
             device="cpu",
             device_module=torch.cpu,

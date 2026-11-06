@@ -31,6 +31,7 @@ import pytest
 import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.models import beam
 
@@ -159,7 +160,12 @@ def test_hopper_fp8_checkpoint_keeps_expert_codes_and_scales(server, hopper_plat
     the dense FP8 linears, with no SM90 FP8 GEMM, are dequantized after
     loading, so attention keeps no fused FP8 projection."""
     server("auto")
-    model = beam.BeamForCausalLM(tiny_config(), Mapping(rank=0, world_size=1), ct())
+    model = beam.BeamForCausalLM(
+        tiny_config(),
+        Mapping(rank=0, world_size=1),
+        ct(),
+        vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
+    )
     checkpoint, _ = fp8_checkpoint()
     assert model.load_weights(checkpoint.items()) == checkpoint.keys()
     experts = model.model.layers[1].mlp.experts

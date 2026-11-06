@@ -6,6 +6,7 @@ from unittest import mock
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle, EagleDraftInput
@@ -170,8 +171,7 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
     )
     executor.runtime_states = SimpleNamespace(
         valid_cache_lengths=torch.zeros(4, dtype=torch.int32),
-        vocab_size=32,
-        output_vocab_size=32,
+        vocabulary=VocabularySpec(input_size=32, output_size=32),
     )
     executor.attn_backend = SimpleNamespace()
     executor.token_to_kv_pool = SimpleNamespace()
@@ -761,7 +761,12 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
-    states = RuntimeStates(POOL, VOCAB, N, "cpu")
+    states = RuntimeStates(
+        POOL,
+        VocabularySpec(input_size=VOCAB, output_size=VOCAB),
+        N,
+        "cpu",
+    )
     states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
     buffers = _draft_buffers()
     pools = SpeculativeSamplingPools(
@@ -1084,7 +1089,12 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
     assert Eagle.supports_speculative_sampling and Mtp.supports_speculative_sampling
     assert not DFlash.supports_speculative_sampling
 
-    states = RuntimeStates(POOL, VOCAB, N, "cpu")
+    states = RuntimeStates(
+        POOL,
+        VocabularySpec(input_size=VOCAB, output_size=VOCAB),
+        N,
+        "cpu",
+    )
     states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
     buffers = _draft_buffers()
     pools = SpeculativeSamplingPools(

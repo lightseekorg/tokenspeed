@@ -39,6 +39,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import LlamaConfig
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
@@ -103,7 +105,11 @@ def _check_greedy_candidate(rank, world_size, device):
     )
     torch.set_default_dtype(torch.bfloat16)
     with torch.device(device):
-        model = LlamaForCausalLMEagle4(config, mapping)
+        model = LlamaForCausalLMEagle4(
+            config,
+            mapping,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        )
 
     # The same full weights and activations on every rank; each rank keeps its vocab shard.
     generator = torch.Generator(device="cpu").manual_seed(0)

@@ -31,6 +31,8 @@ from collections import Counter
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
@@ -212,6 +214,9 @@ def test_every_checkpoint_tensor_fills_exactly_one_parameter() -> None:
                 quant_config=quant_config,
                 is_multimodal_active=True,
                 mm_attention_backend="triton_attn",
+                vocabulary=VocabularySpec.from_hf_config(
+                    _narrow_config(raw), is_draft=False
+                ),
             )
     finally:
         torch.set_default_dtype(previous_dtype)

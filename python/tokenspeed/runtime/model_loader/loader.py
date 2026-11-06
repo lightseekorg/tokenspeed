@@ -167,6 +167,7 @@ def _initialize_model(
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
     return model_class(
         config=model_config.hf_config,
+        vocabulary=model_config.vocabulary,
         mapping=mapping,
         quant_config=quant_config,
         **extra_kwargs,

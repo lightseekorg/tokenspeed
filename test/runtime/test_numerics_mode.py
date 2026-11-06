@@ -441,8 +441,10 @@ class TestModelVerificationGate:
     def _profile(self, envelopes):
         from tokenspeed.runtime.configs.model_config import configure_mla_attention
         from tokenspeed.runtime.configs.model_profile import ModelProfile
+        from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
         return ModelProfile(
+            vocabulary=VocabularySpec(input_size=128, output_size=128),
             configure_attention=configure_mla_attention,
             cache_family="fixture_family",
             linear_attention=None,

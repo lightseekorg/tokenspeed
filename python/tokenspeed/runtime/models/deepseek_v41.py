@@ -113,6 +113,7 @@ from tokenspeed_kernel.selection import NoKernelFoundError
 from torch import nn
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_backend import Group
 from tokenspeed.runtime.distributed.comm_manager import CommManager, gather_sampled_rows
@@ -2748,6 +2749,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         quant_config: QuantizationConfig | None,
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config=config,
@@ -2755,6 +2758,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             quant_config=quant_config,
             prefix="",
             encoder_only=getattr(config, "encoder_only", False),
+            vocabulary=vocabulary,
         )
         self.is_multimodal_active = is_multimodal_active
         self._checkpoint_dir: str | None = None
@@ -2844,7 +2848,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
             return ReplicatedLinear(
                 input_size=config.hidden_size,
-                output_size=config.vocab_size,
+                output_size=self.vocabulary.output_size,
                 bias=False,
                 skip_bias_add=False,
                 params_dtype=params_dtype,
@@ -2852,7 +2856,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
         return ParallelLMHead(
-            num_embeddings=config.vocab_size,
+            num_embeddings=self.vocabulary.output_size,
             embedding_dim=config.hidden_size,
             bias=False,
             params_dtype=params_dtype,

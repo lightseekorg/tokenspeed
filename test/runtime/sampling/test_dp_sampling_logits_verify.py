@@ -171,12 +171,15 @@ def _build_processor(
     tp_group: tuple[int, ...],
 ):
     return LogitsProcessor(
-        config=config,
+        output_vocab_size=getattr(config, "vocab_size", None),
         skip_all_gather=False,
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_group=tp_group,
         dp_lm_head_tp=False,
+        final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+        use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+        tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
     )
 
 

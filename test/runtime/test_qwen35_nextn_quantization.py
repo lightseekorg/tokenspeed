@@ -8,6 +8,7 @@ from transformers import PretrainedConfig
 
 import tokenspeed.runtime.layers.logits_processor as logits_module
 import tokenspeed.runtime.models.qwen3_5_nextn as nextn_module
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.factory import _check_shared_head_layout
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -67,6 +68,7 @@ def test_attention_dp_draft_lm_head_receives_quant_config(monkeypatch):
         config,
         mapping,
         quant_config=quant_config,
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
     )
 
     assert draft.lm_head is lm_head
@@ -119,7 +121,9 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp, 
             / 100
             - 0.16
         )
-    draft = Qwen3_5ForConditionalGenerationNextN(config, mapping)
+    draft = Qwen3_5ForConditionalGenerationNextN(
+        config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
+    )
     _check_shared_head_layout(target, draft)
     draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
 
@@ -150,7 +154,9 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     target = _HeadOnlyTarget(config, mapping)
-    draft = Qwen3_5ForConditionalGenerationNextN(config, mapping)
+    draft = Qwen3_5ForConditionalGenerationNextN(
+        config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
+    )
     _check_shared_head_layout(target, draft)
     full_weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4) / 100
     width = target.lm_head.weight.shape[0]
@@ -252,8 +258,11 @@ def test_mtp_shares_complete_quantized_lm_head(monkeypatch, tied):
     assert should_apply_lm_head_quant_method(draft.lm_head, draft.lm_head.quant_method)
 
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="qwen3_5", vocab_size=4),
+        output_vocab_size=4,
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     hidden_states = torch.ones((1, 4), dtype=torch.bfloat16)
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)

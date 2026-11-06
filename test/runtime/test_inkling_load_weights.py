@@ -18,6 +18,8 @@ import sys
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test.runtime.models.inkling_fixtures import (  # noqa: E402
     NUM_TEST_EXPERTS,
@@ -56,7 +58,10 @@ def _build_model(config, quant_config=None, rank=0, world_size=1, **mapping_kw):
         torch.set_default_dtype(torch.bfloat16)
         try:
             model = InklingForConditionalGeneration(
-                config, mapping, quant_config=quant_config
+                config,
+                mapping,
+                quant_config=quant_config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
             )
         finally:
             torch.set_default_dtype(torch.float32)

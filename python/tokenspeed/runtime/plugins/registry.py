@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import register_numerics_envelope
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
@@ -88,6 +89,7 @@ __all__ = [
     "TraceProvider",
     "register_drafter",
     "ModelProfile",
+    "VocabularySpec",
     "RegisteredModel",
     "register_attention_backend",
     "register_cache_pool",

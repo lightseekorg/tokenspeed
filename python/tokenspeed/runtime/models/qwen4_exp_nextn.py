@@ -30,6 +30,7 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -80,17 +81,19 @@ def _mtp_index_sharing_enabled(config) -> bool:
     return bool(getattr(text_config, "index_share_for_mtp_iteration", False))
 
 
-def _build_mtp_lm_head(config, mapping: Mapping, quant_config, prefix: str):
+def _build_mtp_lm_head(
+    config, mapping: Mapping, quant_config, prefix: str, *, output_vocab_size: int
+):
     if mapping.attn.has_dp and not mapping.lm_head.has_tp:
         return ReplicatedLinear(
             config.hidden_size,
-            config.vocab_size,
+            output_vocab_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
         )
     return ParallelLMHead(
-        config.vocab_size,
+        output_vocab_size,
         config.hidden_size,
         quant_config=quant_config,
         prefix=add_prefix("model.shared_head.head", prefix),
@@ -177,7 +180,10 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         config = copy.deepcopy(getattr(config, "text_config", config))
         quant_config = _resolve_mtp_quant_config(quant_config)
@@ -219,15 +225,24 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         )
         for indexer in self.model.qsa_indexers:
             indexer.share_topk_for_mtp_iteration = self.index_share_for_mtp_iteration
-        self.lm_head = _build_mtp_lm_head(config, mapping, quant_config, prefix)
-        self.logits_processor = LogitsProcessor(
+        self.lm_head = _build_mtp_lm_head(
             config,
+            mapping,
+            quant_config,
+            prefix,
+            output_vocab_size=vocabulary.output_size,
+        )
+        self.logits_processor = LogitsProcessor(
+            self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
             do_argmax=True,
             dp_lm_head_tp=mapping.attn.has_dp and mapping.lm_head.has_tp,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self):

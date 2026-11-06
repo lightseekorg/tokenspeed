@@ -26,6 +26,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 
 def _worker(rank, path):
     from transformers import PretrainedConfig
@@ -45,6 +47,7 @@ def _worker(rank, path):
     class CollectiveModel(BaseCausalLM):
         def __init__(self):
             super().__init__(
+                vocabulary=VocabularySpec(input_size=1, output_size=1),
                 config=PretrainedConfig(),
                 mapping=Mapping(rank=rank, world_size=2),
                 encoder_only=True,

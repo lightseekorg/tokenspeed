@@ -86,11 +86,14 @@ def test_extensible_lm_exposes_base_sampling_setup_handles():
 
 def test_logits_processor_dp_layout_threshold_and_modes():
     processor = LogitsProcessor(
-        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        7,
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=16))
 
@@ -217,11 +220,14 @@ def test_cuda_graph_route_respects_disable_padding_with_global_batch():
 
 def test_configure_dp_sampling_sets_state():
     processor = LogitsProcessor(
-        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        7,
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
 
     processor.configure_dp_logits_layout(_dp_runtime_config())
@@ -274,11 +280,14 @@ def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
     forward_mode,
 ):
     processor = LogitsProcessor(
-        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        7,
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=5))
 
@@ -320,12 +329,15 @@ def test_resolve_dp_sampling_support_rejects_missing_preconditions():
 
 def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
     processor = LogitsProcessor(
-        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        7,
         skip_all_gather=True,
         tp_rank=1,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     processor.configure_dp_logits_layout(
         _dp_runtime_config(tp_rank=1, skip_all_gather=True, device="cpu")
@@ -354,12 +366,15 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
 
 def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
     processor = LogitsProcessor(
-        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        7,
         skip_all_gather=True,
         tp_rank=2,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
         dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
     )
     processor.configure_dp_logits_layout(
         _dp_runtime_config(tp_rank=2, skip_all_gather=True, device="cpu")

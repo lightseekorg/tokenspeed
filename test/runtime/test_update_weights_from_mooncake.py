@@ -37,6 +37,8 @@ from unittest import mock
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -409,7 +411,10 @@ class _TinyDiscardModel(BaseCausalLM):
 
     def __init__(self):
         super().__init__(
-            config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
+            vocabulary=VocabularySpec(input_size=1, output_size=1),
+            config=SimpleNamespace(),
+            mapping=SimpleNamespace(),
+            encoder_only=True,
         )
         self.a = torch.nn.Parameter(torch.tensor([4.0]))
         self.b = torch.nn.Parameter(torch.tensor([5.0]))

@@ -39,6 +39,7 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.execution import input_buffer
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
@@ -100,7 +101,10 @@ def buffers(request, monkeypatch):
         reads_state_checkpoints=False,
     )
     runtime = RuntimeStates(
-        req_pool_size=8, vocab_size=VOCAB_SIZE, output_length=1, device=device
+        req_pool_size=8,
+        vocabulary=VocabularySpec(input_size=VOCAB_SIZE, output_size=VOCAB_SIZE),
+        output_length=1,
+        device=device,
     )
     return ib, runtime
 

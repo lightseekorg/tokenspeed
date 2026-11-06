@@ -44,6 +44,7 @@ from tokenspeed.runtime.configs.model_config import (
     configure_mla_attention,
 )
 from tokenspeed.runtime.configs.model_profile import ModelProfile
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.kv_cache import factory as pool_factory
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import setup as recipe_setup
@@ -54,6 +55,7 @@ from tokenspeed.runtime.utils import hf_transformers_utils
 
 def _profile(**overrides) -> ModelProfile:
     fields = dict(
+        vocabulary=VocabularySpec(input_size=128, output_size=128),
         configure_attention=configure_mla_attention,
         cache_family="fixture_family",
         linear_attention="fixture_linear",

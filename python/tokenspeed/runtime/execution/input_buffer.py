@@ -328,7 +328,7 @@ class InputBuffers:
             self.ngram_prefix_buf[:bs],
             self.ngram_hash_ids_buf[:refresh_tokens],
             total_tokens,
-            runtime_states.vocab_size,
+            runtime_states.vocabulary.input_size,
             uniform_length,
             self.ngram_hash_params,
         )
@@ -729,7 +729,7 @@ class InputBuffers:
         # final chunk's last row (patched by the drafter with the round's
         # sampled token), and every id the drafters consume is sampled or
         # substituted in-vocab by construction.
-        vocab_size = runtime_states.vocab_size
+        vocab_size = runtime_states.vocabulary.input_size
         self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 

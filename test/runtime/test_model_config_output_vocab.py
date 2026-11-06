@@ -32,6 +32,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.model_config import ModelConfig  # noqa: E402
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
@@ -86,8 +87,10 @@ def _load(tmp_path, *, input_vocab_size, output_fields):
 )
 def test_input_and_output_vocabularies_are_independent(tmp_path, output_fields):
     model = _load(tmp_path, input_vocab_size=128, output_fields=output_fields)
-    assert model.input_vocab_size == model.vocab_size == 128
-    assert model.output_vocab_size == (output_fields.get("output_vocab_size") or 128)
+    assert model.vocabulary.input_size == 128
+    assert model.vocabulary.output_size == (
+        output_fields.get("output_vocab_size") or 128
+    )
     assert model.hf_text_config.vocab_size == 128
 
 
@@ -103,8 +106,6 @@ def test_invalid_vocabulary_is_rejected(tmp_path, size, domain):
 
 
 def test_executor_config_keeps_both_vocabularies(tmp_path):
-    from dataclasses import asdict
-
     import torch
 
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
@@ -132,43 +133,19 @@ def test_executor_config_keeps_both_vocabularies(tmp_path):
         global_rank=0,
         prefix_granularity=1,
     )
-    assert executor.vocab_size == 128
-    assert executor.output_vocab_size == 64
-
-    # Existing callers construct the config with one vocabulary size.
-    legacy_args = asdict(executor)
-    legacy_args.pop("output_vocab_size")
-    legacy = ModelExecutorConfig(**legacy_args)
-    assert legacy.vocab_size == legacy.output_vocab_size == 128
-    explicit_none = ModelExecutorConfig(**legacy_args, output_vocab_size=None)
-    assert explicit_none.vocab_size == explicit_none.output_vocab_size == 128
+    assert executor.vocabulary is model.vocabulary
 
 
-@pytest.mark.parametrize("use_keywords", [False, True])
-@pytest.mark.parametrize(
-    "output_fields", [{}, {"output_vocab_size": None}, {"output_vocab_size": 64}]
-)
-def test_runtime_states_preserves_existing_constructor(use_keywords, output_fields):
+@pytest.mark.parametrize("output_size", [64, 128])
+def test_runtime_states_sizes_draft_probabilities_from_output_domain(output_size):
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
-    if use_keywords:
-        states = RuntimeStates(
-            req_pool_size=2,
-            vocab_size=128,
-            output_length=1,
-            device="cpu",
-            **output_fields,
-        )
-    else:
-        states = RuntimeStates(2, 128, 1, "cpu", **output_fields)
+    vocabulary = VocabularySpec(input_size=128, output_size=output_size)
+    states = RuntimeStates(2, vocabulary, 1, "cpu")
     states.init_draft_probs(spec_num_tokens=2, reject_threshold=2.0)
-    assert states.vocab_size == 128
+    assert states.vocabulary is vocabulary
     assert states.future_input_map.shape == (3, 1)
-    assert states.draft_probs.shape == (
-        3,
-        2,
-        output_fields.get("output_vocab_size") or 128,
-    )
+    assert states.draft_probs.shape == (3, 2, output_size)
 
 
 def test_draft_media_substitute_uses_input_vocabulary(tmp_path):
@@ -195,3 +172,82 @@ def test_draft_media_substitute_uses_input_vocabulary(tmp_path):
 
     substitute_mm_pad_(tokens, buffers.mm_pad_substitute_ids)
     assert tokens.tolist() == [10, 100]
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_common_model_builds_head_from_resolved_output_domain(tied):
+    import torch
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+    class EmbeddingModel(torch.nn.Module):
+        def __init__(self, config, **kwargs):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(
+                config.vocab_size, config.hidden_size
+            )
+
+    class CausalModel(BaseCausalLM):
+        model_cls = EmbeddingModel
+
+    config = PretrainedConfig(vocab_size=128, hidden_size=8, tie_word_embeddings=tied)
+    vocabulary = VocabularySpec(input_size=128, output_size=64)
+    mapping = Mapping(rank=0, world_size=1)
+    if tied:
+        with pytest.raises(ValueError, match="equal vocabulary sizes"):
+            CausalModel(config, mapping, vocabulary=vocabulary)
+        return
+    model = CausalModel(config, mapping, vocabulary=vocabulary)
+    hidden = model.model.embed_tokens(torch.tensor([127]))
+    model.logits_processor.prepare_communication(model.lm_head)
+    logits = model.logits_processor._get_logits(
+        hidden, model.lm_head, None, require_full_vocab=True
+    )
+    assert logits.shape == (1, 64)
+    assert model.vocabulary is vocabulary
+    assert config.vocab_size == 128
+
+
+def test_target_outputs_must_be_valid_input_ids(tmp_path):
+    with pytest.raises(ValueError, match="prefix of the input vocabulary"):
+        _load(tmp_path, input_vocab_size=64, output_fields={"output_vocab_size": 128})
+
+
+def test_model_profile_owns_checkpoint_vocabulary_meaning(tmp_path, monkeypatch):
+    from tokenspeed.runtime.configs.model_config import configure_mha_attention
+    from tokenspeed.runtime.configs.model_profile import ModelProfile
+    from tokenspeed.runtime.plugins import registry
+
+    vocabulary = VocabularySpec(input_size=256, output_size=64)
+
+    class ProfiledVocabularyModel:
+        @classmethod
+        def model_profile(cls, hf_config):
+            return ModelProfile(
+                vocabulary=vocabulary,
+                configure_attention=configure_mha_attention,
+                cache_family="mha",
+                linear_attention=None,
+                default_attention_backend=None,
+                request_token_history=False,
+                is_multimodal=False,
+                tokenizer_kwargs={},
+                attention_instances_per_layer=1,
+                numerics_envelopes=frozenset({"auto"}),
+            )
+
+    monkeypatch.setattr(registry, "_MODELS", dict(registry._MODELS))
+    registry.register_model(ProfiledVocabularyModel)
+    model = _load(
+        tmp_path,
+        input_vocab_size=128,
+        output_fields={
+            "architectures": ["ProfiledVocabularyModel"],
+            "output_vocab_size": 32,
+        },
+    )
+    assert model.vocabulary is vocabulary
+    assert model.hf_text_config.vocab_size == 128
+    assert model.hf_text_config.output_vocab_size == 32

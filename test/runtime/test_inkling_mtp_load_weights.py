@@ -22,6 +22,8 @@ import sys
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test.runtime.models.inkling_fixtures import load_inkling_config  # noqa: E402
 
@@ -140,7 +142,11 @@ class TestInklingMTPLoadWeights:
         with torch.device("cuda"):
             torch.set_default_dtype(torch.bfloat16)
             try:
-                cls.model = InklingForConditionalGenerationNextN(cls.config, mapping)
+                cls.model = InklingForConditionalGenerationNextN(
+                    cls.config,
+                    mapping,
+                    vocabulary=VocabularySpec.from_hf_config(cls.config, is_draft=True),
+                )
             finally:
                 torch.set_default_dtype(torch.float32)
         cls.model.eval()
@@ -260,7 +266,13 @@ class TestInklingMTPLoadWeights:
         with torch.device("cuda"):
             torch.set_default_dtype(torch.bfloat16)
             try:
-                model = InklingForConditionalGenerationNextN(self.config, mapping)
+                model = InklingForConditionalGenerationNextN(
+                    self.config,
+                    mapping,
+                    vocabulary=VocabularySpec.from_hf_config(
+                        self.config, is_draft=True
+                    ),
+                )
             finally:
                 torch.set_default_dtype(torch.float32)
         partial = {
@@ -296,7 +308,9 @@ class TestInklingMTPLoadWeightsSWADepths:
             torch.set_default_dtype(torch.bfloat16)
             try:
                 cls.model = InklingForConditionalGenerationNextN(
-                    cls.config, cls.mapping
+                    cls.config,
+                    cls.mapping,
+                    vocabulary=VocabularySpec.from_hf_config(cls.config, is_draft=True),
                 )
             finally:
                 torch.set_default_dtype(torch.float32)
@@ -367,7 +381,11 @@ class TestInklingMTPLoadWeightsSWADepths:
         with torch.device("cuda"):
             torch.set_default_dtype(torch.bfloat16)
             try:
-                model = InklingForConditionalGenerationNextN(config, self.mapping)
+                model = InklingForConditionalGenerationNextN(
+                    config,
+                    self.mapping,
+                    vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+                )
             finally:
                 torch.set_default_dtype(torch.float32)
         assert (len(model.model.layers)) == (2)

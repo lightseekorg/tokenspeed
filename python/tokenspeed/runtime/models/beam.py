@@ -62,6 +62,7 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -1474,12 +1475,13 @@ class BeamModel(BaseTransformerModel):
 
 
 class BeamLogitsProcessor(LogitsProcessor):
-    def __init__(self, config: Any, mapping: Any) -> None:
-        projection_config = copy(config)
-        projection_config.final_logit_softcapping = None
+    def __init__(self, config: Any, mapping: Any, *, output_vocab_size: int) -> None:
         tp = mapping.attn
         super().__init__(
-            projection_config,
+            output_vocab_size,
+            final_logit_softcapping=None,
+            use_fused_lm_head=False,
+            tie_word_embeddings=False,
             skip_all_gather=tp.has_dp,
             do_argmax=False,
             logit_scale=None,
@@ -1538,7 +1540,14 @@ class BeamForCausalLM(BaseCausalLM):
     model_cls = BeamModel
     supports_aux_capture = True
 
-    def __init__(self, config: Any, mapping: Any, quant_config: Any) -> None:
+    def __init__(
+        self,
+        config: Any,
+        mapping: Any,
+        quant_config: Any,
+        *,
+        vocabulary: VocabularySpec,
+    ) -> None:
         config.validate()
         # beam_quant_policy admits or refuses a quantized checkpoint.
         quant = None if quant_config is None else beam_quant_policy(quant_config)
@@ -1577,6 +1586,7 @@ class BeamForCausalLM(BaseCausalLM):
                 quant_config=quant_config,
                 prefix="",
                 encoder_only=False,
+                vocabulary=vocabulary,
             )
         self.beam_quant = quant
         # The positions the sliding layers' shared RoPE table covers, which the
@@ -1603,11 +1613,11 @@ class BeamForCausalLM(BaseCausalLM):
         # slice; the shared logits processor gathers the full vocabulary.
         tp = self.mapping.attn
         return ParallelLMHead(
-            num_embeddings=config.vocab_size,
+            num_embeddings=self.vocabulary.output_size,
             embedding_dim=config.hidden_size,
             bias=False,
             params_dtype=_CHECKPOINT_DTYPE,
-            org_num_embeddings=config.vocab_size,
+            org_num_embeddings=self.vocabulary.output_size,
             padding_size=1,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
@@ -1618,7 +1628,9 @@ class BeamForCausalLM(BaseCausalLM):
         )
 
     def resolve_logits_processor(self, config: Any):
-        return BeamLogitsProcessor(config, self.mapping)
+        return BeamLogitsProcessor(
+            config, self.mapping, output_vocab_size=self.vocabulary.output_size
+        )
 
     def prepare_model_kwargs(self, ctx: Any, input_ids: torch.Tensor, kwargs: dict):
         return {"input_embeds": kwargs.get("input_embeds", kwargs.get("inputs_embeds"))}
@@ -1649,7 +1661,7 @@ class BeamForCausalLM(BaseCausalLM):
             for name, weight in weights:
                 mapped = beam_checkpoint_name(name)
                 if name == "lm_head.weight" and tuple(weight.shape) != (
-                    self.config.vocab_size,
+                    self.vocabulary.output_size,
                     self.config.hidden_size,
                 ):
                     raise ValueError(

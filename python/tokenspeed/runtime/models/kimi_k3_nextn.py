@@ -39,6 +39,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -305,7 +306,10 @@ class KimiK3NextNForCausalLM(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         self.config = config
         self.mapping = mapping
@@ -318,7 +322,7 @@ class KimiK3NextNForCausalLM(nn.Module):
         from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 
         self.lm_head = ParallelLMHead(
-            config.vocab_size,
+            vocabulary.output_size,
             config.hidden_size,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
@@ -329,13 +333,16 @@ class KimiK3NextNForCausalLM(nn.Module):
         # diverges and caps chain acceptance at whatever rank 0's vocab shard
         # happens to contain).
         self.logits_processor = LogitsProcessor(
-            config,
+            self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
@@ -528,12 +535,15 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         text_config = getattr(config, "text_config", None) or config
         self.config = config
         self.language_model = KimiK3NextNForCausalLM(
-            text_config, mapping, quant_config, prefix=prefix
+            text_config, mapping, quant_config, prefix=prefix, vocabulary=vocabulary
         )
         self.logits_processor = self.language_model.logits_processor
         self.lm_head = self.language_model.lm_head

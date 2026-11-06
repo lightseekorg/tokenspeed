@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.models.dflash2 import DFlash2DraftModel
@@ -53,6 +54,8 @@ class DFlash2BeamDraftModel(DFlash2DraftModel):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         # The checkpoint's max_position_embeddings is also the longest
         # --max-model-len the draft accepts; --max-model-len exceeds it only
@@ -74,6 +77,7 @@ class DFlash2BeamDraftModel(DFlash2DraftModel):
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            vocabulary=vocabulary,
         )
         self.config = config
         self.rope_positions = rope_config.max_position_embeddings

@@ -98,6 +98,7 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
@@ -5315,8 +5316,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
         **kwargs,
     ) -> None:
+        self.vocabulary = vocabulary
         super().__init__()
         self.config = config
         self.mapping = mapping
@@ -5330,6 +5334,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 config.text_config,
                 mapping=mapping,
                 quant_config=quant_config,
+                vocabulary=vocabulary,
             )
 
         # Multimodal path. ``image_encoder`` may later be replaced by

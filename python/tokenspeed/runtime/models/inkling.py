@@ -98,6 +98,7 @@ from tokenspeed.runtime.configs.inkling_config import (
     InklingVisionConfig,
     inkling_conv_stream_layout,
 )
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -1523,8 +1524,11 @@ class InklingForConditionalGeneration(nn.Module):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        *,
+        vocabulary: VocabularySpec,
     ):
         # Towers are attention-free; the knob is just a VLM-wrapper interface requirement.
+        self.vocabulary = vocabulary
         del mm_attention_backend
         super().__init__()
 
@@ -1597,12 +1601,17 @@ class InklingForConditionalGeneration(nn.Module):
         )
         # All-gather vocab-sharded logits before sampling; do_argmax would bypass the pad masking below.
         self.logits_processor = _InklingLogitsProcessor(
-            text_config,
+            self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
+            final_logit_softcapping=getattr(
+                text_config, "final_logit_softcapping", None
+            ),
+            use_fused_lm_head=(getattr(text_config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(text_config, "tie_word_embeddings", False),
         )
 
     def get_input_embeddings(self):

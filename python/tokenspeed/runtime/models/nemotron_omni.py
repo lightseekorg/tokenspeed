@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.activation import relu2
 from torch import nn
 
 from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -139,9 +140,13 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
         *,
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
+        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
-            config=config.text_config, mapping=mapping, quant_config=quant_config
+            config=config.text_config,
+            mapping=mapping,
+            quant_config=quant_config,
+            vocabulary=vocabulary,
         )
         self.omni_config = config
         self.is_multimodal_active = is_multimodal_active
@@ -413,8 +418,12 @@ class NemotronH_Omni_Reasoning_V3NextN(NemotronHForCausalLMNextN):  # noqa: N801
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
-        super().__init__(config.text_config, mapping, quant_config, prefix)
+        super().__init__(
+            config.text_config, mapping, quant_config, prefix, vocabulary=vocabulary
+        )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return name.startswith("language_model.mtp.")

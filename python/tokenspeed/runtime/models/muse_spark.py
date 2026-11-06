@@ -72,6 +72,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -2478,6 +2479,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         quant_config: QuantizationConfig | None,
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
         if mapping.pp_size > 1:
             raise ValueError(
@@ -2489,6 +2492,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             quant_config=quant_config,
             prefix="",
             encoder_only=False,
+            vocabulary=vocabulary,
         )
         self.is_multimodal_active = is_multimodal_active
         self._loaded_audio: set[str] = set()
@@ -2623,7 +2627,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
 
     def resolve_logits_processor(self, config: MuseSparkConfig) -> LogitsProcessor:
         return LogitsProcessor(
-            config,
+            self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=False,
             logit_scale=config.output_multiplier,
@@ -2631,6 +2635,9 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
             dp_lm_head_tp=False,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:

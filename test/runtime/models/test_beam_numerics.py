@@ -40,6 +40,7 @@ import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from torch.nn import functional as F
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.gating import apply_attention_output_gate
 from tokenspeed.runtime.models import beam
@@ -85,7 +86,12 @@ def cpu_rmsnorm(monkeypatch):
 
 
 def _tiny_model():
-    return BeamForCausalLM(tiny_config(), Mapping(rank=0, world_size=1), None)
+    return BeamForCausalLM(
+        tiny_config(),
+        Mapping(rank=0, world_size=1),
+        None,
+        vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
+    )
 
 
 def _bf16(*shape, seed=0, scale=1.0):
@@ -288,7 +294,10 @@ def loaded(monkeypatch):
     weights = tiny_weights(config)
     with torch.device("cuda"):
         model = BeamForCausalLM(
-            config, Mapping(rank=0, world_size=1), quant_config=None
+            config,
+            Mapping(rank=0, world_size=1),
+            quant_config=None,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
         )
     assert model.load_weights(weights.items()) == weights.keys()
     return model.eval(), {name: value.cuda() for name, value in weights.items()}
@@ -422,7 +431,9 @@ def test_logits_projection_and_softcap_dtypes(loaded, softcap):
     model, weights = loaded
     config = copy(model.config)
     config.final_logit_softcapping = softcap
-    processor = BeamLogitsProcessor(config, model.mapping)
+    processor = BeamLogitsProcessor(
+        config, model.mapping, output_vocab_size=config.vocab_size
+    )
     hidden = torch.linspace(-1, 1, 2 * 128, device="cuda").reshape(2, 128).bfloat16()
     actual = processor._get_logits(
         hidden,
@@ -446,7 +457,9 @@ def test_logits_processor_fuses_argmax_only_without_softcap(softcap):
     # runs after the shared processor, which keeps it out of a capped head.
     config = tiny_config()
     config.final_logit_softcapping = softcap
-    processor = BeamLogitsProcessor(config, Mapping(rank=0, world_size=1))
+    processor = BeamLogitsProcessor(
+        config, Mapping(rank=0, world_size=1), output_vocab_size=config.vocab_size
+    )
     processor.fuse_argmax()
     assert processor.do_argmax is (softcap is None)
 

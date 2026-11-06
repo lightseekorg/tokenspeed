@@ -30,6 +30,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 from tokenspeed_kernel.ops.quantization import quantize_fp8
@@ -807,7 +809,11 @@ def test_mtp_head_refuses_patterns_its_narrowing_cannot_serve(blocks: list[str])
     config = _config(num_nextn_predict_layers=1, mtp_layers_block_type=blocks)
     assert list(config.mtp_layers_block_type) == blocks
     with pytest.raises(NotImplementedError, match="opens with its only attention"):
-        NemotronHForCausalLMNextN(config, Mapping(rank=0, world_size=1))
+        NemotronHForCausalLMNextN(
+            config,
+            Mapping(rank=0, world_size=1),
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        )
 
 
 @pytest.mark.parametrize("mtp_quantized", [False, True])
@@ -837,7 +843,10 @@ def test_mtp_head_follows_the_checkpoint_quantization(mtp_quantized: bool):
     )
     with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
         head = NemotronHForCausalLMNextN(
-            config, Mapping(rank=0, world_size=1), quant_config
+            config,
+            Mapping(rank=0, world_size=1),
+            quant_config,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
         )
     expected = "nvfp4" if mtp_quantized else "unquant"
     assert head.layers[1].mixer.experts._quant_kind == expected
@@ -1234,7 +1243,11 @@ def test_mtp_head_takes_its_checkpoint_kv_cache_scales_at_startup_only(
     )
     mapping = Mapping(rank=0, world_size=1)
     with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
-        head = NemotronHForCausalLMNextN(config, mapping)
+        head = NemotronHForCausalLMNextN(
+            config,
+            mapping,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        )
     attn = head.layers[0].mixer.attn
     scales = {
         "mtp.layers.0.mixer.k_proj.k_scale": torch.tensor([0.0614]),
@@ -1310,7 +1323,11 @@ def test_eagle_taps_are_the_full_stream_after_each_named_block(
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("cuda"):
-            model = NemotronHForCausalLM(config, mapping)
+            model = NemotronHForCausalLM(
+                config,
+                mapping,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+            )
     finally:
         torch.set_default_dtype(old_dtype)
     g = torch.Generator(device="cuda").manual_seed(5)

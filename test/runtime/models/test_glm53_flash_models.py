@@ -13,6 +13,7 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashTextConfig,
     Glm53FlashVisionConfig,
 )
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
@@ -250,6 +251,7 @@ def _build_model(monkeypatch) -> Glm53FlashForConditionalGeneration:
     return Glm53FlashForConditionalGeneration(
         _tiny_config(),
         mapping=Mapping(rank=0, world_size=1),
+        vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=False),
     )
 
 
@@ -439,8 +441,16 @@ def test_text_and_nextn_model_hierarchies(monkeypatch) -> None:
     monkeypatch.setitem(global_server_args_dict, "attention_backend", "dsa")
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
 
-    causal = Glm53FlashForCausalLM(_tiny_text_config(), mapping)
-    nextn = Glm53FlashForConditionalGenerationNextN(_tiny_config(), mapping)
+    causal = Glm53FlashForCausalLM(
+        _tiny_text_config(),
+        mapping,
+        vocabulary=VocabularySpec.from_hf_config(_tiny_text_config(), is_draft=False),
+    )
+    nextn = Glm53FlashForConditionalGenerationNextN(
+        _tiny_config(),
+        mapping,
+        vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=True),
+    )
 
     assert causal.model.layers[0].is_kda_layer
     assert not causal.model.layers[3].is_kda_layer
@@ -472,8 +482,14 @@ def test_nextn_reuses_first_draft_selection_only_when_configured(
         ] = share_indices
     config = Glm53FlashConfig.from_dict(checkpoint_config)
     assert config.text_config.index_share_for_mtp_iteration is bool(share_indices)
-    model = Glm53FlashForConditionalGenerationNextN(config, mapping)
-    target = Glm53FlashForCausalLM(config.text_config, mapping)
+    model = Glm53FlashForConditionalGenerationNextN(
+        config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
+    )
+    target = Glm53FlashForCausalLM(
+        config.text_config,
+        mapping,
+        vocabulary=VocabularySpec.from_hf_config(config.text_config, is_draft=False),
+    )
     assert model.index_share_for_mtp_iteration is bool(share_indices)
     assert not target.model.layers[3].self_attn.skip_indexer_topk
 

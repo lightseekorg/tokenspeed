@@ -32,6 +32,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -584,8 +585,11 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        vocabulary: VocabularySpec,
     ) -> None:
 
+        self.vocabulary = vocabulary
         nn.Module.__init__(self)
         self.config = config
         self.mapping = mapping
@@ -611,7 +615,7 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             # (mapping.lm_head): the shared target head arrives in that
             # layout, and a draft-vocab head shards the same way.
             self.lm_head = ParallelLMHead(
-                getattr(config, "draft_vocab_size", None) or config.vocab_size,
+                self.vocabulary.output_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 tp_rank=mapping.lm_head.tp_rank,
@@ -621,13 +625,16 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             )
 
         self.logits_processor = LogitsProcessor(
-            config,
+            self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None

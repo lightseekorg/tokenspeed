@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.attention import dsv41
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
     DeepseekV41DSpark,
@@ -251,7 +252,12 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
     config = _draft_config()
     _loader_model(monkeypatch, config, rank, "cpu")
     model = DeepseekV41ForCausalLMDSpark(
-        SimpleNamespace(text_config=config), _mapping(rank, 4, 4), _quant()
+        SimpleNamespace(text_config=config),
+        _mapping(rank, 4, 4),
+        _quant(),
+        vocabulary=VocabularySpec.from_hf_config(
+            SimpleNamespace(text_config=config), is_draft=True
+        ),
     )
     weights = _draft_checkpoint(model.model)
     model.load_weights(reversed(list(weights.items())))
@@ -595,7 +601,12 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     with torch.device("cuda:0"):
         adapter = DeepseekV41ForCausalLMDSpark(
-            SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant()
+            SimpleNamespace(text_config=config),
+            _mapping(0, 1, 1),
+            _quant(),
+            vocabulary=VocabularySpec.from_hf_config(
+                SimpleNamespace(text_config=config), is_draft=True
+            ),
         )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
     # The target lends its BF16 embedding and head; the draft's own are placeholders.
@@ -1153,7 +1164,12 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
     _mock_loader_hardware(monkeypatch, mapping)
     monkeypatch.delitem(global_server_args_dict, "disaggregation_mode", raising=False)
     adapter = DeepseekV41ForCausalLMDSpark(
-        DeepseekV41Config(text_config=vars(_draft_config())), mapping, _quant()
+        DeepseekV41Config(text_config=vars(_draft_config())),
+        mapping,
+        _quant(),
+        vocabulary=VocabularySpec.from_hf_config(
+            DeepseekV41Config(text_config=vars(_draft_config())), is_draft=True
+        ),
     )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
     # The runner's GPU initialization is outside this CPU checkpoint test.
