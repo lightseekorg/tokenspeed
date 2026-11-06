@@ -47,6 +47,8 @@ from tokenspeed.runtime.layers.attention import backends  # noqa: F401
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
 from tokenspeed.runtime.models.dflash2 import (
@@ -201,31 +203,106 @@ def test_block_drafter_declares_only_its_sliding_mask(
 
 
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
+    class TargetModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(64, 4)
+            self.lm_head = ParallelLMHead(32, 4)
+            self.logits_processor = LogitsProcessor(
+                32,
+                dp_lm_head_tp=False,
+                final_logit_softcapping=None,
+                use_fused_lm_head=False,
+                tie_word_embeddings=False,
+            )
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
     drafter = DFlash2.__new__(DFlash2)
-    drafter.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32))
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
     drafter.candidate_logits_processor = None
     drafter.selector_top_k = 4
     drafter.spec_num_tokens = 8
     drafter.input_buffers = SimpleNamespace(max_bs=2)
-    drafter.lm_head = SimpleNamespace()
-    drafter.logits_processor = SimpleNamespace(
-        tp_rank=0,
-        tp_size=1,
-        tp_group=None,
-        skip_all_gather=False,
-        dp_lm_head_tp=False,
-    )
-
-    with mock.patch("tokenspeed.runtime.execution.drafter.dflash2.DFlash.wire_target"):
-        drafter.wire_target(SimpleNamespace())
+    target = TargetModel()
+    drafter.wire_target(target)
 
     assert drafter.candidate_logits_processor is not None
+    assert drafter.candidate_logits_processor.output_vocab_size == 32
     assert drafter.candidate_logits_processor.logit_scale == 1.25
     assert drafter.candidate_logits_processor.final_logit_softcapping == 8.0
     # tp_size == 1 leaves nothing to gather, so the shard-local path stays off.
     assert not drafter.candidate_topk.enabled
+
+
+@pytest.mark.parametrize("storage_vocab", [5, 8])
+@pytest.mark.parametrize("precompute", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_block_draft_argmax_excludes_non_output_head_rows(
+    storage_vocab, precompute, with_bias
+):
+    drafter = DFlash.__new__(DFlash)
+    drafter.lm_head = ParallelLMHead(
+        storage_vocab, 2, params_dtype=torch.float32, padding_size=8
+    )
+    drafter.logits_processor = LogitsProcessor(
+        5,
+        dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
+    )
+    # CPU has no distributed argmax state. The actual projection and selection
+    # still run, including DSpark's optional precomputed logits and Markov bias.
+    drafter._dist_argmax_state = None
+    hidden = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+    with torch.no_grad():
+        drafter.lm_head.weight[:5].copy_(torch.arange(10).reshape(5, 2))
+        drafter.lm_head.weight[5:].fill_(1000)
+    bias = torch.zeros(hidden.shape[0], storage_vocab)
+    bias[:, 0] = 100
+    bias_fn = (
+        (lambda start, count: bias[:, start : start + count]) if with_bias else None
+    )
+    base_logits = (
+        hidden @ drafter.lm_head.weight[:storage_vocab].T if precompute else None
+    )
+    out = torch.empty(hidden.shape[0], dtype=torch.int32)
+
+    actual = drafter._greedy_argmax_vocab_parallel(
+        hidden, out=out, bias_fn=bias_fn, base_logits=base_logits
+    )
+    expected_logits = hidden @ drafter.lm_head.weight[:5].T
+    if with_bias:
+        expected_logits = expected_logits + bias[:, :5]
+    assert actual is out
+    torch.testing.assert_close(actual.long(), expected_logits.argmax(-1))
+
+
+@pytest.mark.parametrize("output_vocab_size", [5, 6, 8])
+def test_block_draft_argmax_preserves_added_output_tokens(output_vocab_size):
+    drafter = DFlash.__new__(DFlash)
+    drafter.lm_head = ParallelLMHead(
+        8, 2, org_num_embeddings=5, params_dtype=torch.float32, padding_size=8
+    )
+    drafter.logits_processor = LogitsProcessor(
+        output_vocab_size,
+        dp_lm_head_tp=False,
+        final_logit_softcapping=None,
+        use_fused_lm_head=False,
+        tie_word_embeddings=False,
+    )
+    drafter._dist_argmax_state = None
+    with torch.no_grad():
+        # The original and added vocabulary are padded separately. Neither
+        # padding region may compete, while the added IDs remain reachable.
+        drafter.lm_head.weight.fill_(1000)
+        drafter.lm_head.weight[:5].zero_()
+        drafter.lm_head.weight[8:11].copy_(torch.arange(6).reshape(3, 2))
+    actual = drafter._greedy_argmax_vocab_parallel(torch.tensor([[1.0, 2.0]]))
+    assert actual.item() == (0 if output_vocab_size == 5 else output_vocab_size - 1)
 
 
 def test_candidate_unary_logits_are_promoted_to_fp32() -> None:

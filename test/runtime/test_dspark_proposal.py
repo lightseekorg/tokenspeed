@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 
@@ -26,7 +27,7 @@ HIDDEN = 6
 def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     """A DSpark drafter shell carrying only the proposal state."""
     drafter = DSpark.__new__(DSpark)
-    drafter.spec_num_tokens = spec_num_tokens
+    BaseDrafter.__init__(drafter, spec_num_tokens=spec_num_tokens)
     drafter.lm_head = None
     torch.manual_seed(0)
     head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)

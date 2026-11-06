@@ -41,7 +41,6 @@ class LogprobServability:
             ``torch``.
         pipeline_parallel: The engine runs pipeline stages.
         disaggregated: The engine is one role of a disaggregated deployment.
-        vocab_size: The model's vocabulary size.
     """
 
     enable_output_logprobs: bool
@@ -49,12 +48,9 @@ class LogprobServability:
     logprob_order: str
     pipeline_parallel: bool
     disaggregated: bool
-    vocab_size: int
 
     @classmethod
-    def of(
-        cls, server_args, *, supports_prompt_logprobs: bool, vocab_size: int
-    ) -> LogprobServability:
+    def of(cls, server_args, *, supports_prompt_logprobs: bool) -> LogprobServability:
         """The servability of an engine started with ``server_args``."""
         return cls(
             enable_output_logprobs=server_args.enable_output_logprobs,
@@ -64,5 +60,4 @@ class LogprobServability:
                 server_args.mapping is not None and server_args.mapping.has_pp
             ),
             disaggregated=server_args.disaggregation_mode != "null",
-            vocab_size=vocab_size,
         )

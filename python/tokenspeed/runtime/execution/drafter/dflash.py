@@ -305,6 +305,7 @@ class DFlash(BaseDrafter):
             or not 2 <= tp_size <= 32
             or int(head.num_embeddings) != int(head.org_vocab_size)
             or shard * tp_size != int(head.org_vocab_size)
+            or int(head.num_embeddings) != self.logits_processor.output_vocab_size
             or not _supports_dist_argmax_shape(shard, dtype, tp_size)
         ):
             return None
@@ -402,7 +403,7 @@ class DFlash(BaseDrafter):
             # Replicated draft rows: no query shard.
             metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
             logits = self.logits_processor._get_logits(
-                hidden_states, self.lm_head, metadata, require_full_vocab=False
+                hidden_states, self.lm_head, metadata, require_full_vocab=True
             )
             if bias_fn is not None:
                 logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
@@ -421,6 +422,11 @@ class DFlash(BaseDrafter):
         num_added = int(shard.num_added_elements)
         org_vocab_start = int(shard.org_vocab_start_index)
         added_vocab_start = int(shard.added_vocab_start_index)
+        # Checkpoint storage rows are not necessarily output tokens. Clip each
+        # shard's logical ranges without changing its physical padding offsets.
+        output_vocab_size = self.logits_processor.output_vocab_size
+        num_org = min(num_org, max(output_vocab_size - org_vocab_start, 0))
+        num_added = min(num_added, max(output_vocab_size - added_vocab_start, 0))
 
         chunk_len = int(hidden_states.shape[0])
         # The collective probe must sit outside every rank-local branch: a rank
@@ -429,6 +435,8 @@ class DFlash(BaseDrafter):
         if num_org > 0:
             if base_logits is None:
                 base_logits = torch.matmul(hidden_states, weight[:num_org].T)
+            else:
+                base_logits = base_logits[:, :num_org]
             if bias_fn is not None:
                 base_logits = base_logits + bias_fn(org_vocab_start, num_org).to(
                     base_logits.dtype
@@ -444,7 +452,7 @@ class DFlash(BaseDrafter):
         else:
             local_max = torch.full(
                 (chunk_len,),
-                torch.finfo(weight.dtype).min,
+                -torch.inf,
                 dtype=weight.dtype,
                 device=hidden_states.device,
             )

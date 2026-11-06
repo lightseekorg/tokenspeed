@@ -64,3 +64,28 @@ def test_without_model_stop_ids_the_tokenizers_eos_ends_a_grammar(
     tokenizer, eos_token_ids
 ):
     assert _stop_ids(tokenizer, eos_token_ids) == {tokenizer.eos_token_id}
+
+
+def test_grammar_uses_only_output_tokens_with_a_larger_input_vocabulary():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({"<eos>": 0, "a": 1, "b": 2, "<image>": 3}, unk_token="<eos>")
+        ),
+        eos_token="<eos>",
+    )
+    info = xgrammar.TokenizerInfo.deserialize_json(
+        grammar_tokenizer_info(tokenizer, 3, [0, 3])
+    )
+    assert info.vocab_size == 3
+    assert set(info.stop_token_ids) == {0}
+    assert len(tokenizer) == 4
+
+    compiled = xgrammar.GrammarCompiler(info).compile_grammar('root ::= "ab"')
+    matcher = xgrammar.GrammarMatcher(compiled)
+    assert matcher.accept_token(1)
+    assert matcher.accept_token(2)
+    assert matcher.accept_token(0)
+    assert matcher.is_terminated()

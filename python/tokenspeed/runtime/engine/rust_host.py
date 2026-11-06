@@ -1332,7 +1332,6 @@ class HostBootstrap:
                 logprob_servability=LogprobServability.of(
                     server_args,
                     supports_prompt_logprobs=specs.supports_prompt_logprobs,
-                    vocab_size=model_config.vocabulary.output_size,
                 ),
                 lm_head_tp_under_dp=mapping.attn.has_dp and mapping.lm_head.has_tp,
                 stream_interval=server_args.stream_interval,

@@ -1582,7 +1582,11 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
     monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    target = _HeadOnlyTarget(config, mapping)
+    target = _HeadOnlyTarget(
+        config,
+        mapping,
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+    )
     with torch.no_grad():
         target.lm_head.weight.copy_(
             torch.arange(target.lm_head.weight.numel()).reshape_as(
@@ -1624,7 +1628,11 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    target = _HeadOnlyTarget(config, mapping)
+    target = _HeadOnlyTarget(
+        config,
+        mapping,
+        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+    )
     draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
         config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
     )
