@@ -36,7 +36,7 @@ from tokenspeed_kernel.ops.attention.mla import (
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     kvp_decode_visible_lengths,
 )
-from tokenspeed_kernel.selection import KernelPlan
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -78,6 +78,12 @@ logger = get_colorful_logger(__name__)
 
 # The gfx950 FP8-cache decode kernels that return an LSE take at most 16 heads.
 _DCP_KERNEL_MAX_HEADS = 16
+
+
+def _dcp_kernel_heads(heads: int) -> int:
+    """The gathered heads one DCP decode launch row takes: the widest divisor
+    of ``heads`` the LSE-returning kernels run."""
+    return max(h for h in range(1, _DCP_KERNEL_MAX_HEADS + 1) if heads % h == 0)
 
 
 @dataclass(kw_only=True)
@@ -259,10 +265,52 @@ class MLAAttnBackend(PagedAttentionBackend):
                 "MLA DCP decode supports neither batch-invariant numerics nor "
                 "block drafts"
             )
+        if not self._dcp_decode_kernel_registered():
+            raise ValueError(
+                "MLA DCP decode needs an mla_decode_with_kvcache kernel that "
+                f"returns the LSE for a {self.data_type} cache on this platform"
+            )
         self.kvp_block_granularity = block_granularity
         self.kvp_virtual_block_count = virtual_block_count
         # Partials merge as latent rows, so the value projection follows the merge.
         self.supports_mla_projected_value_decode = False
+
+    def _dcp_decode_kernel_registered(self) -> bool:
+        """Whether the registry holds a decode kernel returning the LSE the
+        partials merge needs, for the head groups ``_forward_dcp_decode``
+        launches and either query dtype that call may reach."""
+        heads = _dcp_kernel_heads(self.num_local_heads * len(self.kvp_group))
+        traits = {
+            "batch_size": 1,
+            "q_len": 1,
+            "num_q_heads": heads,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "kv_lora_rank": self.kv_lora_rank,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "page_size": self.kernel_page_size,
+            "noncausal_block_size": 1,
+            "block_on_query_axis": False,
+            "logit_cap": False,
+            "return_lse": True,
+            "sliding_window": False,
+        }
+        for q_dtype in dict.fromkeys((self.q_data_type, self.data_type)):
+            signature = format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(self.data_type),
+            )
+            try:
+                select_kernel(
+                    "attention",
+                    "mla_decode_with_kvcache",
+                    signature,
+                    traits=traits,
+                    solution=self.kernel_solution,
+                )
+            except NoKernelFoundError:
+                continue
+            return True
+        return False
 
     @property
     def _dcp_active(self) -> bool:
@@ -810,9 +858,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         heads = layer.tp_q_head_num * len(self.kvp_group)
         # Heads attend independently, so a wide gathered group folds onto the
         # batch axis for the kernels that return an LSE.
-        kernel_heads = max(
-            h for h in range(1, _DCP_KERNEL_MAX_HEADS + 1) if heads % h == 0
-        )
+        kernel_heads = _dcp_kernel_heads(heads)
         groups = heads // kernel_heads
         # Every query row's local causal length, and its kernel length (at
         # least one) for each folded head group. Draft catch-up stores the
