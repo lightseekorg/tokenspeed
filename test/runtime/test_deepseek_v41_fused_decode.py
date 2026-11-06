@@ -30,7 +30,6 @@ from test.runtime.test_deepseek_v41_model import (
     _initialize,
     _quant,
 )
-from types import SimpleNamespace
 
 import pytest
 import torch
