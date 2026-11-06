@@ -65,7 +65,7 @@ def _deepseek_v4_mega_moe_max_num_tokens() -> int:
         global_server_args_dict.get("chunked_prefill_size", 0),
         global_server_args_dict.get("prefill_graph_max_tokens", 0),
         global_server_args_dict.get("max_cudagraph_capture_size", 0),
-        global_server_args_dict.get("max_num_seqs", 0),
+        global_server_args_dict.get("request_state_seqs", 0),
     ]
     return max([int(value or 0) for value in candidates] + [1])
 

@@ -310,19 +310,24 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
 
 
 @pytest.mark.parametrize(
-    "ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected",
+    "ceiling, capture_batch_sizes, context, rows_per_request, request_state_seqs, expected",
     [
         (None, None, 4096, None, 80, 2),
         # A graph ladder wider than the per-forward token budget.
         (65536, None, 4096, None, 80, 16),
         (None, [1, 8, 32], 40960, None, 80, 32),
-        # A narrowing decoder ladder fabricates a request per 128 rows, up to max_num_seqs.
+        # A narrowing decoder ladder fabricates a request per 128 rows, up to request_state_seqs.
         (None, None, 40960, 128, 80, 64),
         (None, None, 40960, 128, 16, 16),
     ],
 )
 def test_the_boot_floor_reads_both_knobs(
-    ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected
+    ceiling,
+    capture_batch_sizes,
+    context,
+    rows_per_request,
+    request_state_seqs,
+    expected,
 ) -> None:
     server_args = SimpleNamespace(
         disaggregation_mode="null",
@@ -331,7 +336,7 @@ def test_the_boot_floor_reads_both_knobs(
         chunked_prefill_size=8192,
         max_total_tokens=None,
         prefill_graph_capture_batch_sizes=capture_batch_sizes,
-        max_num_seqs=max_num_seqs,
+        request_state_seqs=request_state_seqs,
     )
     floor = device.probe_arena_floor(
         server_args,
@@ -469,6 +474,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            request_slots=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     return charged, set(reads), stack[0]

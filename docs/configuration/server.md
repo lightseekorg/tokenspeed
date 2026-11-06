@@ -442,7 +442,7 @@ Trainer-side contract:
 | --- | --- |
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
-| `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
+| `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. With speculative decoding outside prefill-only roles, TokenSpeed still sizes per-request decode state for at least one request per attention-TP peer on each DP rank, which the draft decode warmup needs. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--prefill-chunk-yield-tokens` | Prefill servers: the room, in tokens, a prefill chunk that cannot finish its prompt makes for bootstrapped prompts waiting behind it that fit whole (counted past their prefix hit), so they run complete in the same forward instead of waiting for the long prompt's chunk to pass. The chunk ends on an earlier page and gives up fewer than N plus one page, only while such prompts wait and only what they take, so the long prompt keeps about half of every round or more. `0` (default) is off; at most half of `--chunked-prefill-size`; a decode server ignores it ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
