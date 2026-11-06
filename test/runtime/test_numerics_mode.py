@@ -21,10 +21,16 @@
 """The --numerics envelope folds into the individual determinism switches."""
 
 import sys
+from pathlib import Path
 
 import pytest
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 class TestNumericsMode:
@@ -271,10 +277,10 @@ class TestNumericsMode:
         with pytest.raises((ValueError), match=("--router-topk")):
             ServerArgs(model="x", router_topk="cuda")
 
-    def test_rl_bitwise_reports_megatron_order_logprobs(self):
+    def test_rl_bitwise_reports_blockwise_order_logprobs(self):
         assert (ServerArgs(model="x").logprob_order) == ("torch")
         assert (ServerArgs(model="x", numerics="rl-bitwise").logprob_order) == (
-            "megatron"
+            "blockwise"
         )
         with pytest.raises((ValueError), match=("--logprob-order")):
             ServerArgs(model="x", logprob_order="apex")
@@ -444,6 +450,7 @@ class TestModelVerificationGate:
 
         return ModelProfile(
             configure_attention=configure_mla_attention,
+            create_attention_config=None,
             cache_family="fixture_family",
             linear_attention=None,
             default_attention_backend=None,
@@ -467,7 +474,7 @@ class TestModelVerificationGate:
 
     def test_rl_bitwise_requires_a_verified_unquantized_model(self):
         from tokenspeed.runtime.configs.numerics import (
-            MEGATRON_VOCAB_BLOCK,
+            BLOCKWISE_VOCAB_BLOCK,
             require_verified_numerics,
         )
 
@@ -477,7 +484,7 @@ class TestModelVerificationGate:
                 model_profile=None,
                 architecture="X",
                 quantization=None,
-                vocab_size=MEGATRON_VOCAB_BLOCK,
+                vocab_size=BLOCKWISE_VOCAB_BLOCK,
             )
         with pytest.raises((ValueError), match=("has not been verified")):
             require_verified_numerics(
@@ -485,7 +492,7 @@ class TestModelVerificationGate:
                 model_profile=self._profile({"auto"}),
                 architecture="X",
                 quantization=None,
-                vocab_size=MEGATRON_VOCAB_BLOCK,
+                vocab_size=BLOCKWISE_VOCAB_BLOCK,
             )
         verified = self._profile({"auto", "rl-bitwise"})
         with pytest.raises((ValueError), match=("fp8-quantized")):
@@ -494,22 +501,22 @@ class TestModelVerificationGate:
                 model_profile=verified,
                 architecture="X",
                 quantization="fp8",
-                vocab_size=MEGATRON_VOCAB_BLOCK,
+                vocab_size=BLOCKWISE_VOCAB_BLOCK,
             )
         require_verified_numerics(
             "rl-bitwise",
             model_profile=verified,
             architecture="X",
             quantization=None,
-            vocab_size=4 * MEGATRON_VOCAB_BLOCK,
+            vocab_size=4 * BLOCKWISE_VOCAB_BLOCK,
         )
 
-    def test_rl_bitwise_needs_a_whole_number_of_megatron_vocab_blocks(self):
-        # The envelope folds --logprob-order megatron, whose sum(exp) runs
+    def test_rl_bitwise_needs_a_whole_number_of_blockwise_vocab_blocks(self):
+        # The envelope folds --logprob-order blockwise, whose sum(exp) runs
         # over fixed vocab blocks; a model whose vocabulary cannot be cut into
         # them is refused at startup with that reason.
         from tokenspeed.runtime.configs.numerics import (
-            MEGATRON_VOCAB_BLOCK,
+            BLOCKWISE_VOCAB_BLOCK,
             require_verified_numerics,
         )
 
@@ -521,7 +528,7 @@ class TestModelVerificationGate:
                 quantization=None,
                 vocab_size=32000,
             )
-        assert (MEGATRON_VOCAB_BLOCK) == (32768)
+        assert (BLOCKWISE_VOCAB_BLOCK) == (32768)
 
     def test_profile_envelopes_are_validated(self):
         with pytest.raises((ValueError), match=("must include 'auto'")):
@@ -716,6 +723,17 @@ def test_failed_policy_registration_restores_imported_views():
     assert BITWISE_ENVELOPES == before_bitwise
     with pytest.raises(ValueError, match="--numerics"):
         ServerArgs(model="x", numerics="fixture-rollback")
+
+
+@pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+@pytest.mark.parametrize("order", ["blockwise", "blockwise-direct"])
+def test_explicit_blockwise_order_is_preserved(numerics, order):
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    args = prepare_server_args(
+        ["--model", "x", "--numerics", numerics, "--logprob-order", order]
+    )
+    assert args.logprob_order == order
 
 
 if __name__ == "__main__":

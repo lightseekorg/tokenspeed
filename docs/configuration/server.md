@@ -98,7 +98,7 @@ switch an envelope folds is also available individually under `auto`.
 | `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `rl-bitwise`. |
 | `--layer-boundary-norm {fused,unfused}` | `unfused` materializes `hidden + residual` in bf16 before the norm that opens each physical layer and before the final norm, instead of the fused add+norm kernel; also vetoes all-reduce+norm fusion. Folded to `unfused` by `rl-bitwise`. |
 | `--router-topk {fused,torch}` | Correction-bias MoE routing: the fused CUDA kernel, or fp32 `torch.softmax` + `torch.topk(probs + bias)` with PyTorch tie order and `-1` zero-expert ids. Folded to `torch` by `rl-bitwise`. |
-| `--logprob-order {torch,megatron}` | Order of the selected-token log-softmax: `torch.log_softmax`, or Megatron's vocab-parallel cross-entropy order over fixed 32768-wide vocab blocks; output and prompt (input) logprobs share it. Changes logprobs only. Folded to `megatron` by `rl-bitwise`. |
+| `--logprob-order {torch,blockwise,blockwise-direct}` | Order of the selected-token log-softmax: `torch.log_softmax`, or fixed-width blockwise reduction over 32768-wide vocab blocks; output and prompt (input) logprobs share it. `blockwise` returns negative cross-entropy; `blockwise-direct` uses direct subtraction. Changes logprobs only. `rl-bitwise` folds to `blockwise`, overriding explicit `torch` and preserving explicit `blockwise-direct`. |
 | `--dsa-slot-order {selection,sorted}` | The order a token's selected KV rows are reduced in by the sparse (DSA) attention: as the top-k leaf emitted them (`selection`), or in ascending position order (`sorted`: one reduction order per selected set, invariant across batch compositions, runs and engines -- not ascending slot order, which follows the page placement). The top-k leaf emits the order and the core keeps it, so both must declare the `slot_order` trait (registered batch-invariant leaves); a silent kernel is refused under `sorted`. Defaults to `selection`; `rl-bitwise` fixes it to `selection`, overriding an explicit `sorted`. Both top-k and attention leaves must still be batch-invariant under `rl-bitwise`. |
 | `--moe-combine-order {rank,slot}` | How a token's routed-expert contributions meet across the MoE TP-EP group. `rank`: the MoE kernel returns this rank's partial and the host sums the partials, adding LongCat's identity zero-expert residual once around the reduction. `slot`: the MoE kernel folds the token's top-k slots in fp32 slot order across the EP group itself, residual included, as the trainer's grouped MLP does, and the host reduces nothing; needs MoE TP 1 and a kernel declaring `combine_order` with `slot` (a registered batch-invariant leaf), and vetoes all-reduce+norm fusion. Folded to `slot` by `rl-bitwise`. |
 
@@ -349,6 +349,23 @@ runs across one generates under both weights. Pause first (see the
 trainer-side contract below) when that matters.
 
 ### Mooncake weight updates
+
+The runtime includes the independent WeightStore receiver at
+`tokenspeed.runtime.execution.weight_store`. Select it with
+`--model-update-sdk-module tokenspeed.runtime.execution.weight_store` and
+`--model-update-engine-type TOKENSPEED`, supply the standalone SDK's flat
+`backend=weight_store` configuration and use `--model-update-draft-weights retain`.
+This optional path requires the independent `weight_store` and `data_dist_hub`
+packages in the scheduler environment. It does not import a rollout framework or
+the previous weight-update SDK.
+
+The update request carries a complete publication directory in `snapshot`,
+encoded as `{version, zlib_base64}`. Tensor contents remain in the Store.
+The receiver validates the publication version, declares the target's logical HF
+regions and calls the standalone SDK on the Store device's current CUDA stream.
+The SDK reads and assembles the tensors; the native loader owns physical TP/EP
+layout and the surrounding weight-update session owns finalization. This path
+supports one unquantized target and retains draft checkpoint weights.
 
 `UpdateWeightsFromMooncakeReqInput` loads one committed checkpoint version
 that the RL trainer published to a Mooncake weight store through the Model
@@ -697,6 +714,9 @@ run on the draft-tree path and share its requirements, with these limits:
 - `--enable-speculative-sampling` samples harness trees and chains (not
   when measuring) and needs `--sampling-backend flashinfer`, which accepts
   them by tree rejection sampling. Static `EAGLE4` drafts do not take it.
+  Its sampling kernels are NVIDIA-only: elsewhere (AMD) harness rounds
+  draft greedy trees and chains, and the drafter refuses sampling at
+  startup.
 
 ### Draft-prob rejection sampling
 
@@ -869,6 +889,13 @@ including `ts_mooncake_write_pages` for page transfers.
 Both Prefill and Decode engines select their transport from the detected
 platform. Startup settings pass this protocol to the Rust transfer peer,
 which keeps it when recreating a session after a memory resume.
+
+Upgrade Prefill and Decode nodes together: cache registrations now carry a
+separate cache identity in a ninth frame, and requests name that identity.
+Older peers without this field are incompatible. Each Decode cache resume
+gets a new identity even if its transport IP and port are reused. The sender
+refreshes cached remote memory keys on address reuse without changing the
+public address used by EPD.
 
 ## Observability
 

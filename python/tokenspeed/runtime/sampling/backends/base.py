@@ -82,7 +82,7 @@ class SamplingBackendConfig:
     # "per-request", see ServerArgs.sampling_stream). Behaviour-selecting, so
     # it has no default: every constructor names the stream it wants.
     sampling_stream: str
-    # Order of the selected-token log-softmax ("torch" or "megatron", see
+    # Selected-token logprob recipe (see
     # ServerArgs.logprob_order). Behaviour-selecting, so no default either.
     logprob_order: str
 

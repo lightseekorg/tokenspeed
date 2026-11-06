@@ -743,13 +743,31 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    if isinstance(model_config.hf_config, Dots3NoteConfig):
-        config_cls = Dots3NoteAttentionConfig
-    elif is_deepseek_v41_config(model_config.hf_config):
-        config_cls = DeepseekV41Config
+    profile = model_config.model_profile
+    if profile is not None and profile.create_attention_config is not None:
+        config = profile.create_attention_config(server_args, model_config, is_draft)
+        if not isinstance(config, AttnConfig):
+            raise TypeError(
+                "ModelProfile.create_attention_config must return AttnConfig"
+            )
+        if config.is_draft != is_draft:
+            raise ValueError(
+                "ModelProfile.create_attention_config must build the config for "
+                f"is_draft={is_draft}, got is_draft={config.is_draft}"
+            )
+        if config.component(LinearAttnConfig) is not None:
+            raise ValueError(
+                "ModelProfile.create_attention_config must leave linear attention "
+                "composition to the runtime"
+            )
     else:
-        config_cls = _CONFIG_CLS[arch]
-    config = config_cls.generate(server_args, model_config, is_draft)
+        if isinstance(model_config.hf_config, Dots3NoteConfig):
+            config_cls = Dots3NoteAttentionConfig
+        elif is_deepseek_v41_config(model_config.hf_config):
+            config_cls = DeepseekV41Config
+        else:
+            config_cls = _CONFIG_CLS[arch]
+        config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).

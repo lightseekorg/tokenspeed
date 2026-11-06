@@ -49,7 +49,11 @@ def test_seeds_must_be_aligned() -> None:
 
 def _runtime_states(capacity: int) -> RuntimeStates:
     states = RuntimeStates(
-        req_pool_size=2, vocab_size=32, output_length=1, device="cpu"
+        req_pool_size=2,
+        input_vocab_size=32,
+        vocab_size=32,
+        output_length=1,
+        device="cpu",
     )
     states.init_request_token_history(capacity)
     return states
@@ -142,7 +146,11 @@ def test_graph_layout_masks_padding_rows() -> None:
 
 def _draft_states() -> RuntimeStates:
     states = RuntimeStates(
-        req_pool_size=4, vocab_size=100, device="cpu", output_length=1
+        req_pool_size=4,
+        input_vocab_size=100,
+        vocab_size=100,
+        device="cpu",
+        output_length=1,
     )
     states.init_request_token_history(16)
     return states

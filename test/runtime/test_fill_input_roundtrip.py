@@ -100,7 +100,11 @@ def buffers(request, monkeypatch):
         reads_state_checkpoints=False,
     )
     runtime = RuntimeStates(
-        req_pool_size=8, vocab_size=VOCAB_SIZE, output_length=1, device=device
+        req_pool_size=8,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
+        output_length=1,
+        device=device,
     )
     return ib, runtime
 

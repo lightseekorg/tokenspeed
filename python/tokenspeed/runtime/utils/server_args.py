@@ -2115,7 +2115,8 @@ class ServerArgs:
         # The trainer's router is softmax + topk(scores + bias) in torch.
         self.router_topk = "torch"
         # The trainer's logprobs come from its vocab-parallel cross-entropy.
-        self.logprob_order = "megatron"
+        if self.logprob_order not in ("blockwise", "blockwise-direct"):
+            self.logprob_order = "blockwise"
         # The trainer's grouped MLP applies the router weight inside the
         # activation and folds a token's slots in fp32 slot order.
         self.moe_combine_order = "slot"
@@ -3120,7 +3121,10 @@ class ServerArgs:
             metavar="DISTRIBUTED_TIMEOUT_SECONDS",
             type=int,
             default=ServerArgs.distributed_timeout_seconds,
-            help="Set timeout for torch.distributed initialization.",
+            help="Set the timeout of the torch.distributed process groups "
+            "(initialization and collectives); the fused KVP history "
+            "all-gather's in-kernel waits end before it (see "
+            "docs/serving/parallelism.md).",
         )
         parser.add_argument(
             "--download-dir",
@@ -4376,13 +4380,16 @@ class ServerArgs:
             choices=list(LOGPROB_ORDERS),
             default=ServerArgs.logprob_order,
             help="Order of the selected-token log-softmax behind every "
-            "returned logprob. 'torch': torch.log_softmax. 'megatron': the "
-            "trainer's vocab-parallel cross-entropy order (row max, shift, "
+            "returned logprob. 'torch': torch.log_softmax. 'blockwise': the "
+            "fixed-width blockwise reduction (row max, shift, "
             "sum(exp) over fixed 32768-wide vocab blocks folded in block "
-            "order, logp = target - log(sum_exp)); requests asking for "
+            "order), returning -(log(sum_exp) - target). 'blockwise-direct': "
+            "the same reduction, returning target - log(sum_exp). "
+            "Requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
-            "logprobs only, never the sampled tokens. Folded to megatron by "
-            "--numerics rl-bitwise.",
+            "logprobs only, never the sampled tokens. Folded to blockwise by "
+            "--numerics rl-bitwise, overriding an explicit torch; an explicit "
+            "blockwise-direct is preserved.",
         )
         parser.add_argument(
             "--moe-combine-order",

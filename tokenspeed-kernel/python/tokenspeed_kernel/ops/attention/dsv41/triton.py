@@ -2759,10 +2759,16 @@ def _clean_logits(
     LIVE_TILES_ONLY: tl.constexpr,
     B: tl.constexpr,
 ):
-    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    row = tl.program_id(0).to(tl.int64)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), CAP)
-    if not LIVE_TILES_ONLY or tile * B < end:
-        column = tile * B + tl.arange(0, B)
+    # A row's programs stride over its tiles. A live-only clean visits just the
+    # tiles before end, so a wide capacity launches no idle programs.
+    if LIVE_TILES_ONLY:
+        tiles = tl.cdiv(end, B).to(tl.int32)
+    else:
+        tiles = tl.cdiv(O0, B)
+    for tile in range(tl.program_id(1), tiles, tl.num_programs(1)):
+        column = tile.to(tl.int64) * B + tl.arange(0, B)
         valid = (column < CAP) & (column < end)
         if PAGED:
             page = tl.load(
@@ -4184,7 +4190,11 @@ def _clean_logits_output(
         (values.shape[0], stride), dtype=values.dtype, device=values.device
     )
     if output.numel():
-        _clean_logits[(values.shape[0], triton.cdiv(stride, 1024))](
+        # Enough programs per row to fill the GPU, and no more than a row has
+        # tiles: the live tiles of a wide capacity are a small prefix.
+        tiles = triton.cdiv(stride, 1024)
+        programs = min(tiles, max(16, triton.cdiv(2048, values.shape[0])))
+        _clean_logits[(values.shape[0], programs)](
             values,
             lengths,
             table if table is not None else lengths,

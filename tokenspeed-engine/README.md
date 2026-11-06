@@ -57,6 +57,13 @@ it.
 
 ## Building
 
+Snapshot SDK updates carry a complete publication directory in the optional
+`UpdateWeightsFromMooncakeReqInput.snapshot` map. The native host and Python
+runtime must be built together to transport this field. The existing global
+commit and memory-saver rules still apply. The configured SDK updater receives
+`update_weights(models, version=..., snapshot=...)`. Tensor data remains in the
+SDK's store. Requests without a snapshot retain the existing SDK protocol.
+
 The native crates target Linux and need a C++ compiler, CMake, OpenSSL
 development headers, and Python development headers. Set `PYO3_PYTHON` to
 an interpreter with `nanobind>=2.13.0` and `tokenspeed-spdlog==1.15.1`
