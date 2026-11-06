@@ -828,6 +828,13 @@ Both Prefill and Decode engines select their transport from the detected
 platform. Startup settings pass this protocol to the Rust transfer peer,
 which keeps it when recreating a session after a memory resume.
 
+Upgrade Prefill and Decode nodes together: cache registrations now carry a
+separate cache identity in a ninth frame, and requests name that identity.
+Older peers without this field are incompatible. Each Decode cache resume
+gets a new identity even if its transport IP and port are reused. The sender
+refreshes cached remote memory keys on address reuse without changing the
+public address used by EPD.
+
 ## Observability
 
 | Parameter | Purpose |
