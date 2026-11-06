@@ -275,6 +275,8 @@ class AttnConfig:
             elif softmax.backend_name == "tokenspeed_mla":
                 pass
             elif softmax.backend_name in ("mla", "gluon") and not softmax.is_dsa:
+                # The leaf refuses a platform without a decode kernel that
+                # returns the LSE (MLABackend.configure_runtime).
                 if self.draft_block_decode:
                     raise ValueError("MLA DCP decode does not support block drafts")
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
