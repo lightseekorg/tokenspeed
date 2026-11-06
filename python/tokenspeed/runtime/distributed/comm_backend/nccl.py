@@ -32,6 +32,7 @@ from tokenspeed_kernel.op_profile import (
     current_op_metadata,
     wrap_op_for_profiling,
 )
+from tokenspeed_kernel.profile_communication import record_communication_route
 from tokenspeed_kernel.registry import KernelSpec
 
 from tokenspeed.runtime.distributed.comm_backend.base import (
@@ -123,6 +124,20 @@ class NcclBackend(CommBackend):
             return tensor
         if op is None:
             op = torch.distributed.ReduceOp.SUM
+        if metadata is not None:
+            record_communication_route(
+                ranks=tuple(group),
+                group_name=self._group_name,
+                backend="nccl",
+                workspace=None,
+                algorithm=None,
+                protocol=None,
+            )
+            metadata["comm_api"] = (
+                "pynccl"
+                if res["pynccl_comm"] is not None and not res["pynccl_comm"].disabled
+                else "torch.distributed"
+            )
         pynccl = res["pynccl_comm"]
         if pynccl is not None and not pynccl.disabled:
             pynccl.all_reduce(tensor, op=op)
@@ -158,6 +173,20 @@ class NcclBackend(CommBackend):
             return first, second
         if op is None:
             op = torch.distributed.ReduceOp.SUM
+        if metadata is not None:
+            record_communication_route(
+                ranks=tuple(group),
+                group_name=self._group_name,
+                backend="nccl",
+                workspace=None,
+                algorithm=None,
+                protocol=None,
+            )
+            metadata["comm_api"] = (
+                "pynccl"
+                if res["pynccl_comm"] is not None and not res["pynccl_comm"].disabled
+                else "torch.distributed"
+            )
         pynccl = res["pynccl_comm"]
         coalescing = getattr(torch.distributed, "_coalescing_manager", None)
         if coalescing is None or (pynccl is not None and not pynccl.disabled):

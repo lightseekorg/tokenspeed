@@ -227,6 +227,7 @@ class EngineClient(Protocol):
         with_stack: bool | None = None,
         record_shapes: bool | None = None,
         profile_by_stage: bool = False,
+        profile_id: str | None = None,
     ) -> Any: ...
 
     async def stop_profile(self) -> Any: ...

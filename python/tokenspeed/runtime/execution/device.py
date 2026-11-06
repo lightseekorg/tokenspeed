@@ -778,6 +778,19 @@ class DeviceHandle:
         if remote_cache_slot is not None:
             executor.mark_remote_cache_ready(remote_cache_slot)
 
+    def arm_utilization_profile(self) -> bool:
+        """Arm metadata and report whether startup already began CUDA collection."""
+        profile = self._executor.utilization_profile
+        if profile is not None:
+            return profile.arm()
+        return False
+
+    def stop_utilization_profile(self) -> None:
+        """Flush CPU-ready profile records only, without querying GPU events."""
+        profile = self._executor.utilization_profile
+        if profile is not None:
+            profile.stop()
+
     def reset_expert_load(self) -> None:
         """Zero the router's expert load counters, ordered against forwards.
 

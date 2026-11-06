@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.op_profile import OpProfile, profile_function
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import select_kernel
@@ -189,6 +190,20 @@ def _apply_stop_conditions_torch(
         stopped[slot] = first_stop < kept or kept >= budget
 
 
+@profile_function(
+    family="sampling",
+    name="apply_stop_conditions",
+    profile=OpProfile(
+        "sampling_support.v1",
+        scalar_args=(
+            "num_extends",
+            "num_prefill_outputs",
+            "decode_width",
+            "padding_index",
+        ),
+        integer_tensor_args=("req_pool_indices",),
+    ),
+)
 def apply_stop_conditions(
     req_pool_indices: torch.Tensor,
     output_tokens: torch.Tensor,

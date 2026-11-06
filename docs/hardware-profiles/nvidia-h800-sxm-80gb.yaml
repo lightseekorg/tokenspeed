@@ -4,6 +4,7 @@ name: "NVIDIA H800 SXM 80GB (up to 700W, one full GPU)"
 device:
   vendor: "NVIDIA"
   sku: "H800"
+  compute_capability: "9.0"
   form_factor: "SXM"
   memory_gb: 80
   power_watts: 700
@@ -20,7 +21,31 @@ compute_flops_per_second:
   fp16_tensor: 989500000000000
   fp8_e4m3_tensor: 1979000000000000
   fp32_simt: 67000000000000
+  bf16_simt: 134000000000000
+  tf32_tensor: 494500000000000
 compute_metadata:
+  bf16_simt:
+    kind: "derived"
+    precision: "bf16"
+    engine: "simt"
+    sparsity: "dense"
+    source_id: "nvidia-cuda-throughput"
+    derivation:
+      base_compute_type: "fp32_simt"
+      throughput_ratio: 2
+      compute_capability: "9.0"
+      source_id: "nvidia-cuda-throughput"
+      reference: "cc9_scalar_fma_throughput_ratio"
+      explanation: "CC9.0 native16-bit scalar throughput256 / FP32 throughput128; FMA reference ratio at the same product theoretical clock. Packed BF16x2 consists of two scalar results, not matrix MMA. Derived from FP32 product peak67TFLOP/s, not a published BF16 SIMT product peak."
+  tf32_tensor:
+    precision: "tf32"
+    engine: "tensor"
+    sparsity: "dense"
+    source_id: "nvidia-spec"
+    published_value: 989
+    published_unit: "TFLOP/s"
+    published_sparsity: "sparse"
+    dense_conversion_factor: 0.5
   bf16_tensor:
     precision: "bf16"
     engine: "tensor"
@@ -59,11 +84,84 @@ compute_metadata:
     dense_conversion_factor: 1.0
 hbm_bytes_per_second: 3350000000000
 bandwidth_source_id: "nvidia-spec"
+# Conditional endpoint reference, never selected from the GPU name or NV8 alone.
+# NVML enum6 means NVLink4.0. Eight proven active full-rate links *25GB/s TX.
+# Raw driver26.562GB/s is a state predicate, not the published directional rate.
+communication_capacities:
+  - &trtllm_ipc_oneshot
+    id: "nvlink4-eight-link-trtllm-ipc-oneshot"
+    bytes_per_second: 200000000000
+    scope: "per_rank"
+    direction: "one_direction"
+    normalization: "nccl_tests_bus_bytes"
+    placement: "single_node"
+    topology: "single_node_nvswitch"
+    transport: "nvlink"
+    backend: "trtllm"
+    algorithm: "oneshot"
+    protocol: "lamport"
+    world_size: 8
+    source_id: "nvidia-hopper-nvlink4"
+    conversion_source_id: "nvidia-hopper-nvlink4"
+    normalization_source_id: "nvidia-nccl-tests"
+    published_value: 25
+    published_unit: "GB/s"
+    published_direction: "one_direction"
+    published_scope: "per_link"
+    conversion_factor: 1
+    active_link_count: 8
+    link_version: 6
+    link_generation: "4.0"
+    link_version_source_id: "nvidia-nvml-version"
+    required_link_rate_bytes_per_second: 26562000000
+    conversion_reason: "NVIDIA specifies NVLink4 at25GB/s each direction per link. Multiply by eight only when every participating rank proves eight active NVLink4 links and the required full-rate state. No division of the unspecified H800400GB/s headline and no H10018-link aggregate."
+    normalization_reason: "NCCL-tests equivalent AllReduce bytes divided by the whole fused or pure Op GPU span, referenced to one endpoint's one-direction theoretical NVLink capacity. Lamport one/two-shot remote loads do not transfer exactly these equivalent bytes; this ratio is an estimated normalized reference efficiency, not physical link saturation or protocol payload utilization. Actual selected NVLink transport and the exact IPC route must be evidenced."
+  - <<: *trtllm_ipc_oneshot
+    id: "nvlink4-eight-link-trtllm-ipc-twoshot"
+    algorithm: "twoshot"
+  - <<: *trtllm_ipc_oneshot
+    id: "nvlink4-eight-link-trtllm-mnnvl-oneshot"
+    algorithm: "oneshot"
+    protocol: "mnnvl"
+    normalization: "trtllm_mnnvl_oneshot_remote_payload"
+    normalization_source_id: "nvidia-cuda-multicast"
+    addressing_source_id: "nvidia-cuda-multicast"
+    normalization_reason: "Custom MNNVL one-shot useful remote-payload model: for full input S bytes and P ranks, each rank injects S bytes once to the CUDA NVLS multicast mapping and receives (P-1)*S useful payload bytes from other ranks at its local replica. Divide each directional payload by the whole pure/fused Op GPU span and its200GB/s directional reference; report the larger modeled ratio, not the sum of TX and RX. NCCL-tests AlgBW/BusBW remain independent. Self-replica physical loopback, packet/encoding/retry/control overhead are unmodeled; local Lamport polling, dirty-clear, register reduction and epilogue are not remote payload. This is estimated directional useful-payload utilization, not physical TX/RX occupancy, switch bisection or measured saturation. Require actual CUDA allocator/mapping evidence, selected one-shot pattern0/1, exact single-node NVSwitch rank placement and full active-link predicates. Multi-node and unverified mappings remain unavailable."
 sources:
+  -
+    id: "nvidia-cuda-throughput"
+    title: "CUDA C++ Programming Guide12.8.2 arithmetic throughput Table4"
+    url: "https://docs.nvidia.com/cuda/archive/12.8.2/cuda-c-programming-guide/index.html#arithmetic-instructions"
+    accessed: "2026-11-05"
+    document_version: "CC9.0 scalar native16-bit256 and FP32128 results/SM/cycle; BF16 packed intrinsic guidance5.4.1.1"
   -
     id: "nvidia-spec"
     title: "NVIDIA H800 Tensor Core GPU product brief 2631447"
     url: "https://serverflow.ru/upload/iblock/88a/2fg6cfwqo83oxx9nynevdxkdllj1hbmg/%D0%A1%D0%BF%D0%B5%D1%86%D0%B8%D1%84%D0%B8%D0%BA%D0%B0%D1%86%D0%B8%D1%8F%20NVIDIA%20H800.pdf"
     accessed: "2026-11-04"
     document_version: "2631447, February 2023; NVIDIA-authored; third-party mirror"
+  -
+    id: "nvidia-hopper-nvlink4"
+    title: "NVIDIA Hopper Architecture In-Depth, fourth-generation NVLink"
+    url: "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/"
+    accessed: "2026-11-05"
+    document_version: "NVLink4 per-link directional definition; H100 aggregate link count is not used"
+  -
+    id: "nvidia-nvml-version"
+    title: "NVIDIA CUDA Python NVML NvlinkVersion enum"
+    url: "https://nvidia.github.io/cuda-python/cuda-bindings/13.4.4/module/generated/cuda.bindings.nvml.NvlinkVersion.html"
+    accessed: "2026-11-05"
+    document_version: "cuda-bindings13.4.4; raw enum6 is NVLink4.0"
+  -
+    id: "nvidia-nccl-tests"
+    title: "NVIDIA NCCL-tests performance and bus bandwidth convention"
+    url: "https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md"
+    accessed: "2026-11-05"
+    document_version: "AllReduce/AllGather/ReduceScatter equivalent per-rank traffic convention"
+  -
+    id: "nvidia-cuda-multicast"
+    title: "NVIDIA CUDA C++ Programming Guide12.6, multicast support"
+    url: "https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#multicast-support"
+    accessed: "2026-11-05"
+    document_version: "CUDA12.6.3; cuMulticastCreate/AddDevice/BindMem mappings use NVLink SHARP with NVSwitch"
 source: "NVIDIA H800 Tensor Core GPU product brief 2631447; 2631447, February 2023; NVIDIA-authored; third-party mirror. SXM 80GB, one full GPU, not a multi-GPU NVLink pair or MIG slice. Dense Tensor Core peak is half the sparse published rate; FP32 SIMT and HBM bandwidth are unchanged. Decimal units. power_watts is the nominal maximum configurable TDP, not an observed power limit. Selection is explicit; device names alone do not prove form factor or TDP."

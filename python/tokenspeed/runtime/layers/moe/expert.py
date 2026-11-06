@@ -22,8 +22,10 @@
 import logging
 from collections.abc import Callable
 from dataclasses import replace
+from functools import partial
 
 import torch
+from tokenspeed_kernel.op_profile import OpProfile, wrap_op_for_profiling
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -33,6 +35,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
     TRTLLM_UNQUANT_ISPP_ALIGNMENT,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import KernelSpec
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -104,6 +107,7 @@ class MoELayer(torch.nn.Module):
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.profile_useful_intermediate_size = intermediate_size
         self.quant_config = quant_config
         self.ep_num_redundant_experts = global_server_args_dict[
             "ep_num_redundant_experts"
@@ -236,6 +240,7 @@ class MoELayer(torch.nn.Module):
                 "FP8 block scales tile it",
                 every_backend=True,
             )
+        self.profile_scale_block_shape = fp8_scale_block_shape
         if self._quant_kind == "unquant":
             # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
             # ispp_alignment={TRTLLM_UNQUANT_ISPP_ALIGNMENT}: 64, or 128 when
@@ -668,6 +673,36 @@ class MoELayer(torch.nn.Module):
         placement must pick the same replica for a route on every rank."""
         return self.plan["supports_all_to_all_ep"]
 
+    @partial(
+        wrap_op_for_profiling,
+        spec=KernelSpec(name="moe_experts_api", family="moe", mode="experts"),
+        profile=OpProfile(
+            cost_rule="grouped_experts.v2",
+            scalar_args=(
+                "self.hidden_size",
+                "self.profile_useful_intermediate_size",
+                "self.num_experts",
+                "self.num_local_experts",
+                "self.ep_rank",
+                "self.ep_size",
+                "self.tp_size",
+                "self.zero_expert_num",
+                "self.ep_num_redundant_experts",
+                "self.profile_scale_block_shape",
+                "self._quant_kind",
+                "self.plan.supports_all_to_all_ep",
+                "do_finalize",
+            ),
+            tensor_args=(
+                "self.w13_weight",
+                "self.w2_weight",
+                "self.w13_weight_scale_inv",
+                "self.w2_weight_scale_inv",
+                "topk_output.topk_weights",
+            ),
+            integer_tensor_args=("topk_output.topk_ids",),
+        ),
+    )
     def forward(
         self,
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],

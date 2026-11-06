@@ -38,70 +38,115 @@ from tokenspeed_kernel.op_profile import profiled
 from tokenspeed_kernel.profile_nsys import finalize_nsight
 from tokenspeed_kernel.profile_nvtx import build_nvtx_bridge
 
-from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.utilization_profile import RuntimeUtilizationProfile
-from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeMLP
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA native timeline")
-@pytest.mark.parametrize(
-    "device,eager,prefill_off,speculative,reason",
-    [
-        ("cpu", True, True, False, "NVIDIA CUDA"),
-        ("cuda", False, True, False, "enforce-eager"),
-        ("cuda", True, False, False, "disable-prefill-graph"),
-        ("cuda", True, True, True, "draft models"),
-    ],
-)
-def test_reject_unsupported_execution(
-    monkeypatch, device, eager, prefill_off, speculative, reason
-):
+def test_reject_non_cuda_execution(monkeypatch):
     monkeypatch.setenv("TOKENSPEED_TIMELINE_CONFIG", "unused.json")
-    with pytest.raises(ValueError, match=reason):
+    with pytest.raises(ValueError, match="NVIDIA CUDA"):
         RuntimeUtilizationProfile.from_env(
             model=torch.nn.Module(),
             model_id="qwen",
             rank=0,
-            device=device,
-            enforce_eager=eager,
-            disable_prefill_graph=prefill_off,
-            speculative=speculative,
+            device="cpu",
+            enforce_eager=True,
+            disable_prefill_graph=True,
+            speculative=False,
         )
 
 
-class ProfiledSharedExpert(Qwen3_5MoeMLP):
-    @profiled(level="layer")
-    def forward(self, x):
-        return super().forward(x)
-
-
-class SharedExpertStack(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Qwen3.5-397B-A17B's actual shared-expert dimensions. Random weights
-        # test the runtime/kernel path; this is not a checkpoint-quality test.
-        self.layers = torch.nn.ModuleList(
-            [
-                ProfiledSharedExpert(
-                    hidden_size=4096,
-                    intermediate_size=1024,
-                    hidden_act="silu",
-                    mapping=Mapping(rank=0, world_size=1),
-                    quant_config=None,
-                    reduce_results=False,
-                    parallelism="moe_shared",
-                )
-                for _ in range(2)
-            ]
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA native timeline")
+def test_standalone_from_env_without_process_group(tmp_path, monkeypatch):
+    if torch.distributed.is_initialized():
+        pytest.skip("Requires a standalone process without an initialized group")
+    hardware = tmp_path / "hardware.json"
+    hardware.write_text(
+        json.dumps(
+            {
+                "name": "CPU construction fixture",
+                "compute_flops_per_second": {},
+                "hbm_bytes_per_second": None,
+                "source": "synthetic setup-only fixture",
+            }
         )
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
+    )
+    config = dict(
+        run_id="standalone",
+        output_dir=str(tmp_path),
+        hardware=str(hardware),
+        layers="layers",
+        start_step=1,
+        num_steps=1,
+        max_scopes=16,
+        hbm_policy="unavailable",
+    )
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    monkeypatch.setenv("TOKENSPEED_TIMELINE_CONFIG", str(path))
+    monkeypatch.delenv("TOKENSPEED_PROFILE_RUN_ID", raising=False)
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+    # CUDA is the configured execution device; constructing its CPU-side
+    # observer must not allocate CUDA resources or initialize a process group.
+    initialized = torch.cuda.is_initialized()
+    profile = RuntimeUtilizationProfile.from_env(
+        model=model,
+        model_id="fixture",
+        rank=0,
+        device="cuda",
+        enforce_eager=True,
+        disable_prefill_graph=True,
+        speculative=False,
+    )
+    assert isinstance(profile, RuntimeUtilizationProfile)
+    assert profile.model is model and profile.rank == 0
+    assert profile.graph_enabled is False
+    assert profile.output == tmp_path / "rank-0.metrics.json"
+    snapshot = json.loads((tmp_path / "rank-0.config.json").read_text())
+    assert snapshot["run_id"] == "standalone" and snapshot["rank"] == 0
+    assert snapshot["graph_enabled"] is False
+    assert not (tmp_path / "rank-0.communication.json").exists()
+    assert not torch.distributed.is_initialized()
+    assert torch.cuda.is_initialized() == initialized
 
 
 def _workload(root: Path) -> None:
+    # Keep GPU/model dependencies local to the native workload so the observer
+    # construction regression above remains a CPU-only test.
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeMLP
+
+    class ProfiledSharedExpert(Qwen3_5MoeMLP):
+        @profiled(level="layer")
+        def forward(self, x):
+            return super().forward(x)
+
+    class SharedExpertStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Qwen3.5-397B-A17B's actual shared-expert dimensions. Random weights
+            # test the runtime/kernel path; this is not a checkpoint-quality test.
+            self.layers = torch.nn.ModuleList(
+                [
+                    ProfiledSharedExpert(
+                        hidden_size=4096,
+                        intermediate_size=1024,
+                        hidden_act="silu",
+                        mapping=Mapping(rank=0, world_size=1),
+                        quant_config=None,
+                        reduce_results=False,
+                        parallelism="moe_shared",
+                    )
+                    for _ in range(2)
+                ]
+            )
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = layer(x)
+            return x
+
     torch.manual_seed(7)
     torch.set_default_dtype(torch.bfloat16)
     with torch.device("cuda"):
@@ -125,10 +170,21 @@ def _workload(root: Path) -> None:
     assert profiler.output == root.resolve() / "rank-0.metrics.json"
 
     def forward(step, x):
+        identity = profiler.begin_step(
+            step=step, request_ids=("shared-expert-test",), pool_indices=(0,)
+        )
         with torch.inference_mode(), torch.cuda.stream(stream), profiler.iteration(
-            step=step
+            step=step, identity=identity
         ):
-            return model(x)
+            result = model(x)
+            if identity is not None:
+                event = torch.cuda.Event()
+                event.record()
+                identity.bind_result_event(event)
+        if identity is not None:
+            event.synchronize()
+            identity.device_results_ready(event)
+        return result
 
     def reference(x):
         with torch.inference_mode():
@@ -146,6 +202,7 @@ def _workload(root: Path) -> None:
     for _ in range(3):
         forward(0, prefill)
         forward(0, decode)
+    profiler.arm()
     forward(1, decode)
     assert not profiler.output.exists()
     prefill_output = forward(2, prefill)
@@ -161,7 +218,9 @@ def _workload(root: Path) -> None:
     report = json.loads(saved)
     assert report["device_analysis"]["thread_id"] == threading.get_native_id()
     assert {op["iter_id"] for op in report["ops"]} == {2, 3}
-    assert len(report["ops"]) == 8 and len(report["layers"]) == 4
+    assert len(report["ops"]) == 8
+    assert {layer["layer_id"] for layer in report["layers"]} >= {0, 1}
+    profiler.stop()
 
 
 def test_qwen_shared_expert_native_timeline(tmp_path):
@@ -192,7 +251,7 @@ def test_qwen_shared_expert_native_timeline(tmp_path):
         "layers": "layers",
         "start_step": 2,
         "num_steps": 2,
-        "max_scopes": 12,
+        "max_scopes": 256,
         "hbm_policy": "logical_io_once",
     }
     (root / "capture.json").write_text(json.dumps(config))
@@ -229,16 +288,13 @@ def test_qwen_shared_expert_native_timeline(tmp_path):
         output=root / "rank-0.nsight.json",
     )
     rows = report["device_analysis"]["scopes"]
-    assert len(rows) == 12
+    assert len(rows) == len(report["ops"]) + len(report["layers"])
     assert {op["implementation"] for op in report["ops"]} == {"torch_mm"}
-    assert all(row["mfu"] > 0 and row["estimated_mbu"] > 0 for row in rows)
-    for row in rows:
-        assert row["mfu"] == pytest.approx(
-            row["useful_flops"] / (row["gpu_duration_ns"] * 1e3)
-        )
-        if row["kind"] == "layer":
-            tokens = 32 if row["iter_id"] == 2 else 1
-            assert row["useful_flops"] == 6 * tokens * 4096 * 1024
+    # Generic torch matmul has useful algebra but no instruction-engine proof.
+    assert all(row["mfu"] is None for row in rows)
+    assert any(
+        row["estimated_mbu"] is not None and row["estimated_mbu"] > 0 for row in rows
+    )
     subprocess.run(
         [
             nsys,
@@ -264,7 +320,7 @@ def test_qwen_shared_expert_native_timeline(tmp_path):
             for event in db.execute("SELECT eventType,globalTid,text FROM NVTX_EVENTS")
             if event[2] in labels
         ]
-    assert len(events) == 12
+    assert len(events) == len(rows)
     assert {event[0] for event in events} == {59}
     assert {event[1] % (1 << 24) for event in events} == {
         report["device_analysis"]["thread_id"]
@@ -273,7 +329,7 @@ def test_qwen_shared_expert_native_timeline(tmp_path):
         native = projected[row["native_nvtx_label"]].pop(0)
         assert row["gpu_duration_ns"] == int(native["Projected Duration (ns)"])
         assert int(native["TID"]) == report["device_analysis"]["thread_id"]
-        assert int(native["NumGPUOps"]) >= (1 if row["kind"] == "op" else 3)
+        assert int(native["NumGPUOps"]) >= 1
         if row["kind"] == "op":
             assert "Est.MBU=" in row["nvtx_label"] and "MFU=" in row["nvtx_label"]
         else:

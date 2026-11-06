@@ -94,6 +94,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     resolve_dspark_prefix_replay_tokens,
     should_use_overlap_schedule,
 )
+from tokenspeed.runtime.engine.service_trace import ServiceTrace
 from tokenspeed.runtime.epd.encode_host import EncodeBootstrap
 from tokenspeed.runtime.epd.prefill_receive import (
     assert_embeddings_received,
@@ -571,6 +572,7 @@ class HostDataPlane:
         # The control plane exports the serving-time compilations.
         self._report_compiles = report_compiles
         self._profiler = profiler
+        self._service_trace = ServiceTrace.from_environment()
         # Tag -> MemoryRegion (``memory_occupation.memory_regions``).
         self._regions = regions
         # Per request: what every forward it runs in needs, fixed at
@@ -649,6 +651,7 @@ class HostDataPlane:
         grammar_advance: list[bool] | None,
         logprobs: tuple[tuple[list[int], list[int], list[int], int] | None, int] | None,
         history: tuple[list[int], list[int], list[list[int]]] | None,
+        forward_id: int | None = None,
     ) -> _Dispatched | None:
         """Run one round's plan; the forward to complete later, if one ran.
 
@@ -665,6 +668,8 @@ class HostDataPlane:
                 sampled tokens': the prompt rows (``InputLogprobPlan``'s
                 row starts, counts, positions and top-k), None when no row
                 needs one, and the prefill rows' sampled-token top-k.
+            forward_id: The Rust pending forward's exact identity, None when
+                called without the host bridge. Observation metadata only.
             history: For a model that reads request token history, the
                 committed prefixes the batch seeds (``RequestHistorySeeds``'
                 slots, prefix lengths and tokens); None when no row needs
@@ -753,6 +758,10 @@ class HostDataPlane:
         self._gc_hooks.note_round(forwarded=results is not None or idle_forward)
         if results is None:
             return None
+        if results.profile_identity is not None and forward_id is not None:
+            results.profile_identity.bind_forward_id(forward_id)
+        if self._service_trace is not None and forward_id is not None:
+            self._service_trace.dispatch(forward_id, results.profile_identity)
         return _Dispatched(
             results,
             ForwardMode.from_num_extends(
@@ -810,6 +819,34 @@ class HostDataPlane:
             resolve_grammar_completion(results),
             _logprob_lists(results),
         )
+
+    def trace_token_commit(
+        self,
+        forward_id: int,
+        rows: list[tuple],
+        outputs: list[tuple],
+        owns_frontend: bool,
+        observer_delay_ns: int,
+    ) -> None:
+        """CPU-only observation after Rust applied finish conditions and committed."""
+        if self._service_trace is not None:
+            self._service_trace.commit(
+                forward_id,
+                rows,
+                outputs,
+                owns_frontend=owns_frontend,
+                observer_delay_ns=observer_delay_ns,
+            )
+
+    def trace_token_emit(self, rows: list[tuple], observer_delay_ns: int) -> None:
+        """CPU-only observation after the frontend accepted an output batch."""
+        if self._service_trace is not None:
+            self._service_trace.emit(rows, observer_delay_ns=observer_delay_ns)
+
+    def trace_token_release(self, rids: list[str]) -> None:
+        """Forget observation joins only after the round's frontend send."""
+        if self._service_trace is not None:
+            self._service_trace.release(rids)
 
     def note_committed(self, dispatched: _Dispatched) -> None:
         """A committed forward counts toward a profile's steps. The forward

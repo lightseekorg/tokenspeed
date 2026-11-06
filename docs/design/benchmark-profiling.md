@@ -37,9 +37,12 @@ Tensor fields inside dataclass argument/return holders are described using dotte
 paths, such as `cache.kv_cache` and `return.query`; no tensor values are copied.
 
 Dynamic geometry can explicitly opt into `integer_tensor_args=("cache_seqlens",)`.
-These snapshots accept contiguous 1-D int32/int64 vectors of at most 4096 elements.
-CPU values become immutable tuples immediately. CUDA values require `NvtxTimeline`,
-which queues same-stream D2H copies before the op's NVTX range into a preallocated
+These snapshots accept contiguous 1-D/2-D int32/int64 tensors of at most 4096
+values; matrices use a flat alias view. Explicit dotted argument paths traverse
+stored fields, dictionaries and NamedTuple fields, without evaluating properties.
+Without a collector, CPU values become immutable tuples immediately. CUDA values
+require an observer. The eager `NvtxTimeline`
+queues same-stream D2H copies before the op's NVTX range into a preallocated
 pinned buffer (`max_metadata_bytes`, default 1 MiB). Values are resolved after the
 window's final synchronization for metadata copies only. Reusing a device buffer preserves each
 call's original lengths. Ordinary metadata collection never reads CUDA values;
@@ -62,7 +65,8 @@ and cannot be used as GPU latency.
 
 Collection supports synchronous eager windows on one execution thread. Nested
 sessions, repeated iteration IDs and profiled stateful kernel classes are rejected.
-CUDA graph replay and cross-thread attribution are not implemented. Output
+The session does not infer graph replay or cross-thread attribution. The runtime
+collector below supplies graph identities and the exact async result gate. Output
 metadata describes returned tensors; in-place-only outputs need a separate adapter.
 
 ## Cost analysis
@@ -80,6 +84,14 @@ without device timing and matching hardware peaks. The ordinary metadata path
 adds no GPU synchronization or device timing. A rule can provide `compute_type`
 and `estimated_hbm_bytes` explicitly for utilization analysis; storage dtype does
 not establish the compute engine, precision, sparsity or HBM traffic.
+
+For a positive scope GPU duration `T` in seconds, Estimated MBU is
+`sum(estimated_hbm_bytes) / (hbm_bytes_per_second * T)`. The explicit
+`logical_io_once` policy counts the rule's useful boundary reads and writes once;
+it excludes protocol/workspace traffic, reloads and allocated-but-untouched
+capacity. Host-mapped reads remain separate from estimated HBM bytes. An unknown
+HBM estimate or peak leaves MBU unavailable, independently of compute or
+communication normalization.
 
 Device analysis also exports `useful_flops_per_second` and
 `estimated_hbm_bytes_per_second`, dividing each scope's costs by its Nsight GPU
@@ -112,6 +124,20 @@ chunk factorization's FLOP count. Normalization, gate activations and featurewis
 beta scaling are excluded. Its optional IO estimate includes boundary tensors and
 initial/final state, excluding intermediate chunk buffers. Mixed-precision chunk
 implementations leave MFU unavailable rather than infer a peak from storage dtype.
+
+The source-bound ordinary Lite recurrence keeps `T*H*(7*D*D+D)` useful FLOPs
+when a negative read seeds zero state; a negative write suppresses only its
+state store. Logical state IO counts only actual nonnegative source/destination
+rows (`4*H*D*D` bytes each), plus the explicit boundary tensors and actual
+output. Missing snapshots, invalid positive pages and cross-sequence write
+hazards remain unavailable; this does not extend tree/verify policies.
+
+For the ordinary Triton output-bank convolution, only the declared
+`pad_slot_id=-1` source returns before data/output access. Its padded row counts
+zero useful FLOPs and one logical source-index read, with no output/history
+write. Live rows retain `2*C*W` useful FLOPs and their boundary/history IO; negative
+live destinations suppress only history stores. A skipped row leaves the
+output buffer unchanged, and its actual graph execution remains timed.
 
 ## Communication bandwidth and FLOP conventions
 
@@ -211,17 +237,19 @@ finalization or the separate FlashInfer/CuteDSL fusion interface.
 Dense `M x K` by `K x N` GEMM uses `2*M*N*K` FLOPs with an FMA counted as two;
 a batched GEMM additionally sums over batches. This is an operation count, not
 FLOP/s: divide by seconds for FLOP/s and by `1e12` for TFLOP/s. Dtype does not
-halve FLOP counts; it selects the applicable hardware compute peak.
+halve FLOP counts. Proven execution precision and engine select the compatible
+compute peak; storage dtype alone supplies neither.
 
 The registered DeepGEMM block-FP8 projection opts into `fp8_block_mm.v1`.
 `BlockScaledMatmulCost` counts `2*M*N*K` and boundary IO including its FP32
-activation/weight scales (1x128 and 128x128), with BF16 output. Matching E4M3 GPU
-operands select `fp8_e4m3_tensor`; missing hardware peaks leave MFU unavailable.
+activation/weight scales (1x128 and 128x128), with BF16 output. E4M3 storage alone
+leaves its positive FLOPs unnormalized; a reviewed selected-engine contract and
+matching hardware peak are required for `fp8_e4m3_tensor` MFU.
 Activation quantization is outside this scope. Scale layout conversion is inside,
 but its temporary traffic, padding and reloads are excluded from the logical-IO
 HBM estimate. A native trace can therefore contain several kernels for one op.
-The MLA value-projection fallback retains its direct `torch.bmm` call; it has no
-independent op-cost annotation.
+The MLA value-projection fallback retains its direct `torch.bmm` call and uses
+`mla_project_value.v2`; engine normalization still requires execution evidence.
 
 TRT-LLM's 128-wide FP8 token-group quantizers record their values and FP32 scales.
 Their traits and actual granularity/encoding identify the format. Both reject
@@ -419,10 +447,12 @@ ranges to a new report with the matching installation's `ImportNvtxt` utility:
 python -m tokenspeed_kernel.profile_native_report \
   --report timeline.nsys-rep --metrics rank-0.nsight.json \
   --output timeline-utilization.nsys-rep \
-  --import-nvtxt /path/to/ImportNvtxt
+  --import-nvtxt /path/to/ImportNvtxt --target-id HW:VM --nsys /path/to/nsys
 ```
 
-Open the new report and expand `TokenSpeed MFU / Est.MBU (GPU projection)`.
+Use the actual `HW:VM` target returned by the matching installation's
+`ImportNvtxt --cmd info -i timeline.nsys-rep`. In the new report, expand the
+per-rank `MFU / Est.MBU(HBM) / Est.CommBWUtil | derived GPU analysis` lanes.
 These imported analysis lanes show op and layer labels over their correlated
 GPU spans, including gaps, alongside the original CUDA activities. Their
 timestamps use the same capture's relative time base. The original capture
@@ -486,10 +516,9 @@ timestamp overlap are not used to assign work to an op. GPU activity sum,
 interval union and first-to-last span are retained separately. Diagnostic MFU
 and Estimated MBU use the span, including device gaps.
 
-For a mixed-compute scope, diagnostic `MFU_total` is
-`sum(useful_flops[type] / peak_flops_per_second[type]) / gpu_span_seconds`.
-Per-type contributions are additive; no averaging over the number of types is
-performed. Each layer counts descendant op costs once. Nodes outside opted-in
+Mixed-compute diagnostic scopes use the same additive ideal-time definition
+described under [hardware profile selection](#hardware-profile-selection-and-provenance).
+Each layer counts descendant op costs once. Nodes outside opted-in
 ops make the total explicitly partial; known contributions and missing reasons
 remain visible. Estimated MBU is a logical boundary-IO model, not measured HBM
 traffic. All-rank model labels sum local costs, divide by all selected GPUs'
@@ -502,17 +531,100 @@ measurement. A separate benchmark with detailed collection disabled is needed
 for final performance comparisons.
 
 
+## Runtime graph collection
+
+`RuntimeUtilizationProfile` observes the existing serving path; it does not force
+eager execution or change backend selection. `TOKENSPEED_TIMELINE_CONFIG` names a
+JSON file with the existing run/output/hardware/layers/window/HBM policy fields.
+Graph collection additionally requires explicit `cuda_runtime_library` and
+`cupti_library` paths. CUPTI must be the same already-loaded instance used by the
+external profiler. `max_metadata_bytes` bounds each capture slab and pinned slot;
+`metadata_slots` bounds retained asynchronous results. `ranks` optionally selects
+ranks. Each rank saves its normalized config contents/SHA256 and selected hardware
+input snapshot before capture. `TOKENSPEED_PROFILE_RUN_ID`, when set, must agree.
+
+The existing `Engine.start_profile(...)` forwards its activity/settings arguments
+and returns the existing success status. Start it after service warmup, for
+example with `activities=["CUDA_PROFILER"]` and the same `profile_id` as the run.
+Only this request arms the relative `start_step`/`num_steps` metadata window;
+warmup cannot consume it. `stop_profile()` disarms and flushes only CPU-ready
+metadata before acknowledging. Use a unique run/output for another window. With
+external Nsight, keep full-process node tracing (`--capture-range=none`) so startup
+capture and clone evidence is retained. The start/stop API still controls the
+metadata window. `enable_nvtx=False` can remain the normal service setting; the
+collector emits its own necessary replay identity labels.
+
+`ProfileSession.observe(observer)` is the shared public scope/integer observer
+seam; standard module pre/post hooks provide decoder scopes. The runtime's direct
+`ModelRunner.model.forward` call has an explicit root scope because this method
+call bypasses PyTorch module hooks. Only actual graph capture is observed, after
+warmups; replay performs no per-op Python calls. Each declared device integer
+argument gets a stable D2D snapshot before its source storage can be reused.
+Those observer graph nodes are listed separately and excluded from useful scope
+costs. Their overhead remains part of the collected workload and enclosing span.
+CPU integer arguments during capture remain unavailable, rather than freezing a
+warmup/capture value as replay metadata.
+
+After replay, same-stream nonblocking copies move the bounded slab to a free
+pinned slot. A lease identifies `(slot,generation,step_id)` and cannot be reused
+before persistence. The existing result-copy event covers these copies;
+`ModelExecutionResult.sync()` retains its exact-once event wait and marks metadata
+CPU-ready. A background CPU-only writer saves the binary slab and a small hashed
+index. There is no device value read, synchronization or event query in the
+replay loop or writer. Exhaustion, unsupported geometry, persistence errors and
+unresolved results remain explicit. Even if writing the failure index also fails,
+the writer acknowledges queued CPU work so stop does not deadlock; failed slots
+remain owned and the manifest retains `writer_error`.
+
+Artifacts are `rank-N.capture-C.json` (static op/layer descriptions, node scopes,
+observer nodes, snapshot offsets), `rank-N.replays.jsonl` (exact per-step identity
+and payload index), `rank-N.step-S.metadata.bin` (integer bytes), and
+`rank-N.window.json` (`tokenspeed.profile_window/v1`, selected/ready/persisted/drop
+counts, unresolved results and writer status). `device_results_ready` carries the
+actual serving step, request IDs, pool slots and optional bound Rust ForwardId.
+Late binding is a `forward_identity_bound` event with the same step identity.
+Device readiness alone is `completion_identity_unavailable`; only the separate
+true post-commit service evidence establishes committed token endpoints. An
+unavailable ready row increments `dropped_metadata` only after it is written.
+Unknown/index failures remain visible via `writer_error`. A measured decode
+subset may exclude precisely identified disjoint drops; unknown drops cannot be
+ignored, and whole-run coverage remains partial.
+
+Offline code must decode and hash-verify each replay payload, replace that op's
+`tensor_values`, and reevaluate trusted cost rules. Capture-time dynamic costs
+are unavailable and must not be reused. Construct a `CostRegistry`, call
+`profile_costs.register_compute_costs` and `register_collective_costs` with the
+explicit HBM policy, then pass that registry to analysis. The generic rules
+include `mla_decode.v2`, `mla_project_value.v2`, and `grouped_experts.v2`.
+A trusted caller can additionally register model-specific CPU-safe cost rules
+through an explicitly installed provider, for example
+`my_model.profiling.register_costs(registry, hbm_policy=...)`. This cost entry
+should not import model execution or load weights. No import path from a capture
+is executed, and omitting model rules leaves generic coverage explicitly partial.
+
+MLA validates actual query-axis or flattened request/query geometry, causal row
+lengths and DCP1; cache IO uses a logical request union. Grouped expert costs keep
+route instances separate from unique weights/scales, preserve useful intermediate
+size declared before padding, and reject unsupported ownership/routing policies.
+Missing rows/scales/constructor metadata stay unavailable. Engine normalization
+requires the actual selected callable's owned contract or a reviewed selected-engine
+proof bound after the exact native join. Without that proof, Torch bmm and private
+FP8 expert apply retain useful algebra with an unknown engine; multiple leaves
+also need a useful-FLOP partition. Ordinary B1 decode is the initial runtime scope;
+padding, masked/uninitialized state, unsupported prefill graph and other missing
+critical work remain explicit partial coverage. CPU serialization/math fixtures
+cannot establish GPU numerical correctness, graph mapping, complete model costs
+or collector overhead.
+
+
 ## Hardware profile selection and provenance
 
-Use a specific rank-local profile with `--hardware PATH`, or set
-`TOKENSPEED_PROFILE_HARDWARE` for the manual model and engine-worker diagnostic
-paths. There is no default GPU. For example, from the task root:
-
-```bash
-export TOKENSPEED_PROFILE_HARDWARE="$PWD/tokenspeed/docs/hardware-profiles/nvidia-h100-sxm-80gb.yaml"
-# The diagnostic launcher propagates this selection and its SHA256 to workers.
-bash decode-timeline/scheduler-annotations-v4/run_engine.sh off h100-diagnostic
-```
+For the shipped paired serving flow, select a rank-local profile in the
+timeline config's `hardware` field; see the [service TPOT pilot](../../examples/profiling/README.md).
+There is no default GPU. Offline `--hardware PATH`, when supplied, must match
+the captured profile. Programmatic callers of `HardwareProfile.from_selection`
+can supply a path or `TOKENSPEED_PROFILE_HARDWARE`; that environment variable
+does not replace the paired runtime's required timeline `hardware` field.
 
 The [example profiles](../hardware-profiles/) describe theoretical per-device
 NVIDIA product specifications. They do not establish kernel/model support or
@@ -550,34 +662,26 @@ execution decision; missing evidence leaves MFU unavailable while keeping modele
 FLOPs and bytes. A rule tied to a known implementation may explicitly encode its
 compute contract. Unknown peaks are never borrowed from another SKU or engine.
 
-For eager native analysis, the existing `mfu` policy remains single-compute-type.
-The additive `mfu_total` sums each type's ideal time
-`useful_flops[type] / compatible_peak[type]` and divides by the associated GPU
-span, including gaps. A missing compute type/peak makes the full total
-unavailable; `mfu_total_known` is explicitly partial. Manual/scheduler graph
-analysis uses the same summed ideal-time definition for its existing `mfu` and
-`mfu_known` fields. Every denominator is rank-local; rank-zero metrics never
+The shared eager/runtime-graph calculation uses
+`mfu = mfu_total = sum(F_k / P_k) / T`, where `F_k` is useful FLOPs for a proven
+precision/engine component, `P_k` its compatible rank-local dense peak, and `T`
+the scope's associated GPU span in seconds, including gaps. Optional
+`compute_components` must partition canonical useful FLOPs exactly. Contributions
+are additive; no type-count or child-ratio averaging is performed. Positive
+unknown components retain their FLOPs and missing reasons: the full MFU is N/A,
+while `mfu_total_known` is explicitly partial. Zero model FLOPs need no compute
+peak and do not imply GPU inactivity. Manual/scheduler diagnostics use the same
+ideal-time convention with their versioned fields. Rank-zero metrics never
 multiply a single GPU's peak by world size.
 
 
-Task launchers use a shared `select-hardware.sh` preflight before GPU occupancy
-queries, Nsight startup or `torchrun`. It validates the selected file through
-`HardwareProfile.from_selection`, resolves its absolute path and freezes its
-SHA256 in the child environment. An explicit downstream `--hardware` argument
-must still match that frozen hash. Launchers accept the profile as their final
-optional positional argument, or use `TOKENSPEED_PROFILE_HARDWARE`:
-
-```bash
-bash run-profile.sh NEW_TAG /absolute/path/to/profile.yaml
-bash decode-timeline/run_decode.sh NEW_TAG kda /absolute/path/to/profile.yaml
-bash decode-timeline/run_model_decode.sh NEW_TAG decode /absolute/path/to/profile.yaml
-bash decode-timeline/scheduler-annotations-v4/run_engine.sh off NEW_TAG /absolute/path/to/profile.yaml
-```
-
-Use a new output tag for every capture. The `run-core.sh` execution-only case
-does not calculate utilization and does not require a hardware profile. Single
-GPU launchers check occupancy only on their selected GPU 0; eight-rank launchers
-check exactly their selected eight devices. Explicit precision names in v2 are
+Keep the selected hardware file immutable during collection. The runtime saves
+its contents and SHA256 in the capture; offline analysis checks that identity.
+Use the shipped `examples/profiling/service_tpot.py pair` and
+`tokenspeed_kernel.profile_nsys` flow with a new output directory for every
+capture. Custom diagnostic launchers outside this repository need their own
+recorded resource and hardware preflight; they are not prerequisites for this
+public flow. Explicit precision names in v2 are
 extensible (including future published formats); the schema checks their syntax
 and matching engine key instead of interpreting them as storage dtypes or adding
 op support. An unknown op compute key still has no utilization denominator.
@@ -608,7 +712,7 @@ work without a separate FLOP partition. These fields do not replace an actual
 caller argument named `compute_type`. The exact portable
 `triton_mla_decode_with_kvcache` implementation uses FP32 multiply/sum for QK and
 latent AV; its registered query-width-one contract can select `fp32_simt`.
-Unproven leaves and the `torch.bmm` value-projection fallback remain unknown.
+Unproven leaves, including `torch.bmm` without a matched engine proof, remain unknown.
 An FP8-weight MoE apply identity alone does not prove its private compiled
 artifact's activation precision or instruction engine.
 

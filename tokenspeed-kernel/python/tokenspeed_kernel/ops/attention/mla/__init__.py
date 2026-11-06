@@ -21,13 +21,19 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 
 import torch
-from tokenspeed_kernel.op_profile import current_op_metadata, record_selected_kernel
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    current_op_metadata,
+    record_selected_kernel,
+    wrap_op_for_profiling,
+)
 from tokenspeed_kernel.ops.gemm.flashinfer import autotune_bf16_gemm
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.selection import (
     KernelPlan,
     NoKernelFoundError,
@@ -189,6 +195,13 @@ def plan_mla_project_value(
     )
 
 
+@partial(
+    wrap_op_for_profiling,
+    spec=KernelSpec(
+        name="mla_project_value_api", family="attention", mode="mla_project_value"
+    ),
+    profile=OpProfile(cost_rule="mla_project_value.v2"),
+)
 def mla_project_value(
     attention: torch.Tensor,
     weight: torch.Tensor,
@@ -1099,6 +1112,21 @@ def supports_mla_decode_query_blocks(
     ) and noncausal_block_size in spec.traits.get("noncausal_block_size", ())
 
 
+@partial(
+    wrap_op_for_profiling,
+    spec=KernelSpec(name="mla_decode_api", family="attention", mode="mla_decode"),
+    profile=OpProfile(
+        cost_rule="mla_decode.v2",
+        scalar_args=(
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "window_left",
+            "noncausal_block_size",
+            "return_lse",
+        ),
+        integer_tensor_args=("cache_seqlens",),
+    ),
+)
 def mla_decode_with_kvcache(
     # attention inputs
     q: torch.Tensor,

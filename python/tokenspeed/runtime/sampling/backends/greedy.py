@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.op_profile import OpProfile, profile_function
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
@@ -88,6 +89,23 @@ def _verify_chain_greedy_torch(
     accept_token_num.copy_(num_accepted)
 
 
+@profile_function(
+    family="sampling",
+    name="increment_accept_lengths",
+    profile=OpProfile("sampling_support.v1"),
+)
+def _increment_accept_lengths(accept_length):
+    accept_length += 1
+    return accept_length
+
+
+@profile_function(
+    family="sampling",
+    name="verify_chain_greedy",
+    profile=OpProfile(
+        "sampling_support.v1", scalar_args=("batch_size", "num_draft_tokens")
+    ),
+)
 def _verify_chain_greedy(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -284,7 +302,7 @@ class GreedySamplingBackend(SamplingBackend):
                     accept_length,
                 )
 
-            accept_length += 1
+            accept_length = _increment_accept_lengths(accept_length)
 
         # TP-rank sync on the full verify-output triple, mirrors
         # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length

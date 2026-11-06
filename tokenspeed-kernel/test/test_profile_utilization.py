@@ -865,7 +865,7 @@ def test_metrics_match_analytical_reference_and_repeated_calls(fixture):
         assert row["estimated_hbm_bytes_per_second"] == pytest.approx(1040)
         assert row["mfu"] == pytest.approx(0.48)
         assert row["estimated_mbu"] == pytest.approx(1.04)  # Never clamp to 100%.
-        assert "MFU=48.00% Est.MBU=104.00%" in row["nvtx_label"]
+        assert "MFU=48.00% Est.MBU(HBM)=104.00%" in row["nvtx_label"]
     for row in layers:
         assert row["op_count"] == 1
         assert row["useful_flops_per_second"] == pytest.approx(240)
@@ -914,7 +914,7 @@ def test_missing_cost_is_unavailable_and_has_reason(fixture):
         assert row["covered_op_count"] == 0
         assert "cost rule unavailable" in row["mfu_missing_reason"]
         if row["kind"] == "op":
-            assert "MFU=N/A Est.MBU=N/A" in row["nvtx_label"]
+            assert "MFU=N/A Est.MBU(HBM)=N/A" in row["nvtx_label"]
         else:
             assert row["nvtx_label"] == f"L{row['layer_id']}"
 
@@ -979,11 +979,11 @@ def test_layer_normalizes_only_nonzero_compute_types(fixture, other_flops):
     row = next(r for r in rows if r["trace_label"] == label)
     assert row["estimated_mbu"] == pytest.approx(1.04)
     if other_flops:
-        assert row["mfu"] is None
+        assert row["mfu"] == pytest.approx(0.36)
         assert row["mfu_by_compute_type"] == pytest.approx(
             {"synthetic": 0.24, "other": 0.12}
         )
-        assert "mixed compute types" in row["mfu_missing_reason"]
+        assert row["mfu_missing_reason"] is None
         assert row["mfu_total"] == pytest.approx(0.36)
         assert row["mfu_total_missing_reason"] is None
     else:
@@ -1109,15 +1109,26 @@ def test_collective_bytes_and_busbw(
     assert row["busbw_bytes_per_second"] == pytest.approx(bus / 0.1)
     assert row["algbw_bytes_per_second"] == pytest.approx(total / 0.1)
     assert row["estimated_mbu"] is None
-    assert "Est.MBU=N/A" in row["nvtx_label"]
+    assert "Est.MBU(HBM)=N/A" in row["nvtx_label"]
     if fused_compute:
         assert row["mfu"] == pytest.approx(48 / (1000 * 0.1))
         assert "MFU=48.00%" in row["nvtx_label"]
-        assert "busbw=" in row["nvtx_label"]
     else:
-        assert row["mfu"] is None
+        assert row["mfu"] == row["mfu_total"] == 0
+        assert row["mfu_missing_reason"] is None
         assert "MFU=" not in row["nvtx_label"]
-        assert "busbw=" not in row["nvtx_label"]
+    assert "commAlgBW=" in row["nvtx_label"]
+    assert "commBusBW=" in row["nvtx_label"]
+    heading = row["nvtx_label"].split(" | ")
+    assert heading[:2] == [session.ops[0].op_name, "Est.CommBWUtil=N/A"]
+    assert heading[2].startswith("GPU=") and heading[2].endswith("us")
+    assert float(heading[2][4:-2]) == 100000
+    assert (
+        row["nvtx_label"].index("Est.CommBWUtil=")
+        < row["nvtx_label"].index("Est.MBU(HBM)=")
+        < row["nvtx_label"].index("commAlgBW=")
+    )
+    assert "comm util N/A:" in row["nvtx_label"]
 
 
 def test_layer_busbw_window_and_unavailable_results(fixture):

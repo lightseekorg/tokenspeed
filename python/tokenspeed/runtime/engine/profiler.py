@@ -113,6 +113,8 @@ class Profiler:
         # Rendezvous buffer for _profile_sync, allocated once -- see
         # _profile_sync.
         self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
+        # A configured timeline owns one window for this engine's lifetime.
+        self._timeline_window_started = False
         self.init_profiler()
 
     def note_forward(self, forward_mode: ForwardMode) -> None:
@@ -134,7 +136,23 @@ class Profiler:
         self.profiler_decode_ct: int | None = None
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
+        self._cuda_collection_active: bool = False
         self.viztracer = None
+
+    def _timeline_start_error(self, *, profile_by_stage: bool) -> str | None:
+        if not os.environ.get("TOKENSPEED_TIMELINE_CONFIG"):
+            return None
+        if profile_by_stage:
+            return (
+                "Utilization timelines support one window; "
+                "profile_by_stage is unsupported."
+            )
+        if self._timeline_window_started:
+            return (
+                "A utilization timeline has one window per engine; "
+                "start a fresh engine/run to profile again."
+            )
+        return None
 
     def init_profile(
         self,
@@ -147,6 +165,9 @@ class Profiler:
         profile_by_stage: bool,
         profile_id: str,
     ) -> ProfileReqOutput:
+        timeline_error = self._timeline_start_error(profile_by_stage=profile_by_stage)
+        if timeline_error is not None:
+            return ProfileReqOutput(success=False, message=timeline_error)
         if self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
@@ -251,6 +272,28 @@ class Profiler:
     def start_profile(
         self, stage: ForwardMode | None = None
     ) -> ProfileReqOutput | None:
+        timeline_error = self._timeline_start_error(
+            profile_by_stage=self.profile_by_stage or stage is not None
+        )
+        if timeline_error is not None:
+            return ProfileReqOutput(success=False, message=timeline_error)
+
+        early_collection = False
+        if os.environ.get("TOKENSPEED_TIMELINE_CONFIG") and self._device is not None:
+            # Arm before starting any backend. A failed control request must
+            # neither escape into the data plane nor stop startup collection.
+            self._timeline_window_started = True
+            try:
+                early_collection = self._device.arm_utilization_profile()
+            except Exception as exc:
+                logger.exception("Failed to arm utilization timeline")
+                self.init_profiler()
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"Failed to arm utilization timeline: {exc}. "
+                    "Start a fresh engine/run to retry.",
+                )
+
         stage_str = f" for {stage.name}" if stage else ""
         stage_suffix = f"-{stage.name}" if stage else ""
 
@@ -285,8 +328,9 @@ class Profiler:
         if "MEM" in activities:
             torch.cuda.memory._record_memory_history(max_entries=100000)
 
-        if "CUDA_PROFILER" in activities:
+        if "CUDA_PROFILER" in activities and not early_collection:
             torch.cuda.cudart().cudaProfilerStart()
+        self._cuda_collection_active = early_collection or "CUDA_PROFILER" in activities
 
         if "EXPERT_LOAD" in activities:
             # Routing counts every route; the window starts from zero.
@@ -386,8 +430,12 @@ class Profiler:
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
 
-        if "CUDA_PROFILER" in self.profiler_activities:
+        if os.environ.get("TOKENSPEED_TIMELINE_CONFIG") and self._device is not None:
+            self._device.stop_utilization_profile()
+
+        if self._cuda_collection_active:
             torch.cuda.cudart().cudaProfilerStop()
+            self._cuda_collection_active = False
 
         if "EXPERT_LOAD" in self.profiler_activities:
             # Per-rank, unreduced (a collective here would wait on DP peers);

@@ -26,6 +26,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    profile_function,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
@@ -1196,6 +1200,16 @@ def _vocab_shard_embedding_kernel(
     ],
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
+)
+@profile_function(
+    family="embedding",
+    name="vocab_shard_embedding",
+    profile=OpProfile(
+        "vocab_shard_embedding.v1",
+        scalar_args=("org_range", "num_org_padding", "added_range"),
+        integer_tensor_args=("indices",),
+        tensor_args=(),
+    ),
 )
 def vocab_shard_embedding(weight, indices, org_range, num_org_padding, added_range):
     """Gather this shard's rows for global IDs and zero every other row."""

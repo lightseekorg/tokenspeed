@@ -49,6 +49,10 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as _dist
 import torch.distributed._symmetric_memory as _symm_mem
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    profile_function,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -1151,6 +1155,16 @@ def _dist_argmax_invoke_kernel(
     )
 
 
+@profile_function(
+    family="sampling",
+    name="distributed_argmax",
+    profile=OpProfile(
+        "distributed_argmax.v1",
+        scalar_args=("state.world_size", "state.rank_in_group"),
+        integer_tensor_args=(),
+        tensor_args=("state.slot_buffer", "state.round_id_gpu", "state.warps_done_gpu"),
+    ),
+)
 def distributed_argmax(
     state: DistArgmaxState,
     logits: torch.Tensor,

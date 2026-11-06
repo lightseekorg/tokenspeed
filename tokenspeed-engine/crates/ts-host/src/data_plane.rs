@@ -40,6 +40,7 @@ use std::{
     collections::HashMap,
     sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
     thread,
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -51,7 +52,10 @@ use ts_control::eplb::SlotMoves;
 use ts_control::{
     event_loop::{DataPlane, DataPlaneError, Dispatch, DpRound},
     ingress::Admission,
-    output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows, TopLogprobs},
+    output::{
+        ForwardResult, HistorySeeds, LogprobPlan, NgramWindows, StreamedOutput, TokenCommit,
+        TopLogprobs,
+    },
 };
 use ts_pd::LandedRequest;
 use ts_scheduler::{CacheEvent, CacheEventKind, ExecutionPlan};
@@ -217,6 +221,7 @@ pub struct PythonDataPlane {
     ops: Option<mpsc::Sender<Op>>,
     shared: Arc<Shared>,
     next_forward: ForwardId,
+    service_trace: bool,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -240,6 +245,7 @@ impl PythonDataPlane {
             ops: Some(ops),
             shared: shared.clone(),
             next_forward: 0,
+            service_trace: std::env::var_os("TOKENSPEED_SERVICE_TRACE").is_some(),
             thread: None,
         };
         let thread = thread::Builder::new()
@@ -388,6 +394,88 @@ impl DataPlane for PythonDataPlane {
         // The profiler counts committed forwards, on the thread it traces.
         self.queue(Op::Committed(launched))?;
         Ok(result)
+    }
+
+    fn token_trace_enabled(&self) -> bool {
+        self.service_trace
+    }
+
+    fn token_trace_id(&self, pending: &ForwardId) -> Option<u64> {
+        self.service_trace.then_some(*pending)
+    }
+
+    fn trace_commit(
+        &mut self,
+        forward: u64,
+        rows: &[TokenCommit],
+        outputs: &[StreamedOutput],
+        owns_frontend: bool,
+    ) -> Result<(), DataPlaneError> {
+        let observed_at = Instant::now();
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.rid.clone(),
+                    row.admission,
+                    row.completion_tokens,
+                    row.output_ids.clone(),
+                    row.finish_reason,
+                )
+            })
+            .collect();
+        let outputs: Vec<_> = outputs
+            .iter()
+            .map(|row| {
+                (
+                    row.rid.clone(),
+                    row.completion_tokens,
+                    row.output_ids.clone(),
+                    row.finish_reason,
+                )
+            })
+            .collect();
+        self.query(|plane| {
+            plane
+                .call_method1(
+                    "trace_token_commit",
+                    (
+                        forward,
+                        rows,
+                        outputs,
+                        owns_frontend,
+                        observed_at.elapsed().as_nanos() as u64,
+                    ),
+                )
+                .map(drop)
+        })
+    }
+
+    fn trace_emit(&mut self, outputs: &[StreamedOutput]) -> Result<(), DataPlaneError> {
+        let observed_at = Instant::now();
+        let rows: Vec<_> = outputs
+            .iter()
+            .map(|row| {
+                (
+                    row.rid.clone(),
+                    row.completion_tokens,
+                    row.output_ids.clone(),
+                    row.finish_reason,
+                )
+            })
+            .collect();
+        self.query(|plane| {
+            plane
+                .call_method1(
+                    "trace_token_emit",
+                    (rows, observed_at.elapsed().as_nanos() as u64),
+                )
+                .map(drop)
+        })
+    }
+
+    fn trace_release(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
+        self.query(|plane| plane.call_method1("trace_token_release", (rids.to_vec(),)).map(drop))
     }
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
@@ -677,7 +765,7 @@ fn run(
             let launched = plane
                 .call_method1(
                     "execute",
-                    (plan, dp, ngram, grammar_advance, logprobs, history),
+                    (plan, dp, ngram, grammar_advance, logprobs, history, forward),
                 )
                 .map_err(python)?;
             if let Some(streams) = streams {
@@ -942,7 +1030,7 @@ class Plane:
     def exit_forward_thread(self):
         self.note("exit_forward_thread")
 
-    def execute(self, plan, dp, ngram, grammar_advance, logprobs, history):
+    def execute(self, plan, dp, ngram, grammar_advance, logprobs, history, forward_id=None):
         self.note("execute")
         token = self.next_token
         self.next_token += 1

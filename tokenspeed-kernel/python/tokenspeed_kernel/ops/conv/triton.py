@@ -36,7 +36,7 @@ kernels are re-exported for the conv package entry points.
 
 import torch
 from tokenspeed_kernel._triton import triton
-from tokenspeed_kernel.op_profile import OpProfile
+from tokenspeed_kernel.op_profile import OpProfile, record_compiled_kernel
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
 )
@@ -266,6 +266,11 @@ def triton_causal_conv1d_prefill(
     solution="triton",
     signatures=format_signatures("x", "dense", _CONV_DTYPES),
     priority=Priority.PORTABLE,
+    profile=OpProfile(
+        cost_rule="causal_conv1d_update.v3",
+        scalar_args=("pad_slot_id",),
+        integer_tensor_args=("conv_state_indices", "output_state_indices"),
+    ),
 )
 def triton_causal_conv1d_update(
     x: torch.Tensor,
@@ -423,7 +428,7 @@ def triton_causal_conv1d_update(
     else:
         stride_output_state_indices_seq = stride_output_state_indices_step = 0
 
-    _causal_conv1d_update_kernel[grid](
+    compiled = _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
         weight,
@@ -476,6 +481,7 @@ def triton_causal_conv1d_update(
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
+    record_compiled_kernel(compiled, contract_id="causal_conv1d_update.triton.v1")
     if unsqueeze:
         out = out.squeeze(-1)
     return out

@@ -2221,9 +2221,7 @@ def moe_apply(
     if routing_prepared is not None:
         quantized_kwargs["routing_prepared"] = routing_prepared
     output_kwargs = {"deferred_out": deferred_out} if deferred_out is not None else {}
-    record_selected_kernel(
-        kernel.name, plan["solution"], implementation=kernel.impl
-    )
+    record_selected_kernel(kernel.name, plan["solution"], implementation=kernel.impl)
     return kernel(
         plan=plan,
         x=x,

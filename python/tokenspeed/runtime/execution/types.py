@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.profile_graph import ProfileStep
+
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
@@ -345,6 +347,9 @@ class ModelExecutionResult:
     input_top_logprobs_idx: torch.Tensor | None = None
     output_top_logprobs_val: torch.Tensor | None = None
     output_top_logprobs_idx: torch.Tensor | None = None
+    # Exact optional profiling identity shared with the data plane's ForwardId.
+    # Device readiness is distinct from the Rust post-commit event.
+    profile_identity: ProfileStep | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:
@@ -365,3 +370,5 @@ class ModelExecutionResult:
             raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()
         self._synced = True
+        if self.profile_identity is not None:
+            self.profile_identity.device_results_ready(self.copy_event)

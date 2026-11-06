@@ -32,7 +32,13 @@ once at init; model-level preparation may later grow it in place.
 """
 
 import torch
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    current_op_metadata,
+    wrap_op_for_profiling,
+)
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import KernelSpec
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 
@@ -198,7 +204,20 @@ class TrtllmAllReduceBackend(CommBackend):
         op=None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if not isinstance(tensor, torch.Tensor):
-            return super().all_reduce(tensor, group, op=op)
+            result = super().all_reduce(tensor, group, op=op)
+            metadata = current_op_metadata()
+            if metadata is not None and len(tensor) > 1:
+                # Individual payloads may select different strategies. Keep
+                # their aggregate traffic, without claiming one route capacity.
+                for key in (
+                    "comm_algorithm",
+                    "comm_protocol",
+                    "comm_transport",
+                    "comm_transport_source",
+                ):
+                    metadata.pop(key, None)
+                metadata["comm_route_unavailable"] = "multiple payload route decisions"
+            return result
 
         if op is None:
             op = torch.distributed.ReduceOp.SUM
@@ -322,3 +341,14 @@ class TrtllmAllReduceBackend(CommBackend):
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         raise NotImplementedError("Use AutoBackend for token-aware ops")
+
+
+# The fallback runs inside this same semantic boundary. Nested NCCL recording
+# is suppressed by the shared wrapper, so each payload is accounted for once.
+TrtllmAllReduceBackend.all_reduce = wrap_op_for_profiling(
+    TrtllmAllReduceBackend.all_reduce,
+    spec=KernelSpec(
+        name="trtllm_all_reduce", family="communication", mode="all_reduce"
+    ),
+    profile=OpProfile(cost_rule="nccl_all_reduce_sum.v1"),
+)

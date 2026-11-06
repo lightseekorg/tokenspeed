@@ -171,6 +171,7 @@ class NvtxTimeline:
         self._metadata_used = 0
         self._entered = False
         self._finished = False
+        self._observer_context = None
 
     def _check_context(self) -> None:
         if threading.get_native_id() != self._thread:
@@ -183,7 +184,7 @@ class NvtxTimeline:
             )
 
     def __enter__(self) -> NvtxTimeline:
-        if self._entered or self.session._timeline is not None or self.session._active:
+        if self._entered:
             raise RuntimeError("Nested or reused native timeline is unsupported")
         if self.session.ops or self.session.layers:
             raise ValueError("Native timeline requires an unused ProfileSession")
@@ -201,14 +202,36 @@ class NvtxTimeline:
         except BaseException:
             self._nvtx.close()
             raise
-        self.session._timeline = self
+        self._observer_context = self.session.observe(self)
+        try:
+            self._observer_context.__enter__()
+        except BaseException:
+            self._metadata_buffer = None
+            self._nvtx.close()
+            raise
         return self
 
-    def _snapshot_integer_values(
+    def snapshot_integer_selection(self, producer, target, inputs, name):
+        from tokenspeed_kernel.op_profile import _describe
+
+        source = producer()
+        if (
+            source.dtype not in (torch.int32, torch.int64)
+            or not source.is_contiguous()
+            or not 0 < source.numel() <= 4096
+        ):
+            raise ValueError("Integer selection must be bounded and contiguous")
+        _describe(source, name, inputs)
+        self.snapshot_integer_values(source.view(-1), target, name)
+
+    def snapshot_integer_values(
         self, source: torch.Tensor, target: dict[str, tuple[int, ...] | None], name: str
     ) -> None:
         """Queue a validated integer vector before the op window; never wait here."""
         self._check_context()
+        if source.device.type == "cpu":
+            target[name] = tuple(source.tolist())
+            return
         if self._finished or self._metadata_buffer is None:
             raise RuntimeError("Native timeline is not collecting")
         if source.device != self.stream.device:
@@ -257,9 +280,9 @@ class NvtxTimeline:
             return
         if (
             not self._entered
+            or ProfileSession.current() is self.session
             or self._nvtx is None
-            or self.session._active
-            or self.session._timeline is not self
+            or not self.session.observed_by(self)
         ):
             raise RuntimeError(
                 "Finish outside iteration windows while capture is active"
@@ -303,7 +326,9 @@ class NvtxTimeline:
                 raise
             exc.add_note(f"Native timeline finalization failed: {error}")
         finally:
-            self.session._timeline = None
+            if self._observer_context is not None:
+                self._observer_context.__exit__(exc_type, exc, traceback)
+                self._observer_context = None
             self._snapshots.clear()
             self._metadata_buffer = None
             if self._nvtx is not None:

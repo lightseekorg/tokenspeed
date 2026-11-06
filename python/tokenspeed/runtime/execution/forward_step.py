@@ -23,7 +23,7 @@ from __future__ import annotations
 import bisect
 import gc
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -208,8 +208,10 @@ class ForwardStepRunner:
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
         decode_graph_supported: bool = True,
+        utilization_profile=None,
     ):
         self.config = config
+        self.utilization_profile = utilization_profile
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -426,6 +428,8 @@ class ForwardStepRunner:
         """
         global global_graph_memory_pool
 
+        if self.utilization_profile is not None:
+            self.utilization_profile.release_graphs()
         self.graphs.clear()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
@@ -636,6 +640,13 @@ class ForwardStepRunner:
         if self.sampling_backend is not None:
             self.sampling_backend.reset_capture_state()
 
+        if self.utilization_profile is not None:
+            # Start before the existing rendezvous, so every peer's actual
+            # capture follows collection startup on the selected ranks.
+            self.utilization_profile.start_capture_collection(
+                graph_key=(variant, bs), batch_size=bs
+            )
+
         self.device_module.synchronize()
         dist.barrier()
 
@@ -672,9 +683,19 @@ class ForwardStepRunner:
                 stream=self.stream,
                 tag="cuda_graph",
             )
+        profile_capture = (
+            self.utilization_profile.capture(
+                graph_key=(variant, bs),
+                batch_size=bs,
+                query_width=self.max_tokens_per_req,
+            )
+            if self.utilization_profile is not None
+            else nullcontext()
+        )
         with observer:
-            # The kernel state captured launches need lives as long as the graph.
-            with capture_session(graph), graph_capture:
+            # Only this graph's actual capture belongs to this identity. Drafter
+            # round graphs have separate ownership and are not silently merged.
+            with profile_capture, capture_session(graph), graph_capture:
                 out = run_once()
             # The drafter's own graphs at this batch share the pool and the measure.
             if self.drafter is not None and variant == CUDA_GRAPH_VARIANT_DEFAULT:
@@ -1196,7 +1217,18 @@ class ForwardStepRunner:
                         else [ctx.input_num_tokens] * self.world_size
                     ),
                 )
-            with nvtx_range("graph_replay", color="red"):
+            profile_replay = (
+                self.utilization_profile.replay(
+                    graph_key=graph_key,
+                    batch_size=bs,
+                    padded_batch_size=padded_bs,
+                    query_width=self.max_tokens_per_req,
+                    query_shard=ctx.query_shard,
+                )
+                if self.utilization_profile is not None
+                else nullcontext()
+            )
+            with nvtx_range("graph_replay", color="red"), profile_replay:
                 if self.drafter is not None:
                     self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
                 else:
@@ -1224,7 +1256,13 @@ class ForwardStepRunner:
                 None,
             )
         else:
-            result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            profile_eager = (
+                self.utilization_profile.eager()
+                if self.utilization_profile is not None
+                else nullcontext()
+            )
+            with profile_eager:
+                result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         if use_graph and padded_bs != bs:
             ctx.bs = bs

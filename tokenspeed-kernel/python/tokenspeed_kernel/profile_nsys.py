@@ -25,6 +25,8 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib
+import inspect
 import json
 import sqlite3
 import subprocess
@@ -33,6 +35,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from tokenspeed_kernel.op_profile import CostRegistry
 from tokenspeed_kernel.profile_utilization import (
     ScopeTiming,
     analyze_utilization,
@@ -248,6 +251,441 @@ def finalize_nsight(
     return result
 
 
+def _load_cost_provider(
+    selection: str, *, hbm_policy: str
+) -> tuple[CostRegistry | None, dict]:
+    """Load only an explicitly selected installed CLI registration function."""
+    from tokenspeed_kernel import profile_costs
+    from tokenspeed_kernel.profile_graph_analysis import (
+        default_cost_registry,
+        file_source,
+    )
+
+    provenance = {
+        "selection": selection,
+        "hbm_policy": hbm_policy,
+        "builtin_source": file_source(Path(profile_costs.__file__)),
+    }
+    if selection == "builtin":
+        return None, provenance
+    module_name, separator, function_name = selection.partition(":")
+    if (
+        not separator
+        or not all(part.isidentifier() for part in module_name.split("."))
+        or not function_name.isidentifier()
+    ):
+        raise ValueError("Cost provider must be builtin or installed module:function")
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as error:
+        raise ValueError(
+            f"Cost provider {selection!r} is unavailable; install the provider and its CPU dependencies"
+        ) from error
+    callback = getattr(module, function_name, None)
+    if not inspect.isfunction(callback):
+        raise ValueError(
+            f"Cost provider {selection!r} is not a callable registration function"
+        )
+    source = inspect.getsourcefile(module) or inspect.getfile(module)
+    provenance["source"] = file_source(Path(source))
+    provenance["callable"] = f"{callback.__module__}:{callback.__qualname__}"
+    registry = default_cost_registry(hbm_policy=hbm_policy)
+    try:
+        callback(registry, hbm_policy=hbm_policy)
+    except ImportError as error:
+        raise ValueError(
+            f"Cost provider {selection!r} could not register; install its CPU dependencies"
+        ) from error
+    return registry, provenance
+
+
+def finalize_graph_nsight(
+    *,
+    nsys: str,
+    trace: Path,
+    replays: Path,
+    window: Path,
+    output: Path,
+    hbm_policy: str,
+    hardware: Path | None,
+    service_metadata: Path | None,
+    model_config: Path | None,
+    coverage_output: Path | None,
+    scheduler_mode: str,
+    registry: CostRegistry | None,
+    cost_provider_source: dict | None = None,
+) -> dict[str, Any]:
+    """Export and analyze collector graph artifacts using public CPU cost rules.
+
+    Optional service proof requires all three service inputs. Output files are
+    exclusive new artifacts; their provenance retains hashes of the temporary
+    SQLite export and every consumed capture/binary source. Explicit
+    scheduler_mode="collector" adds scheduler_analysis from the same export and
+    validated per-step service status to native scope labels; "disabled" omits it.
+    registry is an explicitly trusted Python CostRegistry; None selects builtin
+    public costs only. cost_provider_source optionally records caller-supplied
+    provenance; no provider is ever loaded from captured/serialized metadata.
+    """
+    from tokenspeed_kernel.profile_graph_analysis import (
+        analyze_graph_replays,
+        default_cost_registry,
+        native_coverage_receipt,
+    )
+
+    if scheduler_mode not in ("disabled", "collector"):
+        raise ValueError("Select disabled or collector scheduler mode explicitly")
+    if registry is not None and not isinstance(registry, CostRegistry):
+        raise TypeError("registry must be a trusted CostRegistry or explicit None")
+    if cost_provider_source is None:
+        if registry is None:
+            _, cost_provider_source = _load_cost_provider(
+                "builtin", hbm_policy=hbm_policy
+            )
+        else:
+            cost_provider_source = {
+                "selection": "trusted_python_registry",
+                "source": "explicit CostRegistry supplied by Python caller",
+                "hbm_policy": hbm_policy,
+            }
+    if scheduler_mode == "collector" and service_metadata is None:
+        raise ValueError("Collector scheduler analysis requires service metadata")
+    proof = (service_metadata, model_config, coverage_output)
+    if any(item is not None for item in proof) and any(item is None for item in proof):
+        raise ValueError(
+            "Service proof requires metadata, model config and coverage output"
+        )
+    outputs = [output] + ([] if coverage_output is None else [coverage_output])
+    if len({path.resolve() for path in outputs}) != len(outputs) or any(
+        path.exists() for path in outputs
+    ):
+        raise ValueError("Graph analysis output files must be distinct and new")
+    selected_registry = (
+        default_cost_registry(hbm_policy=hbm_policy) if registry is None else registry
+    )
+    source_trace_hash = hashlib.sha256(trace.read_bytes()).hexdigest()
+    with tempfile.TemporaryDirectory(prefix="tokenspeed-graph-nsight-") as directory:
+        database = Path(directory) / "trace.sqlite"
+        subprocess.run(
+            [
+                nsys,
+                "export",
+                "--type=sqlite",
+                f"--output={database}",
+                str(trace.resolve()),
+            ],
+            check=True,
+        )
+        result = analyze_graph_replays(
+            database=database,
+            report=trace,
+            replays=replays,
+            window=window,
+            registry=selected_registry,
+            hardware=hardware,
+            evidence_kind="nsight_capture",
+        )
+        result["provenance"]["cost_provider"] = cost_provider_source
+        result["provenance"]["database"][
+            "origin"
+        ] = "matching_nsys_export_from_source_report"
+        result["provenance"]["database"]["export_command"] = [
+            nsys,
+            "export",
+            "--type=sqlite",
+        ]
+        if result["device_analysis"]["source_report_sha256"] != source_trace_hash:
+            raise ValueError("Source report changed during export/analysis")
+        if scheduler_mode == "collector":
+            from tokenspeed_kernel.profile_scheduler import analyze_scheduler
+
+            scheduler = analyze_scheduler(
+                database,
+                selection_mode="collector",
+                missing_launch_policy="report_unavailable",
+                service_metadata=service_metadata,
+                report=trace,
+                expected_report_sha256=source_trace_hash,
+                registry=selected_registry,
+            )
+            for name, path in (("ready_index", replays), ("window", window)):
+                if (
+                    scheduler["provenance"][name]["sha256"]
+                    != hashlib.sha256(path.read_bytes()).hexdigest()
+                ):
+                    raise ValueError(
+                        f"Scheduler service metadata references a different {name}"
+                    )
+            scheduler["provenance"]["database"] = dict(result["provenance"]["database"])
+            scheduler["provenance"]["cost_provider"] = cost_provider_source
+            result["scheduler_analysis"] = scheduler
+            statuses = {step["step_id"]: step for step in scheduler["steps"]}
+            for scope in result["device_analysis"]["scopes"]:
+                step = statuses.get(scope["step_id"])
+                if step is None or step["forward_id"] != scope["forward_id"]:
+                    raise ValueError("Graph/scheduler exact step/ForwardId mismatch")
+                scope["scheduler_status"] = {
+                    name: step[name]
+                    for name in (
+                        "scheduled",
+                        "gpu_observed",
+                        "device_ready",
+                        "authoritative_commit",
+                        "completion_status",
+                        "token_commits",
+                    )
+                }
+        coverage = (
+            None
+            if service_metadata is None
+            else native_coverage_receipt(
+                result, metadata=service_metadata, model_config=model_config
+            )
+        )
+    for path, content in [(output, result)] + (
+        [] if coverage is None else [(coverage_output, coverage)]
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x") as stream:
+            stream.write(json.dumps(content, indent=2, allow_nan=False) + "\n")
+    return result
+
+
+def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Path | None]:
+    """Validate a sealed pair-driver inventory and select one exact rank.
+
+    Every consumed source must be present in the hash inventory, including
+    capture and binary paths referenced by replay rows. No serialized field
+    selects a provider, policy or Python import.
+    """
+    if rank is not None and (type(rank) is not int or rank < 0):
+        raise ValueError("Select a nonnegative integer rank")
+    raw = path.read_bytes()
+    fingerprint = hashlib.sha256(raw).hexdigest()
+    if not path.name.endswith(f".{fingerprint}.json"):
+        raise ValueError("Run manifest filename must contain its content SHA256")
+    manifest = json.loads(raw)
+    run_id = manifest.get("run_id")
+    if (
+        manifest.get("schema") != "tokenspeed.profile_run/v1"
+        or not isinstance(run_id, str)
+        or not run_id
+    ):
+        raise ValueError("Unsupported run manifest schema/identity")
+    artifacts = manifest["artifacts"]
+    for name, source in artifacts.items():
+        source_path = Path(name)
+        if (
+            not source_path.is_absolute()
+            or source_path.resolve() != source_path
+            or source.get("path") != name
+        ):
+            raise ValueError(
+                "Run manifest sources must use exact resolved absolute paths"
+            )
+        digest = hashlib.sha256()
+        size = 0
+        with source_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+        if (
+            type(source.get("bytes")) is not int
+            or source["bytes"] != size
+            or source.get("sha256") != digest.hexdigest()
+        ):
+            raise ValueError(f"Run artifact hash/size mismatch: {name}")
+
+    def source(name: str) -> Path:
+        if name not in artifacts:
+            raise ValueError(f"Run source absent from hash inventory: {name}")
+        return Path(name)
+
+    if manifest["report"] is None:
+        raise ValueError("JSON-only run has no completed Nsight report")
+    report = source(manifest["report"])
+    client = source(manifest["client"])
+    with client.open() as stream:
+        header = json.loads(next(stream))
+    case = source(manifest["case"])
+    if (
+        header.get("run_id"),
+        header.get("arm"),
+        header.get("repetition"),
+        header.get("case_sha256"),
+    ) != (run_id, "profiled", manifest["arm_index"], artifacts[str(case)]["sha256"]):
+        raise ValueError("Run manifest/client/case identity mismatch")
+    observation = None
+    if manifest.get("startup_observation_sha256") is not None:
+        from tokenspeed_kernel.op_profile import (
+            _profile_config_for_observation,
+            _profile_validate_startup_observation,
+        )
+
+        timeline_path = source(manifest["timeline"])
+        timeline = json.loads(timeline_path.read_text())
+        observation = timeline.pop("startup_observation")
+        body = _profile_validate_startup_observation(
+            observation, run_id=run_id, timeline_config=timeline
+        )
+        driver = source(body["driver_source"]["path"])
+        if (
+            body["case_sha256"] != artifacts[str(case)]["sha256"]
+            or body["repetition"] != manifest["arm_index"]
+            or artifacts[str(driver)] != body["driver_source"]
+            or observation["sha256"] != manifest["startup_observation_sha256"]
+            or header.get("startup_observation_sha256") != observation["sha256"]
+        ):
+            raise ValueError(
+                "Sealed startup observation case/arm/source identity mismatch"
+            )
+    metadata_path = source(manifest["metadata"])
+    metadata = json.loads(metadata_path.read_text())
+    if (
+        metadata.get("schema") != "tokenspeed.metadata_coverage/v1"
+        or metadata.get("run_id") != run_id
+        or type(metadata.get("rank", 0)) is not int
+        or metadata.get("rank", 0) != 0
+    ):
+        raise ValueError("Run manifest/service metadata identity mismatch")
+    for item in metadata.get("service_sources", []):
+        service = source(str(Path(item["path"]).resolve()))
+        if item.get("sha256") != artifacts[str(service)]["sha256"]:
+            raise ValueError("Service metadata source hash mismatch")
+        for line in service.read_text().splitlines():
+            if json.loads(line).get("run_id") != run_id:
+                raise ValueError("Cross-run service source")
+    model_config = (
+        source(manifest["model_config"])
+        if manifest["model_config"] is not None
+        else None
+    )
+    ranks = manifest["ranks"]
+    rank_ids = [item["rank"] for item in ranks]
+    if (
+        not ranks
+        or any(type(value) is not int or value < 0 for value in rank_ids)
+        or len(set(rank_ids)) != len(rank_ids)
+    ):
+        raise ValueError("Run manifest requires distinct nonnegative collector ranks")
+    if rank is None:
+        if len(ranks) != 1:
+            raise ValueError(
+                f"Run manifest has multiple ranks {rank_ids}; select --rank explicitly"
+            )
+        rank = rank_ids[0]
+    if rank not in rank_ids:
+        raise ValueError(f"Rank {rank} is absent from the run manifest")
+    selected = None
+    for item in ranks:
+        identity = (run_id, item["rank"])
+        window = source(item["window"])
+        replays = source(item["replays"])
+        recorded = json.loads(window.read_text())
+        if (
+            recorded.get("schema") != "tokenspeed.profile_window/v1"
+            or type(recorded.get("rank")) is not int
+            or (recorded.get("run_id"), recorded.get("rank")) != identity
+        ):
+            raise ValueError("Cross-run/rank manifest window")
+        semantic = recorded.get("loaded_library_manifest", {}).get(
+            "semantic_provenance", {}
+        )
+        if observation is not None:
+            config = json.loads(source(item["config"]).read_text())
+            if config["config"] != _profile_config_for_observation(
+                observation, run_id=run_id
+            ):
+                raise ValueError(
+                    "Actual expanded runtime config differs from startup observation"
+                )
+            config_sha = hashlib.sha256(
+                json.dumps(
+                    config["config"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest()
+            if (
+                (config.get("run_id"), config.get("rank")) != identity
+                or config.get("sha256") != config_sha
+                or config["config"].get("startup_observation") != observation
+            ):
+                raise ValueError("Sealed startup observation/runtime config mismatch")
+            for snapshot in (semantic, semantic.get("baseline", {})):
+                context = snapshot.get("source_context", {})
+                if (
+                    context.get("startup_observation") != observation
+                    or context.get("profile_config_sha256") != config_sha
+                    or (context.get("run_id"), context.get("rank")) != identity
+                ):
+                    raise ValueError(
+                        "Sealed startup observation/window identity mismatch"
+                    )
+        for line in replays.read_text().splitlines():
+            row = json.loads(line)
+            if (
+                type(row.get("rank")) is not int
+                or (row.get("run_id"), row.get("rank")) != identity
+            ):
+                raise ValueError("Cross-run/rank manifest replay")
+            if row.get("capture_file"):
+                capture_path = source(str(Path(row["capture_file"]).resolve()))
+                capture = json.loads(capture_path.read_text())
+                if any(
+                    capture.get(key) != row.get(key)
+                    for key in ("run_id", "rank", "capture_id", "process_id")
+                ):
+                    raise ValueError("Manifest capture/replay identity mismatch")
+                if observation is not None and (
+                    capture.get("static_metadata", {}).get("startup_observation_sha256")
+                    != observation["sha256"]
+                    or capture.get("static_metadata", {}).get("profile_config_sha256")
+                    != semantic.get("source_context", {}).get("profile_config_sha256")
+                ):
+                    raise ValueError(
+                        "Sealed startup observation/capture config mismatch"
+                    )
+            if row.get("binary_payload"):
+                payload = row["binary_payload"]
+                payload_path = source(str(Path(payload["path"]).resolve()))
+                if any(
+                    payload.get(key) != artifacts[str(payload_path)][key]
+                    for key in ("sha256", "bytes")
+                ):
+                    raise ValueError("Manifest/replay binary fingerprint mismatch")
+        if item["rank"] == rank:
+            selected = {
+                "report": report,
+                "graph_replays": replays,
+                "graph_window": window,
+            }
+    # The pair driver's fixed service proof is rank 0. Other ranks remain valid
+    # graph analyses, but cannot borrow rank 0's scheduler/coverage evidence.
+    if rank == 0:
+        if model_config is None:
+            raise ValueError("Rank 0 service proof requires the frozen model config")
+        for field, value in (
+            ("ready_index_source", selected["graph_replays"]),
+            ("window_manifest_source", selected["graph_window"]),
+            ("model_config_source", model_config),
+        ):
+            recorded = metadata.get(field)
+            if (
+                recorded is None
+                or Path(recorded["path"]).resolve() != value
+                or recorded.get("sha256") != artifacts[str(value)]["sha256"]
+            ):
+                raise ValueError(f"Manifest/service metadata source mismatch: {field}")
+        selected.update(
+            metadata=metadata_path,
+            model_config=model_config,
+            native_coverage=selected["graph_window"].parent
+            / "rank-0.native-coverage.json",
+        )
+    return selected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Calculate utilization from Nsight GPU timestamps"
@@ -256,16 +694,56 @@ def main() -> None:
         "--nsys", default="nsys", help="Nsight CLI matching the capture version"
     )
     parser.add_argument(
-        "--report", type=Path, required=True, help="Completed .nsys-rep"
+        "--report", type=Path, help="Completed .nsys-rep (or use --run-manifest)"
     )
     parser.add_argument(
-        "--metadata", type=Path, required=True, help="Runtime cost metadata JSON"
+        "--run-manifest",
+        type=Path,
+        help="Hash-addressed manifest emitted by service_tpot pair",
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        help="Exact rank from --run-manifest; required when ambiguous",
+    )
+    parser.add_argument(
+        "--metadata",
+        type=Path,
+        help="Eager cost metadata, or service metadata for graph proof",
     )
     parser.add_argument(
         "--output", type=Path, required=True, help="New Nsight-timed metrics JSON"
     )
     parser.add_argument(
-        "--hardware", type=Path, help="Verify the profile saved in capture metadata"
+        "--hardware", type=Path, help="Verify the captured hardware selection"
+    )
+    parser.add_argument(
+        "--graph-replays",
+        type=Path,
+        help="Collector rank-N.replays.jsonl; selects graph analysis",
+    )
+    parser.add_argument(
+        "--graph-window", type=Path, help="Final collector rank-N.window.json"
+    )
+    parser.add_argument(
+        "--hbm-policy",
+        choices=("unavailable", "logical_io_once"),
+        help="Explicit graph cost estimate policy",
+    )
+    parser.add_argument(
+        "--scheduler-mode",
+        choices=("disabled", "collector"),
+        help="Explicit scheduler selection for graph analysis; collector uses --metadata sources",
+    )
+    parser.add_argument(
+        "--cost-provider",
+        help="Explicit graph cost provider: builtin or installed module:function; executes only this user-selected registration function",
+    )
+    parser.add_argument(
+        "--model-config", type=Path, help="Frozen model config for service proof"
+    )
+    parser.add_argument(
+        "--native-coverage", type=Path, help="New service native-coverage receipt"
     )
     parser.add_argument(
         "--annotated-report",
@@ -275,16 +753,99 @@ def main() -> None:
     parser.add_argument(
         "--import-nvtxt", type=Path, help="Matching Nsight ImportNvtxt executable"
     )
-    args = parser.parse_args()
-    if (args.annotated_report is None) != (args.import_nvtxt is None):
-        parser.error("--annotated-report and --import-nvtxt must be supplied together")
-    finalize_nsight(
-        nsys=args.nsys,
-        trace=args.report,
-        metadata=args.metadata,
-        output=args.output,
-        hardware=args.hardware,
+    parser.add_argument(
+        "--target-id", help="Actual Hw:Vm ID from ImportNvtxt report info"
     )
+    args = parser.parse_args()
+    if args.run_manifest is not None:
+        if any(
+            value is not None
+            for value in (
+                args.report,
+                args.graph_replays,
+                args.graph_window,
+                args.metadata,
+                args.model_config,
+            )
+        ):
+            parser.error(
+                "--run-manifest supplies report/replays/window/metadata/model-config; do not mix source options"
+            )
+        try:
+            sources = read_run_manifest(args.run_manifest, rank=args.rank)
+        except (ValueError, KeyError, TypeError, OSError, StopIteration) as error:
+            parser.error(str(error))
+        args.report = sources["report"]
+        args.graph_replays = sources["graph_replays"]
+        args.graph_window = sources["graph_window"]
+        args.metadata = sources.get("metadata")
+        args.model_config = sources.get("model_config")
+        if args.native_coverage is None:
+            args.native_coverage = sources.get("native_coverage")
+    elif args.rank is not None:
+        parser.error("--rank requires --run-manifest")
+    if args.report is None:
+        parser.error("Supply --report or --run-manifest")
+    annotation = (args.annotated_report, args.import_nvtxt, args.target_id)
+    if any(item is not None for item in annotation) and any(
+        item is None for item in annotation
+    ):
+        parser.error(
+            "--annotated-report, --import-nvtxt and --target-id must be supplied together"
+        )
+    if args.graph_replays is not None:
+        if (
+            args.graph_window is None
+            or args.hbm_policy is None
+            or args.scheduler_mode is None
+            or args.cost_provider is None
+        ):
+            parser.error(
+                "Graph mode requires --graph-window, --hbm-policy, --scheduler-mode and --cost-provider"
+            )
+        try:
+            registry, provider_source = _load_cost_provider(
+                args.cost_provider, hbm_policy=args.hbm_policy
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        finalize_graph_nsight(
+            nsys=args.nsys,
+            trace=args.report,
+            replays=args.graph_replays,
+            window=args.graph_window,
+            output=args.output,
+            hbm_policy=args.hbm_policy,
+            hardware=args.hardware,
+            service_metadata=args.metadata,
+            model_config=args.model_config,
+            coverage_output=args.native_coverage,
+            scheduler_mode=args.scheduler_mode,
+            registry=registry,
+            cost_provider_source=provider_source,
+        )
+    else:
+        if args.metadata is None:
+            parser.error("Eager analysis requires --metadata")
+        if any(
+            value is not None
+            for value in (
+                args.graph_window,
+                args.hbm_policy,
+                args.scheduler_mode,
+                args.cost_provider,
+                args.model_config,
+                args.native_coverage,
+            )
+        ):
+            parser.error("Graph options require --graph-replays")
+        finalize_nsight(
+            nsys=args.nsys,
+            trace=args.report,
+            metadata=args.metadata,
+            output=args.output,
+            hardware=args.hardware,
+        )
     if args.annotated_report is not None:
         from tokenspeed_kernel.profile_native_report import annotate_report
 
@@ -293,6 +854,8 @@ def main() -> None:
             metrics=args.output,
             output=args.annotated_report,
             importer=args.import_nvtxt,
+            target_id=args.target_id,
+            nsys=args.nsys,
         )
 
 

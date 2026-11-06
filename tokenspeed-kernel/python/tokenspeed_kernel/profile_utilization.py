@@ -40,6 +40,18 @@ def _positive(value: Any) -> bool:
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
+def _communication_text(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() not in {
+        "",
+        "unknown",
+        "unavailable",
+        "n/a",
+        "auto",
+        "not_recorded",
+        "*",
+    }
+
+
 def _read_hardware(content: str, suffix: str) -> dict[str, Any]:
     if suffix.lower() in {".yaml", ".yml"}:
         try:
@@ -110,6 +122,7 @@ class HardwareProfile:
     compute_metadata: dict[str, dict[str, Any]] | None = None
     sources: list[dict[str, Any]] | None = None
     bandwidth_source_id: str | None = None
+    communication_capacities: list[dict[str, Any]] | None = None
     input_snapshot: dict[str, Any] | None = field(default=None, compare=False)
     selection: dict[str, Any] | None = field(default=None, compare=False)
 
@@ -143,6 +156,7 @@ class HardwareProfile:
                 self.compute_metadata,
                 self.sources,
                 self.bandwidth_source_id,
+                self.communication_capacities,
             )
         ):
             raise ValueError("Structured hardware identity requires schema_version: 2")
@@ -213,6 +227,7 @@ class HardwareProfile:
             ids.append(source["id"])
         if len(ids) != len(set(ids)):
             raise ValueError("Hardware source IDs must be unique")
+        self._validate_communication_capacities(set(ids))
         if (
             self.hbm_bytes_per_second is not None
             and self.bandwidth_source_id not in ids
@@ -242,6 +257,32 @@ class HardwareProfile:
                 raise ValueError(
                     "Compute peaks require dense semantics and a source ID"
                 )
+            if metadata.get("kind") == "derived":
+                derivation = metadata.get("derivation")
+                if not isinstance(derivation, dict):
+                    raise ValueError("Derived peaks require an explicit derivation")
+                base = derivation.get("base_compute_type")
+                ratio = derivation.get("throughput_ratio")
+                if (
+                    key != "bf16_simt"
+                    or base != "fp32_simt"
+                    or ratio != 2
+                    or derivation.get("compute_capability") != "9.0"
+                    or self.device.get("compute_capability") != "9.0"
+                    or derivation.get("source_id") not in ids
+                    or derivation.get("reference") != "cc9_scalar_fma_throughput_ratio"
+                    or self.compute_metadata.get(base, {}).get("kind") == "derived"
+                    or not _positive(self.compute_flops_per_second.get(base))
+                ):
+                    raise ValueError("Unsupported derived scalar throughput contract")
+                expected = self.compute_flops_per_second[base] * ratio
+                if not math.isclose(
+                    self.compute_flops_per_second[key], expected, rel_tol=1e-12
+                ):
+                    raise ValueError(
+                        "Derived peak disagrees with source throughput ratio"
+                    )
+                continue
             published_sparsity = metadata.get("published_sparsity")
             factor = metadata.get("dense_conversion_factor")
             if (
@@ -268,6 +309,124 @@ class HardwareProfile:
             ):
                 raise ValueError(
                     f"Dense peak for {key} disagrees with its published conversion"
+                )
+
+    def _validate_communication_capacities(self, source_ids: set[str]) -> None:
+        capacities = self.communication_capacities
+        if capacities is None:
+            return
+        if not isinstance(capacities, list):
+            raise ValueError("communication_capacities must be a list")
+        identities = set()
+        for capacity in capacities:
+            if not isinstance(capacity, dict):
+                raise ValueError("Communication capacity must be a mapping")
+            for key in (
+                "id",
+                "transport",
+                "topology",
+                "backend",
+                "algorithm",
+                "protocol",
+                "normalization_reason",
+                "conversion_reason",
+            ):
+                if not _communication_text(capacity.get(key)):
+                    raise ValueError(f"Communication capacity requires {key}")
+            if capacity["id"] in identities:
+                raise ValueError("Communication capacity IDs must be unique")
+            identities.add(capacity["id"])
+            if (
+                capacity.get("scope") != "per_rank"
+                or capacity.get("direction") != "one_direction"
+                or capacity.get("normalization")
+                not in {
+                    "nccl_tests_bus_bytes",
+                    "trtllm_mnnvl_oneshot_remote_payload",
+                }
+                or self.device["partition"] != "full_device"
+            ):
+                raise ValueError(
+                    "Communication capacity requires full-device per-rank one-direction bandwidth and a supported traffic model"
+                )
+            if capacity["normalization"] == "trtllm_mnnvl_oneshot_remote_payload" and (
+                capacity["backend"] != "trtllm"
+                or capacity["algorithm"] != "oneshot"
+                or capacity["protocol"] != "mnnvl"
+                or capacity["transport"] != "nvlink"
+                or capacity.get("placement") != "single_node"
+                or capacity.get("addressing_source_id") not in source_ids
+            ):
+                raise ValueError(
+                    "MNNVL directional payload model requires a sourced single-node NVLink one-shot multicast route"
+                )
+            if capacity.get("placement") not in {"single_node", "multi_node"}:
+                raise ValueError("Communication capacity requires explicit placement")
+            if (
+                type(capacity.get("world_size")) is not int
+                or capacity["world_size"] < 2
+            ):
+                raise ValueError("Communication capacity requires world_size >= 2")
+            for key in ("source_id", "conversion_source_id", "normalization_source_id"):
+                if capacity.get(key) not in source_ids:
+                    raise ValueError(f"Communication capacity requires a valid {key}")
+            value, factor = capacity.get("published_value"), capacity.get(
+                "conversion_factor"
+            )
+            unit, direction = capacity.get("published_unit"), capacity.get(
+                "published_direction"
+            )
+            published_scope = capacity.get("published_scope")
+            links = 1
+            if published_scope == "per_link":
+                links = capacity.get("active_link_count")
+                if (
+                    type(links) is not int
+                    or links < 1
+                    or type(capacity.get("link_version")) is not int
+                    or capacity["link_version"] < 1
+                    or capacity["transport"] != "nvlink"
+                    or not _positive(
+                        capacity.get("required_link_rate_bytes_per_second")
+                    )
+                    or capacity.get("link_version_source_id") not in source_ids
+                ):
+                    raise ValueError(
+                        "Per-link capacity requires an explicit NVLink version, active link count and observed full-rate predicate"
+                    )
+                # NVML reports an enum, not the marketed generation number.
+                generations = {
+                    1: "1.0",
+                    2: "2.0",
+                    3: "2.2",
+                    4: "3.0",
+                    5: "3.1",
+                    6: "4.0",
+                    7: "5.0",
+                    8: "6.0",
+                }
+                if generations.get(capacity["link_version"]) != capacity.get(
+                    "link_generation"
+                ):
+                    raise ValueError(
+                        "NVML link_version enum does not match link_generation"
+                    )
+            if (
+                not _positive(value)
+                or not _positive(factor)
+                or unit not in {"byte/s", "GB/s"}
+                or direction not in {"one_direction", "bidirectional_sum"}
+                or published_scope not in {"per_rank", "per_link"}
+                or factor != (0.5 if direction == "bidirectional_sum" else 1)
+                or not _positive(capacity.get("bytes_per_second"))
+                or not math.isclose(
+                    capacity["bytes_per_second"],
+                    value * (1e9 if unit == "GB/s" else 1) * factor * links,
+                    rel_tol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    "Communication capacity needs an explicit supported directional conversion"
                 )
 
     @classmethod
@@ -468,8 +627,21 @@ def _bus_metrics(entries: list[dict[str, Any]], duration_ns: float) -> dict[str,
         for cost in costs
         if cost.get("communication") is not None
     ]
+    # Cost assumptions use this exact prefix for positively known, unmodeled
+    # communication. Ordinary missing traffic does not imply communication.
+    prefix = "comm_unavailable_reason: "
+    unmodeled_reasons = sorted(
+        {
+            assumption.removeprefix(prefix)
+            for cost in costs
+            for assumption in cost.get("assumptions", ())
+            if assumption.startswith(prefix) and assumption.removeprefix(prefix)
+        }
+    )
     result: dict[str, Any] = {
+        "comm_unavailable_reason": "; ".join(unmodeled_reasons) or None,
         "collective_count": len(traffic),
+        "communication_collectives": [item.collective for item in traffic],
         "communication_group": None,
         "communication_world_size": None,
         "collective_total_bytes": None,
@@ -503,9 +675,23 @@ def _bus_metrics(entries: list[dict[str, Any]], duration_ns: float) -> dict[str,
     return result
 
 
-def _metrics(
-    entries: list[dict[str, Any]], duration_ns: float, hardware: HardwareProfile
+def scope_metrics(
+    entries: list[dict[str, Any]],
+    duration_ns: float,
+    hardware: HardwareProfile,
+    *,
+    scope_kind: str | None = None,
+    communication_observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Calculate rank-local metrics for explicit unique cost entries and GPU duration.
+
+    Callers own scope membership and choose the measured GPU denominator. Returns
+    the shared compute, HBM and collective metrics with missing-value reasons.
+    Only scope_kind="op" enables communication peak normalization. Optional
+    communication_observation is that OpRecord's scalar_args, with comm_* host
+    evidence described in docs/hardware-profiles/communication.md. Omission keeps
+    effective bandwidth available without claiming a utilization denominator.
+    """
     costs = [entry["cost"] for entry in entries if entry["cost"] is not None]
     result: dict[str, Any] = {
         "op_count": len(entries),
@@ -514,6 +700,8 @@ def _metrics(
         "useful_flops_per_second": None,
         "estimated_hbm_bytes": None,
         "estimated_hbm_bytes_per_second": None,
+        "recorded_host_mapped_read_bytes": None,
+        "no_model_float_compute": None,
         "mfu": None,
         "mfu_total": None,
         "mfu_total_known": None,
@@ -525,6 +713,11 @@ def _metrics(
         "mbu_missing_reason": None,
         **_bus_metrics(entries, duration_ns),
     }
+    result.update(
+        _communication_utilization(
+            result, hardware, scope_kind, communication_observation
+        )
+    )
     reason = None
     if not entries:
         reason = "no opted-in operations"
@@ -548,39 +741,58 @@ def _metrics(
         return result
 
     seconds = duration_ns * 1e-9
+    result["recorded_host_mapped_read_bytes"] = sum(
+        cost.get("host_mapped_read_bytes") or 0 for cost in costs
+    )
     result["useful_flops"] = sum(cost["useful_flops"] for cost in costs)
     result["useful_flops_per_second"] = result["useful_flops"] / seconds
     flops: dict[str, int] = {}
+    unresolved = []
     for cost in costs:
-        compute_type = cost.get("compute_type")
-        if cost["useful_flops"] == 0:
-            continue
-        if compute_type is None:
-            result["mfu_missing_reason"] = "compute type unavailable"
-            continue
-        flops[compute_type] = flops.get(compute_type, 0) + cost["useful_flops"]
+        components = cost.get("compute_components")
+        if components is None:
+            components = [
+                {
+                    "useful_flops": cost["useful_flops"],
+                    "compute_type": cost.get("compute_type"),
+                }
+            ]
+        if (
+            any(
+                type(item.get("useful_flops")) is not int or item["useful_flops"] < 0
+                for item in components
+            )
+            or sum(item["useful_flops"] for item in components) != cost["useful_flops"]
+        ):
+            result["mfu_missing_reason"] = result["mfu_total_missing_reason"] = (
+                "invalid compute component partition"
+            )
+            return result
+        for item in components:
+            amount, compute_type = item["useful_flops"], item.get("compute_type")
+            if not amount:
+                continue
+            if compute_type is None:
+                unresolved.append(
+                    item.get("missing_reason")
+                    or "positive FLOPs have no proven compute type"
+                )
+                continue
+            flops[compute_type] = flops.get(compute_type, 0) + amount
     for compute_type, amount in flops.items():
         peak = hardware.compute_flops_per_second.get(compute_type)
         if peak is None:
-            result["mfu_missing_reason"] = f"peak unavailable for {compute_type}"
+            unresolved.append(f"peak unavailable for {compute_type}")
         else:
             result["mfu_by_compute_type"][compute_type] = amount / (peak * seconds)
-    if not flops and result["mfu_missing_reason"] is None:
-        result["mfu_missing_reason"] = "no model compute FLOPs in scope"
-    result["mfu_total_known"] = (
-        sum(result["mfu_by_compute_type"].values())
-        if result["mfu_by_compute_type"]
-        else None
-    )
-    result["mfu_total_missing_reason"] = result["mfu_missing_reason"]
-    if result["mfu_total_missing_reason"] is None:
+    result["no_model_float_compute"] = result["useful_flops"] == 0
+    result["mfu_total_known"] = sum(result["mfu_by_compute_type"].values())
+    if unresolved:
+        reason = "; ".join(sorted(set(unresolved)))
+        result["mfu_missing_reason"] = result["mfu_total_missing_reason"] = reason
+    else:
         result["mfu_total"] = result["mfu_total_known"]
-    if len(flops) > 1:
-        result["mfu_missing_reason"] = "mixed compute types; no overall normalization"
-    if not flops and result["mfu_missing_reason"] is None:
-        result["mfu_missing_reason"] = "no model compute FLOPs in scope"
-    if result["mfu_missing_reason"] is None and len(flops) == 1:
-        result["mfu"] = next(iter(result["mfu_by_compute_type"].values()))
+        result["mfu"] = result["mfu_total"]
 
     if any(cost["estimated_hbm_bytes"] is None for cost in costs):
         result["mbu_missing_reason"] = "HBM traffic estimate unavailable"
@@ -598,6 +810,315 @@ def _metrics(
                 result["estimated_hbm_bytes_per_second"] / hardware.hbm_bytes_per_second
             )
     return result
+
+
+def _communication_utilization(
+    metrics: dict[str, Any],
+    hardware: HardwareProfile,
+    scope_kind: str | None,
+    observation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Match the selected route's traffic model to a directional reference."""
+    result: dict[str, Any] = {
+        "estimated_comm_utilization": None,
+        "estimated_comm_utilization_missing_reason": None,
+        "estimated_comm_utilization_warning": None,
+        "estimated_comm_utilization_definition": "max(modeled_tx_payload_rate, modeled_remote_rx_payload_rate) / matching_per_rank_one_direction_capacity; whole_Op_GPU_span; excludes unmodeled wire/protocol overhead; not physical saturation",
+        "estimated_comm_reference_efficiency": None,
+        "estimated_comm_reference_efficiency_definition": "nccl_tests_normalized_busbw / matching_one_direction_reference; not directional payload utilization",
+        "estimated_comm_reference_efficiency_warning": None,
+        "communication_payload_model": None,
+        "estimated_comm_tx_payload_bytes": None,
+        "estimated_comm_rx_payload_bytes": None,
+        "estimated_comm_tx_payload_bytes_per_second": None,
+        "estimated_comm_rx_payload_bytes_per_second": None,
+        "estimated_comm_tx_utilization": None,
+        "estimated_comm_rx_utilization": None,
+        "estimated_comm_tx_capacity_bytes_per_second": None,
+        "estimated_comm_rx_capacity_bytes_per_second": None,
+        "communication_bottleneck_direction": None,
+        "communication_capacity": None,
+        "communication_observation": observation,
+    }
+
+    def unavailable(reason: str) -> dict[str, Any]:
+        result["estimated_comm_utilization_missing_reason"] = reason
+        return result
+
+    if scope_kind != "op":
+        return unavailable("communication utilization is defined only for an Op")
+    if metrics["op_count"] != 1:
+        return unavailable(
+            "communication utilization requires exactly one Op cost entry"
+        )
+    if metrics["busbw_missing_reason"] is not None:
+        return unavailable(metrics["busbw_missing_reason"])
+    if metrics["communication_world_size"] == 1:
+        return unavailable(
+            "single-rank collective has no inter-rank bandwidth denominator"
+        )
+    if not hardware.communication_capacities:
+        return unavailable(
+            "no sourced communication capacity in selected hardware profile"
+        )
+    if not isinstance(observation, dict):
+        return unavailable(
+            "selected communication route and placement evidence unavailable"
+        )
+    for key in (
+        "group",
+        "transport",
+        "topology",
+        "backend",
+        "algorithm",
+        "protocol",
+        "transport_source",
+        "topology_source",
+        "placement_source",
+        "route_source",
+    ):
+        value = observation.get(f"comm_{key}")
+        if not _communication_text(value):
+            return unavailable(f"communication evidence unavailable: comm_{key}")
+    size = metrics["communication_world_size"]
+    ranks = observation.get("comm_ranks")
+    hosts = observation.get("comm_rank_hosts")
+    devices = observation.get("comm_rank_device_uuids")
+    rank = observation.get("comm_rank")
+    if (
+        observation["comm_group"] != metrics["communication_group"]
+        or type(observation.get("comm_world_size")) is not int
+        or observation["comm_world_size"] != size
+        or not isinstance(ranks, (tuple, list))
+        or len(ranks) != size
+        or any(type(item) is not int or item < 0 for item in ranks)
+        or len(set(ranks)) != size
+        or type(rank) is not int
+        or rank not in ranks
+    ):
+        return unavailable("communication group/rank identity does not match cost")
+    if "ranks" in observation and (
+        not isinstance(observation["ranks"], (tuple, list))
+        or tuple(observation["ranks"]) != tuple(ranks)
+    ):
+        return unavailable(
+            "communication evidence ranks differ from recorded collective ranks"
+        )
+    for name, values in (("hosts", hosts), ("device UUIDs", devices)):
+        if (
+            not isinstance(values, (tuple, list))
+            or len(values) != size
+            or any(not _communication_text(item) for item in values)
+        ):
+            return unavailable(f"ordered communication rank {name} unavailable")
+    normalized_devices = [device.removeprefix("GPU-").lower() for device in devices]
+    if len(set(zip(hosts, normalized_devices, strict=True))) != size:
+        return unavailable("communication ranks do not map to distinct devices")
+    selected_uuid = (hardware.selection or {}).get("observed", {}).get("uuid")
+    if (
+        selected_uuid is not None
+        and normalized_devices[ranks.index(rank)]
+        != selected_uuid.removeprefix("GPU-").lower()
+    ):
+        return unavailable("communication rank device differs from selected hardware")
+    placement = "single_node" if len(set(hosts)) == 1 else "multi_node"
+    if observation.get("comm_placement") != placement:
+        return unavailable("communication placement disagrees with ordered rank hosts")
+    match_fields = (
+        "scope",
+        "direction",
+        "normalization",
+        "placement",
+        "transport",
+        "topology",
+        "backend",
+        "algorithm",
+        "protocol",
+        "world_size",
+    )
+    matches = [
+        capacity
+        for capacity in hardware.communication_capacities
+        if all(observation.get(f"comm_{key}") == capacity[key] for key in match_fields)
+    ]
+    if len(matches) != 1:
+        return unavailable(
+            "selected route/scope/direction/topology does not uniquely match a sourced communication capacity"
+        )
+    capacity = matches[0]
+    result["communication_capacity"] = capacity
+    if capacity["published_scope"] == "per_link":
+        counts = observation.get("comm_rank_active_link_counts")
+        versions = observation.get("comm_rank_link_versions")
+        rates = observation.get("comm_rank_min_link_rate_bytes_per_second")
+        source = observation.get("comm_link_source")
+        if not _communication_text(source):
+            return unavailable("active NVLink evidence source unavailable")
+        for key, values, expected in (
+            ("active link count", counts, capacity["active_link_count"]),
+            ("link version", versions, capacity["link_version"]),
+        ):
+            if (
+                not isinstance(values, (tuple, list))
+                or len(values) != size
+                or any(type(value) is not int or value != expected for value in values)
+            ):
+                return unavailable(
+                    f"observed rank NVLink {key} does not match capacity"
+                )
+        if (
+            not isinstance(rates, (tuple, list))
+            or len(rates) != size
+            or any(
+                not _positive(rate)
+                or not math.isclose(
+                    rate, capacity["required_link_rate_bytes_per_second"], rel_tol=1e-6
+                )
+                for rate in rates
+            )
+        ):
+            return unavailable(
+                "observed rank NVLink rates do not match required full-rate state"
+            )
+    if capacity["normalization"] == "nccl_tests_bus_bytes":
+        value = metrics["busbw_bytes_per_second"] / capacity["bytes_per_second"]
+        if not math.isfinite(value) or value < 0:
+            return unavailable(
+                "communication reference efficiency is not finite and nonnegative"
+            )
+        result["estimated_comm_reference_efficiency"] = value
+        if value > 1:
+            result["estimated_comm_reference_efficiency_warning"] = (
+                "equivalent bus bandwidth exceeds reference capacity; not physical directional utilization"
+            )
+        return unavailable(
+            "only NCCL-equivalent reference efficiency is available; selected route has no reviewed directional payload model"
+        )
+    if (
+        observation.get("comm_payload_model") != "trtllm_mnnvl_oneshot_remote_payload"
+        or observation.get("comm_addressing") != "nvls_multicast"
+        or observation.get("comm_allocator_backend") != "CUDA"
+        or not _communication_text(observation.get("comm_allocation_source"))
+        or not _communication_text(observation.get("comm_payload_model_source"))
+        or type(observation.get("comm_pattern")) is not int
+        or observation["comm_pattern"] not in (0, 1)
+        or observation.get("comm_use_oneshot") is not True
+        or observation.get("comm_workspace") != "mnnvl"
+        or type(observation.get("comm_payload_element_size")) is not int
+        or observation["comm_payload_element_size"] != 2
+        or type(observation.get("comm_payload_bytes")) is not int
+        or observation["comm_payload_bytes"] != metrics["collective_total_bytes"]
+        or observation["comm_payload_bytes"] <= 0
+        or observation["comm_payload_bytes"] % 16
+        or metrics["communication_collectives"] != ["all_reduce_sum"]
+    ):
+        return unavailable(
+            "selected MNNVL one-shot directional payload contract is incomplete or differs from collective cost"
+        )
+    payload = metrics["collective_total_bytes"]
+    tx_rate = metrics["algbw_bytes_per_second"]
+    rx_rate = tx_rate * (size - 1)
+    tx_util = tx_rate / capacity["bytes_per_second"]
+    rx_util = rx_rate / capacity["bytes_per_second"]
+    result.update(
+        communication_payload_model={
+            "id": "trtllm_mnnvl_oneshot_remote_payload",
+            "tx_definition": "one complete S-byte input stored once to the NVLS multicast mapping",
+            "rx_definition": "(P-1)*S useful bytes from the other ranks delivered to this rank's local replica",
+            "unmodeled": [
+                "self-replica physical switch loopback",
+                "packet/encoding overhead",
+                "retries and protocol control traffic",
+            ],
+            "local_only": [
+                "Lamport polling of local replicas",
+                "buffer_flags and dirty-buffer clear",
+                "local register reduction and fused epilogue",
+            ],
+            "source": observation["comm_payload_model_source"],
+        },
+        estimated_comm_tx_payload_bytes=payload,
+        estimated_comm_rx_payload_bytes=(size - 1) * payload,
+        estimated_comm_tx_payload_bytes_per_second=tx_rate,
+        estimated_comm_rx_payload_bytes_per_second=rx_rate,
+        estimated_comm_tx_utilization=tx_util,
+        estimated_comm_rx_utilization=rx_util,
+        estimated_comm_tx_capacity_bytes_per_second=capacity["bytes_per_second"],
+        estimated_comm_rx_capacity_bytes_per_second=capacity["bytes_per_second"],
+        communication_bottleneck_direction="rx" if size > 2 else "tx_and_rx",
+    )
+    value = max(tx_util, rx_util)
+    if not math.isfinite(value) or value < 0:
+        return unavailable(
+            "communication utilization ratio is not finite and nonnegative"
+        )
+    # Preserve diagnostic evidence when the payload model exceeds the bound.
+    if value > 1:
+        result["estimated_comm_utilization_warning"] = (
+            "modeled directional payload bandwidth exceeds reference capacity; review timing/model/peak; not measured physical saturation"
+        )
+    result["estimated_comm_utilization"] = value
+    return result
+
+
+def _communication_utilization_label(metrics: dict[str, Any]) -> str:
+    value = metrics.get("estimated_comm_utilization")
+    return "Est.CommBWUtil=" + ("N/A" if value is None else f"{value * 100:.3g}%")
+
+
+def _gpu_duration_label(duration_ns) -> str:
+    if (
+        type(duration_ns) not in (int, float)
+        or not math.isfinite(duration_ns)
+        or duration_ns <= 0
+    ):
+        return "GPU=N/A"
+    return f"GPU={duration_ns / 1000:.5g}us"
+
+
+def _communication_details(metrics: dict[str, Any]) -> str:
+    """Return effective communication rates and estimated utilization for one Op."""
+    fields = (
+        ("algbw_bytes_per_second", "commAlgBW", 1e9, "GB/s"),
+        ("busbw_bytes_per_second", "commBusBW", 1e9, "GB/s"),
+    )
+    parts = []
+    if metrics.get("comm_unavailable_reason"):
+        parts.append(f"Comm=N/A: {metrics['comm_unavailable_reason']}")
+        if not metrics.get("collective_count"):
+            return " | ".join(parts)
+    for key, title, scale, unit in fields:
+        value = metrics.get(key)
+        display = "N/A" if value is None else f"{value / scale:.3g}{unit}"
+        parts.append(f"{title}={display}")
+    if metrics.get("collective_count"):
+        parts.append("comm BW denominator=whole Op GPU span")
+    if metrics.get("communication_bottleneck_direction"):
+        parts.append(
+            f"modeled payload direction={metrics['communication_bottleneck_direction']}"
+        )
+    for key, title in (
+        ("busbw_missing_reason", "comm"),
+        ("estimated_comm_utilization_missing_reason", "comm util"),
+    ):
+        if metrics.get(key):
+            parts.append(f"{title} N/A: {metrics[key]}")
+    if metrics.get("estimated_comm_utilization_warning"):
+        parts.append(metrics["estimated_comm_utilization_warning"])
+    return " | ".join(parts)
+
+
+def communication_label(metrics: dict[str, Any]) -> str:
+    """Lead with directional utilization, retaining rates and evidence details."""
+    return " | ".join(
+        filter(
+            None,
+            (
+                _communication_utilization_label(metrics),
+                _communication_details(metrics),
+            ),
+        )
+    )
 
 
 def analyze_utilization(
@@ -642,7 +1163,15 @@ def analyze_utilization(
                 if timing.start_timestamp <= by_label[label].start_timestamp
                 and by_label[label].end_timestamp <= timing.end_timestamp
             ]
-        metrics = _metrics(entries, timing.gpu_duration_ns, hardware)
+        metrics = scope_metrics(
+            entries,
+            timing.gpu_duration_ns,
+            hardware,
+            scope_kind=kind,
+            communication_observation=(
+                record.get("scalar_args") if kind == "op" else None
+            ),
+        )
         invalid_reason = timing.unavailable_reason
         if record["error"] is not None:
             invalid_reason = f"{kind} failed: {record['error']}"
@@ -659,6 +1188,18 @@ def analyze_utilization(
             metrics["busbw_bytes_per_second"] = None
             metrics["algbw_bytes_per_second"] = None
             metrics["busbw_missing_reason"] = invalid_reason
+            metrics["estimated_comm_utilization"] = None
+            metrics["estimated_comm_utilization_missing_reason"] = invalid_reason
+            metrics["estimated_comm_utilization_warning"] = None
+            metrics["estimated_comm_reference_efficiency"] = None
+            metrics["estimated_comm_reference_efficiency_warning"] = None
+            for key in (
+                "estimated_comm_tx_payload_bytes_per_second",
+                "estimated_comm_rx_payload_bytes_per_second",
+                "estimated_comm_tx_utilization",
+                "estimated_comm_rx_utilization",
+            ):
+                metrics[key] = None
 
         def percentage(value: float | None) -> str:
             return "N/A" if value is None else f"{100 * value:.2f}%"
@@ -672,15 +1213,18 @@ def analyze_utilization(
             and all(entry["cost"]["useful_flops"] == 0 for entry in entries)
         )
         if kind == "op":
+            communication = bool(
+                metrics["collective_count"] or metrics["comm_unavailable_reason"]
+            )
+            if communication:
+                label += f" | {_communication_utilization_label(metrics)} | {_gpu_duration_label(timing.gpu_duration_ns)}"
             if collective_only:
-                label += f" | Est.MBU={percentage(metrics['estimated_mbu'])}"
+                label += f" | Est.MBU(HBM)={percentage(metrics['estimated_mbu'])}"
             else:
                 label += f" | MFU={percentage(metrics['mfu'])}"
-                label += f" Est.MBU={percentage(metrics['estimated_mbu'])}"
-            if metrics["collective_count"] and not collective_only:
-                busbw = metrics["busbw_bytes_per_second"]
-                display = "N/A" if busbw is None else f"{busbw / 1e9:.2f} GB/s"
-                label += f" busbw={display}"
+                label += f" Est.MBU(HBM)={percentage(metrics['estimated_mbu'])}"
+            if communication:
+                label += f" | {_communication_details(metrics)}"
         rows.append(
             {
                 "kind": kind,

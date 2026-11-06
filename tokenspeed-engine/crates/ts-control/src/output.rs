@@ -271,9 +271,22 @@ pub struct StreamedOutput {
     pub output_top_logprobs: Option<TopLogprobs>,
 }
 
+/// An observed token commit, after finish conditions trimmed the output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenCommit {
+    pub rid: String,
+    /// Authoritative admission number; distinguishes reuse of a request id.
+    pub admission: u64,
+    pub completion_tokens: usize,
+    pub output_ids: Vec<i32>,
+    pub finish_reason: Option<&'static str>,
+}
+
 /// What committing a forward produced.
 #[derive(Debug, Default)]
 pub struct Committed {
+    /// Populated only by the optional service trace.
+    pub token_commits: Vec<TokenCommit>,
     /// Feedback for the scheduler, in order.
     pub events: Vec<ForwardEvent>,
     /// Outputs for the frontend.
@@ -938,6 +951,17 @@ impl OutputProcessor {
         input_logprobs: Option<&InputLogprobPlan>,
         result: &ForwardResult,
     ) -> Result<Committed, CommitError> {
+        self.commit_observed(batch, input_logprobs, result, false)
+    }
+
+    /// The same commit, optionally retaining CPU metadata for a service trace.
+    pub fn commit_observed(
+        &mut self,
+        batch: &ForwardBatchView,
+        input_logprobs: Option<&InputLogprobPlan>,
+        result: &ForwardResult,
+        observe: bool,
+    ) -> Result<Committed, CommitError> {
         let rows = batch.request_ids.len();
         let check = |column, found| {
             if found == rows {
@@ -1103,6 +1127,7 @@ impl OutputProcessor {
                 (Some(indices), Some(_)) => indices.get(i).copied().unwrap_or(-1),
                 _ => -1,
             };
+            let previous_count = state.output_ids.len();
             for (j, &token) in model_ids.iter().enumerate() {
                 state.output_ids.push(token);
                 if !hostfunc {
@@ -1159,6 +1184,15 @@ impl OutputProcessor {
                     }
                     break;
                 }
+            }
+            if observe {
+                committed.token_commits.push(TokenCommit {
+                    rid: rid.clone(),
+                    admission: state.admission,
+                    completion_tokens: state.output_ids.len(),
+                    output_ids: state.output_ids[previous_count..].to_vec(),
+                    finish_reason: state.finished_reason.as_ref().map(FinishReason::wire_type),
+                });
             }
             if !state.output_ids.is_empty() {
                 if let Some(timings) = state.timings.as_mut() {
@@ -1969,5 +2003,59 @@ mod tests {
             .commit(&batch(&[("r", 1, 0, 1)], 1), None, &first)
             .unwrap();
         assert_eq!(c.outputs[0].output_logprobs, [-0.25]);
+    }
+
+    #[test]
+    fn service_observation_counts_only_tokens_kept_at_stop() {
+        let mut p = processor(Some(3));
+        register(&mut p, "r", 2, 10, &[9]);
+        let first = p
+            .commit_observed(
+                &batch(&[("r", 2, 0, 2)], 1),
+                None,
+                &result(&[5], &[1]),
+                true,
+            )
+            .unwrap();
+        let admission = first.token_commits[0].admission;
+        let committed = p
+            .commit_observed(
+                &batch(&[("r", 3, 0, 2)], 0),
+                None,
+                &result(&[7, 9, 11], &[3]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(committed.token_commits.len(), 1);
+        let row = &committed.token_commits[0];
+        assert_eq!(row.output_ids, [7, 9]);
+        assert_eq!(row.completion_tokens, 3);
+        assert_eq!(row.finish_reason, Some("stop"));
+        assert_eq!(row.admission, admission);
+        assert_eq!(committed.outputs[0].output_ids, row.output_ids);
+        register(&mut p, "r", 1, 10, &[]);
+        assert_ne!(p.state("r").unwrap().admission, admission);
+    }
+
+    #[test]
+    fn service_observation_does_not_change_model_outputs_or_scheduler_feedback() {
+        let mut plain = processor(None);
+        let mut observed = processor(None);
+        for p in [&mut plain, &mut observed] {
+            register(p, "r", 2, 10, &[]);
+        }
+        let batch = batch(&[("r", 2, 0, 2)], 1);
+        let result = result(&[5], &[1]);
+        let a = plain.commit(&batch, None, &result).unwrap();
+        let b = observed.commit_observed(&batch, None, &result, true).unwrap();
+        assert!(a.token_commits.is_empty());
+        assert_eq!(a.outputs, b.outputs);
+        assert_eq!(a.events, b.events);
+        assert_eq!(a.released, b.released);
+        assert_eq!(a.stats, b.stats);
+        assert_eq!(
+            plain.state("r").unwrap().output_ids,
+            observed.state("r").unwrap().output_ids,
+        );
     }
 }

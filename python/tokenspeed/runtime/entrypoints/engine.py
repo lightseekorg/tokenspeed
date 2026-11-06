@@ -298,6 +298,9 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        # Rank notifications must not interrupt normal owner cleanup either.
+        # An already latched shutdown still needs all cleanup below.
+        begin_process_shutdown()
         # Stop the sync-facade event loop before subprocess teardown so any
         # in-flight blocking callers see a clean loop close instead of a
         # stale-reference error.
@@ -345,11 +348,35 @@ class Engine(EngineBase):
         """Return whether the scheduler is currently paused."""
         return self.llm.run(self.tokenizer_manager.is_scheduler_paused())
 
-    def start_profile(self):
-        self.llm.run(self.tokenizer_manager.start_profile())
+    def start_profile(
+        self,
+        *,
+        output_dir=None,
+        start_step=None,
+        num_steps=None,
+        activities=None,
+        with_stack=None,
+        record_shapes=None,
+        profile_by_stage=False,
+        profile_id=None,
+    ):
+        """Start the existing profiler, forwarding explicit activities/settings."""
+        return self.llm.run(
+            self.tokenizer_manager.start_profile(
+                output_dir=output_dir,
+                start_step=start_step,
+                num_steps=num_steps,
+                activities=activities,
+                with_stack=with_stack,
+                record_shapes=record_shapes,
+                profile_by_stage=profile_by_stage,
+                profile_id=profile_id,
+            )
+        )
 
     def stop_profile(self):
-        self.llm.run(self.tokenizer_manager.stop_profile())
+        """Stop profiling and return its success/error status after CPU flush."""
+        return self.llm.run(self.tokenizer_manager.stop_profile())
 
     def get_server_info(self):
         internal_states = self.llm.run(self.tokenizer_manager.get_internal_state())

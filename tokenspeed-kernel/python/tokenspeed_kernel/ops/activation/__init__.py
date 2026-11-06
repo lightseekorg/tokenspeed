@@ -20,6 +20,11 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    current_op_metadata,
+    profile_function,
+)
 from tokenspeed_kernel.ops.activation.flashinfer import (
     silu_and_mul as flashinfer_silu_and_mul,
 )
@@ -33,6 +38,13 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import error_fn
 
 
+@profile_function(
+    family="activation",
+    name="silu_and_mul",
+    profile=OpProfile(
+        "silu_mul.v1", scalar_args=("limit",), integer_tensor_args=(), tensor_args=()
+    ),
+)
 def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
@@ -54,7 +66,15 @@ def silu_and_mul(
         or flashinfer_silu_and_mul is error_fn
     ):
         return triton_silu_and_mul(x, out, limit=limit)
-    return flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
+    result = flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
+    metadata = current_op_metadata()
+    if metadata is not None:
+        from tokenspeed_kernel.ops.activation.flashinfer import (
+            record_silu_profile_engine,
+        )
+
+        record_silu_profile_engine(metadata, implementation=flashinfer_silu_and_mul)
+    return result
 
 
 def situ_and_mul(

@@ -110,6 +110,8 @@ class SchedulerTimelineTest(unittest.TestCase):
     def analyze(self, *, captures=True, completion=None):
         return analyze_scheduler(
             self.database,
+            selection_mode="legacy",
+            registry=None,
             process_id=self.pid,
             request_label="request",
             replay_label="replay",
@@ -216,6 +218,8 @@ class SchedulerTimelineTest(unittest.TestCase):
             self.analyze()
         result = analyze_scheduler(
             self.database,
+            selection_mode="legacy",
+            registry=None,
             process_id=self.pid,
             request_label="request",
             replay_label="replay",
@@ -243,6 +247,8 @@ class SchedulerTimelineTest(unittest.TestCase):
     def test_whole_capture_has_no_invented_request_boundary(self):
         result = analyze_scheduler(
             self.database,
+            selection_mode="legacy",
+            registry=None,
             process_id=self.pid,
             request_label=None,
             replay_label="replay",
@@ -273,6 +279,8 @@ class SchedulerTimelineTest(unittest.TestCase):
             [
                 sys.executable,
                 str(_MODULE),
+                "--selection-mode",
+                "legacy",
                 "--database",
                 str(self.database),
                 "--process-id",
@@ -304,6 +312,8 @@ class SchedulerTimelineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Database SHA-256"):
             analyze_scheduler(
                 self.database,
+                selection_mode="legacy",
+                registry=None,
                 process_id=self.pid,
                 request_label="request",
                 replay_label="replay",

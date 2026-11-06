@@ -648,7 +648,7 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
             label = row["nvtx_label"]
             labels.add(row["native_nvtx_label"])
             if row["kind"] == "op":
-                assert "Est.MBU=" in label
+                assert "Est.MBU(HBM)=" in label
             else:
                 assert label == f"L{row['layer_id']}"
             assert "MFU=" not in label and "busbw=" not in label

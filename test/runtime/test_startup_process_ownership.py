@@ -241,19 +241,24 @@ def _repeated_failure_cleanup(signal_on_thread, writer):
 
 # A metric reporter plugin whose sink records that it was closed.
 _RELAY_PROBE = """
+import os
 import pathlib
+import signal
 
 from tokenspeed.runtime.metrics.registry import register_metric_reporter
 
 
 class _Sink:
-    def __init__(self, path):
+    def __init__(self, path, notify_pid):
         self._path = pathlib.Path(path)
+        self._notify_pid = notify_pid
 
     def emit(self, event):
         pass
 
     def close(self, timeout):
+        if self._notify_pid is not None:
+            os.kill(self._notify_pid, signal.SIGUSR1)
         self._path.write_text("closed")
 
 
@@ -261,7 +266,7 @@ def register():
     register_metric_reporter(
         "relay-probe",
         validate=lambda config: config,
-        create_sink=lambda config: _Sink(config["path"]),
+        create_sink=lambda config: _Sink(config["path"], config.get("notify_pid")),
         start_node=None,
         override=False,
     )
@@ -281,14 +286,33 @@ def _install_relay_probe(directory):
     )
 
 
-def _engine_shutdown_with_relay(directory, marker, writer):
+def _engine_shutdown_with_relay(
+    directory, marker, notify_during_close, already_latched, writer
+):
     # The relay's spawned process inherits this path, so it loads the probe.
     sys.path.insert(0, directory)
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
     from tokenspeed.runtime.entrypoints.engine import Engine
     from tokenspeed.runtime.metrics.relay import MetricsRelay
+    from tokenspeed.runtime.utils.process import begin_process_shutdown
 
-    relay = MetricsRelay({"relay-probe": {"path": marker}})
+    register_child_failure_signals()
+    received = []
+    handler = signal.getsignal(signal.SIGUSR1)
+
+    def observe_signal(sig, frame):
+        received.append(sig)
+        handler(sig, frame)
+
+    signal.signal(signal.SIGUSR1, observe_signal)
+    relay = MetricsRelay(
+        {
+            "relay-probe": {
+                "path": marker,
+                "notify_pid": os.getpid() if notify_during_close else None,
+            }
+        }
+    )
     # Bypass model and network construction only: the relay and the shutdown
     # are the real implementation.
     tokenizer_manager = AsyncLLM.__new__(AsyncLLM)
@@ -297,8 +321,15 @@ def _engine_shutdown_with_relay(directory, marker, writer):
     engine = Engine.__new__(Engine)
     engine.llm = None
     engine.tokenizer_manager = tokenizer_manager
+    if already_latched:
+        begin_process_shutdown()
     engine.shutdown()
-    writer.send(open(marker).read() if os.path.exists(marker) else None)
+    writer.send(
+        {
+            "closed": open(marker).read() if os.path.exists(marker) else None,
+            "signals": received,
+        }
+    )
 
 
 def _stop_supervisor(proc):
@@ -360,21 +391,48 @@ def test_repeated_failure_signals_cannot_interrupt_owner_cleanup(signal_on_threa
         reader.close()
 
 
-def test_engine_shutdown_lets_the_metrics_relay_flush(tmp_path):
+@pytest.mark.parametrize(
+    "notify_during_close,already_latched",
+    [(False, False), (True, False), (True, True)],
+    ids=["ordinary", "signal-during-close", "already-latched"],
+)
+def test_engine_shutdown_lets_the_metrics_relay_flush(
+    tmp_path, notify_during_close, already_latched
+):
     # The relay closes its sinks on a stop; killed with the process tree, it
     # would drop what they still buffer.
     _install_relay_probe(tmp_path)
     marker = tmp_path / "closed"
     proc, reader = start_process_with_ready_pipe(
         _engine_shutdown_with_relay,
-        (str(tmp_path), str(marker)),
+        (str(tmp_path), str(marker), notify_during_close, already_latched),
         contextlib.nullcontext(),
     )
     try:
         assert reader.poll(_TIMEOUT_S), "Engine did not finish its shutdown"
-        assert reader.recv() == "closed"
+        result = reader.recv()
+        assert result["closed"] == "closed"
+        assert result["signals"] == ([signal.SIGUSR1] if notify_during_close else [])
         proc.join(_TIMEOUT_S)
         assert proc.exitcode == 0
+    finally:
+        _stop_supervisor(proc)
+        reader.close()
+
+
+def _signal_before_normal_shutdown(writer):
+    register_child_failure_signals()
+    os.kill(os.getpid(), signal.SIGUSR1)
+    raise AssertionError("A genuine child failure before shutdown was ignored")
+
+
+def test_signal_before_normal_shutdown_keeps_failure_exit():
+    proc, reader = start_process_with_ready_pipe(
+        _signal_before_normal_shutdown, (), contextlib.nullcontext()
+    )
+    try:
+        proc.join(_TIMEOUT_S)
+        assert proc.exitcode == 1
     finally:
         _stop_supervisor(proc)
         reader.close()

@@ -21,9 +21,11 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.op_profile import ProfileSession
 
 from tokenspeed.runtime.configs.numerics import require_verified_numerics
 from tokenspeed.runtime.execution.model_update import (
@@ -342,12 +344,23 @@ class ModelRunner:
         if kv_sync_event is not None:
             kwargs["kv_sync_event"] = kv_sync_event
 
-        return self.model.forward(
-            ctx,
-            input_ids,
-            positions,
-            **kwargs,
+        profile = ProfileSession.current()
+        model_scope = (
+            profile.layer(
+                self.model,
+                name=f"{type(self.model).__name__}.forward",
+                display_name="Model",
+            )
+            if profile is not None and profile.is_bound(self.model)
+            else nullcontext()
         )
+        with model_scope:
+            return self.model.forward(
+                ctx,
+                input_ids,
+                positions,
+                **kwargs,
+            )
 
     # ------------------------------------------------------------------ #
     # RL online weight sync: receive NCCL-broadcast weights from a trainer.
