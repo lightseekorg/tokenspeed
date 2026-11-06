@@ -102,6 +102,9 @@ pending probe, including optional checkpoint retries. The pre-admission state
 owns the request's reference and releases it when the first admission succeeds.
 The pending match views the request-owned hashes. Mutable execution progress
 copies the reused prefix only after admission succeeds.
+KV-event descriptors are also registered only after first admission succeeds,
+before any new cache publication, so capacity-blocked retries do not rebuild
+them.
 
 An eviction write-back releases its Device entries before its Host segment
 becomes visible. If recorded or in-flight segment keys would extend a submitted
@@ -1595,3 +1598,9 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   remainder (4). Only the empty-round retraction (2), in a round that builds
   nothing and waits for no finished request, retracts or aborts an exempt
   request.
+
+Deferred PD cancellation belongs to the request: it first waits for transfer
+retirement, then for any outstanding local forward. Repeated cancellation
+cannot restart a transfer wait after its terminal event has arrived. Destroying
+the request destroys this state, so reusing a client request ID cannot inherit
+an old abort.

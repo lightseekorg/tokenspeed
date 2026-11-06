@@ -238,16 +238,39 @@ class QueryShardPlan:
             ordered_lens,
             output_size=total_tokens,
         ) + torch.arange(total_tokens, dtype=torch.int64)
-        gather_to_span = torch.empty_like(rank_major_rows)
-        gather_to_span[rank_major_rows] = torch.arange(total_tokens, dtype=torch.int64)
-        rank_offsets = _exclusive_cumsum(row_counts)
-        first = int(rank_offsets[rank])
+        return cls._from_layout(
+            size=size,
+            rank=rank,
+            row_counts=row_counts,
+            rank_major_rows=rank_major_rows,
+            lengths=lengths,
+            sampled_rows=torch.cumsum(lengths, dim=0) - 1,
+            device=device,
+        )
+
+    @classmethod
+    def _from_layout(
+        cls,
+        *,
+        size: int,
+        rank: int,
+        row_counts: torch.Tensor,
+        rank_major_rows: torch.Tensor,
+        lengths: torch.Tensor,
+        sampled_rows: torch.Tensor,
+        device: torch.device | str,
+    ) -> QueryShardPlan:
+        total_tokens = rank_major_rows.numel()
+        gather_to_span = _inverse(rank_major_rows)
+        first = int(row_counts[:rank].sum())
         local_rows = int(row_counts[rank])
         local_row_ids = rank_major_rows[first : first + local_rows]
         local_index_of_row = torch.full((total_tokens,), -1, dtype=torch.int64)
         local_index_of_row[local_row_ids] = torch.arange(local_rows, dtype=torch.int64)
+        local_ends = torch.searchsorted(local_row_ids, torch.cumsum(lengths, dim=0))
+        local_counts = torch.diff(local_ends, prepend=torch.zeros(1, dtype=torch.int64))
         sampled = _split(
-            torch.cumsum(lengths, dim=0) - 1,
+            sampled_rows,
             gather_to_span=gather_to_span,
             row_counts=row_counts,
             rank=rank,
@@ -272,9 +295,7 @@ class QueryShardPlan:
             row_counts=tuple(int(count) for count in row_counts),
             span_to_gather_cpu=rank_major_rows,
             gather_to_span_cpu=gather_to_span,
-            local_rows_per_request=tuple(
-                int(count) for count in per_rank_lens[:, rank].sum(dim=1)
-            ),
+            local_rows_per_request=tuple(int(count) for count in local_counts),
             sampled_rows_per_rank=sampled.rows_per_rank,
             local_row_ids=views[0],
             gather_to_span=views[1],
@@ -283,6 +304,46 @@ class QueryShardPlan:
             local_sampled_index=views[4],
             sampled_to_request=views[5],
         )
+
+    def select_rows(
+        self,
+        rows: torch.Tensor,
+        *,
+        input_lengths: Sequence[int],
+        sampled_rows: torch.Tensor,
+    ) -> QueryShardPlan:
+        """Retain span rows without moving them between ranks.
+
+        Args:
+            rows: Ascending distinct host row IDs in the original span.
+            input_lengths: Per-request counts in the retained span, including zeros.
+            sampled_rows: Host row IDs to sample in the retained span.
+
+        Returns:
+            A plan whose local rows retain their original owners and order.
+        """
+        split = self.split_rows(rows)
+        if bool((rows[1:] <= rows[:-1]).any()):
+            raise ValueError("retained query rows must be ascending and distinct")
+        lengths = torch.tensor(input_lengths, dtype=torch.int64)
+        if bool((lengths < 0).any()) or int(lengths.sum()) != rows.numel():
+            raise ValueError("retained request lengths must cover the retained rows")
+        return self._from_layout(
+            size=self.size,
+            rank=self.rank,
+            row_counts=torch.tensor(split.rows_per_rank, dtype=torch.int64),
+            rank_major_rows=_inverse(split.to_rows_order),
+            lengths=lengths,
+            sampled_rows=sampled_rows,
+            device=self.local_row_ids.device,
+        )
+
+    def local_bounds(self, start: int, stop: int) -> tuple[int, int]:
+        """Return local indices covering the span interval [start, stop)."""
+        bounds = torch.searchsorted(
+            self.local_row_ids_cpu, torch.tensor([start, stop], dtype=torch.int64)
+        )
+        return int(bounds[0]), int(bounds[1])
 
     @property
     def total_rows(self) -> int:

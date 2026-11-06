@@ -33,7 +33,7 @@ hierarchy, unimplemented):
 Two consequences of 3 are enforced at startup, so a model that cannot meet
 them is refused under rl-bitwise with the reason: MoE TP must be 1 (the
 slot-order MoE combine folds over the EP group inside the leaf), and the
-vocabulary must be a whole number of `MEGATRON_VOCAB_BLOCK`-wide blocks (the
+vocabulary must be a whole number of `BLOCKWISE_VOCAB_BLOCK`-wide blocks (the
 trainer's log-softmax folds fixed blocks).
 
 ## The hierarchy
@@ -182,15 +182,14 @@ setting is fixed in each expert plan before warmup and CUDA graph capture.
 
 ## alignment.trainer
 
-`--logprob-order megatron` retains the 32768-wide sum-exp blocks.
-`megatron-16384` instead folds 16384-wide block partials from left to right;
-`rl-bitwise` preserves either explicit choice. Select the trainer's actual
-vocabulary-shard width, independently of serving TP. For a 131072-token
-vocabulary with per-shard sum-exp, TP4 uses 32768 and TP8 uses 16384. Pairing
-two narrow shards before folding changes FP32 rounding, so one order does
-not promise alignment to both trainers. Prompt and output logprobs share
-the chosen operation; logits and sampled tokens are unchanged. The model's
-existing rl-bitwise vocabulary eligibility remains a multiple of 32768.
+`--logprob-order blockwise-16384` and `blockwise-direct-16384` select
+16384-wide sum-exp blocks with the same subtraction forms as `blockwise`
+and `blockwise-direct`. `rl-bitwise` preserves each explicit choice. Select
+the trainer's vocabulary-shard width independently of serving TP: folding
+eight narrow partials is not the same FP32 arithmetic as folding four wide
+partials. Prompt and output logprobs share the selected operation; logits
+and sampled tokens are unchanged. The model's existing rl-bitwise vocabulary
+eligibility remains a multiple of 32768.
 
 The invariance layers make a deployment agree with itself. Trainer alignment
 makes it agree with a different program: the training framework's forward,
@@ -210,7 +209,7 @@ and only the reported log-probabilities change.
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
 | `--dsa-slot-order selection` | Keep the top-k leaf's emitted order when reducing sparse attention, as the trainer does. `rl-bitwise` fixes this choice, overriding an explicit `sorted`; both top-k and attention leaves still require batch invariance. Under `auto`, `sorted` remains available to reduce by token position, never physical cache address | forward values |
-| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = target - log(sum_exp)`, for output and prompt (input) logprobs alike | logprobs only |
+| `--logprob-order blockwise` | Selected-token logprobs use blockwise reduction: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), negative cross-entropy (or direct subtraction with `blockwise-direct`), for output and prompt (input) logprobs alike | logprobs only |
 | `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 (refused by `resolve_numerics` otherwise) and a kernel declaring `combine_order` with `slot`; under `--all2all-backend deepep` that kernel must also own the exchange (`supports_all_to_all_ep`) and returns the complete output of the rows this rank owns. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
 
 `rl-bitwise` folds YaRN to a CPU ramp and CUDA frequencies. The same
@@ -268,10 +267,12 @@ architecture's default, its profile may provide
 `create_attention_config(server_args, model_config, is_draft)`. The factory
 returns the model-wide `AttnConfig` and its softmax component, validates its
 supported dtype and topology, and uses the same resolved launch for target
-and draft construction. The runtime still adds the profile's linear-attention
-component through the ordinary composition path. An omitted factory keeps
-the architecture's existing generator; a factory error propagates instead of
-falling back to a different cache format or numerical path.
+and draft construction. The runtime rejects a result whose `is_draft` differs
+from the requested role. It still adds the profile's linear-attention
+component through the ordinary composition path. Every profile must explicitly
+pass a factory or `None`; `None` keeps the architecture's existing generator.
+A factory error propagates instead of falling back to a different cache format
+or numerical path.
 
 Trainer alignment is a stronger claim than invariance and cannot be checked
 by the engine alone: a model earns `rl-bitwise` in
@@ -509,7 +510,7 @@ the original MoE layer for both precomputed and in-kernel routing.
 A returned logprob is the launch's `--logprob-order` applied to the row --
 `gather_token_logprobs` in `sampling/utils.py`, the one function both
 consumers call: `log_softmax(logits, -1, dtype=float32)` gathered at the token
-under `torch`, Megatron's vocab-parallel cross-entropy order under `megatron`
+under `torch`, fixed-width blockwise reduction under `blockwise`
 (alignment.trainer above) -- with the logits produced by the same LM-head
 route the sampler takes (`LogitsProcessor._get_logits`: quantized or dense
 GEMM, the planned batch-invariant GEMM under rl-bitwise, the TP gather, softcap). The sampler's
@@ -561,6 +562,15 @@ positions are scored by the chunk that feeds them and assembled per request
 afterwards, so chunked prefill and prefix-cache hits do not change a prompt
 logprob either -- the admission probe is capped at `logprob_start_len`
 (`scheduler.md` §1) so every scored position is actually recomputed.
+
+The current trainer defaults to negative cross-entropy, `-(log(sum_exp) - target)`,
+yielding `-0.0` for a certain token; `rl-bitwise` folds `torch` to `blockwise` to
+match these bits and preserves either explicit blockwise choice. This corrects
+the previous assumption that the trainer defaults to
+positive zero. `blockwise-direct` uses `target - log(sum_exp)` for trainers that
+require `+0.0`. Both use the same reduction; `torch` is unchanged. The shared
+logprob dispatcher rejects unknown orders, including the old `megatron` name,
+so programmatic callers cannot silently switch arithmetic after the rename.
 
 ## Prefix hits resume at any token: KV bitwise, recurrent state within tolerance
 
@@ -683,8 +693,8 @@ The portable `block_sumexp` leaf and the vendor leaf reproducing the
 trainer's in-block order differ at ulp level, so the vendor leaf is what
 the comparison runs with.
 
-The leaf contract behind `--logprob-order megatron` is
-`tokenspeed_kernel.ops.sampling.vocab_parallel_logprobs`'s: a leaf
+The leaf contract behind `--logprob-order blockwise` is
+`tokenspeed_kernel.ops.sampling.blockwise_logprobs`'s: a leaf
 registers `("sampling", "block_sumexp")` with the signature
 `format_signatures("shifted", "dense", {torch.float32})` and the
 `batch_invariant` feature (the op requires it), is called as
@@ -697,15 +707,10 @@ shards first is a different reduction tree; do not infer cross-TP agreement
 from the leaf's pairwise in-block tree. The in-tree `torch_block_sumexp` sits at `Priority.PORTABLE`;
 the vendor leaf registers above it (any higher band), so plain selection
 takes it wherever it is installed and no host code names the vendor.
-The final subtraction is `target - log(sum_exp)`, preserving positive zero
-for a token whose rounded probability is one. Negating the equivalent NLL
-would produce negative zero and fail a bit-pattern comparison with the trainer.
+The final subtraction follows the explicit form: `blockwise` negates the NLL
+and `blockwise-direct` subtracts `log(sum_exp)` from the target. Their signed-zero
+contract is described in the logprobs section above.
 
-`--logprob-order mora` uses the same 32768-wide fold and preserves the
-negative-cross-entropy convention instead: probability-one rows return
-`-0.0`. All nonzero FP32 results are unchanged. This is a separate explicit
-order because signed zero is part of a trainer's bitwise logprob contract;
-the existing Megatron orders continue to return `+0.0`.
 
 The pins above cover only the paths a verified model takes, so the
 verification is recorded per model and enforced at startup
@@ -718,7 +723,7 @@ model's promise and the harnesses are what keep it honest: a model declares
 either has a bug to fix, not a flag to set. Two incompatibilities are refused
 regardless of the declaration: quantized checkpoints (no batch-invariant
 quantized GEMM leaf exists, so their linears would select shape-dependent
-ones) and a vocabulary that is not a multiple of `MEGATRON_VOCAB_BLOCK`
+ones) and a vocabulary that is not a multiple of `BLOCKWISE_VOCAB_BLOCK`
 (the envelope's logprob order folds fixed blocks of it; MoE TP other than 1
 is refused by `resolve_numerics` for the same reason on the MoE side).
 
@@ -738,3 +743,37 @@ runtime behavior on other platforms and widths. Tests preserve the old formula
 independently and compare weights/IDs byte-for-byte on ties, cutoff ties, bias,
 identity candidates, near ties, batch packing/reordering and CUDA graph replay.
 This does not promise cross-version PyTorch tie compatibility.
+
+## Input and output vocabularies
+
+The runtime uses `ModelConfig.input_vocab_size` for input token bounds and
+`ModelConfig.vocab_size` for the output vocabulary. The checkpoint convention
+is unchanged: its `vocab_size` is the embedding size and its optional
+`output_vocab_size` is the head size. A missing or null `output_vocab_size`
+means the two sizes are equal. Both must be positive integers, and the output
+vocabulary must fit within the input vocabulary for subsequent decoding.
+Invalid sizes are reported with both runtime field names and their values.
+The original Hugging Face config is not rewritten.
+
+Input buffer clamps, n-gram token validation and multimodal draft substitute
+validation use `input_vocab_size`. Sampling, draft probability tensors,
+grammar masks, logit bias and prompt-logprob validation keep using `vocab_size`.
+Prompt-logprob admission checks only the scored next-token targets,
+`input_ids[logprob_start_len + 1..]`, against the output vocabulary. Unscored
+context retains the input bounds, including the token at `logprob_start_len`;
+it feeds the first scored row rather than being that row's target.
+An input-only token can reach the model without becoming a valid output token
+or prompt-logprob target. Models or plugins with a reduced head must construct
+the embedding and head for their respective checkpoint sizes.
+
+After loading a target model, initialization checks the logits processor's
+logical vocabulary against the runtime output size. A mismatch fails before
+sampling buffers or CUDA graphs are built; TP shards and padded weight rows
+are not logical vocabulary sizes. Workers without logits and draft models
+(which may use their own vocabulary mapping) are outside this target check.
+
+Speculative input preparation bounds only draft candidate columns by the output
+vocabulary; the prompt and the first (verified) decode token retain input bounds.
+The existing defensive clamp still prevents a stale proposal from indexing
+outside output probability tensors. This extra clamp only runs for split
+vocabularies, stays on the device and is shared by eager and graph execution.

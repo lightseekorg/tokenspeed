@@ -33,10 +33,10 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    BLOCKWISE_LOGPROB_ORDERS,
     DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
     LOGPROB_ORDERS,
-    MEGATRON_LOGPROB_BLOCKS,
     MLA_LORA_SCALES,
     MOE_COMBINE_ORDERS,
     NUMERICS_ENVELOPES,
@@ -127,6 +127,14 @@ PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
 AUX_CAPTURE_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4")
 #: Drafters that propose one token per draft step (a chain of steps + 1 tokens, or a tree).
 STEP_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4", "MTP")
+# Drafters whose topk=1 chain can record sampled proposals for block
+# verification or synthetic rejection on the flashinfer backend.
+BLOCK_REJECTION_ALGORITHMS = ("DSPARK", "EAGLE3")
+# Verify rules, named as vLLM's rejection_sample_method.
+REJECTION_SAMPLE_METHODS = ("standard", "block", "synthetic")
+# Draft sampling, named as vLLM's draft_sample_method; "probabilistic" is
+# --enable-speculative-sampling.
+DRAFT_SAMPLE_METHODS = ("greedy", "probabilistic")
 
 
 def expert_placement_requested(server_args) -> bool:
@@ -432,6 +440,12 @@ class ServerArgs:
     # Cache events
     kv_events_config: str | None = None
 
+    # OTLP tracing: an OTLP/HTTP traces endpoint (a collector's /v1/traces,
+    # Jaeger, Langfuse) and the share of requests it samples. 0 disables.
+    otlp_traces_endpoint: str | None = None
+    trace_sample_ratio: float = 0.0
+    trace_provider: str | None = None
+
     # Version identifier for the model weights: the L3 cache's namespace,
     # which a flushed weight update that names a new version replaces.
     weight_version: str = "default"
@@ -611,6 +625,13 @@ class ServerArgs:
     # target distribution; this one trades a sampled proposal for a higher
     # acceptance rate under sampling temperatures.
     enable_speculative_sampling: bool = False
+    # Verify rule, named as vLLM's rejection_sample_method. "standard" is the
+    # existing token-wise rule; "block" is block verification of a sampled
+    # DSpark or EAGLE3 topk=1 chain; "synthetic" forces benchmark acceptance
+    # lengths (set by --synthetic-acceptance-length).
+    speculative_rejection_sample_method: Literal["standard", "block", "synthetic"] = (
+        "standard"
+    )
     # Recorded draft probabilities above this value mark a slot with no
     # proposal (fresh admission, PD landing): always reject. Sentinel rows
     # are written as threshold + 1, so it must lie within
@@ -935,6 +956,38 @@ class ServerArgs:
                     )
                 if self.synthetic_acceptance_length is None:
                     self.synthetic_acceptance_length = length
+
+            if "rejection_sample_method" in config:
+                rejection = config["rejection_sample_method"]
+                if rejection not in REJECTION_SAMPLE_METHODS:
+                    raise ValueError(
+                        f"rejection_sample_method must be one of "
+                        f"{REJECTION_SAMPLE_METHODS}, got {rejection!r}"
+                    )
+                if (
+                    self.speculative_rejection_sample_method != "standard"
+                    and self.speculative_rejection_sample_method != rejection
+                ):
+                    raise ValueError(
+                        "--speculative-rejection-sample-method conflicts with "
+                        "rejection_sample_method in --speculative-config"
+                    )
+                self.speculative_rejection_sample_method = rejection
+
+            if "draft_sample_method" in config:
+                draft_sample = config["draft_sample_method"]
+                if draft_sample not in DRAFT_SAMPLE_METHODS:
+                    raise ValueError(
+                        f"draft_sample_method must be one of "
+                        f"{DRAFT_SAMPLE_METHODS}, got {draft_sample!r}"
+                    )
+                if self.enable_speculative_sampling and draft_sample == "greedy":
+                    raise ValueError(
+                        "--enable-speculative-sampling conflicts with "
+                        "draft_sample_method='greedy' in --speculative-config"
+                    )
+                if draft_sample == "probabilistic":
+                    self.enable_speculative_sampling = True
 
             method = config.get("method")
             if method is not None and self.speculative_algorithm is None:
@@ -1551,6 +1604,26 @@ class ServerArgs:
                 raise ValueError(
                     "DUMMY drafting requires --speculative-num-draft-tokens > 1"
                 )
+        if self.speculative_rejection_sample_method not in REJECTION_SAMPLE_METHODS:
+            raise ValueError(
+                f"--speculative-rejection-sample-method must be one of "
+                f"{REJECTION_SAMPLE_METHODS}, got "
+                f"{self.speculative_rejection_sample_method!r}"
+            )
+        if self.synthetic_acceptance_length is not None:
+            # A synthetic length selects synthetic rejection, as on main.
+            if self.speculative_rejection_sample_method == "block":
+                raise ValueError(
+                    "--synthetic-acceptance-length selects the synthetic rejection "
+                    "method; it cannot be combined with "
+                    "--speculative-rejection-sample-method block"
+                )
+            self.speculative_rejection_sample_method = "synthetic"
+        elif self.speculative_rejection_sample_method == "synthetic":
+            raise ValueError(
+                "--speculative-rejection-sample-method synthetic requires "
+                "--synthetic-acceptance-length"
+            )
         if self.synthetic_acceptance_length is not None:
             length = self.synthetic_acceptance_length
             if (
@@ -1577,9 +1650,16 @@ class ServerArgs:
                     f"[1, {self.speculative_num_draft_tokens}] "
                     "(the speculative verify width including the target token)"
                 )
-            if self.sampling_backend != "greedy":
+            # With sampled drafts (vLLM's draft_sample_method=probabilistic) the
+            # drafter stays on the path and only the verify outcome is forced,
+            # so it uses the flashinfer verifier.
+            if self.sampling_backend != "greedy" and not (
+                self.enable_speculative_sampling
+                and self.sampling_backend == "flashinfer"
+            ):
                 raise ValueError(
-                    "--synthetic-acceptance-length requires --sampling-backend greedy"
+                    "--synthetic-acceptance-length requires --sampling-backend greedy, "
+                    "or --sampling-backend flashinfer with --enable-speculative-sampling"
                 )
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
@@ -1661,6 +1741,41 @@ class ServerArgs:
                 f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}"
             )
 
+        # Block verification, and synthetic rejection over sampled drafts, run
+        # the sampled-chain verify on the flashinfer backend.
+        sampled_chain_verify = self.speculative_rejection_sample_method == "block" or (
+            self.speculative_rejection_sample_method == "synthetic"
+            and self.sampling_backend != "greedy"
+        )
+        if sampled_chain_verify:
+            if (
+                not self.enable_speculative_sampling
+                or self.speculative_algorithm not in BLOCK_REJECTION_ALGORITHMS
+                or self.speculative_eagle_topk != 1
+                or self.sampling_backend != "flashinfer"
+                or self.dp_sampling
+                or self.mapping.has_attn_dp
+                or self.pipeline_parallel_size != 1
+                or self.disaggregation_mode != "null"
+            ):
+                raise ValueError(
+                    f"--speculative-rejection-sample-method "
+                    f"{self.speculative_rejection_sample_method} with sampled drafts "
+                    "requires a DSPARK or EAGLE3 chain "
+                    "(--speculative-eagle-topk 1), --enable-speculative-sampling, "
+                    "the flashinfer sampling backend, and aggregate TP without attention DP, "
+                    "DP sampling, pipeline parallelism, or PD disaggregation"
+                )
+            if self.speculative_rejection_sample_method == "synthetic":
+                # vLLM's draft_sample_method=probabilistic with
+                # rejection_sample_method=synthetic: drafts stay sampled, the
+                # standard draft-probability verify runs for its cost, and the
+                # synthetic length replaces its outcome.
+                logger.warning(
+                    "Synthetic rejection over sampled drafts: drafts are sampled "
+                    "and recorded, but the accepted length is forced and the "
+                    "verify outcome is discarded."
+                )
         if self.enable_speculative_sampling:
             self._validate_speculative_sampling()
 
@@ -1753,11 +1868,22 @@ class ServerArgs:
                 "--enable-speculative-sampling needs speculative decoding: pass "
                 "--speculative-algorithm EAGLE3 or MTP"
             )
-        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS:
+        # DSpark samples its Markov steps only for block verification or for
+        # synthetic rejection over sampled drafts.
+        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS and not (
+            self.speculative_algorithm == "DSPARK"
+            and self.speculative_rejection_sample_method in ("block", "synthetic")
+        ):
             raise ValueError(
                 "--enable-speculative-sampling needs a chain drafter that samples "
                 "one token per step from its own distribution; "
                 f"{self.speculative_algorithm} proposes a whole block greedily"
+                + (
+                    "; pass --speculative-rejection-sample-method block (or "
+                    "synthetic) for sampled DSPARK drafting"
+                    if self.speculative_algorithm == "DSPARK"
+                    else ""
+                )
             )
         # EAGLE-Harness samples its trees (validate_eagle_harness_args).
         if self.speculative_eagle_topk != 1 and not self.eagle_harness:
@@ -1935,10 +2061,8 @@ class ServerArgs:
         # The trainer's router is softmax + topk(scores + bias) in torch.
         self.router_topk = "torch"
         # The trainer's logprobs come from its vocab-parallel cross-entropy.
-        # Keep an explicitly selected trainer shard width. Serving TP does
-        # not determine the trainer's logprob reduction contract.
-        if self.logprob_order not in MEGATRON_LOGPROB_BLOCKS:
-            self.logprob_order = "megatron"
+        if self.logprob_order not in BLOCKWISE_LOGPROB_ORDERS:
+            self.logprob_order = "blockwise"
         # The trainer's grouped MLP applies the router weight inside the
         # activation and folds a token's slots in fp32 slot order.
         self.moe_combine_order = "slot"
@@ -2930,7 +3054,10 @@ class ServerArgs:
             metavar="DISTRIBUTED_TIMEOUT_SECONDS",
             type=int,
             default=ServerArgs.distributed_timeout_seconds,
-            help="Set timeout for torch.distributed initialization.",
+            help="Set the timeout of the torch.distributed process groups "
+            "(initialization and collectives); the fused KVP history "
+            "all-gather's in-kernel waits end before it (see "
+            "docs/serving/parallelism.md).",
         )
         parser.add_argument(
             "--download-dir",
@@ -3035,6 +3162,30 @@ class ServerArgs:
                 "'enable_kv_cache_events': true and publisher 'zmq' to "
                 "publish device prefix-cache mutations."
             ),
+        )
+        parser.add_argument(
+            "--otlp-traces-endpoint",
+            type=str,
+            default=ServerArgs.otlp_traces_endpoint,
+            help=(
+                "OTLP/HTTP traces endpoint (a collector's /v1/traces, "
+                "Jaeger, or Langfuse). Each finished request exports one "
+                "span built from its lifecycle timestamps; the serving "
+                "loop never blocks on it."
+            ),
+        )
+        parser.add_argument(
+            "--trace-sample-ratio",
+            type=float,
+            default=ServerArgs.trace_sample_ratio,
+            help="The share of requests the OTLP endpoint traces (0..1).",
+        )
+
+        parser.add_argument(
+            "--trace-provider",
+            type=str,
+            default=ServerArgs.trace_provider,
+            help="Registered plugin provider of custom trace context; omission retains native generation.",
         )
 
         # Data parallelism
@@ -3274,7 +3425,7 @@ class ServerArgs:
         parser.add_argument(
             "--kda-backend",
             type=str,
-            choices=["auto", "fla", "flashkda", "cutedsl_kda"],
+            choices=["auto", "fla", "flashkda", "cutedsl_kda", "cudnn"],
             default=ServerArgs.kda_backend,
             help="KDA (Kimi Delta Attention) prefill kernel policy. On AMD, "
             "this setting is ignored and compatible kernels are selected using "
@@ -3283,7 +3434,8 @@ class ServerArgs:
             "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
             "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
             "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
-            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
+            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). 'cudnn' uses FlashInfer's "
+            "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
@@ -3510,7 +3662,7 @@ class ServerArgs:
             "--speculative_config",
             type=str,
             default=ServerArgs.speculative_config,
-            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, and synthetic_acceptance_length.",
+            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, synthetic_acceptance_length, rejection_sample_method, and draft_sample_method (vLLM names).",
         )
         parser.add_argument(
             "--speculative-algorithm",
@@ -3595,7 +3747,9 @@ class ServerArgs:
             help="Benchmark-only mean accepted length including the guaranteed "
             "target token, in [1, speculative_num_draft_tokens]. Forces a "
             "floor/ceil acceptance distribution; generated text is not valid "
-            "for correctness evaluation. Requires --sampling-backend greedy without "
+            "for correctness evaluation. Selects the synthetic rejection method. "
+            "Requires --sampling-backend greedy (or flashinfer with "
+            "--enable-speculative-sampling for sampled drafts) without "
             "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
         parser.add_argument(
@@ -3605,13 +3759,28 @@ class ServerArgs:
             help="Standard rejection sampling for chain speculative decoding: the "
             "drafter samples each step from its own distribution q (per-request "
             "temperature; greedy rows stay argmax) and verify accepts with "
-            "coin * q(x) < p(x) instead of the target-only rule. Needs EAGLE3 "
-            "or MTP with --speculative-eagle-topk 1 and the flashinfer or "
+            "coin * q(x) < p(x) instead of the target-only rule (vLLM's "
+            "draft_sample_method=probabilistic). Needs EAGLE3 or MTP, or DSPARK "
+            "with the block or synthetic rejection method, with "
+            "--speculative-eagle-topk 1 and the flashinfer or "
             "flashinfer_full sampling backend, or EAGLE4 on EAGLE-Harness "
             "(--speculative-exec-mode 0 or 1, trees or chains) and the "
             "flashinfer backend; refused on the prefill role of "
             "a disaggregated deployment. Costs a per-request fp32 draft "
             "distribution buffer; see docs/configuration/server.md.",
+        )
+        parser.add_argument(
+            "--speculative-rejection-sample-method",
+            type=str,
+            choices=REJECTION_SAMPLE_METHODS,
+            default=ServerArgs.speculative_rejection_sample_method,
+            help="Verify rule, as vLLM's rejection_sample_method. 'standard': the "
+            "existing token-wise rule. 'block': block verification of a sampled "
+            "DSPARK or EAGLE3 chain (--speculative-eagle-topk 1); requires "
+            "--enable-speculative-sampling and --sampling-backend flashinfer, "
+            "aggregate TP (including DCP) without DP, PP or PD disaggregation. "
+            "'synthetic': benchmark-only forced acceptance; set by "
+            "--synthetic-acceptance-length.",
         )
         parser.add_argument(
             "--spec-reject-draft-prob-threshold",
@@ -4143,16 +4312,18 @@ class ServerArgs:
             choices=list(LOGPROB_ORDERS),
             default=ServerArgs.logprob_order,
             help="Order of the selected-token log-softmax behind every "
-            "returned logprob. 'torch': torch.log_softmax. 'megatron': the "
-            "trainer's vocab-parallel cross-entropy order (row max, shift, "
+            "returned logprob. 'torch': torch.log_softmax. 'blockwise': the "
+            "fixed-width blockwise reduction (row max, shift, "
             "sum(exp) over fixed 32768-wide vocab blocks folded in block "
-            "order, logp = target - log(sum_exp)). 'megatron-16384': "
-            "the same operations with 16384-wide blocks. 'mora': 32768-wide "
-            "blocks with negative-cross-entropy signed zeros (-0.0). Set the trainer's "
-            "shard width, independently of serving TP. Requests asking for "
+            "order), returning -(log(sum_exp) - target). 'blockwise-direct': "
+            "the same reduction, returning target - log(sum_exp). "
+            "Suffix either with -16384 to select 16384-wide blocks, "
+            "independently of serving TP. "
+            "Requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
-            "logprobs only, never the sampled tokens. rl-bitwise defaults "
-            "to megatron and preserves an explicit Megatron block order.",
+            "logprobs only, never the sampled tokens. Folded to blockwise by "
+            "--numerics rl-bitwise, overriding an explicit torch; an explicit "
+            "blockwise form and block width are preserved.",
         )
         parser.add_argument(
             "--moe-combine-order",

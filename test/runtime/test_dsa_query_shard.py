@@ -815,6 +815,8 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
     gather workspace on the target tree against the recipe's plan and the
     draft tree gathers into the same buffers, so a sharded draft extend finds
     its workspace without a second reservation."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
     from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
     target = _backend(0, workspace_rows=0, index_k_format="fp8_scaled")
@@ -823,17 +825,36 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
     target_router = _router(target, is_draft=False)
     draft_router = _router(draft, is_draft=True)
     max_model_len = 37
-    config = SimpleNamespace(
+    spec = DSAConfig(
+        backend_name="dsa",
+        num_attention_heads=2,
+        num_kv_heads=1,
+        head_dim=KV_DIM,
+        attn_tp_size=WORLD,
+        kv_lora_rank=KV_DIM - 2,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=KV_DIM - 2,
+        scaling=0.5,
+        kv_cache_dim=KV_DIM,
+        index_topk=4,
+        index_head_dim=INDEX_HEAD_DIM,
+        index_n_heads=2,
+        index_k_format="fp8_scaled",
+    )
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
         qcp_size=WORLD,
+        qcp_group=tuple(range(WORLD)),
+        kvp_size=WORLD,
+        kvp_group=tuple(range(WORLD)),
         context_len=max_model_len,
         max_bs=4,
         kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
         kernel_page_size=PAGE,
-        component=lambda cls: SimpleNamespace(
-            kv_cache_dim=KV_DIM,
-            index_head_dim=INDEX_HEAD_DIM,
-            index_k_format="fp8_scaled",
-        ),
+        components=(spec,),
     )
     planned = dsa_history_gather_workspace_bytes(config, max_model_len=max_model_len)
     kwargs = dict(

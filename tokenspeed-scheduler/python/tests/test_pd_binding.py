@@ -142,6 +142,12 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(terminal, pool_page
         assert list(later.request_ids) == ["c"], "terminal ACK must unblock allocation"
     scheduler.advance(ExecutionEvent().add_event(PD.FailedEvent("c")))
     assert scheduler.active_lcm_blocks() > 0, "the local forward has not landed yet"
+    # Repeated cancellation after the terminal transfer event must not make
+    # retirement wait for another transfer event that will never arrive.
+    abort = ForwardEvent.Abort()
+    abort.request_id = "c"
+    scheduler.advance(ExecutionEvent().add_event(abort))
+    scheduler.advance(ExecutionEvent().add_event(abort))
     result = ForwardEvent.ExtendResult()
     result.request_id, result.tokens = "c", [12]
     scheduler.advance(ExecutionEvent().add_event(result))

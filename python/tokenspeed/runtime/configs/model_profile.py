@@ -79,9 +79,10 @@ class ModelProfile:
             only once the bitwise invariance harness and the teacher-forced
             logprob comparison against the trainer pass for it; launching an
             unlisted envelope is refused.
-        create_attention_config: Optional model-owned construction of the
+        create_attention_config: Model-owned construction of the
             softmax attention configuration from the resolved launch, model
-            config, and draft flag. None keeps the architecture's generator.
+            config, and draft flag. Explicitly pass None to keep the
+            architecture's generator.
             Returns an ``AttnConfig``; the runtime adds the profile's linear
             component afterwards. The factory owns validation of its cache
             format and execution constraints; its errors are not retried
@@ -97,10 +98,10 @@ class ModelProfile:
     tokenizer_kwargs: Mapping[str, object]
     attention_instances_per_layer: int
     numerics_envelopes: frozenset[str]
-    request_token_history_lookback: int | None = None
     create_attention_config: (
         Callable[[ServerArgs, ModelConfig, bool], AttnConfig] | None
-    ) = None
+    )
+    request_token_history_lookback: int | None = None
 
     def __post_init__(self) -> None:
         if self.create_attention_config is not None and not callable(

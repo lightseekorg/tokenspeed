@@ -929,19 +929,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError("V4.1 CED rows fall outside their source request")
             kept.extend(range(start, start + span.count))
         kept_cpu = torch.tensor(kept, dtype=torch.int64)
-        decoder_plan = QueryShardPlan(
-            size=plan.size,
-            rank=plan.rank,
-            row_counts=plan.rows_per_rank(kept_cpu),
-            sampled_rows_per_rank=(0,) * plan.size,
-        )
-        # Logits rows index the view, whose rows the decoder plan splits.
         sampled_cpu = torch.tensor(view.logits_rows_cpu, dtype=torch.int64)
-        decoder_plan = replace(
-            decoder_plan,
-            sampled_rows_per_rank=decoder_plan.rows_per_rank(sampled_cpu),
+        decoder_plan = plan.select_rows(
+            kept_cpu,
+            input_lengths=[span.count for span in view.spans],
+            sampled_rows=sampled_cpu,
         )
-        local = kept_cpu[decoder_plan.local_slice] - plan.local_start
+        local = plan.split_rows(kept_cpu).local_ids
         return V41PrefillQueryShard(
             self._upload_int64(local.tolist()),
             decoder_plan,
@@ -1391,7 +1385,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         always supply None. A sharded indexer must supply its head-reduction
         process group; replicated indexer heads supply None. Candidates survive
         Reindex updates.
-        query_shard supplies a model-level contiguous plan: coordinates remain
+        query_shard supplies a model-level row plan: coordinates remain
         the complete canonical window on entry, projections contain local rows,
         and returned selections/candidates stay local. History bounds are taken
         from the full request spans, including requests with no local queries.
@@ -1429,8 +1423,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError(
                     "Model QCP selection requires its canonical source window"
                 )
-            positions = positions[query_shard.local_slice]
-            request_indices = request_indices[query_shard.local_slice]
+            positions = positions[query_shard.local_row_ids]
+            request_indices = request_indices[query_shard.local_row_ids]
         owner, source = self.spec.kv_owners[layer_id], self.spec.index_sources[layer_id]
         if owner < 0:
             if index_q is not None or index_weights is not None:
@@ -1604,13 +1598,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if query_shard is not None:
             # Keep the complete request list: even empty query owners must join
             # the same KVP history gathers, using the original history bounds.
-            first, last = query_shard.local_start, query_shard.local_end
             windows = [
-                (
-                    max(first, min(last, start)) - first,
-                    max(first, min(last, stop)) - first,
-                    span,
-                )
+                (*query_shard.local_bounds(start, stop), span)
                 for start, stop, span in windows
             ]
         if partition is not None:
@@ -1687,7 +1676,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     source_table,
                     tile_table,
                     visible,
-                    dsv41.new_index_metadata(tile_table, visible),
+                    dsv41.new_index_metadata(
+                        tile_table,
+                        visible,
+                        scoring_requests[start:stop].to(torch.int32).contiguous(),
+                    ),
                 )
             else:
                 geometry = self._selection_geometry(
@@ -1834,18 +1827,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 positions, requests, forward_mode, query_shard=None
             )
             plans = []
-            first, last = query_shard.local_start, query_shard.local_end
             for request in source.requests:
                 rows = request.rows
                 # Canonical windows have contiguous request spans. Preserve
                 # every request (even with no local query) for KV collectives.
-                start = max(first, min(last, rows.start))
-                stop = max(start, min(last, rows.stop))
-                local_rows = slice(start - first, stop - first)
-                query_rows = slice(
-                    max(0, min(rows.stop, start) - rows.start),
-                    max(0, min(rows.stop, stop) - rows.start),
-                )
+                start, stop = query_shard.local_bounds(rows.start, rows.stop)
+                local_rows = slice(start, stop)
+                query_rows = query_shard.local_row_ids[local_rows] - rows.start
                 plans.append(
                     V41PrefillRequestPlan(
                         request.request,
@@ -1858,8 +1846,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     )
                 )
             return V41SWAQueryPlan(
-                positions[query_shard.local_slice],
-                requests[query_shard.local_slice],
+                positions[query_shard.local_row_ids],
+                requests[query_shard.local_row_ids],
                 tuple(plans),
             )
         key = (forward_mode, id(positions))
@@ -2067,8 +2055,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             source_window = self._window(positions, request_indices, forward_mode)
             if source_window is None:
                 raise ValueError("V4.1 sharded SWA requires a canonical source window")
-            positions = positions[key_rows.plan.local_slice]
-            request_indices = request_indices[key_rows.plan.local_slice]
+            positions = positions[key_rows.plan.local_row_ids]
+            request_indices = request_indices[key_rows.plan.local_row_ids]
         n = positions.numel()
         if (
             n > self.spec.max_query_tokens
@@ -2287,8 +2275,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 lse=None,
             )
         if key_rows is not None:
-            swa_kv = token_all_gather(
-                swa_kv.contiguous(), key_rows.group, list(key_rows.plan.row_counts)
+            swa_kv = key_rows.plan.to_span_order(
+                token_all_gather(
+                    swa_kv.contiguous(), key_rows.group, list(key_rows.plan.row_counts)
+                )
             )
         plan = self._swa_query_plan(
             source_positions,
@@ -2563,13 +2553,33 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # Arbitrary prefill windows may cover a whole prompt. Retaining
             # every replicated table would defeat query tiling's memory bound.
             cacheable = mode.is_decode() or span is not None
+            # DeepGEMM schedules a request from its last query's length. A
+            # free decode window can put a shorter query after a longer one.
+            decode = self.forward_decode_metadata
+            ordered = span is not None or (
+                decode is not None
+                and positions is decode.positions
+                and requests is decode.request_indices
+            )
             geometry = V41IndexGeometry(
                 positions,
                 requests,
                 source_table,
                 tile_table,
                 visible,
-                dsv41.new_index_metadata(tile_table, visible) if cacheable else None,
+                (
+                    dsv41.new_index_metadata(
+                        tile_table,
+                        visible,
+                        (
+                            requests[start:stop].to(torch.int32).contiguous()
+                            if ordered
+                            else None
+                        ),
+                    )
+                    if cacheable
+                    else None
+                ),
             )
             if cacheable:
                 self._index_geometry[key] = geometry

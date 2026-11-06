@@ -631,14 +631,15 @@ impl Shared {
             .cloned()
             .ok_or("CachePD request references an unregistered Decode session")?;
         let route = (registration.endpoint.clone(), registration.port);
-        if {
+        let cancelled = {
             let mut state = self.state();
             if state.cancelled.contains_key(&room) {
                 state.cancel_room(room, Some(cache_id));
             }
             state.cancelled.contains_key(&room)
                 || state.rooms.get(room) == Some(TransferPoll::Failed)
-        } {
+        };
+        if cancelled {
             self.notify_failed(route, room);
             return Ok(());
         }
@@ -1045,25 +1046,46 @@ impl Shared {
         Ok(())
     }
 
-    fn run_worker(&self, queue: &mpsc::Receiver<Chunk>) {
-        while let Ok(chunk) = queue.recv() {
+    fn run_worker(&self, queue: &mpsc::Receiver<QueuedChunk>) {
+        while let Ok(queued) = queue.recv() {
+            let chunk = &queued.chunk;
             let room = chunk.room();
             if !self.state().ended(room) {
-                if let Err(reason) = self.transfer(&chunk) {
+                if let Err(reason) = self.transfer(chunk) {
                     if !self.state().ended(room) {
                         tracing::error!(room, reason, "CachePD transfer failed");
                         self.abort_room(room, &format!("CachePD transfer failed: {reason}"));
                     }
                 }
             }
-            let mut state = self.state();
-            let count = state
-                .pending_chunks
-                .get_mut(&room)
-                .expect("queued chunk counted");
-            *count -= 1;
-            if *count == 0 {
-                state.pending_chunks.remove(&room);
+        }
+    }
+}
+
+/// A queued or executing transfer holds its room until the job is dropped.
+struct QueuedChunk {
+    chunk: Chunk,
+    _retirement: PendingChunk,
+}
+
+struct PendingChunk {
+    shared: Arc<Shared>,
+    room: u64,
+}
+
+impl Drop for PendingChunk {
+    fn drop(&mut self) {
+        // A failed worker may unwind while holding the state lock.
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = state.pending_chunks.get_mut(&self.room) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                state.pending_chunks.remove(&self.room);
             }
         }
     }
@@ -1080,7 +1102,7 @@ impl Shared {
 #[derive(Clone)]
 pub struct PrefillOutbox {
     shared: Arc<Shared>,
-    queues: Arc<Vec<mpsc::Sender<Chunk>>>,
+    queues: Arc<Vec<mpsc::Sender<QueuedChunk>>>,
     staged: Staged,
     /// Layerwise: the producer steps armed so far, modulo `STEP_COUNT_MAX`
     /// (the host half of `StepCounter`).
@@ -1276,7 +1298,7 @@ impl PrefillOutbox {
     /// chunks always reach the same worker, in order.
     fn enqueue(&self, rid: &str, chunk: Chunk) {
         let room = chunk.room();
-        let shard = {
+        let (shard, queued) = {
             let mut state = self.shared.state();
             if state.ended(room) {
                 tracing::debug!(rid, room, "the room already failed or ended");
@@ -1292,20 +1314,16 @@ impl PrefillOutbox {
                 .filter_map(|registration| wire::session_port(&registration.session_id))
                 .sum();
             *state.pending_chunks.entry(room).or_default() += 1;
-            (ports % self.queues.len() as u64) as usize
+            let queued = QueuedChunk {
+                chunk,
+                _retirement: PendingChunk {
+                    shared: self.shared.clone(),
+                    room,
+                },
+            };
+            ((ports % self.queues.len() as u64) as usize, queued)
         };
-        if self.queues[shard].send(chunk).is_err() {
-            {
-                let mut state = self.shared.state();
-                let count = state
-                    .pending_chunks
-                    .get_mut(&room)
-                    .expect("queued chunk counted");
-                *count -= 1;
-                if *count == 0 {
-                    state.pending_chunks.remove(&room);
-                }
-            }
+        if self.queues[shard].send(queued).is_err() {
             self.shared
                 .abort_room(room, "the PD transfer workers stopped");
         }

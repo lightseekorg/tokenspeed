@@ -39,6 +39,7 @@ from tokenspeed.runtime.configs.model_profile import (
 def _profile(**overrides) -> ModelProfile:
     fields = dict(
         configure_attention=lambda model, args: None,
+        create_attention_config=None,
         cache_family="test_history",
         linear_attention=None,
         default_attention_backend=None,

@@ -131,6 +131,7 @@ StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys, std:
         keys.size() > static_cast<std::size_t>(config_.max_keys_per_operation)) {
         return {};
     }
+    _assert(keys.size() == key_tokens.size(), "Each storage query key needs a token span");
     StorageQueryOperation op{nextId(), std::move(keys)};
     const auto id = op.op_id;
     operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, std::move(key_tokens), {}, {}});
@@ -154,7 +155,7 @@ std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
         if (!ticket.success[i] || IsNegative(ticket.keys[i])) continue;
         keys.push_back(ticket.keys[i]);
-        if (i < ticket.key_tokens.size()) query_hit_tokens_ += ticket.key_tokens[i];
+        query_hit_tokens_ += std::exchange(ticket.key_tokens[i], 0);
     }
     return keys;
 }

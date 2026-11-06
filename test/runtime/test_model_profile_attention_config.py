@@ -163,11 +163,16 @@ def test_profile_factory_preserves_storage_and_composes_linear(
 
 
 @pytest.mark.parametrize("profiled", [False, True])
-def test_omitted_factory_preserves_architecture_generator(model_and_args, profiled):
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_no_factory_preserves_architecture_generator(
+    model_and_args, profiled, is_draft
+):
     model, args = model_and_args
     if profiled:
         model.model_profile = _profile(None, linear_attention=None)
-    assert _create_attn_config(args, model) == MHAConfig.generate(args, model)
+    assert _create_attn_config(args, model, is_draft=is_draft) == MHAConfig.generate(
+        args, model, is_draft=is_draft
+    )
 
 
 def test_factory_result_must_be_attention_config(model_and_args):
@@ -175,6 +180,20 @@ def test_factory_result_must_be_attention_config(model_and_args):
     model.model_profile = _profile(lambda *args: None, linear_attention=None)
     with pytest.raises(TypeError, match="must return AttnConfig"):
         _create_attn_config(args, model)
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_factory_cannot_change_target_or_draft_role(model_and_args, is_draft):
+    def wrong_role(args, model, is_draft):
+        return _custom_attention(args, model, not is_draft)
+
+    model, args = model_and_args
+    model.model_profile = _profile(wrong_role, linear_attention=None)
+    with pytest.raises(
+        ValueError,
+        match=f"must build the config for is_draft={is_draft}, got is_draft={not is_draft}",
+    ):
+        _create_attn_config(args, model, is_draft=is_draft)
 
 
 def test_factory_error_does_not_fall_back(model_and_args):

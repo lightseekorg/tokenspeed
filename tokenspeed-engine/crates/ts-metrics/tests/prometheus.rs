@@ -77,7 +77,7 @@ fn run_scenario(directory: &Path) {
     engine.record_preemptions(2);
     engine.observe_request_queue_time(0.4);
     engine.observe_request_queue_time(9000.0);
-    engine.record_cache_occupancy(12, 8, 40, 16);
+    engine.record_cache_occupancy(12, 8, 40, 647);
     engine.record_prefill_queues(1, 2, 0);
     engine.record_decode_queues(3, 4, 1);
     engine.record_generation_tokens(25);

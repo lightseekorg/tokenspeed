@@ -446,8 +446,8 @@ pub struct LoopConfig {
     pub limits: IngressLimits,
     /// Usable cache pages, reported with the load.
     pub kv_total_pages: i64,
-    /// Tokens one usable cache page holds.
-    pub kv_page_tokens: i64,
+    /// Effective token capacity of the usable KV pool.
+    pub kv_token_capacity: i64,
     /// Predecessors Engram reads per token; 0 for a model without Engram.
     pub ngram_context_len: usize,
     /// The model reads each request's committed token history, which the
@@ -519,7 +519,7 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Admissions waiting for their grammars to compile, in arrival order.
     grammar_queue: Vec<(Submission, GrammarKey, Instant)>,
     /// The last cumulative prefix-hit counters reported, for deltas.
-    last_prefix_hits: Option<ts_scheduler::PrefixHitView>,
+    last_prefix_hits: ts_scheduler::PrefixHitView,
     batch_logger: BatchLogger,
     /// The token-history rows' owners, for a model that reads them.
     history: Option<HistoryRows>,
@@ -582,7 +582,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             scheduler,
             data_plane,
             frontend,
-            outputs: outputs.with_metrics_enabled(subsystems.metrics.is_some()),
+            outputs,
             config,
             ranks,
             transfer: subsystems.transfer,
@@ -592,7 +592,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             eplb: subsystems.eplb,
             grammars: subsystems.grammars,
             grammar_queue: Vec::new(),
-            last_prefix_hits: None,
+            last_prefix_hits: Default::default(),
             in_flight: VecDeque::new(),
             cache_ops: CacheOps::new(),
             withheld: Vec::new(),
@@ -841,7 +841,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 total_pages - i64::from(sizes.empty_lcm_blocks),
                 i64::from(active_pages),
                 total_pages,
-                self.config.kv_page_tokens,
+                self.config.kv_token_capacity,
             );
             match self.outputs.role() {
                 crate::output::Role::Prefill => metrics.record_prefill_queues(
@@ -875,16 +875,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             metrics.record_completion_tokens(request.completion_tokens);
             metrics.record_grammar_queue(self.grammar_queue.len() as i64);
             let hits = self.scheduler.prefix_hit_stats();
-            if let Some(last) = self.last_prefix_hits {
-                metrics.record_prefix_hits(
-                    hits.prompt_tokens.saturating_sub(last.prompt_tokens),
-                    hits.device_hit_tokens
-                        .saturating_sub(last.device_hit_tokens),
-                    hits.host_hit_tokens.saturating_sub(last.host_hit_tokens),
-                    hits.l3_hit_tokens.saturating_sub(last.l3_hit_tokens),
-                );
-            }
-            self.last_prefix_hits = Some(hits);
+            let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
+            metrics.record_prefix_hits(
+                delta.prompt_tokens,
+                delta.device_hit_tokens,
+                delta.host_hit_tokens,
+                delta.l3_hit_tokens,
+            );
         }
 
         let dp = self.dp_round(forward.as_ref(), stop)?;
@@ -2407,9 +2404,37 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 }
 
+fn prefix_hit_delta(
+    previous: &mut ts_scheduler::PrefixHitView,
+    hits: ts_scheduler::PrefixHitView,
+) -> ts_scheduler::PrefixHitView {
+    let last = std::mem::replace(previous, hits);
+    ts_scheduler::PrefixHitView {
+        prompt_tokens: hits.prompt_tokens.saturating_sub(last.prompt_tokens),
+        device_hit_tokens: hits
+            .device_hit_tokens
+            .saturating_sub(last.device_hit_tokens),
+        host_hit_tokens: hits.host_hit_tokens.saturating_sub(last.host_hit_tokens),
+        l3_hit_tokens: hits.l3_hit_tokens.saturating_sub(last.l3_hit_tokens),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_prefix_sample_includes_admissions_and_unchanged_counters_add_nothing() {
+        let mut previous = ts_scheduler::PrefixHitView::default();
+        let hits = ts_scheduler::PrefixHitView {
+            prompt_tokens: 48,
+            device_hit_tokens: 16,
+            host_hit_tokens: 8,
+            l3_hit_tokens: 4,
+        };
+        assert_eq!(prefix_hit_delta(&mut previous, hits), hits);
+        assert_eq!(prefix_hit_delta(&mut previous, hits), Default::default());
+    }
 
     #[test]
     fn the_active_page_count_is_reused_while_fresh_and_requests_run() {

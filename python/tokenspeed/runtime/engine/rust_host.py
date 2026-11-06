@@ -127,7 +127,7 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     reasoning_grammar,
 )
 from tokenspeed.runtime.metrics.config import metrics_enabled, raw_metrics_enabled
-from tokenspeed.runtime.metrics.events import MetricEvent
+from tokenspeed.runtime.metrics.events import MetricEvent, MetricEventSink
 from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.multimodal.inputs import (
@@ -137,6 +137,10 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
+from tokenspeed.runtime.plugins.registry import (
+    TraceProvider,
+    get_trace_provider,
+)
 from tokenspeed.runtime.sampling.registry import get_sampling_backend_class
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
@@ -450,6 +454,11 @@ class HostConfig:
         kv_events_publisher: Where this rank publishes them (the ZMQ
             publisher's fields), on the attention-TP group's first rank; else
             None.
+        otlp_traces_endpoint: ``--otlp-traces-endpoint``, the OTLP/HTTP
+            receiver finished requests trace to.
+        trace_provider: Optional registered provider of custom span context.
+        trace_sample_ratio: ``--trace-sample-ratio``, the share of requests
+            it keeps.
         l3: With the L3 storage tier, what the host starts its executor
             from; else None.
         l3_metrics: This rank reports the L3 tier's metrics: with the tier
@@ -484,7 +493,7 @@ class HostConfig:
     request_token_history_lookback: int | None
     physical_context_len: int
     kv_total_pages: int
-    kv_page_tokens: int
+    kv_token_capacity: int
     rank: int
     replica_ranks: tuple[int, ...]
     pp_ranks: tuple[int, ...] | None
@@ -509,6 +518,9 @@ class HostConfig:
     log_request_stats: bool
     kv_events: bool
     kv_events_publisher: KVEventsConfig | None
+    otlp_traces_endpoint: str | None
+    trace_sample_ratio: float
+    trace_provider: TraceProvider | None
     l3: L3Settings | None
     l3_metrics: bool
     attn_tp_rank: int
@@ -1039,7 +1051,7 @@ class MemoryMetricSampler(threading.Thread):
     def __init__(
         self,
         *,
-        sink,
+        sink: MetricEventSink,
         model_name: str,
         app_key: str,
         dp_rank: int,
@@ -1064,15 +1076,23 @@ class MemoryMetricSampler(threading.Thread):
     def run(self) -> None:
         try:
             device_module = torch.get_device_module(torch.device(self._device).type)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                f"Cannot initialize memory metrics for {self._device}: {exc}"
+            )
             return
+        warned = False
         while not self._stopping.wait(_MEMORY_METRIC_INTERVAL_SECONDS):
             try:
                 free_bytes, total_bytes = device_module.mem_get_info(self._gpu_id)
                 allocated = device_module.memory_allocated(self._gpu_id)
                 reserved = device_module.memory_reserved(self._gpu_id)
-            except Exception:
-                # A device that cannot report memory is not a serving failure.
+            except Exception as exc:
+                if not warned:
+                    logger.warning(
+                        f"Cannot sample memory on {self._device} GPU {self._gpu_id}: {exc}"
+                    )
+                    warned = True
                 continue
             mib = 1024**2
             used = total_bytes - free_bytes
@@ -1346,7 +1366,7 @@ class HostBootstrap:
                     model_config.context_len + server_args.spec_context_pad
                 ),
                 kv_total_pages=geometry.num_usable_pages,
-                kv_page_tokens=geometry.prefix_granularity,
+                kv_token_capacity=geometry.token_capacity,
                 rank=global_rank,
                 # Every stage runs the same plan, so with a pipeline the replica
                 # is the world (ServerArgs refuses attention DP with one). Under
@@ -1394,6 +1414,13 @@ class HostBootstrap:
                     if kv_events
                     and attn_tp_rank == 0
                     and kv_events_config.publisher in (None, "zmq")
+                    else None
+                ),
+                otlp_traces_endpoint=server_args.otlp_traces_endpoint,
+                trace_sample_ratio=server_args.trace_sample_ratio,
+                trace_provider=(
+                    get_trace_provider(server_args.trace_provider)
+                    if server_args.trace_provider is not None
                     else None
                 ),
                 epd_receive_enabled=(

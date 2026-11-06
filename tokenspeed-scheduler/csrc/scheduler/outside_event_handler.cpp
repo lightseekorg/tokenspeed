@@ -51,11 +51,10 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
         return;
     }
     if (request->ResultsInFlight() > 0) {
-        retired_pd_failures_.insert(event.request_id);
+        request->RetirePdFailure();
         return;
     }
-    pending_pd_aborts_.erase(event.request_id);
-    retired_pd_failures_.erase(event.request_id);
+    request->ClearPdAbort();
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
@@ -71,7 +70,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     // frontier is final here, so it finishes like any request -- the P's
     // prompt-end state and partial page, the D's final state and tail are
     // published when it settles.
-    if (pending_pd_aborts_.contains(event.request_id)) {
+    if (request->PdAbortPending()) {
         handleEvent(pd::FailedEvent{event.request_id});
         return;
     }
@@ -88,7 +87,7 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
             throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
         }
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
-        if (pending_pd_aborts_.contains(event.request_id)) {
+        if (request->PdAbortPending()) {
             handleEvent(pd::FailedEvent{event.request_id});
         }
         return;
@@ -111,9 +110,8 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 
 void Scheduler::settleFinishedRequests() {
     for (const std::unique_ptr<Request>& request : requests_) {
-        if (retired_pd_failures_.contains(request->Id()) && request->ResultsInFlight() == 0) {
-            pending_pd_aborts_.erase(request->Id());
-            retired_pd_failures_.erase(request->Id());
+        if (request->PdFailureRetired() && request->ResultsInFlight() == 0) {
+            request->ClearPdAbort();
             request->Apply(fsm::AbortEvent{&coordinator_});
             continue;
         }
@@ -280,10 +278,10 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
         if (pdTransferInFlight(*request)) {
-            pending_pd_aborts_.insert(event.request_id);
+            request->DeferPdAbort();
             return;
         }
-        pending_pd_aborts_.erase(event.request_id);
+        request->ClearPdAbort();
         request->Apply(fsm::AbortEvent{&coordinator_});
     }
 }

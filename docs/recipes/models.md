@@ -445,9 +445,8 @@ Notes:
 - The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly.
   You no longer need a flattened local checkpoint and a separately staged
   remote-code cache.
-- The checkpoint carries no FP8 KV scaling factors. When the target K3 uses an
-  FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
-  BF16 so context injection and draft attention match the reference precision.
+- K3's target and DSpark draft MLA caches follow the shared `--kv-cache-dtype`
+  setting, as with EAGLE3: `fp8` selects FP8; `auto` and `bfloat16` select BF16.
 - DSpark proposal blocks use non-causal MLA draft attention. Both the `mla` and
   `trtllm_mla` draft backends preserve every block row during eager execution
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
@@ -612,6 +611,115 @@ TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
   --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
   --disable-kvstore --disable-autotune
 ```
+
+## Kimi K3.1 Pro {#kimi-k3-1-pro}
+
+Kimi-K3.1 (`KimiK31ForConditionalGeneration`) is Kimi-K3 with a DSA lightning
+indexer on each of its 24 MLA layers: every MLA layer attends only the 2048
+history tokens (`index_topk`) its own indexer selects. The KDA layers, the
+MoE, the vision encoder, the parsers, and the cache family are Kimi-K3's, so
+the [Kimi K3](#kimi-k3) notes apply unless a note below says otherwise.
+
+Notes:
+
+- Leave `--attention-backend` unset (or pass `dsa`): the MLA layers then run
+  the `dsa` sparse-MLA backend inside the KDA hybrid wrapper. The dense MLA
+  backends do not run the indexer.
+- The indexer keys live in an index-K plane beside each MLA layer's latent
+  plane in the full-attention cache group, so prefix caching, PD transfer, and
+  frees treat them with the latent rows. The plane stores the keys as FP8 with
+  one FP32 scale per 128 channels, 132 bytes per token per layer, whatever
+  `--kv-cache-dtype` sets for the latent.
+- The checkpoint ships no modeling code. The indexer follows DeepSeek-V3.2:
+  queries from the normalized MLA q latent, LayerNorm keys without RoPE, and
+  per-head ReLU scores weighted by `weights_proj`. Loading validates
+  `dsa_config` against that and fails on anything else, on an indexer tensor
+  without a parameter, and on an indexer parameter the checkpoint does not
+  fill.
+- Speculative verify takes up to 8 query rows per request on Blackwell and
+  up to 6 on gfx950.
+- The DSA layers run attention TP only; TokenSpeed refuses the Kimi-K3 QKV
+  and output projection TP subgroups at startup.
+- On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
+  breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
+  and on the aggregated role when `--prefill-graph-capture-token-sizes` names
+  the buckets and `--enable-mixed-batch` is off; elsewhere prefill runs eager.
+  `--disable-prefill-graph` turns them off.
+- The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
+  proposes 7 tokens per step, so it takes
+  `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
+  causally within its block (its config sets `dflash_config.causal`).
+  `--drafter-attention-backend tokenspeed_mla` runs causal blocks; the other
+  MLA drafter backends refuse the draft at startup.
+- A checkpoint with a Python XTML encoder and no Jinja chat template needs
+  its tokenizer's `apply_chat_template` to encode messages. Pass the token
+  IDs as `input_ids` to the native `/generate` endpoint.
+
+### NVIDIA
+
+Install `flash-linear-attention` for the KDA layers, as for
+[Kimi K3](#kimi-k3), then serve with the DSpark draft on 8 Blackwell GPUs.
+This launch was validated on 2 GB300 nodes with 4 GPUs each. On such nodes,
+start each one with the command below plus
+`--nnodes 2 --node-rank <rank> --dist-init-addr <first-node>:<port>`, where
+`<rank>` is the node's rank (`0` on the first node, `1` on the second) and
+`<first-node>:<port>` is the first node's address and a free port on it. Drop
+the 4 speculative flags to serve without the draft. The context length is the
+checkpoint's 1,048,576 tokens.
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+  --served-model-name kimi-k3.1 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --moe-backend flashinfer_trtllm \
+  --max-num-seqs 64 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
+  --speculative-num-draft-tokens 8 \
+  --drafter-attention-backend tokenspeed_mla \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+### AMD
+
+On 8x MI350X/MI355X (gfx950), serve at TP8 with Kimi-K3's EAGLE-3.1 draft
+(`lightseekorg/kimi-k3-eagle3.1-mla`), which accepts slightly more tokens per
+step than the EAGLE3 draft. The index-K planes make a K3.1 cache block about
+22% larger than K3's, so at the default `--gpu-memory-utilization`, 15 requests
+of 50K input and 500 output tokens run at once.
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+  --served-model-name kimi-k3.1 \
+  --trust-remote-code \
+  --max-model-len 65536 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lightseekorg/kimi-k3-eagle3.1-mla \
+  --drafter-attention-backend gluon \
+  --max-num-seqs 64 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+- The rest comes from the defaults and the draft's config: a 3-step EAGLE3
+  chain (a 4-token verify window), the draft's capture layers
+  (2, 46, 90) and BF16 weights, TP8 without expert parallelism, automatic MoE
+  selection, an 8192-token prefill budget, and CUDA graph capture sizes up to
+  `--max-num-seqs`.
+- `--drafter-attention-backend gluon` pins the draft's MLA layers to the Gluon
+  kernels and fails fast where none is registered; leaving it unset lets the
+  `mla` backend select the kernels.
+- Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
+  NVIDIA only.
+- The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2
 

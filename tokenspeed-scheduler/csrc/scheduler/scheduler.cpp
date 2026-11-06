@@ -498,7 +498,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
-        if (retired_pd_failures_.contains(request->Id())) {
+        if (request->PdFailureRetired()) {
             continue;  // local forward results still own the failed request's pages
         }
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,

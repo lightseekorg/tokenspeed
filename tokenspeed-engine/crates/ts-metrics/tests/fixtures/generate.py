@@ -111,15 +111,19 @@ def _run_scenario() -> None:
     engine.observe_request_queue_time(0.4)
     engine.observe_request_queue_time(9000.0)
     engine.record_cache_occupancy(
-        used_pages=12, active_pages=8, total_pages=40, page_tokens=16
+        used_pages=12, active_pages=8, total_pages=40, token_capacity=647
     )
     engine.record_prefill_queues(prealloc=1, inflight=2, retracted=0)
     engine.record_decode_queues(prealloc=3, transfer=4, retracted=1)
     engine.record_generation_tokens(25)
     engine.record_request_tokens(prompt_tokens=100, cache_hit_tokens=40)
+    engine.observe_time_to_first_token(float("inf"))
     engine.observe_time_to_first_token(0.25)
+    engine.observe_request_time(float("inf"))
     engine.observe_request_time(1.5)
+    engine.observe_decode_time(float("inf"))
     engine.observe_decode_time(1.2)
+    engine.observe_time_per_output_token(float("inf"))
     engine.observe_time_per_output_token(0.02)
     engine.record_completion_tokens(5)
     engine.record_grammar_queue(2)

@@ -21,12 +21,15 @@
 """Row layout behavior, independent of distributed execution."""
 
 import sys
+from pathlib import Path
 
 import pytest
 import torch
-from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
@@ -130,6 +133,38 @@ def test_equal_segments_balance_causal_visible_key_work_per_request(size):
         )
         per_rank.append(costs[plan.local_row_ids].sum().item())
     assert len(set(per_rank)) == 1
+
+
+@pytest.mark.parametrize("size", [1, 2, 4, 8])
+@pytest.mark.parametrize("kept", [[0, 2, 5, 6, 10, 11, 14], [], [14]])
+def test_retained_rows_keep_their_original_owner(size, kept):
+    lengths = [6, 9]
+    kept = torch.tensor(kept, dtype=torch.int64)
+    retained_lengths = [int((kept < 6).sum()), int((kept >= 6).sum())]
+    samples = torch.arange(kept.numel(), dtype=torch.int64)[::2]
+    span = torch.arange(45).reshape(15, 3)
+    pieces, outputs = [], []
+    for rank in range(size):
+        parent = QueryShardPlan.from_forward(
+            total_tokens=15, input_lengths=lengths, size=size, rank=rank, device="cpu"
+        )
+        child = parent.select_rows(
+            kept, input_lengths=retained_lengths, sampled_rows=samples
+        )
+        local = span[parent.local_row_ids][parent.split_rows(kept).local_ids]
+        assert torch.equal(local, span[kept][child.local_row_ids])
+        pieces.append(local)
+        outputs.append(local[child.local_sampled_index])
+        for start, stop in ((0, 6), (6, 15), (2, 11), (0, 0)):
+            lo, hi = parent.local_bounds(start, stop)
+            wanted = parent.local_row_ids[
+                (parent.local_row_ids >= start) & (parent.local_row_ids < stop)
+            ]
+            assert torch.equal(parent.local_row_ids[lo:hi], wanted)
+    assert torch.equal(child.to_span_order(torch.cat(pieces)), span[kept])
+    assert torch.equal(
+        torch.cat(outputs)[child.sampled_to_request], span[kept][samples]
+    )
 
 
 if __name__ == "__main__":

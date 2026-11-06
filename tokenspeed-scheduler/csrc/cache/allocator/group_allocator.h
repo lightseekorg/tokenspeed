@@ -221,10 +221,8 @@ public:
     // (any bucket when the slot was a hole), and sets the table's unconsumed
     // tail capacity. Returns the replaced block: a hitter's shared partial
     // block, which the caller copies into the fresh block; empty for a hole,
-    // which the caller zeroes instead. A hole the claimed hit counted into
-    // the released prefix (a tail inside the table's first block, which the
-    // decode role's probe leaves unclaimed) ends that prefix: the exported
-    // row names the block from then on.
+    // which the caller zeroes instead. Installing into a hole ends the released
+    // prefix at this slot, so subsequent exports include the new writable block.
     CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
                                    std::int32_t available_tokens) {
         _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");

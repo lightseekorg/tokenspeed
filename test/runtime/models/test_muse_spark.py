@@ -684,9 +684,6 @@ def test_muse_spark_checkpoint_names_load_into_runtime_layout(
     bf16_default_dtype,
 ) -> None:
     model = _tiny_model()
-    assert not any(
-        name.startswith("model._final_norm_op") for name, _ in model.named_parameters()
-    )
     expert_config = model.get_model_config_for_expert_location(model.config)
     assert (expert_config.num_layers, expert_config.num_logical_experts) == (1, 4)
 
@@ -1137,6 +1134,7 @@ def test_owned_attention_stores_prepared_rows_once(
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda *args: positions,
             cache_placement=lambda layer: None,
+            query_dtype=lambda layer, mode, activation: activation,
             forward=attend,
         ),
         token_to_kv_pool=SimpleNamespace(

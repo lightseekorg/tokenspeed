@@ -6,7 +6,8 @@
 all-gather layout. Each owner keeps rows in input order, including duplicate
 slots. `fetch` receives only the calling rank's physical slots; the caller
 initializes any send padding, which the split leaves untouched. Empty inputs
-leave both outputs untouched.
+leave both outputs untouched. Gather indices and per-owner counts are int32;
+the host rejects gathered spans larger than `2**31` rows before launching.
 
 CUDA and ROCm count each owner's rows in parallel 1024-row tiles, scan the
 counts across tiles, then place each tile independently. A row's destination

@@ -1295,7 +1295,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             },
         },
         kv_total_pages: 512,
-        kv_page_tokens: 16,
+        kv_token_capacity: 512 * 16,
         ngram_context_len: setup.ngram_context_len,
         request_token_history: setup.request_token_history,
         request_token_history_lookback: setup.request_token_history_lookback,
@@ -1377,6 +1377,8 @@ fn run_rank<F: Frontend>(
             enabled: true,
             request_stats: true,
         },
+        false,
+        None,
     );
     let transfer = pd.map(|pd| {
         Box::new(FakePeer {

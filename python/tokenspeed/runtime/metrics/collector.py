@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import math
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.metrics.events import MetricEventSink
@@ -228,7 +229,7 @@ class EngineMetrics:
         )
         self.prompt_tokens = factory.counter(
             name="tokenspeed:prompt_tokens",
-            documentation="Prompt tokens of requests that finished.",
+            documentation="Prompt tokens of requests that ended, including aborted requests.",
             labelnames=labelnames,
         )
         self.cache_hit_tokens = factory.counter(
@@ -362,7 +363,7 @@ class EngineMetrics:
         )
         self.prefix_l3_hit_tokens = factory.counter(
             name="tokenspeed:prefix_l3_hit_tokens",
-            documentation="Tokens of keys storage queries found (L3).",
+            documentation="Token spans of successful storage keys (L3), counted per cache group.",
             labelnames=labelnames,
         )
         # Request-latency bucket grid: 0.3 s to 7680 s.
@@ -492,16 +493,18 @@ class EngineMetrics:
         used_pages: int,
         active_pages: int,
         total_pages: int,
-        page_tokens: int,
+        token_capacity: int,
     ) -> None:
-        if not self.enabled or total_pages <= 0 or page_tokens <= 0:
+        if not self.enabled or total_pages <= 0 or token_capacity < 0:
             return
         used = min(max(used_pages, 0), total_pages)
         active = min(max(active_pages, 0), total_pages)
         self.kv_token_usage_ratio.labels(**self.labels).set(used / total_pages)
-        self.num_used_tokens.labels(**self.labels).set(used * page_tokens)
+        self.num_used_tokens.labels(**self.labels).set(
+            used * token_capacity // total_pages
+        )
         self.num_free_tokens.labels(**self.labels).set(
-            (total_pages - active) * page_tokens
+            (total_pages - active) * token_capacity // total_pages
         )
 
     def record_prefill_queues(
@@ -536,19 +539,19 @@ class EngineMetrics:
             self.cache_hit_tokens.labels(**self.labels).inc(cache_hit_tokens)
 
     def observe_time_to_first_token(self, seconds: float) -> None:
-        if self.enabled and seconds >= 0.0:
+        if self.enabled and math.isfinite(seconds) and seconds >= 0.0:
             self.time_to_first_token_seconds.labels(**self.labels).observe(seconds)
 
     def observe_request_time(self, seconds: float) -> None:
-        if self.enabled and seconds >= 0.0:
+        if self.enabled and math.isfinite(seconds) and seconds >= 0.0:
             self.request_time_seconds.labels(**self.labels).observe(seconds)
 
     def observe_decode_time(self, seconds: float) -> None:
-        if self.enabled and seconds >= 0.0:
+        if self.enabled and math.isfinite(seconds) and seconds >= 0.0:
             self.decode_time_seconds.labels(**self.labels).observe(seconds)
 
     def observe_time_per_output_token(self, seconds: float) -> None:
-        if self.enabled and seconds >= 0.0:
+        if self.enabled and math.isfinite(seconds) and seconds >= 0.0:
             self.time_per_output_token_seconds.labels(**self.labels).observe(seconds)
 
     def record_completion_tokens(self, count: int) -> None:

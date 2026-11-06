@@ -68,9 +68,7 @@ struct PrefixHitStats {
 // tokens (`PrefixHitView`); the rest stay for tests and inspection.
 struct HostCacheStats {
     PrefixHitStats prefix_hits;
-    // Tokens of keys storage queries found, cumulative. They are also part of
-    // `prefix_hits.host_hit_tokens` once loaded; subtract them to separate
-    // the Host's own cache from L3.
+    // Cumulative token spans of successful storage keys, counted per cache group.
     std::uint64_t storage_query_hit_tokens{0};
     TierTransferManager::WriteBackStats publication_stores;
     TierTransferManager::WriteBackStats finish_stores;
@@ -555,9 +553,6 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
-    // A client abort cannot release pages still used by PD or a local forward.
-    std::unordered_set<std::string> pending_pd_aborts_;
-    std::unordered_set<std::string> retired_pd_failures_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).
