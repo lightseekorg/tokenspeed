@@ -101,6 +101,23 @@ def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
     return None
 
 
+def validate_output_vocabulary(model: torch.nn.Module, vocab_size: int) -> None:
+    """Check the loaded target's logical logits width before allocating samplers."""
+    # Models without logits (encoder workers and intermediate PP stages) have
+    # no output vocabulary. Inspect the model interface, not padded/sharded weights.
+    processor = getattr(model, "logits_processor", None)
+    if processor is None:
+        return
+    actual = processor.config.vocab_size
+    if actual != vocab_size:
+        raise ValueError(
+            f"{type(model).__name__} produces a logical output vocabulary of "
+            f"{actual}, but the runtime vocab_size is {vocab_size}. "
+            "The model must construct its output head and logits processor "
+            "with the checkpoint's output_vocab_size."
+        )
+
+
 class ModelRunner:
     def __init__(
         self,
@@ -229,6 +246,8 @@ class ModelRunner:
             checkpoint_load_group=self.checkpoint_load_group,
             is_draft_worker=self.is_draft_worker,
         )
+        if not self.is_draft_worker:
+            validate_output_vocabulary(self.model, self.model_config.vocab_size)
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
         )

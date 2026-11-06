@@ -726,3 +726,9 @@ grammar masks, logit bias and prompt-logprob validation keep using `vocab_size`.
 An input-only token can reach the model without becoming a valid output token
 or prompt-logprob target. Models or plugins with a reduced head must construct
 the embedding and head for their respective checkpoint sizes.
+
+After loading a target model, initialization checks the logits processor's
+logical vocabulary against the runtime output size. A mismatch fails before
+sampling buffers or CUDA graphs are built; TP shards and padded weight rows
+are not logical vocabulary sizes. Workers without logits and draft models
+(which may use their own vocabulary mapping) are outside this target check.
