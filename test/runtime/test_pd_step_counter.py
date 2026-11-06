@@ -20,10 +20,19 @@
 
 """Producer-step counters use the requested accelerator and publish progress."""
 
+import os
+import sys
+
 import pytest
 import torch
 
-from tokenspeed.runtime.pd.utils import StepCounter
+# This test imports the full runtime, so schedule it in runtime-1gpu.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+from tokenspeed.runtime.pd.utils import StepCounter  # noqa: E402
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu"])

@@ -32,6 +32,7 @@ from __future__ import annotations
 import gc
 import os
 import sys
+import threading
 import time
 from datetime import timedelta
 from multiprocessing import shared_memory
@@ -378,10 +379,6 @@ def test_the_cache_capacity_knobs(monkeypatch):
     assert type(make_embedding_cache(4 << 30, 0, "cuda:0")) is EmbeddingCache
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 def test_npu_encode_lands_rows_on_selected_device():
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
@@ -396,12 +393,22 @@ def test_npu_encode_lands_rows_on_selected_device():
         device=device,
         tp_cpu_group=None,
     )
-    plane.enter_forward_thread()
-    item = _item(7, 3)
-    item.feature = item.feature.to(device)
-    plane._items[1] = item
-    plane.encode([(1, 0)])
-    torch.npu.synchronize()
-    assert plane.encoded()[0][:3] == (1, None, 3)
-    assert plane.encoded() == []
-    assert torch.equal(_slot(ring, 0, 3).cpu(), torch.full((3, HIDDEN), 7.0))
+    thread = threading.current_thread()
+    original_name = thread.name
+    try:
+        plane.enter_forward_thread()
+        item = _item(7, 3)
+        item.feature = item.feature.to(device)
+        # Admission reads CPU wire frames; seed an NPU tensor to test the device copy.
+        plane._items[1] = item
+        plane.encode([(1, 0)])
+        torch.npu.synchronize()
+        assert plane.encoded()[0][:3] == (1, None, 3)
+        assert plane.encoded() == []
+        assert torch.equal(_slot(ring, 0, 3).cpu(), torch.full((3, HIDDEN), 7.0))
+    finally:
+        thread.name = original_name
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

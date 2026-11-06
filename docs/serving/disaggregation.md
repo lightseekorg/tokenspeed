@@ -99,7 +99,7 @@ examples.
 
 ## Ascend device handling
 
-On supported Ascend models, encode and prefill use the selected NPU device
+On supported Ascend NPUs, encode and prefill use the selected NPU device
 for copy-completion events and the device process group for embedding
 reconstruction. The prefill producer-step counter also resides on that device.
 Use an Ascend-compatible Mooncake build for embedding and KV transfers.
