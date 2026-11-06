@@ -292,6 +292,7 @@ def test_masked_state_tables_pads_only_the_stopped_rows_of_state_groups(device, 
         contract=_contract(),
         num_requests=2,
         validate_page_ids=True,
+        host_tables=False,
     )
     tables = dict(metadata.tables(active_forward_op=batch))
     assert tuple(tables) == tuple(group_id for group_id, _ in _GROUP_KINDS)
