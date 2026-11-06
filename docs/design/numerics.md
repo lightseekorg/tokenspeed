@@ -33,7 +33,7 @@ hierarchy, unimplemented):
 Two consequences of 3 are enforced at startup, so a model that cannot meet
 them is refused under rl-bitwise with the reason: MoE TP must be 1 (the
 slot-order MoE combine folds over the EP group inside the leaf), and the
-vocabulary must be a whole number of `MEGATRON_VOCAB_BLOCK`-wide blocks (the
+vocabulary must be a whole number of `BLOCKWISE_VOCAB_BLOCK`-wide blocks (the
 trainer's log-softmax folds fixed blocks).
 
 ## The hierarchy
@@ -200,7 +200,7 @@ and only the reported log-probabilities change.
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
 | `--dsa-slot-order selection` | Keep the top-k leaf's emitted order when reducing sparse attention, as the trainer does. `rl-bitwise` fixes this choice, overriding an explicit `sorted`; both top-k and attention leaves still require batch invariance. Under `auto`, `sorted` remains available to reduce by token position, never physical cache address | forward values |
-| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = target - log(sum_exp)`, for output and prompt (input) logprobs alike | logprobs only |
+| `--logprob-order blockwise` | Selected-token logprobs use blockwise reduction: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), negative cross-entropy (or direct subtraction with `blockwise-direct`), for output and prompt (input) logprobs alike | logprobs only |
 | `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 (refused by `resolve_numerics` otherwise) and a kernel declaring `combine_order` with `slot`; under `--all2all-backend deepep` that kernel must also own the exchange (`supports_all_to_all_ep`) and returns the complete output of the rows this rank owns. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
 
 `rl-bitwise` folds YaRN to a CPU ramp and CUDA frequencies. The same
@@ -485,7 +485,7 @@ the original MoE layer for both precomputed and in-kernel routing.
 A returned logprob is the launch's `--logprob-order` applied to the row --
 `gather_token_logprobs` in `sampling/utils.py`, the one function both
 consumers call: `log_softmax(logits, -1, dtype=float32)` gathered at the token
-under `torch`, Megatron's vocab-parallel cross-entropy order under `megatron`
+under `torch`, fixed-width blockwise reduction under `blockwise`
 (alignment.trainer above) -- with the logits produced by the same LM-head
 route the sampler takes (`LogitsProcessor._get_logits`: quantized or dense
 GEMM, the planned batch-invariant GEMM under rl-bitwise, the TP gather, softcap). The sampler's
@@ -537,6 +537,10 @@ positions are scored by the chunk that feeds them and assembled per request
 afterwards, so chunked prefill and prefix-cache hits do not change a prompt
 logprob either -- the admission probe is capped at `logprob_start_len`
 (`scheduler.md` §1) so every scored position is actually recomputed.
+
+For bitwise agreement, `--logprob-order blockwise` uses negative cross-entropy
+and returns negative zero; `blockwise-direct` uses direct subtraction and returns
+positive zero. Both use the same reduction; `torch` is unchanged.
 
 ## Prefix hits resume at any token: KV bitwise, recurrent state within tolerance
 
@@ -659,8 +663,8 @@ The portable `block_sumexp` leaf and the vendor leaf reproducing the
 trainer's in-block order differ at ulp level, so the vendor leaf is what
 the comparison runs with.
 
-The leaf contract behind `--logprob-order megatron` is
-`tokenspeed_kernel.ops.sampling.vocab_parallel_logprobs`'s: a leaf
+The leaf contract behind `--logprob-order blockwise` is
+`tokenspeed_kernel.ops.sampling.blockwise_logprobs`'s: a leaf
 registers `("sampling", "block_sumexp")` with the signature
 `format_signatures("shifted", "dense", {torch.float32})` and the
 `batch_invariant` feature (the op requires it), is called as
@@ -689,7 +693,7 @@ model's promise and the harnesses are what keep it honest: a model declares
 either has a bug to fix, not a flag to set. Two incompatibilities are refused
 regardless of the declaration: quantized checkpoints (no batch-invariant
 quantized GEMM leaf exists, so their linears would select shape-dependent
-ones) and a vocabulary that is not a multiple of `MEGATRON_VOCAB_BLOCK`
+ones) and a vocabulary that is not a multiple of `BLOCKWISE_VOCAB_BLOCK`
 (the envelope's logprob order folds fixed blocks of it; MoE TP other than 1
 is refused by `resolve_numerics` for the same reason on the MoE side).
 
