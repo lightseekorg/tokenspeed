@@ -52,9 +52,9 @@ eager execution; no backend-private request state is introduced.
 
 ## PrimTS plan preparation
 
-The FlashInfer PrimTS adapter caches cluster occupancy by CUDA device, context,
-and cluster size. New eager layouts retain their own workspace plans and route
-offsets while sharing the hardware capacity query. This keeps CuTe's
+FlashInfer PrimTS caches cluster occupancy by CUDA device and cluster size.
+New eager layouts retain their own workspace plans and route offsets while
+sharing the hardware capacity query. This keeps CuTe's
 occupancy-query kernel compilation in startup and preserves the serving JIT
 checks when batch geometry changes.
 
