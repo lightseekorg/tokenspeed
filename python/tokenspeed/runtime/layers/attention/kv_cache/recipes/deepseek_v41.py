@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_WINDOW_SIZE,
     v41_dspark_field_name,
     v41_layer_mapping,
+    v41_prefill_kv_workspace_rows,
     v41_table_widths,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
@@ -319,15 +320,25 @@ class DeepseekV41Recipe(CacheRecipe):
         selections = queries * ((2048 + 2 * 512 + 128) * 8 + rows.swa_row_bytes)
         local_heads = spec.num_attention_heads // spec.attn_tp_size
         padded_heads = 64 if local_heads <= 64 else 128
-        query_tile = min(queries, V41_PREFILL_QUERY_TILE)
-        # Native Q and output coexist for one tile. Previous tiles release the
-        # padded result after copying their real heads into the final output.
-        native_attention = 2 * query_tile * padded_heads * V41_HEAD_DIM * 2
         real_output = queries * local_heads * V41_HEAD_DIM * 2
-        # One request at a time shares its prefix/current/global BF16 workspace.
-        # The ratio-1 group is the upper bound for any compressed history.
+        if local_heads == padded_heads:
+            # A prefill batch runs as one call; its native output is the layer
+            # output, or coexists with it once when a step needs several batches.
+            native_attention = real_output
+        else:
+            # Padded Q and output coexist for one tile. Previous tiles release
+            # the padded result after copying their real heads into the output.
+            query_tile = min(queries, V41_PREFILL_QUERY_TILE)
+            native_attention = 2 * query_tile * padded_heads * V41_HEAD_DIM * 2
+        # Persistent BF16 workspace of batched prefill attention: each batch's
+        # owner histories and SWA keys, sized for a few worst-case requests.
         compact_kv = (
-            (self.attn_config.context_len + queries + max_bs * V41_WINDOW_SIZE)
+            v41_prefill_kv_workspace_rows(
+                self.attn_config.context_len,
+                queries,
+                spec.kv_owners,
+                spec.compress_ratios,
+            )
             * V41_HEAD_DIM
             * 2
         )

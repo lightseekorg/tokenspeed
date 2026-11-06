@@ -1053,7 +1053,8 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         + queries * 512 * 4
         + 2 * queries * 64 * 512 * 2
         + queries * 2 * 512 * 2
-        + (config.context_len + queries + config.max_bs * 128) * 512 * 2
+        # Batched prefill KV workspace: four worst-case ratio-1 requests.
+        + 4 * (config.context_len + 128 + queries) * 512 * 2
         + queries * (512 * 2 + (128 + 512) * 4)
         + queries * 32 * (128 * 2 + 68)
         + queries * 24 * (512 + 128) * 12
@@ -1730,6 +1731,164 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
         for_graph_replay=False,
     )
     assert backend.sparse_topk.prefill is None and backend.sparse_topk.decode is None
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batched_prefill_attention_matches_per_request_batches(monkeypatch):
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    backend = _backend("cuda", 2)
+    tables = _tables("cuda")
+    meta = _extend(backend, tables, [17, 3], [0, 0], [0, 0], _final([17, 3], [0, 0]))
+    torch.manual_seed(13)
+    n = meta.positions.numel()
+    for owner in (2, 20):
+        main = torch.randn(n, 512, device="cuda", dtype=torch.bfloat16)
+        backend.write_global(
+            owner,
+            main,
+            torch.randn(n, 128, device="cuda", dtype=torch.bfloat16),
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.EXTEND,
+            main_rope_cache=None,
+        )
+    iq = torch.randn(n, 2, 128, device="cuda", dtype=torch.bfloat16)
+    iw = torch.rand(n, 2, device="cuda", dtype=torch.bfloat16)
+    sink = torch.tensor([0.3, -0.7], device="cuda", dtype=torch.float32)
+    # Layer 21 reads a reordered row subset of layer 20's selection.
+    pick = torch.tensor([18, 16, 4], device="cuda")
+    layers = ((0, None), (20, None), (21, pick))
+    q = {
+        i: torch.randn(n, 2, 512, device="cuda", dtype=torch.bfloat16)
+        for i, _ in layers
+    }
+    swa = {
+        i: torch.randn(n, 512, device="cuda", dtype=torch.bfloat16) for i, _ in layers
+    }
+    calls = []
+    real = dsv41.selected_attention
+
+    def counting(*args, **kwargs):
+        calls.append(args[0].shape[0])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dsv41, "selected_attention", counting)
+
+    def run(rows_budget):
+        backend._prefill_kv_rows = rows_budget
+        backend._prefill_layouts.clear()
+        calls.clear()
+        outs = []
+        for layer, rows in layers:
+            rows = slice(None) if rows is None else rows
+            outs.append(
+                backend.forward_v41(
+                    q[layer][rows],
+                    swa[layer][rows],
+                    layer_id=layer,
+                    positions=meta.positions[rows],
+                    request_indices=meta.request_indices[rows],
+                    forward_mode=ForwardMode.EXTEND,
+                    index_q=iq if layer == 20 else None,
+                    index_weights=iw if layer == 20 else None,
+                    attn_sink=sink,
+                    softmax_scale=512**-0.5,
+                    index_process_group=None,
+                    swa_rope_cache=None,
+                    swa_norm_weight=None,
+                    swa_norm_eps=0.0,
+                    key_rows=None,
+                )
+            )
+        return outs, list(calls)
+
+    # Layer 0 (SWA only) needs 17 + 3 rows. Layer 20: request 0 needs 17
+    # history + 17 SWA rows, request 1 needs 3 + 3. Layer 21's subset holds
+    # request 1 (row 18: 2 history + 2 SWA) then request 0 (rows 16 and 4:
+    # 17 history + 15 old + 2 step SWA). 34 rows split layers 20 and 21 per
+    # request; 40 rows run every layer as one batch.
+    separate, separate_calls = run(34)
+    together, together_calls = run(40)
+    assert separate_calls == [20, 17, 3, 1, 2]
+    assert together_calls == [20, 20, 3]
+    for got, want in zip(together, separate, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batched_prefill_reuses_owner_history_until_global_write():
+    backend = _backend("cuda", 2)
+    tables = _tables("cuda")
+    meta = _extend(backend, tables, [17, 3], [0, 0], [0, 0], _final([17, 3], [0, 0]))
+    torch.manual_seed(17)
+    n = meta.positions.numel()
+
+    def write(seed):
+        torch.manual_seed(seed)
+        main = torch.randn(n, 512, device="cuda", dtype=torch.bfloat16)
+        backend.write_global(
+            20,
+            main,
+            torch.randn(n, 128, device="cuda", dtype=torch.bfloat16),
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.EXTEND,
+            main_rope_cache=None,
+        )
+
+    iq = torch.randn(n, 2, 128, device="cuda", dtype=torch.bfloat16)
+    iw = torch.rand(n, 2, device="cuda", dtype=torch.bfloat16)
+    sink = torch.tensor([0.3, -0.7], device="cuda", dtype=torch.float32)
+    q = {
+        i: torch.randn(n, 2, 512, device="cuda", dtype=torch.bfloat16) for i in (20, 21)
+    }
+    swa = {
+        i: torch.randn(n, 512, device="cuda", dtype=torch.bfloat16) for i in (20, 21)
+    }
+
+    def run(layer):
+        return backend.forward_v41(
+            q[layer],
+            swa[layer],
+            layer_id=layer,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=iq if layer == 20 else None,
+            index_weights=iw if layer == 20 else None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            key_rows=None,
+        )
+
+    write(1)
+    run(20)
+    reused = run(21)
+    # Layer 21 reads layer 20's history from the workspace, not the cache:
+    # clobbering the cache behind the backend's back leaves it unchanged,
+    # while a forced gather sees the clobbered rows.
+    saved = backend.cache_pool.global_kv(20).clone()
+    backend.cache_pool.global_kv(20).zero_()
+    torch.testing.assert_close(run(21), reused, rtol=0, atol=0)
+    backend._prefill_kv_batch = None
+    assert not torch.equal(run(21), reused)
+    backend.cache_pool.global_kv(20).copy_(saved)
+    backend._prefill_kv_batch = None
+    torch.testing.assert_close(run(21), reused, rtol=0, atol=0)
+    # A global write makes the held history stale: the next layer gathers
+    # the new rows, matching a forced gather.
+    write(2)
+    rewritten = run(21)
+    backend._prefill_kv_batch = None
+    torch.testing.assert_close(run(21), rewritten, rtol=0, atol=0)
+    assert not torch.equal(rewritten, reused)
     torch.cuda.synchronize()
 
 
