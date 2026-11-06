@@ -43,7 +43,7 @@ import torch.multiprocessing as mp
 WORLD = 4
 HIDDEN = 8
 # Vocabulary per order: a small one for torch's log-softmax, two trainer
-# blocks for the megatron fold (which needs a block multiple). Sharded over
+# blocks for the blockwise fold (which needs a block multiple). Sharded over
 # the four ranks' heads either way.
 VOCABS = {"torch": 64, "blockwise": 2 * 32768}
 
