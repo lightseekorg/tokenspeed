@@ -34,7 +34,7 @@ import torch.multiprocessing as mp
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="runtime-2gpu")
+register_cuda_ci(est_time=180, suite="runtime-2gpu")
 
 
 def _candidate_inputs(rank, rows, width, phase):

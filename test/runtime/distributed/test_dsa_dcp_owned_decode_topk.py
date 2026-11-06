@@ -53,7 +53,7 @@ import torch.multiprocessing as mp
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="runtime-2gpu")
+register_cuda_ci(est_time=45, suite="runtime-2gpu")
 
 _HEADS, _DIM, _TOPK, _PAGE, _BLOCK, _Q_LEN = 32, 128, 2048, 64, 128, 4
 _COLUMNS = 512

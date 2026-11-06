@@ -44,7 +44,7 @@ from tokenspeed_kernel.platform import current_platform
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=300, suite="runtime-1gpu")
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and current_platform().is_cdna4),
