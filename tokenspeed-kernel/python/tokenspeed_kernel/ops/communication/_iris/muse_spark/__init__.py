@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_fused_lamport_allreduce_routed_rmsnorm_sum,
     iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
+    iris_fused_routed_rmsnorm_sum_lamport_allgather,
     iris_routed_rmsnorm_weighted_sum_write_through,
 )
 from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
@@ -102,7 +103,10 @@ class MuseIrisState:
     """Compose prepared generic collectives and the model's boundary storage.
 
     All layers reuse these buffers in stream order. Reductions and gathers can
-    return borrowed activations; a consumer must finish before the next write.
+    return borrowed activations. No borrowed producer-buffer or pull-scratch
+    view, nor the ready flags guarding it, may be live across an ordinary
+    reduction on the group, including one the backend runs for another
+    caller through ProducerAllReduce.reduce_ordinary.
     The generic all-reduce retains its independent-output contract.
     Expert TP and EP use the same owned-row token cutoffs; each owner
     holds ceil(global rows / world size) rows, with padding masked.
@@ -210,6 +214,19 @@ class MuseIrisState:
         )
         # Expert TP stages raw routes separately from the producer buffer.
         self.owned_route_max_rows = owned_route_max_rows
+        # Expert TP8 completes routes on token owners, normalizes there and
+        # gathers the 8x smaller sums once the route all-reduce outgrows the
+        # Lamport two-shot (44 rows). Below that the all-reduce plus replicated
+        # norm stays faster (measured in 8-rank graph replay on MI350X). The
+        # start is tied to the two-shot capacity on purpose:
+        # retuning LAMPORT_TWO_SHOT_MAX_ELEMENTS means re-measuring it.
+        self.route_scatter_min_rows: int | None = (
+            self.reduction.lamport_two_shot_max_numel
+            // (_MUSE_TOPK * _MUSE_ROUTE_WIDTH)
+            + 1
+            if self.reduction.lamport_two_shot_max_numel
+            else None
+        )
         self.owned_route_input = (
             peers.ctx.empty(
                 (owned_route_max_rows, _MUSE_TOPK, _MUSE_ROUTE_WIDTH),
@@ -240,7 +257,14 @@ class MuseIrisState:
         )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy."""
+        """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy.
+
+        The policy is ProducerAllReduce.reduce_ordinary, the same one the
+        backend uses for ordinary all-reduces on this group. Payloads past the
+        producer buffer are reduced in capacity-sized chunks. Views of this
+        state's symmetric storage, and unaligned views, which it declines,
+        take run directly.
+        """
         numel = tensor.numel()
         assert tensor.dtype == self.all_reduce.dtype and tensor.is_contiguous()
         capacity = self.all_reduce.producer_direct_max_numel
@@ -250,6 +274,9 @@ class MuseIrisState:
         flat = tensor.view(-1)
         for begin in range(0, numel, capacity):
             chunk = flat[begin : begin + capacity]
+            if self.reduction.can_reduce_ordinary(chunk, rccl_fallback=False):
+                self.reduction.reduce_ordinary(chunk)
+                continue
             reduced = self.reduction.run(chunk, chunk, chunk.numel())
             if reduced.data_ptr() != chunk.data_ptr():
                 chunk.copy_(reduced[: chunk.numel()])
@@ -608,6 +635,30 @@ class MuseIrisState:
             WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
+
+    def all_gather_owned_stream_bf16(
+        self, stream: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        """Round each rank's FP32 residual rows to BF16 and gather full rows.
+
+        The rounded rows are written straight into pull scratch, so the
+        gather skips the staging copy it makes for a separate BF16 tensor.
+        ``stream`` must not alias pull scratch. Returns independent
+        ``[rows, 8192]`` BF16 storage.
+        """
+        assert self.can_use_owned_rows(rows)
+        local_rows = triton.cdiv(rows, self.world_size)
+        assert stream.shape == (local_rows, _MUSE_BOUNDARY_WIDTH)
+        assert stream.dtype == torch.float32 and stream.is_contiguous()
+        assert stream.device == self.all_reduce.device
+        staging = self.all_reduce.producer_pull.scratch[: stream.numel()]
+        begin, size = staging.data_ptr(), staging.numel() * staging.element_size()
+        assert (
+            stream.data_ptr() + stream.numel() * stream.element_size() <= begin
+            or begin + size <= stream.data_ptr()
+        ), "the FP32 stream must not alias its BF16 staging"
+        staging = staging.view(local_rows, _MUSE_BOUNDARY_WIDTH).copy_(stream)
+        return self.all_gather_owned_rows(staging, rows, False)
 
     def gather_owned_moe_inputs(
         self,
@@ -1152,6 +1203,132 @@ class MuseIrisState:
         )
         return self.gather.output[: num_tokens * width].view(num_tokens, width)
 
+    def can_reduce_scatter_routed_rmsnorm_sum_all_gather(self, rows: int) -> bool:
+        """Whether expert TP8 completes ``rows`` tokens' routes on their owners.
+
+        Depends only on the row count and prepared capacity, so every rank
+        decides alike; a producer may then write into
+        ``acquire_owned_route_input`` before the reduction.
+        """
+        return (
+            self.world_size == 8
+            and self.reduction.lamport_region is not None
+            and self.route_scatter_min_rows is not None
+            and self.route_scatter_min_rows <= rows < _MUSE_OWNED_MIN_ROWS
+            and rows <= self.owned_route_max_rows
+            and triton.cdiv(rows, self.world_size) * _MUSE_ROUTE_WIDTH
+            <= self.reduction.lamport_max_numel
+        )
+
+    def reduce_scatter_routed_rmsnorm_sum_all_gather(
+        self,
+        routes: torch.Tensor,
+        rows: int,
+        route_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+    ) -> torch.Tensor:
+        """Sum expert TP routes on token owners, normalize there, gather the sums.
+
+        ``routes`` holds this rank's canonical partial routes
+        ``[rows * 8, 4096]``, ideally written into ``acquire_owned_route_input``.
+        ``reduce_scatter_owned_routes`` completes each owner's
+        ceil(rows / 8) tokens; the owner applies the routed RMSNorm and
+        weighted sum in the portable path's order (equal up to BF16
+        rounding) and the BF16 ``[rows, 4096]`` sums are gathered through
+        the Lamport one-shot mailbox into independent storage.
+        """
+        assert self.can_reduce_scatter_routed_rmsnorm_sum_all_gather(rows)
+        assert route_weights.shape == (rows, _MUSE_TOPK)
+        assert route_weights.dtype == torch.float32 and route_weights.is_contiguous()
+        assert norm_weight.shape == (_MUSE_ROUTE_WIDTH,)
+        assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
+        assert all(
+            value.device == self.all_reduce.device
+            for value in (route_weights, norm_weight)
+        )
+        owned = self.reduce_scatter_owned_routes(routes, None, rows)
+        output = torch.empty(
+            (rows, _MUSE_ROUTE_WIDTH),
+            dtype=torch.bfloat16,
+            device=self.all_reduce.device,
+        )
+        self._launch_route_sum_gather(
+            owned,
+            route_weights,
+            norm_weight,
+            output,
+            rows,
+            eps,
+            weight_offset,
+            compile_only=False,
+        )
+        return output
+
+    def warmup_reduce_scatter_routed_rmsnorm_sum_all_gather(
+        self, norm_weight: torch.Tensor, eps: float, weight_offset: float
+    ) -> None:
+        """Compile the owner-side route norm and gather without running it.
+
+        Startup's warmup prefill takes owned rows, and decode capture may not
+        reach the row window, so the first such batch would compile it.
+        """
+        rows = self.route_scatter_min_rows
+        if rows is None or not self.can_reduce_scatter_routed_rmsnorm_sum_all_gather(
+            rows
+        ):
+            return
+        device = self.all_reduce.device
+        self._launch_route_sum_gather(
+            self.owned_route_output[: triton.cdiv(rows, self.world_size)],
+            torch.empty((rows, _MUSE_TOPK), dtype=torch.float32, device=device),
+            norm_weight,
+            torch.empty((rows, _MUSE_ROUTE_WIDTH), dtype=torch.bfloat16, device=device),
+            rows,
+            eps,
+            weight_offset,
+            compile_only=True,
+        )
+
+    def _launch_route_sum_gather(
+        self,
+        owned: torch.Tensor,
+        route_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        output: torch.Tensor,
+        rows: int,
+        eps: float,
+        weight_offset: float,
+        *,
+        compile_only: bool,
+    ) -> None:
+        kernel = iris_fused_routed_rmsnorm_sum_lamport_allgather
+        args = (
+            owned,
+            route_weights,
+            norm_weight,
+            output,
+            self.reduction.lamport_region,
+            self.reduction.lamport_epochs,
+            self.reduction.lamport_peer_addresses[: self.world_size],
+            rows,
+        )
+        options = dict(
+            RANK=self.all_reduce.rank_in_group,
+            WIDTH=_MUSE_ROUTE_WIDTH,
+            EPS=eps,
+            WEIGHT_OFFSET=weight_offset,
+            MAX_ELEMENTS=self.reduction.lamport_max_numel,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            WAIT_STORES=self._arch.wait_stores,
+            num_warps=8,
+        )
+        if compile_only:
+            kernel.warmup(*args, grid=(1,), **options)
+        else:
+            kernel[(owned.shape[0],)](*args, **options)
+
     def can_all_gather_rmsnorm_mxfp4_quant(
         self,
         local: torch.Tensor,
@@ -1163,24 +1340,43 @@ class MuseIrisState:
             or self.world_size not in (4, 8)
             or local.ndim != 2
             or local.dtype != torch.bfloat16
+            or local.device != self.all_reduce.device
             or self.all_reduce.dtype != torch.bfloat16
             or not local.is_contiguous()
             or weight.shape != (local.shape[1] * self.all_reduce.world_size,)
             or weight.dtype != local.dtype
             or weight.device != local.device
             or not weight.is_contiguous()
-            or self.all_reduce.producer.data is None
-            or self.gather.ready_flags is None
         ):
             return False
-        return local.shape[0] <= self.gather.ready_flags.shape[
-            0
-        ] and all_gather_columns_can_run(
+        # The Lamport variant is limited only by mailbox capacity; the pull
+        # variant stages rows in producer storage and needs one ready flag per
+        # row.
+        if self._lamport_gathers_rmsnorm_mxfp4(local):
+            return True
+        return (
+            self.all_reduce.producer.data is not None
+            and self.gather.ready_flags is not None
+            and local.shape[0] <= self.gather.ready_flags.shape[0]
+        ) and all_gather_columns_can_run(
             world_size=self.all_reduce.world_size,
             num_tokens=local.shape[0],
             local_hidden_size=local.shape[1],
             dtype=local.dtype,
             max_bytes=self.all_reduce.producer_direct_max_numel * local.element_size(),
+        )
+
+    def _lamport_gathers_rmsnorm_mxfp4(self, local: torch.Tensor) -> bool:
+        """Whether the gather-and-quantize takes the Lamport mailbox variant."""
+        rows, local_width = local.shape
+        total_width = local_width * self.world_size
+        return (
+            self.reduction.lamport_region is not None
+            and self.reduction.lamport_epochs is not None
+            and local_width % 512 == 0
+            and triton.next_power_of_2(total_width) == total_width
+            and total_width % 1024 == 0
+            and rows * local_width <= self.reduction.lamport_max_numel
         )
 
     def all_gather_rmsnorm_mxfp4_quant(
@@ -1193,8 +1389,6 @@ class MuseIrisState:
         """Gather feature shards and return normalized MXFP4 rows."""
         if not self.can_all_gather_rmsnorm_mxfp4_quant(local, weight):
             raise RuntimeError("unsupported Iris gather-and-MXFP4 fusion")
-        assert self.all_reduce.producer.data is not None
-        assert self.gather.ready_flags is not None
         rows, local_width = local.shape
         from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
             empty_swizzled_cdna4_mxfp4_scale,
@@ -1202,24 +1396,12 @@ class MuseIrisState:
 
         total_width = local_width * self.world_size
         packed = torch.empty(
-            (rows, total_width // 2),
-            dtype=torch.uint8,
-            device=self.all_reduce.producer.data.device,
+            (rows, total_width // 2), dtype=torch.uint8, device=local.device
         )
         scales = empty_swizzled_cdna4_mxfp4_scale(
-            rows,
-            total_width // 32,
-            device=self.all_reduce.producer.data.device,
+            rows, total_width // 32, device=local.device
         )
-        block_k = triton.next_power_of_2(total_width)
-        if (
-            self.reduction.lamport_region is not None
-            and self.reduction.lamport_epochs is not None
-            and local_width % 512 == 0
-            and block_k == total_width
-            and total_width % 1024 == 0
-            and rows * local_width <= self.reduction.lamport_max_numel
-        ):
+        if self._lamport_gathers_rmsnorm_mxfp4(local):
             if local.data_ptr() % 4:
                 # Rank-local fallback could split ranks across protocols.
                 raise ValueError(
@@ -1248,6 +1430,8 @@ class MuseIrisState:
                 num_warps=1,
             )
             return packed, scales
+        assert self.all_reduce.producer.data is not None
+        assert self.gather.ready_flags is not None
         iris_fused_pull_allgather_rmsnorm_mxfp4[(rows,)](
             local,
             self.all_reduce.producer.data,
@@ -1263,7 +1447,7 @@ class MuseIrisState:
             weight_offset=weight_offset,
             scale_stride_linear=scales.stride(0),
             scale_stride_mblock=scales.stride(1),
-            block_k=block_k,
+            block_k=triton.next_power_of_2(total_width),
             input_published=(
                 rows == 1
                 and local.data_ptr()
