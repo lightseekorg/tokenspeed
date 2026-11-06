@@ -124,6 +124,14 @@ def test_installed_flashinfer_lists_the_pinned_tiles():
         fi.flashinfer_tgv_decode_gemm(x[:, ::2], w[:, ::2], None, tgv.tactics[TILE16])
 
 
+def test_pinned_tiles_start_where_the_joint_path_ends():
+    # select_tgv_decode_tile pins its lower row bound instead of reading
+    # BF16_GEMM_MAX_M, which follows the host GPU. On SM100 and SM103 the two
+    # agree, so mm() hands every row count above the joint FlashInfer path to
+    # the tile policy.
+    assert fi.TGV_DECODE_MIN_M == fi.BF16_GEMM_MAX_M
+
+
 @pytest.mark.parametrize(
     "m,n,k,routed",
     [

@@ -88,9 +88,10 @@ On SM100 and SM103, `mm` runs a BF16 GEMM on one pinned FlashInfer TGV tile
 instead of cuBLASLt when all of these hold:
 
 - no bias, BF16 output, and no plan, `solution`, override, scales or `alpha`;
-- `BF16_GEMM_MAX_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows,
-  `mm` takes FlashInfer's joint BF16 GEMM (`flashinfer_bf16_gemm`) instead, in
-  which FlashInfer's tuner chooses among its TGV and CuTe DSL tactics;
+- `TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows
+  (`BF16_GEMM_MAX_M` on SM100 and SM103), `mm` takes FlashInfer's joint BF16
+  GEMM (`flashinfer_bf16_gemm`) instead, in which FlashInfer's tuner chooses
+  among its TGV and CuTe DSL tactics;
 - `TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K` (2048 <= K <= 3072; below);
 - this rank's weight takes at most `TGV_DECODE_MAX_WEIGHT_BYTES` (16 MiB);
 - one of the pinned tiles covers the GEMM in one wave (below);

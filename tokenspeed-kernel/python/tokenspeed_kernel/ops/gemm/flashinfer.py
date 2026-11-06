@@ -944,7 +944,7 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 # ===-----------------------------------------------------------------------===#
 #
 # With PDL and before serving, mm() runs a bias-free BF16 GEMM with
-# BF16_GEMM_MAX_M < M <= TGV_DECODE_MAX_M rows and
+# TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M rows and
 # TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K on a weight of at most
 # TGV_DECODE_MAX_WEIGHT_BYTES with one TGV tile instead of cuBLASLt. Under
 # PDL, TGV's weight-load warp fills its shared-memory stages while the
@@ -960,6 +960,11 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 # tiles call directly, outside the tuner. The GPU tests capture and replay
 # each tile, alone and in a chain of PDL kernels.
 
+# The policy routes rows above TGV_DECODE_MIN_M, the joint FlashInfer path's
+# bound on SM100 and SM103 (BF16_GEMM_MAX_M there; the GPU tests check that
+# they agree). BF16_GEMM_MAX_M itself follows the host GPU, 4 on SM107, so the
+# policy keeps its own bound and depends only on its arguments.
+TGV_DECODE_MIN_M = 32
 TGV_DECODE_MAX_M = 512
 TGV_DECODE_MAX_WEIGHT_BYTES = 16 << 20
 # Measured on GB300 against cuBLASLt in a captured PDL chain (an RMSNorm, then
@@ -1027,7 +1032,7 @@ def select_tgv_decode_tile(
 
     Returns:
         With PDL on SM100 and SM103, for
-        ``BF16_GEMM_MAX_M < m <= TGV_DECODE_MAX_M``,
+        ``TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M``,
         ``TGV_DECODE_MIN_K <= k <= TGV_DECODE_MAX_K`` and
         ``weight_bytes <= TGV_DECODE_MAX_WEIGHT_BYTES``, the first tile of
         :data:`TGV_DECODE_TILES` whose grid has at most ``sm_count`` CTAs. TGV
@@ -1037,7 +1042,7 @@ def select_tgv_decode_tile(
     if (
         not pdl
         or arch not in _CUTE_DSL_SM100_ARCHS
-        or not BF16_GEMM_MAX_M < m <= TGV_DECODE_MAX_M
+        or not TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M
         or not TGV_DECODE_MIN_K <= k <= TGV_DECODE_MAX_K
         or weight_bytes > TGV_DECODE_MAX_WEIGHT_BYTES
     ):
@@ -1224,7 +1229,7 @@ def warm_tgv_decode_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
         return
     # The fewest rows routed. Fewer rows never need a larger grid, so if
     # they get no tile, no row count does.
-    m = BF16_GEMM_MAX_M + 1
+    m = TGV_DECODE_MIN_M + 1
     if (
         select_tgv_decode_tile(
             m=m,

@@ -71,9 +71,10 @@ def select(m, n, k=2560, *, arch=SM100, sm_count=148, pdl=True):
 
 @pytest.mark.parametrize("arch", [SM100, SM103])
 def test_rows_above_the_joint_bound_up_to_512_are_routed(arch):
+    assert (fi.TGV_DECODE_MIN_M, fi.TGV_DECODE_MAX_M) == (32, 512)
     # A 512-row router weight: 8 CTAs of 64 rows, so every row count fits.
-    assert select(fi.BF16_GEMM_MAX_M, 512, arch=arch) is None
-    assert select(fi.BF16_GEMM_MAX_M + 1, 512, arch=arch) == TILE16
+    assert select(fi.TGV_DECODE_MIN_M, 512, arch=arch) is None
+    assert select(fi.TGV_DECODE_MIN_M + 1, 512, arch=arch) == TILE16
     assert select(fi.TGV_DECODE_MAX_M, 512, arch=arch) == TILE32
     assert select(fi.TGV_DECODE_MAX_M + 1, 512, arch=arch) is None
 
@@ -179,7 +180,7 @@ def test_tile_only_grows_with_rows(n, sm_count):
     order = [*fi.TGV_DECODE_TILES, None]
     steps = [
         order.index(select(m, n, sm_count=sm_count))
-        for m in range(fi.BF16_GEMM_MAX_M + 1, fi.TGV_DECODE_MAX_M + 1)
+        for m in range(fi.TGV_DECODE_MIN_M + 1, fi.TGV_DECODE_MAX_M + 1)
     ]
     assert steps == sorted(steps)
 
