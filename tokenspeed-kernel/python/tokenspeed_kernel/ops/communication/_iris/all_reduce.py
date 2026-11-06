@@ -692,7 +692,8 @@ def _iris_lamport_push(
     Each ``program`` (a sender index, uniform per program) starts at a
     different peer so that concurrent stores spread across all links instead
     of all targeting RANK + 1 first. One uniform branch selects the order, so
-    peer bases stay scalar constants.
+    peer bases stay scalar constants. Every caller, the Kimi-K3 gather senders
+    included, passes its own program index (``gl.program_id(0)`` today).
     """
     rotation = program % (WORLD_SIZE - 1)
     for first in gl.static_range(WORLD_SIZE - 1):
