@@ -1470,7 +1470,7 @@ to `mha_decode_with_kvcache`, which then selects
   fewest whose work items fit 512 (two per CU), at least 2 and at most 128
   splits per request; a padding request takes one. The grid holds at most
   max(512, one per row block) items; positions past the last item exit.
-- A work-group finds its request by comparing its slot with 64 requests' first
+- A workgroup finds its request by comparing its slot with 64 requests' first
   slots per round of vector loads, and items run in XCD-contiguous order
   (`_remap_xcd`), so the row blocks of a slot, which read the same pages, share
   one XCD's L2. Splits are bounded by the live `cache_seqlens` and a request's
@@ -1481,14 +1481,13 @@ to `mha_decode_with_kvcache`, which then selects
 - The reduce finds a row's partials from its request's first slot and split
   count, stored next to each other, and loads them 16 bytes per lane in one
   tile of 16 or 64 splits. A row without keys merges to its sink alone.
-- The choice is by shape only: calls whose rows of one KV head take a
-  multi-wave work-group (e.g. speculative verify) take the schedule. There it
+- The choice is by shape only: calls whose rows of one KV head take a multi-wave
+  workgroup (for example, speculative verify) take the schedule. There it
   matched or beat the split grid at every batch (1-64 requests) and length
-  (8k-190k, uniform and mixed) measured on MI355X, counting the 4-7 us
-  schedule once per step; one-wave work-groups (plain decode) lost up to
-  ~20% on uniform batches of 4 or more requests and keep the split grid.
-  Batch sizes and lengths are runtime values: the kernels compile once per
-  layer shape.
+  (8k-190k, uniform and mixed) measured on MI355X, counting the 4-7 us schedule
+  once per step; one-wave workgroups (plain decode) lost up to ~20% on uniform
+  batches of 4 or more requests and keep the split grid. Batch sizes and lengths
+  are runtime values: the kernels compile once per layer shape.
 
 ### gfx950 MHA prefill
 
@@ -1509,10 +1508,10 @@ KV cache, and `gluon_mha_prefill_sliding_gfx950` the sliding-window variant.
 
 #### Algorithm
 
-Both kernels launch a persistent grid of 512 work-groups, each owning one
+Both kernels launch a persistent grid of 512 workgroups, each owning one
 128-row query block of one head at a time. The causal kernel gives every
-work-group a fixed batch slot, head and query slot: up to 512 / heads
-requests share a round, and the work-groups left per request become query
+workgroup a fixed batch slot, head and query slot: up to 512 / heads
+requests share a round, and the workgroups left per request become query
 slots, which take that request's query blocks in alternating directions so
 the long late blocks spread out. More requests take further rounds; in the
 last round, slots past the last request are skipped. With skip-softmax, a
@@ -1554,10 +1553,10 @@ Each workgroup owns one KV head and packs its query-head group with up to 16
 query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
 two when no request has more than 64 queries. Unused head lanes are masked.
 With head dim 64 and 16-bit K/V, 256-row tiles on eight waves (below) take
-over when each work-group streams many cached keys: under full attention a
+over when each workgroup streams many cached keys: under full attention a
 cached prefix (`max_seqlen_k - max_seqlen_q`) of at least 8192 keys; under a
 window of at least 2047 keys a prefix of at least the window and one to four
-work-groups per CU over the launch. `max_seqlen_k` should be the longest
+workgroups per CU over the launch. `max_seqlen_k` should be the longest
 request's length, as serving passes for pure extends; the context limit would
 send short-prefix extends to the slower 8-wave tile.
 Both products run on 32x32 MFMAs: depth 16 for BF16, and
@@ -1583,8 +1582,8 @@ copies. K and V pass through 4-slot LDS rings, K four pages ahead and V two.
 The running maximum moves only when a page raises it by more than 8 (base 2),
 so most pages skip the accumulator rescale, and a wave whose 32 rows all kept
 their maximum skips it with one scalar branch. A wave uses about 196 VGPRs, so
-one 8-wave work-group runs per CU; the split count therefore counts each as
-two 4-wave work-groups.
+one 8-wave workgroup runs per CU; the split count therefore counts each as
+two 4-wave workgroups.
 
 ### gfx950 MLA extend
 
