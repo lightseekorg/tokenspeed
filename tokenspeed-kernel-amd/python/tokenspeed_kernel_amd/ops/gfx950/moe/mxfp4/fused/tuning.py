@@ -72,7 +72,7 @@ _GROUPED_MOE_CONFIGS = {
 
 
 class _RouteTileStage(NamedTuple):
-    """Tile widths, prefetch depth and wave count of one route-tiled GEMM.
+    """Tile widths, prefetch depth, and wave count of one route-tiled GEMM.
 
     ``block_n`` and ``block_k`` are the output and K tile widths.
     ``prefetch_tiles`` (``PREFETCH_TILES``) is how many K tiles' loads it

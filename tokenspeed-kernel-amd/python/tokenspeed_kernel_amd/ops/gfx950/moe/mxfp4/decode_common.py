@@ -592,7 +592,7 @@ def _route_groups_from_ids(
     expert at most once, so each expert holds at most ``MAX_ROWS`` routes.
     Groups follow local expert order. Returns each route's local expert (-1
     for another rank's routes and past ``rows``), the per-expert route
-    counts, each expert's group index and the number of groups.
+    counts, each expert's group index, and the number of groups.
     """
     ROUTE_BLOCK: gl.constexpr = triton.next_power_of_2(MAX_ROWS * TOPK)
     EXPERT_PAD: gl.constexpr = triton.next_power_of_2(NUM_EXPERTS)
@@ -616,7 +616,7 @@ def _group_routes(
     group,
     BLOCK_M: gl.constexpr,
 ):
-    """Return one group's local expert, route count and padded routes.
+    """Return one group's local expert, route count, and padded routes.
 
     The routes (``[BLOCK_M]``, at least the group's count) are in route
     order, padded with the group's first route.
