@@ -352,6 +352,8 @@ class UpdateWeightsFromMooncakeReqInput(BaseReq, kw_only=True):
     # Required. The L3 namespace to publish after a successful load, or
     # ``None`` for the default ``mooncake_load_weight_version`` resolves.
     weight_version: str | None
+    # Optional publication directory for SDKs that use explicit snapshots.
+    snapshot: dict | None = None
 
 
 class UpdateWeightsFromMooncakeReqOutput(BaseReq, kw_only=True):
