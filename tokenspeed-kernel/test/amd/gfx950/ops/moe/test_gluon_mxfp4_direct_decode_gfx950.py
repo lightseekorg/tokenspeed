@@ -816,8 +816,11 @@ def _direct_route_reference(packed, scales, w13, s13, w2, s2, ids, expert_start)
 
 
 def _random_route_ids(rows: int, generator: torch.Generator) -> torch.Tensor:
-    """Distinct top-k experts per token among this rank's and the next
-    rank's experts, so tokens share some local experts and skip others."""
+    """Random distinct top-k experts per token across two ranks.
+
+    The IDs cover this rank's and the next rank's experts, so tokens share
+    some local experts and skip others.
+    """
     return (
         torch.stack(
             [
@@ -833,9 +836,11 @@ def _random_route_ids(rows: int, generator: torch.Generator) -> torch.Tensor:
 
 @pytest.mark.parametrize("rows", [4, 7, 16])
 def test_id_grouped_route_tiles_match_direct_under_replay(rows: int) -> None:
-    """Route tiles grouped from the top-k IDs keep every local route bitwise
-    equal to direct decode, including tokens that skip an expert, and a
-    captured graph regroups new IDs on replay."""
+    """ID-grouped route tiles match direct decode under graph replay.
+
+    Every local route stays bitwise equal to direct decode, including tokens
+    that skip an expert, and a captured graph regroups new IDs on replay.
+    """
     config = next(
         config
         for entries in _ROUTE_TILE_CONFIGS.values()
