@@ -388,10 +388,35 @@ def _quantize_fp8_dynamic(
         x.shape[0] if x.ndim == 2 else None,
         granularity_trait,
         scale_encoding,
+        scale_layout="token_major",
         solution=solution,
         override=override,
         required_features=required_features,
     )
+    return _run_fp8_dynamic(
+        kernel,
+        x,
+        granularity=granularity,
+        granularity_trait=granularity_trait,
+        group_size=group_size,
+        block_size=block_size,
+        scale_encoding=scale_encoding,
+        enable_pdl=enable_pdl,
+    )
+
+
+def _run_fp8_dynamic(
+    kernel: SelectedKernel,
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    granularity_trait: str,
+    group_size: int | None,
+    block_size: tuple[int, int] | list[int] | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch a quantizer ``_select_fp8_dynamic`` selected for ``x``."""
     shape_params = {
         "shape": tuple(x.shape),
         "granularity": granularity_trait,
@@ -426,6 +451,7 @@ def _select_fp8_dynamic(
     granularity_trait: str,
     scale_encoding: str,
     *,
+    scale_layout: str,
     solution: str | None,
     override: str | None,
     required_features: frozenset[str] | None = None,
@@ -433,7 +459,7 @@ def _select_fp8_dynamic(
     traits = {
         "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
-        "scale_layout": "token_major",
+        "scale_layout": scale_layout,
     }
     if rows is not None:
         # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
@@ -476,6 +502,7 @@ def select_fp8_token_quantizer(
         rows,
         "token",
         "float32",
+        scale_layout="token_major",
         solution=solution,
         override=override,
         required_features=required_features,

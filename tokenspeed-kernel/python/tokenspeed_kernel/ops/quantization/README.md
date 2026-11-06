@@ -77,8 +77,11 @@ A downstream GEMM can also skip its scale repack only when it accepts the
 native strides and encoding. In particular, it does not guarantee that
 Blackwell consumers can skip scale alignment or encoding conversion.
 
-Ordinary quantization requests token-major storage and excludes this entry
-from ranked selection. Explicit `override` selects the native entry; its
-implementation validates the supported quantization parameters. Callers
-opting in must support the returned strides. This entry does not change
-model projections or GEMM dispatch.
+Ordinary quantization requests token-major storage, which excludes this
+entry from ranked selection. The native entry is selected by an explicit
+`override`, or by a request for MN-major scales with the `mn_major_scales`
+feature; its implementation validates the supported quantization
+parameters. Callers opting in must support the returned strides.
+`block_fp8_linear` makes that request to run it in place of the canonical
+TRT-LLM quantizer before a GEMM declaring the same feature (see the GEMM
+README); GEMM dispatch is unchanged.

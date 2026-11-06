@@ -184,11 +184,15 @@ _BLOCK_FP8_TRAITS = {
 
 
 # Both registrations use one implementation. Keep the low-priority entry for
-# explicit solution selection below the automatic M=17 threshold.
+# explicit solution selection below the automatic M=17 threshold. The launcher
+# repacks activation scales into compact MN-major storage itself, so it reads
+# the native layout of trtllm_quantize_fp8_mn_major too (mn_major_scales),
+# without a copy where that layout is already compact.
 @register_kernel(
     "gemm",
     "mm",
     name="trtllm_cutedsl_mm_fp8_blockscale_large_m",
+    features={"mn_major_scales"},
     solution="trtllm_cutedsl",
     capability=_BLOCK_FP8_CAPABILITY,
     signatures=_BLOCK_FP8_SIGNATURES,
@@ -199,6 +203,7 @@ _BLOCK_FP8_TRAITS = {
     "gemm",
     "mm",
     name="trtllm_cutedsl_mm_fp8_blockscale",
+    features={"mn_major_scales"},
     solution="trtllm_cutedsl",
     capability=_BLOCK_FP8_CAPABILITY,
     signatures=_BLOCK_FP8_SIGNATURES,

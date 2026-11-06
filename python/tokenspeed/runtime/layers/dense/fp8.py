@@ -25,6 +25,7 @@
 
 import torch
 from tokenspeed_kernel.ops.gemm import (
+    block_fp8_linear,
     mm,
     prepare_mxfp8_weight_scales,
 )
@@ -43,7 +44,9 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class Fp8LinearMethod(LinearMethodBase):
-    """Load FP8 weights and execute linear layers through quantize_fp8 and mm."""
+    """Load FP8 weights and execute linear layers through quantize_fp8 and mm.
+    Block-scaled layers quantize their own activations with block_fp8_linear,
+    except with prepacked MXFP8 weight scales, where mm quantizes them."""
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
@@ -306,16 +309,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
             )
             return out if out is not None else output.view(*output_shape)
-        if block_scale is None:
-            scale_encoding = (
-                "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
-            )
-            input_2d, block_scale = quantize_fp8(
-                input_2d,
-                granularity="token_group",
-                group_size=self.quant_config.weight_block_size[1],
-                scale_encoding=scale_encoding,
-            )
         solution = None
         if global_server_args_dict["dense_gemm_backend"] in (
             "trtllm_cutedsl",
@@ -325,18 +318,31 @@ class Fp8LinearMethod(LinearMethodBase):
             128,
         ):
             solution = global_server_args_dict["dense_gemm_backend"]
-        output = mm(
-            input_2d,
-            layer.weight,
-            A_scales=block_scale,
-            B_scales=layer.weight_scale_inv,
-            bias=bias,
-            out_dtype=output_dtype,
-            quant="mxfp8",
-            block_size=self.quant_config.weight_block_size,
-            solution=solution,
-            out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
-        )
+        out_2d = out.view(-1, layer.weight.shape[0]) if out is not None else None
+        if block_scale is None:
+            output = block_fp8_linear(
+                input_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                block_size=self.quant_config.weight_block_size,
+                bias=bias,
+                out=out_2d,
+                out_dtype=output_dtype,
+                solution=solution,
+            )
+        else:
+            output = mm(
+                input_2d,
+                layer.weight,
+                A_scales=block_scale,
+                B_scales=layer.weight_scale_inv,
+                bias=bias,
+                out_dtype=output_dtype,
+                quant="mxfp8",
+                block_size=self.quant_config.weight_block_size,
+                solution=solution,
+                out=out_2d,
+            )
         return (
             out
             if out is not None

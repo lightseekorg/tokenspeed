@@ -15,6 +15,9 @@ so neither implementation module imports the package entry points.
 The contract is E4M3 A[M,K], E4M3 B[N,K], FP32 activation scales [M,K/128],
 and FP32 weight scales [N/128,K/128]. Output is BF16, accumulation is FP32.
 N and K must be divisible by 128. Scale layout copies do not change values.
+Activation scales may also be the strided view of the native MN-major storage
+that `trtllm_quantize_fp8_mn_major` returns; the launch then copies them only
+to drop the row padding of that storage.
 No E8M0 conversion or weight requantization is performed.
 
 CuTe-DSL and TVM-FFI load when this backend is first used.

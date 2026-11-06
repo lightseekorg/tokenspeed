@@ -870,6 +870,35 @@ def test_native_fp8_scales_match_canonical(
     assert captured_scales.stride() == expected_stride
 
 
+@pytest.mark.parametrize("rows", [1, 13, 32, 33, 8190])
+@pytest.mark.parametrize("columns", [256, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_canonical_trtllm_token_groups_match_mm_online_layout(
+    device: str, rows: int, columns: int, dtype: torch.dtype, require
+) -> None:
+    """block_fp8_linear selects the GEMM before this quantizer runs, from mm's
+    description of online-quantized operands: for a contiguous x with two or
+    more groups per row, contiguous 16-byte aligned E4M3 codes and unit-stride,
+    16-byte aligned FP32 scales."""
+    require("quantization", "fp8_with_scale", "trtllm", dtype, "x")
+    torch.manual_seed(3)
+    x = torch.randn(rows, columns, device=device, dtype=dtype)
+    try:
+        q, scales = quantize_fp8(
+            x,
+            granularity="token_group",
+            group_size=128,
+            override="trtllm_quantize_fp8_with_scale",
+        )
+    except RuntimeError:
+        # The op may reject a registered dtype at launch, before any GEMM.
+        pytest.skip(f"TRT-LLM token-group quantization rejects {dtype}")
+    assert q.dtype == _FP8_DTYPE and q.shape == x.shape and q.is_contiguous()
+    assert scales.dtype == torch.float32
+    assert scales.shape == (rows, columns // 128) and scales.stride(-1) == 1
+    assert q.data_ptr() % 16 == 0 and scales.data_ptr() % 16 == 0
+
+
 def test_native_fp8_quantization_rejects_pdl(device: str, require) -> None:
     require("quantization", "fp8_with_scale", "trtllm", torch.bfloat16, "x")
     x = torch.zeros(1, 256, device=device, dtype=torch.bfloat16)

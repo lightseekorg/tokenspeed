@@ -486,8 +486,13 @@ a plugin owns its own policy without changing individual execution entry points.
 The existing `gemm/mm` plan also accepts already quantized FP8 operands and
 canonical scales. Quantization stays in the caller's existing quantization
 hook; an online quantizer is not selected by a frozen GEMM plan. The ordinary
-FP8 linear method retains its original dynamic selection and has no new plan
-field or forwarding path.
+FP8 linear method keeps dynamic selection and has no plan field. When it
+quantizes its own block-scaled activations it calls `block_fp8_linear`, except
+with prepacked MXFP8 weight scales, where `mm` quantizes them. That op selects,
+on every call, the quantizer and GEMM that `quantize_fp8` followed by `mm`
+would select. Where the GEMM can be selected before quantizing, it may run
+the quantizer's declared native-scale variant, which writes the same codes and
+scales in the layout the selected GEMM reads (see the GEMM README).
 
 The original RMSNorm module may accept a preselected callable through `kernel`.
 The caller uses the existing registry selection during initialization; forward

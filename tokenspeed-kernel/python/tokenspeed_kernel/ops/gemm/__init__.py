@@ -48,7 +48,12 @@ from tokenspeed_kernel.ops.gemm._triton.kimi3 import (
     kimi3_shared_situ_projection_gemv,
 )
 from tokenspeed_kernel.ops.gemm.triton_router_gemv import fp32_router_gemv_counters
-from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.quantization import (
+    _run_fp8_dynamic,
+    _select_fp8_dynamic,
+    quantize_fp8,
+)
+from tokenspeed_kernel.ops.quantization import trtllm as trtllm_quantization
 from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
 from tokenspeed_kernel.platform import (
     Platform,
@@ -136,6 +141,8 @@ __all__ = [
     "kimi3_router_projection",
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
+    # Block-FP8 linear with dynamic activation quantization
+    "block_fp8_linear",
     # MXFP4 linear with dynamic MXFP4 activations
     "Mxfp4LinearWeight",
     "mxfp4_linear",
@@ -750,6 +757,92 @@ def mm(
         if bias is None and _use_mv(A, B):
             return mv(A, B, out)
 
+    kernel, select_dtype = _select_mm(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        out=out,
+        out_dtype=out_dtype,
+        alpha=alpha,
+        block_size=block_size,
+        quant=quant,
+        plan=plan,
+        solution=solution,
+        override=override,
+        enable_pdl=enable_pdl,
+        M=M,
+        N=N,
+        K=K,
+        b_layout=b_layout,
+    )
+    # Online activation quantization
+    if (
+        quant == "mxfp8"
+        and A_scales is None
+        and not _kernel_handles_online_mxfp8(kernel.name)
+    ):
+        assert (
+            block_size is not None
+        ), "block_size is required for online activation quantization"
+        A, A_scales = _online_quantize_mxfp8(
+            A,
+            block_size,
+            "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
+            enable_pdl=enable_pdl,
+            kernel_name=kernel.name,
+        )
+
+    # Online per-token FP8 quantization of 16-bit activations.
+    if (
+        quant == "fp8"
+        and A_scales is None
+        and A.dtype != _fp8_dtype
+        and B_scales is not None
+    ):
+        A, A_scales = quantize_fp8(A, granularity="token", enable_pdl=enable_pdl)
+
+    return _run_mm(
+        kernel,
+        A,
+        B,
+        A_scales,
+        B_scales,
+        bias=bias,
+        out=out,
+        out_dtype=out_dtype,
+        alpha=alpha,
+        block_size=block_size,
+        enable_pdl=enable_pdl,
+        select_dtype=select_dtype,
+        M=M,
+        N=N,
+        K=K,
+    )
+
+
+def _select_mm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    *,
+    out: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    alpha: torch.Tensor | None,
+    block_size: list[int] | None,
+    quant: str | None,
+    plan: KernelPlan | None,
+    solution: str | None,
+    override: str | None,
+    enable_pdl: bool,
+    M: int,
+    N: int,
+    K: int,
+    b_layout: str,
+) -> tuple[SelectedKernel, torch.dtype]:
+    """The kernel ``mm`` launches for these operands and the dtype its
+    profiling scopes name; ``mm`` has already normalized the arguments."""
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
     )
@@ -825,32 +918,29 @@ def mm(
             solution=solution,
             override=override,
         )
-    # Online activation quantization
-    if (
-        quant == "mxfp8"
-        and A_scales is None
-        and not _kernel_handles_online_mxfp8(kernel.name)
-    ):
-        assert (
-            block_size is not None
-        ), "block_size is required for online activation quantization"
-        A, A_scales = _online_quantize_mxfp8(
-            A,
-            block_size,
-            "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
-            enable_pdl=enable_pdl,
-            kernel_name=kernel.name,
-        )
+    return kernel, select_dtype
 
-    # Online per-token FP8 quantization of 16-bit activations.
-    if (
-        quant == "fp8"
-        and A_scales is None
-        and A.dtype != _fp8_dtype
-        and B_scales is not None
-    ):
-        A, A_scales = quantize_fp8(A, granularity="token", enable_pdl=enable_pdl)
 
+def _run_mm(
+    kernel: SelectedKernel,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    *,
+    bias: torch.Tensor | None,
+    out: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    alpha: torch.Tensor | None,
+    block_size: list[int] | None,
+    enable_pdl: bool,
+    select_dtype: torch.dtype,
+    M: int,
+    N: int,
+    K: int,
+) -> torch.Tensor:
+    """Launch ``mm``'s selected kernel on its final operands, then add the
+    bias unless the kernel fused it."""
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {
         "alpha": alpha,
@@ -1062,6 +1152,164 @@ def bmm(
         else:
             output = output + bias_view
     return output
+
+
+# ===-----------------------------------------------------------------------===#
+# Block-FP8 linear with dynamic activation quantization
+# ===-----------------------------------------------------------------------===#
+
+
+def block_fp8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    *,
+    block_size: list[int],
+    bias: torch.Tensor | None,
+    out: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    solution: str | None,
+) -> torch.Tensor:
+    """Quantize activations to FP8 token groups and run a block-FP8 GEMM.
+
+    Every call selects and launches the kernels that ``quantize_fp8(x,
+    granularity="token_group", group_size=block_size[1], scale_encoding=...)``
+    followed by ``mm(values, weight, A_scales=scales, B_scales=weight_scales,
+    quant="mxfp8", ...)`` launch, with the same arguments, and returns the same
+    result. When the selected quantizer has a native-scale variant and
+    ``mm``'s online-quantization description of the operands is exact for its
+    output, the GEMM is selected from that description before quantizing. If
+    that GEMM declares ``mn_major_scales`` and the registry's selection of an
+    MN-major quantizer with that feature returns the variant, the variant runs
+    instead: the same codes and scales, left in the native MN-major layout
+    that GEMM reads without the quantizer's transpose copy; the GEMM compacts
+    padded rows only when ``M % 4 != 0`` and ``K > 128``.
+
+    Args:
+        x: BF16/FP16 activations ``[M, K]``.
+        weight: E4M3 weight ``[N, K]``.
+        weight_scales: FP32 or UE8M0 (uint8) weight block scales; the
+            activations get scales of the same encoding.
+        block_size: Weight scale block ``[block_n, block_k]``; ``block_k`` is
+            the activation group size.
+        bias: Optional ``[N]`` bias.
+        out: Optional ``[M, N]`` destination with unit inner stride.
+        out_dtype: Output dtype.
+        solution: Registered solution the GEMM is restricted to, or None. The
+            quantizer is selected without restriction, as in ``quantize_fp8``.
+
+    Returns:
+        ``[M, N]`` output; ``out`` when provided.
+    """
+    group_size = block_size[1]
+    granularity_trait = f"token_group_{group_size}"
+    scale_encoding = "ue8m0" if weight_scales.dtype == torch.uint8 else "float32"
+    override = resolve_kernel_override("gemm", "mm", None)
+    enable_pdl = pdl_enabled()
+    quantizer = _select_fp8_dynamic(
+        x.dtype,
+        x.shape[0],
+        granularity_trait,
+        scale_encoding,
+        scale_layout="token_major",
+        solution=None,
+        override=None,
+    )
+    native = trtllm_quantization._NATIVE_SCALE_VARIANTS.get(quantizer.impl)
+
+    # mm's prologue for these operands.
+    B_scales = _as_2d_tensor_scale(weight_scales)
+    M = x.shape[0]
+    K = x.shape[-1]
+    b_layout = "KN" if weight.shape[0] == K else "NK"
+    N = weight.shape[-1] if b_layout == "KN" else weight.shape[0]
+    if out is not None:
+        _validate_gemm_out(
+            out,
+            shape=(M, N),
+            dtype=out_dtype,
+            device=x.device,
+            op="block_fp8_linear",
+        )
+    select_args = {
+        "out": out,
+        "out_dtype": out_dtype,
+        "alpha": None,
+        "block_size": block_size,
+        "quant": "mxfp8",
+        "plan": None,
+        "solution": solution,
+        "override": override,
+        "enable_pdl": enable_pdl,
+        "M": M,
+        "N": N,
+        "K": K,
+        "b_layout": b_layout,
+    }
+    # For online quantization mm selects as if A were contiguous, 16-byte
+    # aligned E4M3 codes with unit-stride, aligned scales. The canonical
+    # TRT-LLM quantizer returns exactly that for FP32 scales, a contiguous x
+    # and two or more groups per row (one group keeps the native scale
+    # stride), so there the GEMM is selected first. Overrides and an empty x
+    # keep quantize_fp8's order.
+    gemm_first = (
+        native is not None
+        and weight_scales.dtype == torch.float32
+        and M > 0
+        and x.is_contiguous()
+        and K >= 2 * group_size
+        and override is None
+        and resolve_kernel_override("quantization", "fp8_with_scale", None) is None
+    )
+    if gemm_first:
+        kernel, select_dtype = _select_mm(x, weight, None, B_scales, **select_args)
+        if "mn_major_scales" in KernelRegistry.get().get_by_name(kernel.name).features:
+            try:
+                selected = _select_fp8_dynamic(
+                    x.dtype,
+                    x.shape[0],
+                    granularity_trait,
+                    scale_encoding,
+                    scale_layout="mn_major",
+                    solution=None,
+                    override=None,
+                    required_features=frozenset({"mn_major_scales"}),
+                )
+            except NoKernelFoundError:
+                # Not registered for this dtype.
+                selected = None
+            if selected is not None and selected.impl is native:
+                quantizer = selected
+    A, A_scales = _run_fp8_dynamic(
+        quantizer,
+        x,
+        granularity="token_group",
+        granularity_trait=granularity_trait,
+        group_size=group_size,
+        block_size=None,
+        scale_encoding=scale_encoding,
+        enable_pdl=False,
+    )
+    A_scales = _as_2d_tensor_scale(A_scales)
+    if not gemm_first:
+        kernel, select_dtype = _select_mm(A, weight, A_scales, B_scales, **select_args)
+    return _run_mm(
+        kernel,
+        A,
+        weight,
+        A_scales,
+        B_scales,
+        bias=bias,
+        out=out,
+        out_dtype=out_dtype,
+        alpha=None,
+        block_size=block_size,
+        enable_pdl=enable_pdl,
+        select_dtype=select_dtype,
+        M=M,
+        N=N,
+        K=K,
+    )
 
 
 # ===-----------------------------------------------------------------------===#

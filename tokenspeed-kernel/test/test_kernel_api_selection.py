@@ -117,6 +117,7 @@ from tokenspeed_kernel.ops.attention.gdn import GdnChunkPrefillResult
 from tokenspeed_kernel.ops.attention.gdn import triton as _attention_triton_gdn
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel_mha
+from tokenspeed_kernel.ops.gemm import block_fp8_linear as kernel_block_fp8_linear
 from tokenspeed_kernel.ops.gemm import bmm as kernel_bmm
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32 as kernel_dsv4_linear_fp32
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
@@ -135,8 +136,14 @@ from tokenspeed_kernel.ops.transform import (
     hadamard_transform as kernel_hadamard_transform,
 )
 from tokenspeed_kernel.ops.tuning import kernel_warmup
-from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    Platform,
+    PlatformInfo,
+    pdl_enabled,
+)
+from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
 from tokenspeed_kernel.selection import (
     SelectedKernel,
@@ -144,7 +151,11 @@ from tokenspeed_kernel.selection import (
     spec_matches_shape_traits,
     spec_matches_traits,
 )
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 from utils import is_amd
 
 _ATTENTION_GLUON_MODULES = [
@@ -912,6 +923,273 @@ def test_block_fp8_online_quantization_layout(
         registry.clear_cache()
     assert calls == [expected]
     assert len(quantized) == 1 and quantized[0] is a
+
+
+def _launch_block_fp8_linear(calls, x, weight, weight_scales, **kwargs):
+    """Kernels one block_fp8_linear call launches, as the spy records them."""
+    calls.clear()
+    try:
+        kernel_block_fp8_linear(x, weight, weight_scales, **kwargs)
+    except kernel_NoKernelFoundError:
+        calls.append("NoKernelFoundError")
+    return list(calls)
+
+
+def _launch_quantize_fp8_and_mm(calls, x, weight, weight_scales, **kwargs):
+    """Kernels quantize_fp8 followed by mm launch for the same call."""
+    calls.clear()
+    block_size = kwargs["block_size"]
+    try:
+        values, scales = kernel_quantize_fp8(
+            x,
+            granularity="token_group",
+            group_size=block_size[1],
+            scale_encoding=(
+                "ue8m0" if weight_scales.dtype == torch.uint8 else "float32"
+            ),
+        )
+        kernel_mm(
+            values,
+            weight,
+            A_scales=scales,
+            B_scales=weight_scales,
+            quant="mxfp8",
+            **kwargs,
+        )
+    except kernel_NoKernelFoundError:
+        calls.append("NoKernelFoundError")
+    return list(calls)
+
+
+@pytest.mark.parametrize(
+    ("x_dtype", "out_dtype"),
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float16, torch.float16),
+        (torch.float16, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize(
+    ("platform_fixture", "solution"),
+    [
+        ("b200_platform", None),
+        ("b200_platform", "trtllm_cutedsl"),
+        ("b200_platform", "triton"),
+        ("b300_platform", None),
+        ("b300_platform", "trtllm_cutedsl"),
+        ("h100_platform", None),
+        ("h100_platform", "deepgemm"),
+        ("mi350_platform", None),
+    ],
+)
+def test_block_fp8_linear_launches_what_quantize_fp8_and_mm_select(
+    platform_fixture,
+    solution,
+    x_dtype,
+    out_dtype,
+    request,
+    monkeypatch,
+    selected_kernel_spy,
+):
+    """Every call launches the GEMM that quantize_fp8 followed by mm selects,
+    after the quantizer quantize_fp8 selects. Where mm's description of
+    online-quantized operands is exact for the canonical TRT-LLM quantizer's
+    output and no override is active, the GEMM is selected first: a call no
+    GEMM serves fails before quantizing, and the quantizer's paired
+    native-scale variant runs before a GEMM reading its layout."""
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    host_pdl = pdl_enabled()
+    registry = KernelRegistry.get()
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_supported_gpu, "supported-gpu", "gemm", "mm", "", lambda: None
+    )
+    capability = CapabilityRequirement(
+        max_arch_version=ArchVersion(10, 9), vendors=frozenset({"nvidia"})
+    )
+    canonical = partial(
+        register_kernel,
+        "quantization",
+        "fp8_with_scale",
+        name="trtllm_quantize_fp8_with_scale",
+        solution="trtllm",
+        capability=capability,
+        signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+        traits={
+            "granularity": frozenset({"token_group_128"}),
+            "scale_encoding": frozenset({"float32", "ue8m0"}),
+        },
+        priority=Priority.PERFORMANT,
+    )
+    native = partial(
+        register_kernel,
+        "quantization",
+        "fp8_with_scale",
+        name="trtllm_quantize_fp8_mn_major",
+        features={"mn_major_scales"},
+        solution="trtllm",
+        capability=capability,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "granularity": frozenset({"token_group_128"}),
+            "scale_encoding": frozenset({"float32"}),
+            "scale_layout": frozenset({"mn_major"}),
+        },
+        priority=Priority.REFERENCE,
+    )
+
+    # Stand-ins for the TRT-LLM pair, which this host may not have.
+    @canonical()
+    def canonical_quantizer(*_args, **_kwargs):
+        raise AssertionError("the spy launches kernels")
+
+    @native()
+    def native_quantizer(*_args, **_kwargs):
+        raise AssertionError("the spy launches kernels")
+
+    def plugin_quantizer(*_args, **_kwargs):
+        raise AssertionError("the spy launches kernels")
+
+    monkeypatch.setitem(
+        _quantization_trtllm._NATIVE_SCALE_VARIANTS,
+        canonical_quantizer,
+        native_quantizer,
+    )
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        # FP32 128x128 weight scales with four groups per row and with one,
+        # UE8M0 128x128 and 1x32 ones; mm reads a square weight as K x N.
+        for (n, k), scale_dtype, block_size in (
+            ((256, 512), torch.float32, [128, 128]),
+            ((512, 512), torch.float32, [128, 128]),
+            ((256, 128), torch.float32, [128, 128]),
+            ((256, 512), torch.uint8, [128, 128]),
+            ((256, 512), torch.uint8, [1, 32]),
+        ):
+            weight = torch.empty((n, k), dtype=_fp8_dtype())
+            weight_scales = torch.empty(
+                (n // block_size[0], k // block_size[1]), dtype=scale_dtype
+            )
+            # The weight off 16-byte alignment and with padded rows, and its
+            # scales off 16-byte alignment.
+            offset_weight = torch.empty(n * k + 8, dtype=_fp8_dtype())[8:].view(n, k)
+            padded_weight = torch.empty((n, k + 128), dtype=_fp8_dtype())[:, :k]
+            offset_weight_scales = torch.empty(
+                weight_scales.numel() + 1, dtype=scale_dtype
+            )[1:].view(weight_scales.shape)
+            # Both sides of the M=16/17 and 32/33 boundaries, M % 4 != 0, and
+            # empty activations.
+            for m in (0, 1, 13, 16, 17, 31, 32, 33, 512, 8190):
+                x = torch.empty((m, k), dtype=x_dtype)
+                plain = dict(
+                    x=x, weight=weight, weight_scales=weight_scales, out=None, pdl=True
+                )
+                # Selection reads the layout and 16-byte alignment of the
+                # operands and the output, and the PDL policy.
+                for change in (
+                    {},
+                    {"out": torch.empty((m, n), dtype=out_dtype)},
+                    {"out": torch.empty(m * n + 1, dtype=out_dtype)[1:].view(m, n)},
+                    {"out": torch.empty((2 * m, n), dtype=out_dtype)[::2]},
+                    # The spy writes the codes in x's layout.
+                    {"x": torch.empty((k, m), dtype=x_dtype).t()},
+                    {"x": torch.empty(m * k + 1, dtype=x_dtype)[1:].view(m, k)},
+                    {"weight": offset_weight},
+                    {"weight": padded_weight},
+                    {"weight_scales": offset_weight_scales},
+                    {"pdl": False},
+                ):
+                    call = plain | change
+                    pdl_enabled(overwrite=call["pdl"])
+                    operands = (call["x"], call["weight"], call["weight_scales"])
+                    kwargs = dict(
+                        block_size=block_size,
+                        out=call["out"],
+                        out_dtype=out_dtype,
+                        solution=solution,
+                    )
+                    for override in (
+                        None,
+                        ("GEMM_MM", "trtllm_cutedsl_mm_fp8_blockscale"),
+                        ("QUANTIZATION_FP8_WITH_SCALE", "trtllm"),
+                    ):
+                        with monkeypatch.context() as patch:
+                            if override is not None:
+                                patch.setenv(
+                                    f"TOKENSPEED_KERNEL_OVERRIDE_{override[0]}",
+                                    override[1],
+                                )
+                            expected = _launch_quantize_fp8_and_mm(
+                                calls, *operands, **kwargs
+                            )
+                            launched = _launch_block_fp8_linear(
+                                calls, *operands, bias=None, **kwargs
+                            )
+                        # Where the op selects the GEMM first, a call no GEMM
+                        # serves fails before quantizing; the native variant
+                        # takes BF16 and writes FP32 scales.
+                        if (
+                            override is None
+                            and expected[0] == "trtllm_quantize_fp8_with_scale"
+                            and scale_dtype == torch.float32
+                            and m > 0
+                            and call["x"].is_contiguous()
+                            and k >= 2 * block_size[1]
+                        ):
+                            if expected[1] == "NoKernelFoundError":
+                                expected = ["NoKernelFoundError"]
+                            elif (
+                                expected[1]
+                                in (
+                                    "trtllm_cutedsl_mm_fp8_blockscale",
+                                    "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+                                )
+                                and x_dtype == torch.bfloat16
+                            ):
+                                expected = [
+                                    "trtllm_quantize_fp8_mn_major",
+                                    expected[1],
+                                ]
+                        assert launched == expected, (
+                            n,
+                            k,
+                            block_size,
+                            m,
+                            list(change),
+                            override,
+                        )
+
+        # A plugin registered under either name of the pair is never paired.
+        x = torch.empty((33, 512), dtype=x_dtype)
+        weight = torch.empty((256, 512), dtype=_fp8_dtype())
+        weight_scales = torch.empty((2, 4), dtype=torch.float32)
+        kwargs = dict(
+            block_size=[128, 128], out=None, out_dtype=out_dtype, solution=solution
+        )
+        canonical()(plugin_quantizer)
+        assert _launch_block_fp8_linear(
+            calls, x, weight, weight_scales, bias=None, **kwargs
+        ) == _launch_quantize_fp8_and_mm(calls, x, weight, weight_scales, **kwargs)
+        canonical()(canonical_quantizer)
+        native()(plugin_quantizer)
+        expected = _launch_quantize_fp8_and_mm(
+            calls, x, weight, weight_scales, **kwargs
+        )
+        # The op selects the GEMM first here.
+        if expected == ["trtllm_quantize_fp8_with_scale", "NoKernelFoundError"]:
+            expected = ["NoKernelFoundError"]
+        assert (
+            _launch_block_fp8_linear(
+                calls, x, weight, weight_scales, bias=None, **kwargs
+            )
+            == expected
+        )
+    finally:
+        Platform.override(host_platform)
+        pdl_enabled(overwrite=host_pdl)
+        registry.clear_cache()
 
 
 def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
@@ -7228,6 +7506,28 @@ def selected_kernel_spy(monkeypatch):
         case = active_case["case"]
         assert case is not None, "selected_kernel_spy used without an active case"
         calls.append(self.name)
+
+        # A GEMM case can also launch a token-group quantizer
+        # (block_fp8_linear): return codes laid out like x and canonical
+        # scales, or a [M, K / group] view of native MN-major storage padded
+        # to 4 rows for a kernel declaring that scale layout.
+        spec = KernelRegistry.get().get_by_name(self.name)
+        if (
+            spec is not None
+            and (spec.family, spec.mode) == ("quantization", "fp8_with_scale")
+            and kwargs.get("granularity") == "token_group"
+        ):
+            x = args[0]
+            rows, groups = x.shape[0], x.shape[1] // kwargs["group_size"]
+            scale_dtype = (
+                torch.uint8 if kwargs["scale_encoding"] == "ue8m0" else torch.float32
+            )
+            if "mn_major" in spec.traits.get("scale_layout", ()):
+                scales = torch.empty((groups, (rows + 3) // 4 * 4), dtype=scale_dtype)
+                scales = scales[:, :rows].t()
+            else:
+                scales = torch.empty((rows, groups), dtype=scale_dtype)
+            return torch.empty_like(x, dtype=_fp8_dtype()), scales
 
         if case.family == "gemm":
             if case.mode == "dsv4_linear_fp32":

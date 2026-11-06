@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_fp8_blockscale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
@@ -64,6 +66,42 @@ def test_process_weights_preserves_canonical_scales(
     ).repeat_interleave(128, dim=1)
     reference = x.float() @ dequant.t()
     torch.testing.assert_close(prepared.float(), reference, atol=2e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize("m", [1, 17, 33])
+@pytest.mark.parametrize("backend", ["auto", "trtllm_cutedsl"])
+def test_apply_returns_the_quantize_fp8_and_mm_bytes(
+    m: int, backend: str, monkeypatch
+) -> None:
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", backend)
+    layer = _make_layer(256, 512)
+    method = _method()
+    method.process_weights_after_loading(layer)
+    x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
+    values, scales = quantize_fp8(x, granularity="token_group", group_size=128)
+    expected = mm(
+        values,
+        layer.weight,
+        A_scales=scales,
+        B_scales=layer.weight_scale_inv,
+        out_dtype=torch.bfloat16,
+        quant="mxfp8",
+        block_size=[128, 128],
+        solution=None if backend == "auto" else backend,
+    )
+    out = torch.empty_like(expected)
+    # The CuTe-DSL GEMM compiles its tactic on first use; below M=17 it runs
+    # only when the backend asks for it.
+    monkeypatch.setattr(launcher, "_compiled", {})
+    for actual in (
+        method.apply(layer, x),
+        method.apply(layer, x),
+        method.apply_into(layer, x, None, None, torch.bfloat16, out),
+    ):
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert bool(launcher._compiled) == (backend == "trtllm_cutedsl" or m > 16)
 
 
 @pytest.mark.parametrize("m", [1, 65, 129])

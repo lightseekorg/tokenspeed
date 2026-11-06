@@ -25,14 +25,19 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.gemm import (
+    block_fp8_linear,
+)
 from tokenspeed_kernel.ops.gemm import bmm as kernel_bmm
 from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import NoKernelFoundError, SelectedKernel
 from utils import kernel_supported, make_fp8_per_channel_gemm_operands
 
 
@@ -706,6 +711,77 @@ def test_mm_fp8_per_tensor_scale_any_rank(scale_shape) -> None:
     )
     ref = (a_q.float() * a_scale) @ (b_q.float() * b_scale)
     torch.testing.assert_close(out.float(), ref, atol=1e-1, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize(
+    "solution", [None, "trtllm_cutedsl", "flashinfer", "triton", "deepgemm"]
+)
+def test_block_fp8_linear_matches_quantize_fp8_and_mm_bytes(
+    solution: str | None, monkeypatch
+) -> None:
+    """Each call returns the bytes of quantize_fp8 followed by mm and launches
+    the same GEMM. Before a TRT-LLM CuTe-DSL GEMM, rows of two or more scale
+    groups run the native-scale TRT-LLM quantizer instead of the canonical
+    one."""
+    launched = []
+    launch = SelectedKernel.__call__
+
+    def record(self, *args, **kwargs):
+        launched.append(self.name)
+        return launch(self, *args, **kwargs)
+
+    monkeypatch.setattr(SelectedKernel, "__call__", record)
+    torch.manual_seed(0)
+    n = 384
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    for k in (128, 512):
+        weight = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
+        weight_scales = torch.rand(n // 128, k // 128, device="cuda") * 0.02 + 0.001
+        for m in (1, 13, 16, 17, 31, 32, 33, 129, 8190):
+            x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+            for with_bias, with_out in ((False, False), (True, False), (True, True)):
+                kwargs = dict(
+                    bias=bias if with_bias else None,
+                    out_dtype=torch.bfloat16,
+                    block_size=[128, 128],
+                    solution=solution,
+                )
+                launched.clear()
+                try:
+                    values, scales = quantize_fp8(
+                        x, granularity="token_group", group_size=128
+                    )
+                    expected = kernel_mm(
+                        values,
+                        weight,
+                        A_scales=scales,
+                        B_scales=weight_scales,
+                        quant="mxfp8",
+                        **kwargs,
+                    )
+                except NoKernelFoundError:
+                    with pytest.raises(NoKernelFoundError):
+                        block_fp8_linear(x, weight, weight_scales, out=None, **kwargs)
+                    continue
+                selected = list(launched)
+                launched.clear()
+                out = torch.empty_like(expected) if with_out else None
+                actual = block_fp8_linear(x, weight, weight_scales, out=out, **kwargs)
+                assert out is None or actual is out
+                assert torch.equal(
+                    actual.view(torch.int16), expected.view(torch.int16)
+                ), (k, m, with_bias, with_out)
+                native = (
+                    k > 128
+                    and selected[0] == "trtllm_quantize_fp8_with_scale"
+                    and selected[1].startswith("trtllm_cutedsl_mm_fp8_blockscale")
+                )
+                assert launched == (
+                    ["trtllm_quantize_fp8_mn_major", selected[1]]
+                    if native
+                    else selected
+                ), (k, m)
 
 
 @pytest.mark.parametrize(

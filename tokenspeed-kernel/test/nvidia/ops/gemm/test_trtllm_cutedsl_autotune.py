@@ -24,13 +24,15 @@ from pathlib import Path
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.gemm import block_fp8_linear, mm
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     load_autotune_cache,
     save_autotune_cache,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import SelectedKernel
 
 if current_platform().is_blackwell:
     from flashinfer.autotuner import AutoTuner
@@ -179,6 +181,94 @@ def test_fp8_all_tactics_preserve_values_and_graph(monkeypatch):
             torch.cuda.synchronize()
             torch.testing.assert_close(actual, -expected, atol=1e-4, rtol=1e-2)
             inputs[0].copy_((-inputs[0].float()).to(inputs[0].dtype))
+
+
+@torch.inference_mode()
+def test_fp8_all_tactics_read_native_mn_major_activation_scales(monkeypatch):
+    """Every candidate gives the same bytes for activation scales in the
+    native storage of trtllm_quantize_fp8_mn_major ([K/128, M rounded up to
+    4], read as an [M, K/128] view), the layout its mn_major_scales feature
+    promises, and reuses the tactic compiled for canonical scales."""
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise.runner import BlockwiseGemmRunner
+    from utils import assert_no_cute_compile
+
+    monkeypatch.setattr(launcher, "_compiled", {})
+    runner = BlockwiseGemmRunner()
+    # One scale group, padded rows with several groups (copied), and M % 4 == 0.
+    for m, n, k in ((1, 384, 128), (13, 384, 256), (17, 384, 512), (32, 512, 256)):
+        inputs = _inputs(m, n, k)
+        a, b, sa, sb, _ = inputs
+        # NaN padding fails the comparison if a kernel reads it.
+        native = torch.full((k // 128, (m + 3) // 4 * 4), float("nan"), device="cuda")
+        native[:, :m] = sa.t()
+        mn_major = native[:, :m].t()
+        for tactic in runner.get_valid_tactics(inputs, None):
+            expected = runner(inputs, tactic=tactic).clone()
+            out = torch.empty_like(expected)
+            with assert_no_cute_compile():
+                actual = runner([a, b, mn_major, sb, out], tactic=tactic)
+                assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    runner([a, b, mn_major, sb, out], tactic=tactic)
+                a.copy_((-a.float()).to(a.dtype))
+                graph.replay()
+                torch.cuda.synchronize()
+            expected = runner(inputs, tactic=tactic)
+            assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+            a.copy_((-a.float()).to(a.dtype))
+
+
+@torch.inference_mode()
+def test_block_fp8_linear_graph_replays_the_native_scale_quantizer(monkeypatch):
+    """After a warm-up call, later calls and their CUDA graph replay run the
+    native-scale TRT-LLM quantizer before this GEMM without compiling, and
+    match quantize_fp8 followed by mm."""
+    from utils import assert_no_cute_compile
+
+    launched = []
+    launch = SelectedKernel.__call__
+
+    def record(self, *args, **kwargs):
+        launched.append(self.name)
+        return launch(self, *args, **kwargs)
+
+    monkeypatch.setattr(SelectedKernel, "__call__", record)
+    torch.manual_seed(1639)
+    n, k = 384, 512
+    weight = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
+    weight_scales = torch.rand(n // 128, k // 128, device="cuda") * 0.02 + 0.001
+    kwargs = dict(
+        bias=None,
+        out=None,
+        out_dtype=torch.bfloat16,
+        block_size=[128, 128],
+        solution="trtllm_cutedsl",
+    )
+    for m in (1, 13, 17, 32, 33, 8190):
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        block_fp8_linear(x, weight, weight_scales, **kwargs)
+        with assert_no_cute_compile():
+            block_fp8_linear(x, weight, weight_scales, **kwargs)
+            graph = torch.cuda.CUDAGraph()
+            launched.clear()
+            with torch.cuda.graph(graph):
+                actual = block_fp8_linear(x, weight, weight_scales, **kwargs)
+            assert launched[0] == "trtllm_quantize_fp8_mn_major", (m, launched)
+            x.copy_(torch.randn_like(x))
+            graph.replay()
+            torch.cuda.synchronize()
+        values, scales = quantize_fp8(x, granularity="token_group", group_size=128)
+        expected = mm(
+            values,
+            weight,
+            A_scales=scales,
+            B_scales=weight_scales,
+            quant="mxfp8",
+            **{key: value for key, value in kwargs.items() if key != "out"},
+        )
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16)), m
 
 
 @torch.inference_mode()

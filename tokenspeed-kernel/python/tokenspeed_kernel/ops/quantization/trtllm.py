@@ -19,6 +19,8 @@
 # SOFTWARE.
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from tokenspeed_kernel._optional import has_trtllm_kernel
 from tokenspeed_kernel.platform import (
@@ -32,6 +34,12 @@ from tokenspeed_kernel.signature import format_signatures
 platform = current_platform()
 _HAS_TRTLLM_KERNEL = platform.is_nvidia and has_trtllm_kernel()
 __all__ = []
+# Canonical quantizer -> its native-scale variant, which writes the same codes
+# and scale values but returns the native MN-major scale storage.
+# block_fp8_linear may run the variant before a GEMM declaring the
+# mn_major_scales feature. Keyed by implementation, so a plugin registered
+# under either name is never paired.
+_NATIVE_SCALE_VARIANTS: dict[Callable, Callable] = {}
 
 
 def _per_token_group_quant_8bit(
@@ -169,6 +177,10 @@ if _HAS_TRTLLM_KERNEL:
         # Preserve the native M stride; padding depends on the TRT-LLM ABI.
         # Consumers may still need to align or repack these scales.
         return q, scale.t()
+
+    _NATIVE_SCALE_VARIANTS[trtllm_quantize_fp8_with_scale] = (
+        trtllm_quantize_fp8_mn_major
+    )
 
     __all__ = [
         "trtllm_fp8_token_group_128",

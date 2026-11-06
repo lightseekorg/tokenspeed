@@ -60,6 +60,33 @@ scale view falls back to FlashInfer where its M range permits, or Triton.
 This scale check is conservative even when a layout copy would align the view.
 Online quantization supplies freshly allocated, aligned activations and scales.
 
+## Block-FP8 linear
+
+`block_fp8_linear` quantizes BF16/FP16 activations into FP8 token groups and
+runs the block-FP8 GEMM. Every call selects the kernels that `quantize_fp8`
+followed by `mm(quant="mxfp8")` select for the same call, through the same
+selection functions, and launches them with the same arguments.
+
+Both TRT-LLM CuTe-DSL registrations declare the `mn_major_scales` feature:
+their launcher repacks activation scales into compact MN-major storage
+itself, so it also reads the native layout `trtllm_quantize_fp8_mn_major`
+returns. To use it when the selected quantizer has such a native variant, the
+op selects the GEMM before quantizing, from the description `mm` uses for
+online quantization: contiguous, 16-byte aligned E4M3 codes with unit-stride,
+aligned scales. That description is exact for the canonical TRT-LLM
+quantizer's output, and so selects the same GEMM, when the weight scales are
+FP32, `x` is contiguous and each row has at least two scale groups; with one
+group the canonical scales keep the native stride. Otherwise, for an empty
+`x` and while a quantization or GEMM override is active, the op quantizes
+first and selects the GEMM from the quantizer's output, as `mm` does. When
+the GEMM selected first declares `mn_major_scales`, the op asks the registry
+for an MN-major quantizer with that feature and runs it if it is the
+canonical quantizer's native variant. It writes the same codes and scales, so
+the quantizer's transpose copy is gone, and the GEMM's repack copies only
+when the native storage pads the rows (M not a multiple of 4 on the
+flat-buffer ABI) and K exceeds 128. The pair is matched by implementation, so
+a plugin that registers either quantizer under its name keeps its own kernel.
+
 ## Small dense projections
 
 `mv` selects the registered small-row projection implementation. Its dispatcher
