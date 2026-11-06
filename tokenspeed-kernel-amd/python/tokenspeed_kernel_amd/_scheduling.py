@@ -121,3 +121,21 @@ def sched_group(mask, size, _semantic):
         is_pure=False,
         _semantic=_semantic,
     )
+
+
+@tl.core.extern
+def wave_all_equal(a, b, _semantic):
+    """1 where ``a == b`` (FP32, ordered) holds in every active lane of the
+    wave, else 0, as an int32 tensor whose value is the same across the
+    wave (in an SGPR, so a branch on it is a scalar branch). One compare
+    into a lane mask (``llvm.amdgcn.ballot``) tested against the active
+    lanes. Launch with :func:`sched_compile_options`.
+    """
+    return tl.core.extern_elementwise(
+        _SCHED_LIBRARY_NAME,
+        _SCHED_LIBRARY_PATH,
+        [a, b],
+        {(tl.float32, tl.float32): ("__tokenspeed_sched_wave_all_equal_f32", tl.int32)},
+        is_pure=False,
+        _semantic=_semantic,
+    )

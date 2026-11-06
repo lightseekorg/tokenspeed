@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from tokenspeed_kernel_amd._scheduling import wave_all_equal
 from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin, tl
 
 _INV_LN2_VALUE = 1.4426950408889634
@@ -97,6 +98,62 @@ def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
 @gluon.jit
 def max(input, axis=None, keep_dims=False):
     return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
+
+
+# ===-----------------------------------------------------------------------===#
+# Warp-pipeline helpers
+#
+# Shared by the 8-wave kernels that split their loop into
+# gl.amd.warp_pipeline_stage clusters.
+# ===-----------------------------------------------------------------------===#
+
+
+@gluon.jit
+def _keep_in_cluster(x):
+    # An empty side-effecting asm that reads and redefines x. Neither the IR
+    # optimizer nor MachineSink moves it across the cluster barriers, so the
+    # ops producing x stay in the cluster that computes them instead of drifting
+    # toward their consumer in a later cluster. "=v,0" ties the result to the
+    # input register, so no instruction is emitted; narrower values go in
+    # groups that fill one 32-bit VGPR per asm operand.
+    pack: gl.constexpr = 32 // x.dtype.primitive_bitwidth
+    return gl.inline_asm_elementwise(
+        asm="",
+        constraints="=v,0",
+        args=[x],
+        dtype=x.dtype,
+        is_pure=False,
+        pack=pack,
+    )
+
+
+@gluon.jit
+def _split_columns(x):
+    # Register-only column halves: each half keeps x's MFMA layout.
+    half: gl.constexpr = x.shape[1] // 2
+    lo = gl.amd.slice(x, [x.shape[0], half], [0, 0])
+    hi = gl.amd.slice(x, [x.shape[0], half], [0, half])
+    return lo, hi
+
+
+@gluon.jit
+def _join_columns(lo, hi):
+    # Inverse of _split_columns, also register-only. join/permute/reshape
+    # places lo's columns before hi's; assert_trivial fails the build if the
+    # result would need data movement.
+    layout: gl.constexpr = lo.type.layout
+    shape: gl.constexpr = [lo.shape[0], lo.shape[1] + hi.shape[1]]
+    x = gl.join(lo, hi).permute([0, 2, 1]).reshape(shape)
+    return gl.convert_layout(x, layout, assert_trivial=True)
+
+
+@gluon.jit
+def _wave_maxima_unchanged(m_old, m_new):
+    # Returns 1 when no row of the wave moved its maximum, else 0, as one
+    # wave-uniform SGPR value, so a branch on it is a scalar branch that skips
+    # the rescale for the whole wave (v_cmp_eq_f32 into a lane mask, compared
+    # with EXEC). Kernels calling it launch with sched_compile_options().
+    return wave_all_equal(m_old, m_new)
 
 
 @gluon.constexpr_function
