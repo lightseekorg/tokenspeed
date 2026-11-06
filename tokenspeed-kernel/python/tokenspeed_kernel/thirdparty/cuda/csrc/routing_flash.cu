@@ -30,6 +30,7 @@
 #include <type_traits>
 
 using namespace flashinfer::routing_flash;
+using tvm::ffi::Optional;
 
 int get_sm_count() {
   static int sm_count = 0;
@@ -227,10 +228,13 @@ __device__ void reduce_topk(
 // Ported from TRT-LLM customMoeRoutingKernels.cu (Apache-2.0).
 // Supports any nExperts (256, 384, etc.) via template parameter.
 // ---------------------------------------------------------------------------
-template <int nExperts, int topK, bool hash, typename TokenIdT, typename WeightT>
+template <int nExperts, int topK, bool hash, bool alt_bias,
+          typename TokenIdT, typename WeightT>
 __global__ void gate_forward_kernel(
     const float* __restrict__ scores_in,
     const float* __restrict__ bias,
+    const float* __restrict__ bias_alt,
+    const bool* __restrict__ bias_alt_mask,
     const TokenIdT* __restrict__ input_ids,
     const int* __restrict__ tid2eid,
     WeightT* __restrict__ out_weights,
@@ -245,8 +249,8 @@ __global__ void gate_forward_kernel(
 
   __shared__ float smem_scores[kWarpsPerBlock][nExperts];
 
-  int const global_warp_id =
-      (blockIdx.x * blockDim.x + threadIdx.x) / warp_topk::kWARP_SIZE;
+  int64_t const global_warp_id =
+      (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / warp_topk::kWARP_SIZE;
   int const local_warp_id =
       (threadIdx.x / warp_topk::kWARP_SIZE) % kWarpsPerBlock;
   int const lane_id = threadIdx.x % warp_topk::kWARP_SIZE;
@@ -270,7 +274,7 @@ __global__ void gate_forward_kernel(
   int my_topk_index = 0;
 
   if constexpr (hash) {
-    int token_id = static_cast<int>(input_ids[global_warp_id]);
+    int64_t token_id = static_cast<int64_t>(input_ids[global_warp_id]);
     const int* expert_ids = tid2eid + token_id * topK;
     if (lane_id < topK) {
       int expert_id = expert_ids[lane_id];
@@ -278,13 +282,17 @@ __global__ void gate_forward_kernel(
       my_topk_value = my_smem[expert_id];
     }
   } else {
+    const float* row_bias = bias;
+    if constexpr (alt_bias) {
+      row_bias = bias_alt_mask[global_warp_id] ? bias_alt : bias;
+    }
     float scores[kExpertsPerThread];
     int32_t indices[kExpertsPerThread];
 #pragma unroll
     for (int e = 0; e < kExpertsPerThread; ++e) {
       int expert_id = lane_id + e * warp_topk::kWARP_SIZE;
       indices[e] = expert_id;
-      scores[e] = my_smem[expert_id] + bias[expert_id];
+      scores[e] = my_smem[expert_id] + row_bias[expert_id];
     }
 
     float topk_vals[topK];
@@ -344,7 +352,8 @@ __global__ void gate_forward_kernel(
 template <int nExperts, typename TokenIdT, typename WeightT>
 void launch_gate_forward(
     const float* scores_in, const float* bias, const TokenIdT* input_ids,
-    const int* tid2eid, WeightT* out_weights, int* out_indices,
+    const int* tid2eid, const float* bias_alt, const bool* bias_alt_mask,
+    WeightT* out_weights, int* out_indices,
     int batch_size, float route_scale, bool is_hash, bool enable_pdl,
     cudaStream_t stream) {
   constexpr int kTopK = 6;
@@ -359,33 +368,40 @@ void launch_gate_forward(
   config.numAttrs = enable_pdl ? 1 : 0;
   config.attrs = enable_pdl ? &attr : nullptr;
   auto kernel = is_hash
-      ? dsv4_routing::gate_forward_kernel<nExperts, kTopK, true, TokenIdT, WeightT>
-      : dsv4_routing::gate_forward_kernel<nExperts, kTopK, false, TokenIdT, WeightT>;
-  cudaLaunchKernelEx(&config, kernel, scores_in, bias, input_ids, tid2eid,
-                     out_weights, out_indices, batch_size, route_scale);
+      ? dsv4_routing::gate_forward_kernel<nExperts, kTopK, true, false, TokenIdT, WeightT>
+      : bias_alt != nullptr
+          ? dsv4_routing::gate_forward_kernel<nExperts, kTopK, false, true, TokenIdT, WeightT>
+          : dsv4_routing::gate_forward_kernel<nExperts, kTopK, false, false, TokenIdT, WeightT>;
+  cudaLaunchKernelEx(&config, kernel, scores_in, bias, bias_alt, bias_alt_mask,
+                     input_ids, tid2eid, out_weights, out_indices, batch_size, route_scale);
 }
 
 // Keep all routing arithmetic in FP32; the consumer chooses the final store.
 template <int nExperts, typename TokenIdT>
 void dispatch_gate_forward(
     const float* scores, const float* bias, const TokenIdT* ids, const int* table,
+    const float* bias_alt, const bool* bias_alt_mask,
     TensorView weights, int* indices, int rows, float scale, bool hash,
     bool enable_pdl, cudaStream_t stream) {
   if (rows == 0) return;
   if (weights.dtype() == dl_bfloat16) {
     launch_gate_forward<nExperts, TokenIdT, __nv_bfloat16>(
-        scores, bias, ids, table, static_cast<__nv_bfloat16*>(weights.data_ptr()),
-        indices, rows, scale, hash, enable_pdl, stream);
+        scores, bias, ids, table, bias_alt, bias_alt_mask,
+        static_cast<__nv_bfloat16*>(weights.data_ptr()), indices, rows, scale,
+        hash, enable_pdl, stream);
   } else {
     launch_gate_forward<nExperts, TokenIdT, float>(
-        scores, bias, ids, table, static_cast<float*>(weights.data_ptr()),
-        indices, rows, scale, hash, enable_pdl, stream);
+        scores, bias, ids, table, bias_alt, bias_alt_mask,
+        static_cast<float*>(weights.data_ptr()), indices, rows, scale,
+        hash, enable_pdl, stream);
   }
 }
 
 void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
                               TensorView topk_indices, TensorView topk_weights,
-                              bool renormalize, float routed_scaling_factor, bool enable_pdl) {
+                              bool renormalize, float routed_scaling_factor,
+                              Optional<TensorView> correction_bias_alt,
+                              Optional<TensorView> bias_alt_mask, bool enable_pdl) {
   TVM_FFI_ICHECK_EQ(input.ndim(), 2);
   TVM_FFI_ICHECK_EQ(correction_bias.ndim(), 1);
   TVM_FFI_ICHECK_EQ(topk_indices.ndim(), 2);
@@ -401,6 +417,30 @@ void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
   TVM_FFI_ICHECK_EQ(topk, 6)
       << "gate_forward_kernel is compiled for top_k=6, got " << topk;
   TVM_FFI_ICHECK_EQ(correction_bias.size(0), num_experts);
+  TVM_FFI_ICHECK_EQ(correction_bias.dtype(), dl_float32);
+  TVM_FFI_ICHECK(correction_bias.is_contiguous());
+  TVM_FFI_ICHECK_EQ(correction_bias_alt.has_value(), bias_alt_mask.has_value())
+      << "correction_bias_alt and bias_alt_mask must be supplied together";
+  const float* bias_alt_ptr = nullptr;
+  const bool* mask_ptr = nullptr;
+  if (correction_bias_alt.has_value()) {
+    auto alt = correction_bias_alt.value();
+    auto mask = bias_alt_mask.value();
+    TVM_FFI_ICHECK_EQ(alt.ndim(), 1);
+    TVM_FFI_ICHECK_EQ(alt.size(0), num_experts);
+    TVM_FFI_ICHECK_EQ(alt.dtype(), dl_float32);
+    TVM_FFI_ICHECK(alt.is_contiguous());
+    TVM_FFI_ICHECK_EQ(mask.ndim(), 1);
+    TVM_FFI_ICHECK_EQ(mask.size(0), num_rows);
+    TVM_FFI_ICHECK_EQ(mask.dtype(), dl_bool);
+    TVM_FFI_ICHECK(mask.is_contiguous());
+    TVM_FFI_ICHECK_EQ(alt.device().device_type, input.device().device_type);
+    TVM_FFI_ICHECK_EQ(alt.device().device_id, input.device().device_id);
+    TVM_FFI_ICHECK_EQ(mask.device().device_type, input.device().device_type);
+    TVM_FFI_ICHECK_EQ(mask.device().device_id, input.device().device_id);
+    bias_alt_ptr = static_cast<const float*>(alt.data_ptr());
+    mask_ptr = static_cast<const bool*>(mask.data_ptr());
+  }
   TVM_FFI_ICHECK_EQ(topk_weights.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(topk_indices.size(0), num_rows);
   TVM_FFI_ICHECK_EQ(topk_indices.size(1), topk);
@@ -421,11 +461,11 @@ void softplus_sqrt_topk_flash(TensorView input, TensorView correction_bias,
 
   if (num_experts == 256) {
     dispatch_gate_forward<256, int>(
-        scores, bias_ptr, static_cast<const int*>(nullptr), nullptr,
+        scores, bias_ptr, static_cast<const int*>(nullptr), nullptr, bias_alt_ptr, mask_ptr,
         topk_weights, out_i, num_rows, routed_scaling_factor, false, enable_pdl, stream);
   } else {
     dispatch_gate_forward<384, int>(
-        scores, bias_ptr, static_cast<const int*>(nullptr), nullptr,
+        scores, bias_ptr, static_cast<const int*>(nullptr), nullptr, bias_alt_ptr, mask_ptr,
         topk_weights, out_i, num_rows, routed_scaling_factor, false, enable_pdl, stream);
   }
 
@@ -483,11 +523,11 @@ void hash_softplus_sqrt_topk_flash(TensorView input, TensorView input_ids,
     using TokenIdT = std::remove_const_t<std::remove_pointer_t<decltype(ids)>>;
     if (num_experts == 256) {
       dispatch_gate_forward<256, TokenIdT>(
-          scores, nullptr, ids, tid2eid, topk_weights, out_i, num_rows,
+          scores, nullptr, ids, tid2eid, nullptr, nullptr, topk_weights, out_i, num_rows,
           routed_scaling_factor, true, enable_pdl, stream);
     } else {
       dispatch_gate_forward<384, TokenIdT>(
-          scores, nullptr, ids, tid2eid, topk_weights, out_i, num_rows,
+          scores, nullptr, ids, tid2eid, nullptr, nullptr, topk_weights, out_i, num_rows,
           routed_scaling_factor, true, enable_pdl, stream);
     }
   };

@@ -120,7 +120,7 @@ def torch_sigmoid_bias_topk(
         for dtype in (torch.float16, torch.bfloat16, torch.float32)
     ),
     traits={
-        "routing_kind": frozenset({"plain", "bias", "hash"}),
+        "routing_kind": frozenset({"plain", "bias", "bias_alt", "hash"}),
         "score_function": frozenset({"sqrt_softplus"}),
     },
     priority=Priority.REFERENCE,
@@ -135,6 +135,8 @@ def torch_sqrt_softplus_topk(
     need_scores: bool,
     routed_scaling_factor: float,
     weights_dtype: torch.dtype,
+    correction_bias_alt: torch.Tensor | None = None,
+    bias_alt_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     scores = torch.sqrt(F.softplus(router_logits.float()))
     if hash_indices_table is not None:
@@ -149,6 +151,10 @@ def torch_sqrt_softplus_topk(
             bias = correction_bias.to(device=scores.device, dtype=scores.dtype)
             if bias.ndim == 1:
                 bias = bias.unsqueeze(0)
+            if correction_bias_alt is not None:
+                bias = torch.where(
+                    bias_alt_mask.unsqueeze(-1), correction_bias_alt.float(), bias
+                )
             selection_scores = selection_scores + bias
         topk_ids = torch.topk(
             selection_scores,

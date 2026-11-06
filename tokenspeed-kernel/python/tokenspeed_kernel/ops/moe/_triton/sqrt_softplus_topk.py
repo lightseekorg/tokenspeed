@@ -30,6 +30,8 @@ from tokenspeed_kernel._triton import libdevice, tl, triton
 def _sqrt_softplus_topk_kernel(
     logits_ptr,
     bias_ptr,
+    bias_alt_ptr,
+    bias_alt_mask_ptr,
     hash_ptr,
     ids_ptr,
     weights_ptr,
@@ -38,6 +40,8 @@ def _sqrt_softplus_topk_kernel(
     logits_stride_m,
     logits_stride_e,
     bias_stride,
+    bias_alt_stride,
+    bias_alt_mask_stride,
     hash_stride_m,
     hash_stride_k,
     scale,
@@ -47,11 +51,13 @@ def _sqrt_softplus_topk_kernel(
     BLOCK_K: tl.constexpr,
     HASH: tl.constexpr,
     BIAS: tl.constexpr,
+    BIAS_ALT: tl.constexpr,
     RENORMALIZE: tl.constexpr,
     NEED_SCORES: tl.constexpr,
 ):
     """Write expert ids and sqrt-softplus weights using top-k or hash routing."""
-    token = tl.program_id(0)
+    # A row stride can exceed 2^31 even when every launch scalar fits in i32.
+    token = tl.program_id(0).to(tl.int64)
     expert = tl.arange(0, BLOCK_E)
     logits = tl.load(
         logits_ptr + token * logits_stride_m + expert * logits_stride_e,
@@ -70,9 +76,18 @@ def _sqrt_softplus_topk_kernel(
     else:
         choice = scores
         if BIAS:
-            choice += tl.load(
+            bias = tl.load(
                 bias_ptr + expert * bias_stride, mask=expert < EXPERTS, other=0
-            )
+            ).to(tl.float32)
+            if BIAS_ALT:
+                use_alt = tl.load(bias_alt_mask_ptr + token * bias_alt_mask_stride)
+                alt = tl.load(
+                    bias_alt_ptr + expert * bias_alt_stride,
+                    mask=expert < EXPERTS,
+                    other=0,
+                ).to(tl.float32)
+                bias = tl.where(use_alt, alt, bias)
+            choice += bias
         choice = tl.where(choice == choice, choice, float("inf"))
         remaining = expert < EXPERTS
     for rank in tl.static_range(TOPK):
@@ -114,6 +129,8 @@ def triton_sqrt_softplus_topk(
     need_scores: bool,
     routed_scaling_factor: float,
     weights_dtype: torch.dtype,
+    correction_bias_alt: torch.Tensor | None = None,
+    bias_alt_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select experts using the sqrt-softplus routing contract.
 
@@ -127,6 +144,8 @@ def triton_sqrt_softplus_topk(
         need_scores: Materialize all sqrt-softplus scores when true.
         routed_scaling_factor: FP32 multiplier applied after normalization.
         weights_dtype: FP32 or BF16 storage, converted only after scaling.
+        correction_bias_alt: Optional alternate selection bias, one value per expert.
+        bias_alt_mask: Bool [tokens] selector for correction_bias_alt.
 
     Returns:
         Route weights in weights_dtype, INT32 expert ids, and FP32 scores (or the unused
@@ -155,6 +174,8 @@ def triton_sqrt_softplus_topk(
         _sqrt_softplus_topk_kernel[(tokens,)](
             router_logits,
             correction_bias,
+            correction_bias_alt,
+            bias_alt_mask,
             hash_indices_table,
             None if input_ids is None else input_ids.contiguous(),
             weights,
@@ -163,6 +184,8 @@ def triton_sqrt_softplus_topk(
             router_logits.stride(0),
             router_logits.stride(1),
             correction_bias.stride(0) if bias_routing else 0,
+            correction_bias_alt.stride(0) if correction_bias_alt is not None else 0,
+            bias_alt_mask.stride(0) if bias_alt_mask is not None else 0,
             hash_indices_table.stride(0) if hash_indices_table is not None else 0,
             hash_indices_table.stride(1) if hash_indices_table is not None else 0,
             float(routed_scaling_factor),
@@ -172,6 +195,7 @@ def triton_sqrt_softplus_topk(
             BLOCK_K=triton.next_power_of_2(top_k),
             HASH=hash_indices_table is not None,
             BIAS=bias_routing,
+            BIAS_ALT=correction_bias_alt is not None,
             RENORMALIZE=renormalize,
             NEED_SCORES=need_scores,
             num_warps=4,

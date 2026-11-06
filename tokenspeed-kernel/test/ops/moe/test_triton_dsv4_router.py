@@ -50,10 +50,14 @@ def test_router_reuses_compilation_across_token_counts(
     from tokenspeed_kernel.ops.moe._triton import sqrt_softplus_topk
     from utils import assert_no_triton_compile
 
+    bias = torch.arange(256, device="cuda", dtype=torch.float32)
+    alt = -bias
+
     def run(tokens):
         logits = (torch.arange(256, device="cuda", dtype=torch.float32) / 256).repeat(
             tokens, 1
         )
+        mask = torch.arange(tokens, device="cuda") % 2 == 0
         weights, ids = moe_topk(
             logits,
             top_k=6,
@@ -63,9 +67,15 @@ def test_router_reuses_compilation_across_token_counts(
             routed_scaling_factor=2.5,
             topk_weights_dtype=weights_dtype,
             override="triton_sqrt_softplus_topk",
+            correction_bias=bias,
+            correction_bias_alt=alt,
+            bias_alt_mask=mask,
         )
         scores = F.softplus(logits).sqrt()
-        expected_weights, expected_ids = scores.topk(6, dim=-1)
+        expected_ids = (
+            (scores + torch.where(mask[:, None], alt, bias)).topk(6, dim=-1).indices
+        )
+        expected_weights = scores.gather(1, expected_ids)
         expected_weights = (
             expected_weights / expected_weights.sum(dim=-1, keepdim=True) * 2.5
         ).to(weights_dtype)
@@ -109,6 +119,10 @@ def test_router_matches_reference(
         if kind == "bias"
         else None
     )
+    alt = mask = None
+    if kind == "bias" and kernel == "triton_sqrt_softplus_topk":
+        alt = (-bias.repeat_interleave(2))[::2]
+        mask = (torch.arange(34, device="cuda") % 3 == 0)[::2]
     table = (
         torch.stack(
             [
@@ -136,8 +150,12 @@ def test_router_matches_reference(
         hash_indices_table=table,
         input_ids=input_ids,
         override=kernel,
+        correction_bias_alt=alt,
+        bias_alt_mask=mask,
     )
     expected_scores = F.softplus(logits.float()).sqrt()
+    if alt is not None:
+        bias = torch.where(mask[:, None], alt, bias)
     expected_ids = (
         table[input_ids].long()
         if table is not None
@@ -226,6 +244,9 @@ def test_gfx1250_fused_router_reuses_compilation_across_token_counts() -> None:
 @pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
 def test_router_ties_and_graph_replay(weights_dtype: torch.dtype) -> None:
     logits = torch.zeros((2, 256), device="cuda", dtype=torch.float32)
+    bias = torch.zeros(256, device="cuda")
+    alt = torch.zeros_like(bias)
+    mask = torch.zeros(2, device="cuda", dtype=torch.bool)
 
     def run():
         return moe_topk(
@@ -237,6 +258,9 @@ def test_router_ties_and_graph_replay(weights_dtype: torch.dtype) -> None:
             routed_scaling_factor=1.0,
             topk_weights_dtype=weights_dtype,
             override="triton_sqrt_softplus_topk",
+            correction_bias=bias,
+            correction_bias_alt=alt,
+            bias_alt_mask=mask,
         )
 
     weights, ids = run()
@@ -251,10 +275,43 @@ def test_router_ties_and_graph_replay(weights_dtype: torch.dtype) -> None:
     logits.copy_(
         torch.arange(512, device="cuda", dtype=torch.float32).reshape(2, 256) / 32
     )
-    graph.replay()
-    eager = run()
-    for actual, expected in zip(captured, eager, strict=True):
-        torch.testing.assert_close(actual, expected)
+    alt.copy_(-torch.arange(256, device="cuda", dtype=torch.float32))
+    for images in (True, False):
+        mask.fill_(images)
+        graph.replay()
+        eager = run()
+        for actual, expected in zip(captured, eager, strict=True):
+            torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_router_row_offsets_beyond_int32():
+    # Each stride fits i32, but the last row's offset does not.
+    stride = 2**30 + 128
+    if torch.cuda.mem_get_info()[0] < 6 * stride + 2**30:
+        pytest.skip("requires space for sparse logits and mask beyond 2^31 elements")
+    logits = torch.empty_strided(
+        (3, 256), (stride, 1), device="cuda", dtype=torch.bfloat16
+    ).zero_()
+    mask = torch.empty_strided((3,), (stride,), device="cuda", dtype=torch.bool)
+    mask.copy_(torch.tensor([False, True, False], device="cuda"))
+    bias = torch.arange(256, device="cuda", dtype=torch.float32)
+    weights, ids = moe_topk(
+        logits,
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="topk",
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        correction_bias=bias,
+        correction_bias_alt=-bias,
+        bias_alt_mask=mask,
+        override="triton_sqrt_softplus_topk",
+    )
+    expected = torch.arange(255, 249, -1, device="cuda").repeat(3, 1)
+    expected[1] = torch.arange(6, device="cuda")
+    torch.testing.assert_close(ids.long(), expected, atol=0, rtol=0)
+    torch.testing.assert_close(weights, torch.full_like(weights, 1 / 6))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
