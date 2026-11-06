@@ -52,7 +52,6 @@ from tokenspeed.runtime.layers.attention.configs.dsa import (
     dsa_index_k_row_bytes,
     index_k_row_bytes,
 )
-from tokenspeed.runtime.layers.attention.dcp.cache import HistoryGatherWorkspace
 from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
@@ -938,13 +937,22 @@ def test_a_query_with_neither_head_layout_is_refused():
     assert not (len(backend.kvp_group) > 1)
 
 
+@pytest.mark.parametrize("history_prefill", [False, True])
 @pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
-def test_the_workspace_reservation_matches_the_recipe_plan(index_k_format):
+def test_the_workspace_reservation_matches_the_recipe_plan(
+    monkeypatch, index_k_format, history_prefill
+):
     """The recipe's plan (``dsa_history_gather_workspace_bytes``) and the
     leaf's allocation are the same bytes in either index-K format: the
-    index-K rows are packed in the plane's own row width and share the
-    latent rows' buffer."""
+    index-K rows are packed in the plane's own row width, beside the latent
+    rows or, under a KVP prefill over gathered histories, in their buffer."""
+    from tokenspeed.runtime.layers.attention.configs import dsa as dsa_configs
+
+    monkeypatch.setattr(
+        dsa_configs, "dsa_kvp_history_prefill", lambda config: history_prefill
+    )
     backend = _backend(0, workspace_rows=0, index_k_format=index_k_format)
+    backend._history_prefill = history_prefill
     max_model_len = 37
     allocated = backend.preallocate_history_gather_workspace(max_model_len)
     config = SimpleNamespace(
@@ -963,31 +971,26 @@ def test_the_workspace_reservation_matches_the_recipe_plan(index_k_format):
     rows = 38
     row_bytes = index_k_row_bytes(INDEX_HEAD_DIM, index_k_format)
     assert row_bytes == (132 if index_k_format == "fp8_scaled" else 256)
-    assert allocated == rows * max(KV_DIM * 2, row_bytes)
+
+    def planned(rows):
+        if history_prefill:
+            return rows * max(KV_DIM * 2, row_bytes)
+        return rows * (KV_DIM * 2 + row_bytes)
+
+    assert allocated == planned(rows)
     workspace = backend.history_gather_workspace()
     assert workspace.rows == rows and workspace.nbytes == allocated
     assert workspace.kv.shape == (rows, KV_DIM)
     assert workspace.index_k.shape == (rows, row_bytes)
-    assert workspace.kv.data_ptr() == workspace.index_k.data_ptr()
+    shared = workspace.kv.data_ptr() == workspace.index_k.data_ptr()
+    assert shared == history_prefill
     assert workspace.index_k.dtype == torch.uint8
     assert workspace.index_k_format == index_k_format
     # Without an override the plan follows the sparse kernels' fixed page.
     config.kernel_page_size = None
     assert dsa_history_gather_workspace_bytes(
         config, max_model_len=max_model_len
-    ) == 64 * max(KV_DIM * 2, row_bytes)
-
-
-def test_the_workspace_refuses_latent_and_index_k_rows_apart():
-    """The workspace's bytes are one buffer's, so latent and index-K rows
-    allocated apart are refused."""
-    with pytest.raises(ValueError, match="share one buffer"):
-        HistoryGatherWorkspace(
-            rows=2,
-            kv=torch.empty((2, KV_DIM), dtype=torch.bfloat16),
-            index_k=torch.empty((2, 132), dtype=torch.uint8),
-            index_k_format="fp8_scaled",
-        )
+    ) == planned(64)
 
 
 def test_build_prefill_slots_match_the_group_history():

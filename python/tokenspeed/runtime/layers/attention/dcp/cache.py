@@ -68,13 +68,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class HistoryGatherWorkspace:
-    """The buffer a request group's gathered history lands in.
+    """The buffers a request group's gathered history lands in.
 
     Allocated once per engine (the recipe reserves the bytes from the cache
     budget, ``OrdinaryRecipe.workspace_bytes``) by the target's DSA leaf and
     shared with the draft's: the two never gather at the same time, since the
     draft's extend step follows the target's forward on the same stream.
 
+    Under a KVP prefill over gathered histories (``dsa_kvp_history_prefill``)
     ``kv`` and ``index_k`` view the same leading bytes: a layer's top-k
     consumes its gathered index-K rows before the layer gathers its latent
     rows, on the same stream, so the buffer holds the wider of the two.
@@ -111,12 +112,12 @@ class HistoryGatherWorkspace:
                 f"{tuple(self.kv.shape)} / index_k {tuple(self.index_k.shape)} "
                 f"{self.index_k.dtype}"
             )
-        if self.kv.data_ptr() != self.index_k.data_ptr():
-            raise ValueError("the history workspace's kv and index_k share one buffer")
 
     @property
     def nbytes(self) -> int:
-        return max(self.kv.nbytes, self.index_k.nbytes)
+        if self.kv.data_ptr() == self.index_k.data_ptr():
+            return max(self.kv.nbytes, self.index_k.nbytes)
+        return self.kv.nbytes + self.index_k.nbytes
 
 
 @dataclass(frozen=True)

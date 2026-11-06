@@ -807,18 +807,27 @@ class DSABackend(PagedAttentionBackend):
         rows = dsa_history_gather_workspace_rows(
             max_model_len, page_size=self.kernel_page_size
         )
-        kv_bytes = rows * self.kv_cache_dim * self.data_type.itemsize
         # Index-K rows packed in the plane's format (FP8 bytes then fp32
         # scales, or bf16 keys), one gather per group.
         row_bytes = index_k_row_bytes(self.index_head_dim, self.index_k_format)
-        buffer = torch.empty(
-            max(kv_bytes, rows * row_bytes), dtype=torch.uint8, device=self.device
-        )
+        if self._history_prefill:
+            # A layer's top-k consumes its gathered index-K rows before the
+            # layer gathers its latent rows, on the same stream.
+            kv_bytes = rows * self.kv_cache_dim * self.data_type.itemsize
+            buffer = torch.empty(
+                max(kv_bytes, rows * row_bytes), dtype=torch.uint8, device=self.device
+            )
+            kv = buffer[:kv_bytes].view(self.data_type).view(rows, self.kv_cache_dim)
+            index_k = buffer[: rows * row_bytes].view(rows, row_bytes)
+        else:
+            kv = torch.empty(
+                (rows, self.kv_cache_dim), dtype=self.data_type, device=self.device
+            )
+            index_k = torch.empty(
+                (rows, row_bytes), dtype=torch.uint8, device=self.device
+            )
         self._history_workspace = HistoryGatherWorkspace(
-            rows=rows,
-            kv=buffer[:kv_bytes].view(self.data_type).view(rows, self.kv_cache_dim),
-            index_k=buffer[: rows * row_bytes].view(rows, row_bytes),
-            index_k_format=self.index_k_format,
+            rows=rows, kv=kv, index_k=index_k, index_k_format=self.index_k_format
         )
         return self._history_workspace.nbytes
 
