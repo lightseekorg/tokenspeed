@@ -404,6 +404,10 @@ struct WireRoom {
     fails: bool,
     /// The transfer breaks on this prefill rank alone.
     fails_on_prefill_rank: Option<usize>,
+    /// Cancellation was requested; the peer must still acknowledge retirement.
+    cancel_pending: bool,
+    /// Keep the cancellation acknowledgment pending, as an in-flight write does.
+    hold_cancel: bool,
 }
 
 /// A stand-in transfer peer over a [`Wire`]: a transfer advances as soon as
@@ -449,6 +453,7 @@ impl TransferPeer for FakePeer {
                 .map(|(_, room, bootstrapped)| {
                     let room = wire.rooms.entry(*room).or_default();
                     let poll = if room.fails
+                        || (room.cancel_pending && !room.hold_cancel)
                         || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
                     {
                         TransferPoll::Failed
@@ -532,6 +537,18 @@ impl TransferPeer for FakePeer {
     }
 
     fn abort_room(&mut self, _: &str, _: u64) {}
+
+    fn cancel(&mut self, rid: &str) {
+        if let Some((_, room, _)) = self.tracked.iter().find(|(id, _, _)| id == rid) {
+            self.wire
+                .lock()
+                .unwrap()
+                .rooms
+                .entry(*room)
+                .or_default()
+                .cancel_pending = true;
+        }
+    }
 }
 
 /// EPD: a `lost-*` request's receive fails at its second poll, a `slow-*`
@@ -1631,6 +1648,7 @@ struct ScriptedRank {
     released: Vec<(String, i32)>,
     cache_ops: Vec<CacheOpKind>,
     idle_forwards: usize,
+    forwards: usize,
 }
 
 /// Run `layout`'s ranks, one script per engine (its first rank's frontend
@@ -1705,19 +1723,22 @@ fn run_scripted(
     ranks
         .into_iter()
         .map(
-            |(thread, replies, finished, outputs, released, plans, idle_forwards)| ScriptedRank {
-                outcome: thread.join().unwrap(),
-                replies: replies.lock().unwrap().clone(),
-                finished: finished.lock().unwrap().clone(),
-                outputs: outputs.lock().unwrap().clone(),
-                released: released.lock().unwrap().clone(),
-                cache_ops: plans
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
-                    .collect(),
-                idle_forwards: *idle_forwards.lock().unwrap(),
+            |(thread, replies, finished, outputs, released, plans, idle_forwards)| {
+                let outcome = thread.join().unwrap();
+                let plans = plans.lock().unwrap();
+                ScriptedRank {
+                    outcome,
+                    replies: replies.lock().unwrap().clone(),
+                    finished: finished.lock().unwrap().clone(),
+                    outputs: outputs.lock().unwrap().clone(),
+                    released: released.lock().unwrap().clone(),
+                    cache_ops: plans
+                        .iter()
+                        .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
+                        .collect(),
+                    idle_forwards: *idle_forwards.lock().unwrap(),
+                    forwards: plans.iter().filter(|(_, rids, _)| !rids.is_empty()).count(),
+                }
             },
         )
         .collect()
@@ -3408,6 +3429,226 @@ fn disaggregated(
         bootstrap_port: Some(8998),
         bootstrap_room: Some(room),
         ..request(rid, prompt_len, budget(max_new_tokens))
+    }
+}
+
+#[test]
+fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        for abort_first in [false, true] {
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                ..Wire::default()
+            }));
+            let add = EngineRequest::Add(Box::new(disaggregated("cancelled", 70, 20, 4)));
+            let abort = EngineRequest::Abort(vec!["cancelled".to_owned()]);
+            let mut script = vec![Vec::new(); 10];
+            script[0] = if abort_first {
+                vec![abort, add]
+            } else {
+                vec![add, abort]
+            };
+            script[1].push(EngineRequest::Control(Box::new(pause("wait"))));
+            let ranks = run_scripted(
+                layout,
+                1,
+                Tiers::DeviceOnly,
+                Setup {
+                    pd: Some(Pd {
+                        role: Role::Decode,
+                        wire: wire.clone(),
+                    }),
+                    ..Setup::default()
+                },
+                vec![script],
+                no_reaction,
+            );
+            assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
+            assert_eq!(
+                outcome(ranks[0].replies.clone()),
+                [("PauseSchedulerReqOutput", true)]
+            );
+            for rank in ranks {
+                assert_eq!(rank.outcome, Ok(()));
+                assert_eq!(rank.released, [("cancelled".to_owned(), 0)]);
+                assert_eq!(rank.forwards, 0);
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abort_pause_waits_for_pd_retirement_before_releasing_memory() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 2,
+        ..Wire::default()
+    }));
+    wire.lock()
+        .unwrap()
+        .rooms
+        .entry(70)
+        .or_default()
+        .hold_cancel = true;
+    let decode = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire: wire.clone(),
+            }),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let stream = decode
+        .client
+        .generate(disaggregated("waiting-kv", 70, 20, 4))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if wire
+                .lock()
+                .unwrap()
+                .rooms
+                .get(&70)
+                .is_some_and(|room| room.preallocated.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("decode allocated its KV landing pages");
+
+    let paused = control(&decode, pause("abort"));
+    tokio::pin!(paused);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut paused)
+            .await
+            .is_err()
+    );
+    assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
+    for rank in 0..decode.ranks.len() {
+        assert!(
+            decode.released_on(rank).is_empty(),
+            "pages released before the peer retired"
+        );
+    }
+    wire.lock().unwrap().rooms.get_mut(&70).unwrap().hold_cancel = false;
+    assert_eq!(paused.await, [("PauseSchedulerReqOutput", true)]);
+    let chunks = collect(stream).await;
+    assert!(tokens(&chunks).is_empty());
+    assert_eq!(
+        chunks.last().unwrap().finish_reason.as_deref(),
+        Some("abort")
+    );
+    decode.settle().await;
+    for rank in 0..decode.ranks.len() {
+        // The fake device reserves the bootstrap token when it allocates
+        // landing pages; no decode forward may actually have run.
+        assert_eq!(decode.released_on(rank), [("waiting-kv".to_owned(), 1)]);
+        assert!(decode.ranks[rank]
+            .plans
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, rids, _)| rids.is_empty()));
+    }
+    assert_eq!(
+        control(
+            &decode,
+            ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(vec!["kv_cache".to_owned()]),
+            })
+        )
+        .await,
+        [("ReleaseMemoryOccupationReqOutput", true)]
+    );
+    assert_eq!(
+        control(
+            &decode,
+            ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(vec!["kv_cache".to_owned()]),
+            })
+        )
+        .await,
+        [("ResumeMemoryOccupationReqOutput", true)]
+    );
+    assert_eq!(
+        control(&decode, resume()).await,
+        [("ResumeSchedulerReqOutput", true)]
+    );
+    // A fresh request can use the released pages after a new KV transfer.
+    {
+        let mut wire = wire.lock().unwrap();
+        let room = wire.rooms.entry(71).or_default();
+        room.sent = Some(1000);
+        room.sent_by = vec![0, 1];
+    }
+    assert_eq!(
+        tokens(&run(&decode.client, disaggregated("resumed", 71, 20, 3)).await),
+        [1000, 1001, 1002]
+    );
+}
+
+#[test]
+fn a_prefill_abort_waits_for_its_outstanding_forward_results() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 2,
+        ..Wire::default()
+    }));
+    wire.lock().unwrap().rooms.insert(
+        70,
+        WireRoom {
+            decode_registered: true,
+            preallocated: Some(0),
+            ..WireRoom::default()
+        },
+    );
+    let mut script = vec![Vec::new(); 20];
+    script[0].push(EngineRequest::Add(Box::new(disaggregated(
+        "prefilling",
+        70,
+        3000,
+        4,
+    ))));
+    script[3].push(EngineRequest::Control(Box::new(pause("abort"))));
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        2,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Prefill,
+                wire: wire.clone(),
+            }),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
+    assert_eq!(
+        outcome(ranks[0].replies.clone()),
+        [("PauseSchedulerReqOutput", true)]
+    );
+    assert_eq!(
+        ranks[0].finished,
+        [("prefilling".to_owned(), "abort".to_owned())]
+    );
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert!(rank.forwards > 0 && rank.forwards < 12);
+        assert_eq!(rank.released.len(), 1);
+        assert_eq!(rank.released[0].0, "prefilling");
     }
 }
 
