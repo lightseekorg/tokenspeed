@@ -1468,6 +1468,154 @@ class TestPrefillRoleGraphsTest:
         assert self._decode_runner(config).disable
         assert self._prefill_owner(config).disable
 
+    def _planning_owner(self, *, enforce_eager: bool):
+        """A prefill owner whose backend admits every inline variant."""
+        from unittest import mock
+
+        inner = SimpleNamespace(embed_tokens=object())
+        model_runner = SimpleNamespace(
+            model=SimpleNamespace(model=inner),
+            model_config=SimpleNamespace(requires_request_token_history=False),
+            is_generation=True,
+            is_multimodal=False,
+        )
+        with mock.patch.object(self.prefill_graph.PrefillGraph, "capture"):
+            return self.prefill_graph.PrefillGraph(
+                model_runner=model_runner,
+                attn_backend=SimpleNamespace(
+                    admits_prefill_graph=lambda tokens, bs, mode: True
+                ),
+                token_to_kv_pool=_fake_pool(runtime_contract=object()),
+                input_buffers=object(),
+                config=self._config(prefill_only=True, enforce_eager=enforce_eager),
+            )
+
+    def _check_plan(
+        self,
+        monkeypatch,
+        owner,
+        *,
+        world_size: int,
+        peer=None,
+        max_logits_mb: int = 512,
+    ):
+        """Run the boot check with emulated peers holding ``peer(local)``
+        (this rank's own tuple by default), on a launch with ``max_logits_mb``
+        as ``--deepseek-v4-indexer-prefill-max-logits-mb``; returns the groups
+        it asked for."""
+        import torch
+
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        groups = []
+
+        def get_process_group(backend, ranks):
+            groups.append((backend, ranks))
+            return "gloo-world"
+
+        def all_reduce(tensor, op, group):
+            assert group == "gloo-world"
+            other = tensor.clone() if peer is None else peer(tensor.clone())
+            if op == torch.distributed.ReduceOp.MIN:
+                tensor.copy_(torch.minimum(tensor, other))
+            else:
+                assert op == torch.distributed.ReduceOp.MAX
+                tensor.copy_(torch.maximum(tensor, other))
+
+        monkeypatch.setattr(pg_manager, "get_process_group", get_process_group)
+        monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+        server_args = SimpleNamespace(
+            mapping=SimpleNamespace(
+                world_size=world_size, world_group=tuple(range(world_size))
+            ),
+            deepseek_v4_indexer_prefill_max_logits_mb=max_logits_mb,
+        )
+        self.prefill_graph.check_rank_uniform_prefill_plan(owner, server_args)
+        return groups
+
+    def _agreed_tuple(self, monkeypatch, owner, *, max_logits_mb: int):
+        """The tuple a rank launched with this indexer prefill logits budget
+        brings to the boot check, as its peers see it."""
+        seen = []
+
+        def record(local):
+            seen.append(local.clone())
+            return local
+
+        self._check_plan(
+            monkeypatch,
+            owner,
+            world_size=2,
+            peer=record,
+            max_logits_mb=max_logits_mb,
+        )
+        return seen[0]
+
+    def test_ranks_that_plan_the_same_prefill_graphs_boot(self, monkeypatch):
+        monkeypatch.delenv("NCCL_GRAPH_MIXING_SUPPORT", raising=False)
+        for enforce_eager in (False, True):
+            owner = self._planning_owner(enforce_eager=enforce_eager)
+            assert bool(owner.disable) is enforce_eager
+            assert bool(owner.capture_plan) is not enforce_eager
+            groups = self._check_plan(monkeypatch, owner, world_size=2)
+            assert groups == [("gloo", (0, 1))]
+        # A single rank has no peer to compare with.
+        owner = self._planning_owner(enforce_eager=False)
+        assert self._check_plan(monkeypatch, owner, world_size=1) == []
+
+    def test_a_rank_planning_other_prefill_graphs_fails_the_boot(self, monkeypatch):
+        monkeypatch.delenv("NCCL_GRAPH_MIXING_SUPPORT", raising=False)
+        owner = self._planning_owner(enforce_eager=False)
+
+        def other_digest(local):
+            local[2] += 1
+            return local
+
+        def graphs_off(local):
+            local[0], local[1] = 0, 0
+            return local
+
+        for peer in (other_digest, graphs_off):
+            with pytest.raises(RuntimeError, match="differs across ranks"):
+                self._check_plan(monkeypatch, owner, world_size=2, peer=peer)
+
+    def test_a_rank_with_another_indexer_logits_budget_fails_the_boot(
+        self, monkeypatch
+    ):
+        """The indexer's prefill logits budget sets how many KVP exchanges a
+        DSA break makes, replayed or eager: a rank launched with another
+        budget fails the boot although it plans the same prefill graphs."""
+        import torch
+
+        monkeypatch.delenv("NCCL_GRAPH_MIXING_SUPPORT", raising=False)
+        for enforce_eager in (False, True):
+            owner = self._planning_owner(enforce_eager=enforce_eager)
+            launch = self._agreed_tuple(monkeypatch, owner, max_logits_mb=512)
+            other = self._agreed_tuple(monkeypatch, owner, max_logits_mb=2048)
+            # Only the digest tells the launches apart.
+            assert torch.equal(other[[0, 1, 3]], launch[[0, 1, 3]])
+            assert other[2] != launch[2]
+            with pytest.raises(RuntimeError, match="differs across ranks"):
+                self._check_plan(
+                    monkeypatch,
+                    owner,
+                    world_size=2,
+                    peer=lambda local, other=other: other.clone(),
+                )
+
+    def test_prefill_graphs_refuse_nccl_graph_mixing_off(self, monkeypatch):
+        monkeypatch.setenv("NCCL_GRAPH_MIXING_SUPPORT", "0")
+        with pytest.raises(RuntimeError, match="NCCL_GRAPH_MIXING_SUPPORT"):
+            self._check_plan(
+                monkeypatch, self._planning_owner(enforce_eager=False), world_size=1
+            )
+        # Without prefill graphs nothing captured mixes with eager NCCL.
+        self._check_plan(
+            monkeypatch, self._planning_owner(enforce_eager=True), world_size=1
+        )
+
 
 def test_all_capture_stages_warm_the_execution_stream():
     import torch
