@@ -2233,7 +2233,28 @@ class ProducerAllReduce:
             return self.push_output
         if input.data_ptr() != self.pull.producer.data.data_ptr():
             self.pull.producer.data[:numel].copy_(input.view(-1))
-        iris_pull_twoshot_allreduce[(_PULL_MAX_PROGRAMS,)](
+        self._launch_pull_two_shot(output, numel, compile_only=False)
+        return output
+
+    def warmup_pull_two_shot(self, output: torch.Tensor) -> None:
+        """Compile the two-shot pull that ``run`` takes past the push and
+        Lamport windows, without running it.
+
+        Startup and graph capture might not reduce any payload in that window,
+        so the first serving step that does would compile it while its peers
+        wait. ``numel`` is not specialized, so one compile serves every size.
+
+        Args:
+            output: A tensor ``run`` writes the pull's result to, such as
+                the caller's output buffer.
+        """
+        if self.pull.producer.data.numel() > self.push_max_numel:
+            self._launch_pull_two_shot(output, self.world_size * 8, compile_only=True)
+
+    def _launch_pull_two_shot(
+        self, output: torch.Tensor, numel: int, *, compile_only: bool
+    ) -> None:
+        args = (
             self.pull.producer.data,
             self.pull.scratch,
             output,
@@ -2241,13 +2262,20 @@ class ProducerAllReduce:
             self.epochs,
             self.pull.producer.peers.addresses[: self.world_size],
             numel,
+        )
+        options = dict(
             RANK=self.pull.producer.peers.rank,
             BLOCK=2048,
             NUM_SUBGROUPS=4,
             num_warps=4,
             WAIT_VMEM=self._arch.wait_vmem,
         )
-        return output
+        if compile_only:
+            iris_pull_twoshot_allreduce.warmup(
+                *args, grid=(_PULL_MAX_PROGRAMS,), **options
+            )
+        else:
+            iris_pull_twoshot_allreduce[(_PULL_MAX_PROGRAMS,)](*args, **options)
 
 
 @gluon.jit
