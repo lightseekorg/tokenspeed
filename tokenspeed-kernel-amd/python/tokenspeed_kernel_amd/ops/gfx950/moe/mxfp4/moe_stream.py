@@ -818,7 +818,11 @@ def _store_routes(out_d, y, route, cols):
     )
 
 
-@gluon.jit
+def _moe_stream_launch_metadata(grid, kernel, args):
+    return {"name": f"{kernel.name} (rows={args['ROWS']})"}
+
+
+@gluon.jit(launch_metadata=_moe_stream_launch_metadata)
 def gluon_mxfp4_moe_stream_gfx950(
     epochs,
     claims,
