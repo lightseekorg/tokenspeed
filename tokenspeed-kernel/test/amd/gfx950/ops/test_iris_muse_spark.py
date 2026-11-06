@@ -1184,12 +1184,8 @@ def test_route_sum_gather_lamport_polling_codegen():
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
-def test_attntail_lamport_polling_codegen():
-    """Each subgroup of the 16-subgroup poller retries on its own.
-
-    A workgroup-wide readiness reduction would put shared-memory traffic and
-    barriers into every retry; the subgroup ballot keeps them out.
-    """
+def _attntail_lamport_assembly() -> str:
+    """gfx950 assembly of the 16-subgroup Lamport attention tail at TP8."""
     rank = 5
     from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
@@ -1233,7 +1229,16 @@ def test_attntail_lamport_polling_codegen():
         },
         num_warps=16,
     )
-    assembly = kernel.asm["amdgcn"]
+    return kernel.asm["amdgcn"]
+
+
+def test_attntail_lamport_polling_codegen():
+    """Each subgroup of the 16-subgroup poller retries on its own.
+
+    A workgroup-wide readiness reduction would put shared-memory traffic and
+    barriers into every retry; the subgroup ballot keeps them out.
+    """
+    assembly = _attntail_lamport_assembly()
     polls = [
         cycle for cycle in polling_cycles(assembly) if _batched_peer_reads(cycle, 7)
     ]
@@ -1242,6 +1247,26 @@ def test_attntail_lamport_polling_codegen():
         votes_with_subgroup_mask(cycle) for cycle in polls
     ), "a retry must branch on one subgroup lane mask"
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+def test_attntail_stage_store_follows_a_barrier():
+    """Every wave loads its workgroup's stage; one lane stores the next.
+
+    A wave that loaded after that store would use the next stage's mailbox
+    slot, so a workgroup barrier must precede the store on every path: it
+    sits in the block that ends in the store.
+    """
+    lines = _attntail_lamport_assembly().splitlines()
+    stores = [i for i, line in enumerate(lines) if "global_store_dword " in line]
+    assert len(stores) == 1, "expected one global store (the stage)"
+    index = stores[0]
+    # Walk back through fall-through-only blocks ("; %bb.N:") to a block
+    # that branches may enter (".LBB").
+    while index > 0 and not lines[index].startswith(".LBB"):
+        if "s_barrier" in lines[index]:
+            break
+        index -= 1
+    assert "s_barrier" in lines[index], "the stage store does not follow a barrier"
 
 
 def test_gather_lamport_polling_codegen():
