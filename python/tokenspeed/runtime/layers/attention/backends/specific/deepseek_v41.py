@@ -2241,6 +2241,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._decode_schedule_keepalive.append(schedule)
         return schedule
 
+    @property
+    def supports_fused_attention(self) -> bool:
+        # FP8 output must follow the complete softmax, not a DCP partial.
+        return self.kvp_size == 1
+
     def forward_v41(
         self,
         q,
@@ -2258,13 +2263,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        fused_decode_groups: int | None,
         out_rope_cache=None,
         key_rows: QueryShardGather | None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Joint SWA/global attention; returns BF16 [T,Hlocal,512].
 
         The output is BEFORE inverse RoPE unless out_rope_cache (the inverse
         FP32 [positions,64] table) is given; then it is rotated with it.
+
+        With fused_decode_groups, q instead uses the prepared weight's unrotated
+        layout. Local decode returns grouped FP8 codes/scales after inverse RoPE,
+        for the matching prepared output projection. SWA uses the same RoPE table.
 
         q and swa_kv are [T,Hlocal,512] / [T,512]. q is post-RoPE; SWA can
         defer RMSNorm and RoPE using swa_norm_weight/eps and swa_rope_cache.
@@ -2282,6 +2292,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         are evaluated. Global selections and Reindex candidates remain query-local.
         """
         from tokenspeed_kernel.ops.attention import dsv41
+
+        if fused_decode_groups is not None and (
+            q.shape[1] not in (64, 128) or q.shape[1] != 8 * fused_decode_groups
+        ):
+            raise ValueError("Fused V4.1 output requires 8 heads per group")
+        if fused_decode_groups is not None and (
+            not forward_mode.is_decode()
+            or not self.supports_fused_attention
+            or swa_rope_cache is None
+            or out_rope_cache is not None
+        ):
+            raise ValueError(
+                "Fused V4.1 attention requires local decode with its RoPE table"
+            )
 
         source_positions, source_requests = positions, request_indices
         source_window = None
@@ -2378,11 +2402,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     swa_rope_cache=swa_rope_cache,
                     swa_norm_weight=swa_norm_weight,
                     swa_norm_eps=swa_norm_eps,
+                    fused_decode_groups=None,
                     out_rope_cache=out_rope_cache,
                     key_rows=None,
                 )
             return out
         if n == 0 and key_rows is None:
+            if fused_decode_groups is not None:
+                groups = fused_decode_groups
+                width = q.shape[1] * q.shape[2] // groups
+                return (
+                    q.new_empty((0, groups, width), dtype=torch.float8_e4m3fn),
+                    q.new_empty((0, groups, width // 128), dtype=torch.int32),
+                )
             return torch.empty_like(q)
         prepared = self._prepared_selections.pop(
             (layer_id, forward_mode, id(positions), id(request_indices)), None
@@ -2446,6 +2478,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 if canonical
                 else self.window_slots(V41_SWA_GROUP_ID, positions, request_indices)
             )
+            if fused_decode_groups is not None:
+                return dsv41.selected_attention_fp8(
+                    q,
+                    cache,
+                    swa_slots,
+                    swa_lens,
+                    global_cache,
+                    global_slots,
+                    global_lens,
+                    attn_sink,
+                    softmax_scale,
+                    positions,
+                    swa_rope_cache,
+                    fused_decode_groups,
+                    None,
+                    None,
+                )
             if self.kvp_size > 1 and owner >= 0:
                 # Indexer selections remain global; only KV reads are owner-local.
                 local_slots, local_counts, local_swa_lens = (

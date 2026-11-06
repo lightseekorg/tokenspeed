@@ -373,3 +373,20 @@ in the same order when publishing the cache pool, before any forward or
 decode graph capture. A forward never creates a process group; an idle DP
 rank still participates in startup. Temporary tensor ownership ends after
 the final consumer, while the process-group manager retains the communicator.
+
+### V4.1 fused decode attention
+
+On supported Blackwell configurations, V4.1 decode keeps a separate prepared
+copy of the query and grouped output projection weights. The query projection
+returns the fused attention layout without applying RoPE. Selected attention
+then applies Q RoPE, the existing softmax and sink, inverse output RoPE, and
+per-32 FP8 quantization; the matching output projection consumes those codes
+and packed scales directly. The latent query norm remains before its projection.
+DSpark decode uses the same contract over its BF16 window workspace.
+
+The native epilogue requires eight query heads per output group. Unsupported
+head or projection geometry and distributed partial attention retain the regular
+path. Main-model prefill always uses the canonical weights. Prepared copies are
+nonpersistent buffers, refreshed in place from the canonical checkpoint after
+weight updates so captured graphs retain their addresses. Cache ownership,
+selection and write ordering are unchanged.

@@ -76,6 +76,8 @@ __all__ = [
     "index_query_rope_weights",
     "index_query_rope_quant",
     "selected_attention",
+    "selected_attention_fp8",
+    "prepare_fused_decode_weights",
     "selected_attention_rope",
     "new_attention_schedule",
     "index_score",
@@ -360,6 +362,79 @@ def new_attention_schedule() -> object | None:
     from tokenspeed_kernel.ops.attention.dsv41.flash_mla import new_flashmla_schedule
 
     return new_flashmla_schedule()
+
+
+def prepare_fused_decode_weights(
+    q_weight: torch.Tensor,
+    q_scales: torch.Tensor,
+    output_weight: torch.Tensor,
+    output_scales: torch.Tensor,
+    num_heads: int,
+    num_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Prepare separate projection weights for fused V4.1 decode attention.
+
+    Q scales are canonical uint8 UE8M0 [N,K/32]; output scales are the
+    packed scales from ``prepare_grouped_fp8_projection``. Returns permuted
+    Q codes/canonical scales and grouped output codes/packed scales, without
+    changing the original tensors. None means this device has no fused kernel.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_fused_decode_available,
+    )
+
+    if not is_flash_mla_fused_decode_available():
+        return None
+    try:
+        kernel = _kernel("prepare_fused_decode_weights", q_weight)
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        q_weight, q_scales, output_weight, output_scales, num_heads, num_groups
+    )
+
+
+def selected_attention_fp8(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor | None,
+    swa_slots: torch.Tensor | None,
+    swa_lens: torch.Tensor | None,
+    global_cache: torch.Tensor | None,
+    global_slots: torch.Tensor | None,
+    global_lens: torch.Tensor | None,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_groups: int,
+    prefill_kv: torch.Tensor | None,
+    prefill_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused Q RoPE, selected attention and inverse RoPE with FP8 output.
+
+    Q is unrotated BF16 [T,H,512] from the prepared Q weight; no extra Q norm
+    is applied. Cache/selection inputs follow ``selected_attention``. A BF16
+    workspace and its indices may replace paged inputs for draft decoding.
+    Returns E4M3 [T,groups,H/groups*512] and packed UE8M0 int32 scales for
+    ``grouped_fp8_projection`` with the prepared output weight. Both prepared
+    projections must be used together; this layout is not the ordinary output.
+    """
+    return _kernel("selected_attention_fp8", q)(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        positions,
+        cos_sin_cache,
+        num_groups,
+        prefill_kv,
+        prefill_indices,
+    )
 
 
 def selected_attention(
