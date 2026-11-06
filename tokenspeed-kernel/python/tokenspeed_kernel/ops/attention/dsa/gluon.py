@@ -821,6 +821,8 @@ if current_platform().is_amd:
             page_size=page_size,
             softmax_scale=softmax_scale,
             query_group_size=query_group_size,
+            query_requests=query_requests.to(torch.int32).contiguous(),
+            request_count=local_page_table.shape[0],
         )
         if initial_tokens or local_tokens:
             # Without mandatory windows the mask has nothing to add: the
