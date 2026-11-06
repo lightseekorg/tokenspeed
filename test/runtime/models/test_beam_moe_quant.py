@@ -808,7 +808,7 @@ def fp8_checkpoints(tmp_path_factory):
     root = tmp_path_factory.mktemp("fp8")
     paths = {}
     for label, raw in (("fp8", RAW), ("tensor", edited((*W, "strategy"), "tensor"))):
-        path = write_tiny_checkpoint(root / label)
+        path = write_tiny_checkpoint(root / label, config=tiny_config())
         config = json.loads((path / "config.json").read_text())
         config["quantization_config"] = raw
         (path / "config.json").write_text(json.dumps(config))
@@ -1076,7 +1076,7 @@ def test_a_quantized_launch_detects_the_format_and_keeps_the_moe_default(
 
     monkeypatch.setattr(moe_flashinfer, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", 128)
     caplog.set_level(logging.INFO, logger=model_config_module.__name__)
-    nvfp4 = write_tiny_checkpoint(tmp_path / "nvfp4")
+    nvfp4 = write_tiny_checkpoint(tmp_path / "nvfp4", config=tiny_config())
     (nvfp4 / "hf_quant_config.json").write_text(json.dumps(HF_QUANT_CONFIG))
     save_file(nvfp4_checkpoint(), str(nvfp4 / "model.safetensors"))
     beam_width = json.dumps({"moe_intermediate_size": 2560})
