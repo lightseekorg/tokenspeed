@@ -41,6 +41,16 @@ flight ahead of the MFMA (`PREFETCH_TILES`). Neither changes the K
 accumulation order, so every schedule, and the direct decode and staged
 package paths that serve the other rows, produce bitwise-identical results.
 
+The package prefill also runs as two calls split at the intermediate:
+`gluon_mxfp4_sorted_gate_up_gfx950` writes sorted E2M1 rows into a caller
+buffer and returns the sorted-route metadata, and
+`gluon_mxfp4_sorted_down_gfx950` projects sorted rows through any down weight
+laid out by `preprocess_sorted_down_weight`. The split sort is
+deterministic (each expert's routes in top-k order), so expert TP ranks holding
+different intermediate slices produce row-aligned outputs whose bytes and scale
+panels concatenate along K into the full intermediate; a down weight split by
+output columns then yields complete route values without a cross-rank sum.
+
 For the staged package's second GEMM, TP uses direct BF16 atomic accumulation
 through 2048 tokens with E2M1 activations (64 with E4M3), and scratch-plus-FP32
 reduction at larger sizes. E2M1 atomics use adjacent column pairs per lane and
