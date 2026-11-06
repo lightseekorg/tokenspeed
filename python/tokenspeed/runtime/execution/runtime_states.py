@@ -65,11 +65,13 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
+        input_vocab_size: int,
         vocab_size: int,
         output_length: int,
         device: str = "cuda",
     ):
         self.device = device
+        self.input_vocab_size = input_vocab_size
         self.vocab_size = vocab_size
         self.ngram_accepted_tokens: torch.Tensor | None = None
         self.ngram_needs_seed: torch.Tensor | None = None

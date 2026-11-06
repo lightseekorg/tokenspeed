@@ -30,6 +30,16 @@ prepared variants using the existing shape and topology policies. Different
 staging geometries have separate synchronization buffers because their workgroup
 IDs cover different element ranges. Triton RSAG remains independent.
 
+A model can also install its prepared `ProducerAllReduce` as a group's ordinary
+all-reduce. The backend then reduces caller-owned BF16 tensors in place through
+`reduce_ordinary`: Lamport windows directly, the TP4 push window with a copy
+back, and other payloads up to a measured per-group-size limit through the
+producer buffer and the generic pull. Past the limit they fall back to RCCL.
+Results never borrow state storage, but ordinary reductions write the producer
+buffer and pull scratch, so no borrowed producer-buffer or pull-scratch view,
+nor the ready flags guarding it, may be live across an ordinary reduction on
+the group.
+
 Model preparation, dispatch, and fusions live in `kimi_k3/` and
 `muse_spark/`. General collectives live in `all_reduce.py`,
 `reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
@@ -53,10 +63,16 @@ restores its scatter markers before it publishes the reduced row, and no rank
 starts its next launch before it has every reduced row, so row counts may
 change between launches.
 
-Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
+Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950; its own
+ordinary all-reduces use the same `reduce_ordinary` policy. Both
 topologies keep the same global token cutoffs for Lamport, push, pull, and
 owned-row paths. Owned rows use ceil(global rows / world size), with padded
 rows masked; QKVG exchange derives each rank's head widths from the group size.
+With expert TP8 (EP1), batches whose routes outgrow the Lamport two-shot
+all-reduce (44 rows) and stay below the owned-row cutoff reduce-scatter each
+token's raw routes onto its owner through the owned-row route staging,
+normalize them there, and gather the 8x smaller sums through the Lamport
+one-shot mailbox; smaller batches all-reduce the routes.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
