@@ -1225,7 +1225,7 @@ def probe_arena_floor(
     A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
     ``max_decoder_rows_per_request``, None for other models) fabricates one
     request per that many rows of a bucket no wider than the token ladder's,
-    and never more than ``max_num_seqs``.
+    and never more than ``request_state_seqs``.
     """
     from tokenspeed.runtime.execution.cudagraph_memory import probe_arena_parent_blocks
     from tokenspeed.runtime.execution.model_executor import (
@@ -1240,7 +1240,9 @@ def probe_arena_floor(
         decoder_requests=(
             0
             if decoder_rows_per_request is None
-            else min(-(-tokens // decoder_rows_per_request), server_args.max_num_seqs)
+            else min(
+                -(-tokens // decoder_rows_per_request), server_args.request_state_seqs
+            )
         ),
     )
 
@@ -1312,6 +1314,7 @@ def build_device_side(
     overlap_schedule_depth: int,
     decode_input_tokens: int,
     max_batch_size: int,
+    request_slots: int,
     kv_transfer_builder,
 ) -> DeviceBuild:
     """Construct the whole device side and return the three views of it.
@@ -1340,9 +1343,13 @@ def build_device_side(
             size the KV budget.
         overlap_schedule_depth: Decode KV reservation depth.
         decode_input_tokens: Tokens each decode step feeds per request.
-        max_batch_size: Rank-local scheduler batch bound; the executor
-            sizes its request pool one row past it for the graph-padding
-            sink row.
+        max_batch_size: Rank-local scheduler batch bound (the retraction
+            pool's live-request limit).
+        request_slots: Rank-local requests the per-request decode state is
+            sized for, at least ``max_batch_size``
+            (``ServerArgs.request_state_seqs`` per attention-DP rank); the
+            executor sizes its request pool one row past it for the
+            graph-padding sink row.
         kv_transfer_builder: Builds the PD transfer peer from the finished
             attention build, or returns None outside disaggregation: the
             host's ``build_host_peer`` (``pd/host_peer.py``), bound to the
@@ -1397,7 +1404,7 @@ def build_device_side(
     )
     max_forward_tokens = max(
         max_forward_tokens,
-        max_batch_size * decode_input_tokens,
+        request_slots * decode_input_tokens,
     )
     with startup_phase("communication.prepare"):
         target.prepare_communication_runtime(max_forward_tokens)
@@ -1493,7 +1500,7 @@ def build_device_side(
                 server_args=server_args,
                 model_config=model_config,
                 model=target.model,
-                max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
+                max_req_pool_size=RequestSlotLayout(request_slots).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,
                 prefix_granularity=views.cache_geometry.prefix_granularity,

@@ -2019,6 +2019,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            request_slots=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     budget, rows = sized.value.args
