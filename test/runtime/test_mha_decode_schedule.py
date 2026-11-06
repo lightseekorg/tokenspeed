@@ -305,7 +305,7 @@ def test_verify_keeps_the_default_split_when_no_schedule_kernel_serves(
     """An override that leaves the schedule op without a kernel while the
     decode kernel still takes one sends the verify layers to the default
     split instead of reading an unset schedule. Each of the two verify
-    layers asks for a schedule once; later forwards do not ask again."""
+    layers asks for a schedule once. Later forwards don't ask again."""
     from tokenspeed_kernel.selection import kernel_override
 
     step = _Step(width=8)

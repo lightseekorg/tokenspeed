@@ -2223,7 +2223,7 @@ def launch_gluon_mha_decode_balanced_gfx950(
     *,
     schedule: torch.Tensor,
 ) -> torch.Tensor:
-    """Full-attention paged decode split by a balanced schedule.
+    """Run full-attention paged decode, split by a balanced schedule.
 
     See "Balanced split schedule" in the ops README.
 
@@ -2233,8 +2233,8 @@ def launch_gluon_mha_decode_balanced_gfx950(
         k_cache, v_cache: Paged caches, [pages, page_size, kv_heads, dim].
         page_table: int32 [num_requests, pages per request] page indices.
         cache_seqlens: int32 [num_requests] cache lengths.
-        max_seqlen_k: Accepted for the decode signature; unused, as the
-            schedule sizes the splits.
+        max_seqlen_k: Unused. The schedule sizes the splits, so this
+            argument only matches the decode signature.
         max_seqlen_q: Query tokens per request.
         window_left: Must be -1 (full attention).
         logit_cap: Must be 0.

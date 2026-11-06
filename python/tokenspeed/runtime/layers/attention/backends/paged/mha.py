@@ -424,10 +424,10 @@ class MHAAttnBackend(PagedAttentionBackend):
                 **scale_kwargs,
             )
             if computed is None:
-                # No schedule kernel serves these calls (its selection can
-                # differ from the decode kernel's, e.g. under an override),
-                # so they keep the default split rather than read an unset
-                # schedule.
+                # No schedule kernel serves these calls. Its selection can
+                # differ from the decode kernel's, for example under an
+                # override. These calls keep the default split rather than
+                # read an unset schedule.
                 self._layer_reads_schedule[key] = False
                 return None
             self._schedule_stale = False
