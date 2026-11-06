@@ -94,7 +94,7 @@ def test_run_eager_reruns_on_replay_with_live_host_state() -> None:
     def publish() -> None:
         published.copy_(buffers[chosen["index"]])
 
-    cap = BreakableCapture(run_segments_while_capturing=False)
+    cap = BreakableCapture()
     with torch.inference_mode():
         with cap:
             x.add_(1)

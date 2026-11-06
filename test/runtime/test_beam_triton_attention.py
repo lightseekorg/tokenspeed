@@ -431,7 +431,7 @@ def test_beam_triton_runtime_mixed_breakable_graph_refresh(width):
     # remains eager; A/B/A refreshes the SAME capture and runtime objects.
     harness.prepare(rounds[True], seed=72)
     torch.cuda.synchronize()
-    capture = BreakableCapture(run_segments_while_capturing=False)
+    capture = BreakableCapture()
     with capture:
         captured = harness.forward()
     segments = capture.num_segments

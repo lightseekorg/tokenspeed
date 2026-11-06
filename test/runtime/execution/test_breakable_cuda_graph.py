@@ -58,7 +58,7 @@ class TestBreakableCudaGraph:
 
     def _build_capture(self):
         """Capture the same forward with relu as an eager break."""
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
 
         def forward():
             h = self.x_static @ self.w1
@@ -121,7 +121,7 @@ class TestBreakableCudaGraph:
         for _ in range(3):
             forward()
         torch.cuda.synchronize()
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
         with cap:
             captured_out = forward()
 
@@ -156,7 +156,7 @@ class TestBreakableCudaGraph:
             forward()
         torch.cuda.synchronize()
         seen.clear()
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
         with cap:
             captured_out = forward()
 
@@ -186,7 +186,7 @@ class TestBreakableCudaGraph:
                 h = h @ ws[i + 1]
             return h
 
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
 
         def forward():
             h = self.x_static @ ws[0]
@@ -240,9 +240,9 @@ class TestBreakableCudaGraph:
         assert torch.equal(result, table[offsets * 10 + 7] + 1)
 
     def test_nested_capture_rejected(self):
-        with BreakableCapture(run_segments_while_capturing=False):
+        with BreakableCapture():
             with pytest.raises((RuntimeError)):
-                with BreakableCapture(run_segments_while_capturing=False):
+                with BreakableCapture():
                     pass
 
     def test_scrub_padding_tail(self):
@@ -322,7 +322,7 @@ class TestBucketedCapture:
             for _ in range(2):  # warmup
                 self._inner(bucket)
             torch.cuda.synchronize()
-            cap = BreakableCapture(pool=self._pool, run_segments_while_capturing=False)
+            cap = BreakableCapture(pool=self._pool)
             with cap:
                 out = self._inner(bucket)
             self._pool = self._pool or cap.pool
@@ -385,9 +385,7 @@ class TestSharedHandoffStorage:
         for _ in range(2):
             self._inner(n)
         torch.cuda.synchronize()
-        cap = BreakableCapture(
-            pool=pool, handoff_storage=storage, run_segments_while_capturing=False
-        )
+        cap = BreakableCapture(pool=pool, handoff_storage=storage)
         with cap:
             out = self._inner(n)
         return cap, out
@@ -570,7 +568,7 @@ class TestBreakPointAndAmbientCtx:
             with active_forward(dummy):
                 outer()
         torch.cuda.synchronize()
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
         with active_forward(dummy):
             with cap:
                 captured = outer()
@@ -615,7 +613,7 @@ class TestBreakPointAndAmbientCtx:
             with active_forward(dummy):
                 outer()
         torch.cuda.synchronize()
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
         with active_forward(dummy):
             with cap:
                 captured = outer()
@@ -656,7 +654,7 @@ class TestBreakPointAndAmbientCtx:
             with active_forward(dummy):
                 outer()
         torch.cuda.synchronize()
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
         with active_forward(dummy):
             with cap:
                 captured = outer()
@@ -693,7 +691,7 @@ class TestBreakPointAndAmbientCtx:
         for _ in range(3):
             outer()
         torch.cuda.synchronize()
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
         with cap:
             captured = outer()
         assert (tuple(captured.shape)) == ((self.x_static.size(0), d2))
@@ -733,7 +731,7 @@ class TestBreakPointAndAmbientCtx:
         for _ in range(3):
             fwd()
         torch.cuda.synchronize()
-        cap = BreakableCapture(run_segments_while_capturing=False)
+        cap = BreakableCapture()
         with cap:
             captured = fwd()
         # Exactly one break (outer) => 2 graph segments + 1 break = 3.
@@ -955,8 +953,7 @@ class TestPoolReuseAcrossCaptures:
                 fwd(n)
             torch.cuda.synchronize()
             before = self._pool_mb()
-            # No stream given: the shared default capture stream.
-            cap = BreakableCapture(pool=pool, run_segments_while_capturing=False)
+            cap = BreakableCapture(pool=pool)  # shared default capture stream
             with cap:
                 out = fwd(n)
             cap.replay()
@@ -1027,11 +1024,7 @@ class TestPoolReuseAcrossCaptures:
                 fwd(n)
             torch.cuda.synchronize()
             before = self._pool_mb()
-            cap = BreakableCapture(
-                pool=pool,
-                handoff_storage=handoff_storage,
-                run_segments_while_capturing=False,
-            )
+            cap = BreakableCapture(pool=pool, handoff_storage=handoff_storage)
             with cap:
                 fwd(n)
             torch.cuda.synchronize()

@@ -855,10 +855,7 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool,
-            stream=stream,
-            handoff_storage=self._handoff_storage,
-            run_segments_while_capturing=False,
+            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -886,7 +883,6 @@ class PrefillGraph:
             pool=self._pool,
             stream=stream,
             handoff_storage=self._encoder_handoff_storage,
-            run_segments_while_capturing=False,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -916,10 +912,7 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool,
-            stream=stream,
-            handoff_storage=self._handoff_storage,
-            run_segments_while_capturing=False,
+            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):

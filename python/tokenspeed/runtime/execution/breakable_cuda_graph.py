@@ -183,7 +183,7 @@ class BreakableCapture:
 
     Usage::
 
-        cap = BreakableCapture(pool=shared_pool, run_segments_while_capturing=False)
+        cap = BreakableCapture(pool=shared_pool)
         with cap:
             model_forward(...)        # attention calls hit break_here()
         # later, after copying live inputs into the static buffers:
@@ -207,13 +207,14 @@ class BreakableCapture:
         handoff_storage: An optional handoff storage map shared with captures that
             never replay while this one's handoffs are live; see ``_handoff_view``.
         run_segments_while_capturing: Whether each segment runs once as soon
-            as it is captured, before the break that follows it. A capture
-            records a segment's kernels without running them, so without this
-            a break that runs during the capture reads whatever the pool held
-            for the tensors the segment computes, and one that indexes with
-            such a tensor can fault. Replays are unaffected. The drafter's
-            extend captures need it: their breaks index with the top-k rows
-            the narrowing gathers and with positions a captured step advances.
+            as it is captured, before the break that follows it (default
+            False). A capture records a segment's kernels without running
+            them, so without this a break that runs during the capture reads
+            whatever the pool held for the tensors the segment computes, and
+            one that indexes with such a tensor can fault. Replays are
+            unaffected. The drafter's extend captures need it: their breaks
+            index with the top-k rows the narrowing gathers and with positions
+            a captured step advances.
     """
 
     _active: BreakableCapture | None = None
@@ -225,7 +226,7 @@ class BreakableCapture:
         stream: torch.cuda.Stream | None = None,
         handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
         *,
-        run_segments_while_capturing: bool,
+        run_segments_while_capturing: bool = False,
     ) -> None:
         self.pool = pool
         self._run_segments_while_capturing = run_segments_while_capturing
