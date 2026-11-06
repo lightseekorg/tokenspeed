@@ -330,7 +330,7 @@ remain unchanged. Kernel traits exclude other head counts.
 DeepGEMM's FP8 logits kernels take no query scale, so
 `quantize_index_query_weights` quantizes each (token, head) query to E4M3
 with the 1x128 token-group quantizer's arithmetic and folds that scale and
-`softmax_scale` into the head weights in one launch, bit-exact with
+`softmax_scale` into the head weights in one launch, bit-exact with NVIDIA's
 `quantize_fp8` followed by `combine_topk_weights`. Before the decode top-k,
 `scrub_nonfinite_logits` reads the per-request lengths and derives each
 verify row's causal candidate count itself.

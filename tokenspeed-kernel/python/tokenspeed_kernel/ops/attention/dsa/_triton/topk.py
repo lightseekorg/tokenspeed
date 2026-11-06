@@ -514,8 +514,8 @@ def quantize_index_query_weights(
     """Quantize index queries to E4M3 with one scale per (token, head) and fold
     that scale and ``softmax_scale`` into the head weights, in one launch.
 
-    Bit-exact with the 1x128 token-group ``quantize_fp8`` followed by
-    ``combine_topk_weights``, which it replaces on the DeepGEMM scoring paths.
+    Bit-exact with NVIDIA's 1x128 token-group ``quantize_fp8`` followed by
+    ``combine_topk_weights``, which it replaces on the NVIDIA scoring paths.
 
     Args:
         q: ``[tokens, heads, 128]`` BF16 index queries, unit stride on the last dim.

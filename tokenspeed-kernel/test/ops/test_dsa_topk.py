@@ -28,8 +28,8 @@ Covers the per-solution wrappers behind ``deep_gemm_dsa_decode_topk``:
     compression ratio, plus row-aligned (widened) logits equivalence.
   * ``combine_topk_weights`` (Triton): bit-exactness against the unfused
     ``weights.float() * q_scale * softmax_scale`` reference chain.
-  * ``quantize_index_query_weights`` (Triton): bit-exactness against the
-    1x128 ``quantize_fp8`` followed by ``combine_topk_weights``.
+  * ``quantize_index_query_weights`` (Triton): one compile per heads-per-program
+    bucket (its parity with the NVIDIA quantizer is under ``test/nvidia/ops``).
   * ``_prepare_logits_for_topk``: widening of DeepGEMM's narrowed logits
     slices plus the in-place NaN/inf -> -inf scrub.
 
@@ -286,36 +286,6 @@ def test_combine_topk_weights_empty():
 # ---------------------------------------------------------------------------
 # quantize_index_query_weights (one launch for the query quantizer and combine)
 # ---------------------------------------------------------------------------
-@requires_cuda
-@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("tokens,heads", [(1, 32), (8, 32), (37, 64), (513, 32)])
-def test_quantize_index_query_weights_matches_quantizer_then_combine(
-    weights_dtype, tokens, heads
-):
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
-
-    torch.manual_seed(tokens + heads)
-    softmax_scale = 128**-0.5 * heads**-0.5
-    q = torch.randn(tokens, heads, 128, device="cuda", dtype=torch.bfloat16) * 3
-    q[0, 0] = 0  # an all-zero group keeps scale one
-    q[-1, -1, 5] = 2.0e4  # a group whose amax dwarfs the rest
-    fused = torch.randn(tokens, 128 + heads, device="cuda", dtype=weights_dtype)
-    weights = fused.split([128, heads], dim=-1)[1]
-
-    ref_q, ref_scale = quantize_fp8(
-        q.view(-1, 128),
-        granularity="token_group",
-        group_size=128,
-        scale_encoding="float32",
-    )
-    ref_w = combine_topk_weights(weights, ref_scale, softmax_scale)
-    got_q, got_w = quantize_index_query_weights(q, weights, softmax_scale)
-
-    assert got_q.shape == (tokens, heads, 128) and got_q.is_contiguous()
-    assert torch.equal(got_q.view(torch.uint8), ref_q.view_as(q).view(torch.uint8))
-    assert torch.equal(got_w, ref_w)
-
-
 @requires_cuda
 def test_quantize_index_query_weights_compiles_once_per_bucket():
     """Token count, row pitches and the score scale stay runtime arguments
