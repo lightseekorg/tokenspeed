@@ -411,7 +411,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         if not reads:
             return None
         if self._schedule_stale:
-            mha_decode_schedule(
+            computed = mha_decode_schedule(
                 q=q,
                 k_cache=k_cache,
                 v_cache=v_cache,
@@ -423,6 +423,13 @@ class MHAAttnBackend(PagedAttentionBackend):
                 solution=self.kernel_solution,
                 **scale_kwargs,
             )
+            if computed is None:
+                # No schedule kernel serves these calls. Its selection can
+                # differ from the decode kernel's, for example under an
+                # override. These calls keep the default split rather than
+                # read an unset schedule.
+                self._layer_reads_schedule[key] = False
+                return None
             self._schedule_stale = False
         return self.decode_schedule_buf
 
