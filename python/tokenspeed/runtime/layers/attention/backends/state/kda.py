@@ -452,7 +452,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             # Allocated once at its maximum; graphs may hold its addresses, so
             # an overrun is an invariant violation, never a resize.
             capacity = next(iter(scratch.values()))[0].shape[0]
-            if capacity < rows:
+            if not self._replay_uses_raw_gate and capacity < rows:
                 raise RuntimeError(
                     f"KDA verify needs {rows} transient conv rows but the "
                     f"preallocated scratch holds {capacity}"
@@ -461,12 +461,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         scratch = {}
         for layer_id in self._state_layer_ids():
             conv, _ = self._state_components(layer_id)
-            if self._replay_uses_raw_gate and conv.shape[0] < rows:
-                raise RuntimeError(
-                    f"KDA verify needs {rows} transient conv rows but the "
-                    f"bound pool's conv slab holds {conv.shape[0]}"
-                )
             scratch[layer_id] = (
+                # A raw-gate verify stores no conv tape: the bound slab only
+                # fills the argument, so it needs no rows of its own.
                 (
                     conv
                     if self._replay_uses_raw_gate

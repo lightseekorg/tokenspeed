@@ -1120,9 +1120,7 @@ place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 `alignment`, `max_padding_fraction`, `packing`, `check_layout`,
 `num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
-`pool_options`, `verify_scratch_in_pool`.
-The last answers whether speculative verify stages its scratch in the bound
-pool; a CUDA-graph memory probe arena then keeps the serving concurrency.
+`pool_options`.
 `groups()` itself is a seam for the two families whose groups are not
 per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`

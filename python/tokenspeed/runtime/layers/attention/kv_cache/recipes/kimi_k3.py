@@ -37,10 +37,7 @@ from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheRecipe,
-    kda_verify_scratch_in_pool,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -325,10 +322,6 @@ class KimiK3Recipe(CacheRecipe):
         if self.server_args.speculative_algorithm is None:
             return False
         return kda_replay_supported(self.attn_config)
-
-    @override
-    def verify_scratch_in_pool(self) -> bool:
-        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
     @override
     def workspace_bytes(self) -> int:

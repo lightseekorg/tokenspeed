@@ -71,8 +71,7 @@ def probe_arena_parent_blocks(
     prefill bucket, including configured capture batch sizes and the requests
     a narrowing model's decoder ladder fabricates (``decoder_requests``, 0 for
     other models) -- takes a distinct page; decode capture uses only the null
-    page. A family whose verify scratch is the pool itself keeps the serving
-    concurrency instead (``verify_scratch_in_pool``).
+    page.
     """
     from tokenspeed.runtime.execution.prefill_graph import dummy_batch_size
 

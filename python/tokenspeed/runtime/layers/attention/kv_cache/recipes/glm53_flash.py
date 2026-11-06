@@ -35,7 +35,6 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnCo
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
-    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
@@ -349,10 +348,6 @@ class Glm53FlashRecipe(CacheRecipe):
             mla_element_size=self.attn_config.kv_cache_dtype.itemsize,
             state_group_ids=state_group_ids,
         )
-
-    @override
-    def verify_scratch_in_pool(self) -> bool:
-        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
     @cached_property
     def replay_kda(self) -> bool:

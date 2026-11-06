@@ -874,8 +874,9 @@ def test_a_rebound_backend_matches_a_fresh_one_field_by_field():
     assert_no_alias(rebound.backend, old_slabs)
 
 
-def test_a_pool_too_small_for_the_raw_gate_scratch_is_refused(monkeypatch):
-    """The raw-gate scratch is the pool's own conv slab, so a probe pool must hold max_bs rows."""
+def test_a_raw_gate_verify_needs_no_pool_rows(monkeypatch):
+    """A raw-gate verify stores no conv tape: a pool smaller than max_bs serves,
+    and the scratch is the bound pool's own slab, not an allocation."""
     monkeypatch.setattr(
         "tokenspeed.runtime.layers.attention.backends.state.kda.kda_batched_replay_uses_raw_gate",
         lambda dtype, **kwargs: True,
@@ -884,8 +885,10 @@ def test_a_pool_too_small_for_the_raw_gate_scratch_is_refused(monkeypatch):
     assert harness.backend._replay_uses_raw_gate
     harness.backend.set_kv_pool(_make_kimi_pool(DEV, usable_pages=4))
 
-    with pytest.raises(RuntimeError, match="transient conv rows"):
-        harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+    harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+    for layer_id, (conv_scratch, _) in harness.backend._verify_scratch.items():
+        conv, _ = harness.backend._state_components(layer_id)
+        assert conv_scratch.data_ptr() == conv.data_ptr()
 
 
 def test_hybrid_rebinding_reaches_the_state_child():
