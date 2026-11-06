@@ -142,6 +142,59 @@ def _mha_decode_balanced():
     )
 
 
+def _sliding_tail(rows):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_sliding_attention_twoshot_muse_attntail as fn,
+    )
+
+    types = dict(
+        _ATTENTION_POINTERS,
+        counters_ptr="*i32",
+        gate_ptr="*bf16",
+        gate_stride="i32",
+        weight_ptr="*bf16",
+        att_buffer="*bf16",
+        epochs="*i32",
+        region="*bf16",
+        rs_peers=("i64",) * 8,
+        sums="*i64",
+        sums_peers=("i64",) * 8,
+        stream_ptr="*fp32",
+        post_weight_ptr="*bf16",
+        alpha_ptr="*fp32",
+        beta_ptr="*fp32",
+        pre_weight_ptr="*bf16",
+        out_stream_ptr="*fp32",
+        pre_fp32_ptr="*fp32",
+        pre_bf16_ptr="*bf16",
+        rows="i32",
+    )
+    constexprs = dict(_ATTENTION)
+    constexprs.pop("NUM_WARPS")
+    constexprs.update(
+        NUM_KV_SPLITS=8,
+        WINDOW_LEFT=2047,
+        NUM_REQUESTS=rows // 8,
+        WIDTH=8192,
+        RANK=5,
+        WORLD_SIZE=8,
+        MAX_SHARD_ELEMENTS=16 * 1024,
+        MAX_ROWS=16,
+        PARTS=8 if rows <= 8 else 4,
+        GATE_EPS=1e-6,
+        POST_EPS=1e-6,
+        POST_WEIGHT_OFFSET=1.0,
+        PRE_EPS=1e-6,
+        PRE_WEIGHT_OFFSET=1.0,
+        POST_HAS_WEIGHT=True,
+        RESERVED_LDS=128 * 1024,
+        PEER_SIGNAL_STORE_CACHE=_peer_signal_store(),
+    )
+    return _compile_gfx950(
+        fn, types, constexprs, 4, ("rows", "gate_stride"), _sched_options()
+    )
+
+
 def _attntail_lamport():
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
         iris_fused_lamport_allreduce_muse_attntail as fn,
@@ -274,6 +327,26 @@ def _moetail_fused():
     return _compile_gfx950(fn, types, constexprs, 16, ("region", "M"), _sched_options())
 
 
+def _moetail_columns():
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        _MUSE_BOUNDARY_WIDTH,
+        _MUSE_MOETAIL_COLUMN_OUTPUTS,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
+        iris_columns_lamport_allgather_muse_moetail as fn,
+    )
+
+    types = dict(_MOETAIL_POINTERS, y_ptr="*bf16")
+    constexprs = dict(
+        _MOETAIL,
+        LOCAL_WIDTH=_MUSE_BOUNDARY_WIDTH // 8,
+        BLOCK_M=16,
+        OUTPUTS=_MUSE_MOETAIL_COLUMN_OUTPUTS,
+        PEER_SIGNAL_STORE_CACHE=_peer_signal_store(),
+    )
+    return _compile_gfx950(fn, types, constexprs, 16, ("region", "M"))
+
+
 # The router of one rank: 256 experts over K = 8192, FP32.
 def _router_gemv():
     # Up to 8 rows run the GEMV.
@@ -289,6 +362,82 @@ def _router_gemv():
         constexprs,
         router_gemv._NUM_WARPS,
         ("M",),
+    )
+
+
+def _router_splitk():
+    # 9-64 rows run the split-K MFMA GEMM (one variant: M is not specialized).
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32 import router_gemv
+
+    block_m, block_n, split_k, waves, chunks = router_gemv._choose_splitk_config(
+        16, 256, 8192
+    )
+    types = {
+        "x_ptr": "*fp32",
+        "weight_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "partial_ptr": "*fp32",
+        "counter_ptr": "*i32",
+        "M": "i32",
+    }
+    constexprs = dict(
+        K=8192, N=256, BLOCK_M=block_m, BLOCK_N=block_n, SPLIT_K=split_k,
+        CHUNKS=chunks, MULTIPLIER=1.0,
+    )  # fmt: skip
+    return _compile_gfx950(
+        router_gemv.gluon_fp32_router_gemv_splitk_gfx950,
+        types,
+        constexprs,
+        waves,
+        ("M",),
+        _sched_options(),
+    )
+
+
+def _router_with_mm(rows):
+    # The router beside the 512 x 8192 pre-expert decode GEMM in one launch.
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32 import router_gemv
+
+    block_m, block_n, split_k, waves, chunks = router_gemv._WITH_MM_ROUTER_CONFIG
+    router_programs = (
+        router_gemv.gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows, 256)
+        * split_k
+    )
+    mm_block_m, mm_block_n, mm_block_k, warps_m, warps_n, buffers, mm_split, xcds = (
+        router_gemv._choose_decode_config(rows, 512, 8192)
+    )
+    types = {
+        "x_ptr": "*fp32",
+        "weight_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "router_partial_ptr": "*fp32",
+        "router_counter_ptr": "*i32",
+        "a_ptr": "*bf16",
+        "b_ptr": "*bf16",
+        "c_ptr": "*bf16",
+        "partial_ptr": "*fp32",
+        "counter_ptr": "*i32",
+        "M": "i32",
+        "MM_N": "i32",
+        "stride_am": "i32",
+        "stride_bn": "i32",
+        "stride_cm": "i32",
+    }
+    constexprs = dict(
+        K=8192, N=256, BLOCK_M=block_m, BLOCK_N=block_n, SPLIT_K=split_k,
+        CHUNKS=chunks, MULTIPLIER=1.0, ROUTER_PROGRAMS=router_programs,
+        MM_K=8192, MM_BLOCK_M=mm_block_m, MM_BLOCK_N=mm_block_n,
+        MM_BLOCK_K=mm_block_k, MM_WARPS_M=warps_m, MM_WARPS_N=warps_n,
+        MM_NUM_BUFFERS=buffers, MM_SPLIT_K=mm_split, MM_NUM_XCDS=xcds,
+    )  # fmt: skip
+    options = dict(_sched_options(), llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),))
+    return _compile_gfx950(
+        router_gemv.gluon_fp32_router_gemv_mm_a16w16_gfx950,
+        types,
+        constexprs,
+        waves,
+        ("M",),
+        options,
     )
 
 
@@ -400,11 +549,17 @@ VARIANTS = {
     "mha_decode_split": _mha_decode_split,
     "mha_decode_sliding_split": _mha_decode_sliding_split,
     "mha_decode_balanced": _mha_decode_balanced,
+    "sliding_tail-rows8": lambda: _sliding_tail(8),
+    "sliding_tail-rows16": lambda: _sliding_tail(16),
     "attntail_lamport": _attntail_lamport,
     "routed_lamport": _routed_lamport,
     "rows_gemv-rows4": lambda: _rows_gemv(4),
     "moetail_fused-rows8": _moetail_fused,
+    "moetail_columns-rows16": _moetail_columns,
     "router_gemv-rows8": _router_gemv,
+    "router_splitk-rows16": _router_splitk,
+    "router_with_mm-rows8": lambda: _router_with_mm(8),
+    "router_with_mm-rows16": lambda: _router_with_mm(16),
     "mha_extend_warp_pipelined": _mha_extend_warp_pipelined,
     "mla_prefill_8wave": _mla_prefill_8wave,
     "dsa_persistent_topk": _dsa_persistent_topk,
