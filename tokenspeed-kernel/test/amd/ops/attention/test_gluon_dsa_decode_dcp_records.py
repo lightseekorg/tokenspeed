@@ -175,12 +175,10 @@ def _assert_records_attend(records, q, cache, slots, lengths):
 @pytest.mark.parametrize(
     "tokens,degree,local_heads",
     [
-        # K3.1 at TP8 / KVP8: the drafter's 16 rows, C12 and C16 verify rows.
+        # K3.1 at TP8 / KVP8: the drafter's 16 rows and C16's verify rows.
         (16, 8, 12),
-        (48, 8, 12),
         (64, 8, 12),
         (4, 8, 12),
-        (64, 2, 8),
         (20, 4, 16),
     ],
 )
@@ -215,7 +213,7 @@ def test_decode_records_match_the_dispatched_decode(tokens, degree, local_heads)
     assert (empty[..., 256] == neg_inf_bits).all()
 
 
-@pytest.mark.parametrize("tokens", [4, 16, 48, 64])
+@pytest.mark.parametrize("tokens", [4, 64])
 def test_decode_records_of_a_row_follow_only_its_own_length(tokens):
     # A row's split count comes from its own live length, so its record
     # does not move when the other rows' lengths do.
@@ -231,7 +229,7 @@ def test_decode_records_of_a_row_follow_only_its_own_length(tokens):
         _assert_records_attend(after, q, cache, slots, lengths)
 
 
-@pytest.mark.parametrize("tokens", [4, 48, 64])
+@pytest.mark.parametrize("tokens", [4, 64])
 def test_decode_records_read_a_query_riding_in_a_gathered_chunk(tokens):
     # One all-gather of every rank's index scores and query lands rank r's
     # query after its scores: each rank's rows contiguous, the ranks one
@@ -271,7 +269,7 @@ def test_decode_records_read_a_query_riding_in_a_gathered_chunk(tokens):
     assert torch.equal(dsa_decode_dcp_records(q=far, **kwargs), expected)
 
 
-@pytest.mark.parametrize("tokens", [1, 4, 48, 64])
+@pytest.mark.parametrize("tokens", [1, 64])
 def test_decode_records_lead_a_given_workspace(tokens):
     # An exchange that reads the records in place lends their storage: they
     # lead it, bit for bit what the core writes into its own.

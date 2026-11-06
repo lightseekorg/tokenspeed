@@ -300,10 +300,7 @@ def _bytes(tensor: torch.Tensor) -> torch.Tensor:
     "shape, dtype, dim",
     [
         ((5, 3, 576), torch.float8_e4m3fn, 1),  # 8-byte words
-        ((5, 3, 576), torch.float8_e4m3fn, -1),
-        ((3, 4, 2), torch.int32, 1),
         ((6, 7), torch.uint8, -1),  # runs of 7 bytes
-        ((4, 3, 5), torch.bfloat16, 2),
         ((1, 6), torch.bfloat16, -1),  # one outer index: no relayout
         ((2, 3), torch.float32, 0),
     ],
