@@ -28,6 +28,7 @@ from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel_amd._scheduling import (
+    arithmetic_fence,
     release_drain,
     sched_compile_options,
     wave_uniform_i32,
@@ -58,6 +59,10 @@ _GFX950_SM_COUNT = 256
 # for a one-wave work-group; with more waves, each wave issues its share. The
 # loop is either this deep or single-buffered.
 _FULL_DECODE_STAGES = 4
+# Pipeline depth of the long-window sliding split decode (four-wave
+# workgroups): each split streams several pages, each a full load round trip
+# when single-buffered.
+_SLIDING_DECODE_STAGES = 2
 # s_waitcnt vmcnt(N) takes a 6-bit count: a wave can wait for all but at most
 # 63 of its outstanding vector memory loads.
 _GFX950_MAX_VMCNT = 63
@@ -881,15 +886,27 @@ def _stream_split_pipelined(
             # Wait for this page; the NUM_STAGES - 1 prefetched pages stay
             # outstanding (s_waitcnt vmcnt(N), N = their copies).
             async_copy.wait_group(NUM_STAGES - 1)
-            k = program.shared_load_k(k_smem.index(stage))
-            qk = program.compute_qk(q, k)
-            # Full attention starts at token 0; only pages reaching past the
-            # split's end or the block's first causal end need a mask.
-            if start_n + cfg.BLOCK_N > program.mask_start:
-                qk = program.apply_kv_mask(qk, start_n)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-            v = program.shared_load_v(v_smem.index(stage))
-            acc = program.compute_pv(p, v, acc)
+            # A page past the split (the last iteration's padding) is skipped,
+            # not masked: masked to -inf it would still rescale the running
+            # sums by exp2 of the max's FMA rounding error, so the result would
+            # differ from the single-buffered loop's in the last bit.
+            if start_n < program.split_end:
+                k = program.shared_load_k(k_smem.index(stage))
+                qk = program.compute_qk(q, k)
+                # Full attention starts at token 0; only pages reaching past the
+                # split's end or the block's first causal end need a mask. A
+                # sliding window also masks keys before each row's window start.
+                if cfg.IS_SLIDING or start_n + cfg.BLOCK_N > program.mask_start:
+                    qk = program.apply_kv_mask(qk, start_n)
+                p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+                v = program.shared_load_v(v_smem.index(stage))
+                acc = program.compute_pv(p, v, acc)
+                # Each page must round as one iteration of the single-buffered
+                # loop does: there the running max enters as a loop-carried
+                # value, and m_i * SM_SCALE fuses into the rescale's FMA. Here
+                # the next page would reuse this page's rounded m_new *
+                # SM_SCALE instead, changing the last bit.
+                m_i = arithmetic_fence(m_i)
         pages = next_pages
         next_pages = later_pages
 
@@ -1093,6 +1110,7 @@ def _mha_decode_sliding_split_atomic(
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -1125,34 +1143,22 @@ def _mha_decode_sliding_split_atomic(
         gl.program_id(1),
         gl.program_id(2),
     )
-    k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-    )
-    v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-    )
-
     q = program.load_q()
     m_i, l_i, acc, _ = program.init_state(sink_ptr, False)
-    physical_page = program.load_page(program.split_start)
-
-    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
-        with gl.amd.warp_pipeline_stage("load", priority=1):
-            program.issue_load_k(physical_page, k_smem)
-            program.issue_load_v(physical_page, v_smem)
-            physical_page = program.load_page(start_n + cfg.BLOCK_N)
-
-        with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
-            async_copy.wait_group(1)
-            k = program.shared_load_k(k_smem)
-            qk = program.compute_qk(q, k)
-            qk = program.apply_kv_mask(qk, start_n)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-
-        with gl.amd.warp_pipeline_stage("pv", priority=1):
-            async_copy.wait_group(0)
-            v = program.shared_load_v(v_smem)
-            acc = program.compute_pv(p, v, acc)
+    if NUM_STAGES == 1:
+        k_smem = gl.allocate_shared_memory(
+            k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+        )
+        v_smem = gl.allocate_shared_memory(
+            v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+        )
+        m_i, l_i, acc = _stream_split_single_buffer(
+            program, q, m_i, l_i, acc, k_smem, v_smem
+        )
+    else:
+        m_i, l_i, acc = _stream_split_pipelined(
+            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        )
 
     program.store_split(acc, l_i, m_i)
     program.finalize_splits(out_ptr, sink_ptr, counters_ptr, HAS_SINK)
@@ -1385,8 +1391,22 @@ def get_config(
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=num_kv_splits,
-        num_stages=_full_decode_stages(
-            num_kv_splits, page_size, head_dim, k_cache.element_size(), num_warps
+        # Short windows stay single-buffered: their one-wave blocks fill
+        # the grid, so other waves cover each page's load.
+        num_stages=(
+            1
+            if short_window
+            else (
+                _SLIDING_DECODE_STAGES
+                if is_sliding
+                else _full_decode_stages(
+                    num_kv_splits,
+                    page_size,
+                    head_dim,
+                    k_cache.element_size(),
+                    num_warps,
+                )
+            )
         ),
         block_m=block_m,
         block_n=block_n,
@@ -1506,6 +1526,7 @@ def launch_gluon_mha_decode_gfx950(
             config.window_left,
             has_sink,
             is_fp8,
+            config.num_stages,
             num_warps=config.num_warps,
             **sched_compile_options(),
         )

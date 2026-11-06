@@ -1414,6 +1414,11 @@ since a masked copy becomes a branch followed by `s_waitcnt vmcnt(0)`; only
 pages crossing the split's end or a row's causal end are masked. The loop waits
 for the prefetches before the epilogue reuses their LDS.
 
+A long sliding window in four-wave blocks (more than 16 pages) streams each
+split through the same pipeline two deep: one page is in flight while another
+is consumed, and every page is masked to the rows' windows. Its rows equal the
+single-buffered loop's bit for bit.
+
 Every split stores its partial and LSE (-inf for rows without keys in it), so
 the reduce does not read cache lengths.
 
