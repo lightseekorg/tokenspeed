@@ -733,3 +733,9 @@ logical vocabulary against the runtime output size. A mismatch fails before
 sampling buffers or CUDA graphs are built; TP shards and padded weight rows
 are not logical vocabulary sizes. Workers without logits and draft models
 (which may use their own vocabulary mapping) are outside this target check.
+
+Speculative input preparation bounds only draft candidate columns by the output
+vocabulary; the prompt and the first (verified) decode token retain input bounds.
+The existing defensive clamp still prevents a stale proposal from indexing
+outside output probability tensors. This extra clamp only runs for split
+vocabularies, stays on the device and is shared by eager and graph execution.

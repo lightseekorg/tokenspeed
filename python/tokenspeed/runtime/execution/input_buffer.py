@@ -721,6 +721,22 @@ class InputBuffers:
                 out=self.input_ids_buf[:total_tokens].view(-1, width),
             )
 
+        width = runtime_states.future_input_map.shape[1]
+        if (
+            num_extends < batch_size
+            and width > 1
+            and runtime_states.vocab_size < runtime_states.input_vocab_size
+        ):
+            # Only draft columns index output probabilities. Column 0 may be
+            # an explicit input-only token, as may any token in the prompt.
+            prefill_tokens = sum(forward_op.input_lengths[:num_extends])
+            candidates = self.input_ids_buf[prefill_tokens:total_tokens].view(
+                -1, width
+            )[:, 1:]
+            # Preserve the verifier's defensive output bound even when the
+            # embedding admits a larger input-only token range.
+            candidates.clamp_(0, runtime_states.vocab_size - 1)
+
         # Defensive clamp of the target-model IDs into the valid vocab range.
         # Decode IDs come from future_input_map, written by the previous
         # sampler/drafter; a stale/corrupt value must not reach the captured
