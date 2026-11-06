@@ -588,11 +588,11 @@ def _route_groups_from_ids(
 ):
     """Group the routes of at most ``MAX_ROWS`` tokens by local expert.
 
-    The groups come straight from the tokens' top-k IDs. A token lists an expert at most once, so each expert holds at most
-    ``MAX_ROWS`` routes. Groups follow local expert order. Returns each
-    route's local expert (-1 for another rank's routes and past ``rows``),
-    the per-expert route counts, each expert's group index and the number of
-    groups.
+    The groups come straight from the tokens' top-k IDs. A token lists an
+    expert at most once, so each expert holds at most ``MAX_ROWS`` routes.
+    Groups follow local expert order. Returns each route's local expert (-1
+    for another rank's routes and past ``rows``), the per-expert route
+    counts, each expert's group index and the number of groups.
     """
     ROUTE_BLOCK: gl.constexpr = triton.next_power_of_2(MAX_ROWS * TOPK)
     EXPERT_PAD: gl.constexpr = triton.next_power_of_2(NUM_EXPERTS)
