@@ -67,7 +67,10 @@ def test_gather_dispatches_on_the_order():
     assert torch.equal(
         blockwise,
         blockwise_logprobs(
-            logits, tokens, vocab_block=BLOCKWISE_VOCAB_BLOCK, form="direct"
+            logits,
+            tokens,
+            vocab_block=BLOCKWISE_VOCAB_BLOCK,
+            form="negative-cross-entropy",
         ),
     )
     torch.testing.assert_close(blockwise, torch_order, rtol=1e-5, atol=1e-5)
@@ -137,7 +140,10 @@ def test_flashinfer_backend_reports_blockwise_logprobs(monkeypatch):
     assert torch.equal(
         output.next_token_logprobs,
         blockwise_logprobs(
-            logits, sampled, vocab_block=BLOCKWISE_VOCAB_BLOCK, form="direct"
+            logits,
+            sampled,
+            vocab_block=BLOCKWISE_VOCAB_BLOCK,
+            form="negative-cross-entropy",
         ),
     )
 
@@ -193,7 +199,10 @@ def test_prompt_logprobs_follow_the_order(monkeypatch):
     assert torch.equal(
         blockwise,
         blockwise_logprobs(
-            logits, ids, vocab_block=BLOCKWISE_VOCAB_BLOCK, form="direct"
+            logits,
+            ids,
+            vocab_block=BLOCKWISE_VOCAB_BLOCK,
+            form="negative-cross-entropy",
         ),
     )
     torch.testing.assert_close(blockwise, torch_order, rtol=1e-5, atol=1e-5)
