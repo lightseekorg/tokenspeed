@@ -1452,6 +1452,28 @@ def dsa_merge_candidates(
         return kernel(records, topk=topk)
 
 
+def dsa_select_owned_candidates_supported(
+    *, ranks: int, rows: int, topk: int, rank_stride: int
+) -> bool:
+    """Whether :func:`dsa_select_owned_candidates` serves gathered scores of
+    ``ranks`` ranks' ``rows`` rows of ``topk`` candidates, ``rank_stride``
+    elements apart.
+
+    Host values only, so every rank of a KVP group decides alike before the
+    scores are gathered. The op has one leaf, gfx950's one-launch selection:
+    other sizes, and other platforms, keep :func:`dsa_merge_candidates`.
+    """
+    if not current_platform().is_cdna4:
+        return False
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
+        gathered_owned_selection_supported,
+    )
+
+    return gathered_owned_selection_supported(
+        ranks=ranks, rows=rows, topk=topk, rank_stride=rank_stride
+    )
+
+
 def dsa_select_owned_candidates(
     scores: torch.Tensor,
     positions: torch.Tensor,

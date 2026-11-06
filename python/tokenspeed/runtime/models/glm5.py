@@ -722,7 +722,9 @@ class GlmDsaSparseAttentionMixin:
                     q.shape[0],
                     dcp_index,
                     page_size=page_size,
+                    topk=topk,
                     max_logits_bytes=None,
+                    rider_bytes=0 if query_rider is None else query_rider.numel(),
                 )
             ):
                 owned = dict(

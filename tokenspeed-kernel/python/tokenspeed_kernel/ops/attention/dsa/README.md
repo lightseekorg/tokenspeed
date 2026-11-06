@@ -153,11 +153,15 @@ quota from the same planes, keeps its own candidates above the score and its
 share of the first tied ones (ranks in order, then candidate order), and
 writes `local_page_table[request, position // page_size] * page_size +
 position % page_size` in candidate order, padded with -1, with the count per
-row. That is bit for bit the merge's selection compacted to the rank's
-slots, without exchanging positions. A score plane reads an invalid
-candidate off its score, so `scores_out` holds -inf for every -1 offset. The
-Triton leaf takes a `torch.topk` of the merged planes; on gfx950 (topk 512,
-1024 or 2048) the live radix top-k skips each rank's dead tail.
+row. That is bit for bit `cuda_dsa_merge_candidates`' selection compacted to
+the rank's slots, without exchanging positions; `triton_dsa_merge_candidates`
+selects the same candidates in score order. A score plane reads an invalid
+candidate off its score, so `scores_out` holds -inf for every -1 offset.
+Only gfx950 registers it, as one launch over the gathered planes:
+`dsa_select_owned_candidates_supported` accepts a power-of-two rank count, a
+power-of-two topk of at least 512, at most 16384 gathered scores per row and
+rank chunks within 32-bit offsets, and refuses other platforms. A KVP decode
+whose sizes it refuses merges the candidates instead.
 
 ## Materialized Triton row top-k
 

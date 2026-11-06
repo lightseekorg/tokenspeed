@@ -285,6 +285,10 @@ def owned_selects(recorded, monkeypatch):
         return out, lens_out
 
     monkeypatch.setattr(glm5, "select_owned_dsa_topk", select_owned)
+    # The gathered scores' sizes as a gfx950 one-launch selection takes them.
+    monkeypatch.setattr(
+        indexer, "dsa_select_owned_candidates_supported", lambda **sizes: True
+    )
     return calls
 
 
@@ -316,12 +320,17 @@ def test_owned_decode_topk_writes_this_ranks_local_slots(recorded, owned_selects
     assert record.owned_placement == _PLACEMENT
 
 
-@pytest.mark.parametrize("case", ["host", "backend"])
+@pytest.mark.parametrize("case", ["host", "backend", "leaf"])
 def test_owned_decode_topk_needs_the_host_and_the_backend(
-    recorded, owned_selects, case
+    recorded, owned_selects, monkeypatch, case
 ):
     _, selects = recorded
     seq_lens, page_table, q_len = _batch()
+    if case == "leaf":
+        # No owned selection leaf takes these gathered scores: the merge runs.
+        monkeypatch.setattr(
+            indexer, "dsa_select_owned_candidates_supported", lambda **sizes: False
+        )
     ctx = _owned_ctx(seq_lens, q_len, takes=case != "backend")
     layer = _layer() if case == "host" else _owned_layer()
     record = _decode_layer(layer, ctx, page_table, seq_lens, q_len)

@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_index_candidates_accepts_pages,
     dsa_merge_candidates,
     dsa_select_owned_candidates,
+    dsa_select_owned_candidates_supported,
     plan_dsa_index_candidates,
 )
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
@@ -582,15 +583,26 @@ def owned_dsa_topk_fits(
     metadata: DCPIndexMetadata,
     *,
     page_size: int,
+    topk: int,
     max_logits_bytes: int | None,
+    rider_bytes: int = 0,
 ) -> bool:
-    """Whether :func:`select_owned_dsa_topk` serves ``metadata``'s rows: it
-    scores them in one tile and exchanges them once, as
-    :func:`select_dsa_topk` does without a logits budget."""
+    """Whether :func:`select_owned_dsa_topk` (``rider_bytes`` per rank
+    riding its gather) serves ``metadata``'s rows: it scores them in one
+    tile and exchanges them once, as :func:`select_dsa_topk` does without a
+    logits budget, and a ``dsa_select_owned_candidates`` leaf takes the
+    gathered scores. Host values only, the same on every rank."""
     if max_logits_bytes is not None and max_logits_bytes > 0:
         return False
     columns = metadata.columns or metadata.local_page_table.shape[1]
-    return _tile_rows(rows, columns, page_size, None) >= rows
+    if _tile_rows(rows, columns, page_size, None) < rows:
+        return False
+    return dsa_select_owned_candidates_supported(
+        ranks=len(metadata.placement.group),
+        rows=rows,
+        topk=topk,
+        rank_stride=rows * topk + rider_bytes // 4,
+    )
 
 
 def select_owned_dsa_topk(

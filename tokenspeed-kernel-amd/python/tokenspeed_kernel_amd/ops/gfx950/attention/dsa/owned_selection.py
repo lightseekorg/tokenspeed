@@ -173,23 +173,37 @@ def _select_owned_from_gathered_kernel(
     gl.store(counts + row, count)
 
 
-def gathered_owned_selection_fits(scores: torch.Tensor, topk: int) -> bool:
+def gathered_owned_selection_supported(
+    *, ranks: int, rows: int, topk: int, rank_stride: int
+) -> bool:
     """Whether :func:`gluon_dsa_select_owned_from_gathered_gfx950` takes
-    these gathered scores (FP32 ``[ranks, rows, candidates]``): ``topk``
-    candidates per rank and row, a power of two that every rank's share of
-    a row fills registers with, rows contiguous, and every byte read within
-    one buffer's 32-bit range."""
+    gathered scores of ``ranks`` ranks' ``rows`` rows of ``topk`` candidates,
+    ``rank_stride`` elements apart: a power-of-two ``topk`` that every rank's
+    share of a row fills registers with, a power-of-two rank count, and every
+    byte read within one buffer's 32-bit range. Host values only."""
+    return (
+        topk & (topk - 1) == 0
+        and topk >= 64 * _NUM_WARPS
+        and ranks & (ranks - 1) == 0
+        and ranks * topk <= _MAX_COLUMNS
+        and rank_stride >= rows * topk
+        and ((ranks - 1) * rank_stride + rows * topk) * 4 < 2**31
+    )
+
+
+def gathered_owned_selection_fits(scores: torch.Tensor, topk: int) -> bool:
+    """:func:`gathered_owned_selection_supported` for FP32 ``[ranks, rows,
+    candidates]`` gathered scores with ``topk`` candidates per rank and row
+    and contiguous rows."""
     if scores.dim() != 3 or scores.dtype != torch.float32:
         return False
     degree, rows, width = scores.shape
     return (
         width == topk
-        and width & (width - 1) == 0
-        and width >= 64 * _NUM_WARPS
-        and degree & (degree - 1) == 0
-        and degree * width <= _MAX_COLUMNS
         and scores.stride()[1:] == (width, 1)
-        and ((degree - 1) * scores.stride(0) + rows * width) * 4 < 2**31
+        and gathered_owned_selection_supported(
+            ranks=degree, rows=rows, topk=topk, rank_stride=scores.stride(0)
+        )
     )
 
 
@@ -215,7 +229,8 @@ def gluon_dsa_select_owned_from_gathered_gfx950(
     local pages (``-1`` where not owned); ``query_requests`` every row's
     request. Returns int32 ``[rows, topk]`` slots, the kept ones first in
     candidate order and ``-1`` after, and int32 ``[rows]`` counts: bit for
-    bit ``select_owned_through_threshold`` over the merge's top-k.
+    bit this rank's share of ``select_through_threshold`` over an exact
+    top-k of the merged scores.
     """
     if not gathered_owned_selection_fits(scores, topk):
         raise ValueError(

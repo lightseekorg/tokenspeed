@@ -339,10 +339,19 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                     query, weights, plane, table, seq_lens, placement
                 )
                 assert owned_dsa_topk_fits(
-                    rows, metadata, page_size=_PAGE, max_logits_bytes=None
+                    rows,
+                    metadata,
+                    page_size=_PAGE,
+                    topk=_TOPK,
+                    max_logits_bytes=None,
+                    rider_bytes=rows * _RIDER,
                 )
                 assert not owned_dsa_topk_fits(
-                    rows, metadata, page_size=_PAGE, max_logits_bytes=64 << 20
+                    rows,
+                    metadata,
+                    page_size=_PAGE,
+                    topk=_TOPK,
+                    max_logits_bytes=64 << 20,
                 )
                 out = torch.full((rows, _TOPK), 7, dtype=torch.int32, device=device)
                 lens_out = torch.full((rows,), 7, dtype=torch.int32, device=device)
@@ -473,13 +482,12 @@ def _worker(rank, degree, rendezvous, pull_exchange):
 def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
     tmp_path, degree, pull_exchange
 ):
+    from tokenspeed_kernel.platform import current_platform
+
     if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
         pytest.skip(f"requires {degree} GPUs")
-    if pull_exchange:
-        from tokenspeed_kernel.platform import current_platform
-
-        if not current_platform().is_cdna4:
-            pytest.skip("Iris pull exchanges run on CDNA4")
+    if not current_platform().is_cdna4:
+        pytest.skip("the owned selection and Iris pull exchanges run on CDNA4")
     mp.spawn(
         _worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}", pull_exchange),
