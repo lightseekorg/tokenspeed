@@ -977,7 +977,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
+def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=(), options=None):
     """Compile a Gluon kernel for gfx950 without launching it.
 
     Arguments named in unspecialized get no 16-byte divisibility, as when a
@@ -1005,7 +1005,7 @@ def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
     return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": num_warps},
+        options={"num_warps": num_warps, **(options or {})},
     )
 
 
