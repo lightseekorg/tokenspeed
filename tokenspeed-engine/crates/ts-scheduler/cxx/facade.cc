@@ -208,9 +208,10 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
-        .active_lcm_blocks = scheduler.ActiveLcmBlocks(),
     };
 }
+
+std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler) { return scheduler.ActiveLcmBlocks(); }
 
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id) {
     const std::string id(group_id);
@@ -270,6 +271,16 @@ StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
         .unavailable_dropped_backup_keys = stats.unavailable_dropped_backup_keys,
         .disabled_dropped_backup_keys = stats.disabled_dropped_backup_keys,
         .cleanup_dropped_backup_keys = stats.cleanup_dropped_backup_keys,
+    };
+}
+
+PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::HostCacheStats stats = scheduler.GetHostCacheStats();
+    return PrefixHitView{
+        .prompt_tokens = stats.prefix_hits.prompt_tokens,
+        .device_hit_tokens = stats.prefix_hits.device_hit_tokens,
+        .host_hit_tokens = stats.prefix_hits.host_hit_tokens,
+        .l3_hit_tokens = stats.storage_query_hit_tokens,
     };
 }
 

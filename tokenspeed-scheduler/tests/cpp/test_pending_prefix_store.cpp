@@ -28,11 +28,14 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig config = SchedulerTestSuite::MakeConfig();
         config.prefix_granularity = 4;
-        config.device_allocator.total_pages = 8;
+        // Eight usable blocks: pressure's 23-token prompt holds six and the
+        // copy-in block of its prompt end, so it evicts one of seed's two
+        // cached pages; the startup bound charges a tail handover beside it.
+        config.device_allocator.total_pages = 9;
         config.host_allocator.total_pages = 65;
         config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
         config.cache_groups.front().block_granularity = 4;
-        config.cache_groups.front().total_pages = 8;
+        config.cache_groups.front().total_pages = 9;
         SetTestSnapshotPool(config);
         return config;
     }
@@ -104,21 +107,24 @@ TEST_F(PendingPrefixStoreTest, ARequestThatForbidsReuseDoesNotWaitForItsCopy) {
 // A prior branch leaves a longer checkpoint beside the one hit will reuse.
 // Pressure evicts both in its admission; later prompts in that same plan
 // must see the recorded store before the plan drains it into a copy command.
+// The pool fits hit beside pressure exactly once the store lands: the
+// branch's last page is the cache hit may still evict, for the copy-in block
+// of its prompt end at 9.
 class SamePlanPrefixStoreTest : public PendingPrefixStoreTest {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig config = PendingPrefixStoreTest::MakeConfig();
-        config.device_allocator.total_pages = 24;
-        config.cache_groups.front().total_pages = 24;
+        config.device_allocator.total_pages = 25;
+        config.cache_groups.front().total_pages = 25;
         config.cache_groups.push_back(CacheGroupConfig{
-            .group_id = "state", .block_granularity = 0, .total_pages = 24, .attn_kind = AttnKind::kState});
+            .group_id = "state", .block_granularity = 0, .total_pages = 25, .attn_kind = AttnKind::kState});
         SetTestSnapshotPool(config);
         return config;
     }
 
     void SeedBranches() {
         for (const auto& [id, length] :
-             std::vector<std::pair<std::string, std::int32_t>>{{"seed", 8}, {"branch", 16}}) {
+             std::vector<std::pair<std::string, std::int32_t>>{{"seed", 8}, {"branch", 20}}) {
             Submit(RequestSpec{.request_id = id, .tokens = MakeTokens(length), .max_new_tokens = 1});
             const ExecutionPlan plan = PlanOnce();
             const ForwardBatch* batch = FindForwardBatch(plan);

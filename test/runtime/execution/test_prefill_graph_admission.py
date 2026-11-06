@@ -230,18 +230,21 @@ def test_the_hybrid_wrapper_needs_its_own_counter_and_the_inner_answer() -> None
         assert any(c[0] == "prepare" for c in calls) is expected
 
 
-def test_kda_admits_only_the_enabled_cutedsl_extend_path() -> None:
+@pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
+def test_kda_admits_only_the_enabled_capacity_extend_path(backend_name) -> None:
     extend = ForwardMode.EXTEND
     backend = KdaAttnBackend.__new__(KdaAttnBackend)
     backend._prefill_graph_enabled = True
-    backend.kda_backend = "cutedsl_kda"
+    backend.kda_backend = backend_name
     backend.step_counter = None
     assert backend.admits_prefill_graph(8, 1, extend) is True
     assert backend.admits_prefill_graph(8, 1, ForwardMode.DECODE) is False
 
     refusals = [("step_counter", object()), ("_prefill_graph_enabled", False)]
     refusals += [
-        ("kda_backend", name) for name in KDA_PREFILL_BACKENDS if name != "cutedsl_kda"
+        ("kda_backend", name)
+        for name in KDA_PREFILL_BACKENDS
+        if name not in ("cutedsl_kda", "cudnn")
     ]
     for attr, value in refusals:
         restore = getattr(backend, attr)

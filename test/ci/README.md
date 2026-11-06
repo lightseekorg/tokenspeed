@@ -486,6 +486,9 @@ requested pull request. The generated `srun` steps name that variable in
 `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`. That pin and the
 in-tree package carry the same version, so pip keeps the wheel and an unreleased
 in-tree kernel change never runs.
+Tests of unreleased MLA implementation behavior, such as KV packing compilation
+reuse, import the in-tree package in a subprocess with an explicit `PYTHONPATH`.
+This keeps those checks independent of the installed wheel used by API tests.
 
 The job gets the node exclusively by default so another job cannot contend for
 its GPU or fixed service ports. Runtime cleanup is
@@ -691,10 +694,10 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
-The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.2 by image digest.
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.3 by image digest.
 When upgrading, keep the FlashInfer Python requirement, release cubin checksum,
-and runner JIT-cache version aligned. FlashInfer 0.7.2 also requires
-cuDNN frontend 1.31.0 or newer and splits its JIT cache into provider packages.
+and runner JIT-cache version aligned. FlashInfer 0.7.3 also requires
+cuDNN frontend 1.32.0 or newer and splits its JIT cache into provider packages.
 GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
 index and checks their installed versions again after dependency installation.
 

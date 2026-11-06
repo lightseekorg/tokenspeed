@@ -111,6 +111,7 @@ def test_w4a16_routing_rejects_unavailable_backend(monkeypatch):
 
 
 def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.dense import Nvfp4W4A16LinearMethod
     from tokenspeed.runtime.layers.linear import ReplicatedLinear
 
@@ -122,7 +123,9 @@ def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
     quant_config = ModelOptMixedConfig(quantized_layers={"lm_head": "W4A16_NVFP4"})
     model = BaseCausalLM.__new__(BaseCausalLM)
     nn.Module.__init__(model)
-    model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
+    # Attention DP with replicated lm_head; a real Mapping keeps the double
+    # in step with the fields resolve_lm_head reads.
+    model.mapping = Mapping(rank=0, world_size=4, attn_dp_size=4)
 
     lm_head = model.resolve_lm_head(
         SimpleNamespace(

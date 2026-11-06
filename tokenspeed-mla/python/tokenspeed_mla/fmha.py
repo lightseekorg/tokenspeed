@@ -41,7 +41,6 @@ from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int8, Int32, Int64
-from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 if __name__ == "__main__":
@@ -116,6 +115,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mask_type: fmha_utils.MaskEnum,
         enable_ex2_emulation: bool,
         enable_skip_correction: bool,
+        compute_capability: tuple[int, int],
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -149,6 +149,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type mma_tiler: Tuple[int, int]
         :param head_dim: The head dimension, it can be a single integer or a tuple of two integers (D, Dv).
         :type head_dim: Union[int, Tuple[int, int]]
+        :param compute_capability: Explicit target architecture, one of (10, 0),
+                                   (10, 3), or (10, 7); independent of the active device.
+        :type compute_capability: tuple[int, int]
         :param is_persistent: Whether to use persistent kernel mode
         :type is_persistent: bool
         :param mask_type: Type of mask to use
@@ -264,11 +267,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         # inplaced with s0
         self.tmem_skip_softmax1_offset = 8
 
+        self.correction_rescale_tile_size = 16
+        self.correction_epilog_unroll: int | None = None
         self.num_regs_softmax = 192
         self.num_regs_correction = 96
         self.num_regs_other = 32
         self.buffer_align_bytes = 1024
-        self.arch = BaseDSL._get_dsl().get_arch_enum()
+        architectures = {
+            (10, 0): Arch.sm_100,
+            (10, 3): Arch.sm_103,
+            (10, 7): Arch.sm_107,
+        }
+        self.arch = architectures[compute_capability]
 
         if self.arch >= Arch.sm_103:
             assert (
@@ -279,6 +289,29 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.softmax_warpgroup_count = (
             len((*self.softmax0_warp_ids, *self.softmax1_warp_ids))
             // num_warps_per_warpgroup
+        )
+
+    def _make_qk_tiled_mma(self, cta_group):
+        return sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
+            self.q_dtype,
+            self.q_major_mode,
+            self.k_major_mode,
+            self.qk_acc_dtype,
+            cta_group,
+            self.qk_mma_tiler[:2],
+        )
+
+    def _make_pv_tiled_mma(self, cta_group, p_major_mode, p_source):
+        return sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
+            self.v_dtype,
+            p_major_mode,
+            self.v_major_mode,
+            self.pv_acc_dtype,
+            cta_group,
+            self.pv_mma_tiler[:2],
+            p_source,
         )
 
     def _setup_attributes(self):
@@ -395,41 +428,45 @@ class BlackwellFusedMultiHeadAttentionForward:
         d = cute.assume(Int32(d), 128)
         dv = cute.assume(Int32(dv), 128)
 
-        stride_b_q = h_r * h_k * s_q * d if cum_seqlen_q is None else 0
-        stride_b_o = h_r * h_k * s_q * dv if cum_seqlen_q is None else 0
-        stride_b_k = h_k * s_k * d if cum_seqlen_k is None else 0
-        stride_b_v = h_k * s_v * dv if cum_seqlen_k is None else 0
-        stride_b_lse = h_r * h_k * s_lse if cum_seqlen_q is None else 0
+        stride_b_q = Int64(h_r) * h_k * s_q * d if cum_seqlen_q is None else 0
+        stride_b_o = Int64(h_r) * h_k * s_q * dv if cum_seqlen_q is None else 0
+        stride_b_k = Int64(h_k) * s_k * d if cum_seqlen_k is None else 0
+        stride_b_v = Int64(h_k) * s_v * dv if cum_seqlen_k is None else 0
+        stride_b_lse = Int64(h_r) * h_k * s_lse if cum_seqlen_q is None else 0
 
         # (b, s_q, h_k, h_r, d) -> (s_q, d, ((h_r, h_k), b))
         q_layout = cute.make_layout(
             (s_q, d, ((h_r, h_k), b)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_q)),
+            stride=(Int64(d) * h_r * h_k, 1, ((Int64(d), Int64(d) * h_r), stride_b_q)),
         )
         q = cute.make_tensor(q_tensor.iterator, q_layout)
         # (b, s_k, h_k, 1, d) -> (s_k, d, ((1, h_k), b)), 0-stride for h_r to broadcast
         k_layout = cute.make_layout(
             (s_k, d, ((h_r, h_k), b)),
-            stride=(d * h_k, 1, ((0, d), stride_b_k)),
+            stride=(Int64(d) * h_k, 1, ((0, Int64(d)), stride_b_k)),
         )
         k = cute.make_tensor(k_tensor.iterator, k_layout)
         # (b, s_v, h_k, 1, dv) -> (dv, s_v, ((1, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
             (dv, s_v, ((h_r, h_k), b)),
-            stride=(1, dv * h_k, ((0, dv), stride_b_v)),
+            stride=(1, Int64(dv) * h_k, ((0, Int64(dv)), stride_b_v)),
         )
         v = cute.make_tensor(v_tensor.iterator, v_layout)
         # (b, s_q, h_k, h_r, dv) -> (s_q, dv, ((h_r, h_k), b))
         o_layout = cute.make_layout(
             (s_q, dv, ((h_r, h_k), b)),
-            stride=(dv * h_r * h_k, 1, ((dv, dv * h_r), stride_b_o)),
+            stride=(
+                Int64(dv) * h_r * h_k,
+                1,
+                ((Int64(dv), Int64(dv) * h_r), stride_b_o),
+            ),
         )
         o = cute.make_tensor(o_tensor.iterator, o_layout)
         if cutlass.const_expr(lse_tensor is not None):
             # (b, s_lse, h_q=h_r*h_k) row-major -> (s_lse, ((h_r, h_k), b))
             lse_layout = cute.make_layout(
                 (s_lse, ((h_r, h_k), b)),
-                stride=(h_r * h_k, ((1, h_r), stride_b_lse)),
+                stride=(Int64(h_r) * h_k, ((1, Int64(h_r)), stride_b_lse)),
             )
             lse = cute.make_tensor(lse_tensor.iterator, lse_layout)
         else:
@@ -474,25 +511,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         # the intermediate tensor p is from tmem & k-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = OperandMajorMode.K
-        qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.q_dtype,
-            self.q_dtype,
-            self.q_major_mode,
-            self.k_major_mode,
-            self.qk_acc_dtype,
-            cta_group,
-            self.qk_mma_tiler[:2],
-        )
-        pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.v_dtype,
-            self.v_dtype,
-            p_major_mode,
-            self.v_major_mode,
-            self.pv_acc_dtype,
-            cta_group,
-            self.pv_mma_tiler[:2],
-            p_source,
-        )
+        qk_tiled_mma = self._make_qk_tiled_mma(cta_group)
+        pv_tiled_mma = self._make_pv_tiled_mma(cta_group, p_major_mode, p_source)
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -642,6 +662,21 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
 
     #  GPU device kernel
+    @cute.jit
+    def _has_visible_keys(self, seqlen_q, seqlen_k, block_coord, window_right):
+        has_keys = seqlen_k > 0
+        if cutlass.const_expr(
+            self.mask_type is fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
+            and window_right is not None
+        ):
+            # All warps skip a CTA entirely before key zero under bottom-right
+            # alignment; the correction warps write its neutral output instead.
+            last_q_exclusive = (block_coord[0] + 1) * self.cta_tiler[0]
+            has_keys = (
+                has_keys and last_q_exclusive + seqlen_k - seqlen_q + window_right > 0
+            )
+        return has_keys
+
     @cute.kernel
     def kernel(
         self,
@@ -960,7 +995,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                         seqlen_k = (
                             cum_seqlen_k[batch_coord + 1] - cum_seqlen_k[batch_coord]
                         )
-                    continue_cond = seqlen_k <= 0
+                    continue_cond = not self._has_visible_keys(
+                        seqlen_q, seqlen_k, curr_block_coord, window_size_right
+                    )
                 if not continue_cond:
 
                     mQ_qdl_ = mQ_qdl
@@ -1170,7 +1207,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                    continue_cond = seqlen_k <= 0
+                    continue_cond = not self._has_visible_keys(
+                        seqlen_q, seqlen_k, curr_block_coord, window_size_right
+                    )
                 if not continue_cond:
                     # Wait for Q0
                     q0_handle = load_q_consumer.wait_and_advance()
@@ -1427,7 +1466,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     gO0 = gO[None, None, o0_coord, 0, curr_block_coord[2]]
                     gO1 = gO[None, None, o1_coord, 0, curr_block_coord[2]]
 
-                    if seqlen_k <= 0:
+                    if not self._has_visible_keys(
+                        seqlen_q, seqlen_k, curr_block_coord, window_size_right
+                    ):
                         self.correction_empty_k_epilog(
                             pv_thr_mma,
                             tOtO0,
@@ -1763,50 +1804,55 @@ class BlackwellFusedMultiHeadAttentionForward:
         ARV_COUNT,
     ):
         """Pipelined exp/cvt path used by softmax_step."""
-        for i in cutlass.range_constexpr(0, EXP2_EMULATION_OFFSET, 2):
-            if cutlass.const_expr(i >= CVT_COUNT):
-                if cutlass.const_expr(i % CVT_PER_STEP == 0):
-                    if cutlass.const_expr(self.q_dtype.width == 8):
-                        fmha_utils.cvt_f32x4_to_f8x4(
-                            tTMEM_LOADrS_cvt[None, (i - CVT_COUNT) // CVT_PER_STEP],
+        # Bound each static expansion to avoid CuTe's large-loop warning.
+        for group in cutlass.range_constexpr(0, EXP2_EMULATION_OFFSET, 64):
+            for local in cutlass.range_constexpr(
+                0, min(64, EXP2_EMULATION_OFFSET - group), 2
+            ):
+                i = group + local
+                if cutlass.const_expr(i >= CVT_COUNT):
+                    if cutlass.const_expr(i % CVT_PER_STEP == 0):
+                        if cutlass.const_expr(self.q_dtype.width == 8):
+                            fmha_utils.cvt_f32x4_to_f8x4(
+                                tTMEM_LOADrS_cvt[None, (i - CVT_COUNT) // CVT_PER_STEP],
+                                tTMEM_STORErS_x4_e_cvt[
+                                    None, (i - CVT_COUNT) // CVT_PER_STEP
+                                ],
+                            )
+                        else:
+                            s_vec = tTMEM_LOADrS_cvt[
+                                None, (i - CVT_COUNT) // CVT_PER_STEP
+                            ].load()
                             tTMEM_STORErS_x4_e_cvt[
                                 None, (i - CVT_COUNT) // CVT_PER_STEP
-                            ],
-                        )
-                    else:
-                        s_vec = tTMEM_LOADrS_cvt[
-                            None, (i - CVT_COUNT) // CVT_PER_STEP
-                        ].load()
-                        tTMEM_STORErS_x4_e_cvt[
-                            None, (i - CVT_COUNT) // CVT_PER_STEP
-                        ].store(s_vec.to(self.q_dtype))
-                local_row_sum = cute.arch.add_packed_f32x2(
-                    local_row_sum,
-                    (
-                        tTMEM_LOADrS[i - CVT_COUNT],
-                        tTMEM_LOADrS[i - CVT_COUNT + 1],
-                    ),
-                )
-            tTMEM_LOADrS[i] = cute.math.exp2(tTMEM_LOADrS[i], fastmath=True)
-            if cutlass.const_expr(i + FMA_COUNT < EXP2_EMULATION_OFFSET):
-                (
-                    tTMEM_LOADrS[i + FMA_COUNT],
-                    tTMEM_LOADrS[i + FMA_COUNT + 1],
-                ) = cute.arch.fma_packed_f32x2(
+                            ].store(s_vec.to(self.q_dtype))
+                    local_row_sum = cute.arch.add_packed_f32x2(
+                        local_row_sum,
+                        (
+                            tTMEM_LOADrS[i - CVT_COUNT],
+                            tTMEM_LOADrS[i - CVT_COUNT + 1],
+                        ),
+                    )
+                tTMEM_LOADrS[i] = cute.math.exp2(tTMEM_LOADrS[i], fastmath=True)
+                if cutlass.const_expr(i + FMA_COUNT < EXP2_EMULATION_OFFSET):
                     (
                         tTMEM_LOADrS[i + FMA_COUNT],
                         tTMEM_LOADrS[i + FMA_COUNT + 1],
-                    ),
-                    (scale, scale),
-                    (minus_row_max_scale, minus_row_max_scale),
-                )
-            tTMEM_LOADrS[i + 1] = cute.math.exp2(tTMEM_LOADrS[i + 1], fastmath=True)
-            if cutlass.const_expr(i == EXP2_EMULATION_OFFSET - ARV_COUNT):
-                if cutlass.const_expr(self.enable_sequence_barrier):
-                    if cutlass.const_expr(stage == 0):
-                        self.sequence_s1_s0_barrier.arrive()
-                    else:
-                        self.sequence_s0_s1_barrier.arrive()
+                    ) = cute.arch.fma_packed_f32x2(
+                        (
+                            tTMEM_LOADrS[i + FMA_COUNT],
+                            tTMEM_LOADrS[i + FMA_COUNT + 1],
+                        ),
+                        (scale, scale),
+                        (minus_row_max_scale, minus_row_max_scale),
+                    )
+                tTMEM_LOADrS[i + 1] = cute.math.exp2(tTMEM_LOADrS[i + 1], fastmath=True)
+                if cutlass.const_expr(i == EXP2_EMULATION_OFFSET - ARV_COUNT):
+                    if cutlass.const_expr(self.enable_sequence_barrier):
+                        if cutlass.const_expr(stage == 0):
+                            self.sequence_s1_s0_barrier.arrive()
+                        else:
+                            self.sequence_s0_s1_barrier.arrive()
 
         for i in cutlass.range_constexpr(
             EXP2_EMULATION_OFFSET - CVT_COUNT,
@@ -1884,6 +1930,26 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
         inplace_consumer.wait_and_advance(inplace_peek_status)
         return local_row_sum, inplace_consumer
+
+    @cute.jit
+    def _apply_mask(
+        self,
+        acc_qk,
+        index_qk,
+        seqlen_q,
+        seqlen_k,
+        window_size_left,
+        window_size_right,
+    ):
+        fmha_utils.FusedMask.apply_mask(
+            self.mask_type,
+            acc_qk,
+            index_qk,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
 
     @cute.jit
     def softmax_step(
@@ -2004,8 +2070,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tTMEM_LOADtS[None, i, 0, 0],
                         (tTMEM_LOADrS[None, i, 0, 0], tTMEM_LOADrMax[None, i]),
                     )
-            fmha_utils.FusedMask.apply_mask(
-                self.mask_type,
+            self._apply_mask(
                 tTMEM_LOADrS,
                 tTMEM_LOADcS,
                 seqlen_q,
@@ -2515,7 +2580,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k_ = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                continue_cond = seqlen_k_ <= 0
+                continue_cond = not self._has_visible_keys(
+                    seqlen_q_, seqlen_k_, curr_block_coord, window_size_right
+                )
             if not continue_cond:
                 logical_offset = (
                     curr_block_coord[0] * self.cta_tiler[0]
@@ -2697,7 +2764,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         cO = cute.make_identity_tensor(pv_tiled_mma_shape)
         tOcO = thr_mma.partition_C(cO)
-        corr_tile_size = 16  # tuneable parameter
+        corr_tile_size = self.correction_rescale_tile_size
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
             self.pv_acc_dtype,
@@ -2845,6 +2912,27 @@ class BlackwellFusedMultiHeadAttentionForward:
         return
 
     @cute.jit
+    def _store_o_tile_direct(self, tTMrO, dst, row_idx, seqlen_q):
+        tGMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
+        tGMrO.store(tTMrO.load().to(self.o_dtype))
+        bits = min(cute.size(tGMrO) * self.o_dtype.width, 128)
+        bits = math.gcd(bits, dst.iterator.max_alignment * 8)
+        bits = max(bits, self.o_dtype.width)
+        atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.o_dtype,
+            num_bits_per_copy=bits,
+        )
+        tiled = cute.make_cotiled_copy(
+            atom,
+            cute.make_layout((1, bits // self.o_dtype.width)),
+            cute.make_layout(tGMrO.shape),
+        )
+        thr = tiled.get_slice(0)
+        if row_idx < seqlen_q:
+            cute.copy(atom, thr.partition_S(tGMrO), thr.partition_D(dst))
+
+    @cute.jit
     def correction_epilog(
         self,
         thr_mma: cute.ThrMma,
@@ -2902,27 +2990,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tTMEM_LOADgO = thr_tmem_load.partition_D(tOgO_i[(None, None), None])
         tTMEM_LOADoO = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
-        gmem_store_num_bits = min(
-            cute.size(tTMEM_LOADoO[None, 0, 0, 0]) * self.o_dtype.width,
-            128,
-        )
-        gmem_store_num_bits = math.gcd(
-            gmem_store_num_bits,
-            tTMEM_LOADgO[None, 0, 0, 0].iterator.max_alignment * 8,
-        )
-        gmem_store_num_bits = max(gmem_store_num_bits, self.o_dtype.width)
-        gmem_store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.o_dtype,
-            num_bits_per_copy=gmem_store_num_bits,
-        )
-        gmem_store_copy = cute.make_cotiled_copy(
-            gmem_store_atom,
-            cute.make_layout((1, gmem_store_num_bits // self.o_dtype.width)),
-            cute.make_layout(tTMEM_LOADoO[None, 0, 0, 0].shape),
-        )
-        thr_gmem_store = gmem_store_copy.get_slice(0)
-
         # Wait for vec_i (row_wise global sum)
         vec_i_handle = si_corr_consumer.wait_and_advance()
         tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
@@ -2934,8 +3001,16 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # Wait for Oi
         oi_handle = mma_corr_consumer.wait_and_advance()
-        scale = scale_output / tTMEM_LOAD_VECrS[0]
-        for i in range(self.cta_tiler[2] // corr_tile_size):
+        # Bottom-right causal masks can hide every key for an individual row.
+        # Its PV accumulator is zero; avoid multiplying it by infinity.
+        scale = Float32(0.0)
+        if tTMEM_LOAD_VECrS[0] > 0.0:
+            scale = scale_output / tTMEM_LOAD_VECrS[0]
+        for i in cutlass.range(
+            self.cta_tiler[2] // corr_tile_size,
+            unroll_full=self.correction_epilog_unroll is None,
+            unroll=self.correction_epilog_unroll or 1,
+        ):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADgO_i = tTMEM_LOADgO[None, 0, 0, i]
             tTMrO = cute.make_rmem_tensor(
@@ -2947,14 +3022,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
-            tGMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
-            o_vec = tTMrO.load()
-            tGMrO.store(o_vec.to(self.o_dtype))
-            # STG: store directly to global memory (with bounds check for varlen)
-            if row_idx < seqlen_q:
-                tGMrO_stg = thr_gmem_store.partition_S(tGMrO)
-                tTMEM_LOADgO_stg = thr_gmem_store.partition_D(tTMEM_LOADgO_i)
-                cute.copy(gmem_store_atom, tGMrO_stg, tTMEM_LOADgO_stg)
+            self._store_o_tile_direct(tTMrO, tTMEM_LOADgO_i, row_idx, seqlen_q)
         if cutlass.const_expr(mLSE is not None):
             scaled_tmp = scale_softmax * tTMEM_LOAD_VECrS[1]
             lse = cute.math.log(tTMEM_LOAD_VECrS[0], fastmath=True) + scaled_tmp
@@ -3414,6 +3482,7 @@ def run(
         mask_type,
         enable_ex2_emulation,
         enable_skip_correction,
+        compute_capability=torch.cuda.get_device_capability(),
     )
 
     can_implement = fmha.can_implement(

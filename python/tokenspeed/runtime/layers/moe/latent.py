@@ -139,6 +139,9 @@ class Kimi3MoEExecutionPlan:
     owns_ep_communication: bool
     overlap_shared_experts: bool
     joint_moe_reduce: bool
+    # Decode forwards may take the mailbox decode chain, bound once communication
+    # is prepared where its kernels serve the model.
+    decode_chain: bool
     use_marlin: bool = False
 
     @classmethod
@@ -189,6 +192,16 @@ class Kimi3MoEExecutionPlan:
                 and mapping.moe.tp_size == 1
                 and mapping.moe.ep_size > 1
                 and mapping.moe.ep_group == mapping.moe.tp_ep_group
+            ),
+            # One tensor-parallel group shared by attention and MoE, Blackwell TRT-LLM.
+            decode_chain=(
+                use_trtllm
+                and current_platform().is_blackwell
+                and mapping.pp_size == 1
+                and mapping.attn.dp_size == 1
+                and mapping.moe.ep_size == 1
+                and mapping.attn.tp_size == mapping.moe.tp_size
+                and mapping.attn.tp_group == mapping.moe.tp_ep_group
             ),
         )
 

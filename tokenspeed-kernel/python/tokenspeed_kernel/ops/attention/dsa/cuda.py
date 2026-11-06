@@ -38,7 +38,13 @@ lengths.
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
+from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
+    rank_major_scores,
+    select_through_threshold,
+)
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_persistent_topk,
     persistent_topk,
@@ -47,6 +53,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -218,6 +225,46 @@ def ragged_decode_topk(
     )
 
 
+if has_persistent_topk():
+
+    @register_kernel(
+        "attention",
+        "dsa_merge_candidates",
+        name="cuda_dsa_merge_candidates",
+        solution="cuda",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {format_signature(records=dense_tensor_format(torch.int32))}
+        ),
+        traits={"topk": frozenset({512, 1024, 2048})},
+        priority=Priority.PERFORMANT,
+    )
+    def cuda_dsa_merge_candidates(
+        records: torch.Tensor, *, topk: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``dsa_merge_candidates`` with the persistent-radix top-k. Its
+        atomics pick among tied scores in arrival order, so only its k-th
+        score is used: the selection is redone from it deterministically,
+        as every KVP rank must select the same candidates."""
+        scores = rank_major_scores(records)
+        rows, columns = scores.shape
+        order = torch.empty((rows, topk), device=scores.device, dtype=torch.int32)
+        if rows:
+            persistent_topk(
+                scores,
+                torch.full((rows,), columns, device=scores.device, dtype=torch.int32),
+                order,
+                topk,
+                columns,
+                1,
+                enable_pdl=pdl_enabled(),
+            )
+        return select_through_threshold(records, scores, order, topk=topk)
+
+
 def _mask_sparse_slots(
     slots: torch.Tensor, lengths: torch.Tensor | None
 ) -> torch.Tensor:
@@ -244,7 +291,11 @@ def _finish_sparse_attention(
     return (result, lse) if return_lse else result
 
 
-if platform.is_nvidia and platform.is_hopper_plus:
+if (
+    platform.is_nvidia
+    and platform.is_hopper_plus
+    and importlib.util.find_spec("flash_mla") is not None
+):
 
     @register_kernel(
         "attention",
@@ -329,7 +380,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
         return _finish_sparse_attention(result, lse, slots, out, return_lse)
 
 
-if platform.is_nvidia and platform.is_hopper_plus:
+if (
+    platform.is_nvidia
+    and platform.is_hopper_plus
+    and importlib.util.find_spec("flash_mla") is not None
+):
 
     @register_kernel(
         "attention",
@@ -383,12 +438,18 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_kernel, actual_heads = _pad_prefill_query(q)
         kv = _flatten_regular_kv_cache(kv_cache, page_size)
         slots = _mask_sparse_slots(topk_slots, topk_lens)
+        # topk_length stops each row at its owned prefix; its -1 tail adds nothing.
+        topk_length = None
+        if topk_lens is not None:
+            topk_length = topk_lens.reshape(-1).clamp(0, slots.shape[-1])
+            topk_length = topk_length.to(torch.int32).contiguous()
         result, _, lse = flash_mla_sparse_fwd(
             q=q_kernel,
             kv=kv,
             indices=slots.unsqueeze(1),
             sm_scale=float(softmax_scale) * float(k_scale),
             d_v=int(kv_lora_rank),
+            topk_length=topk_length,
         )
         result = result[:, :actual_heads, :]
         lse = lse[:, :actual_heads]

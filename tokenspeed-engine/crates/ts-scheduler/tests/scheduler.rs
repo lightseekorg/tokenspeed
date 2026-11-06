@@ -97,6 +97,48 @@ fn spec(request_id: &str, tokens: Vec<i32>) -> RequestSpec {
     }
 }
 
+#[test]
+fn submission_errors_return_to_rust_without_inserting_the_batch() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("active", vec![1, 2])])
+        .unwrap();
+
+    let mut negative_budget = spec("invalid", vec![3]);
+    negative_budget.max_new_tokens = -1;
+    let mut negative_prefix = spec("invalid", vec![3]);
+    negative_prefix.max_cached_prefix_tokens = -1;
+    for (invalid, message) in [
+        (spec("active", vec![3]), "duplicate request id"),
+        (spec("fresh", vec![3]), "duplicate request id"),
+        (spec("invalid", Vec::new()), "tokens must be non-empty"),
+        (negative_budget, "max_new_tokens must be non-negative"),
+        (
+            negative_prefix,
+            "max_cached_prefix_tokens must be non-negative",
+        ),
+        (spec("invalid", vec![3; 2000]), "exceeds cache capacity"),
+    ] {
+        let error = scheduler
+            .submit_requests(&[spec("fresh", vec![4, 5, 6]), invalid])
+            .unwrap_err();
+        assert!(error.what().contains(message), "{error}");
+        assert_eq!(scheduler.sizes().waiting, 1);
+        assert_eq!(scheduler.request_token_size("active"), 2);
+        assert_eq!(scheduler.request_token_size("fresh"), -1);
+        assert_eq!(scheduler.request_token_size("invalid"), -1);
+    }
+
+    scheduler
+        .submit_requests(&[spec("fresh", vec![4, 5, 6])])
+        .unwrap();
+    let batches = scheduler.next_execution_plan().forward_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].request_ids, ["active", "fresh"]);
+}
+
 fn event(kind: ForwardEventKind, request_id: &str, tokens: Vec<i32>) -> ForwardEvent {
     ForwardEvent {
         kind,
@@ -133,7 +175,9 @@ fn a_request_runs_from_prefill_to_finish() {
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
 
-    scheduler.submit_requests(&[spec("r1", (1..=10).collect())]);
+    scheduler
+        .submit_requests(&[spec("r1", (1..=10).collect())])
+        .unwrap();
     assert_eq!(scheduler.sizes().waiting, 1);
 
     let plan = scheduler.next_execution_plan();
@@ -200,7 +244,9 @@ fn an_event_the_state_does_not_allow_is_an_error() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
-    scheduler.submit_requests(&[spec("r0", vec![1, 2, 3, 4])]);
+    scheduler
+        .submit_requests(&[spec("r0", vec![1, 2, 3, 4])])
+        .unwrap();
     let error = scheduler
         .advance(&[event(ForwardEventKind::Finish, "r0", Vec::new())])
         .unwrap_err();
@@ -233,7 +279,9 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
          result = ts.Scheduler(cfg)",
     );
     let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
-    scheduler.submit_requests(&[spec("r1", (1..=10).collect())]);
+    scheduler
+        .submit_requests(&[spec("r1", (1..=10).collect())])
+        .unwrap();
 
     // Decode until the scheduler retracts the request: its plan stores the
     // image and runs no forward for it.
@@ -339,7 +387,9 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
     scheduler.advance_head(&tick(1), &[]).unwrap();
-    scheduler.submit_requests(&[spec("waiting", vec![1, 2, 3, 4])]);
+    scheduler
+        .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
+        .unwrap();
 
     // The prompt's probe runs on the storage executors: the device's cache
     // ops never count it, and the request waits for its answer.
@@ -385,7 +435,9 @@ fn a_detached_request_cancels_its_storage_operation() {
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
     scheduler.advance_head(&tick(1), &[]).unwrap();
-    scheduler.submit_requests(&[spec("waiting", vec![1, 2, 3, 4])]);
+    scheduler
+        .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
+        .unwrap();
     let query = scheduler.next_execution_plan().storage_ops()[0].clone();
 
     let detach = StorageRound {
@@ -396,7 +448,9 @@ fn a_detached_request_cancels_its_storage_operation() {
         ..tick(2)
     };
     scheduler.advance_head(&detach, &[]).unwrap();
-    scheduler.submit_requests(&[spec("next", vec![5, 6, 7, 8])]);
+    scheduler
+        .submit_requests(&[spec("next", vec![5, 6, 7, 8])])
+        .unwrap();
     // The cancel goes out before the next request's probe.
     let ops = scheduler.next_execution_plan().storage_ops();
     assert_eq!(
@@ -503,7 +557,9 @@ fn a_remote_prefill_carries_what_the_data_plane_reads() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, &pd_scheduler("D"))).unwrap());
-    scheduler.submit_requests(&[spec("r1", (1..=40).collect())]);
+    scheduler
+        .submit_requests(&[spec("r1", (1..=40).collect())])
+        .unwrap();
     scheduler.next_execution_plan();
     scheduler
         .advance(&[event(ForwardEventKind::PdBootstrapped, "r1", Vec::new())])
@@ -529,11 +585,58 @@ fn a_remote_prefill_carries_what_the_data_plane_reads() {
 }
 
 #[test]
+fn a_remote_partial_prefix_has_a_live_transfer_destination() {
+    interpreter();
+    for prefix in [7, 23, 39] {
+        let mut scheduler =
+            Python::attach(|py| Scheduler::from_python(&run(py, &pd_scheduler("D"))).unwrap());
+        let mut seed = spec("seed", (1..=prefix).collect());
+        seed.max_new_tokens = 1;
+        scheduler.submit_requests(&[seed]).unwrap();
+        scheduler
+            .advance(&[event(ForwardEventKind::PdBootstrapped, "seed", vec![])])
+            .unwrap();
+        let first = scheduler
+            .next_execution_plan()
+            .remote_prefill_transfer()
+            .unwrap();
+        let source = first.block_tables[0].blocks[(prefix / 16) as usize];
+        scheduler
+            .advance(&[
+                ForwardEvent {
+                    bootstrap_token: 1000,
+                    ..event(ForwardEventKind::PdRemotePrefillDone, "seed", vec![])
+                },
+                event(ForwardEventKind::Finish, "seed", vec![]),
+            ])
+            .unwrap();
+        scheduler.next_execution_plan();
+
+        scheduler
+            .submit_requests(&[spec("hit", (1..=prefix + 2).collect())])
+            .unwrap();
+        scheduler
+            .advance(&[event(ForwardEventKind::PdBootstrapped, "hit", vec![])])
+            .unwrap();
+        let plan = scheduler.next_execution_plan();
+        let rows = plan.remote_prefill_transfer().unwrap();
+        assert_eq!(rows.extend_prefix_lens, [prefix]);
+        let blocks = &rows.block_tables[0].blocks;
+        let tail = (prefix / 16) as usize;
+        assert!(blocks[..=tail].iter().all(|&block| block > 0), "{rows:?}");
+        assert_ne!(blocks[tail], source, "the peer writes a private tail block");
+        assert_eq!(python_transfer_view(plan, "remote_prefill"), rows);
+    }
+}
+
+#[test]
 fn a_remote_decode_carries_the_first_token_and_the_prompt_blocks() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, &pd_scheduler("P"))).unwrap());
-    scheduler.submit_requests(&[spec("r1", (1..=20).collect())]);
+    scheduler
+        .submit_requests(&[spec("r1", (1..=20).collect())])
+        .unwrap();
     scheduler.next_execution_plan();
     scheduler
         .advance(&[event(ForwardEventKind::PdBootstrapped, "r1", Vec::new())])
@@ -576,24 +679,24 @@ fn session_demotion_preserves_active_pages_and_reusable_cache() {
         Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
     let mut request = spec("tagged", (1..=40).collect());
     request.session_id = "session-a".into();
-    scheduler.submit_requests(&[request]);
+    scheduler.submit_requests(&[request]).unwrap();
     scheduler.next_execution_plan();
     scheduler
         .advance(&[event(ForwardEventKind::ExtendResult, "tagged", vec![42])])
         .unwrap();
-    let before = scheduler.sizes().active_lcm_blocks;
+    let before = scheduler.active_lcm_blocks();
     scheduler.demote_session("session-a", true);
-    assert_eq!(scheduler.sizes().active_lcm_blocks, before);
+    assert_eq!(scheduler.active_lcm_blocks(), before);
     scheduler
         .advance(&[event(ForwardEventKind::Finish, "tagged", vec![])])
         .unwrap();
     scheduler.next_execution_plan();
-    assert_eq!(scheduler.sizes().active_lcm_blocks, 0);
+    assert_eq!(scheduler.active_lcm_blocks(), 0);
     // Finish publishes the pages at their already-demoted session's age.
     assert_eq!(scheduler.demote_session("session-a", true), 0);
     let mut resumed = spec("resumed", (1..=40).collect());
     resumed.session_id = "session-b".into();
-    scheduler.submit_requests(&[resumed]);
+    scheduler.submit_requests(&[resumed]).unwrap();
     let plan = scheduler.next_execution_plan();
     assert!(
         plan.forward_batches()[0].extend_prefix_lens[0] > 0,
@@ -608,7 +711,7 @@ fn session_demotion_counts_only_newly_aged_idle_pages() {
         Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
     let mut request = spec("tagged", (1..=40).collect());
     request.session_id = "session-a".into();
-    scheduler.submit_requests(&[request]);
+    scheduler.submit_requests(&[request]).unwrap();
     scheduler.next_execution_plan();
     scheduler
         .advance(&[event(ForwardEventKind::ExtendResult, "tagged", vec![42])])
@@ -617,7 +720,7 @@ fn session_demotion_counts_only_newly_aged_idle_pages() {
         .advance(&[event(ForwardEventKind::Finish, "tagged", vec![])])
         .unwrap();
     scheduler.next_execution_plan();
-    assert_eq!(scheduler.sizes().active_lcm_blocks, 0);
+    assert_eq!(scheduler.active_lcm_blocks(), 0);
     assert!(scheduler.demote_session("session-a", false) > 0);
     assert_eq!(scheduler.demote_session("session-a", false), 0);
     assert_eq!(scheduler.demote_session("session-a", true), 0);
@@ -637,7 +740,9 @@ fn admission_capacity_uses_native_geometry_and_live_slots() {
         .windows(2)
         .all(|pair| pair[0] <= pair[1]));
     assert!(*initial.capacity_blocks.last().unwrap() <= i64::from(initial.total_blocks));
-    scheduler.submit_requests(&[spec("capacity", (1..=10).collect())]);
+    scheduler
+        .submit_requests(&[spec("capacity", (1..=10).collect())])
+        .unwrap();
     scheduler.next_execution_plan();
     let active = scheduler.admission_snapshot(8);
     assert_eq!(active.free_slots, initial.free_slots - 1);

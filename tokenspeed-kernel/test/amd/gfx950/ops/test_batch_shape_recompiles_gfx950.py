@@ -27,12 +27,7 @@ specialization class, then sweep the batch-dependent value inside
 
 import pytest
 import torch
-from utils import (
-    assert_no_triton_compile,
-    int_specialization_class,
-    is_cdna4,
-    warm_specialization_classes,
-)
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -106,6 +101,91 @@ def test_mha_extend_split_count():
             run(pages * page - 5)
 
 
+# Request lengths per batch: the batch size runs across the persistent
+# scheduler's slot split (512 workgroups / 32 heads = 16 batch slots), including
+# a partly filled last batch group (17 requests), and the longest query length
+# is 1, divisible by 16, or neither.
+_PREFILL_BATCHES = (
+    [1],
+    [64, 200],
+    [130, 1, 77],
+    [16] * 7,
+    [129, 64, 1, 300, 16, 5, 90, 33, 250, 48, 2, 7, 140, 64, 31, 99],
+    [40] * 17,
+    [96, 3] * 16,
+)
+
+
+def _prefill_inputs(heads, kv_heads, dim, lengths):
+    generator = torch.Generator(device=DEVICE).manual_seed(len(lengths))
+    tokens = sum(lengths)
+
+    def rand(*shape):
+        return torch.randn(
+            *shape, device=DEVICE, dtype=torch.bfloat16, generator=generator
+        )
+
+    q = rand(tokens, heads, dim)
+    k = rand(tokens, kv_heads, dim)
+    v = rand(tokens, kv_heads, dim)
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    cu_gpu = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
+    return q, k, v, cu, cu_gpu
+
+
+def _check_batch_matches_single_requests(run, lengths, out, lse):
+    # Every (request, head, query block) tile is computed alone, so a request's
+    # result must not depend on the batch around it or the slot split.
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    for index, length in enumerate(lengths):
+        rows = slice(cu[index], cu[index + 1])
+        single_out, single_lse = run(lengths, single=index)
+        torch.testing.assert_close(out[rows], single_out, rtol=0, atol=0)
+        torch.testing.assert_close(lse[rows], single_lse, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "window_left,skip_softmax_threshold", [(-1, 0.0), (-1, 1e-3), (100, 0.0)]
+)
+def test_mha_prefill_batch_size(window_left, skip_softmax_threshold):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import prefill
+
+    heads, kv_heads, dim = 32, 8, 128
+
+    def run(lengths, single=None):
+        q, k, v, cu, cu_gpu = _prefill_inputs(heads, kv_heads, dim, lengths)
+        if single is not None:
+            rows = slice(cu[single], cu[single + 1])
+            q, k, v = q[rows], k[rows], v[rows]
+            lengths = [lengths[single]]
+            cu = [0, lengths[0]]
+            cu_gpu = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
+        return prefill.launch_gluon_mha_prefill_gfx950(
+            q,
+            k,
+            v,
+            cu_gpu,
+            cu,
+            max(lengths),
+            window_left=window_left,
+            return_lse=True,
+            skip_softmax_threshold=skip_softmax_threshold,
+        )
+
+    # The batch size and longest query length are unspecialized: one compile.
+    run([5])
+    with assert_no_triton_compile(
+        prefill.gluon_mha_prefill_gfx950, prefill.gluon_mha_prefill_sliding_gfx950
+    ):
+        for lengths in _PREFILL_BATCHES:
+            out, lse = run(lengths)
+            _check_batch_matches_single_requests(run, lengths, out, lse)
+
+
 def test_mxfp8_gemm_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import mm
 
@@ -175,7 +255,7 @@ def test_mxfp4_moe_sorting_route_count():
     experts, topk, block = 64, 8, 32
     generator = torch.Generator(device=DEVICE).manual_seed(3)
 
-    def run(tokens):
+    def run(tokens, block=block):
         ids = torch.randint(
             0, experts, (tokens, topk), device=DEVICE, generator=generator
         ).int()
@@ -204,24 +284,18 @@ def test_mxfp4_moe_sorting_route_count():
         torch.testing.assert_close(sorted_weights[position], weights.flatten()[flat])
         assert torch.equal(block_experts[position // block], ids.flatten()[flat])
 
-    def key(tokens):
-        routes = tokens * topk
-        programs = max(experts, -(-routes // 1024))
-        per_program = -(-routes // programs)
-        counts = (routes, programs, per_program)
-        return (
-            *map(int_specialization_class, counts),
-            1 << (per_program - 1).bit_length(),
-        )
-
-    # Route counts from 8K to 16K share one power-of-two route block.
-    sweep = (1033, 1100, 1500, 2000)
-    warm_specialization_classes(run, key, sweep, range(1030, 2049))
+    # Prefill sizes vary routes per program and the padding block; neither recompiles.
+    sweep = (100, 300, 1033, 1100, 3000, 8000)
+    run(1030)
     with assert_no_triton_compile(
-        moe_sorting._moe_sorting_stage1_kernel, moe_sorting._moe_sorting_stage4_kernel
+        moe_sorting._moe_sorting_stage1_kernel,
+        moe_sorting._moe_sorting_stage2_kernel,
+        moe_sorting._moe_sorting_stage3_kernel,
+        moe_sorting._moe_sorting_stage4_kernel,
     ):
         for tokens in sweep:
-            run(tokens)
+            for padding_block in (16, 32, 64, 128):
+                run(tokens, padding_block)
 
 
 def test_moe_topk_row_count():

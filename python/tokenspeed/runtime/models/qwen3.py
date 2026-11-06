@@ -33,13 +33,9 @@ from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.layernorm import RMSNorm
-from tokenspeed.runtime.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from tokenspeed.runtime.layers.linear import QKVParallelLinear, RowParallelLinear
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.paged_attention import (
     PagedAttention,
     hf_sliding_window_to_window_left,
@@ -54,51 +50,6 @@ from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.env import global_server_args_dict
-
-
-class Qwen3MLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: QuantizationConfig | None = None,
-        tp_rank: int | None = None,
-        tp_size: int | None = None,
-        tp_group: tuple[int, ...] | None = None,
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-        )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class Qwen3Attention(nn.Module):
@@ -247,14 +198,17 @@ class Qwen3DecoderLayer(nn.Module):
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = GatedMLP.tensor_parallel(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
+            activation=gated_activation(config.hidden_act, swiglu_limit=None),
             tp_rank=self.mapping.dense.tp_rank,
             tp_size=self.mapping.dense.tp_size,
             tp_group=self.mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(

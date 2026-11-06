@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import gc
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -108,7 +109,20 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
-def get_batch_sizes_to_capture(config: ModelExecutorConfig):
+@dataclasses.dataclass(frozen=True)
+class DecodeLadderArgs:
+    """The executor config fields the decode graph ladder is built from
+    (``get_batch_sizes_to_capture``), as ``ModelExecutorConfig.from_server_args``
+    takes them."""
+
+    cudagraph_capture_sizes: list[int] | None
+    max_num_seqs: int
+    data_parallel_size: int
+    disable_cuda_graph_padding: bool
+    max_cudagraph_capture_size: int
+
+
+def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
@@ -1101,9 +1115,9 @@ class ForwardStepRunner:
         The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
         input buffers on every call — empty for a pure decode or the idle
         replay, which never read them. ``block_tables_cpu`` mirrors
-        ``block_tables`` on the host (the same group keys; empty at bs 0) for
-        backends that plan an extend from the tables without waiting on the
-        device.
+        ``block_tables`` on the host (the same group keys) for backends that
+        plan an extend from the tables without waiting on the device; a pure
+        decode, which plans nothing from them, gets none.
 
         ``settle`` finishes what the inputs still wait on (a pending draft
         round): a decode calls it once the target's decode metadata, which

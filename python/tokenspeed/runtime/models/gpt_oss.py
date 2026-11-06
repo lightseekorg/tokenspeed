@@ -35,9 +35,6 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.linear import (
     QKVParallelLinear,
@@ -60,8 +57,8 @@ from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import (
     BaseCausalLM,
+    BaseMoEDecoderLayer,
     BaseTransformerModel,
-    CompiledMoEDecoderLayer,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
@@ -277,6 +274,8 @@ class GptOssSparseMoeBlock(nn.Module):
         self.swiglu_limit = config.swiglu_limit
         self.num_experts = num_experts
         self.quant_config = quant_config
+        # Petit's MegaMoE kernel dispatches and combines this rank's rows itself.
+        self.owns_ep_communication: bool = get_all2all_backend().is_gluon_petit()
         if self.tp_size > config.num_local_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -377,7 +376,7 @@ def get_attention_sliding_window_size(config):
     return hf_sliding_window_to_window_left(config.sliding_window)
 
 
-class GptOssDecoderLayer(CompiledMoEDecoderLayer):
+class GptOssDecoderLayer(BaseMoEDecoderLayer):
 
     def __init__(
         self,
@@ -386,19 +385,9 @@ class GptOssDecoderLayer(CompiledMoEDecoderLayer):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        sliding_window_size: int | None = None,
     ) -> None:
 
-        self._config = config
-        self._mapping = mapping
-        self._quant_config = quant_config
-        self._prefix = prefix
-
-        if sliding_window_size is None:
-            self.sliding_window_size = get_attention_sliding_window_size(config)
-        else:
-            self.sliding_window_size = sliding_window_size
-
+        self.sliding_window_size = get_attention_sliding_window_size(config)
         super().__init__(
             config=config,
             layer_id=layer_id,
@@ -407,22 +396,16 @@ class GptOssDecoderLayer(CompiledMoEDecoderLayer):
             prefix=prefix,
         )
 
-        self.attn_tp_group = pg_manager.get_process_group(
-            "nccl", self.mapping.attn.tp_group
-        )
-        self.attn_tp_size = self.mapping.attn.tp_size
-        self.attn_tp_rank = self.mapping.attn.tp_rank
-
     def resolve_attn(self, prefix: str) -> nn.Module:
 
-        config = self._config
+        config = self.config
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
 
         return GptOssAttention(
             config=config,
-            mapping=self._mapping,
+            mapping=self.mapping,
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -433,7 +416,7 @@ class GptOssDecoderLayer(CompiledMoEDecoderLayer):
             head_dim=head_dim,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
-            quant_config=self._quant_config,
+            quant_config=self.quant_config,
             prefix=add_prefix("self_attn", prefix),
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[self.layer_id],
@@ -442,19 +425,37 @@ class GptOssDecoderLayer(CompiledMoEDecoderLayer):
 
     def resolve_mlp(self, prefix: str) -> nn.Module:
 
-        config = self._config
+        config = self.config
 
         return GptOssSparseMoeBlock(
             config=config,
-            mapping=self._mapping,
+            mapping=self.mapping,
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            quant_config=self._quant_config,
+            quant_config=self.quant_config,
             layer_index=self.layer_id,
             prefix=add_prefix("mlp", prefix),
         )
+
+    def forward_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        """The MoE output; Petit's MoE dispatches and combines this rank's rows
+        itself, so then ``residual`` and ``ctx`` go unused and no CommManager
+        leg runs."""
+
+        if not self.mlp.owns_ep_communication:
+            return super().forward_mlp(
+                hidden_states, residual, ctx, num_global_tokens, max_num_tokens_per_gpu
+            )
+        return self.mlp(hidden_states, num_global_tokens, max_num_tokens_per_gpu)
 
 
 class GptOssModel(BaseTransformerModel):
