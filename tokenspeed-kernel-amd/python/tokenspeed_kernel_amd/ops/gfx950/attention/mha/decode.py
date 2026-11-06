@@ -2218,9 +2218,33 @@ def launch_gluon_mha_decode_balanced_gfx950(
     *,
     schedule: torch.Tensor,
 ) -> torch.Tensor:
-    """Full-attention paged decode split by a balanced schedule from
-    launch_gluon_mha_decode_schedule_gfx950 (see Balanced Split Schedule);
-    arguments otherwise as launch_gluon_mha_decode_gfx950."""
+    """Run full-attention paged decode, split by a balanced schedule.
+
+    See "Balanced split schedule" in the ops README.
+
+    Args:
+        q: Query, [num_requests * max_seqlen_q, heads, dim], in the cache's
+            dtype for an FP8 cache (read at unit scale).
+        k_cache, v_cache: Paged caches, [pages, page_size, kv_heads, dim].
+        page_table: int32 [num_requests, pages per request] page indices.
+        cache_seqlens: int32 [num_requests] cache lengths.
+        max_seqlen_k: Unused. The schedule sizes the splits, so this
+            argument only matches the decode signature.
+        max_seqlen_q: Query tokens per request.
+        window_left: Must be -1 (full attention).
+        logit_cap: Must be 0.
+        sinks: Optional per-head attention sinks, [heads].
+        return_lse: Must be False.
+        softmax_scale: Score scale, or None for 1 / sqrt(dim).
+        q_scale, k_scale, v_scale: Must be None.
+        schedule: int32 [>= num_requests + 1, 2] schedule that
+            launch_gluon_mha_decode_schedule_gfx950 computed from
+            ``cache_seqlens``.
+
+    Returns:
+        The attention output, shaped like ``q``, in ``q``'s dtype, or BF16
+        for an FP8 query.
+    """
     # The schedule sizes the splits from the lengths; max_seqlen_k (the
     # split grid's sizing input) has nothing to size here.
     del max_seqlen_k
