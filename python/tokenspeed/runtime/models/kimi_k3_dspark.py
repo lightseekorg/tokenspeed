@@ -561,7 +561,6 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         positions: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
-        kv_sync_event=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
@@ -583,9 +582,6 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # A zero residual rather than None: the drafter hands over an un-reduced
         # embedding, so the first layer must take the all-reduce path too.
         residual = torch.zeros_like(hidden_states)
-
-        if kv_sync_event is not None:
-            torch.cuda.current_stream().wait_event(kv_sync_event)
 
         for layer in self.layers:
             hidden_states, residual = layer(
