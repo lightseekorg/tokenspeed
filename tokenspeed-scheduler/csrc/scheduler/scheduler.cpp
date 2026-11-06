@@ -158,8 +158,10 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     // An event reports the net change since the last drain: a boundary is
-    // published exactly while every child block of it is cached. Mutations
-    // mark boundaries in whatever order the coordinator touches pages, so the
+    // published while its required continuous-history blocks are cached. Sparse state
+    // checkpoints must not leave holes in the router's parent chain. Router
+    // overlap estimates locality; admission computes the actual reusable state.
+    // Mutations mark boundaries in whatever order the coordinator touches pages, so the
     // batch is sorted by chain depth: removals leaf-first, then Stored
     // parent-first, because consumers resolve a Stored event's
     // parent_block_hash against what they have already received.
@@ -174,17 +176,17 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
         // A tail's descriptor carries fewer tokens than a page.
         const auto descriptor_tokens = static_cast<std::int32_t>(event_boundary.stored.token_ids.size());
         const std::int32_t tail_tokens = descriptor_tokens < config_.prefix_granularity ? descriptor_tokens : 0;
-        const CacheCoordinator::BoundaryResidency residency =
-            coordinator_.DeviceBoundaryResidency(boundary, tail_tokens);
-        const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
-        if (complete && !event_boundary.published) {
-            stored.emplace_back(event_boundary.depth, event_boundary.stored);
-        } else if (!complete && event_boundary.published) {
-            removed.emplace_back(event_boundary.depth,
-                                 KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+        const auto status = coordinator_.GetBoundaryEventStatus(boundary, tail_tokens);
+        if (status.publishable != event_boundary.published) {
+            if (status.publishable) {
+                stored.emplace_back(event_boundary.depth, event_boundary.stored);
+            } else {
+                removed.emplace_back(event_boundary.depth,
+                                     KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+            }
         }
-        event_boundary.published = complete;
-        if (residency == CacheCoordinator::BoundaryResidency::kNone) {
+        event_boundary.published = status.publishable;
+        if (!status.has_device_entries) {
             kv_event_boundaries_.erase(it);
         }
     }
