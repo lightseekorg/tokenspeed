@@ -77,7 +77,11 @@ MAX_BS = 4
 
 def _states() -> RuntimeStates:
     states = RuntimeStates(
-        req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device="cpu"
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=N,
+        device="cpu",
     )
     states.init_draft_tree_q(num_nodes=N, num_slots=STEPS, num_candidates=K)
     return states
@@ -134,7 +138,11 @@ def test_the_sampled_walk_records_each_chain_at_its_state_write_slot():
     torch.manual_seed(0)
     device = "cuda"
     states = RuntimeStates(
-        req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device=device
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=N,
+        device=device,
     )
     drafter = _dflash2(states)
     backend = _triton_backend(enable_speculative_sampling=True, device=device)
@@ -248,7 +256,11 @@ def test_base_dflash_refuses_the_flag_at_bind():
     # row; only the loaded checkpoint tells it apart from DFlash2.
     drafter = DFlash.__new__(DFlash)
     drafter.runtime_states = RuntimeStates(
-        req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device="cpu"
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=N,
+        device="cpu",
     )
     with pytest.raises(ValueError, match="needs a DFlash2 draft"):
         drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=True))
@@ -274,7 +286,11 @@ def _dflash2(states: RuntimeStates) -> DFlash2:
 
 def test_dflash2_binds_a_sparse_q_and_the_verifiers_pools():
     states = RuntimeStates(
-        req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device="cpu"
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=N,
+        device="cpu",
     )
     drafter = _dflash2(states)
     backend = _triton_backend(enable_speculative_sampling=True)
@@ -299,7 +315,11 @@ def test_dflash2_binds_a_sparse_q_and_the_verifiers_pools():
 
 def test_dflash2_without_the_flag_keeps_the_greedy_walk():
     states = RuntimeStates(
-        req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device="cpu"
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=N,
+        device="cpu",
     )
     drafter = _dflash2(states)
 
@@ -319,6 +339,7 @@ def _executor_config(spec_algo: str) -> ModelExecutorConfig:
         prefix_granularity=1,
         max_num_seqs=MAX_BS,
         chunked_prefill_size=MAX_BS * N,
+        input_vocab_size=VOCAB,
         vocab_size=VOCAB,
         context_len=N,
         physical_context_len=N,
@@ -350,7 +371,11 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     executor = ModelExecutor.__new__(ModelExecutor)
     for spec_algo, dense in (("DFLASH", False), ("DSPARK", True)):
         executor.runtime_states = RuntimeStates(
-            req_pool_size=POOL, vocab_size=VOCAB, output_length=N, device="cpu"
+            req_pool_size=POOL,
+            input_vocab_size=VOCAB,
+            vocab_size=VOCAB,
+            output_length=N,
+            device="cpu",
         )
         config = _executor_config(spec_algo)
         executor._init_draft_probs(config, N)
