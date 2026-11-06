@@ -123,11 +123,12 @@ def dsa_history_gather_workspace_bytes(
 
     One whole history (``max_model_len`` rows, padded to kernel pages by
     :func:`dsa_history_gather_workspace_rows`) of latent rows in the KV cache
-    dtype plus index-K rows packed in the plane's own format
+    dtype or of index-K rows packed in the plane's own format
     (:func:`index_k_row_bytes` of ``spec.index_k_format``: FP8 keys with
-    their scales, or bf16 keys): the sharded extend arm gathers each request
-    group's history into it, so a request's history may never exceed the
-    model length. ``DSABackend.preallocate_history_gather_workspace``
+    their scales, or bf16 keys), whichever is wider: the two share the
+    buffer (``HistoryGatherWorkspace``). The sharded extend arm gathers each
+    request group's history into it, so a request's history may never exceed
+    the model length. ``DSABackend.preallocate_history_gather_workspace``
     allocates exactly these bytes.
     """
     spec = config.component(DSAConfig)
@@ -139,8 +140,8 @@ def dsa_history_gather_workspace_bytes(
     kv_bytes = (
         spec.kv_cache_dim * torch.tensor([], dtype=config.kv_cache_dtype).element_size()
     )
-    return rows * (
-        kv_bytes + index_k_row_bytes(spec.index_head_dim, spec.index_k_format)
+    return rows * max(
+        kv_bytes, index_k_row_bytes(spec.index_head_dim, spec.index_k_format)
     )
 
 
