@@ -1453,10 +1453,10 @@ Each workgroup owns one KV head and packs its query-head group with up to 16
 query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
 two when no request has more than 64 queries. Unused head lanes are masked.
 With head dim 64 and 16-bit K/V, 256-row tiles on eight waves (below) take
-over when each work-group streams many cached keys: under full attention a
+over when each workgroup streams many cached keys: under full attention a
 cached prefix (`max_seqlen_k - max_seqlen_q`) of at least 8192 keys; under a
 window of at least 2047 keys a prefix of at least the window and one to four
-work-groups per CU over the launch. `max_seqlen_k` should be the longest
+workgroups per CU over the launch. `max_seqlen_k` should be the longest
 request's length, as serving passes for pure extends; the context limit would
 send short-prefix extends to the slower 8-wave tile.
 
@@ -1479,8 +1479,8 @@ copies. K and V pass through 4-slot LDS rings, K four pages ahead and V two.
 The running maximum moves only when a page raises it by more than 8 (base 2),
 so most pages skip the accumulator rescale, and a wave whose 32 rows all kept
 their maximum skips it with one scalar branch. A wave uses about 196 VGPRs, so
-one 8-wave work-group runs per CU; the split count therefore counts each as
-two 4-wave work-groups.
+one 8-wave workgroup runs per CU; the split count therefore counts each as
+two 4-wave workgroups.
 
 ### gfx950 MLA extend
 
