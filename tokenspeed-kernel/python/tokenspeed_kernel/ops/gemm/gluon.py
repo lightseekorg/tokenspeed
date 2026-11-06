@@ -119,10 +119,19 @@ if platform.is_amd:
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950 as _router_gemv_mm_counters,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         gluon_fp32_router_gemv_num_counters_gfx950 as _fp32_router_gemv_counters,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         launch_gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        launch_gluon_fp32_router_gemv_mm_a16w16_gfx950 as _fp32_router_gemv_mm_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        supports_gluon_fp32_router_gemv_mm_a16w16_gfx950 as _supports_router_gemv_mm,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         transpose_fp32_router_weight_gfx950 as _transpose_fp32_router_weight,
@@ -248,6 +257,67 @@ if platform.is_amd:
             device=x.device,
         )
         return _fp32_router_gemv_impl(x, weight, multiplier, tile_counters, enable_pdl)
+
+    def _supports_router_gemv_mm_problem(m: int, n: int, k: int) -> bool:
+        # Any router shape the traits admit tiles the router half; the decode
+        # GEMM must have a measured four-wave config for these rows.
+        return _supports_router_gemv_mm(m, 16, 512, n, k)
+
+    @register_kernel(
+        "gemm",
+        "prepared_fp32_router_gemv_with_mm",
+        name="gluon_fp32_router_gemv_mm_a16w16_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.float32),
+                    weight=dense_tensor_format(torch.float32),
+                    mm_a=dense_tensor_format(torch.bfloat16),
+                    mm_b=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        # m, n, k describe the decode GEMM; the router declares its own shape.
+        traits={
+            "router_n": frozenset(range(16, 1025, 16)),
+            "router_k": frozenset(range(512, 16385, 512)),
+            "mnk_problem_filter": frozenset({_supports_router_gemv_mm_problem}),
+        },
+        weight_preprocessor=_transpose_fp32_router_weight,
+    )
+    def gluon_fp32_router_gemv_mm_a16w16_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        multiplier: float,
+        mm_a: torch.Tensor,
+        mm_b: torch.Tensor,
+        mm_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the router's split-K GEMM and a decode GEMM in one gfx950 launch."""
+        router_counters = _router_gemv_mm_counters(x.shape[0], weight.shape[0])
+        counters = zeroed_state(
+            router_counters
+            + _mm_a16w16_decode_counters(mm_a.shape[0], mm_b.shape[0], mm_b.shape[1]),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        return _fp32_router_gemv_mm_impl(
+            x,
+            weight,
+            multiplier,
+            counters[:router_counters],
+            mm_a,
+            mm_b,
+            mm_out,
+            counters[router_counters:],
+        )
 
     try:
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
