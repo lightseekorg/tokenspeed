@@ -1125,9 +1125,9 @@ class ForwardStepRunner:
         The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
         input buffers on every call — empty for a pure decode or the idle
         replay, which never read them. ``block_tables_cpu`` mirrors
-        ``block_tables`` on the host (the same group keys; empty at bs 0) for
-        backends that plan an extend from the tables without waiting on the
-        device.
+        ``block_tables`` on the host (the same group keys) for backends that
+        plan an extend from the tables without waiting on the device; a pure
+        decode, which plans nothing from them, gets none.
 
         ``settle`` finishes what the inputs still wait on (a pending draft
         round): a decode calls it once the target's decode metadata, which

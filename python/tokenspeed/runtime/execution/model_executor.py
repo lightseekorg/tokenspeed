@@ -2380,11 +2380,14 @@ class ModelExecutor:
                     contract=self._cache_runtime_contract,
                     num_requests=bs,
                     validate_page_ids=self._validate_page_ids,
+                    # Only an extend plans from host tables.
+                    host_tables=num_extends > 0,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
-                block_tables_cpu = dict(
-                    cache_metadata.tables_cpu(active_forward_op=forward_op)
-                )
+                if num_extends > 0:
+                    block_tables_cpu = dict(
+                        cache_metadata.tables_cpu(active_forward_op=forward_op)
+                    )
             # What the batch fixes on its own is staged while a pending round still drafts.
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
