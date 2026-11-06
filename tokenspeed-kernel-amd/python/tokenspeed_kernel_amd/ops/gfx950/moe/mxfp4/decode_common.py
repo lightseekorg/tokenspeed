@@ -586,10 +586,9 @@ def _route_groups_from_ids(
     TOPK: gl.constexpr,
     MAX_ROWS: gl.constexpr,
 ):
-    """Group the routes of at most ``MAX_ROWS`` tokens by local expert,
-    straight from their top-k IDs.
+    """Group the routes of at most ``MAX_ROWS`` tokens by local expert.
 
-    A token lists an expert at most once, so each expert holds at most
+    The groups come straight from the tokens' top-k IDs. A token lists an expert at most once, so each expert holds at most
     ``MAX_ROWS`` routes. Groups follow local expert order. Returns each
     route's local expert (-1 for another rank's routes and past ``rows``),
     the per-expert route counts, each expert's group index and the number of
@@ -617,9 +616,11 @@ def _group_routes(
     group,
     BLOCK_M: gl.constexpr,
 ):
-    """Return ``(expert, count, routes)`` of one group: its local expert,
-    its route count and its routes in route order, padded with its first
-    route (``[BLOCK_M]``, at least the group's count)."""
+    """Return one group's local expert, route count and padded routes.
+
+    The routes (``[BLOCK_M]``, at least the group's count) are in route
+    order, padded with the group's first route.
+    """
     EXPERT_PAD: gl.constexpr = counts.shape[0]
     ROUTE_BLOCK: gl.constexpr = route_expert.shape[0]
     layout: gl.constexpr = _route_layout(gl.num_warps())
