@@ -120,7 +120,8 @@ def test_stage_reads_rows_past_int32_offsets():
     weights = torch.rand(2, 6, device="cuda", dtype=torch.float32)
     ids = torch.randint(0, 384, (2, 6), device="cuda", dtype=torch.int32)
 
-    got = _stage(hidden, weights, ids)
-    want = _reference(hidden.contiguous(), weights, ids)
-    for a, b in zip(got, want):
-        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    for got, want in zip(
+        _stage(hidden, weights, ids),
+        _reference(hidden.contiguous(), weights, ids),
+    ):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
