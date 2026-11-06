@@ -34,13 +34,12 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
-from cutlass.base_dsl.enums import Arch
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import BaseDSL
 from tokenspeed_mla import fmha_helpers as fmha_utils
 from tokenspeed_mla.fmha import (
     BlackwellFusedMultiHeadAttentionForward,
 )
+from tokenspeed_mla.fmha_sm107 import RubinFusedMultiHeadAttentionForward
 from tokenspeed_mla.utils import torch_to_cutlass_dtype
 
 logger = logging.getLogger(__name__)
@@ -54,32 +53,21 @@ def _to_cute(src: torch.Tensor, dtype):
     return ct
 
 
-def _to_cute_1d(t: torch.Tensor):
+def _to_cute_1d(t: torch.Tensor, device: torch.device):
     """Convert a 1D int32 tensor (cum_seqlen) to cute with TVM-FFI.
     Returns (cute_tensor, torch_tensor) to keep backing storage alive."""
-    t = t.to(torch.int32) if t.dtype != torch.int32 else t
-    if not t.is_cuda:
-        t = t.cuda()
+    t = t.to(device=device, dtype=torch.int32).contiguous()
     ct = from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True)
     ct.element_type = cutlass.Int32
     return ct, t
 
 
-def _enable_ex2_emulation() -> bool:
-    arch = BaseDSL._get_dsl().get_arch_enum()
-    if Arch.sm_100 <= arch <= Arch.sm_100f:
-        # On sm100, default output is False.
-        return False
-
-    if Arch.sm_103 <= arch <= Arch.sm_103f:
-        # On sm103, it must be False.
-        return False
-
-    if Arch.sm_107 <= arch <= Arch.sm_107f:
-        # SM107 uses native exp2, as SM103 does.
-        return False
-
-    raise NotImplementedError(f"MLA prefill not implemented for arch={arch}.")
+def _enable_ex2_emulation(compute_capability: tuple[int, int]) -> bool:
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+        raise NotImplementedError(
+            f"MLA prefill not implemented for {compute_capability}."
+        )
+    return False
 
 
 def _compile_prefill_kernel(
@@ -88,8 +76,9 @@ def _compile_prefill_kernel(
     head_dim_v: int,
     is_causal: bool,
     return_lse: bool,
-    use_pdl: bool = False,
-    enable_ex2_emulation: bool = True,
+    use_pdl: bool,
+    enable_ex2_emulation: bool,
+    compute_capability: tuple[int, int],
 ):
     """Compile FMHA prefill kernel with fully fake/symbolic tensors.
 
@@ -108,7 +97,14 @@ def _compile_prefill_kernel(
         else fmha_utils.MaskEnum.RESIDUAL_MASK
     )
 
-    kernel_obj = BlackwellFusedMultiHeadAttentionForward(
+    kernel_cls = BlackwellFusedMultiHeadAttentionForward
+    if (
+        compute_capability == (10, 7)
+        and q_dtype == torch.float8_e4m3fn
+        and (head_dim_qk, head_dim_v) == (192, 128)
+    ):
+        kernel_cls = RubinFusedMultiHeadAttentionForward
+    kernel_obj = kernel_cls(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
         mma_tiler=mma_tiler_mn,
@@ -117,6 +113,7 @@ def _compile_prefill_kernel(
         mask_type=mask_type,
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
+        compute_capability=compute_capability,
     )
 
     # Symbolic cum_seqlen — allows variable batch_size without recompile.
@@ -148,25 +145,49 @@ def _compile_prefill_kernel(
     q_fake = cute.runtime.make_fake_tensor(
         cutlass_dtype,
         shape=(1, sym_s_q, cute.sym_int(), cute.sym_int(), head_dim_qk),
-        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        stride=(
+            cute.sym_int(64),
+            cute.sym_int(64),
+            cute.sym_int(64),
+            cute.sym_int(64),
+            1,
+        ),
         assumed_align=16,
     )
     k_fake = cute.runtime.make_fake_tensor(
         cutlass_dtype,
         shape=(1, sym_s_kv, cute.sym_int(), 1, head_dim_qk),
-        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        stride=(
+            cute.sym_int(64),
+            cute.sym_int(64),
+            cute.sym_int(64),
+            cute.sym_int(64),
+            1,
+        ),
         assumed_align=16,
     )
     v_fake = cute.runtime.make_fake_tensor(
         cutlass_dtype,
         shape=(1, sym_s_kv, cute.sym_int(), 1, head_dim_v),
-        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        stride=(
+            cute.sym_int(64),
+            cute.sym_int(64),
+            cute.sym_int(64),
+            cute.sym_int(64),
+            1,
+        ),
         assumed_align=16,
     )
     o_fake = cute.runtime.make_fake_tensor(
         out_cutlass_dtype,
         shape=(1, sym_s_q, cute.sym_int(), cute.sym_int(), head_dim_v),
-        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        stride=(
+            cute.sym_int(64),
+            cute.sym_int(64),
+            cute.sym_int(64),
+            cute.sym_int(64),
+            1,
+        ),
         assumed_align=16,
     )
 
@@ -175,7 +196,7 @@ def _compile_prefill_kernel(
         lse_fake = cute.runtime.make_fake_tensor(
             cutlass.Float32,
             shape=(sym_s_q, cute.sym_int()),
-            stride=(cute.sym_int(), 1),
+            stride=(cute.sym_int(64), 1),
             assumed_align=4,
         )
     else:
@@ -201,12 +222,12 @@ def _compile_prefill_kernel(
         None,
         stream_compile,
         use_pdl,
-        options="--enable-tvm-ffi --opt-level 2",
+        options=f"--enable-tvm-ffi --opt-level 2 --gpu-arch=sm_{compute_capability[0]}{compute_capability[1]}a",
     )
     return compiled
 
 
-# Cache: (dtype, d_qk, d_v, h_q, h_k, is_causal, return_lse, pdl, ex2)
+# Cache: (dtype, d_qk, d_v, causal, lse, pdl, ex2, architecture, device)
 # New fmha.py accepts cute.Tensor and handles varlen without padding.
 # TMA descriptors rebuilt from runtime tensors. Buffer sizes NOT in key.
 _compiled_kernels = {}
@@ -232,7 +253,9 @@ def warmup_compile_prefill(
     Safe to call multiple times: if a config is already in `_compiled_kernels`,
     it is skipped. Called from `CuteDSLMLABackend.__init__` at server startup.
     """
-    enable_ex2_emulation = _enable_ex2_emulation()
+    device_index = torch.cuda.current_device()
+    compute_capability = torch.cuda.get_device_capability(device_index)
+    enable_ex2_emulation = _enable_ex2_emulation(compute_capability)
     for is_causal in (True, False):
         for return_lse in (True,):  # tokenspeed only uses return_lse=True
             config = (
@@ -243,6 +266,8 @@ def warmup_compile_prefill(
                 return_lse,
                 enable_pdl,
                 enable_ex2_emulation,
+                compute_capability,
+                device_index,
             )
             if config in _compiled_kernels:
                 continue
@@ -260,7 +285,49 @@ def warmup_compile_prefill(
                 return_lse,
                 use_pdl=enable_pdl,
                 enable_ex2_emulation=enable_ex2_emulation,
+                compute_capability=compute_capability,
             )
+
+
+def _validate_prefill_inputs(
+    query, key, value, seq_lens, cum_q, cum_kv, batch_size, max_q_len, max_kv_len
+):
+    """Validate metadata only; GPU length values remain on the device."""
+    for name, tensor in (("query", query), ("key", key), ("value", value)):
+        if tensor.ndim != 3:
+            raise ValueError(f"{name} must be a 3D tensor")
+        if tensor.device.type != "cuda" or tensor.device != query.device:
+            raise ValueError(f"{name} must be on query's CUDA device {query.device}")
+        if tensor.dtype != query.dtype:
+            raise TypeError("query, key and value must have the same dtype")
+    if query.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError("prefill supports FP16, BF16 and FP8 E4M3 inputs")
+    if key.shape[:2] != value.shape[:2] or key.shape[2] != query.shape[2]:
+        raise ValueError("K/V token and head counts, and Q/K dimensions, must match")
+    if key.shape[1] <= 0 or query.shape[1] <= 0 or query.shape[1] % key.shape[1]:
+        raise ValueError("Q heads must be a positive multiple of KV heads")
+    if query.shape[2] <= 0 or value.shape[2] <= 0:
+        raise ValueError("head dimensions must be positive")
+    if batch_size < 0 or max_q_len < 0 or max_kv_len < 0:
+        raise ValueError("batch size and maximum sequence lengths must be nonnegative")
+    if max(batch_size, max_q_len, max_kv_len, query.shape[0], key.shape[0]) >= 2**31:
+        raise ValueError("token counts and sequence lengths must fit in int32")
+    for name, tensor, count in (
+        ("seq_lens", seq_lens, batch_size),
+        ("cum_seq_lens_q", cum_q, batch_size + 1),
+        ("cum_seq_lens", cum_kv, batch_size + 1),
+    ):
+        if tensor.ndim != 1 or tensor.numel() != count:
+            raise ValueError(f"{name} must be a 1D tensor with {count} entries")
+        if tensor.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"{name} must contain int32 or int64 lengths")
+
+
+def _packed_input(tensor):
+    tensor = tensor.contiguous()
+    # A contiguous view may still start one element into its allocation.
+    # TMA and vector stores rely on the alignment promised by _to_cute.
+    return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
 def tokenspeed_mla_prefill(
@@ -285,8 +352,30 @@ def tokenspeed_mla_prefill(
       Q shape: [sum(q_lens), h_q, d_qk]
       K shape: [sum(kv_lens), h_k, d_qk]
       V shape: [sum(kv_lens), h_k, d_v]
-    If provided, out must be contiguous BF16 with shape [sum(q_lens), h_q, d_v].
+    Inputs share a CUDA device and an FP16, BF16 or E4M3 dtype. Strided or
+    unaligned inputs are packed before launch. If provided, out must be
+    contiguous, 16-byte aligned BF16 with shape [sum(q_lens), h_q, d_v].
+    LSE is FP32 in natural-log units. Empty visible rows return zero / -inf.
+    Cumulative vectors are authoritative; seq_lens is redundant KV metadata
+    kept for framework compatibility and must agree with their differences.
+    Length values must be nonnegative int32-representable values, cumulative
+    ranges must lie within the buffers, and maxima must cover every request.
+    These device-resident values are not copied to the CPU for validation.
     """
+    cum_seq_lens_q = cum_seq_lens if cum_seq_lens_q is None else cum_seq_lens_q
+    max_seq_len_q = max_seq_len if max_seq_len_q is None else max_seq_len_q
+    _validate_prefill_inputs(
+        query,
+        key,
+        value,
+        seq_lens,
+        cum_seq_lens_q,
+        cum_seq_lens,
+        batch_size,
+        max_seq_len_q,
+        max_seq_len,
+    )
+    query, key, value = (_packed_input(t) for t in (query, key, value))
     total_q_tokens, h_q, d_qk = query.shape
     total_kv_tokens, h_k, _ = key.shape
     d_v = value.shape[2]
@@ -296,13 +385,9 @@ def tokenspeed_mla_prefill(
     out_torch_dtype = torch.bfloat16
     out_cutlass_dtype = cutlass.BFloat16
 
-    # Q and KV may have different cum_seq_lens and max_seq_len.
+    # Length values are read from the cumulative vectors in the kernel.
     cum_seq_lens_kv = cum_seq_lens
     max_seq_len_kv = max_seq_len
-    if cum_seq_lens_q is None:
-        cum_seq_lens_q = cum_seq_lens_kv
-    if max_seq_len_q is None:
-        max_seq_len_q = max_seq_len_kv
 
     global _call_count
     _call_count += 1
@@ -323,10 +408,6 @@ def tokenspeed_mla_prefill(
     k_5d = key.reshape(1, total_kv_tokens, h_k, 1, d_qk)
     v_5d = value.reshape(1, total_kv_tokens, h_k, 1, d_v)
 
-    q_ct = _to_cute(q_5d, cutlass_dtype)
-    k_ct = _to_cute(k_5d, cutlass_dtype)
-    v_ct = _to_cute(v_5d, cutlass_dtype)
-
     # Output: BF16, same 5D layout. The kernel writes (out=0, lse=-inf) for
     # rows in batches where seqlen_k==0, so no pre-init is required.
     if out is None:
@@ -343,30 +424,37 @@ def tokenspeed_mla_prefill(
             raise ValueError(f"out device {out.device} must match query {query.device}")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
+        if out.numel() and out.data_ptr() % 16:
+            raise ValueError("out must be 16-byte aligned")
         o_torch = out
     o_5d = o_torch.view(1, total_q_tokens, h_k, h_r, d_v)
-    o_ct = _to_cute(o_5d, out_cutlass_dtype)
-
-    # Cumulative sequence lengths.
-    # Keep backing tensors alive until after kernel launch.
-    cum_q_ct, _cum_q_backing = _to_cute_1d(cum_seq_lens_q)
-    cum_k_ct, _cum_k_backing = _to_cute_1d(cum_seq_lens_kv)
-
     if return_lse:
         lse_torch = torch.empty(
             (total_q_tokens, h_q),
             dtype=torch.float32,
             device=query.device,
         )
-        lse_ct = _to_cute(lse_torch, cutlass.Float32)
     else:
         lse_torch = None
-        lse_ct = None
+
+    if total_q_tokens == 0:
+        return (o_torch, lse_torch) if return_lse else o_torch
+
+    q_ct = _to_cute(q_5d, cutlass_dtype)
+    k_ct = _to_cute(k_5d, cutlass_dtype)
+    v_ct = _to_cute(v_5d, cutlass_dtype)
+    o_ct = _to_cute(o_5d, out_cutlass_dtype)
+    lse_ct = _to_cute(lse_torch, cutlass.Float32) if return_lse else None
+    # Keep converted cumulative-vector storage alive through launch.
+    cum_q_ct, _cum_q_backing = _to_cute_1d(cum_seq_lens_q, query.device)
+    cum_k_ct, _cum_k_backing = _to_cute_1d(cum_seq_lens_kv, query.device)
 
     # Cache by static config — all shapes are symbolic at compile time, but
     # ``enable_pdl`` and ``enable_ex2_emulation`` flip constexpr paths inside
     # the kernel and produce different SASS, hence keying on both.
-    enable_ex2_emulation = _enable_ex2_emulation()
+    device_index = query.device.index
+    compute_capability = torch.cuda.get_device_capability(query.device)
+    enable_ex2_emulation = _enable_ex2_emulation(compute_capability)
     config = (
         q_dtype,
         d_qk,
@@ -375,17 +463,21 @@ def tokenspeed_mla_prefill(
         return_lse,
         enable_pdl,
         enable_ex2_emulation,
+        compute_capability,
+        device_index,
     )
     if config not in _compiled_kernels:
-        _compiled_kernels[config] = _compile_prefill_kernel(
-            q_dtype,
-            d_qk,
-            d_v,
-            is_causal,
-            return_lse,
-            use_pdl=enable_pdl,
-            enable_ex2_emulation=enable_ex2_emulation,
-        )
+        with torch.cuda.device(query.device):
+            _compiled_kernels[config] = _compile_prefill_kernel(
+                q_dtype,
+                d_qk,
+                d_v,
+                is_causal,
+                return_lse,
+                use_pdl=enable_pdl,
+                enable_ex2_emulation=enable_ex2_emulation,
+                compute_capability=compute_capability,
+            )
     compiled_kernel = _compiled_kernels[config]
 
     scale_softmax_log2 = softmax_scale * LOG2_E
@@ -406,7 +498,7 @@ def tokenspeed_mla_prefill(
     # TVM FFI env stream must be set to PyTorch's current stream.
     import tvm_ffi
 
-    with tvm_ffi.use_torch_stream():
+    with torch.cuda.device(query.device), tvm_ffi.use_torch_stream():
         compiled_kernel(
             q_ct,
             k_ct,
