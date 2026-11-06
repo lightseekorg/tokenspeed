@@ -71,9 +71,7 @@ def _staging_executor(shifted_ids: torch.Tensor, vocab: int):
     executor_module.is_pin_memory_available = lambda: False
     executor = object.__new__(executor_module.ModelExecutor)
     executor.device = "cpu"
-    executor.runtime_states = SimpleNamespace(
-        input_vocab_size=vocab, output_vocab_size=vocab
-    )
+    executor.runtime_states = SimpleNamespace(vocab_size=vocab, output_vocab_size=vocab)
     executor.config = SimpleNamespace(input_logprob_chunk_tokens=2)
     executor.input_buffers = SimpleNamespace(shifted_prefill_ids_buf=shifted_ids)
     executor.nan_guard = NanGuard(max_bs=8, device="cpu")

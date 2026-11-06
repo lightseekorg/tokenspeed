@@ -65,14 +65,18 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
-        input_vocab_size: int,
-        output_vocab_size: int,
+        vocab_size: int,
         output_length: int,
         device: str = "cuda",
+        *,
+        output_vocab_size: int | None = None,
     ):
         self.device = device
-        self.input_vocab_size = input_vocab_size
-        self.output_vocab_size = output_vocab_size
+        self.vocab_size = vocab_size
+        # An omitted head size preserves the existing shared vocabulary.
+        self.output_vocab_size = (
+            vocab_size if output_vocab_size is None else output_vocab_size
+        )
         self.ngram_accepted_tokens: torch.Tensor | None = None
         self.ngram_needs_seed: torch.Tensor | None = None
         self.ngram_request_ids: list[str | None] = []

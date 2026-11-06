@@ -1257,7 +1257,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
     LoopConfig {
         in_flight_depth,
         limits: IngressLimits {
-            output_vocab_size: 100_000,
+            vocab_size: 100_000,
             eos_token_ids: Vec::new(),
             top_k_exclusive_max: Some(ts_control::sampling::TOP_K_FUSED_MAX),
             max_model_len: setup.context_limit.unwrap_or(4096),

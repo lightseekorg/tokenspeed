@@ -388,7 +388,7 @@ class HostConfig:
         engine_index: The engine identity this rank registers as.
         ready_response: The msgpack-encoded ``WireEngineCoreReadyResponse``.
         in_flight_depth: Dispatched forwards that may await commit.
-        output_vocab_size: Token ids represented by the output head.
+        vocab_size: Token ids represented by the output head.
         eos_token_ids: The model's EOS ids.
         top_k_exclusive_max: The selected sampler's admission bound; None
             when the backend normalizes every positive finite top_k.
@@ -474,7 +474,7 @@ class HostConfig:
     engine_index: int
     ready_response: bytes
     in_flight_depth: int
-    output_vocab_size: int
+    vocab_size: int
     eos_token_ids: tuple[int, ...]
     top_k_exclusive_max: int | None
     max_model_len: int
@@ -1319,7 +1319,7 @@ class HostBootstrap:
                 in_flight_depth=(
                     mapping.pp_size if mapping.has_pp else overlap_schedule_depth
                 ),
-                output_vocab_size=model_config.output_vocab_size,
+                vocab_size=model_config.output_vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
                 top_k_exclusive_max=get_sampling_backend_class(
                     server_args

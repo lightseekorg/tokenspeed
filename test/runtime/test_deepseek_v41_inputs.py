@@ -152,11 +152,7 @@ def buffers(request, monkeypatch):
     )
     ib.init_ngram_buffers(3, _hash_params(ib.device), VOCAB_SIZE)
     runtime = RuntimeStates(
-        req_pool_size=5,
-        input_vocab_size=VOCAB_SIZE,
-        output_vocab_size=VOCAB_SIZE,
-        output_length=1,
-        device=device,
+        req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=1, device=device
     )
     runtime.init_ngram_state(3)
     return ib, runtime
@@ -517,11 +513,7 @@ def test_the_buffers_validate_the_windows_and_the_config_their_width(buffers):
 
 def _spec_runtime(ib, width):
     runtime = RuntimeStates(
-        req_pool_size=5,
-        input_vocab_size=VOCAB_SIZE,
-        output_vocab_size=VOCAB_SIZE,
-        output_length=width,
-        device=ib.device,
+        req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=width, device=ib.device
     )
     runtime.init_ngram_state(3)
     return runtime
@@ -818,8 +810,7 @@ def test_executor_input_capacity_covers_decode_capture(
         max_req_pool_size=5,
         pp_size=pp_size,
         overlap_schedule_depth=depth,
-        input_vocab_size=VOCAB_SIZE,
-        output_vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
         output_length=width,
         enable_nan_detection=False,
         enable_speculative_sampling=False,
@@ -1383,7 +1374,7 @@ def test_input_only_tokens_survive_prefill_decode_and_ngram_preparation(buffers)
     ib, _ = buffers
     runtime = RuntimeStates(
         req_pool_size=5,
-        input_vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
         output_vocab_size=64,
         output_length=1,
         device=ib.device,

@@ -103,6 +103,8 @@ def test_invalid_vocabulary_is_rejected(tmp_path, size, domain):
 
 
 def test_executor_config_keeps_both_vocabularies(tmp_path):
+    from dataclasses import asdict
+
     import torch
 
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
@@ -130,8 +132,43 @@ def test_executor_config_keeps_both_vocabularies(tmp_path):
         global_rank=0,
         prefix_granularity=1,
     )
-    assert executor.input_vocab_size == 128
+    assert executor.vocab_size == 128
     assert executor.output_vocab_size == 64
+
+    # Existing callers construct the config with one vocabulary size.
+    legacy_args = asdict(executor)
+    legacy_args.pop("output_vocab_size")
+    legacy = ModelExecutorConfig(**legacy_args)
+    assert legacy.vocab_size == legacy.output_vocab_size == 128
+    explicit_none = ModelExecutorConfig(**legacy_args, output_vocab_size=None)
+    assert explicit_none.vocab_size == explicit_none.output_vocab_size == 128
+
+
+@pytest.mark.parametrize("use_keywords", [False, True])
+@pytest.mark.parametrize(
+    "output_fields", [{}, {"output_vocab_size": None}, {"output_vocab_size": 64}]
+)
+def test_runtime_states_preserves_existing_constructor(use_keywords, output_fields):
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+
+    if use_keywords:
+        states = RuntimeStates(
+            req_pool_size=2,
+            vocab_size=128,
+            output_length=1,
+            device="cpu",
+            **output_fields,
+        )
+    else:
+        states = RuntimeStates(2, 128, 1, "cpu", **output_fields)
+    states.init_draft_probs(spec_num_tokens=2, reject_threshold=2.0)
+    assert states.vocab_size == 128
+    assert states.future_input_map.shape == (3, 1)
+    assert states.draft_probs.shape == (
+        3,
+        2,
+        output_fields.get("output_vocab_size") or 128,
+    )
 
 
 def test_draft_media_substitute_uses_input_vocabulary(tmp_path):

@@ -398,7 +398,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
     let config = LoopConfig {
         in_flight_depth: 1,
         limits: IngressLimits {
-            output_vocab_size: 1 << 17,
+            vocab_size: 1 << 17,
             eos_token_ids: vec![2],
             top_k_exclusive_max: Some(ts_control::sampling::TOP_K_FUSED_MAX),
             max_model_len: 1 << 24,

@@ -41,7 +41,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct IngressLimits {
     /// Token ids represented by the output head.
-    pub output_vocab_size: i64,
+    pub vocab_size: i64,
     /// The model's EOS ids, which end every request not ignoring EOS.
     pub eos_token_ids: Vec<i32>,
     /// The selected sampler's exclusive finite top-k bound; `None` when
@@ -96,7 +96,7 @@ impl LogprobServability {
         &self,
         input_ids: &[i32],
         has_multimodal_inputs: bool,
-        output_vocab_size: i64,
+        vocab_size: i64,
     ) -> Option<String> {
         if !self.supports_prompt_logprobs {
             return Some(
@@ -115,11 +115,11 @@ impl LogprobServability {
         }
         let outside = input_ids
             .iter()
-            .any(|&id| id < 0 || i64::from(id) >= output_vocab_size);
+            .any(|&id| id < 0 || i64::from(id) >= vocab_size);
         outside.then(|| {
             format!(
                 "prompt logprobs need every prompt token id inside the vocabulary \
-                 [0, {output_vocab_size}); input_ids contains one outside it."
+                 [0, {vocab_size}); input_ids contains one outside it."
             )
         })
     }
@@ -516,7 +516,7 @@ fn refusal(
             if let Some(reason) = limits.logprobs.prompt_logprobs_refusal(
                 input_ids,
                 request.has_multimodal_inputs,
-                limits.output_vocab_size,
+                limits.vocab_size,
             ) {
                 return Some(reason);
             }
@@ -544,7 +544,7 @@ fn refusal(
                 .to_owned(),
         );
     }
-    sampling::verify_with_top_k_limit(params, limits.output_vocab_size, limits.top_k_exclusive_max).err()
+    sampling::verify_with_top_k_limit(params, limits.vocab_size, limits.top_k_exclusive_max).err()
 }
 
 /// More stop tokens than the sampler's stop table holds.
@@ -576,7 +576,7 @@ mod tests {
 
     fn limits() -> IngressLimits {
         IngressLimits {
-            output_vocab_size: 1000,
+            vocab_size: 1000,
             eos_token_ids: vec![2],
             top_k_exclusive_max: Some(sampling::TOP_K_FUSED_MAX),
             max_model_len: 100,
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn input_only_tokens_are_not_output_logprob_targets() {
         let limits = IngressLimits {
-            output_vocab_size: 64,
+            vocab_size: 64,
             enable_output_logprobs: true,
             ..limits()
         };

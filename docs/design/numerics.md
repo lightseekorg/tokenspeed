@@ -9,12 +9,15 @@ The legacy `ModelConfig.vocab_size` alias retains the input meaning, as does
 the original Hugging Face config. A model with a smaller head must construct
 its head and logits processor for that output size.
 
-`ModelExecutorConfig` and `RuntimeStates` carry both sizes explicitly. Input
-buffer clamps, n-gram preparation and multimodal draft substitutions use the
-input size. Sampling, draft probability tensors, grammar masks, output-token
-validation and selected-token logprobs use the output size. The host's ingress
-also uses the output size to validate logit bias and prompt-logprob targets:
-an input-only token can be embedded, but cannot be scored by the output head.
+`ModelExecutorConfig` and `RuntimeStates` keep their existing `vocab_size`
+field and positional arguments for the input vocabulary. Their new
+`output_vocab_size` argument is keyword-only; omitting it keeps the shared
+vocabulary. Input buffer clamps, n-gram preparation and multimodal draft
+substitutions continue using the input size. Sampling, draft probability
+tensors, grammar masks, output-token validation and selected-token logprobs
+use the output size. The host passes that size through its existing
+`vocab_size` field, preserving the Python/native host interface. An input-only
+token can be embedded, but cannot be scored by the output head.
 Model-specific relationships between input, text/hash and output vocabularies
 belong in the model or plugin config, not in the common runtime.
 

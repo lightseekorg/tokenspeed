@@ -60,7 +60,7 @@ def _staging_executor(monkeypatch, *, shifted_ids: list[int], vocab_size: int = 
     executor = object.__new__(executor_module.ModelExecutor)
     executor.device = "cpu"
     executor.runtime_states = SimpleNamespace(
-        input_vocab_size=vocab_size, output_vocab_size=vocab_size
+        vocab_size=vocab_size, output_vocab_size=vocab_size
     )
     executor.config = SimpleNamespace(input_logprob_chunk_tokens=3)
     executor.input_buffers = SimpleNamespace(

@@ -23,7 +23,7 @@ from __future__ import annotations
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -371,8 +371,7 @@ class ModelExecutorConfig:
     prefix_granularity: int
     max_num_seqs: int
     chunked_prefill_size: int
-    input_vocab_size: int
-    output_vocab_size: int
+    vocab_size: int
     # Logical context limit (user semantics: input validation, max_new_tokens
     # folding, stop checks all key off this).
     context_len: int
@@ -466,6 +465,14 @@ class ModelExecutorConfig:
     # (--enable-state-checkpoint-in-forward).
     state_checkpoint_in_forward: bool = False
 
+    # The optional head size does not shift any existing positional arguments.
+    # Omitting it retains the shared input/output vocabulary.
+    output_vocab_size: int | None = field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        if self.output_vocab_size is None:
+            self.output_vocab_size = self.vocab_size
+
     @property
     def spec_draft_tree(self) -> bool:
         """Drafts go through the draft-tree path: topk > 1, or EAGLE-Harness chains."""
@@ -509,7 +516,7 @@ class ModelExecutorConfig:
             prefix_granularity=prefix_granularity,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
-            input_vocab_size=model_config.input_vocab_size,
+            vocab_size=model_config.vocab_size,
             output_vocab_size=model_config.output_vocab_size,
             context_len=model_config.context_len,
             physical_context_len=(
@@ -634,11 +641,11 @@ class ModelExecutor:
         self.input_buffers.init_ngram_buffers(
             ngram_context,
             model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
-            config.input_vocab_size,
+            config.vocab_size,
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
-            input_vocab_size=config.input_vocab_size,
+            vocab_size=config.vocab_size,
             output_vocab_size=config.output_vocab_size,
             device=self.device,
             output_length=config.output_length,
