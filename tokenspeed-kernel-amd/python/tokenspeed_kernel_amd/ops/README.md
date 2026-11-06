@@ -1414,7 +1414,7 @@ to `mha_decode_with_kvcache`, which then selects
   fewest whose work items fit 512 (two per CU), at least 2 and at most 128
   splits per request; a padding request takes one. The grid holds at most
   max(512, one per row block) items; positions past the last item exit.
-- A work-group finds its request by comparing its slot with 64 requests' first
+- A workgroup finds its request by comparing its slot with 64 requests' first
   slots per round of vector loads, and items run in XCD-contiguous order
   (`_remap_xcd`), so the row blocks of a slot, which read the same pages, share
   one XCD's L2. Splits are bounded by the live `cache_seqlens` and a request's
@@ -1426,10 +1426,10 @@ to `mha_decode_with_kvcache`, which then selects
   count, stored next to each other, and loads them 16 bytes per lane in one
   tile of 16 or 64 splits. A row without keys merges to its sink alone.
 - The choice is by shape only: calls whose rows of one KV head take a
-  multi-wave work-group (e.g. speculative verify) take the schedule. There it
+  multi-wave workgroup (e.g. speculative verify) take the schedule. There it
   matched or beat the split grid at every batch (1-64 requests) and length
   (8k-190k, uniform and mixed) measured on MI355X, counting the 4-7 us
-  schedule once per step; one-wave work-groups (plain decode) lost up to
+  schedule once per step; one-wave workgroups (plain decode) lost up to
   ~20% on uniform batches of 4 or more requests and keep the split grid.
   Batch sizes and lengths are runtime values: the kernels compile once per
   layer shape.
