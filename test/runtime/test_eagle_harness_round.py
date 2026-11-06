@@ -205,7 +205,8 @@ class _DraftModel:
     def __init__(self, mapping: Mapping) -> None:
         self.config = LlamaConfig(vocab_size=VOCAB, hidden_size=HIDDEN)
         self.logits_processor = Eagle4CandidateLogitsProcessor(
-            self.config.vocab_size,
+            self.config,
+            vocab_size=self.config.vocab_size,
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,

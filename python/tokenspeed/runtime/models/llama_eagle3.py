@@ -581,23 +581,23 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[LlamaConfig],
+        init_config: ModelInitConfig[LlamaConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
 
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         nn.Module.__init__(self)
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
 
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
 
-        self.model = self.resolve_model(hf_config, mapping, quant_config, prefix)
+        self.model = self.resolve_model(config, mapping, quant_config, prefix)
 
         self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
@@ -608,14 +608,14 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
                 )
             self.lm_head = self.model.embed_tokens
         else:
-            if getattr(hf_config, "draft_vocab_size", None) is None:
+            if getattr(config, "draft_vocab_size", None) is None:
                 self.load_lm_head_from_target = True
             # The draft's head follows the target's LM-head layout
             # (mapping.lm_head): the shared target head arrives in that
             # layout, and a draft-vocab head shards the same way.
             self.lm_head = ParallelLMHead(
                 self.vocabulary.output_size,
-                hf_config.hidden_size,
+                config.hidden_size,
                 quant_config=quant_config,
                 tp_rank=mapping.lm_head.tp_rank,
                 tp_size=mapping.lm_head.tp_size,
@@ -624,16 +624,14 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             )
 
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
-            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None

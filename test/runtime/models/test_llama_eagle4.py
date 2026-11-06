@@ -28,12 +28,12 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from test.runtime.conftest import model_init_config
 
 import pytest
 import torch
 from transformers import LlamaConfig
 
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(
@@ -87,10 +87,7 @@ def _build_model(
     try:
         with torch.device(device):
             return LlamaForCausalLMEagle4(
-                ModelInitConfig(
-                    hf_config=config,
-                    vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-                ),
+                model_init_config(config, is_draft=True),
                 mapping,
             )
     finally:

@@ -167,7 +167,7 @@ def _initialize_model(
         extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
     return model_class(
-        config=ModelInitConfig(
+        init_config=ModelInitConfig(
             hf_config=model_config.hf_config, vocabulary=model_config.vocabulary
         ),
         mapping=mapping,

@@ -282,14 +282,14 @@ def test_model_profile_owns_checkpoint_vocabulary_meaning(tmp_path, monkeypatch)
     vocabulary = VocabularySpec(input_size=256, output_size=64)
 
     class ProfiledVocabularyModel(torch.nn.Module):
-        def __init__(self, config: ModelInitConfig, mapping, quant_config):
+        def __init__(self, init_config: ModelInitConfig, mapping, quant_config):
             super().__init__()
-            self.vocabulary = config.vocabulary
+            self.vocabulary = init_config.vocabulary
             self.embedding = torch.nn.Embedding(
-                config.vocabulary.input_size, config.hf_config.hidden_size
+                init_config.vocabulary.input_size, init_config.hf_config.hidden_size
             )
             self.head = torch.nn.Linear(
-                config.hf_config.hidden_size, config.vocabulary.output_size
+                init_config.hf_config.hidden_size, init_config.vocabulary.output_size
             )
 
         def forward(self, input_ids):

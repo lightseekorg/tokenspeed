@@ -50,22 +50,22 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: ModelInitConfig[Any],
+        init_config: ModelInitConfig[Any],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
         self.is_multimodal_active = is_multimodal_active
 
-        thinker_config = getattr(hf_config, "thinker_config", hf_config)
+        thinker_config = getattr(config, "thinker_config", config)
         self.thinker_config = thinker_config
         text_config = thinker_config.text_config
         audio_config = getattr(thinker_config, "audio_config", None)
@@ -81,7 +81,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         # nesting it under this attribute yields the desired runtime parameter
         # names (language_model.model.*, language_model.lm_head.*).
         self.language_model = Qwen3ForCausalLM(
-            config.with_hf_config(text_config),
+            init_config.with_hf_config(text_config),
             mapping=mapping,
             quant_config=quant_config,
         )

@@ -414,28 +414,28 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
+        config = init_config.hf_config
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
         )
         dtype = self.fc.weight.dtype
         self.input_embedding_scale = float(
-            _dflash2_config_value(hf_config, "input_embedding_scale", 1.0)
+            _dflash2_config_value(config, "input_embedding_scale", 1.0)
         )
-        self.block_size = int(_dflash2_config_value(hf_config, "block_size"))
+        self.block_size = int(_dflash2_config_value(config, "block_size"))
         self.candidate_selector = CandidateSelector(
-            hidden_size=int(hf_config.hidden_size),
-            vocab_size=config.vocabulary.output_size,
-            rank=int(_dflash2_config_value(hf_config, "selector_rank")),
-            top_k=int(_dflash2_config_value(hf_config, "selector_top_k")),
+            hidden_size=int(config.hidden_size),
+            vocab_size=init_config.vocabulary.output_size,
+            rank=int(_dflash2_config_value(config, "selector_rank")),
+            top_k=int(_dflash2_config_value(config, "selector_top_k")),
             params_dtype=dtype,
             prefix=add_prefix("candidate_selector", prefix),
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
@@ -13,8 +14,6 @@ from tokenspeed.runtime.configs.model_config import (
     _resolve_attention_family,
     is_multimodal_model,
 )
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.mlp import GatedMLP
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
@@ -126,12 +125,7 @@ def _build_model(
     try:
         with torch.device("meta"):
             return MiniMaxM3SparseForConditionalGeneration(
-                ModelInitConfig(
-                    hf_config=_tiny_config(),
-                    vocabulary=VocabularySpec.from_hf_config(
-                        _tiny_config(), is_draft=False
-                    ),
-                ),
+                model_init_config(_tiny_config(), is_draft=False),
                 mapping,
                 quant_config=quant_config,
                 is_multimodal_active=is_multimodal_active,
@@ -455,10 +449,7 @@ def test_minimax_m3_dspark_draft_layout_and_checkpoint_names() -> None:
         dspark_config={"markov_rank": 8, "markov_head_type": "vanilla"},
     )
     model = DSparkMiniMaxDraftModel(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-        ),
+        model_init_config(config, is_draft=True),
         Mapping(rank=0, world_size=1),
     )
     attn = model.layers[0].self_attn

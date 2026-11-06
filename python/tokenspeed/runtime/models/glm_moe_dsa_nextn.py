@@ -150,17 +150,17 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[PretrainedConfig],
+        init_config: ModelInitConfig[PretrainedConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         nn.Module.__init__(self)
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         self.index_share_for_mtp_iteration = bool(
-            getattr(hf_config, "index_share_for_mtp_iteration", False)
+            getattr(config, "index_share_for_mtp_iteration", False)
         )
         self._init_indexer_pairing_state()
         # ``q_a_proj`` / ``kv_a_proj_with_mqa`` checkpoint tensors waiting for
@@ -175,35 +175,33 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         self.quant_config = quant_config
 
         self.model = GlmMoeDsaModelNextN(
-            hf_config, mapping=self.mapping, quant_config=quant_config
+            config, mapping=self.mapping, quant_config=quant_config
         )
 
         if self.mapping.attn.has_dp:
             self.lm_head = ReplicatedLinear(
-                hf_config.hidden_size,
+                config.hidden_size,
                 self.vocabulary.output_size,
                 bias=False,
             )
         else:
             self.lm_head = ParallelLMHead(
                 self.vocabulary.output_size,
-                hf_config.hidden_size,
+                config.hidden_size,
                 quant_config=quant_config,
                 tp_rank=self.mapping.attn.tp_rank,
                 tp_size=self.mapping.attn.tp_size,
                 tp_group=self.mapping.attn.tp_group,
             )
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     prepare_dsa_topk_for_mtp_decode = staticmethod(_prepare_dsa_topk_for_mtp_decode)

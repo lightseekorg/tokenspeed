@@ -1,6 +1,7 @@
 """Unit tests for the shared Qwen3-ASR/Qwen3-Omni audio tower."""
 
 import json
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
@@ -201,10 +202,7 @@ def test_tiny_asr_wrapper_loads_audio_and_language_roots():
     )
     with torch.device("cuda"):
         model = Qwen3ASRForConditionalGeneration(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-            ),
+            model_init_config(config, is_draft=False),
             Mapping(rank=0, world_size=1),
             mm_attention_backend="triton_attn",
         ).eval()

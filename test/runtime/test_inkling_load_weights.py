@@ -14,12 +14,10 @@ exact-placement asserts and make the TP/EP slice tests single-process.
 
 import os
 import sys
+from test.runtime.conftest import model_init_config
 
 import pytest
 import torch
-
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test.runtime.models.inkling_fixtures import (  # noqa: E402
@@ -59,10 +57,7 @@ def _build_model(config, quant_config=None, rank=0, world_size=1, **mapping_kw):
         torch.set_default_dtype(torch.bfloat16)
         try:
             model = InklingForConditionalGeneration(
-                ModelInitConfig(
-                    hf_config=config,
-                    vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-                ),
+                model_init_config(config, is_draft=False),
                 mapping,
                 quant_config=quant_config,
             )

@@ -20,14 +20,13 @@
 
 """Beam's packed Quark MXFP4 admission, loading and precision policy."""
 
+from test.runtime.conftest import model_init_config
 from test.runtime.models.beam_fixture import tiny_config, tiny_weights
 from test.runtime.models.test_beam_amd_fp8 import amd_platform  # noqa: F401
 
 import pytest
 import torch
 
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
@@ -104,10 +103,7 @@ def test_beam_mxfp4_keeps_packed_experts_and_bf16_dense_weights(
             (rows, width // 32), 120, dtype=torch.uint8
         )
     model = BeamForCausalLM(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-        ),
+        model_init_config(config, is_draft=False),
         Mapping(rank=rank, world_size=world, moe_ep_size=ep),
         mxfp4_config(),
     )
@@ -200,10 +196,7 @@ def test_beam_mxfp4_refuses_unqualified_backends(server, amd_platform, backend):
     mapping = Mapping(rank=0, world_size=4)
     with pytest.raises(NoKernelFoundError):
         BeamForCausalLM(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-            ),
+            model_init_config(config, is_draft=False),
             mapping,
             mxfp4_config(),
         )

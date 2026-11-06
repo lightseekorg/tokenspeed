@@ -1701,33 +1701,33 @@ class Glm53FlashForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: ModelInitConfig[Glm53FlashConfig],
+        init_config: ModelInitConfig[Glm53FlashConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
         self.is_multimodal_active = is_multimodal_active
-        encoder_only = hasattr(hf_config, "encoder_only") and hf_config.encoder_only
+        encoder_only = hasattr(config, "encoder_only") and config.encoder_only
         self.language_model = (
             None
             if encoder_only
             else Glm53FlashForCausalLM(
-                config.with_hf_config(hf_config.text_config),
+                init_config.with_hf_config(config.text_config),
                 mapping=mapping,
                 quant_config=quant_config,
             )
         )
         if is_multimodal_active:
             self.vision = Glm53FlashVision(
-                hf_config.vision_config,
+                config.vision_config,
                 mapping,
                 prefix=add_prefix("visual", prefix),
                 mm_attention_backend=mm_attention_backend,

@@ -1518,7 +1518,7 @@ class InklingForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: ModelInitConfig[InklingMMConfig],
+        init_config: ModelInitConfig[InklingMMConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -1526,14 +1526,14 @@ class InklingForConditionalGeneration(nn.Module):
         mm_attention_backend: str | None = None,
     ):
         # Towers are attention-free; the knob is just a VLM-wrapper interface requirement.
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         del mm_attention_backend
         super().__init__()
 
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
-        text_config = hf_config.get_text_config()
+        text_config = config.get_text_config()
         self.text_config = text_config
         _translate_quant_exclusions(quant_config)
         if (
@@ -1555,29 +1555,27 @@ class InklingForConditionalGeneration(nn.Module):
         # Tower presence is a checkpoint fact; --language-model-only turns them off at runtime.
         self.is_multimodal_active = is_multimodal_active
         audio_enabled = (
-            is_multimodal_active and hf_config.audio_config.decoder_dmodel is not None
+            is_multimodal_active and config.audio_config.decoder_dmodel is not None
         )
         vision_enabled = (
-            is_multimodal_active and hf_config.vision_config.decoder_dmodel is not None
+            is_multimodal_active and config.vision_config.decoder_dmodel is not None
         )
         if audio_enabled:
             assert (
-                hf_config.audio_config.decoder_dmodel == text_config.hidden_size
+                config.audio_config.decoder_dmodel == text_config.hidden_size
             ), "audio decoder_dmodel must match the text hidden size"
         if vision_enabled:
             assert (
-                hf_config.vision_config.decoder_dmodel == text_config.hidden_size
+                config.vision_config.decoder_dmodel == text_config.hidden_size
             ), "vision decoder_dmodel must match the text hidden size"
         self.audio = (
-            InklingAudioTower(
-                hf_config.audio_config, prefix=add_prefix("audio", prefix)
-            )
+            InklingAudioTower(config.audio_config, prefix=add_prefix("audio", prefix))
             if audio_enabled
             else None
         )
         self.visual = (
             InklingVisionTower(
-                hf_config.vision_config, prefix=add_prefix("visual", prefix)
+                config.vision_config, prefix=add_prefix("visual", prefix)
             )
             if vision_enabled
             else None
@@ -1602,17 +1600,13 @@ class InklingForConditionalGeneration(nn.Module):
         )
         # All-gather vocab-sharded logits before sampling; do_argmax would bypass the pad masking below.
         self.logits_processor = _InklingLogitsProcessor(
-            self.vocabulary.output_size,
+            text_config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(
-                text_config, "final_logit_softcapping", None
-            ),
-            use_fused_lm_head=(getattr(text_config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(text_config, "tie_word_embeddings", False),
         )
 
     def get_input_embeddings(self):

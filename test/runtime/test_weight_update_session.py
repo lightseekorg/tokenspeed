@@ -32,6 +32,7 @@ chunks.
 
 from __future__ import annotations
 
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 from unittest import mock
 
@@ -77,7 +78,7 @@ class _TinyLM(BaseCausalLM):
 
     def __init__(self) -> None:
         super().__init__(
-            config=ModelInitConfig(
+            init_config=ModelInitConfig(
                 hf_config=SimpleNamespace(),
                 vocabulary=VocabularySpec(input_size=1, output_size=1),
             ),
@@ -458,10 +459,7 @@ def nextn() -> DeepseekV3ForCausalLMNextN:
     )
     with mock.patch.object(deepseek_nextn, "DeepseekModelNextN", _DraftModel):
         return DeepseekV3ForCausalLMNextN(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-            ),
+            model_init_config(config, is_draft=True),
             mapping,
             None,
         )

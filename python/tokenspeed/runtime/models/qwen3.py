@@ -348,12 +348,12 @@ class Qwen3ForCausalLM(BaseCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[Qwen3Config],
+        init_config: ModelInitConfig[Qwen3Config],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
         )

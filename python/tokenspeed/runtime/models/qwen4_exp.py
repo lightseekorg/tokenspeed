@@ -796,15 +796,15 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        text_config = getattr(hf_config, "text_config", hf_config)
+        config = init_config.hf_config
+        text_config = getattr(config, "text_config", config)
         super().__init__(
-            config.with_hf_config(text_config),
+            init_config.with_hf_config(text_config),
             mapping,
             quant_config,
             prefix,
@@ -836,7 +836,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     def __init__(
         self,
-        config: ModelInitConfig[Qwen4ExpConfig],
+        init_config: ModelInitConfig[Qwen4ExpConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -844,7 +844,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         mm_attention_backend: str | None = None,
     ) -> None:
         super().__init__(
-            config,
+            init_config,
             mapping,
             quant_config,
             prefix,

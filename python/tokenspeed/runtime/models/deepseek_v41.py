@@ -2744,19 +2744,19 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[DeepseekV41Config],
+        init_config: ModelInitConfig[DeepseekV41Config],
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
     ) -> None:
-        hf_config = config.hf_config
+        config = init_config.hf_config
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix="",
-            encoder_only=getattr(hf_config, "encoder_only", False),
+            encoder_only=getattr(config, "encoder_only", False),
         )
         self.is_multimodal_active = is_multimodal_active
         self._checkpoint_dir: str | None = None
@@ -2770,14 +2770,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 else torch.get_default_dtype()
             )
             with set_default_torch_dtype(dtype):
-                self.vision = DeepseekV41Vision(
-                    hf_config, mapping, mm_attention_backend
-                )
+                self.vision = DeepseekV41Vision(config, mapping, mm_attention_backend)
             if self.model is not None:
                 for layer in self.model.layers:
                     layer.ffn.gate.bias_vl = nn.Parameter(
                         torch.empty(
-                            hf_config.text_config.n_routed_experts, dtype=torch.float32
+                            config.text_config.n_routed_experts, dtype=torch.float32
                         ),
                         requires_grad=False,
                     )

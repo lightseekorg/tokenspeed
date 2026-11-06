@@ -162,14 +162,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[PretrainedConfig],
+        init_config: ModelInitConfig[PretrainedConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         nn.Module.__init__(self)
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         # ``q_a_proj`` / ``kv_a_proj_with_mqa`` checkpoint tensors waiting for
         # their partner before the fused projection is written. Kept on the
@@ -190,37 +190,35 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.quant_config = quant_config
 
         self.model = DeepseekModelNextN(
-            hf_config, mapping=self.mapping, quant_config=quant_config
+            config, mapping=self.mapping, quant_config=quant_config
         )
 
         # The draft shares the target's LM-head layout (mapping.lm_head):
         # replicated under attention DP unless --lm-head-tp-size shards it.
         if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
             self.lm_head = ReplicatedLinear(
-                hf_config.hidden_size,
+                config.hidden_size,
                 self.vocabulary.output_size,
                 bias=False,
             )
         else:
             self.lm_head = ParallelLMHead(
                 self.vocabulary.output_size,
-                hf_config.hidden_size,
+                config.hidden_size,
                 quant_config=quant_config,
                 tp_rank=self.mapping.lm_head.tp_rank,
                 tp_size=self.mapping.lm_head.tp_size,
                 tp_group=self.mapping.lm_head.tp_group,
             )
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
-            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     @torch.no_grad()

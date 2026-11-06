@@ -592,7 +592,7 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping,
         quant_config=None,
         prefix="",
@@ -600,7 +600,7 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
         is_multimodal_active=False,
         mm_attention_backend=None,
     ):
-        hf_config = config.hf_config
+        config = init_config.hf_config
         if is_multimodal_active:
             raise NotImplementedError(
                 "dots3-note encoders are not implemented; use --language-model-only"
@@ -613,15 +613,15 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
                 "dots3-note does not yet support attention head TP"
             )
         if (
-            not hf_config.apply_mla_qkv_lora_rescale
-            or hf_config.attention_gate_type != "headwise"
-            or hf_config.swa_attention_gate_type != "headwise"
-            or hf_config.attention_bias
-            or hf_config.rope_scaling is not None
+            not config.apply_mla_qkv_lora_rescale
+            or config.attention_gate_type != "headwise"
+            or config.swa_attention_gate_type != "headwise"
+            or config.attention_bias
+            or config.rope_scaling is not None
         ):
             raise ValueError("Unsupported dots3-note attention configuration")
         super().__init__(
-            config,
+            init_config,
             mapping,
             quant_config=quant_config,
             prefix=prefix,

@@ -1171,20 +1171,20 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[Qwen3_5Config],
+        init_config: ModelInitConfig[Qwen3_5Config],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
     ):
-        hf_config = config.hf_config
+        config = init_config.hf_config
         super().__init__(
-            config=config.with_hf_config(hf_config.text_config),
+            init_config=init_config.with_hf_config(config.text_config),
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
-            encoder_only=getattr(hf_config, "encoder_only", False),
+            encoder_only=getattr(config, "encoder_only", False),
         )
 
         rope_config = get_rope_parameters(self.config)
@@ -1199,9 +1199,9 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             self.video_encoder = None
         else:
             self.visual = Qwen3VLMoeVisionModel(
-                hf_config.vision_config,
+                config.vision_config,
                 quant_config=None,
-                norm_eps=getattr(hf_config, "rms_norm_eps", 1e-6),
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 mapping=mapping,
                 mm_attention_backend=mm_attention_backend,
@@ -1513,7 +1513,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     def __init__(
         self,
-        config: ModelInitConfig[Qwen3_5Config],
+        init_config: ModelInitConfig[Qwen3_5Config],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -1521,7 +1521,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         mm_attention_backend: str | None = None,
     ) -> None:
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
@@ -1654,18 +1654,18 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        if not hasattr(hf_config, "text_config"):
-            archs = list(getattr(hf_config, "architectures", None) or [])
-            hf_config = Qwen3_5MoeConfig(text_config=hf_config)
-            hf_config.__dict__["architectures"] = archs or ["Qwen3_5MoeForCausalLM"]
+        config = init_config.hf_config
+        if not hasattr(config, "text_config"):
+            archs = list(getattr(config, "architectures", None) or [])
+            config = Qwen3_5MoeConfig(text_config=config)
+            config.__dict__["architectures"] = archs or ["Qwen3_5MoeForCausalLM"]
         super().__init__(
-            config=config.with_hf_config(hf_config),
+            init_config=init_config.with_hf_config(config),
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,

@@ -302,27 +302,27 @@ class KimiK3NextNForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: ModelInitConfig[KimiLinearConfig],
+        init_config: ModelInitConfig[KimiLinearConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
         self.model = KimiK3ModelNextN(
-            hf_config, mapping, quant_config, prefix=add_prefix("model", prefix)
+            config, mapping, quant_config, prefix=add_prefix("model", prefix)
         )
         # The checkpoint ships a dedicated draft head (shared_head.head).
         from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
         from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 
         self.lm_head = ParallelLMHead(
-            config.vocabulary.output_size,
-            hf_config.hidden_size,
+            init_config.vocabulary.output_size,
+            config.hidden_size,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
@@ -332,16 +332,14 @@ class KimiK3NextNForCausalLM(nn.Module):
         # diverges and caps chain acceptance at whatever rank 0's vocab shard
         # happens to contain).
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
@@ -530,18 +528,18 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
-        text_config = getattr(hf_config, "text_config", None) or hf_config
-        self.config = hf_config
+        text_config = getattr(config, "text_config", None) or config
+        self.config = config
         self.language_model = KimiK3NextNForCausalLM(
-            config.with_hf_config(text_config),
+            init_config.with_hf_config(text_config),
             mapping,
             quant_config,
             prefix=prefix,

@@ -1476,12 +1476,12 @@ class BeamModel(BaseTransformerModel):
 
 class BeamLogitsProcessor(LogitsProcessor):
     def __init__(self, config: Any, mapping: Any, *, vocab_size: int) -> None:
+        projection_config = copy(config)
+        projection_config.final_logit_softcapping = None
         tp = mapping.attn
         super().__init__(
-            vocab_size,
-            final_logit_softcapping=None,
-            use_fused_lm_head=False,
-            tie_word_embeddings=False,
+            projection_config,
+            vocab_size=vocab_size,
             skip_all_gather=tp.has_dp,
             do_argmax=False,
             logit_scale=None,
@@ -1542,12 +1542,12 @@ class BeamForCausalLM(BaseCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[Any],
+        init_config: ModelInitConfig[Any],
         mapping: Any,
         quant_config: Any,
     ) -> None:
-        hf_config = config.hf_config
-        hf_config.validate()
+        config = init_config.hf_config
+        config.validate()
         # beam_quant_policy admits or refuses a quantized checkpoint.
         quant = None if quant_config is None else beam_quant_policy(quant_config)
         if (
@@ -1559,7 +1559,7 @@ class BeamForCausalLM(BaseCausalLM):
                 "--moe-backend flashinfer_trtllm (Beam's default on NVIDIA SM100 "
                 "to SM103 where it applies)"
             )
-        hf_config.validate_parallelism(
+        config.validate_parallelism(
             tensor_parallel_size=mapping.attn.tp_size, ep_size=mapping.moe.ep_size
         )
         if global_server_args_dict["ep_num_redundant_experts"]:
@@ -1580,7 +1580,7 @@ class BeamForCausalLM(BaseCausalLM):
         # or FP8 linears and FP8 experts.
         with set_default_torch_dtype(_CHECKPOINT_DTYPE):
             super().__init__(
-                config=config,
+                init_config=init_config,
                 mapping=mapping,
                 quant_config=quant_config,
                 prefix="",

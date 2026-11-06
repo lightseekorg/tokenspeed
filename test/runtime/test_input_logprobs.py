@@ -218,11 +218,9 @@ def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
     weight = torch.randint(-8, 9, (vocab, 4)).float() / 8
     rows, targets = [0, 1, 3], [5, 2, 3]
     processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=vocab),
         vocab_size=vocab,
         dp_lm_head_tp=False,
-        final_logit_softcapping=None,
-        use_fused_lm_head=False,
-        tie_word_embeddings=False,
     )
 
     def run(top_k):
@@ -282,11 +280,9 @@ def test_prompt_rows_and_sampled_rows_take_the_same_top_k_of_the_same_logits():
     hidden = (torch.randint(-16, 17, (num_rows, vocab)) / 4).to(torch.bfloat16)
     hidden[:, [3, 17, 40]] = 5.0
     processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=vocab),
         vocab_size=vocab,
         dp_lm_head_tp=False,
-        final_logit_softcapping=None,
-        use_fused_lm_head=False,
-        tie_word_embeddings=False,
     )
     out = processor(
         input_ids=None,

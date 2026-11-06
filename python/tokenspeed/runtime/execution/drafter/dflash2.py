@@ -97,16 +97,17 @@ class DFlash2(DFlash):
         # The target's LM-head layout, so a vocab-sharded head under attention
         # DP (--lm-head-tp-size) transposes its logits back the same way.
         self.candidate_logits_processor = LogitsProcessor(
-            self.logits_processor.vocab_size,
+            self.model.config,
+            vocab_size=self.logits_processor.vocab_size,
             skip_all_gather=self.logits_processor.skip_all_gather,
             logit_scale=self.output_multiplier,
             tp_rank=self.logits_processor.tp_rank,
             tp_size=self.logits_processor.tp_size,
             tp_group=self.logits_processor.tp_group,
             dp_lm_head_tp=self.logits_processor.dp_lm_head_tp,
-            final_logit_softcapping=(self.final_logit_softcapping or None),
-            use_fused_lm_head=False,
-            tie_word_embeddings=self.logits_processor.tie_word_embeddings,
+        )
+        self.candidate_logits_processor.final_logit_softcapping = (
+            self.final_logit_softcapping if self.final_logit_softcapping > 0 else None
         )
         processor = self.candidate_logits_processor
         self.candidate_topk = VocabParallelTopK(

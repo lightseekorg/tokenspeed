@@ -18,12 +18,10 @@ Blackwell runners alongside the other Inkling suites.
 
 import os
 import sys
+from test.runtime.conftest import model_init_config
 
 import pytest
 import torch
-
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test.runtime.models.inkling_fixtures import load_inkling_config  # noqa: E402
@@ -144,12 +142,7 @@ class TestInklingMTPLoadWeights:
             torch.set_default_dtype(torch.bfloat16)
             try:
                 cls.model = InklingForConditionalGenerationNextN(
-                    ModelInitConfig(
-                        hf_config=cls.config,
-                        vocabulary=VocabularySpec.from_hf_config(
-                            cls.config, is_draft=True
-                        ),
-                    ),
+                    model_init_config(cls.config, is_draft=True),
                     mapping,
                 )
             finally:
@@ -272,12 +265,7 @@ class TestInklingMTPLoadWeights:
             torch.set_default_dtype(torch.bfloat16)
             try:
                 model = InklingForConditionalGenerationNextN(
-                    ModelInitConfig(
-                        hf_config=self.config,
-                        vocabulary=VocabularySpec.from_hf_config(
-                            self.config, is_draft=True
-                        ),
-                    ),
+                    model_init_config(self.config, is_draft=True),
                     mapping,
                 )
             finally:
@@ -315,12 +303,7 @@ class TestInklingMTPLoadWeightsSWADepths:
             torch.set_default_dtype(torch.bfloat16)
             try:
                 cls.model = InklingForConditionalGenerationNextN(
-                    ModelInitConfig(
-                        hf_config=cls.config,
-                        vocabulary=VocabularySpec.from_hf_config(
-                            cls.config, is_draft=True
-                        ),
-                    ),
+                    model_init_config(cls.config, is_draft=True),
                     cls.mapping,
                 )
             finally:
@@ -393,10 +376,7 @@ class TestInklingMTPLoadWeightsSWADepths:
             torch.set_default_dtype(torch.bfloat16)
             try:
                 model = InklingForConditionalGenerationNextN(
-                    ModelInitConfig(
-                        hf_config=config,
-                        vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-                    ),
+                    model_init_config(config, is_draft=True),
                     self.mapping,
                 )
             finally:

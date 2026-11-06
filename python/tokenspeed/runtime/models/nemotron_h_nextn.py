@@ -88,19 +88,19 @@ class NemotronHForCausalLMNextN(nn.Module):
 
     def __init__(
         self,
-        config: ModelInitConfig[NemotronHConfig],
+        init_config: ModelInitConfig[NemotronHConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
         del prefix
         require_single_tp_group(mapping)
-        block_types = tuple(hf_config.mtp_layers_block_type)
+        block_types = tuple(config.mtp_layers_block_type)
         if (
-            hf_config.num_nextn_predict_layers != 1
+            config.num_nextn_predict_layers != 1
             or block_types[:1] != ("attention",)
             or block_types.count("attention") != 1
             or "mamba" in block_types
@@ -109,18 +109,18 @@ class NemotronHForCausalLMNextN(nn.Module):
             raise NotImplementedError(
                 "Nemotron-H MTP needs one predict layer that opens with its only "
                 "attention block and has no Mamba2 blocks, got "
-                f"{hf_config.num_nextn_predict_layers} of {block_types}"
+                f"{config.num_nextn_predict_layers} of {block_types}"
             )
         # An export that quantizes no MTP module (Nemotron 3 Super) left it in BF16.
         if quant_config is not None and not quant_config.quantizes_any("mtp."):
             quant_config = None
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         attn = mapping.attn
-        hidden = hf_config.hidden_size
-        eps = hf_config.layer_norm_epsilon
+        hidden = config.hidden_size
+        eps = config.layer_norm_epsilon
         self.embed_tokens = VocabParallelEmbedding(
-            hf_config.vocab_size,
+            config.vocab_size,
             hidden,
             tp_rank=attn.tp_rank,
             tp_size=attn.tp_size,
@@ -138,11 +138,11 @@ class NemotronHForCausalLMNextN(nn.Module):
         alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
             NemotronHBlock(
-                hf_config,
+                config,
                 mapping,
                 block_type,
                 0 if block_type == "attention" else None,
-                hf_config.num_hidden_layers + i,
+                config.num_hidden_layers + i,
                 quant_config,
                 f"mtp.layers.{i}",
                 alt_stream,
@@ -150,7 +150,7 @@ class NemotronHForCausalLMNextN(nn.Module):
             for i, block_type in enumerate(block_types)
         )
         self.final_layernorm = NemotronHNorm(
-            hidden, eps, mapping, hf_config.num_hidden_layers + len(block_types)
+            hidden, eps, mapping, config.num_hidden_layers + len(block_types)
         )
         self.lm_head = ParallelLMHead(
             self.vocabulary.output_size,
@@ -160,15 +160,13 @@ class NemotronHForCausalLMNextN(nn.Module):
             tp_group=attn.tp_group,
         )
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=False,
             tp_rank=attn.tp_rank,
             tp_size=attn.tp_size,
             tp_group=attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self) -> None:

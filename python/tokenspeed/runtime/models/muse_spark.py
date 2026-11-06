@@ -2474,19 +2474,19 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[MuseSparkConfig],
+        init_config: ModelInitConfig[MuseSparkConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
     ) -> None:
-        hf_config = config.hf_config
+        config = init_config.hf_config
         if mapping.pp_size > 1:
             raise ValueError(
                 "Muse Spark builds every layer on each rank; pp_size must be 1"
             )
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix="",
@@ -2506,17 +2506,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             return
 
         self.vision_tower = MuseSparkVisionTower(
-            raw_config=hf_config.vision_config,
-            out_hidden_size=hf_config.out_hidden_size,
-            projector_hidden_size=hf_config.projector_hidden_size,
+            raw_config=config.vision_config,
+            out_hidden_size=config.out_hidden_size,
+            projector_hidden_size=config.projector_hidden_size,
             mapping=mapping,
             prefix="vision_tower",
             mm_attention_backend=mm_attention_backend,
         )
         vision = mapping.vision
         self.vision_projection = RowParallelLinear(
-            input_size=hf_config.projector_hidden_size,
-            output_size=hf_config.hidden_size,
+            input_size=config.projector_hidden_size,
+            output_size=config.hidden_size,
             bias=False,
             input_is_parallel=False,
             skip_bias_add=False,
@@ -2529,7 +2529,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             reduce_results=True,
         )
         self.audio_tower = MuseSparkAudioTower.from_config(
-            hf_config.audio_config, hf_config.hidden_size
+            config.audio_config, config.hidden_size
         )
 
     def get_vision_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
@@ -2625,7 +2625,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
 
     def resolve_logits_processor(self, config: MuseSparkConfig) -> LogitsProcessor:
         return LogitsProcessor(
-            self.vocabulary.output_size,
+            config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=False,
             logit_scale=config.output_multiplier,
@@ -2633,9 +2634,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:

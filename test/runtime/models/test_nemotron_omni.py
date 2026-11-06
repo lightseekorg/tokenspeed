@@ -27,14 +27,12 @@ ViT on the same weights; Parakeet runs against transformers'
 
 import os
 import sys
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
-
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _TEST_DIR)
@@ -654,12 +652,7 @@ def test_mtp_draft_reads_the_language_model_mtp_tensors():
 
     with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
         draft = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN(
-            ModelInitConfig(
-                hf_config=_mtp_omni_config(),
-                vocabulary=VocabularySpec.from_hf_config(
-                    _mtp_omni_config(), is_draft=True
-                ),
-            ),
+            model_init_config(_mtp_omni_config(), is_draft=True),
             Mapping(rank=0, world_size=1),
         )
     names = [
@@ -685,20 +678,14 @@ def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
     mapping = Mapping(rank=0, world_size=1)
     with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
         target = nemotron_omni.NemotronH_Omni_Reasoning_V3(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-            ),
+            model_init_config(config, is_draft=False),
             mapping,
             None,
             is_multimodal_active=False,
             mm_attention_backend=None,
         )
         draft = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-            ),
+            model_init_config(config, is_draft=True),
             mapping,
         )
     scales = {

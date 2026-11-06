@@ -322,43 +322,43 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
-        eps = float(getattr(hf_config, "rms_norm_eps", 1e-6))
+        eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
-                    config=hf_config,
+                    config=config,
                     mapping=mapping,
                     layer_id=i,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{i}", prefix),
                 )
-                for i in range(int(hf_config.num_hidden_layers))
+                for i in range(int(config.num_hidden_layers))
             ]
         )
-        self.norm = RMSNorm(int(hf_config.hidden_size), eps=eps)
-        target_layer_ids = (getattr(hf_config, "dflash_config", {}) or {}).get(
+        self.norm = RMSNorm(int(config.hidden_size), eps=eps)
+        target_layer_ids = (getattr(config, "dflash_config", {}) or {}).get(
             "target_layer_ids"
-        ) or (getattr(hf_config, "target_layer_ids", None) or [])
+        ) or (getattr(config, "target_layer_ids", None) or [])
         self.num_context_features = len(target_layer_ids)
         self.fc = ReplicatedLinear(
-            self.num_context_features * int(hf_config.hidden_size),
-            int(hf_config.hidden_size),
+            self.num_context_features * int(config.hidden_size),
+            int(config.hidden_size),
             bias=False,
             prefix=add_prefix("fc", prefix),
         )
-        self.hidden_norm = RMSNorm(int(hf_config.hidden_size), eps=eps)
+        self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
         # Name the DFlash drafter reads off the draft model.
-        self.block_size = read_checkpoint_block_size(hf_config)
+        self.block_size = read_checkpoint_block_size(config)
         self._residual_buffer: torch.Tensor | None = None
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:

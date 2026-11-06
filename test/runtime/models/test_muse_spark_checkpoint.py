@@ -27,12 +27,10 @@ import json
 import os
 import sys
 from collections import Counter
+from test.runtime.conftest import model_init_config
 
 import pytest
 import torch
-
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -210,12 +208,7 @@ def test_every_checkpoint_tensor_fills_exactly_one_parameter() -> None:
     try:
         with torch.device("cuda"):
             model = MuseSparkForConditionalGeneration(
-                config=ModelInitConfig(
-                    hf_config=_narrow_config(raw),
-                    vocabulary=VocabularySpec.from_hf_config(
-                        _narrow_config(raw), is_draft=False
-                    ),
-                ),
+                init_config=model_init_config(_narrow_config(raw), is_draft=False),
                 mapping=_single_rank_mapping(),
                 quant_config=quant_config,
                 is_multimodal_active=True,

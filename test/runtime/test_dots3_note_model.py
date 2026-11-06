@@ -20,6 +20,7 @@
 
 """Dots-specific latent rescaling, routing precision and checkpoint loading."""
 
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
@@ -27,8 +28,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.models.dots3_note import (
     Dots3NoteAttention,
     Dots3NoteRouter,
@@ -347,10 +346,7 @@ def test_model_entry_accepts_text_only_loader_kwargs(monkeypatch):
     )
     mapping = SimpleNamespace(attn=SimpleNamespace(has_head_tp=False))
     Dots3NoteForCausalLM(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-        ),
+        model_init_config(config, is_draft=False),
         mapping,
         is_multimodal_active=False,
         mm_attention_backend=None,
@@ -358,10 +354,7 @@ def test_model_entry_accepts_text_only_loader_kwargs(monkeypatch):
     assert len(calls) == 1 and calls[0][0] == (config, mapping)
     with pytest.raises(NotImplementedError, match="language-model-only"):
         Dots3NoteForCausalLM(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-            ),
+            model_init_config(config, is_draft=False),
             mapping,
             is_multimodal_active=True,
             mm_attention_backend=None,

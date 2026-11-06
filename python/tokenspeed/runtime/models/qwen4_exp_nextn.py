@@ -176,31 +176,31 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
-        hf_config = copy.deepcopy(getattr(hf_config, "text_config", hf_config))
+        config = copy.deepcopy(getattr(config, "text_config", config))
         quant_config = _resolve_mtp_quant_config(quant_config)
-        hf_config.num_hidden_layers = 1
-        hf_config.layer_types = ["full_attention"]
-        hf_config.ple_layer_ids = []
-        self.config = hf_config
-        self.index_share_for_mtp_iteration = _mtp_index_sharing_enabled(hf_config)
+        config.num_hidden_layers = 1
+        config.layer_types = ["full_attention"]
+        config.ple_layer_ids = []
+        self.config = config
+        self.index_share_for_mtp_iteration = _mtp_index_sharing_enabled(config)
         self.mapping = mapping
         self.quant_config = quant_config
-        self.hidden_size = int(hf_config.hidden_size)
-        self.hc_count = int(hf_config.hc_count)
+        self.hidden_size = int(config.hidden_size)
+        self.hc_count = int(config.hc_count)
 
         self.pre_fc_norm_embedding = GemmaRMSNorm(
-            self.hidden_size, eps=hf_config.rms_norm_eps
+            self.hidden_size, eps=config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = GemmaRMSNorm(
-            self.hidden_size * self.hc_count, eps=hf_config.rms_norm_eps
+            self.hidden_size * self.hc_count, eps=config.rms_norm_eps
         )
         self.fc_embedding = ReplicatedLinear(
             self.hidden_size,
@@ -217,7 +217,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
             prefix=add_prefix("mtp.fc_hidden", prefix),
         )
         self.model = Qwen4ExpDraftModel(
-            hf_config,
+            config,
             mapping,
             quant_config,
             prefix=add_prefix("mtp", prefix),
@@ -225,23 +225,21 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         for indexer in self.model.qsa_indexers:
             indexer.share_topk_for_mtp_iteration = self.index_share_for_mtp_iteration
         self.lm_head = _build_mtp_lm_head(
-            hf_config,
+            config,
             mapping,
             quant_config,
             prefix,
-            output_vocab_size=config.vocabulary.output_size,
+            output_vocab_size=init_config.vocabulary.output_size,
         )
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
             do_argmax=True,
             dp_lm_head_tp=mapping.attn.has_dp and mapping.lm_head.has_tp,
-            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self):

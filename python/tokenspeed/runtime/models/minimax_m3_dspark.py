@@ -178,22 +178,20 @@ class DSparkMiniMaxDraftModel(DSparkDraftModel):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
+        config = init_config.hf_config
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
         )
-        self.norm = GemmaRMSNorm(hf_config.hidden_size, eps=hf_config.rms_norm_eps)
-        self.hidden_norm = GemmaRMSNorm(
-            hf_config.hidden_size, eps=hf_config.rms_norm_eps
-        )
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def final_norm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None

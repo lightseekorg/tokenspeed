@@ -39,6 +39,7 @@ from contextlib import contextmanager
 from copy import copy
 from dataclasses import replace
 from pathlib import Path
+from test.runtime.conftest import model_init_config
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
 from test.runtime.test_deepseek_v41_engram import _mapping, _Tokenizer
 from types import SimpleNamespace
@@ -2165,7 +2166,7 @@ class _TinyFp8Model(BaseCausalLM):
 
     def __init__(self):
         super().__init__(
-            config=ModelInitConfig(
+            init_config=ModelInitConfig(
                 hf_config=SimpleNamespace(),
                 vocabulary=VocabularySpec(input_size=1, output_size=1),
             ),
@@ -2241,7 +2242,7 @@ class _TinyFp8WoAModel(BaseCausalLM):
     def __init__(self, config):
         mapping = _mapping(0, 1, 1)
         super().__init__(
-            config=ModelInitConfig(
+            init_config=ModelInitConfig(
                 hf_config=SimpleNamespace(),
                 vocabulary=VocabularySpec(input_size=1, output_size=1),
             ),
@@ -2543,12 +2544,7 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     torch.manual_seed(41)
     with torch.device("cuda:0"):
         adapter = DeepseekV41ForCausalLM(
-            ModelInitConfig(
-                hf_config=SimpleNamespace(text_config=config),
-                vocabulary=VocabularySpec.from_hf_config(
-                    SimpleNamespace(text_config=config), is_draft=False
-                ),
-            ),
+            model_init_config(SimpleNamespace(text_config=config), is_draft=False),
             _mapping(0, 1, 1),
             _quant(),
             is_multimodal_active=False,
@@ -3169,12 +3165,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         config.qk_rope_head_dim, config.q_lora_rank = 64, 128
         with set_default_torch_dtype(torch.bfloat16), torch.device(device):
             adapter = DeepseekV41ForCausalLM(
-                ModelInitConfig(
-                    hf_config=SimpleNamespace(text_config=config),
-                    vocabulary=VocabularySpec.from_hf_config(
-                        SimpleNamespace(text_config=config), is_draft=False
-                    ),
-                ),
+                model_init_config(SimpleNamespace(text_config=config), is_draft=False),
                 mapping,
                 _quant(),
                 is_multimodal_active=False,
@@ -3308,10 +3299,7 @@ def _loader_model(monkeypatch, config, rank, device):
     monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
     with torch.device(device):
         return DeepseekV41ForCausalLM(
-            ModelInitConfig(
-                hf_config=wrapper,
-                vocabulary=VocabularySpec.from_hf_config(wrapper, is_draft=False),
-            ),
+            model_init_config(wrapper, is_draft=False),
             mapping,
             _quant(),
             is_multimodal_active=False,
@@ -3450,10 +3438,7 @@ def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only)
     )
     with set_default_torch_dtype(torch.bfloat16):
         model = v41.DeepseekV41ForCausalLM(
-            config=ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-            ),
+            init_config=model_init_config(config, is_draft=False),
             mapping=mapping,
             quant_config=_quant(),
             is_multimodal_active=active,
@@ -4175,12 +4160,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
         config.qk_rope_head_dim, config.q_lora_rank = 64, 128
         with set_default_torch_dtype(torch.bfloat16), torch.device(device):
             adapter = DeepseekV41ForCausalLM(
-                ModelInitConfig(
-                    hf_config=SimpleNamespace(text_config=config),
-                    vocabulary=VocabularySpec.from_hf_config(
-                        SimpleNamespace(text_config=config), is_draft=False
-                    ),
-                ),
+                model_init_config(SimpleNamespace(text_config=config), is_draft=False),
                 mapping,
                 _quant(),
                 is_multimodal_active=False,

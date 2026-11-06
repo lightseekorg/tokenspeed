@@ -310,7 +310,7 @@ class LogitsProcessor(nn.Module):
 
     def __init__(
         self,
-        vocab_size: int,
+        config,
         skip_all_gather: bool = False,
         do_argmax: bool = False,
         logit_scale: float | None = None,
@@ -319,9 +319,7 @@ class LogitsProcessor(nn.Module):
         tp_group: tuple[int, ...] | None = None,
         *,
         dp_lm_head_tp: bool,
-        final_logit_softcapping: float | None,
-        use_fused_lm_head: bool,
-        tie_word_embeddings: bool,
+        vocab_size: int,
     ):
         """``vocab_size`` is the logical output width, excluding weight padding.
 
@@ -338,7 +336,7 @@ class LogitsProcessor(nn.Module):
         if type(vocab_size) is not int or vocab_size <= 0:
             raise ValueError("vocab_size must be a positive integer")
         self.vocab_size = vocab_size
-        self.tie_word_embeddings = tie_word_embeddings
+        self.config = config
         self.skip_all_gather = skip_all_gather
         self.do_argmax = do_argmax
         self.dp_sampling_enabled = False
@@ -382,7 +380,9 @@ class LogitsProcessor(nn.Module):
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
         self._dist_argmax_binding: tuple[object, ...] | None = None
 
-        self.final_logit_softcapping = final_logit_softcapping
+        self.final_logit_softcapping = getattr(
+            self.config, "final_logit_softcapping", None
+        )
         if (
             self.final_logit_softcapping is not None
             and self.final_logit_softcapping < 0
@@ -390,7 +390,7 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
-        self._use_fused_lm_head = use_fused_lm_head
+        self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
 
     def require_full_vocab_logits(self) -> None:
         """Turn the fused draft argmax off so every forward returns full-vocab logits.

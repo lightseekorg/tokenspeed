@@ -26,13 +26,12 @@ No GPU kernels are launched; the platform is overridden to SM90.
 import dataclasses
 import os
 import sys
+from test.runtime.conftest import model_init_config
 
 import pytest
 import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.models import beam
 
@@ -162,10 +161,7 @@ def test_hopper_fp8_checkpoint_keeps_expert_codes_and_scales(server, hopper_plat
     loading, so attention keeps no fused FP8 projection."""
     server("auto")
     model = beam.BeamForCausalLM(
-        ModelInitConfig(
-            hf_config=tiny_config(),
-            vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
-        ),
+        model_init_config(tiny_config(), is_draft=False),
         Mapping(rank=0, world_size=1),
         ct(),
     )

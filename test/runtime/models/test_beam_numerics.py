@@ -33,6 +33,7 @@ import math
 import os
 import sys
 from copy import copy
+from test.runtime.conftest import model_init_config
 
 import pytest
 import tokenspeed_kernel.ops.layernorm.qk_rmsnorm_ssmax as qk_facade
@@ -40,8 +41,6 @@ import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from torch.nn import functional as F
 
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.gating import apply_attention_output_gate
 from tokenspeed.runtime.models import beam
@@ -88,10 +87,7 @@ def cpu_rmsnorm(monkeypatch):
 
 def _tiny_model():
     return BeamForCausalLM(
-        ModelInitConfig(
-            hf_config=tiny_config(),
-            vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
-        ),
+        model_init_config(tiny_config(), is_draft=False),
         Mapping(rank=0, world_size=1),
         None,
     )
@@ -297,10 +293,7 @@ def loaded(monkeypatch):
     weights = tiny_weights(config)
     with torch.device("cuda"):
         model = BeamForCausalLM(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-            ),
+            model_init_config(config, is_draft=False),
             Mapping(rank=0, world_size=1),
             quant_config=None,
         )

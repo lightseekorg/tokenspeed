@@ -7,14 +7,13 @@ per-aux-state ``fc_norm`` RMSNorms and the ``norm_output`` aux convention.
 from __future__ import annotations
 
 from dataclasses import replace
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers import LlamaConfig
 
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -82,10 +81,7 @@ def _build_model(
     try:
         with torch.device("meta"):
             return LlamaForCausalLMEagle3(
-                ModelInitConfig(
-                    hf_config=config,
-                    vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-                ),
+                model_init_config(config, is_draft=True),
                 mapping,
             )
     finally:

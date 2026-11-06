@@ -21,13 +21,12 @@
 """Server-side selection of the decode TP layouts: argument constraints, the
 LM-head resolution and the module-level refusals (no distributed runtime)."""
 
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
@@ -185,10 +184,7 @@ def _causal_lm(mapping: Mapping) -> _StubModel:
         hidden_size=16, vocab_size=64, tie_word_embeddings=False, model_type="t"
     )
     return _StubModel(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-        ),
+        model_init_config(config, is_draft=False),
         mapping,
     )
 
@@ -232,28 +228,20 @@ class TestLmHeadResolution:
         config = SimpleNamespace(model_type="t", vocab_size=8)
         with pytest.raises(ValueError, match="dp_lm_head_tp"):
             LogitsProcessor(
-                getattr(config, "vocab_size", None),
+                config,
+                vocab_size=config.vocab_size,
                 skip_all_gather=True,
                 dp_lm_head_tp=True,
-                final_logit_softcapping=getattr(
-                    config, "final_logit_softcapping", None
-                ),
-                use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
-                tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             )
         with pytest.raises(ValueError, match="dp_lm_head_tp"):
             LogitsProcessor(
-                getattr(config, "vocab_size", None),
+                config,
+                vocab_size=config.vocab_size,
                 skip_all_gather=False,
                 tp_rank=0,
                 tp_size=2,
                 tp_group=(0, 1),
                 dp_lm_head_tp=True,
-                final_logit_softcapping=getattr(
-                    config, "final_logit_softcapping", None
-                ),
-                use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
-                tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             )
 
 

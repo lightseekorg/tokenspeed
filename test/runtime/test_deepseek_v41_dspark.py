@@ -27,6 +27,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from test.runtime.conftest import model_init_config
 from test.runtime.test_deepseek_v41_engram import _mapping
 from test.runtime.test_deepseek_v41_model import (
     _Backend,
@@ -45,7 +46,6 @@ from tokenspeed_kernel.ops.attention import dsv41
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
@@ -256,12 +256,7 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
     config = _draft_config()
     _loader_model(monkeypatch, config, rank, "cpu")
     model = DeepseekV41ForCausalLMDSpark(
-        ModelInitConfig(
-            hf_config=SimpleNamespace(text_config=config),
-            vocabulary=VocabularySpec.from_hf_config(
-                SimpleNamespace(text_config=config), is_draft=True
-            ),
-        ),
+        model_init_config(SimpleNamespace(text_config=config), is_draft=True),
         _mapping(rank, 4, 4),
         _quant(),
     )
@@ -335,10 +330,7 @@ def test_compact_draft_checkpoint_loads_input_and_output_domains(
     _mock_loader_hardware(monkeypatch, mapping)
     with set_default_torch_dtype(torch.bfloat16):
         adapter = DeepseekV41ForCausalLMDSpark(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-            ),
+            model_init_config(config, is_draft=True),
             mapping,
             _quant(),
         )
@@ -670,12 +662,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     with torch.device("cuda:0"):
         adapter = DeepseekV41ForCausalLMDSpark(
-            ModelInitConfig(
-                hf_config=SimpleNamespace(text_config=config),
-                vocabulary=VocabularySpec.from_hf_config(
-                    SimpleNamespace(text_config=config), is_draft=True
-                ),
-            ),
+            model_init_config(SimpleNamespace(text_config=config), is_draft=True),
             _mapping(0, 1, 1),
             _quant(),
         )
@@ -1243,10 +1230,7 @@ def test_dp_draft_checkpoint_and_idle_schedule(
     config.output_vocab_size = output_vocab_size
     config = DeepseekV41Config(text_config=vars(config))
     adapter = DeepseekV41ForCausalLMDSpark(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-        ),
+        model_init_config(config, is_draft=True),
         mapping,
         _quant(),
     )

@@ -30,7 +30,7 @@ block sampler does not implement. The Markov projection and workspace use
 the head's group, independently of the attention TP width. Padding-only
 shards contribute no candidate but still join every TP gather.
 
-Every model entrypoint receives a `ModelInitConfig` through its `config`
+Every model entrypoint receives a `ModelInitConfig` through its `init_config`
 argument. This lightweight, frozen envelope contains the model-specific
 `hf_config` and the already resolved `vocabulary`; it has no loading or serving
 policy and does not forward unknown attributes to the HF config. Construction
@@ -39,13 +39,15 @@ or use `with_hf_config(text_config)` to select checkpoint metadata while keeping
 the same vocabulary object. Drafts receive their own resolved vocabulary.
 The envelope does not freeze the HF object: adapters that modify checkpoint
 metadata copy it first. Internal layers continue to receive their existing
-HF config or the domain sizes they consume.
+HF config or the domain sizes they consume. Constructors keep the local name
+`config` for HF metadata, so ordinary model internals do not need renaming.
 `ModelExecutorConfig` and `RuntimeStates` retain that value, without legacy
 `vocab_size` aliases or per-layer defaults. Components that consume only one
 domain keep the local name `vocab_size`; callers select `input_size` or
 `output_size` at the boundary. `LogitsProcessor` takes the logical output width
-as `vocab_size` and explicit projection policies, never an HF config. Tied common
-heads require equal input and output sizes. Model adapters own any other
+as a required `vocab_size` keyword, independently of its existing HF configuration
+for projection policies. Tied common heads require equal input and output sizes.
+Model adapters own any other
 checkpoint-specific layout or sharing rules. A draft that shares the target's
 head must resolve the same output domain before construction; mismatches are
 rejected during wiring.
@@ -58,11 +60,11 @@ than silently scoring a clamped ID. Internal graph padding may still use safe
 indices after the corresponding validity checks.
 
 Runtime plugin API 4 requires `ModelProfile.vocabulary` and a model constructor
-that accepts `config: ModelInitConfig`. A plugin interprets its checkpoint
+that accepts `init_config: ModelInitConfig`. A plugin interprets its checkpoint
 fields in `model_profile(hf_config)`; the loader binds that resolved vocabulary
 to the construction config. Plugins forward the envelope to base model
-constructors and read checkpoint fields from `config.hf_config`. Text/hash
+constructors and read checkpoint fields from `init_config.hf_config`. Text/hash
 vocabulary constraints remain model-owned.
-Plugins calling `LogitsProcessor` pass `vocab_size=vocabulary.output_size`,
-`final_logit_softcapping`, `use_fused_lm_head` and `tie_word_embeddings` explicitly;
-copying and rewriting a checkpoint config for logits is no longer necessary.
+Plugins calling `LogitsProcessor` keep the configuration argument and pass
+`vocab_size=vocabulary.output_size` explicitly; copying and rewriting a
+checkpoint's vocabulary for logits is unnecessary.

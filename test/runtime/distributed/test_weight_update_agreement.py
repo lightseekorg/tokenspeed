@@ -48,7 +48,7 @@ def _worker(rank, path):
     class CollectiveModel(BaseCausalLM):
         def __init__(self):
             super().__init__(
-                config=ModelInitConfig(
+                init_config=ModelInitConfig(
                     hf_config=PretrainedConfig(),
                     vocabulary=VocabularySpec(input_size=1, output_size=1),
                 ),

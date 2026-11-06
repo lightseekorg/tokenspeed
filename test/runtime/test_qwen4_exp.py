@@ -24,6 +24,7 @@ import gc
 import logging
 import weakref
 from dataclasses import replace
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
@@ -1642,17 +1643,11 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     target = _HeadOnlyTarget(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-        ),
+        model_init_config(config, is_draft=False),
         mapping,
     )
     draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-        ),
+        model_init_config(config, is_draft=True),
         mapping,
     )
     _check_shared_head_layout(target, draft)
@@ -3964,10 +3959,7 @@ def test_qwen4_exp_nextn_shares_unquantized_target_head(monkeypatch, attention_d
         exclude_modules=["lm_head", "mtp.fc_embedding", "mtp.fc_hidden"]
     )
     draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-        ),
+        model_init_config(config, is_draft=True),
         mapping,
         quant,
     )

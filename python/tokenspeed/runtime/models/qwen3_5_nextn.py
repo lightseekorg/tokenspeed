@@ -134,49 +134,45 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):
     def __init__(
         self,
-        config: ModelInitConfig[PretrainedConfig],
+        init_config: ModelInitConfig[PretrainedConfig],
         mapping: Mapping,
         quant_config=None,
         prefix: str = "",
     ) -> None:
-        hf_config = deepcopy(config.hf_config)
-        self.vocabulary = config.vocabulary
+        config = deepcopy(init_config.hf_config)
+        self.vocabulary = init_config.vocabulary
         nn.Module.__init__(self)
 
-        if hasattr(hf_config, "text_config"):
-            hf_config = hf_config.text_config
+        if hasattr(config, "text_config"):
+            config = config.text_config
 
         quant_config = _resolve_mtp_quant_config(quant_config)
 
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
 
-        self.fc = nn.Linear(
-            2 * hf_config.hidden_size, hf_config.hidden_size, bias=False
-        )
+        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
-            hf_config.hidden_size, hf_config.rms_norm_eps
+            config.hidden_size, config.rms_norm_eps
         )
-        self.pre_fc_norm_hidden = RMSNorm_cls(
-            hf_config.hidden_size, hf_config.rms_norm_eps
-        )
-        hf_config.num_hidden_layers = 1
-        hf_config.full_attention_interval = 1
+        self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
+        config.num_hidden_layers = 1
+        config.full_attention_interval = 1
         self.model = Qwen3_5DraftForCausalLM(
-            hf_config,
+            config,
             mapping=self.mapping,
             quant_config=quant_config,
             prefix=add_prefix("mtp", prefix),
         )
 
-        if hf_config.tie_word_embeddings:
+        if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
                 self.lm_head = ReplicatedLinear(
-                    hf_config.hidden_size,
+                    config.hidden_size,
                     self.vocabulary.output_size,
                     bias=False,
                     quant_config=quant_config,
@@ -185,7 +181,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             else:
                 self.lm_head = ParallelLMHead(
                     self.vocabulary.output_size,
-                    hf_config.hidden_size,
+                    config.hidden_size,
                     quant_config=quant_config,
                     tp_rank=self.mapping.lm_head.tp_rank,
                     tp_size=self.mapping.lm_head.tp_size,
@@ -196,16 +192,14 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         # The shared target head follows mapping.lm_head. Under attention DP
         # its replicated vocabulary can differ from the attention TP layout.
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=self.mapping.attn.has_dp,
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
             do_argmax=True,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
-            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self):

@@ -24,6 +24,7 @@ import math
 import os
 import socket
 import sys
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -33,8 +34,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 sys.path.insert(
@@ -228,12 +227,7 @@ def _single_rank_mapping() -> Mapping:
 def _tiny_model() -> MuseSparkForConditionalGeneration:
     with torch.device("cuda"):
         return MuseSparkForConditionalGeneration(
-            config=ModelInitConfig(
-                hf_config=_tiny_config(),
-                vocabulary=VocabularySpec.from_hf_config(
-                    _tiny_config(), is_draft=False
-                ),
-            ),
+            init_config=model_init_config(_tiny_config(), is_draft=False),
             mapping=_single_rank_mapping(),
             quant_config=None,
             is_multimodal_active=True,
@@ -610,10 +604,7 @@ def test_tensor_parallel_checkpoint_loading_preserves_gate_up_pairing(
     )
     with torch.device("cuda"):
         model = MuseSparkForConditionalGeneration(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-            ),
+            model_init_config(config, is_draft=False),
             mapping,
             quant_config,
             is_multimodal_active=False,

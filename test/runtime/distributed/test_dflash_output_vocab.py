@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.comm_backend import registry
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
@@ -68,14 +69,12 @@ def _worker(rank: int, init_method: str) -> None:
             tp_group=group,
         )
         drafter.logits_processor = LogitsProcessor(
-            5,
+            PretrainedConfig(),
+            vocab_size=5,
             tp_rank=rank,
             tp_size=4,
             tp_group=group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=None,
-            use_fused_lm_head=False,
-            tie_word_embeddings=False,
         )
         drafter._dist_argmax_state = None
         drafter._greedy_gathered_max = None

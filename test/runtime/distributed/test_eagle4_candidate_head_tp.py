@@ -32,15 +32,13 @@ Usage:
 import os
 import socket
 import sys
+from test.runtime.conftest import model_init_config
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import LlamaConfig
-
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -107,10 +105,7 @@ def _check_greedy_candidate(rank, world_size, device):
     torch.set_default_dtype(torch.bfloat16)
     with torch.device(device):
         model = LlamaForCausalLMEagle4(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-            ),
+            model_init_config(config, is_draft=True),
             mapping,
         )
 

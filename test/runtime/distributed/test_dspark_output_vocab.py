@@ -22,6 +22,7 @@
 
 import os
 import sys
+from test.runtime.conftest import model_init_config
 from test.runtime.test_deepseek_v41_dspark import _draft_config, _quant
 from test.runtime.test_deepseek_v41_engram import _mapping
 from test.runtime.test_deepseek_v41_model import _mock_loader_hardware
@@ -32,8 +33,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -80,10 +79,7 @@ def _check_compact_head(rank, output_size, device, *, attention_dp):
     with pytest.MonkeyPatch.context() as patch, set_default_torch_dtype(torch.bfloat16):
         _mock_loader_hardware(patch, mapping)
         adapter = DeepseekV41ForCausalLMDSpark(
-            ModelInitConfig(
-                hf_config=config,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-            ),
+            model_init_config(config, is_draft=True),
             mapping,
             _quant(),
         )

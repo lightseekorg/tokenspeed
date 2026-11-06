@@ -197,14 +197,14 @@ def _run(rank: int, port: int, logprob_order: str) -> None:
 
     vocab = VOCABS[logprob_order]
     processor = LogitsProcessor(
+        config=SimpleNamespace(
+            model_type="test", vocab_size=vocab, final_logit_softcapping=None
+        ),
         vocab_size=vocab,
         tp_rank=rank,
         tp_size=WORLD,
         tp_group=group,
         dp_lm_head_tp=False,
-        final_logit_softcapping=None,
-        use_fused_lm_head=False,
-        tie_word_embeddings=False,
     )
     # No symmetric-memory multicast on CPU: the vocab gather is the collective.
     processor._all_gather_state = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
@@ -9,8 +10,6 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.models import kimi_k3
 from tokenspeed.runtime.models.kimi_k3 import (
@@ -31,9 +30,9 @@ class _FakeBackbone(nn.Module):
 
 
 class _FakeLanguageModel(nn.Module):
-    def __init__(self, config, **_kwargs) -> None:
+    def __init__(self, init_config, **_kwargs) -> None:
         super().__init__()
-        self.model = _FakeBackbone(config.hf_config.hidden_size)
+        self.model = _FakeBackbone(init_config.hf_config.hidden_size)
         self.lm_head = nn.Identity()
         self.logits_processor = object()
         self.forward_kwargs = None
@@ -79,10 +78,7 @@ def _item_dp_mapping(rank: int = 5) -> Mapping:
 def _build_model(monkeypatch, mapping: Mapping | None = None):
     monkeypatch.setattr(kimi_k3, "KimiLinearForCausalLM", _FakeLanguageModel)
     return KimiK3ForConditionalGeneration(
-        ModelInitConfig(
-            hf_config=_tiny_config(),
-            vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=False),
-        ),
+        model_init_config(_tiny_config(), is_draft=False),
         mapping=mapping or Mapping(rank=0, world_size=1),
         mm_attention_backend="triton_attn",
     )
@@ -201,10 +197,7 @@ def test_kimi_k3_encoder_only_skips_language_model(monkeypatch):
         kimi_k3, "KimiLinearForCausalLM", fail_language_model_construction
     )
     model = KimiK3ForConditionalGeneration(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-        ),
+        model_init_config(config, is_draft=False),
         mapping=Mapping(rank=0, world_size=1),
         mm_attention_backend="triton_attn",
     )
@@ -231,10 +224,7 @@ def test_kimi_k3_encoder_only_drains_stream_and_loads_all_vision_weights(
         ),
     )
     model = KimiK3ForConditionalGeneration(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-        ),
+        model_init_config(config, is_draft=False),
         mapping=Mapping(rank=0, world_size=1),
         mm_attention_backend="triton_attn",
     )

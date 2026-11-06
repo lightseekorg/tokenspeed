@@ -97,19 +97,19 @@ class DSparkDraftModel(DFlashDraftModel):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
+        config = init_config.hf_config
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
         )
-        markov_rank, markov_head_type = _get_markov_params(hf_config)
+        markov_rank, markov_head_type = _get_markov_params(config)
         if markov_rank <= 0:
             raise ValueError(
                 "DSpark draft requires markov_rank > 0 (the Markov head is the "
@@ -121,7 +121,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 f"static build only supports {SUPPORTED_MARKOV_HEAD_TYPES}."
             )
         self.markov_head = VanillaMarkov(
-            vocabulary=config.vocabulary, markov_rank=markov_rank
+            vocabulary=init_config.vocabulary, markov_rank=markov_rank
         )
 
 

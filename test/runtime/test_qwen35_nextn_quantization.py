@@ -1,3 +1,4 @@
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 from unittest import mock
 
@@ -8,8 +9,6 @@ from transformers import PretrainedConfig
 
 import tokenspeed.runtime.layers.logits_processor as logits_module
 import tokenspeed.runtime.models.qwen3_5_nextn as nextn_module
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.factory import _check_shared_head_layout
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -66,10 +65,7 @@ def test_attention_dp_draft_lm_head_receives_quant_config(monkeypatch):
     )
 
     draft = Qwen3_5ForConditionalGenerationNextN(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-        ),
+        model_init_config(config, is_draft=True),
         mapping,
         quant_config=quant_config,
     )
@@ -116,10 +112,7 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp, 
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     target = _HeadOnlyTarget(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-        ),
+        model_init_config(config, is_draft=False),
         mapping,
     )
     with torch.no_grad():
@@ -131,10 +124,7 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp, 
             - 0.16
         )
     draft = Qwen3_5ForConditionalGenerationNextN(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-        ),
+        model_init_config(config, is_draft=True),
         mapping,
     )
     _check_shared_head_layout(target, draft)
@@ -167,17 +157,11 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     target = _HeadOnlyTarget(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
-        ),
+        model_init_config(config, is_draft=False),
         mapping,
     )
     draft = Qwen3_5ForConditionalGenerationNextN(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-        ),
+        model_init_config(config, is_draft=True),
         mapping,
     )
     _check_shared_head_layout(target, draft)
@@ -281,11 +265,9 @@ def test_mtp_shares_complete_quantized_lm_head(monkeypatch, tied):
     assert should_apply_lm_head_quant_method(draft.lm_head, draft.lm_head.quant_method)
 
     processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="qwen3_5", vocab_size=4),
         vocab_size=4,
         dp_lm_head_tp=False,
-        final_logit_softcapping=None,
-        use_fused_lm_head=False,
-        tie_word_embeddings=False,
     )
     hidden_states = torch.ones((1, 4), dtype=torch.bfloat16)
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)

@@ -209,20 +209,20 @@ class InklingMultiTokenPredictor(nn.Module):
 class InklingForConditionalGenerationNextN(nn.Module):
     def __init__(
         self,
-        config: ModelInitConfig[InklingMMConfig],
+        init_config: ModelInitConfig[InklingMMConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         del is_multimodal_active, mm_attention_backend  # draft is text-only
         super().__init__()
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
-        text_config = hf_config.get_text_config()
+        text_config = config.get_text_config()
         if text_config.num_nextn_predict_layers <= 0:
             raise ValueError(
                 "Inkling NextN requires mtp_config.num_nextn_predict_layers > 0"
@@ -250,19 +250,13 @@ class InklingForConditionalGenerationNextN(nn.Module):
         )
         # do_argmax off (as base model): the distributed-argmax path skips the padded-vocab masking below.
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            self.text_config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(
-                self.text_config, "final_logit_softcapping", None
-            ),
-            use_fused_lm_head=(
-                getattr(self.text_config, "model_type", None) == "kimi_k2"
-            ),
-            tie_word_embeddings=getattr(self.text_config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self):

@@ -22,14 +22,13 @@
 
 import os
 import sys
+from test.runtime.conftest import model_init_config
 
 import pytest
 import torch
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import KimiK3DSparkConfig
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
@@ -86,10 +85,7 @@ def test_replicated_markov_checkpoint_and_bias_use_separate_domains(
             DSparkDraftModel if family == "generic" else DSparkMiniMaxDraftModel
         )
     model = model_class(
-        ModelInitConfig(
-            hf_config=config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
-        ),
+        model_init_config(config, is_draft=True),
         Mapping(rank=0, world_size=1, attn_tp_size=1),
     )
     embedding = (torch.arange(128 * 4).reshape(128, 4) % 11).float()

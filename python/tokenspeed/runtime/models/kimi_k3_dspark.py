@@ -325,31 +325,31 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
-        validate_k3_dspark_config(hf_config)
-        for note in k3_dspark_inactive_features(hf_config):
+        validate_k3_dspark_config(config)
+        for note in k3_dspark_inactive_features(config):
             logger.warning(f"K3 DSpark: {note!s}")
-        self.config = hf_config
+        self.config = config
         self.mapping = mapping
         self.attention_kind = "kimi_mla"
-        hidden_size = int(hf_config.hidden_size)
-        eps = float(hf_config.rms_norm_eps)
+        hidden_size = int(config.hidden_size)
+        eps = float(config.rms_norm_eps)
 
         if mapping.has_pp and quant_config is not None:
             raise ValueError("Pipeline DSpark requires an unquantized draft checkpoint")
         # A PP stage projects only the target taps it can produce. Proposal
         # layers live on the final stage, using that stage's existing TP groups.
         self.checkpoint_load_group = mapping.attn.tp_group if mapping.has_pp else None
-        num_target_execution_layers = int(hf_config.target_num_hidden_layers)
-        num_draft_blocks = int(hf_config.num_hidden_layers)
-        self.target_capture_layer_ids = tuple(hf_config.target_layer_ids)
+        num_target_execution_layers = int(config.target_num_hidden_layers)
+        num_draft_blocks = int(config.num_hidden_layers)
+        self.target_capture_layer_ids = tuple(config.target_layer_ids)
         start, end = pp_layer_window(num_target_execution_layers, mapping)
         self.local_tap_indices = tuple(
             tap_index
@@ -358,13 +358,13 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             <= _context_tap_owner_layer(
                 int(layer_id),
                 num_target_execution_layers,
-                hf_config.aux_hidden_stream,
+                config.aux_hidden_stream,
             )
             < end
         )
         self.context_proj = (
             ReplicatedLinear(
-                len(self.local_tap_indices) * int(hf_config.target_hidden_size),
+                len(self.local_tap_indices) * int(config.target_hidden_size),
                 hidden_size,
                 bias=False,
                 quant_config=quant_config,
@@ -379,11 +379,11 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         self.fc_norm = (
             nn.ModuleList(
                 [
-                    RMSNorm(int(hf_config.target_hidden_size), eps=eps)
+                    RMSNorm(int(config.target_hidden_size), eps=eps)
                     for _ in self.local_tap_indices
                 ]
             )
-            if hf_config.fc_norm and self.local_tap_indices
+            if config.fc_norm and self.local_tap_indices
             else None
         )
         self.register_buffer("_fc_norm_weight", None, persistent=False)
@@ -391,7 +391,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         self.layers = nn.ModuleList(
             [
                 K3DSparkDecoderLayer(
-                    config=hf_config,
+                    config=config,
                     mapping=mapping,
                     layer_id=i,
                     quant_config=quant_config,
@@ -405,8 +405,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         )
         self.markov_head = (
             VanillaMarkov(
-                vocabulary=config.vocabulary,
-                markov_rank=int(hf_config.markov_rank),
+                vocabulary=init_config.vocabulary,
+                markov_rank=int(config.markov_rank),
             )
             if mapping.is_last_pp_rank
             else None
@@ -416,9 +416,9 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # own TP shard there; non-PP serving continues to borrow the target.
         self.embed_tokens = (
             VocabParallelEmbedding(
-                int(hf_config.vocab_size),
+                int(config.vocab_size),
                 hidden_size,
-                org_num_embeddings=int(hf_config.vocab_size),
+                org_num_embeddings=int(config.vocab_size),
                 tp_rank=mapping.attn.tp_rank,
                 tp_size=mapping.attn.tp_size,
                 tp_group=mapping.attn.tp_group,

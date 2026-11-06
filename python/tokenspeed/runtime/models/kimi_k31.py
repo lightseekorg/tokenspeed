@@ -472,12 +472,14 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
 class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
     """Kimi-K3.1 top-level model: the K3 model over a DSA text config."""
 
-    def __init__(self, config: ModelInitConfig, mapping: Mapping, **kwargs) -> None:
-        if not config.hf_config.text_config.dsa_layer_ids:
+    def __init__(
+        self, init_config: ModelInitConfig, mapping: Mapping, **kwargs
+    ) -> None:
+        if not init_config.hf_config.text_config.dsa_layer_ids:
             raise ValueError(
                 "KimiK31ForConditionalGeneration requires text_config.dsa_config"
             )
-        super().__init__(config, mapping, **kwargs)
+        super().__init__(init_config, mapping, **kwargs)
 
     def load_weights(self, weights) -> None:
         super().load_weights(weights)

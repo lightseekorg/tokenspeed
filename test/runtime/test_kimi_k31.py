@@ -26,13 +26,11 @@ import json
 import os
 import sys
 from pathlib import Path
+from test.runtime.conftest import model_init_config
 from types import SimpleNamespace
 
 import pytest
 import torch
-
-from tokenspeed.runtime.configs.model_init import ModelInitConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 # ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``).
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1480,12 +1478,7 @@ def _tiny_model(*, dsa: bool):
     try:
         with torch.device("cuda"):
             return KimiLinearForCausalLM(
-                ModelInitConfig(
-                    hf_config=_tiny_text_config(dsa=dsa),
-                    vocabulary=VocabularySpec.from_hf_config(
-                        _tiny_text_config(dsa=dsa), is_draft=False
-                    ),
-                ),
+                model_init_config(_tiny_text_config(dsa=dsa), is_draft=False),
                 mapping=Mapping(rank=0),
                 quant_config=None,
             )

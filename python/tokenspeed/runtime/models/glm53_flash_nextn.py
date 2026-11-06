@@ -140,16 +140,16 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
 
     def __init__(
         self,
-        config: ModelInitConfig[Glm53FlashConfig],
+        init_config: ModelInitConfig[Glm53FlashConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        self.vocabulary = config.vocabulary
+        config = init_config.hf_config
+        self.vocabulary = init_config.vocabulary
         super().__init__()
         del prefix
-        self.config = hf_config.text_config
+        self.config = config.text_config
         self.mapping = mapping
         self.quant_config = quant_config
         self.index_share_for_mtp_iteration = self.config.index_share_for_mtp_iteration
@@ -175,18 +175,14 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
                 tp_group=mapping.attn.tp_group,
             )
         self.logits_processor = LogitsProcessor(
-            self.vocabulary.output_size,
+            self.config,
+            vocab_size=self.vocabulary.output_size,
             skip_all_gather=mapping.attn.has_dp,
             do_argmax=True,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(
-                self.config, "final_logit_softcapping", None
-            ),
-            use_fused_lm_head=(getattr(self.config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(self.config, "tie_word_embeddings", False),
         )
 
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:

@@ -1,4 +1,4 @@
-"""Shared helpers for Kimi-K3 cache-group runtime tests."""
+"""Shared helpers for runtime tests."""
 
 from __future__ import annotations
 
@@ -284,4 +284,15 @@ def full_attention_metadata_for(pool, full_table_np, device):
         pool.arena.runtime_contract,
         {"full_attention": np.asarray(full_table_np, dtype=np.int32)},
         device,
+    )
+
+
+def model_init_config(hf_config, *, is_draft: bool):
+    """Resolve common checkpoint vocabulary once for direct model tests."""
+    from tokenspeed.runtime.configs.model_init import ModelInitConfig
+    from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+
+    return ModelInitConfig(
+        hf_config=hf_config,
+        vocabulary=VocabularySpec.from_hf_config(hf_config, is_draft=is_draft),
     )

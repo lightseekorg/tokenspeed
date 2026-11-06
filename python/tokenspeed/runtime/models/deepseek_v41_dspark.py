@@ -475,9 +475,9 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
         del target_config
         target_model.set_dspark_layers_to_capture(list(self.model.target_layer_ids))
 
-    def __init__(self, config: ModelInitConfig, mapping, quant_config):
+    def __init__(self, init_config: ModelInitConfig, mapping, quant_config):
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
             is_multimodal_active=False,

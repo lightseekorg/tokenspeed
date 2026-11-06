@@ -140,11 +140,11 @@ def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
 def _processor(order: str, monkeypatch, vocab_size: int = VOCAB) -> LogitsProcessor:
     monkeypatch.setitem(global_server_args_dict, "logprob_order", order)
     return LogitsProcessor(
-        vocab_size,
+        SimpleNamespace(
+            model_type="test", vocab_size=vocab_size, final_logit_softcapping=None
+        ),
+        vocab_size=vocab_size,
         dp_lm_head_tp=False,
-        final_logit_softcapping=None,
-        use_fused_lm_head=False,
-        tie_word_embeddings=False,
     )
 
 

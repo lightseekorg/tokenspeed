@@ -959,15 +959,15 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[_PretrainedConfig],
+        init_config: ModelInitConfig[_PretrainedConfig],
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        hf_config = config.hf_config
-        _ensure_longcat_config(hf_config)
+        config = init_config.hf_config
+        _ensure_longcat_config(config)
         super().__init__(
-            config=config,
+            init_config=init_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,

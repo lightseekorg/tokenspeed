@@ -169,19 +169,19 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig,
+        init_config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
     ) -> None:
-        hf_config = config.hf_config
-        self.omni_config = hf_config
-        self.thinker_config = _get_thinker_config(hf_config)
+        config = init_config.hf_config
+        self.omni_config = config
+        self.thinker_config = _get_thinker_config(config)
         text_config = self.thinker_config.text_config
         _ensure_layer_types(text_config)
         super().__init__(
-            config=config.with_hf_config(text_config),
+            init_config=init_config.with_hf_config(text_config),
             mapping=mapping,
             quant_config=quant_config,
         )

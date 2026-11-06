@@ -27,6 +27,7 @@ from unittest import mock
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -206,14 +207,13 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     class TargetModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
+            self.config = PretrainedConfig(vocab_size=64, output_vocab_size=32)
             self.embed_tokens = torch.nn.Embedding(64, 4)
             self.lm_head = ParallelLMHead(32, 4)
             self.logits_processor = LogitsProcessor(
-                32,
+                self.config,
+                vocab_size=32,
                 dp_lm_head_tp=False,
-                final_logit_softcapping=None,
-                use_fused_lm_head=False,
-                tie_word_embeddings=False,
             )
 
         def get_input_embeddings(self):
@@ -227,6 +227,7 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter.spec_num_tokens = 8
     drafter.input_buffers = SimpleNamespace(max_bs=2)
     target = TargetModel()
+    drafter.model = target
     drafter.wire_target(target)
 
     assert drafter.candidate_logits_processor is not None
@@ -256,14 +257,12 @@ def test_block_draft_dist_argmax_rejects_a_wider_physical_head(monkeypatch):
         tp_group=(0, 1, 2, 3),
     )
     drafter.logits_processor = LogitsProcessor(
-        8192,
+        PretrainedConfig(),
+        vocab_size=8192,
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
         dp_lm_head_tp=False,
-        final_logit_softcapping=None,
-        use_fused_lm_head=False,
-        tie_word_embeddings=False,
     )
     # This padding-free, 4096-column shard is large enough for the fast path.
     # A logical-width mismatch must reject it before the collective rendezvous;
@@ -282,11 +281,9 @@ def test_block_draft_argmax_excludes_non_output_head_rows(
         storage_vocab, 2, params_dtype=torch.float32, padding_size=8
     )
     drafter.logits_processor = LogitsProcessor(
-        5,
+        PretrainedConfig(),
+        vocab_size=5,
         dp_lm_head_tp=False,
-        final_logit_softcapping=None,
-        use_fused_lm_head=False,
-        tie_word_embeddings=False,
     )
     # CPU has no distributed argmax state. The actual projection and selection
     # still run, including DSpark's optional precomputed logits and Markov bias.
@@ -322,11 +319,9 @@ def test_block_draft_argmax_preserves_added_output_tokens(output_vocab_size):
         8, 2, org_num_embeddings=5, params_dtype=torch.float32, padding_size=8
     )
     drafter.logits_processor = LogitsProcessor(
-        output_vocab_size,
+        PretrainedConfig(),
+        vocab_size=output_vocab_size,
         dp_lm_head_tp=False,
-        final_logit_softcapping=None,
-        use_fused_lm_head=False,
-        tie_word_embeddings=False,
     )
     drafter._dist_argmax_state = None
     with torch.no_grad():

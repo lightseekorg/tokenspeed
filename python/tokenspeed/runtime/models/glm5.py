@@ -1805,13 +1805,13 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
 
     def __init__(
         self,
-        config: ModelInitConfig[PretrainedConfig],
+        init_config: ModelInitConfig[PretrainedConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
-            config,
+            init_config,
             mapping,
             quant_config=quant_config,
             prefix=prefix,
