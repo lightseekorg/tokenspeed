@@ -24,19 +24,21 @@ policy ranks."""
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.eagle_harness_policy import (
+from tokenspeed_kernel.ops.sampling.eagle_harness import (
     eagle_harness_policy_select_verify,
 )
+from tokenspeed_kernel.platform import current_platform
 
+# The CUDA build serves NVIDIA, the Triton build AMD (ops/sampling/eagle_harness).
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not current_platform().is_nvidia,
-    reason="eagle_harness_policy CUDA kernel is NVIDIA-only",
+    not torch.cuda.is_available()
+    or not (current_platform().is_nvidia or current_platform().is_cdna4),
+    reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
 
 _DEVICE = "cuda"
 _MAX_ROWS, _MAX_COLS = 32, 64
-# The ``State`` scalars (eagle_harness_policy.cu) a ranking uses; all others zero make a first unsampled round.
+# Indices of the policy state scalars a ranking uses; all others zero make a first unsampled round.
 _RANKED_COUNT, _BATCH_SIZE, _VERIFY_COUNT, _FLAT, _NUM_STATE = 6, 7, 17, 18, 21
 
 
