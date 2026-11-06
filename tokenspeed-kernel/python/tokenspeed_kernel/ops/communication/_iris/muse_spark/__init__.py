@@ -77,6 +77,7 @@ from tokenspeed_kernel.ops.moe import gather_moe_routes
 from tokenspeed_kernel.platform import current_platform
 
 if current_platform().is_cdna4:
+    from tokenspeed_kernel_amd._scheduling import sched_compile_options
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_geometry_gfx950,
     )
@@ -1434,6 +1435,8 @@ class MuseIrisState:
             HAS_PRE=pre_weight is not None,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=16,
+            # The GEMV's per-step pin is in the scheduling library.
+            **sched_compile_options(),
         )
         return out_stream, pre_bf16
 

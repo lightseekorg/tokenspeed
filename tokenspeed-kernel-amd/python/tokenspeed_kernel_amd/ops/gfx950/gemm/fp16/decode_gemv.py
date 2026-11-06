@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._scheduling import arithmetic_fence, sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
 
 _SUBGROUP_SIZE = 64
@@ -108,6 +109,19 @@ def supports_gluon_rowcta_bf16_gemv_gfx950(m: int, n: int, k: int) -> bool:
 
 
 @gluon.jit
+def _rows_x_step(x_ptr, rows, x_columns, M, K: gl.constexpr, start: gl.constexpr):
+    """Load one K step of every activation row; rows past M read zero."""
+    # No ``other``: a masked lane's buffer load gets an out-of-range offset
+    # and reads zero (CDNA4 ISA 9.1.5.1), while ``other`` would add a
+    # v_cndmask per loaded register.
+    return gl.amd.cdna4.buffer_load(
+        x_ptr,
+        (rows[:, None] * K + start + x_columns[None, :]).to(gl.int32),
+        mask=(rows < M)[:, None],
+    )
+
+
+@gluon.jit
 def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     x_ptr,
     weight_ptr,
@@ -141,20 +155,44 @@ def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     w_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, w_layout))
     rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, x_layout))
     x_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, x_layout))
+    # A lane holds only a few bytes of each K step, so one step in flight
+    # leaves each wave with K / BLOCK_K serialized HBM round trips. Issue
+    # every step's weights up front, and the activation rows (L2 hits, but a
+    # register per row and step) X_AHEAD steps ahead. Vector loads retire in
+    # issue order, so step s's FMAs wait only for loads issued before its
+    # own. The FMA order, and so the result, is unchanged.
+    gl.static_assert(K % BLOCK_K == 0, "the K steps must tile K exactly")
+    STEPS: gl.constexpr = K // BLOCK_K
+    X_AHEAD: gl.constexpr = 1
+    xs = ()
+    for step in gl.static_range(min(X_AHEAD, STEPS)):
+        xs += (_rows_x_step(x_ptr, rows, x_columns, M, K, step * BLOCK_K),)
+    weights = ()
+    for step in gl.static_range(STEPS):
+        weights += (
+            gl.amd.cdna4.buffer_load(
+                weight_ptr,
+                (outputs[:, None] * K + step * BLOCK_K + w_columns[None, :]).to(
+                    gl.int32
+                ),
+                cache=".cg",
+            ),
+        )
     accumulator = gl.zeros((BLOCK_M, OUTPUTS, BLOCK_K), gl.float32, layout=layout)
-    for start in range(0, K, BLOCK_K):
-        weight = gl.amd.cdna4.buffer_load(
-            weight_ptr,
-            (outputs[:, None] * K + start + w_columns[None, :]).to(gl.int32),
-            cache=".cg",
-        ).to(gl.float32)
-        x = gl.amd.cdna4.buffer_load(
-            x_ptr,
-            (rows[:, None] * K + start + x_columns[None, :]).to(gl.int32),
-            mask=(rows < M)[:, None],
-            other=0.0,
-        ).to(gl.float32)
+    for step in gl.static_range(STEPS):
+        if step + X_AHEAD < STEPS:
+            xs += (
+                _rows_x_step(x_ptr, rows, x_columns, M, K, (step + X_AHEAD) * BLOCK_K),
+            )
+        weight = weights[step].to(gl.float32)
+        x = xs[step].to(gl.float32)
         accumulator += x[:, None, :] * weight[None, :, :]
+        # Pin this step's math here (a value LLVM treats as new). Otherwise
+        # LLVM vectorizes the math of all steps together after every load,
+        # keeping each step's activation registers live, which spills at the
+        # larger row buckets.
+        accumulator = arithmetic_fence(accumulator)
+        gl.amd.hint.sched_barrier()
     return gl.sum(accumulator, axis=2)
 
 
@@ -321,6 +359,7 @@ def gluon_rowcta_bf16_gemv_gfx950(
         OUTPUTS_PER_WAVE=outputs_per_wave,
         NUM_WARPS=num_warps,
         num_warps=num_warps,
+        **sched_compile_options(),
     )
     return out
 
