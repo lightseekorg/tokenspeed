@@ -233,6 +233,10 @@ def kda_layer_id(pool) -> int:
     return min(pool.state_group_by_layer)
 
 
+def whole_row_windows(arrays):
+    return {group_id: (array, array.shape[1]) for group_id, array in arrays.items()}
+
+
 def whole_row_spans(arrays):
     """Block-table row spans covering every column, exact for any table."""
     return {
@@ -257,7 +261,8 @@ def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
             arrays[spec.group_id] = np.full((bs, 1), filler_page, dtype=np.int32)
     spans = whole_row_spans(arrays)
     forward_op = SimpleNamespace(
-        block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+        block_table_windows=lambda: whole_row_windows(arrays),
+        block_table_spans=lambda: spans,
     )
     metadata = CacheBatchMetadata.from_forward_op(
         forward_op,

@@ -159,7 +159,9 @@ def test_cache_batch_metadata_accepts_npu_tables():
         group_packing={"full_attention": 1},
     )
     forward_op = SimpleNamespace(
-        block_tables_arrays=lambda: {"full_attention": np.array([[1]], dtype=np.int32)},
+        block_table_windows=lambda: {
+            "full_attention": (np.array([[1]], dtype=np.int32), 1)
+        },
         block_table_spans=lambda: {
             "full_attention": np.array([[0, 1]], dtype=np.int32)
         },

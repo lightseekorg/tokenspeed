@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from test.runtime.conftest import whole_row_spans
+from test.runtime.conftest import whole_row_spans, whole_row_windows
 from types import SimpleNamespace
 
 import numpy as np
@@ -192,7 +192,8 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     }
     spans = whole_row_spans(arrays)
     forward_op = SimpleNamespace(
-        block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+        block_table_windows=lambda: whole_row_windows(arrays),
+        block_table_spans=lambda: spans,
     )
     metadata = CacheBatchMetadata.from_forward_op(
         forward_op,
