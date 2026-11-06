@@ -26,7 +26,7 @@ import re
 
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, is_cdna4, vmcnt_zero_before_barrier
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -230,6 +230,7 @@ def _compile_splitk(**config):
     ``config`` overrides the 8192 x 256 router's 64-row bucket.
     """
     from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._scheduling import sched_compile_options
 
     fn = gluon_fp32_router_gemv_splitk_gfx950
     pointers = ("x_ptr", "weight_ptr", "out_ptr", "partial_ptr", "counter_ptr")
@@ -259,7 +260,7 @@ def _compile_splitk(**config):
             attrs=attrs,
         ),
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": 4},
+        options={"num_warps": 4, **sched_compile_options()},
     )
 
 
@@ -288,3 +289,20 @@ def test_splitk_partials_bypass_l2_and_weights_stream(config) -> None:
     assert set(loads) == {system, stream, default}, loads
     assert loads.count(system) % config["SPLIT_K"] == 0
     assert system in stores, stores
+
+
+def test_splitk_partials_reach_l2_before_arrival() -> None:
+    """Every wave's partial reaches L2 before the split arrives.
+
+    All waves write the split's partial, and one thread bumps the tile's
+    relaxed counter. Compile without launching and check that, on every
+    path, each wave runs s_waitcnt vmcnt(0) before the barrier preceding
+    the counter atomic.
+    """
+    arrivals = vmcnt_zero_before_barrier(
+        _compile_splitk().asm["amdgcn"],
+        "gluon_fp32_router_gemv_splitk_gfx950",
+        r"\bglobal_atomic_add\w*\b",
+    )
+    assert arrivals, "each split must arrive with an atomic add"
+    assert all(waited for _, waited, _ in arrivals), arrivals
