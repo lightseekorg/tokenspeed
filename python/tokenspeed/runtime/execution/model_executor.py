@@ -28,6 +28,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
+from tokenspeed_kernel.ops.gemm.hipblaslt import load_hipblaslt_tuned_solutions
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
 from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
@@ -1056,6 +1057,12 @@ class ModelExecutor:
         )
         if self.model_runner is None:
             return
+        tuned_file = envs.TOKENSPEED_HIPBLASLT_TUNED_FILE.get()
+        if tuned_file is not None:
+            # A process-wide BLAS setting rather than a kernel choice: GEMMs
+            # that dispatch to torch.mm replay the listed solutions from here
+            # on, in warmup and in graph capture alike.
+            load_hipblaslt_tuned_solutions(tuned_file)
         ib = self.input_buffers
         # The one traversal that discovers each operator is shaped like the
         # forwards this engine runs: an extend over the prefill budget, or,
