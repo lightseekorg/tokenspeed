@@ -59,13 +59,17 @@ def test_dense_launch_parameters_ignore_live_length(
     kv_dtype: torch.dtype,
     rope_dim: int,
 ) -> None:
-    launches: list[tuple[torch.Size, tuple[int, int, int], dict[str, Any]]] = []
+    launches: list[tuple[str, torch.Size, tuple[int, int, int], dict[str, Any]]] = []
 
     class CaptureKernel:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
         def __getitem__(self, grid: Any) -> Any:
             def launch(*args: Any, **kwargs: Any) -> None:
                 launches.append(
                     (
+                        self.name,
                         args[2].shape,
                         grid({"BLOCK_H": kwargs["BLOCK_H"]}),
                         kwargs,
@@ -79,7 +83,12 @@ def test_dense_launch_parameters_ignore_live_length(
             del grid
             return lambda *args, **kwargs: None
 
-    monkeypatch.setattr(attention, "_dsa_dense_mfma_kv_kernel", CaptureKernel())
+    monkeypatch.setattr(
+        attention, "_dsa_dense_mfma_kv_kernel", CaptureKernel("dense_mfma")
+    )
+    monkeypatch.setattr(
+        attention, "_dsa_sparse_prefill_fp8_kernel", CaptureKernel("prefill_fp8")
+    )
     monkeypatch.setattr(attention, "_dsa_dense_mfma_reduce_kernel", IgnoreReduce())
 
     q = torch.empty((tokens, 16, 512 + rope_dim), dtype=q_dtype)
@@ -113,10 +122,20 @@ def test_dense_launch_parameters_ignore_live_length(
 
     assert len(launches) == 7
     assert all(launch == launches[0] for launch in launches[1:])
-    width, grid, constants = launches[0]
+    kernel, width, grid, constants = launches[0]
     assert width == torch.Size((tokens, 2051))
     assert grid[0] == tokens
-    assert grid[2] == constants["NUM_KV_SPLITS"]
+    assert constants["SPLIT_KV"] == (grid[2] > 1)
+    native_fp8 = q_dtype == kv_dtype and q_dtype in attention._FP8_DTYPES
+    is_prefill = launch is launch_gluon_dsa_prefill_gfx950
+    if is_prefill and native_fp8 and rope_dim == 64:
+        assert kernel == "prefill_fp8"
+        assert constants["NATIVE_E5M2"] == (q_dtype == torch.float8_e5m2)
+        # Four CTAs per CU, whatever the selection width.
+        assert constants["waves_per_eu"] == 4
+        assert "TOPK_STAGED" not in constants
+        return
+    assert kernel == "dense_mfma"
     assert "PHASED_E4M3" not in constants
     assert "COLUMN_PARALLEL" not in constants
     assert constants["CONVERT_INPUTS"] == (q_dtype != kv_dtype)
