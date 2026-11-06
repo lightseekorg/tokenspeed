@@ -527,6 +527,15 @@ def _records_selection(degree, tokens, device):
     return slots.to(device), lengths.to(device)
 
 
+def _records_values(degree, device):
+    """Every virtual slot's BF16 latent row, before the caches' FP8."""
+    generator = torch.Generator().manual_seed(77)
+    values = torch.randn(
+        (_records_virtual_blocks(degree) * _RECORDS_BLOCK, 576), generator=generator
+    )
+    return values.to(device=device, dtype=torch.bfloat16)
+
+
 def _records_cache(degree, rank, device):
     """This rank's FP8 cache: the owned virtual blocks at their local slots."""
     from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
@@ -534,9 +543,7 @@ def _records_cache(degree, rank, device):
     )
 
     virtual = _records_virtual_blocks(degree)
-    generator = torch.Generator().manual_seed(77)
-    values = torch.randn((virtual * _RECORDS_BLOCK, 576), generator=generator)
-    values = values.to(device=device, dtype=torch.bfloat16)
+    values = _records_values(degree, device)
     local, owned = virtual_slots_to_local(
         torch.arange(values.shape[0], device=device),
         rows_per_page=_RECORDS_BLOCK,
@@ -781,6 +788,24 @@ def _decode_records_leaf(dsa, group, rank, requests, records_core):
     return leaf
 
 
+def _assert_attends_live_slots(output, q, slots, lengths, degree, scaling):
+    """A decode's TP-local heads against FP32 attention over each row's live
+    virtual slots, the query and cache in the FP8 the decode cores take,
+    within what their FP8 probabilities cost
+    (test_gluon_dsa_decode_dcp_records' bounds)."""
+    keys = _records_values(degree, q.device).to(torch.float8_e4m3fn).float()
+    queries = q.to(torch.float8_e4m3fn).float()
+    expected = torch.zeros((q.shape[0], q.shape[1], 512), device=q.device)
+    for row in range(q.shape[0]):
+        live = slots[row, : int(lengths[row])].long()
+        if live.numel():
+            scores = queries[row] @ keys[live].T * scaling
+            expected[row] = torch.softmax(scores, dim=-1) @ keys[live, :512]
+    error = output.float().view_as(expected) - expected
+    assert error.abs().max() < 0.15
+    assert error.square().mean().sqrt() <= 0.02 * expected.square().mean().sqrt()
+
+
 def _decode_records_worker(rank, degree, rendezvous, use_pynccl):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
@@ -841,10 +866,12 @@ def _decode_records_worker(rank, degree, rendezvous, use_pynccl):
             logit_cap=0.0,
         )
         with context:
-            # 4 and 16 requests reach the records core; 128 requests' rows
-            # fill the gfx950 core's grid without splitting its keys, so the
-            # decode keeps the packed partials.
-            for requests, records_arm in ((16, True), (4, True), (128, False)):
+            # Every launch reaches the records core. 4 and 16 requests' rows
+            # split by their live keys, which rounds the FP8 probabilities
+            # against other running maxima than the token-major decode, so
+            # both are held to FP32 attention; 128 requests' rows fill the
+            # gfx950 core's grid in one split, as the token-major decode's do.
+            for requests, exact in ((16, False), (4, False), (128, True)):
                 tokens = requests * 4
                 slots, lengths = _records_selection(degree, tokens, device)
                 generator = torch.Generator().manual_seed(900 + rank)
@@ -864,21 +891,24 @@ def _decode_records_worker(rank, degree, rendezvous, use_pynccl):
                             topk_lens=lengths,
                         )
                     )
-                    ran = probed and records_arm
                     shape = (degree, tokens, _RECORDS_HEADS, 576)
-                    assert launches == ([shape] if ran else [])
+                    assert launches == ([shape] if probed else [])
                 off, on = outputs
                 assert off.shape == (tokens, _RECORDS_HEADS * 512)
-                # Bit for bit, signed zeros included.
-                assert torch.equal(off.view(torch.int16), on.view(torch.int16))
-                assert not off[0].any()
+                if exact:
+                    # Bit for bit, signed zeros included.
+                    assert torch.equal(off.view(torch.int16), on.view(torch.int16))
+                else:
+                    for output in outputs:
+                        _assert_attends_live_slots(
+                            output, q, slots, lengths, degree, layer.scaling
+                        )
+                assert not off[0].any() and not on[0].any()
 
                 # The records core reads the query where an owned top-k's
                 # score gather landed its rider, bit for bit.
                 rider = leaf.dcp_decode_query_rider(layer, q)
-                assert (rider is not None) == records_arm
-                if rider is None:
-                    continue
+                assert rider is not None
                 gathered = rider.new_empty((degree, *rider.shape))
                 dist.all_gather_into_tensor(gathered, rider)
                 owned_slots, owned_lens = compact_owned_cache_slots(
