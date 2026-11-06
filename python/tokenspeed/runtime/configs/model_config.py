@@ -862,6 +862,11 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
+        if server_args.decode_monokernel:
+            # The model reads the switch from its text config. ServerArgs
+            # accepts it only for DECODE_MONOKERNEL_ARCHITECTURES, whose
+            # text configs declare the field.
+            self.hf_text_config.decode_monokernel = True
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -971,7 +976,20 @@ class ModelConfig:
                 )
                 if nextn_layers is not None and nextn_layers > 0:
                     self.num_attention_layers = nextn_layers
-        self.vocab_size = self.hf_text_config.vocab_size
+        self.input_vocab_size = self.hf_text_config.vocab_size
+        self.vocab_size = getattr(self.hf_text_config, "output_vocab_size", None)
+        if self.vocab_size is None:
+            self.vocab_size = self.input_vocab_size
+
+        if not (
+            type(self.input_vocab_size) is int
+            and type(self.vocab_size) is int
+            and 0 < self.vocab_size <= self.input_vocab_size
+        ):
+            raise ValueError(
+                "Vocabulary sizes must be integers satisfying 0 < output <= input; "
+                f"got input_vocab_size={self.input_vocab_size!r}, vocab_size={self.vocab_size!r}"
+            )
 
         # Verify quantization
         self._verify_quantization()
