@@ -1,58 +1,58 @@
 diff --git a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
-index c4f877e2e6fe73635767fad786f938a50a5f09da..37c3a54a3adfb242d25689255318eaa15f8d7adc 100644
+index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0ac34120b 100644
 --- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 +++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 @@ -58,0 +59 @@
 +#include "tensorrt_llm/deep_gemm/scheduler.cuh"
-@@ -3108,0 +3110 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -3161,0 +3163 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
 +  size_t deepseek_fc2_scales_size = 0;
-@@ -3123,0 +3126,5 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -3176,0 +3179,5 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
 +    if (is_gated_activation) {
 +      deepseek_fc2_scales_size =
 +          ::deep_gemm::compute_padded_offset(num_rows * experts_per_token, num_experts_per_node) *
 +          ((inter_size + 127) / 128) * sizeof(float);
 +    }
-@@ -3166,0 +3174 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -3219,0 +3227 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
 +  ADD(deepseek_fc2_scales);
-@@ -3285,0 +3294 @@ void CutlassMoeFCRunner<
+@@ -3338,0 +3347 @@ void CutlassMoeFCRunner<
 +  deepseek_fc2_scales_ = getWsPtr(float{}, "deepseek_fc2_scales");
-@@ -3358 +3367,3 @@ void CutlassMoeFCRunner<
+@@ -3411 +3420,3 @@ void CutlassMoeFCRunner<
 -                           bool enable_pdl, cudaStream_t stream) {
 +                           bool enable_pdl, cudaStream_t stream, int64_t expected_m,
 +                           float* fused_fc2_scales) {
 +  bool const fuse_swiglu_quant = fused_fc2_scales != nullptr;
-@@ -3363 +3374,5 @@ void CutlassMoeFCRunner<
+@@ -3416 +3427,5 @@ void CutlassMoeFCRunner<
 -
 +#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC1
 +  constexpr int max_num_stages_fc1 = FLASHINFER_SM90_MOE_MAX_STAGES_FC1;
 +#else
 +  constexpr int max_num_stages_fc1 = -1;
 +#endif
-@@ -3367 +3382,3 @@ void CutlassMoeFCRunner<
+@@ -3420 +3435,3 @@ void CutlassMoeFCRunner<
 -                      quant_params.fp8_block_scaling.fc1_scales_ptrs);
 +                      quant_params.fp8_block_scaling.fc1_scales_ptrs, expected_m,
 +                      max_num_stages_fc1, /*paired_rows=*/fuse_swiglu_quant, false,
 +                      fuse_swiglu_quant ? output : nullptr, fused_fc2_scales, enable_pdl);
-@@ -3369,0 +3387,2 @@ void CutlassMoeFCRunner<
+@@ -3422,0 +3440,2 @@ void CutlassMoeFCRunner<
 +  if (fuse_swiglu_quant) return;
 +
-@@ -3400 +3419,2 @@ void CutlassMoeFCRunner<
+@@ -3453 +3472,2 @@ void CutlassMoeFCRunner<
 -                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream) {
 +                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
 +                           int64_t expected_m, float* fused_fc2_scales) {
-@@ -3402,0 +3423,5 @@ void CutlassMoeFCRunner<
+@@ -3455,0 +3476,5 @@ void CutlassMoeFCRunner<
 +#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC2
 +  constexpr int max_num_stages_fc2 = FLASHINFER_SM90_MOE_MAX_STAGES_FC2;
 +#else
 +  constexpr int max_num_stages_fc2 = -1;
 +#endif
-@@ -3406,2 +3431,3 @@ void CutlassMoeFCRunner<
+@@ -3459,2 +3484,3 @@ void CutlassMoeFCRunner<
 -                      num_experts_per_node, shape_n, shape_k, stream, nullptr,
 -                      quant_params.fp8_block_scaling.fc2_scales_ptrs);
 +                      num_experts_per_node, shape_n, shape_k, stream, fused_fc2_scales,
 +                      quant_params.fp8_block_scaling.fc2_scales_ptrs, expected_m,
 +                      max_num_stages_fc2, false, fused_fc2_scales != nullptr, nullptr, nullptr, enable_pdl);
-@@ -3451,23 +3477,21 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
+@@ -3504,23 +3530,21 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
 -void CutlassMoeFCRunner<
 -    T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
 -    Enable>::gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
@@ -97,16 +97,16 @@ index c4f877e2e6fe73635767fad786f938a50a5f09da..37c3a54a3adfb242d25689255318eaa1
 +          bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
 +          bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
 +          bool enable_pdl, int64_t expected_m, float* fused_fc2_scales) {
-@@ -3479,2 +3503,2 @@ void CutlassMoeFCRunner<
+@@ -3532,2 +3556,2 @@ void CutlassMoeFCRunner<
 -                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl,
 -                        stream);
 +                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl, stream,
 +                        expected_m, fused_fc2_scales);
-@@ -3736 +3760,2 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+@@ -3789 +3813,2 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 -          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
 +          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
 +          int64_t expected_m, float* fused_fc2_scales) {
-@@ -3748,7 +3773,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+@@ -3801,7 +3826,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 -    Self::BlockScaleFC2(*fp8_blockscale_gemm_runner, input, gemm_output, final_output,
 -                        expert_first_token_offset, fc2_expert_weights, fc2_expert_biases,
 -                        unpermuted_final_scales, unpermuted_row_to_permuted_row,
@@ -121,7 +121,7 @@ index c4f877e2e6fe73635767fad786f938a50a5f09da..37c3a54a3adfb242d25689255318eaa1
 +        num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
 +        inter_size, num_experts_per_node, k, parallelism_config, enable_alltoall, quant_params,
 +        enable_pdl, stream, expected_m, fused_fc2_scales);
-@@ -4096 +4121,9 @@ void CutlassMoeFCRunner<
+@@ -4149 +4174,9 @@ void CutlassMoeFCRunner<
 -                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
 +                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
 +                    int64_t expected_m) {
@@ -132,13 +132,13 @@ index c4f877e2e6fe73635767fad786f938a50a5f09da..37c3a54a3adfb242d25689255318eaa1
 +#endif
 +  TLLM_CHECK_WITH_INFO(expected_m == -1 || (use_deepseek_fp8_block_scale && !min_latency_mode),
 +                       "expected_m is supported only by DeepSeek FP8 block-scaled MoE");
-@@ -4300 +4333 @@ void CutlassMoeFCRunner<
+@@ -4353 +4386 @@ void CutlassMoeFCRunner<
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4316 +4349 @@ void CutlassMoeFCRunner<
+@@ -4369 +4402 @@ void CutlassMoeFCRunner<
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4393,0 +4427,18 @@ void CutlassMoeFCRunner<
+@@ -4446,0 +4480,18 @@ void CutlassMoeFCRunner<
 +    float* fused_fc2_scales = nullptr;
 +#if defined(ENABLE_FP8_BLOCK_SCALE) && defined(FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT) && \
 +    FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT
@@ -157,10 +157,10 @@ index c4f877e2e6fe73635767fad786f938a50a5f09da..37c3a54a3adfb242d25689255318eaa1
 +      gemm2_result = glu_inter_result_;
 +    }
 +#endif
-@@ -4435 +4486 @@ void CutlassMoeFCRunner<
+@@ -4488 +4539 @@ void CutlassMoeFCRunner<
 -                nullptr, enable_pdl);
 +                nullptr, enable_pdl, expected_m, fused_fc2_scales);
-@@ -4448,9 +4499,10 @@ void CutlassMoeFCRunner<
+@@ -4501,9 +4552,10 @@ void CutlassMoeFCRunner<
 -    Self::gemm2(
 -        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
 -        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
@@ -181,7 +181,7 @@ index c4f877e2e6fe73635767fad786f938a50a5f09da..37c3a54a3adfb242d25689255318eaa1
 +                parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
 +                enable_pdl, expected_m, fused_fc2_scales);
 diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
-index 8aced03878c5d2058da77d393d7cd20d8bb97798..c1127e1189331a62209ce5afd393290d4876bedd 100644
+index 396830dca29767fb7cff4f29126a5053c90fd485..7b3d04ef60b4121ec011a5cd364c88f1e24fd3a8 100644
 --- a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
 +++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
 @@ -339,0 +340,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
@@ -191,31 +191,29 @@ index 8aced03878c5d2058da77d393d7cd20d8bb97798..c1127e1189331a62209ce5afd393290d
 +   * -1 uses the default estimate. Explicit hints require the OSS runner without
 +   * minimum-latency mode and are validated before dispatch.
 +   */
-@@ -352 +358,2 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
--              Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
-+              Optional<TensorView> workspace_buffer = Optional<TensorView>{},
+@@ -353 +359,2 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+-              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) {
++              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv,
 +              int64_t expected_m = -1) {
-@@ -355,0 +363,5 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -356,0 +364,5 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 +    TVM_FFI_ICHECK(expected_m == -1 || (expected_m > 0 && expected_m <= UINT32_MAX))
 +        << "expected_m must be -1 or a positive uint32 value";
 +    TVM_FFI_ICHECK(expected_m == -1 || (mUseDeepSeekFP8BlockScaling && !min_latency_mode))
 +        << "expected_m requires DeepSeek FP8 block scaling without min-latency mode";
 +
-@@ -486 +498 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -487 +499 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 -        min_latency_mode, min_latency_params, enable_pdl, stream);
 +        min_latency_mode, min_latency_params, enable_pdl, stream, expected_m);
-@@ -487,0 +500 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -488,0 +501 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 +    TVM_FFI_ICHECK_EQ(expected_m, -1) << "expected_m requires the OSS CUTLASS MoE runner";
-@@ -780,0 +794 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -783,0 +797 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 +  /** @brief Return a named MoE execution or profiling entry point for TVM FFI. */
-@@ -841 +855,2 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
--                 int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
-+                 int64_t base_activation_type, Optional<TensorView> workspace_buffer,
-+                 int64_t expected_m) {
-@@ -847 +862,2 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
--                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer);
-+                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer,
-+                   expected_m);
+@@ -845 +859 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+-                 int64_t nvfp4_4over6_code) {
++                 int64_t nvfp4_4over6_code, int64_t expected_m) {
+@@ -852 +866 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+-                   nvfp4_4over6_code);
++                   nvfp4_4over6_code, expected_m);
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
 index fbdc902972668033d6bd8653d60c875dd51889f7..5cf6590c561c80f0ca7c7d6f30e6c58ff6622e76 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
@@ -1169,32 +1167,32 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838
 -      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched);
 +      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched, false, false, false, false);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
-index 19e4b314358c94482e2beac17b56e4c80a604e19..bcddd6594effca300ccec1ca93571ae2637454fd 100644
+index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..0fd87439c869dfbe11a957494e4d7fd4122b98a5 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
-@@ -476,0 +477,5 @@ class CutlassMoeFCRunnerInterface {
+@@ -481,0 +482,5 @@ class CutlassMoeFCRunnerInterface {
 +  /**
 +   * @brief Execute the routed expert layers and combine their outputs.
 +   * @param expected_m Per-call token estimate for both DeepSeek FP8 block-scale
 +   * GEMMs, or -1 for the default estimate. Explicit hints exclude minimum-latency mode.
 +   */
-@@ -489,2 +494,2 @@ class CutlassMoeFCRunnerInterface {
+@@ -494,2 +499,2 @@ class CutlassMoeFCRunnerInterface {
 -                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
 -                      cudaStream_t stream) = 0;
 +                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
 +                      int64_t expected_m = -1) = 0;
-@@ -703,0 +709,5 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -708,0 +714,5 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 +  /**
 +   * @brief Permute tokens, run both expert GEMMs, and finalize the MoE output.
 +   * @param expected_m DeepSeek FP8 token estimate forwarded to both GEMMs for
 +   * this call, or -1 to retain their default configuration-selection policy.
 +   */
-@@ -715,2 +725,2 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -720,2 +730,2 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 -              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
 -              cudaStream_t stream) override;
 +              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
 +              int64_t expected_m = -1) override;
-@@ -719,27 +729,38 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -724,27 +734,38 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 -  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
 -                                  Sm90Wfp4Afp8Mode>& gemm_runner,
 -                    // This argument must not be null if fp8 block scaling is being used.
@@ -1260,23 +1258,23 @@ index 19e4b314358c94482e2beac17b56e4c80a604e19..bcddd6594effca300ccec1ca93571ae2
 +   * @param expected_m Per-call token estimate for the FP8 block-scale runner;
 +   * -1 uses its default estimate. Other GEMM paths do not consume this hint.
 +   */
-@@ -766 +787 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -771 +792 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 -      bool enable_pdl);
 +      bool enable_pdl, int64_t expected_m, float* fused_fc2_scales);
-@@ -797 +818 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -802 +823 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 -                       active_expert_global_ids, enable_pdl);
 +                       active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -832 +853 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -837 +858 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 -        num_active_experts_per, active_expert_global_ids, enable_pdl);
 +        num_active_experts_per, active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -986,0 +1008,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -991,0 +1013,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 +  /**
 +   * @brief Run the first FP8 block-scale expert GEMM and apply its activation.
 +   * @param fused_fc2_scales Non-null selects fused FP8 output and receives its padded scales.
 +   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
 +   * for the runner's default estimate. The workspace must already be configured.
 +   */
-@@ -996,2 +1023,9 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -1001,2 +1028,9 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 -                            bool enable_pdl, cudaStream_t stream);
 -
 +                            bool enable_pdl, cudaStream_t stream, int64_t expected_m,
@@ -1288,17 +1286,17 @@ index 19e4b314358c94482e2beac17b56e4c80a604e19..bcddd6594effca300ccec1ca93571ae2
 +   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
 +   * for the runner's default estimate. The workspace must already be configured.
 +   */
-@@ -1009 +1043,2 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -1014 +1048,2 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 -      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream);
 +      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
 +      int64_t expected_m, float* fused_fc2_scales);
-@@ -1039,0 +1075 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -1044,0 +1080 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 +  float* deepseek_fc2_scales_{};
 diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
-index 70e0fa9a3e25c61d9232cbc831efedb15b0be1e4..d85f47a5cc8aa320941c839e310ec40e238bfdae 100644
+index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..1aa77331d4811179b440d00a176e8be2483741de 100644
 --- a/flashinfer/fused_moe/core.py
 +++ b/flashinfer/fused_moe/core.py
-@@ -627,0 +628,23 @@
+@@ -636,0 +637,23 @@
 +def _validate_cutlass_moe_expected_m(
 +    expected_m: Optional[int],
 +    *,
@@ -1322,7 +1320,7 @@ index 70e0fa9a3e25c61d9232cbc831efedb15b0be1e4..d85f47a5cc8aa320941c839e310ec40e
 +        )
 +
 +
-@@ -629 +652,9 @@
+@@ -638 +661,9 @@
 -def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
 +def get_cutlass_fused_moe_module(
 +    backend: str = "100",
@@ -1333,26 +1331,26 @@ index 70e0fa9a3e25c61d9232cbc831efedb15b0be1e4..d85f47a5cc8aa320941c839e310ec40e
 +    """Build and cache CUTLASS MoE operations and their workspace-size query."""
 +    if enable_sm90_moe_optimizations and backend != "90":
 +        raise ValueError("SM90 MoE optimizations require the SM90 backend")
-@@ -637 +668,4 @@
+@@ -646 +677,4 @@
 -        module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
 +        module = gen_cutlass_fused_moe_sm90_module(
 +            use_fast_build,
 +            enable_sm90_moe_optimizations=enable_sm90_moe_optimizations,
 +        ).build_and_load()
-@@ -780 +814 @@
+@@ -789 +823 @@
 -            )
 +            ) + (("sm90_grouped_optimized",) if enable_sm90_moe_optimizations else ())
-@@ -961,0 +996,4 @@
+@@ -970,0 +1005,4 @@
 +    op_name = "flashinfer::cutlass_fused_moe"
 +    if enable_sm90_moe_optimizations:
 +        op_name += "_sm90_grouped_optimized"
 +
-@@ -963 +1001 @@
+@@ -972 +1010 @@
 -        "flashinfer::cutlass_fused_moe",
 +        op_name,
-@@ -1003,0 +1042 @@
+@@ -1014,0 +1053 @@
 +        expected_m: Optional[int] = None,
-@@ -1004,0 +1044,12 @@
+@@ -1015,0 +1055,12 @@
 +        """Execute CUTLASS MoE with the selected tactics and workspace.
 +
 +        Forward expected_m to both DeepSeek FP8 block-scale expert GEMMs for
@@ -1365,27 +1363,27 @@ index 70e0fa9a3e25c61d9232cbc831efedb15b0be1e4..d85f47a5cc8aa320941c839e310ec40e
 +                min_latency_mode=min_latency_mode,
 +                backend="cutlass",
 +            )
-@@ -1131,0 +1183,5 @@
+@@ -1143,0 +1195,5 @@
 +            *(
 +                []
 +                if min_latency_mode
 +                else [expected_m if expected_m is not None else -1]
 +            ),
-@@ -1145 +1201 @@
+@@ -1157 +1213 @@
 -    @register_fake_op("flashinfer::cutlass_fused_moe")
 +    @register_fake_op(op_name)
-@@ -1183,0 +1240 @@
+@@ -1197,0 +1254 @@
 +        expected_m: Optional[int] = None,
-@@ -1184,0 +1242,5 @@
+@@ -1198,0 +1256,5 @@
 +        """Infer output tensors for fake execution of the CUTLASS MoE operation.
 +
 +        Minimum-latency mode also returns expert-routing metadata. The
 +        expected_m scheduling hint does not affect output shapes or dtypes.
 +        """
-@@ -1316,0 +1379,2 @@
+@@ -1331,0 +1394,2 @@
 +    expected_m: Optional[int] = None,
 +    enable_sm90_moe_optimizations: bool = False,
-@@ -1502,0 +1567,18 @@
+@@ -1529,0 +1594,18 @@
 +    expected_m : Optional[int]
 +        Expected number of tokens per local expert for DeepGEMM configuration selection.
 +        Supported only by CUTLASS DeepSeek FP8 block-scale MoE on SM90 with DeepGEMM
@@ -1404,7 +1402,7 @@ index 70e0fa9a3e25c61d9232cbc831efedb15b0be1e4..d85f47a5cc8aa320941c839e310ec40e
 +        Choose this option before warmup and CUDA graph capture. Modules, native
 +        kernel caches and tuning keys are separate for the two configurations.
 +
-@@ -1522,0 +1605,15 @@
+@@ -1570,0 +1653,15 @@
 +    if type(enable_sm90_moe_optimizations) is not bool:
 +        raise TypeError("enable_sm90_moe_optimizations must be a bool")
 +    if enable_sm90_moe_optimizations and (
@@ -1420,7 +1418,7 @@ index 70e0fa9a3e25c61d9232cbc831efedb15b0be1e4..d85f47a5cc8aa320941c839e310ec40e
 +            min_latency_mode=min_latency_mode,
 +            backend=backend,
 +        )
-@@ -1614 +1711,7 @@
+@@ -1662 +1759,7 @@
 -        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
 +        if enable_sm90_moe_optimizations:
 +            module = get_cutlass_fused_moe_module(
@@ -1429,5 +1427,5 @@ index 70e0fa9a3e25c61d9232cbc831efedb15b0be1e4..d85f47a5cc8aa320941c839e310ec40e
 +        else:
 +            module = get_cutlass_fused_moe_module(device_arch)
 +        return module.cutlass_fused_moe(
-@@ -1651,0 +1755 @@
+@@ -1700,0 +1804 @@
 +            expected_m=expected_m,

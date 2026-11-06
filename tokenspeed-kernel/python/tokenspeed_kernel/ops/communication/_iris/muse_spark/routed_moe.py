@@ -56,6 +56,7 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
     weight_offset: gl.constexpr,
     block: gl.constexpr,
     num_warps: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Normalize and weight local expert routes, then all-reduce their token sums.
 
@@ -99,6 +100,11 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
     row_offsets = token * width + columns
     local = combined.to(gl.bfloat16)
     gl.store(symmetric_input + row_offsets, local, mask=valid)
+    # The barrier the compiler inserts before the one-thread release does not
+    # wait for memory, and the releasing thread's buffer_wbl2 and s_waitcnt
+    # vmcnt(0) cover only its own subgroup's stores. So each subgroup first
+    # waits until its stores reach L2 (s_waitcnt vmcnt(0) on gfx950).
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
 
     local_heap = _iris_group_heap_base(rank, heaps)
     epoch_ptr = ready_flags + token * WORLD_SIZE + rank

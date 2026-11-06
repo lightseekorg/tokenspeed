@@ -1569,6 +1569,7 @@ class MuseIrisState:
             weight_offset=weight_offset,
             block=block,
             num_warps=num_warps,
+            WAIT_STORES=self._arch.wait_stores,
         )
         return self.gather.output[: num_tokens * width].view(num_tokens, width)
 
@@ -1887,6 +1888,7 @@ class MuseIrisState:
                 + self.all_reduce.rank_in_group * local_width * local.element_size()
             ),
             num_warps=8,
+            WAIT_STORES=self._arch.wait_stores,
         )
         return packed, scales
 
