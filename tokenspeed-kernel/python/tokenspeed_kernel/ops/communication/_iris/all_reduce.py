@@ -682,17 +682,20 @@ def _iris_lamport_push(
     offset,
     offsets,
     mask,
+    program,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
     """Store values[delta - 1] at offset in peer (RANK + delta)'s region.
 
-    Each program starts at a different peer so that concurrent stores spread
-    across all links instead of all targeting RANK + 1 first. One uniform
-    branch selects the order, so peer bases stay scalar constants.
+    Each ``program`` (a sender index, uniform per program) starts at a
+    different peer so that concurrent stores spread across all links instead
+    of all targeting RANK + 1 first. One uniform branch selects the order, so
+    peer bases stay scalar constants. Every caller, the Kimi-K3 gather senders
+    included, passes its own program index (``gl.program_id(0)`` today).
     """
-    rotation = gl.program_id(0) % (WORLD_SIZE - 1)
+    rotation = program % (WORLD_SIZE - 1)
     for first in gl.static_range(WORLD_SIZE - 1):
         if rotation == first:
             for step in gl.static_range(WORLD_SIZE - 1):
@@ -842,6 +845,7 @@ def _iris_lamport_exchange_tile(
         generation * stride + RANK * MAX_ELEMENTS,
         offsets,
         mask,
+        gl.program_id(0),
         RANK,
         WORLD_SIZE,
         PEER_SIGNAL_STORE_CACHE,
@@ -2362,6 +2366,7 @@ def iris_lamport_bf16_allreduce(
         generation * stride + RANK * MAX_ELEMENTS,
         offsets,
         mask,
+        gl.program_id(0),
         RANK,
         WORLD_SIZE,
         PEER_SIGNAL_STORE_CACHE,
@@ -2418,6 +2423,7 @@ def iris_lamport_twoshot_rs_push(
     stage,
     offsets,
     mask,
+    program,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     MAX_SHARD_ELEMENTS: gl.constexpr,
@@ -2429,6 +2435,8 @@ def iris_lamport_twoshot_rs_push(
     at offsets within the shard, already sanitized (no negative zero).
     regions are the peers' two-shot region addresses; stage selects one of
     the region's [stage][reduce-scatter, all-gather][source][shard] mailboxes.
+    ``program`` is the sender index that picks the first peer (see
+    _iris_lamport_push).
     """
     PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
     _iris_lamport_push(
@@ -2437,6 +2445,7 @@ def iris_lamport_twoshot_rs_push(
         stage * (2 * PHASE) + RANK * MAX_SHARD_ELEMENTS,
         offsets,
         mask,
+        program,
         RANK,
         WORLD_SIZE,
         PEER_SIGNAL_STORE_CACHE,
@@ -2490,12 +2499,17 @@ def iris_lamport_twoshot_ag_push(
     stage,
     offsets,
     mask,
+    program,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     MAX_SHARD_ELEMENTS: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
-    """Push this rank's reduced shard part to every peer's all-gather slot RANK."""
+    """Push this rank's reduced shard part to every peer's all-gather slot RANK.
+
+    ``program`` is the sender index that picks the first peer (see
+    _iris_lamport_push).
+    """
     PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
     published = ()
     for _ in gl.static_range(1, WORLD_SIZE):
@@ -2506,6 +2520,7 @@ def iris_lamport_twoshot_ag_push(
         stage * (2 * PHASE) + PHASE + RANK * MAX_SHARD_ELEMENTS,
         offsets,
         mask,
+        program,
         RANK,
         WORLD_SIZE,
         PEER_SIGNAL_STORE_CACHE,
@@ -2596,6 +2611,7 @@ def _iris_lamport_twoshot_tile(
         stage,
         offsets,
         None,
+        gl.program_id(0),
         RANK,
         WORLD_SIZE,
         MAX_SHARD_ELEMENTS,
@@ -2619,6 +2635,7 @@ def _iris_lamport_twoshot_tile(
         stage,
         offsets,
         None,
+        gl.program_id(0),
         RANK,
         WORLD_SIZE,
         MAX_SHARD_ELEMENTS,
