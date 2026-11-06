@@ -1035,7 +1035,8 @@ TEST(BlockTablePageIdsExport, ASwappedSlotExportsTheFreshBlock) {
     BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, pool.AcquireBlocks(0, 2), /*available_tokens=*/0);
     const std::vector<std::int32_t> before = allocator.BlockTablePageIds(table);
 
-    const CacheBlockRef replaced = allocator.SwapInFreshBlock(pool, table, /*slot=*/1, /*available_tokens=*/0);
+    const CacheBlockRef replaced =
+        allocator.SwapInFreshBlock(pool, table, /*slot=*/1, /*available_tokens=*/0, /*destination=*/std::nullopt);
 
     ASSERT_TRUE(replaced);
     EXPECT_EQ(allocator.ResolveCacheBlockId(*replaced), before[1]);

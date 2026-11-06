@@ -500,6 +500,37 @@ TEST(PrefixCacheIndexCommonOrderTest, KeepsEvictionAndCommonOrderCurrentWhenPinn
     EXPECT_FALSE(index.NextCommonRecentEntry(source, cursor));
 }
 
+// The common order follows a relocated source entry: the pair stays, listed
+// at the new location, and leaves with the entry.
+TEST(PrefixCacheIndexCommonOrderTest, KeepsTheCommonOrderCurrentWhenAnEntryMoves) {
+    BlockPool source(3, {1});
+    BlockPool peer(1, {1});
+    PrefixCacheIndex index(kGroupId);
+    index.TrackCommonEntries(source, peer);
+    const CacheBlockLocation from = Cache(index, source, "moved", 4);
+    Cache(index, source, "other", 7);
+    Cache(index, peer, "moved", 40);
+    CacheBlockRef pin = index.Find(source, KeyOf("moved"));
+    CacheBlockRef copy = source.AcquireBlock(kGroupId);
+    const CacheBlockLocation to = copy->Location();
+    index.Relocate(source, from, copy);
+    pin = std::move(copy);
+    {
+        PrefixCacheIndex::CommonCursor cursor;
+        const auto common = index.NextCommonRecentEntry(source, cursor);
+        ASSERT_TRUE(common);
+        EXPECT_EQ(*common->key, KeyOf("moved"));
+        EXPECT_EQ(common->source.location, to);
+        EXPECT_EQ(common->source.metadata.last_access_epoch, 4u);
+        EXPECT_TRUE(common->source.pinned);
+        EXPECT_FALSE(index.NextCommonRecentEntry(source, cursor));
+    }
+    pin.reset();
+    EXPECT_EQ(index.Evict(source, to), KeyOf("moved"));
+    PrefixCacheIndex::CommonCursor cursor;
+    EXPECT_FALSE(index.NextCommonRecentEntry(source, cursor));
+}
+
 TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinningEntries) {
     BlockPool pool(3, {1});
     BlockPool absent(1, {1});
@@ -631,6 +662,64 @@ TEST(PrefixCacheIndexEvictionOrderTest, EvictedEntriesLeaveTheOrder) {
 
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{kept}));
     EXPECT_EQ(index.NumEntries(pool), 1);
+}
+
+// A lone request's compaction copies a published block and moves its entry
+// onto the copy: the entry keeps its age, acquisition mark, pin and its hold
+// on the boundary-tree node (which keeps its boundary), nothing is left at
+// the old location, and the eviction order lists it where it is now once
+// the pin goes.
+TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePinAndHold) {
+    BlockPool pool(4, {1});
+    BoundaryTree tree(BoundaryTree::Config{.prefix_granularity = 8,
+                                           .closed_blocks_per_page = 1,
+                                           .num_state_groups = 0,
+                                           .has_prefix_closed_groups = true,
+                                           .has_host_tier = false,
+                                           .queue_dead_candidates = false},
+                      /*checkpoints=*/nullptr);
+    PrefixCacheIndex index(kGroupId);
+    index.TrackBoundaries(tree, pool, /*host_pool=*/nullptr, /*state=*/false, /*closed=*/true);
+    const std::vector<std::string> hashes{"moved"};
+    BoundaryTree::Hold publication =
+        tree.LinkPublication(CompletedPages{.prefix_hashes = hashes, .first_new_prefix_page = 0});
+    const CacheBlockLocation from = Cache(index, pool, "moved", /*access_epoch=*/10);
+    const CacheBlockLocation other = Cache(index, pool, "other", /*access_epoch=*/20);
+    publication.reset();
+    const BoundaryTree::Node* node = tree.Find("moved");
+    ASSERT_NE(node, nullptr);
+    ASSERT_EQ(node->boundary_tokens, 8);
+
+    // Pinned by a hit, and set aside by a traversal that found it pinned.
+    CacheBlockRef pin =
+        index
+            .AcquireMatched(pool, std::vector<CacheKey>{KeyOf("moved")}, 0, GroupPrefixProbe{.hits = {1}},
+                            /*access_epoch=*/10, /*session=*/nullptr)
+            .blocks.front();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{other}));
+    CacheBlockRef copy = pool.AcquireBlock(kGroupId);
+    const CacheBlockLocation to = copy->Location();
+    index.Relocate(pool, from, copy);
+    pin = std::move(copy);  // the pin follows; nothing holds the old block
+    EXPECT_FALSE(pool.IsOccupied(from));
+    EXPECT_FALSE(index.Contains(pool, from));
+    EXPECT_EQ(index.KeyOf(pool, to), KeyOf("moved"));
+    const auto moved = index.Inspect(pool, KeyOf("moved"));
+    ASSERT_TRUE(moved);
+    EXPECT_EQ(moved->location, to);
+    EXPECT_EQ(moved->metadata.last_access_epoch, 10u);
+    EXPECT_TRUE(moved->metadata.was_acquired);
+    EXPECT_TRUE(moved->pinned);
+    EXPECT_EQ(tree.Find("moved"), node);
+    EXPECT_EQ(node->Entries(BoundaryTree::kDevice), 1);
+    EXPECT_EQ(node->boundary_tokens, 8);
+    // Set aside while pinned; back in age order, at the new location, once
+    // the pin goes.
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{other}));
+    pin.reset();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{to, other}));
+    EXPECT_EQ(index.Evict(pool, to), KeyOf("moved"));
+    EXPECT_EQ(tree.Find("moved"), nullptr);
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, MatchesTheEvictableSetSeenByAFullScan) {

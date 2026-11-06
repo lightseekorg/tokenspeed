@@ -270,6 +270,21 @@ public:
         return out;
     }
 
+    // One block at a given free child slot of a parent already bound to this
+    // group. The one placement that names its slot: a lone request's
+    // compaction (CacheCoordinator::CompactLoneRequest) moves a block into a
+    // hole of one of the request's own denser parents, where the hole-first
+    // order of nextLocation (most occupied parent first, then the FIFO) could
+    // pick another parent or the block's own.
+    CacheBlockRef AcquireBlockAt(std::uint32_t group_id, CacheBlockLocation location) {
+        const LcmBlock& parent = lcmBlock(location.lcm_block_id);
+        _assert(parent.bound_group == group_id && location.slot_index >= 0 &&
+                    static_cast<std::size_t>(location.slot_index) < parent.occupancy.size() &&
+                    !parent.occupancy[static_cast<std::size_t>(location.slot_index)],
+                "a placed block takes a free slot of a parent bound to its group");
+        return createBlockRef(group_id, placement(group_id).packing, location);
+    }
+
     std::vector<CacheBlockRef> AcquireUpToBlocks(std::uint32_t group_id, std::int32_t max_num) {
         const auto cache_blocks_per_lcm_block = placement(group_id).packing;
         if (max_num <= 0) {
@@ -426,6 +441,9 @@ private:
     CacheBlockLocation nextLocation(const GroupAvailability& group, std::span<const std::int64_t> loads) const {
         // Ordinary allocation orders by parent occupancy, parent ID, then slot.
         // Balanced allocation puts request load and bucket ID before that order.
+        // Holes first, so a request's blocks can land one per parent beside
+        // cached pages; what that leaves a request alone is undone by its
+        // compaction (CacheCoordinator::CompactLoneRequest), never here.
         using Priority = std::tuple<std::int64_t, std::size_t, std::int32_t, std::int32_t, std::int32_t>;
         std::optional<Priority> best;
         CacheBlockLocation location;
