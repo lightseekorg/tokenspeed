@@ -48,6 +48,7 @@ from tokenspeed_kernel.ops.layernorm import (
 )
 from tokenspeed_kernel.ops.moe import (
     FUSED_ROUTING_MAX_TOKENS,
+    MoeStreamDecode,
     PreparedNvfp4Routing,
     bf16_moe_routes,
     bf16_moe_routes_warmup,
@@ -56,6 +57,7 @@ from tokenspeed_kernel.ops.moe import (
     moe_sorted_gate_up,
     moe_topk,
     moe_warmup,
+    prepare_moe_stream_decode,
     prepare_nvfp4_routing,
     routed_input_scale_rmsnorm_sum,
     routed_input_scale_rmsnorm_sum_gathered,
@@ -144,6 +146,12 @@ _GATHER_WORKSPACE_ROWS = 64
 # workspace rows past 64 serve only as the fused path's placeholder for the
 # gathered BF16 rows, which it returns but does not fill.
 _GATHER_MXFP4_MAX_ROWS = 172
+# Decode row counts at which expert TP8 (EP1) on gfx950 runs the experts as
+# one stream launch instead of the two-stage direct decode. The launch
+# compiles once per row count, so keep this set small. Measured on MI355X
+# (one GPU, graph replay, cold weights, recorded routings): faster at 8 rows;
+# at 16 rows the route-tile decode is as fast, so it keeps that path.
+_MOE_STREAM_ROWS = frozenset({8})
 _gather_workspaces: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
 
 
@@ -1167,7 +1175,9 @@ class MuseSparkMoE(nn.Module):
         # The copy costs one more down projection of weight memory per GPU.
         # Other layouts and the BF16 expert layers keep the reduce-scatter.
         self.down_columns: MoEDownColumns | None = None
-        if (
+        # The same layouts may run small decode batches as one stream launch
+        # (``moe_stream``), bound with the communication state.
+        self.expert_tp8_mxfp4 = (
             self.quantized_experts
             and current_platform().is_cdna4
             and self.expert_quant_kind == "mxfp4"
@@ -1179,7 +1189,9 @@ class MuseSparkMoE(nn.Module):
             and config.moe_intermediate_size == 4096
             and self.num_experts == 256
             and self.topk == 8
-        ):
+        )
+        self.moe_stream: MoeStreamDecode | None = None
+        if self.expert_tp8_mxfp4:
             self.down_columns = MoEDownColumns(
                 self.experts_per_rank,
                 compressed_size,
@@ -1426,15 +1438,16 @@ class MuseSparkMoE(nn.Module):
             deferred_out = self._acquire_route_destination(
                 topk_ids.shape[0], owned_rows
             )
-        gemm2_out, _, expanded_idx = self.experts(
-            hidden_states=compressed,
-            topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
-            num_global_tokens=num_global_tokens,
-            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-            do_finalize=False,
-            x_quantized=compressed_quantized,
-            routing_prepared=prepared,
-            deferred_out=deferred_out,
+        gemm2_out, expanded_idx = self._expert_routes(
+            compressed,
+            compressed_quantized,
+            topk_weights,
+            topk_ids,
+            router_logits,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            prepared,
+            deferred_out,
         )
         if deferred_out is not None:
             assert gemm2_out.data_ptr() == deferred_out.data_ptr()
@@ -1462,6 +1475,47 @@ class MuseSparkMoE(nn.Module):
             route_weights=topk_weights,
             owned_rows=owned_rows,
         )
+
+    def _expert_routes(
+        self,
+        compressed: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        compressed_quantized: tuple[torch.Tensor, torch.Tensor] | None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor | None,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        prepared: PreparedNvfp4Routing | None,
+        deferred_out: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Unweighted expert routes and their route map (None: canonical rows).
+
+        Decode batches of ``_MOE_STREAM_ROWS`` rows written into a borrowed
+        destination run as one stream launch when the layer has one bound;
+        everything else runs the planned MoE kernel. Both write the same rows,
+        bit for bit.
+        """
+        if (
+            self.moe_stream is not None
+            and deferred_out is not None
+            and compressed_quantized is not None
+            and topk_ids.shape[0] in _MOE_STREAM_ROWS
+        ):
+            routes = self.moe_stream(
+                compressed_quantized, topk_ids, self.experts, deferred_out
+            )
+            return routes, None
+        routes, _, route_map = self.experts(
+            hidden_states=compressed,
+            topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            do_finalize=False,
+            x_quantized=compressed_quantized,
+            routing_prepared=prepared,
+            deferred_out=deferred_out,
+        )
+        return routes, route_map
 
     def _column_split_combined(
         self,
@@ -2615,6 +2669,29 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
                 if isinstance(projection, _MuseGatheredLinear):
                     projection.iris_state = state
+        stream_mlps = [
+            layer.mlp for layer in self.model.layers if layer.mlp.expert_tp8_mxfp4
+        ]
+        # Bound once: its launch state lives as long as the model.
+        if stream_mlps and stream_mlps[0].moe_stream is None:
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            stream = prepare_moe_stream_decode(
+                device,
+                # expert_tp8_mxfp4 holds only for MXFP4 experts.
+                weight_dtype="mxfp4",
+                hidden=self.config.moe_hidden_size,
+                ispp=self.config.moe_intermediate_size // mapping.moe.tp_size,
+                num_experts=stream_mlps[0].experts_per_rank,
+                top_k=self.config.num_experts_per_tok,
+                ep_size=mapping.moe.ep_size,
+                num_cus=torch.cuda.get_device_properties(device).multi_processor_count,
+            )
+            if stream is not None:
+                # Every layer shares the expert shapes; compile each row count.
+                for rows in sorted(_MOE_STREAM_ROWS):
+                    stream.warmup(stream_mlps[0].experts, rows)
+            for mlp in stream_mlps:
+                mlp.moe_stream = stream
         if owned_route_max_rows:
             # Startup may never run a batch in the expert TP8 owner-side
             # window; every layer shares the routed norm's eps and center.

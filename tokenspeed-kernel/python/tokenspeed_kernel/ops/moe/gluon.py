@@ -1359,6 +1359,12 @@ if platform.is_amd:
         sorted_route_capacity,
         warm_gluon_mxfp4_situ_prefill_rows,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_stream import (
+        TAIL_SHARE,
+        MoeStreamState,
+        launch_gluon_mxfp4_moe_stream_gfx950,
+        moe_stream_weights,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp4_gemm import (
         launch_gluon_mxfp4_a4w4_moe_apply_gfx950,
     )
@@ -1368,6 +1374,9 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_mxfp8 import (
         mxfp8_situ_prefill,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+        empty_swizzled_cdna4_mxfp4_scale,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
         _supports_a16w4_warp_decode_ep_gfx950,
@@ -1911,6 +1920,77 @@ if platform.is_amd:
     )
     gluon_mxfp4_sorted_down_gfx950._tokenspeed_warmup = (  # type: ignore[attr-defined]
         _warmup_sorted_prefill_gfx950
+    )
+
+    @register_kernel(
+        "moe",
+        "stream_decode",
+        name="gluon_mxfp4_moe_stream_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=format_signatures("x", "dense", {torch.uint8}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "hidden": frozenset({4096}),
+            "ispp": frozenset({512}),
+            "num_experts": frozenset({256}),
+            "top_k": frozenset({8}),
+            "ep_size": frozenset({1}),
+            # One workgroup per CU, all resident at once (see moe_stream.py).
+            "num_cus": frozenset({256}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mxfp4_moe_stream_gfx950(
+        state: Any,
+        x_quantized: tuple[torch.Tensor, torch.Tensor],
+        topk_ids: torch.Tensor,
+        w: torch.nn.Module,
+        deferred_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """gfx950 kernel of :class:`tokenspeed_kernel.ops.moe.MoeStreamDecode`.
+
+        Bitwise equal to the direct A4W4 decode's deferred route rows.
+        """
+        swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+        return launch_gluon_mxfp4_moe_stream_gfx950(
+            x_quantized[0],
+            x_quantized[1],
+            moe_stream_weights(w),
+            topk_ids,
+            deferred_out,
+            state,
+            tail_num=TAIL_SHARE[0],
+            tail_den=TAIL_SHARE[1],
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
+        )
+
+    def _moe_stream_state_gfx950(device: torch.device) -> Any:
+        return MoeStreamState(device)
+
+    def _warmup_moe_stream_gfx950(state: Any, w: torch.nn.Module, rows: int) -> None:
+        """Run the stream once for ``rows`` tokens (a compilation per row
+        count) with the serving activation layout."""
+        device = state.device
+        top_k = 8
+        with torch.cuda.device(device), torch.no_grad():
+            packed = torch.zeros((rows, 2048), device=device, dtype=torch.uint8)
+            scales = empty_swizzled_cdna4_mxfp4_scale(rows, 128, device=device)
+            scales.fill_(127)
+            ids = torch.arange(rows * top_k, device=device, dtype=torch.int32)
+            ids = ids.remainder(256).view(rows, top_k)
+            out = torch.empty((rows * top_k, 4096), device=device, dtype=torch.bfloat16)
+            gluon_mxfp4_moe_stream_gfx950(state, (packed, scales), ids, w, out)
+            torch.cuda.synchronize(device)
+
+    # The launch state and warmup belong to the selected kernel.
+    gluon_mxfp4_moe_stream_gfx950._tokenspeed_state = (  # type: ignore[attr-defined]
+        _moe_stream_state_gfx950
+    )
+    gluon_mxfp4_moe_stream_gfx950._tokenspeed_warmup = (  # type: ignore[attr-defined]
+        _warmup_moe_stream_gfx950
     )
 
     @register_kernel(

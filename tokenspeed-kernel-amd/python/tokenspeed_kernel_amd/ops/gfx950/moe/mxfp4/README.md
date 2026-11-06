@@ -42,6 +42,10 @@ its depth per shape from `_DIRECT_STAGE1_PREFETCH_TILES`. Neither changes the
 K accumulation order, so every schedule, and the direct decode and staged
 package paths that serve the other rows, produce bitwise-identical results.
 
+At a few decode row counts, `moe_stream.py` runs both decode stages as one
+launch of per-wave weight streams with the same numerics; see
+`gluon_mxfp4_moe_stream_gfx950` in `ops/README.md`.
+
 The package prefill also runs as two calls split at the intermediate:
 `gluon_mxfp4_sorted_gate_up_gfx950` writes sorted E2M1 rows into a caller
 buffer and returns the sorted-route metadata, and
