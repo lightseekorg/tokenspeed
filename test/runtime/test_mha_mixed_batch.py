@@ -633,11 +633,17 @@ def _cached_attention_cpu(
     window_left,
     **kwargs
 ):
-    """CPU stand-in for the unavailable GPU operation, using its public ABI."""
+    """CPU stand-in for the unavailable GPU operation, using its public ABI.
+
+    Drops keys past max_seqlen_k so a bound below a request's length fails the
+    comparison.
+    """
     outputs = []
+    bound = kwargs.get("max_seqlen_k", cache_seqlens.max().item())
     for request, length in enumerate(cache_seqlens.tolist()):
         start, end = cu_seqlens_q[request : request + 2].tolist()
         slots = page_table[request, : (length + 15) // 16].long()
+        length = min(length, bound)
         repeats = q.shape[1] // k_cache.shape[2]
         key = k_cache[slots].flatten(0, 1)[:length].repeat_interleave(repeats, dim=1)
         value = v_cache[slots].flatten(0, 1)[:length].repeat_interleave(repeats, dim=1)
@@ -730,6 +736,74 @@ def test_mixed_forward_keeps_decode_history_and_drops_only_padding(
     torch.testing.assert_close(output, torch.cat(expected).flatten(1), rtol=0, atol=0)
     assert torch.isfinite(output).all()
     assert torch.equal(key, before_key) and torch.equal(value, before_value)
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.MIXED])
+def test_cached_extend_bounds_keys_by_the_longest_request(monkeypatch, mode):
+    # The cached-prefix kernel gets the longest request's length as
+    # max_seqlen_k when the host knows every length (pure extends), and the
+    # context limit when decode lengths live only on the device (mixed).
+    backend = _backend(width=4)
+    monkeypatch.setattr(backend, "plan", lambda **kwargs: {"extend_mode": "prewrite"})
+    monkeypatch.setattr(mha, "mha_extend_with_kvcache", _cached_attention_cpu)
+    layer = PagedAttention(
+        backend.tp_q_head_num,
+        128,
+        128**-0.5,
+        backend.tp_kv_head_num,
+        0,
+        sliding_window_size=-1,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    generator = torch.Generator().manual_seed(7)
+    shape = (8, 16, backend.tp_kv_head_num, 128)
+    key = torch.randn(shape, generator=generator).to(torch.bfloat16)
+    value = torch.randn(shape, generator=generator).to(torch.bfloat16)
+    tables = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    if mode == ForwardMode.EXTEND:
+        queries, prefixes, lengths = [3, 20, 5], [25, 0, 7], [28, 20, 12]
+        query_lengths, expected_bound = queries, 28
+    else:
+        queries, prefixes, lengths = [3, 20], [5, 0], [8, 20, 30]
+        query_lengths, expected_bound = queries + [4], 1024
+    metadata = _init(
+        backend,
+        lengths=lengths,
+        queries=queries,
+        prefixes=prefixes,
+        mode=mode,
+        tables=tables,
+    )
+    assert metadata.max_seqlen_k == expected_bound
+    query = torch.randn(
+        (sum(query_lengths), backend.tp_q_head_num, 128), generator=generator
+    ).to(torch.bfloat16)
+    output = backend.forward_extend(
+        query,
+        query[:, : backend.tp_kv_head_num],
+        query[:, : backend.tp_kv_head_num],
+        layer,
+        torch.empty(0, dtype=torch.int32),
+        _CPUCache(key, value),
+        len(lengths),
+    )
+    expected = []
+    cursor = 0
+    for request, count in enumerate(query_lengths):
+        expected.append(
+            _cached_attention_cpu(
+                q=query[cursor : cursor + count],
+                cu_seqlens_q=torch.tensor([0, count]),
+                k_cache=key,
+                v_cache=value,
+                page_table=tables[request : request + 1],
+                cache_seqlens=torch.tensor([lengths[request]]),
+                window_left=-1,
+            )
+        )
+        cursor += count
+    torch.testing.assert_close(output, torch.cat(expected).flatten(1), rtol=0, atol=0)
 
 
 def _cached_decode_cpu(*, q, **kwargs):
