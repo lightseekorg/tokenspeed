@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel_amd._memory import release_cached_memory
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
     PrecisionConfig,
 )
@@ -212,7 +213,9 @@ def preprocess_gluon_mxfp4_gfx1250_moe_weights(
     _release_parameter(w, "w2_weight")
     _release_parameter(w, "w13_weight_scale")
     _release_parameter(w, "w2_weight_scale")
-    torch.cuda.empty_cache()
+    # Return the replaced checkpoint weights before the next layer allocates;
+    # see _memory for why this waits on the driver.
+    release_cached_memory(w13_weight_scale.device)
 
 
 __all__ = [

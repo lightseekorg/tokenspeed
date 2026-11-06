@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from tokenspeed_kernel_amd._memory import release_cached_memory
 
 # The gdot128 preshuffle below must mirror the MFMA geometry the fused
 # pipelined kernel reads with (fused/pipelined_program preshuffled-W layouts).
@@ -422,4 +423,6 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
 
         mxfp4.attach_prefill_aliases(w, w13_scale, w2_scale)
 
-    torch.cuda.empty_cache()
+    # Return the replaced checkpoint weights before the next layer allocates;
+    # see _memory for why this waits on the driver.
+    release_cached_memory(w13_weight_scale.device)
