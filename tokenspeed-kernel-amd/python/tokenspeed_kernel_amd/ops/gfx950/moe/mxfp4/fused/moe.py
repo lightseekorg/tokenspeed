@@ -1087,7 +1087,7 @@ def _launch_mxfp4_route_tiles(
             (n_tokens * top_k, out_dim), dtype=torch.bfloat16, device=device
         )
     expanded_idx = torch.empty((n_tokens * top_k,), dtype=torch.int32, device=device)
-    # Routes are grouped by expert (inside the GEMMs up to 16 rows, by the
+    # Routes are grouped by expert (inside stage 1 up to 16 rows, by the
     # descriptor kernels above 16 rows); results retain token/slot order.
     num_local_experts = int(w13_runtime.shape[0])
     block_m = 16
@@ -1098,12 +1098,18 @@ def _launch_mxfp4_route_tiles(
                 "gluon_mxfp4_moe_stage1_route_tiles_gfx950: grouping routes from "
                 f"top-k IDs needs at most {block_m} rows, got {n_tokens}"
             )
-        # Both GEMMs group the routes by expert from the top-k IDs; stage 1
-        # writes the route map into the descriptor argument, and group_count
-        # is an unused placeholder.
-        sorted_routes = topk_ids
-        descriptors = expanded_idx
-        group_count = expanded_idx
+        # Stage 1 groups the routes by expert from the top-k IDs, writes the
+        # route map into its descriptor argument and writes the grouping in
+        # the descriptor kernels' format for stage 2.
+        stage1_routes = topk_ids
+        stage1_descriptors = expanded_idx
+        group_count = torch.empty(1, dtype=torch.int32, device=device)
+        sorted_routes = torch.empty(
+            num_local_experts * block_m, dtype=torch.int32, device=device
+        )
+        descriptors = torch.empty(
+            (num_local_experts, 3), dtype=torch.int32, device=device
+        )
     else:
         max_rows = config.route_capacity
         if n_tokens > max_rows:
@@ -1142,14 +1148,18 @@ def _launch_mxfp4_route_tiles(
             MAX_ROWS=max_rows,
             num_warps=4,
         )
+        stage1_routes = sorted_routes
+        stage1_descriptors = descriptors
     gluon_mxfp4_moe_stage1_route_tiles_gfx950[(2048,)](
         q_hidden,
         q_hidden_scale,
         w13_runtime,
         w13_scale,
+        stage1_routes,
+        stage1_descriptors,
+        group_count,
         sorted_routes,
         descriptors,
-        group_count,
         q_inter,
         q_inter_scale,
         n_tokens,
@@ -1182,8 +1192,8 @@ def _launch_mxfp4_route_tiles(
         sorted_routes,
         descriptors,
         group_count,
+        descriptors.shape[0],
         out,
-        n_tokens,
         INTERMEDIATE=inter_dim,
         OUTPUT=out_dim,
         XS0=q_inter_scale.stride(0),
@@ -1196,10 +1206,6 @@ def _launch_mxfp4_route_tiles(
         BLOCK_K=config.stage2.block_k,
         BLOCK_M=block_m,
         PREFETCH_TILES=config.stage2.prefetch_tiles,
-        ROUTES_FROM_IDS=routes_from_ids,
-        TOPK=top_k,
-        EXPERT_START=expert_start,
-        NUM_EXPERTS=num_local_experts,
         num_warps=config.stage2.num_warps,
     )
     return out, None, expanded_idx
