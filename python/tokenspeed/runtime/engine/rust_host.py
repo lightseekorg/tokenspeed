@@ -144,6 +144,7 @@ from tokenspeed.runtime.plugins.registry import (
 from tokenspeed.runtime.sampling.registry import get_sampling_backend_class
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
+from tokenspeed.runtime.utils.common import maybe_set_numa_aware_cpu_affinity
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.jit_compile_check import (
@@ -265,7 +266,10 @@ def start_rust_host(
     a socket pair; the returned end raises ``EOFError`` if the host dies
     first. Its command line starts with the rank's process title
     (``rank_process_title``; ``tokenspeed::encode_tp{rank}`` for an EPD
-    encode rank), which ``ps`` and stale-process cleanup match.
+    encode rank), which ``ps`` and stale-process cleanup match. The host, and
+    every thread it starts, runs on the CPUs
+    ``maybe_set_numa_aware_cpu_affinity`` picks for the rank's GPU (the
+    calling thread's when it picks none); the calling thread keeps its own.
 
     Args:
         binary: The ``ts-host`` executable.
@@ -288,25 +292,38 @@ def start_rust_host(
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
-    with start_context:
-        popen = subprocess.Popen(
-            [
-                (
-                    f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
-                    if server_args.disaggregation_mode == "encode"
-                    else rank_process_title(server_args.mapping)
-                ),
-                "--python",
-                sys.executable,
-                "--control-fd",
-                str(child.fileno()),
-                "--enable-async-logging",
-                str(server_args.enable_async_logging).lower(),
-            ],
-            executable=binary,
-            pass_fds=[child.fileno(), held_until_exit],
-            preexec_fn=preexec_fn,
+    mapping = server_args.mapping
+    launcher_cpus = os.sched_getaffinity(0)
+    try:
+        # The host inherits this thread's CPUs, so it runs on its GPU's NUMA
+        # node before its interpreter imports anything: the memory those
+        # imports first touch (modules, code and type objects every forward
+        # walks) lands on that node too; pinning after the imports would not
+        # move it. The GPU is the one the rank's bootstrap selects.
+        maybe_set_numa_aware_cpu_affinity(
+            mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
         )
+        with start_context:
+            popen = subprocess.Popen(
+                [
+                    (
+                        f"tokenspeed::encode_tp{mapping.attn.tp_rank}"
+                        if server_args.disaggregation_mode == "encode"
+                        else rank_process_title(mapping)
+                    ),
+                    "--python",
+                    sys.executable,
+                    "--control-fd",
+                    str(child.fileno()),
+                    "--enable-async-logging",
+                    str(server_args.enable_async_logging).lower(),
+                ],
+                executable=binary,
+                pass_fds=[child.fileno(), held_until_exit],
+                preexec_fn=preexec_fn,
+            )
+    finally:
+        os.sched_setaffinity(0, launcher_cpus)
     child.close()
     os.close(held_until_exit)
     parent.send((server_args, port_args, metrics_relay_endpoint))

@@ -27,6 +27,7 @@ and scheduler, with a CPU stand-in for the model executor.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import signal
 import stat
@@ -38,6 +39,7 @@ from contextlib import nullcontext
 import msgspec
 import pytest
 import torch
+from tokenspeed_kernel.platform import Platform, current_platform
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -158,8 +160,8 @@ def _fake_host(tmp_path, body: str) -> str:
     return str(path)
 
 
-def _rank_args(rank: int) -> tuple[ServerArgs, PortArgs]:
-    server_args = ServerArgs(model="x")
+def _rank_args(rank: int, **fields) -> tuple[ServerArgs, PortArgs]:
+    server_args = ServerArgs(model="x", **fields)
     server_args.mapping.rank = rank
     return server_args, PortArgs.init_new(server_args)
 
@@ -207,6 +209,104 @@ def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
         receive_ready_messages([reader], [proc])
     proc.join(timeout=10)
     assert proc.exitcode == 3
+
+
+# With and without the parent-death signal: Popen runs a preexec_fn after a
+# fork, or may vfork.
+@pytest.mark.parametrize("parent_death_signal", [False, True])
+@pytest.mark.parametrize(
+    "launcher", ["unconstrained", "switched_off", "constrained", "no_entry", "amd"]
+)
+def test_a_host_starts_on_its_gpus_numa_local_cpus(
+    tmp_path, monkeypatch, launcher, parent_death_signal
+):
+    all_cpus = os.sched_getaffinity(0)
+    if all_cpus != set(range(os.cpu_count())) or len(all_cpus) < 2:
+        pytest.skip("needs an unconstrained test process with two CPUs or more")
+    binary = _fake_host(
+        tmp_path,
+        """
+        import os
+        connection.recv()
+        connection.send({"status": "ready", "cpus": os.sched_getaffinity(0)})
+        time.sleep(600)
+        """,
+    )
+    # Attention TP 2 x DP 4 on two nodes of four ranks each, on GPUs 1 to 4:
+    # rank 6 is local rank 2 on node 1 (attention TP rank 0), so it uses GPU
+    # 3, whose NUMA-local CPU is the lowest. The other GPUs' is the highest,
+    # which a constrained launcher is held to.
+    server_args, port_args = _rank_args(
+        6,
+        attn_tp_size=2,
+        data_parallel_size=4,
+        nnodes=2,
+        node_rank=1,
+        base_gpu_id=1,
+        dist_init_addr="127.0.0.1:25000",
+    )
+    other_cpus, gpu3_cpus = (max(all_cpus),), (min(all_cpus),)
+    monkeypatch.setenv(
+        "TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY",
+        "0" if launcher == "switched_off" else "1",
+    )
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(
+            original,
+            vendor="amd" if launcher == "amd" else "nvidia",
+            numa_cpu_affinity=(other_cpus,) * 3
+            + (() if launcher == "no_entry" else (gpu3_cpus,)),
+        )
+    )
+    try:
+        if launcher == "constrained":
+            os.sched_setaffinity(0, other_cpus)
+        launcher_cpus = os.sched_getaffinity(0)
+        proc, reader = start_rust_host(
+            binary, server_args, port_args, nullcontext(), None, parent_death_signal
+        )
+        try:
+            (ready,) = receive_ready_messages([reader], [proc])
+        finally:
+            proc.terminate()
+            proc.join(timeout=10)
+        # Only an unconstrained NVIDIA launcher with the switch on and an entry
+        # for the GPU narrows the host's CPUs; the launcher keeps its own.
+        expected = set(gpu3_cpus) if launcher == "unconstrained" else launcher_cpus
+        assert ready["cpus"] == expected
+        assert os.sched_getaffinity(0) == launcher_cpus
+    finally:
+        os.sched_setaffinity(0, all_cpus)
+        Platform.override(original)
+
+
+def test_a_host_that_cannot_start_leaves_the_launchers_cpus(tmp_path, monkeypatch):
+    all_cpus = os.sched_getaffinity(0)
+    if all_cpus != set(range(os.cpu_count())) or len(all_cpus) < 2:
+        pytest.skip("needs an unconstrained test process with two CPUs or more")
+    server_args, port_args = _rank_args(0)
+    monkeypatch.setenv("TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY", "1")
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(
+            original, vendor="nvidia", numa_cpu_affinity=((min(all_cpus),),)
+        )
+    )
+    try:
+        with pytest.raises(FileNotFoundError):
+            start_rust_host(
+                str(tmp_path / "missing"),
+                server_args,
+                port_args,
+                nullcontext(),
+                None,
+                False,
+            )
+        assert os.sched_getaffinity(0) == all_cpus
+    finally:
+        os.sched_setaffinity(0, all_cpus)
+        Platform.override(original)
 
 
 def test_request_length_limits_reserve_the_first_decode_window():

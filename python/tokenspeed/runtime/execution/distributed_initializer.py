@@ -32,7 +32,6 @@ from tokenspeed.runtime.utils import (
     get_available_gpu_memory,
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.common import maybe_set_numa_aware_cpu_affinity
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
@@ -171,8 +170,6 @@ class DistributedInitializer:
             "Init torch distributed begin. Avail mem="
             f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
-        if config.device == "cuda":
-            maybe_set_numa_aware_cpu_affinity(config.gpu_id)
 
         # Determine backend
         if config.device == "cuda":

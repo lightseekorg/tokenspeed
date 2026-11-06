@@ -109,10 +109,11 @@ def maybe_inference_mode():
 
 
 def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
-    """Pin the current process to ``device_id``'s NUMA-local CPU set.
+    """Pin the calling thread to ``device_id``'s NUMA-local CPU set; a process
+    it starts afterwards inherits the set.
 
     NVIDIA-only optimization. No-op if the env var is False, the platform is not
-    NVIDIA, or the process already has a constrained affinity (e.g., taskset).
+    NVIDIA, or the thread already has a constrained affinity (e.g., taskset).
     """
     from tokenspeed.runtime.utils.env import envs
 
@@ -122,8 +123,7 @@ def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
     if not platform.is_nvidia:
         return
 
-    proc = psutil.Process()
-    if proc.cpu_affinity() != list(range(psutil.cpu_count())):
+    if os.sched_getaffinity(0) != set(range(psutil.cpu_count())):
         return
 
     if device_id >= len(platform.numa_cpu_affinity):
@@ -133,10 +133,9 @@ def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
     if not cpu_affinity:
         return
 
-    proc.cpu_affinity(list(cpu_affinity))
+    os.sched_setaffinity(0, cpu_affinity)
     logger.info(
-        f"Worker process {proc.pid!s} pinned to {len(cpu_affinity)!s} NUMA-local CPUs "
-        f"for device {device_id!s}.",
+        f"Pinned to {len(cpu_affinity)!s} NUMA-local CPUs for device {device_id!s}.",
     )
 
 

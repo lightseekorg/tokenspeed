@@ -96,9 +96,6 @@ def test_startup_arms_the_complete_selected_fusion_window(
     monkeypatch.setattr(initializer.torch, "get_device_module", lambda _: _Device())
     monkeypatch.setattr(initializer, "get_available_gpu_memory", lambda *a, **k: 1.0)
     monkeypatch.setattr(
-        initializer, "maybe_set_numa_aware_cpu_affinity", lambda _: None
-    )
-    monkeypatch.setattr(
         initializer.pg_manager, "init_distributed", lambda *a, **k: None
     )
     monkeypatch.setattr(

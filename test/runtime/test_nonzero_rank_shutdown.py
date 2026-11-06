@@ -102,6 +102,7 @@ if __name__ == "__main__":
         disaggregation_mode="null",
         kv_events_config=None,
         dist_init_addr="127.0.0.1:25000",
+        base_gpu_id=0,
         # The ranks get the args pickled: a builtin's partial survives that.
         zmq_handshake_endpoint=functools.partial(str, "tcp://127.0.0.1:25001"),
     )

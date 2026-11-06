@@ -424,9 +424,6 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch, amd):
         initializer, "get_available_gpu_memory", lambda *args, **kwargs: 1.0
     )
     monkeypatch.setattr(
-        initializer, "maybe_set_numa_aware_cpu_affinity", lambda gpu: None
-    )
-    monkeypatch.setattr(
         initializer.pg_manager,
         "init_distributed",
         lambda *args, **kwargs: events.append("distributed"),
