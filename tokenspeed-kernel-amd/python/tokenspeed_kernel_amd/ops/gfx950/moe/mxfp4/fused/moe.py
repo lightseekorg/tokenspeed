@@ -83,6 +83,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
     _ROUTE_TILE_MAX_M,
     _RouteTileConfig,
     _select_direct_stage1_prefetch_tiles,
+    _select_direct_stage2_deferred_block_n,
     _select_grouped_moe_config,
     _select_route_tile_config,
 )
@@ -275,13 +276,27 @@ def _select_direct_stage2_tiles(
     num_tokens: int,
     *,
     ep_deferred: bool,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int | None,
+    top_k: int,
 ) -> tuple[int, int]:
     """Return the rocprof-tuned gfx950 ``(BLOCK_N, BLOCK_K)`` pair."""
     if not ep_deferred:
         return _DIRECT_STAGE2_BLOCK_N, _DIRECT_STAGE2_BLOCK_K
     # Wide output tiles amortize deferred expert stores at the largest captured
     # batch; deeper K tiles shorten the four-tile dependency chain at M <= 8.
-    block_n = 32 if num_tokens >= 16 else _DIRECT_STAGE2_BLOCK_N
+    block_n = _select_direct_stage2_deferred_block_n(
+        num_tokens,
+        hidden_dim=hidden_dim,
+        inter_dim=inter_dim,
+        num_local_experts=num_local_experts,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    if block_n is None:
+        block_n = 32 if num_tokens >= 16 else _DIRECT_STAGE2_BLOCK_N
     block_k = 256 if num_tokens <= 8 else _DIRECT_STAGE2_BLOCK_K
     return block_n, block_k
 
@@ -1442,6 +1457,11 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     stage2_block_n, stage2_block_k = _select_direct_stage2_tiles(
         n_tokens,
         ep_deferred=is_ep_deferred,
+        hidden_dim=hidden_dim,
+        inter_dim=inter_dim,
+        num_local_experts=local_experts,
+        num_experts=global_num_experts,
+        top_k=top_k,
     )
     if slot_parallel:
         stage2_block_n = 32 if n_tokens >= 12 else 16
