@@ -2895,7 +2895,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_k_rope_consumer_state.advance()
         else:
             load_k_pipeline.consumer_wait(load_k_consumer_state)
-            for q_stage in range(self.iterations_qk_latent):
+            # The latent/rope dimensions are static; expose their descriptor
+            # offsets to the compiler in this hot loop.
+            for q_stage in cutlass.range_constexpr(self.iterations_qk_latent):
                 kc_stage = load_k_consumer_state.index
                 for k_block in cutlass.range_constexpr(
                     cute.size(qk_params.tSrQ.shape[2])
@@ -2909,7 +2911,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     )
                     tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
 
-            for q_stage in range(self.iterations_qk_rope):
+            for q_stage in cutlass.range_constexpr(self.iterations_qk_rope):
                 kc_stage = load_k_consumer_state.index
                 for k_block in cutlass.range_constexpr(
                     self.rope_dim // tiled_mma_qk.shape_mnk[2]
@@ -3017,10 +3019,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         else:
             load_v_pipeline.consumer_wait(load_v_consumer_state)
             vc_stage = load_v_consumer_state.index
-            for acc_stage in range(self.iterations_pv_n):
+            for acc_stage in cutlass.range_constexpr(self.iterations_pv_n):
                 mma_o_pipeline.producer_acquire(mma_o_producer_state)
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
-                for p_stage in range(self.iterations_pv_k):
+                for p_stage in cutlass.range_constexpr(self.iterations_pv_k):
                     tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
                     for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
                         cute.gemm(
