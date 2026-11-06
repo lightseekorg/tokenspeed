@@ -271,6 +271,7 @@ def _launch_pull_twoshot(
         EXIT_BARRIER=exit_barrier,
         PEER_PAYLOAD_LOAD_CACHE=arch.peer_payload_load,
         PEER_SIGNAL_STORE_CACHE=arch.peer_signal_store,
+        WAIT_STORES=arch.wait_stores,
         **_hc_post_args(hc_post, elements_per_word),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
@@ -1466,6 +1467,7 @@ def iris_pull_twoshot(
     EXIT_BARRIER: gl.constexpr,
     PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
     residual=None,
     post=None,
     comb=None,
@@ -1598,6 +1600,12 @@ def iris_pull_twoshot(
         )
         tile_id += NUM_PROGRAMS
 
+    # Every subgroup stored part of the partition. The barrier the compiler
+    # inserts before the one-thread release does not wait for memory, and the
+    # releasing thread's buffer_wbl2 and s_waitcnt vmcnt(0) cover only its own
+    # subgroup's stores. So each subgroup first waits until its stores reach
+    # L2 (s_waitcnt vmcnt(0) on gfx950).
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(
         ready_flags,
@@ -1923,7 +1931,7 @@ class ProducerAllReduce:
     _ORDINARY_GRANULE = 64
 
     @staticmethod
-    def _lamport_two_shot_capacity(
+    def lamport_two_shot_capacity(
         max_numel: int, *, world_size: int, enable_lamport: bool
     ) -> int:
         """Return the TP8 Lamport two-shot capacity in elements, or 0."""
@@ -1947,7 +1955,7 @@ class ProducerAllReduce:
             if enable_lamport
             else 0
         )
-        two_shot = ProducerAllReduce._lamport_two_shot_capacity(
+        two_shot = ProducerAllReduce.lamport_two_shot_capacity(
             max_numel, world_size=world_size, enable_lamport=enable_lamport
         )
         alignment = world_size * 8
@@ -2024,7 +2032,7 @@ class ProducerAllReduce:
             self.lamport_peer_addresses = tuple(
                 base + offset for base in peers.addresses
             )
-        self.lamport_two_shot_max_numel = self._lamport_two_shot_capacity(
+        self.lamport_two_shot_max_numel = self.lamport_two_shot_capacity(
             max_numel, world_size=self.world_size, enable_lamport=enable_lamport
         )
         two_shot_shard = self.lamport_two_shot_max_numel // self.world_size
