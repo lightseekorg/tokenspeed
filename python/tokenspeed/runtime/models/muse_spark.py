@@ -288,8 +288,8 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         ):
             # gemm.mm selects the GEMV or GEMM the unquantized method would and
             # writes ``out`` in place, saving a copy launch. It infers the
-            # weight layout from its shape, so a square [N, K] weight could be
-            # read as [K, N]; those take the unquantized method instead.
+            # weight layout from its shape, so it could read a square [N, K]
+            # weight as [K, N]. Square weights take the unquantized method.
             result = mm(x, weight, out=out)
         else:
             result = self.quant_method.apply(SimpleNamespace(weight=weight), x, None)
