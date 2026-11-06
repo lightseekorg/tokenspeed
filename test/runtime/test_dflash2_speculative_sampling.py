@@ -311,7 +311,7 @@ def test_dflash2_without_the_flag_keeps_the_greedy_walk():
 
 
 def _executor_config(spec_algo: str) -> ModelExecutorConfig:
-    """A chain-drafting executor config with speculative sampling on."""
+    """Build a chain-drafting executor config with speculative sampling on."""
     return ModelExecutorConfig(
         max_req_pool_size=POOL,
         output_length=N,
