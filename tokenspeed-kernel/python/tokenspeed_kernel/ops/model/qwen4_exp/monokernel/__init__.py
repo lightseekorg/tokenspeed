@@ -389,5 +389,5 @@ def qwen4_exp_mtp_fuse_inputs(
 
 
 # Register the backends (side-effect imports).
-import tokenspeed_kernel.ops.monokernel.gluon  # noqa: E402,F401
-import tokenspeed_kernel.ops.monokernel.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.model.qwen4_exp.monokernel.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.model.qwen4_exp.monokernel.triton  # noqa: E402,F401

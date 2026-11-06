@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.monokernel import (
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel import (
     qwen4_exp_mtp_fuse_inputs,
     select_qwen4_exp_mtp_fuse_inputs_kernel,
 )
-from tokenspeed_kernel.ops.monokernel.triton import _qwen4_exp_mtp_fuse_inputs_kernel
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel.triton import (
+    _qwen4_exp_mtp_fuse_inputs_kernel,
+)
 from utils import assert_no_triton_compile
 
 H, VOCAB, EPS = 2560, 1000, 1e-6

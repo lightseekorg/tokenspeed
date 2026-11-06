@@ -25,8 +25,8 @@ monokernel classes (``Qwen4ExpModel.decoder_layer_cls``): subclasses of the
 regular layers with :class:`DeltaMonokernelLayer` or
 :class:`QSAMonokernelLayer`. Such a layer runs a decode step of at most
 ``MAX_ROWS`` rows as one persistent launch from
-``tokenspeed_kernel.ops.monokernel``, and every other forward (prefill, larger
-steps) with its regular code. After loading, :func:`enable_decode_monokernels`
+``tokenspeed_kernel.ops.model.qwen4_exp.monokernel``, and every other
+forward (prefill, larger steps) with its regular code. After loading, :func:`enable_decode_monokernels`
 packs every layer and gives all of them one :class:`Qwen4ExpMonokernelState`.
 Startup fails when a layer cannot be packed: the switch never serves a layer
 without its kernel. ``tokenspeed.runtime.models.monokernel`` holds the part
@@ -72,7 +72,7 @@ import logging
 
 import torch
 from tokenspeed_kernel.ops.gemm import MXFP4_LINEAR_MFMA_LAYOUT
-from tokenspeed_kernel.ops.monokernel import (
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel import (
     FusedDecodeLayer,
     prepare_qwen4_exp_delta_layer,
     prepare_qwen4_exp_qsa_layer,

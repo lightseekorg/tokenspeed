@@ -28,7 +28,7 @@ import sys
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.monokernel import FusedDecodeLayer
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel import FusedDecodeLayer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402

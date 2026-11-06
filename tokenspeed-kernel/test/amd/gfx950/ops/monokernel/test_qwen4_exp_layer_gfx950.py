@@ -40,7 +40,7 @@ from qwen4_exp_reference import bf  # noqa: E402
 from qwen4_exp_reference import cos_sin as _cos_sin  # noqa: E402
 from qwen4_exp_reference import gemma, index_norm, rotate  # noqa: E402
 from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit  # noqa: E402
-from tokenspeed_kernel.ops.monokernel import (  # noqa: E402
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel import (  # noqa: E402
     prepare_qwen4_exp_delta_layer,
     prepare_qwen4_exp_qsa_layer,
     qwen4_exp_delta_layer_decode,

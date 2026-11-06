@@ -8,7 +8,7 @@ Read these documents with this one:
 
 - [`docs/design/monokernel.md`](../../../../../../docs/design/monokernel.md):
   the invariants.
-- [`tokenspeed_kernel/ops/monokernel/README.md`](../../../../../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md):
+- [`tokenspeed_kernel/ops/model/qwen4_exp/monokernel/README.md`](../../../../../../tokenspeed-kernel/python/tokenspeed_kernel/ops/model/qwen4_exp/monokernel/README.md):
   the ops, how a model's runtime seam calls them, the steps to add a model,
   and the tests.
 - `tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_monokernel_example_gfx950.py`:

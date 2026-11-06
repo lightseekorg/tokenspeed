@@ -28,11 +28,13 @@ from typing import Any
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.monokernel import (
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel import (
     qwen4_exp_mtp_fuse_inputs,
     select_qwen4_exp_mtp_fuse_inputs_kernel,
 )
-from tokenspeed_kernel.ops.monokernel.triton import MTP_FUSE_INPUTS_MAX_ROWS
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel.triton import (
+    MTP_FUSE_INPUTS_MAX_ROWS,
+)
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping

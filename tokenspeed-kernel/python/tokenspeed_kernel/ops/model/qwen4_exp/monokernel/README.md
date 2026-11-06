@@ -2,11 +2,12 @@
 
 A decode monokernel runs one decoder layer's decode step as one persistent
 launch. The design and its invariants are in
-[`docs/design/monokernel.md`](../../../../../docs/design/monokernel.md).
+[`docs/design/monokernel.md`](../../../../../../../docs/design/monokernel.md).
 The gfx950 building blocks, and the rules for writing a stage, are in
-[`tokenspeed_kernel_amd/ops/gfx950/monokernel/README.md`](../../../../../tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/monokernel/README.md).
-This file gives the ops, how a model's runtime seam calls them, and the
-steps to add a model.
+[`tokenspeed_kernel_amd/ops/gfx950/monokernel/README.md`](../../../../../../../tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/monokernel/README.md).
+This directory holds the Qwen4-Exp ops. Each model has its own
+`tokenspeed_kernel/ops/model/<model>/monokernel/`. This file gives the ops,
+how a model's runtime seam calls them, and the steps to add a model.
 
 ## The ops
 
@@ -95,11 +96,12 @@ A model calls the ops from its runtime seam,
    softmax over all blocks, a top-k over all experts. Each such point is a
    stage boundary and costs one handoff. Use few, large stages.
 2. **Write the layer kernels** in the vendor package. For gfx950, the
-   [gfx950 monokernel README](../../../../../tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/monokernel/README.md)
+   [gfx950 monokernel README](../../../../../../../tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/monokernel/README.md)
    gives the steps: the stage modules, the layer, the weight packing and the
    model's README.
-3. **Register the ops** in this package. `gluon.py` registers the gfx950
-   kernels, and `__init__.py` holds the public functions.
+3. **Register the ops** in `tokenspeed_kernel/ops/model/<model>/monokernel/`,
+   as this directory does: `gluon.py` registers the gfx950 kernels, and
+   `__init__.py` holds the public functions.
 4. **Add the monokernel layer classes** as in "How a model uses the ops".
    Pass the per-step operands by name.
 

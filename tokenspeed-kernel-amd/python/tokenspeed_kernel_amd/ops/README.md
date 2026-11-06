@@ -2599,7 +2599,7 @@ A decode monokernel runs one decoder layer's decode step as one persistent
 launch. The stages of the layer run as tasks on fixed CTAs, and they give
 values to each other through tagged mailbox pairs in a scratch buffer. The
 invariants are in `docs/design/monokernel.md`. The steps to add a model are
-in `tokenspeed_kernel/ops/monokernel/README.md`.
+in `tokenspeed_kernel/ops/model/qwen4_exp/monokernel/README.md`.
 
 ### gfx950 decode monokernels
 

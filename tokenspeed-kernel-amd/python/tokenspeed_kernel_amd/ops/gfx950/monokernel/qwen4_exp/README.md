@@ -13,8 +13,9 @@ the rules for writing a stage.
 | `gluon_qwen4_exp_qsa_layer_gfx950` | A QSA full-attention layer. The last layer's launch also runs the model's final mixer. |
 
 `layer.py` holds both kernels and their launchers
-(`launch_<kernel name>`). `tokenspeed_kernel/ops/monokernel/` registers them
-as `prepare_qwen4_exp_*` and `qwen4_exp_*_decode`.
+(`launch_<kernel name>`).
+`tokenspeed_kernel/ops/model/qwen4_exp/monokernel/` registers them as
+`prepare_qwen4_exp_*` and `qwen4_exp_*_decode`.
 
 ### Contract
 

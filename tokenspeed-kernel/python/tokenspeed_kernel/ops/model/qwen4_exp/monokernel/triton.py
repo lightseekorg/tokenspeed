@@ -128,7 +128,7 @@ def triton_qwen4_exp_mtp_fuse_inputs(
     eps: float,
     out: torch.Tensor,
 ) -> None:
-    """See :func:`tokenspeed_kernel.ops.monokernel.qwen4_exp_mtp_fuse_inputs`."""
+    """See :func:`tokenspeed_kernel.ops.model.qwen4_exp.monokernel.qwen4_exp_mtp_fuse_inputs`."""
     size = embedding.shape[1]
     rows = input_ids.shape[0]
     _qwen4_exp_mtp_fuse_inputs_kernel[(size // 16,)](
