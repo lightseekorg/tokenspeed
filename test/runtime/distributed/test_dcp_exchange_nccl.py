@@ -462,6 +462,18 @@ def _partial_worker(rank, degree, rendezvous):
             for _ in range(2):
                 result = combine()
             _check_partials(result, rank, degree, dtype, "normal", sink, keep_all_heads)
+            if not keep_all_heads:
+                # Records packed into the exchange's lent input combine alike.
+                lent = combine_attention_partials(
+                    output,
+                    lse,
+                    group=group,
+                    rank=rank,
+                    sink=sink,
+                    keep_all_heads=False,
+                    lend_records=True,
+                )
+                assert torch.equal(lent.view(torch.uint8), result.view(torch.uint8))
             torch.cuda.synchronize()
             dist.barrier(group=coordination)
             graph = torch.cuda.CUDAGraph()
@@ -599,6 +611,7 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
     from tokenspeed.runtime.layers.attention.backends.paged import dsa
     from tokenspeed.runtime.layers.attention.dcp.comm import (
         gather_query_heads,
+        gather_query_heads_lent,
         gather_query_heads_padded,
         gather_query_heads_rank_major,
     )
@@ -690,6 +703,15 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
             assert torch.equal(
                 rank_major.permute(1, 0, 2, 3).reshape(token_major.shape),
                 token_major,
+            )
+            # Through the exchange's lent input: the same bytes, FP8 and BF16.
+            lent = gather_query_heads_lent(q, group)
+            assert lent.dtype == q.dtype
+            assert torch.equal(lent.view(torch.uint8), token_major)
+            wide = q.to(torch.bfloat16)
+            assert torch.equal(
+                gather_query_heads_lent(wide, group).view(torch.uint8),
+                gather_query_heads(wide, group).view(torch.uint8),
             )
             # 48 heads x 2 ranks = 96, like K3.1's 12 x KVP8; trtllm-gen runs 96 as 128.
             wide_heads = 48
@@ -945,6 +967,131 @@ def test_rank_major_decode_core_matches_packed_partials(tmp_path, degree, use_py
     mp.spawn(
         _decode_records_worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}", use_pynccl),
+        nprocs=degree,
+        join=True,
+    )
+
+
+def _lent_worker(rank, degree, rendezvous):
+    torch.set_num_threads(1)
+    torch.cuda.set_device(rank)
+    from tokenspeed_kernel.ops.communication._iris import (
+        IrisGroup,
+        get_or_create_context,
+    )
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.comm import (
+        combine_attention_partials,
+        gather_query_heads,
+        gather_query_heads_lent,
+    )
+
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=degree,
+        device_id=device,
+        timeout=timedelta(seconds=300),
+    )
+    graph = None
+    try:
+        group = tuple(range(degree))
+        coordination = dist.new_group(backend="gloo", timeout=timedelta(seconds=300))
+        process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
+        process_group_manager.register_process_group("gloo", group, coordination)
+        backend = AutoBackend()
+        backend.configure(use_pynccl=False)
+        set_global_backend(backend)
+        # The drafter's shapes at K3.1's KVP8: 12 heads a rank, 576-wide FP8
+        # queries, 512-wide BF16 partials, 16 rows (4 verify rows of 4 requests).
+        rows, heads = 16, 12
+        exchange = IrisPullExchange(
+            IrisGroup(
+                get_or_create_context(heap_size=1 << 28),
+                dist.group.WORLD,
+                rank,
+                device,
+            ),
+            rows * heads * degree * (512 // 2 + 1) * 4,
+        )
+        exchange.peers.finish_prepare()
+        generator = torch.Generator().manual_seed(40 + rank)
+        q = torch.randn((rows, heads, 576), generator=generator)
+        q = q.to(device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        output = torch.randn((rows, heads * degree, 512), generator=generator)
+        output = output.to(device=device, dtype=torch.bfloat16)
+        lse = (torch.randn((rows, heads * degree), generator=generator) * 3).to(device)
+        lse[1] = -torch.inf
+        output[1] = torch.nan
+        # References through NCCL, before the pull exchange is installed.
+        gathered = gather_query_heads(q, group)
+        combined = combine_attention_partials(
+            output, lse, group=group, rank=rank, sink=None, keep_all_heads=False
+        )
+        backend.iris.install_pull_exchange(group, exchange)
+
+        def lent():
+            return (
+                gather_query_heads_lent(q, group),
+                combine_attention_partials(
+                    output,
+                    lse,
+                    group=group,
+                    rank=rank,
+                    sink=None,
+                    keep_all_heads=False,
+                    lend_records=True,
+                ),
+            )
+
+        def check(query, merged):
+            assert torch.equal(query.view(torch.uint8), gathered.view(torch.uint8))
+            assert torch.equal(merged.view(torch.int16), combined.view(torch.int16))
+
+        epoch = int(exchange.state[0])
+        for _ in range(2):
+            check(*lent())
+        # Both pulled through the exchange: two epochs a call.
+        assert int(exchange.state[0]) == epoch + 4
+        torch.cuda.synchronize()
+        dist.barrier(group=coordination)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            query, merged = lent()
+        for _ in range(3):
+            query.zero_()
+            merged.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            check(query, merged)
+        dist.barrier(group=coordination)
+    finally:
+        if graph is not None:
+            graph.reset()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("degree", [2, 8])
+def test_lent_query_gather_and_records_combine_match_nccl(tmp_path, degree):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
+        pytest.skip(f"requires {degree} GPUs")
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_cdna4:
+        pytest.skip("Iris pull exchanges run on CDNA4")
+    mp.spawn(
+        _lent_worker,
+        args=(degree, f"file://{tmp_path / 'rendezvous'}"),
         nprocs=degree,
         join=True,
     )

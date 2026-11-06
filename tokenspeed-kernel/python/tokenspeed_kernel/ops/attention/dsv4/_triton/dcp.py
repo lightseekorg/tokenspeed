@@ -439,7 +439,11 @@ def _combine_dcp_attention_partials(
 
 
 def dispatch_dcp_attention_partials(
-    output: torch.Tensor, lse: torch.Tensor, *, degree: int
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    degree: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prepare O/LSE for dispatch to head owners, preserving their original bits.
 
@@ -450,6 +454,8 @@ def dispatch_dcp_attention_partials(
         output: FP16/BF16/FP32 CUDA [tokens, heads, dim], possibly strided.
         lse: FP32 natural-log [tokens, heads] on the same device.
         degree: Number of head owners, dividing heads.
+        out: Optional contiguous int32 storage of the returned shape (an
+            exchange's lent input) to write the records into.
 
     Returns:
         Contiguous int32 [degree, tokens, heads / degree, words + 1].
@@ -469,11 +475,18 @@ def dispatch_dcp_attention_partials(
         raise ValueError("DCP partials require one CUDA device")
     tokens, heads, dim = output.shape
     per_word = torch.int32.itemsize // output.element_size()
-    records = torch.empty(
-        (degree, tokens, heads // degree, triton.cdiv(dim, per_word) + 1),
-        dtype=torch.int32,
-        device=output.device,
-    )
+    shape = (degree, tokens, heads // degree, triton.cdiv(dim, per_word) + 1)
+    if out is None:
+        records = torch.empty(shape, dtype=torch.int32, device=output.device)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.int32
+        or not out.is_contiguous()
+        or out.device != output.device
+    ):
+        raise ValueError(f"DCP records storage must be contiguous int32 {shape}")
+    else:
+        records = out
     if records.numel():
         _dispatch_dcp_attention_partials[(tokens, heads)](
             output,

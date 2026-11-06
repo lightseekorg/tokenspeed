@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.attention.mla import (
     supports_mla_decode_query_blocks,
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
-    kvp_local_visible_lengths,
+    kvp_decode_visible_lengths,
 )
 from tokenspeed_kernel.selection import KernelPlan
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -55,7 +55,7 @@ from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.dcp.comm import (
     combine_attention_partials,
-    gather_query_heads,
+    gather_query_heads_lent,
 )
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
@@ -807,46 +807,42 @@ class MLAAttnBackend(PagedAttentionBackend):
         """
         metadata = self.forward_decode_metadata
         dcp = self.dcp_metadata.slice_requests(num_extends, num_extends + bs)
-        # Draft catch-up stores the first query's visible KV length; target
-        # verify stores the last one's and backs up.
-        offset_start = 0 if self.is_draft else 1 - q_len_per_req
-        offsets = torch.arange(
-            offset_start,
-            offset_start + q_len_per_req,
-            device=q.device,
-            dtype=torch.int32,
-        )
-        endpoints = (
-            (metadata.seq_lens[num_extends : num_extends + bs, None] + offsets)
-            .clamp_min_(0)
-            .to(torch.int32)
-        )
-        local_lengths = torch.empty_like(endpoints)
-        kvp_local_visible_lengths(
-            dcp.page_prefix,
-            endpoints,
-            page_size=self.kernel_page_size,
-            out=local_lengths,
-        )
-        local_lengths = local_lengths.reshape(-1)
-
-        query = gather_query_heads(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim), self.kvp_group
-        )
-        rows, heads = query.shape[:2]
+        heads = layer.tp_q_head_num * len(self.kvp_group)
         # Heads attend independently, so a wide gathered group folds onto the
         # batch axis for the kernels that return an LSE.
         kernel_heads = max(
             h for h in range(1, _DCP_KERNEL_MAX_HEADS + 1) if heads % h == 0
         )
         groups = heads // kernel_heads
+        # Every query row's local causal length, and its kernel length (at
+        # least one) for each folded head group. Draft catch-up stores the
+        # first query's visible KV length; target verify stores the last
+        # one's and backs up.
+        local_lengths = torch.empty(
+            (bs * q_len_per_req,), device=q.device, dtype=torch.int32
+        )
+        cache_seqlens = torch.empty(
+            (bs * q_len_per_req * groups,), device=q.device, dtype=torch.int32
+        )
+        kvp_decode_visible_lengths(
+            dcp.page_prefix,
+            metadata.seq_lens[num_extends : num_extends + bs],
+            offset=0 if self.is_draft else 1 - q_len_per_req,
+            queries=q_len_per_req,
+            groups=groups,
+            page_size=self.kernel_page_size,
+            local_lengths=local_lengths,
+            cache_lengths=cache_seqlens,
+        )
+
+        query = gather_query_heads_lent(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim), self.kvp_group
+        )
+        rows = query.shape[0]
         query = query.reshape(rows * groups, 1, kernel_heads, layer.head_dim)
         page_table = dcp.local_page_table.repeat_interleave(
             q_len_per_req * groups, dim=0
         )
-        cache_seqlens = local_lengths.clamp_min(1)
-        if groups > 1:
-            cache_seqlens = cache_seqlens.repeat_interleave(groups)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != kv_cache.dtype:
             kv_cache = kv_cache.to(self.data_type)
@@ -877,6 +873,7 @@ class MLAAttnBackend(PagedAttentionBackend):
             rank=self.kvp_rank,
             sink=None,
             keep_all_heads=False,
+            lend_records=True,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 

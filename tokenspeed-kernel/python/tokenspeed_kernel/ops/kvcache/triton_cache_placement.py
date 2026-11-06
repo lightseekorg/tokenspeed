@@ -661,3 +661,113 @@ def kvp_local_visible_lengths(
         out.copy_(before * page_size + (after > before) * (visible_lengths % page_size))
         if local_lengths is not None:
             local_lengths.copy_(out[:, -1])
+
+
+# A mixed round's decode rows start past its extends: inputs at any alignment.
+@triton.jit(
+    do_not_specialize=["PSTRIDE", "COLS", "OFFSET"],
+    do_not_specialize_on_alignment=["Prefix", "SeqLens"],
+)
+def _decode_visible_lengths(
+    Prefix,
+    SeqLens,
+    LocalOut,
+    CacheOut,
+    PSTRIDE,
+    COLS,
+    OFFSET,
+    QUERIES: tl.constexpr,
+    GROUPS: tl.constexpr,
+    PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    q = tl.arange(0, BLOCK)
+    live = q < QUERIES
+    length = tl.maximum(tl.load(SeqLens + row).to(tl.int32) + OFFSET + q, 0)
+    page = length // PAGE
+    before = tl.load(Prefix + row * PSTRIDE + page, live, 0)
+    after = tl.load(Prefix + row * PSTRIDE + page + 1, live & (page < COLS), 0)
+    local = before * PAGE + tl.where(after > before, length % PAGE, 0)
+    tl.store(LocalOut + row * QUERIES + q, local, live)
+    cache = tl.maximum(local, 1)
+    for group in tl.static_range(GROUPS):
+        tl.store(CacheOut + (row * QUERIES + q) * GROUPS + group, cache, live)
+
+
+def kvp_decode_visible_lengths(
+    page_prefix: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    offset: int,
+    queries: int,
+    groups: int,
+    page_size: int,
+    local_lengths: torch.Tensor,
+    cache_lengths: torch.Tensor,
+) -> None:
+    """:func:`kvp_local_visible_lengths` of a decode's query endpoints, and
+    the kernel cache lengths derived from them, in one launch.
+
+    Query ``q < queries`` of request ``r`` ends at ``max(seq_lens[r] + offset
+    + q, 0)``; its local token count goes to ``local_lengths[r * queries + q]``
+    and, at least one, to ``cache_lengths`` at ``(r * queries + q) * groups +
+    g`` for every ``g < groups``: the endpoints, translation, clamp and
+    repeat a decode over ``groups`` folded head groups would run as separate
+    launches, value for value.
+
+    Args:
+        page_prefix: Exclusive owned-page counts [batch, max_pages + 1] from
+            compact_kvp_pages, rows contiguous.
+        seq_lens: Global sequence lengths [batch], contiguous.
+        offset: First query's endpoint relative to ``seq_lens``.
+        queries: Query rows per request.
+        groups: Copies of each cache length.
+        page_size: Tokens per kernel page.
+        local_lengths: Contiguous int32 [batch * queries] output.
+        cache_lengths: Contiguous int32 [batch * queries * groups] output.
+    """
+    batch = seq_lens.shape[0]
+    if (
+        seq_lens.dim() != 1
+        or not seq_lens.is_contiguous()
+        or page_prefix.dim() != 2
+        or page_prefix.shape[0] != batch
+        or page_prefix.stride(1) != 1
+        or queries < 1
+        or groups < 1
+    ):
+        raise ValueError("decode visible lengths need [batch] lengths and prefix rows")
+    if (
+        local_lengths.shape != (batch * queries,)
+        or cache_lengths.shape != (batch * queries * groups,)
+        or local_lengths.dtype != torch.int32
+        or cache_lengths.dtype != torch.int32
+        or not local_lengths.is_contiguous()
+        or not cache_lengths.is_contiguous()
+    ):
+        raise ValueError("decode visible lengths need contiguous int32 outputs")
+    if seq_lens.is_cuda:
+        if batch:
+            _decode_visible_lengths[(batch,)](
+                page_prefix,
+                seq_lens,
+                local_lengths,
+                cache_lengths,
+                page_prefix.stride(0),
+                page_prefix.shape[1] - 1,
+                offset,
+                queries,
+                groups,
+                page_size,
+                triton.next_power_of_2(queries),
+            )
+        return
+    endpoints = (
+        seq_lens.to(torch.int32)[:, None]
+        + torch.arange(offset, offset + queries, dtype=torch.int32)
+    ).clamp_min(0)
+    local = torch.empty_like(endpoints)
+    kvp_local_visible_lengths(page_prefix, endpoints, page_size=page_size, out=local)
+    local_lengths.copy_(local.reshape(-1))
+    cache_lengths.copy_(local.reshape(-1).clamp_min(1).repeat_interleave(groups))
