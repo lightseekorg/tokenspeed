@@ -46,6 +46,8 @@ pub struct RegistrationInfo {
     pub port: u16,
     /// Its transfer session.
     pub session_id: String,
+    /// The identity of this cache incarnation, independent of its address.
+    pub cache_id: String,
     /// Its arena base.
     pub arena_base: u64,
     /// Its contract, with its landing addresses.
@@ -57,10 +59,14 @@ pub struct RegistrationInfo {
 }
 
 impl RegistrationInfo {
-    /// Parse a registration's eight frames (`KVArgsRegisterInfo.from_zmq`).
+    /// Parse a registration's nine frames (`KVArgsRegisterInfo.from_zmq`).
     pub fn from_frames(frames: &[Bytes]) -> Result<Self, LayoutError> {
-        let (endpoint, port, session_id) =
+        let (endpoint, port, cache_id) =
             wire::registration_route(frames).map_err(|error| LayoutError::new(error.0))?;
+        if !frames[3].is_ascii() || frames[3].is_empty() || frames[3].len() > 512 {
+            return Err(LayoutError::new("CachePD registration session is invalid"));
+        }
+        let session_id = String::from_utf8_lossy(&frames[3]).into_owned();
         let pointer: [u8; 8] = frames[4]
             .as_ref()
             .try_into()
@@ -80,6 +86,7 @@ impl RegistrationInfo {
             endpoint,
             port,
             session_id,
+            cache_id,
             arena_base,
             layout,
             tp_size: tp_size as i64,
@@ -93,8 +100,8 @@ impl RegistrationInfo {
 pub struct Preallocation {
     /// The request's room.
     pub room: u64,
-    /// The Decode rank's transfer session.
-    pub session_id: String,
+    /// The Decode rank's cache incarnation.
+    pub cache_id: String,
     /// Its destination manifest; `None` from a rank that only joins the
     /// status agreement.
     pub manifest: Option<Manifest>,
@@ -103,7 +110,7 @@ pub struct Preallocation {
 impl Preallocation {
     /// Parse a pre-allocation's three frames (`TransferInfo.from_zmq`).
     pub fn from_frames(frames: &[Bytes]) -> Result<Self, LayoutError> {
-        let (room, session_id) =
+        let (room, cache_id) =
             wire::preallocation_route(frames).map_err(|error| LayoutError::new(error.0))?;
         let manifest = if frames[2].is_empty() {
             None
@@ -112,7 +119,7 @@ impl Preallocation {
         };
         Ok(Self {
             room,
-            session_id,
+            cache_id,
             manifest,
         })
     }
