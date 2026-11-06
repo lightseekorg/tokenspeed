@@ -1005,6 +1005,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if self.controls.take_abort_all() {
             for rid in self.outputs.rids() {
                 self.outputs.mark_abort(&rid, true);
+                if let Some(transfer) = self.transfer.as_mut() {
+                    transfer.cancel(&rid);
+                }
             }
         }
         if self.controls.take_cancel_unscheduled() {
@@ -1409,6 +1412,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.outputs.mark_submitted(&rid, now);
             if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), &bootstrap) {
                 transfer.register(&rid, bootstrap)?;
+                // An abort may precede this round's batched submission.
+                if self.outputs.state(&rid).is_some_and(|state| state.to_abort) {
+                    transfer.cancel(&rid);
+                }
             }
         }
         Ok(())
@@ -2243,6 +2250,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 EngineRequest::Abort(rids) => {
                     for rid in rids {
                         self.outputs.mark_abort(&rid, false);
+                        if let Some(transfer) = self.transfer.as_mut() {
+                            transfer.cancel(&rid);
+                        }
                         // On the storage path the abort detaches the request
                         // from its storage work at the next round's head; one
                         // that holds no pages yet finishes there, and no

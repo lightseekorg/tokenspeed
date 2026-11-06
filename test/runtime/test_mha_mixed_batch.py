@@ -386,7 +386,7 @@ def _block_runtime():
     drafter = DFlash2.__new__(DFlash2)
     drafter.spec_num_tokens = drafter.draft_query_width = 16
     drafter.input_buffers = InputBuffers(4, 64, 16, device="cpu")
-    drafter.runtime_states = RuntimeStates(16, 32, 16, device="cpu")
+    drafter.runtime_states = RuntimeStates(16, 32, 32, 16, device="cpu")
     drafter.draft_seq_lens_buf = torch.zeros(4, dtype=torch.int32)
     drafter.block_ids_buf = torch.ones((4, 16), dtype=torch.int32)
     drafter.block_positions_buf = torch.zeros((4, 16), dtype=torch.int64)

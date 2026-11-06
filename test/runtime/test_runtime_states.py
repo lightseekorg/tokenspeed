@@ -37,7 +37,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 def test_reset_states_preserves_unselected_rows(device, rows):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    states = RuntimeStates(4, 32, 2, device)
+    states = RuntimeStates(4, 32, 32, 2, device)
     states.valid_cache_lengths.fill_(7)
     states.spec_candidates_ready.fill_(True)
     states.future_input_map.fill_(11)
@@ -54,7 +54,7 @@ def test_reset_states_preserves_unselected_rows(device, rows):
 
 
 def test_draft_probs_start_as_sentinel_with_a_zero_bonus_slot():
-    states = RuntimeStates(4, 32, 3, "cpu")
+    states = RuntimeStates(4, 32, 32, 3, "cpu")
     assert states.draft_probs is None
     # reset_draft_probs is a no-op until the buffer exists.
     states.reset_draft_probs(torch.tensor([1], dtype=torch.int64))
@@ -72,7 +72,7 @@ def test_draft_tree_parents_are_declared_at_construction():
     # A PD decode destination writes its bootstrap token through
     # write_decode_input_ids, which reads future_parent_map, before any reset
     # or drafter has touched the slot: the fields exist from construction.
-    states = RuntimeStates(4, 32, 3, "cpu")
+    states = RuntimeStates(4, 32, 32, 3, "cpu")
     assert states.chain_parents is None
     assert states.future_parent_map is None
 
@@ -85,7 +85,7 @@ def test_draft_tree_parents_are_declared_at_construction():
 
 
 def _recorded_states() -> RuntimeStates:
-    states = RuntimeStates(4, 32, 3, "cpu")
+    states = RuntimeStates(4, 32, 32, 3, "cpu")
     states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0)
     # Pretend the drafter recorded every slot's two steps.
     states.draft_probs[:, :-1] = 0.25
@@ -132,7 +132,7 @@ def test_remote_landing_relies_on_the_receive_time_reset():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_reset_states_does_not_synchronize_cuda():
-    states = RuntimeStates(4, 32, 2, "cuda")
+    states = RuntimeStates(4, 32, 32, 2, "cuda")
     indices = torch.tensor([1, 3], dtype=torch.int64, device="cuda")
     lengths = torch.tensor([128, 256], dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
@@ -150,7 +150,7 @@ def test_reset_states_does_not_synchronize_cuda():
 def test_remote_candidate_landing_does_not_synchronize_cuda():
     # A PD decode destination lands each remote prefill's candidates on the
     # forward thread, while a step may be in flight.
-    states = RuntimeStates(4, 32, 3, "cuda")
+    states = RuntimeStates(4, 32, 32, 3, "cuda")
     torch.cuda.synchronize()
     previous_mode = torch.cuda.get_sync_debug_mode()
     try:
@@ -165,7 +165,7 @@ def test_remote_candidate_landing_does_not_synchronize_cuda():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_reset_states_graph_replay_uses_current_inputs():
-    states = RuntimeStates(4, 32, 2, "cuda")
+    states = RuntimeStates(4, 32, 32, 2, "cuda")
     indices = torch.tensor([1, 3], dtype=torch.int64, device="cuda")
     lengths = torch.tensor([128, 256], dtype=torch.int32, device="cuda")
     graph = torch.cuda.CUDAGraph()
