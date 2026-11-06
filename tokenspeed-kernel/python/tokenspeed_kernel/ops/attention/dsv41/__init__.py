@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41._metadata import index_logit_rows
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -79,6 +80,7 @@ __all__ = [
     "index_score",
     "index_topk",
     "new_index_metadata",
+    "index_logit_rows",
     "index_select_all",
     "local_index_supported",
     "index_candidates",
@@ -640,14 +642,18 @@ def index_topk(
     FP8 ``index_v4`` rows into FP32 logits and the in-tree CuTe DSL DeepSelect
     kernel selects. This native accumulation
     differs from the portable reference's intermediate BF16 rounding.
-    Blackwell paged scoring uses query_chunk_size and optional request IDs;
-    its cleaned rows have native-aligned strides and are borrowed by TopK with
-    exclusive ends. Candidate block reduction only writes valid blocks and the
-    final aligned prefetch segment. Zero-row-stride broadcast
-    scoring retains a 128MiB logits budget. Native logits and their cleaned
-    copy can coexist. Hopper retains its 32MiB paged / 128MiB broadcast budgets.
-    That broadcast layout gathers packed history once per call and packs Q
-    once before the score tiles; no payload survives the call. For unsharded
+    Blackwell paged scoring (decode and verify) uses query_chunk_size and
+    optional request IDs; its cleaned rows have native-aligned strides and are
+    borrowed by TopK with exclusive ends. Blackwell dense scoring (prefill,
+    history_rows) scores the caller's whole batch: packed keys plus per-row
+    cu_seq_len starts, without a 128MiB inner tile. The runtime keeps one
+    call's BF16 logits within index_logit_rows. DeepSelect borrows the MQA
+    view; invalid pages before each row's end are set to -inf in place.
+    Candidate block reduction only writes valid blocks and the final aligned
+    prefetch segment. For paged and candidate-source scoring, native logits
+    and their cleaned copy can coexist. Hopper retains its 32MiB paged /
+    128MiB broadcast budgets. Packed history is gathered once per call and Q
+    is packed once; no payload survives the call. For unsharded
     68-byte MXFP4 caches, AMD Gluon Full similarly caps each FP32 logits query
     tile at 32MiB instead of limiting history width; Reindex scores only the
     candidate rows.
@@ -1509,6 +1515,8 @@ def new_index_metadata(
     page_table: torch.Tensor,
     visible_lens: torch.Tensor,
     request_indices: torch.Tensor | None,
+    *,
+    history_rows: tuple[int, ...] | None,
 ) -> object:
     """Create invocation-owned reusable index geometry for these exact inputs.
 
@@ -1527,10 +1535,22 @@ def new_index_metadata(
     KV values or scores are cached. Consumers on other streams wait for metadata
     producers before reading. Cached geometry is retained until this object is
     released.
+
+    history_rows selects the Blackwell Full scorer. A tuple gives the number of
+    consecutive query rows that share one request history, in table order, and
+    sums to the table's rows: each history is gathered once into a packed key
+    buffer and scored densely (prefill). None scores every row through the
+    paged page table (decode and verify). request_indices only groups paged
+    scoring; dense scoring ignores it.
     """
     from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
-    return IndexMetadata(page_table, visible_lens, request_indices)
+    if history_rows is not None and (
+        any(rows < 1 for rows in history_rows)
+        or sum(history_rows) != page_table.shape[0]
+    ):
+        raise ValueError("history_rows must be positive and cover every query row")
+    return IndexMetadata(page_table, visible_lens, request_indices, history_rows)
 
 
 def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
