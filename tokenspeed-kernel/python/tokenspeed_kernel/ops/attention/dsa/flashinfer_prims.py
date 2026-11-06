@@ -31,19 +31,6 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-sparse_attention = None
-if current_platform().is_nvidia:
-    try:
-        from tokenspeed_kernel.thirdparty.flashinfer.dsa_prims import sparse_attention
-    except ImportError:
-        # FlashInfer releases without PR #7984 lack the sparse MLA wrapper.
-        pass
-
-
-def has_prims_sparse_mla() -> bool:
-    """Whether the installed FlashInfer provides Prims-TS sparse MLA."""
-    return sparse_attention is not None
-
 
 def _attention(
     *,
@@ -67,6 +54,8 @@ def _attention(
     out: torch.Tensor | None,
     enable_pdl: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.thirdparty.flashinfer.dsa_prims import sparse_attention
+
     if kv_cache is None or sparse_kv_cache is not None:
         raise ValueError(
             "Prims-TS DSA requires a native KV cache without a packed cache"
@@ -152,7 +141,7 @@ def flashinfer_prims_dsa_prefill(**kwargs):
     return _attention(mode="prefill", **kwargs)
 
 
-if has_prims_sparse_mla():
+if current_platform().is_nvidia:
     for _mode, _function in (
         ("dsa_decode", flashinfer_prims_dsa_decode),
         ("dsa_prefill", flashinfer_prims_dsa_prefill),

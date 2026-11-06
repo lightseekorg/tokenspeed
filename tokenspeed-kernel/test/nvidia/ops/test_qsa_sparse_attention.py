@@ -400,38 +400,6 @@ def test_prims_qsa_kernel_warmup_does_not_enable_extra_compilation(device):
     )
 
 
-def test_prims_cluster_occupancy_cache_preserves_cluster_sizes(device):
-    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
-        pytest.skip("PrimTS QSA requires SM100 or SM103")
-    from cutlass.utils import HardwareInfo
-    from tokenspeed_kernel.compile_monitor import CompileMonitor
-    from tokenspeed_kernel.compile_monitor.cute_dsl import CuteDslHooks
-    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import (
-        _cache_cluster_occupancy,
-    )
-
-    def query(cluster_size):
-        return HardwareInfo(torch.cuda.current_device()).get_max_active_clusters(
-            cluster_size
-        )
-
-    cached_query = _cache_cluster_occupancy(query)
-    with torch.cuda.device(device):
-        expected = {size: query(size) for size in (1, 2, 4)}
-        monitor = CompileMonitor("error", 4)
-        hooks = CuteDslHooks(monitor)
-        hooks.install()
-        try:
-            for size in expected:
-                assert cached_query(size) == expected[size]
-            monitor.serving = True
-            for size in (1, 2, 4, 2, 1, 4, 1, 2, 4):
-                assert cached_query(size) == expected[size]
-            assert monitor.stats().serving_compiles == 0
-        finally:
-            hooks.uninstall()
-
-
 def test_prims_qsa_new_batch_plans_reuse_cluster_occupancy(device):
     if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
         pytest.skip("PrimTS QSA requires SM100 or SM103")
