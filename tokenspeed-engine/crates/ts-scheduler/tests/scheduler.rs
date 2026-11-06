@@ -585,6 +585,51 @@ fn a_remote_prefill_carries_what_the_data_plane_reads() {
 }
 
 #[test]
+fn a_remote_partial_prefix_has_a_live_transfer_destination() {
+    interpreter();
+    for prefix in [7, 23, 39] {
+        let mut scheduler =
+            Python::attach(|py| Scheduler::from_python(&run(py, &pd_scheduler("D"))).unwrap());
+        let mut seed = spec("seed", (1..=prefix).collect());
+        seed.max_new_tokens = 1;
+        scheduler.submit_requests(&[seed]).unwrap();
+        scheduler
+            .advance(&[event(ForwardEventKind::PdBootstrapped, "seed", vec![])])
+            .unwrap();
+        let first = scheduler
+            .next_execution_plan()
+            .remote_prefill_transfer()
+            .unwrap();
+        let source = first.block_tables[0].blocks[(prefix / 16) as usize];
+        scheduler
+            .advance(&[
+                ForwardEvent {
+                    bootstrap_token: 1000,
+                    ..event(ForwardEventKind::PdRemotePrefillDone, "seed", vec![])
+                },
+                event(ForwardEventKind::Finish, "seed", vec![]),
+            ])
+            .unwrap();
+        scheduler.next_execution_plan();
+
+        scheduler
+            .submit_requests(&[spec("hit", (1..=prefix + 2).collect())])
+            .unwrap();
+        scheduler
+            .advance(&[event(ForwardEventKind::PdBootstrapped, "hit", vec![])])
+            .unwrap();
+        let plan = scheduler.next_execution_plan();
+        let rows = plan.remote_prefill_transfer().unwrap();
+        assert_eq!(rows.extend_prefix_lens, [prefix]);
+        let blocks = &rows.block_tables[0].blocks;
+        let tail = (prefix / 16) as usize;
+        assert!(blocks[..=tail].iter().all(|&block| block > 0), "{rows:?}");
+        assert_ne!(blocks[tail], source, "the peer writes a private tail block");
+        assert_eq!(python_transfer_view(plan, "remote_prefill"), rows);
+    }
+}
+
+#[test]
 fn a_remote_decode_carries_the_first_token_and_the_prompt_blocks() {
     interpreter();
     let mut scheduler =

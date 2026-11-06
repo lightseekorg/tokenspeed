@@ -3911,8 +3911,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 (H, split_kv, S, B),
                 stride=(split_kv, 1, H * split_kv, H * split_kv * S),
             )
+            # Form bytes first: intermediate bit counts overflow Int32 at 256 MiB.
             acc_lse_iter = cute.recast_ptr(
-                workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
+                workspace.iterator + cute.cosize(acc_o_layout) * (acc_dtype.width // 8),
                 dtype=acc_dtype,
             )
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
