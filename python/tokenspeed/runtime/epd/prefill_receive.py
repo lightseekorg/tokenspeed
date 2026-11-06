@@ -215,7 +215,7 @@ class EmbeddingPublisher:
         self._shards = shards
         # (the event after a publish's copies, their slots), in publish
         # order: appended by the forward thread, read by the control thread.
-        self._copies: list[tuple[torch.cuda.Event | None, list[int]]] = []
+        self._copies: list[tuple[Any | None, list[int]]] = []
         self._lock = threading.Lock()
 
     def publish(
@@ -252,8 +252,8 @@ class EmbeddingPublisher:
                     rebuilt.append(item)
         if slots:
             event = None
-            if self._device.type == "cuda":
-                event = torch.cuda.Event()
+            if self._device.type in ("cuda", "npu"):
+                event = torch.get_device_module(self._device.type).Event()
                 event.record()
             with self._lock:
                 self._copies.append((event, slots))
@@ -345,15 +345,17 @@ def build_epd_receive(
     shards = None
     if _agreed_shard_flag(attn_tp_size, attn_tp_cpu_group):
         shards = ShardGroup(
-            nccl_group=pg_manager.get_process_group("nccl", mapping.attn.tp_group),
+            nccl_group=pg_manager.get_device_process_group(mapping.attn.tp_group),
             group_ranks=mapping.attn.tp_group,
         )
-        # NCCL sets a communicator up on its first collective: warm it now, so
+        # Device collectives initialize on first use: warm the communicator now, so
         # the first request does not pay for it and a broken group fails the
         # boot instead of a request.
         warmup = torch.zeros(1, device=facts.device)
         dist.broadcast(warmup, src=shards.group_ranks[0], group=shards.nccl_group)
-        torch.cuda.current_stream().synchronize()
+        torch.get_device_module(
+            torch.device(facts.device).type
+        ).current_stream().synchronize()
         logger.info(f"EPD embedding row sharding over {attn_tp_size} attn-TP ranks")
     slots, slot_mb = recv_pool_geometry()
     pools = None
