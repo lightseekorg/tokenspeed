@@ -42,7 +42,7 @@ def _stage(hidden, weights, ids):
         torch.full((tokens, ids.shape[1]), -1, device="cuda", dtype=torch.int64),
         torch.empty(tokens, ids.shape[1], device="cuda", dtype=torch.float32),
     )
-    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out)
+    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, None, None)
     return out
 
 
@@ -120,8 +120,80 @@ def test_stage_reads_rows_past_int32_offsets():
     weights = torch.rand(2, 6, device="cuda", dtype=torch.float32)
     ids = torch.randint(0, 384, (2, 6), device="cuda", dtype=torch.int32)
 
-    for got, want in zip(
-        _stage(hidden, weights, ids),
-        _reference(hidden.contiguous(), weights, ids),
-    ):
+    got = _stage(hidden, weights, ids)
+    want = _reference(hidden.contiguous(), weights, ids)
+    for a, b in zip(got, want):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _shared_rows(tokens, block_m):
+    """Rows of the shared expert's MN-major scales: grouped by BLOCK_M, UTCCP within 128."""
+    rows = []
+    aligned = (block_m + 127) // 128 * 128
+    for token in range(tokens):
+        m = token % block_m
+        rows.append(
+            token // block_m * aligned + m // 128 * 128 + m % 32 * 4 + m % 128 // 32
+        )
+    return torch.tensor(rows, device="cuda")
+
+
+def _shared_scales(size):
+    """A shared-expert scale buffer, MN-major like DeepGEMM's, filled with a sentinel.
+
+    Its row count is fixed, as the symmetric buffer's is, so its stride is too.
+    """
+    return torch.full((size // 128, 1024), -1, device="cuda", dtype=torch.int32).t()
+
+
+@pytest.mark.parametrize("tokens,block_m", [(1, 16), (37, 16), (200, 64), (300, 192)])
+def test_shared_scales_land_in_block_m_rows(tokens, block_m):
+    torch.manual_seed(tokens + block_m)
+    hidden = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(tokens, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (tokens, 6), device="cuda", dtype=torch.int32)
+    plain = _stage(hidden, weights, ids)
+    shared = _shared_scales(512)
+    out = (
+        torch.empty_like(plain[0]),
+        torch.empty_like(plain[1]),
+        torch.empty_like(plain[2]),
+        torch.empty_like(plain[3]),
+    )
+    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, shared, block_m)
+
+    for got, want in zip(out, plain):
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    rows = _shared_rows(tokens, block_m)
+    assert torch.equal(shared[rows], plain[1])
+    untouched = torch.ones(shared.shape[0], dtype=torch.bool, device="cuda")
+    untouched[rows] = False
+    assert (shared[untouched] == -1).all()
+
+
+def test_shared_block_m_does_not_recompile():
+    hidden = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(512, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (512, 6), device="cuda", dtype=torch.int32)
+
+    def stage(tokens, block_m):
+        out = (
+            torch.empty(tokens, 512, device="cuda", dtype=torch.float8_e4m3fn),
+            torch.empty(tokens, 4, device="cuda", dtype=torch.int32),
+            torch.empty(tokens, 6, device="cuda", dtype=torch.int64),
+            torch.empty(tokens, 6, device="cuda", dtype=torch.float32),
+        )
+        stage_mxfp4_mega_moe_inputs(
+            hidden[:tokens],
+            weights[:tokens],
+            ids[:tokens],
+            *out,
+            _shared_scales(512),
+            block_m,
+        )
+
+    for tokens in (1, 64, 300):
+        stage(tokens, 16)
+    with assert_no_triton_compile(_stage_mxfp4_mega_moe_inputs_kernel):
+        for tokens, block_m in ((2, 32), (65, 48), (300, 192), (512, 128)):
+            stage(tokens, block_m)

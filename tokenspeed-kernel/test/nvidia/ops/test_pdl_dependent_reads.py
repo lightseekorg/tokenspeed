@@ -288,7 +288,7 @@ def _case_stage_mxfp4_mega_moe_inputs():
             torch.empty(tokens, top_k, dtype=torch.int64, device=DEVICE),
             torch.empty(tokens, top_k, dtype=torch.float32, device=DEVICE),
         )
-        stage_mxfp4_mega_moe_inputs(hidden_states, weights, ids, *out)
+        stage_mxfp4_mega_moe_inputs(hidden_states, weights, ids, *out, None, None)
         return out
 
     return real, run

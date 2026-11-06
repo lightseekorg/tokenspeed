@@ -27,6 +27,11 @@ arrays are empty on decode-only batches. Use ``.tolist()`` for Python integers,
 or ``np.array(view, dtype=np.int32, copy=True)`` for writable storage (including
 when passing the data to PyTorch). The explicit dtype also accepts token lists
 from older scheduler releases without changing the result's dtype.
+
+``Forward.Batch.block_tables_arrays()`` gives every group's ``[rows, columns]``
+int32 table, read-only and zero-copy, and ``block_table_spans()`` each row's
+``(released, pages)``: the row's columns before ``released`` are null holes (0)
+and those from ``pages`` on are -1 padding.
 """
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext

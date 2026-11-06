@@ -233,6 +233,16 @@ def kda_layer_id(pool) -> int:
     return min(pool.state_group_by_layer)
 
 
+def whole_row_spans(arrays):
+    """Block-table row spans covering every column, exact for any table."""
+    return {
+        group_id: np.tile(
+            np.array([0, array.shape[1]], dtype=np.int32), (len(array), 1)
+        )
+        for group_id, array in arrays.items()
+    }
+
+
 def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
     from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
         CacheBatchMetadata,
@@ -245,13 +255,17 @@ def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
             arrays[spec.group_id] = np.asarray(tables[spec.group_id], dtype=np.int32)
         else:
             arrays[spec.group_id] = np.full((bs, 1), filler_page, dtype=np.int32)
-    forward_op = SimpleNamespace(block_tables_arrays=lambda: arrays)
+    spans = whole_row_spans(arrays)
+    forward_op = SimpleNamespace(
+        block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+    )
     metadata = CacheBatchMetadata.from_forward_op(
         forward_op,
         device=device,
         contract=contract,
         num_requests=bs,
         validate_page_ids=True,
+        host_tables=True,
     )
     return metadata, forward_op
 

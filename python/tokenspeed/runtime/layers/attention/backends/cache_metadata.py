@@ -46,7 +46,10 @@ class CacheBatchMetadata:
 
     group_ids: tuple[str, ...]
     _group_tables: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
-    _group_tables_cpu: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
+    # None unless the factory was asked for host tables.
+    _group_tables_cpu: Mapping[str, torch.Tensor] | None = field(
+        repr=False, compare=False
+    )
     _forward_op: Any = field(repr=False, compare=False)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -61,6 +64,7 @@ class CacheBatchMetadata:
         contract: CacheRuntimeContract,
         num_requests: int,
         validate_page_ids: bool,
+        host_tables: bool,
     ) -> CacheBatchMetadata:
         """Check the tables against the contract, pack once, and retain
         operation provenance.
@@ -69,7 +73,9 @@ class CacheBatchMetadata:
         ``validate_page_ids`` every page ID is also scanned against its
         group's virtual block count: tables built outside the scheduler
         (prefill-graph capture) always ask for it, scheduler-built ones under
-        ``TOKENSPEED_VALIDATE_PAGE_IDS``.
+        ``TOKENSPEED_VALIDATE_PAGE_IDS``. ``host_tables`` also keeps a host
+        copy for ``tables_cpu``: a forward with extends plans from it, a pure
+        decode never reads it.
         """
         if forward_op is None:
             raise ValueError("forward_op must not be None")
@@ -96,6 +102,7 @@ class CacheBatchMetadata:
         tables = packed_block_tables_from_forward_op(
             forward_op,
             device,
+            host_tables=host_tables,
             num_reqs=num_requests,
             expected_group_ids=group_ids,
             # The packer scans every page ID against bounds it is given.
@@ -104,7 +111,7 @@ class CacheBatchMetadata:
         return cls._from_validated_tables(
             group_ids=group_ids,
             group_tables=tables.tables,
-            group_tables_cpu=tables.tables_cpu,
+            group_tables_cpu=tables.tables_cpu if host_tables else None,
             num_requests=num_requests,
             forward_op=forward_op,
         )
@@ -115,11 +122,13 @@ class CacheBatchMetadata:
         *,
         group_ids: tuple[str, ...],
         group_tables: Mapping[str, torch.Tensor],
-        group_tables_cpu: Mapping[str, torch.Tensor],
+        group_tables_cpu: Mapping[str, torch.Tensor] | None,
         num_requests: int,
         forward_op: Any,
     ) -> CacheBatchMetadata:
-        if tuple(group_tables) != group_ids or tuple(group_tables_cpu) != group_ids:
+        if tuple(group_tables) != group_ids or (
+            group_tables_cpu is not None and tuple(group_tables_cpu) != group_ids
+        ):
             raise ValueError(
                 "cache group table mapping must exactly match contract order"
             )
@@ -147,7 +156,7 @@ class CacheBatchMetadata:
         if len(pointers) != 1:
             raise ValueError("cache group tables must share packed storage")
 
-        for group_id, table in group_tables_cpu.items():
+        for group_id, table in (group_tables_cpu or {}).items():
             if not isinstance(table, torch.Tensor) or table.device.type != "cpu":
                 raise ValueError(
                     f"CPU table for cache group {group_id!r} must be on the CPU"
@@ -159,7 +168,13 @@ class CacheBatchMetadata:
         object.__setattr__(metadata, "group_ids", group_ids)
         object.__setattr__(metadata, "_group_tables", MappingProxyType(ordered))
         object.__setattr__(
-            metadata, "_group_tables_cpu", MappingProxyType(dict(group_tables_cpu))
+            metadata,
+            "_group_tables_cpu",
+            (
+                None
+                if group_tables_cpu is None
+                else MappingProxyType(dict(group_tables_cpu))
+            ),
         )
         # A strong reference makes Python/nanobind object identity safe against
         # id reuse until all metadata views become unreachable.
@@ -180,6 +195,8 @@ class CacheBatchMetadata:
         return self._group_tables
 
     def tables_cpu(self, *, active_forward_op: Any) -> Mapping[str, torch.Tensor]:
-        """The same tables as CPU views of the stage they were uploaded from."""
+        """The same tables as CPU views of one host copy (pinned for a device)."""
         self._validate_active_forward_op(active_forward_op)
+        if self._group_tables_cpu is None:
+            raise RuntimeError("this batch's metadata was built without host tables")
         return self._group_tables_cpu

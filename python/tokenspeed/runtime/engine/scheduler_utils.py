@@ -529,12 +529,12 @@ def cache_ops_from_plan(execution_plan) -> CacheOperations:
 
 
 class PackedBlockTables(NamedTuple):
-    """One batch's per-group block tables, staged once and uploaded once.
+    """One batch's per-group block tables, uploaded once.
 
     Attributes:
         tables: Per-group int32 views into the one device storage.
-        tables_cpu: The same tables as views into the pinned host stage they
-            were uploaded from, for planning that must not wait on the device.
+        tables_cpu: The same tables as views into one pinned host copy, for
+            planning that must not wait on the device; empty unless asked for.
     """
 
     tables: dict[str, torch.Tensor]
@@ -554,6 +554,7 @@ def block_tables_from_forward_op(
     return packed_block_tables_from_forward_op(
         forward_op,
         device,
+        host_tables=False,
         num_reqs=num_reqs,
         expected_group_ids=expected_group_ids,
         max_page_id=max_page_id,
@@ -565,6 +566,7 @@ def packed_block_tables_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
     *,
+    host_tables: bool,
     num_reqs: int | None = None,
     expected_group_ids: tuple[str, ...] | None = None,
     max_page_id: int | None = None,
@@ -574,34 +576,41 @@ def packed_block_tables_from_forward_op(
     page indices, null hole = 0 preserved, ragged-row padding -1. No
     base-offset companion -- the cache path never compacts.
 
-    All groups stage into ONE pinned buffer and ride ONE H2D copy; the
-    returned per-group views share a single storage, which is the
+    All groups ride ONE H2D copy and one kernel rebuilds them into ONE device
+    storage; the returned per-group views share it, which is the
     precondition of the routers' one-launch fill of every group
     (``GroupTableStacks.fill``). Per-group uploads would fail its
-    same-storage check and fall back to one launch per group. The host
-    stage is returned too, so a backend planning from the tables reads them
-    without a D2H sync.
+    same-storage check and fall back to one launch per group. The copy
+    carries each row's span from the scheduler (``block_table_spans``):
+    before it the row holds its released prefix's null holes and after it
+    padding, so a sliding-window row at a long context moves a few entries.
+    With ``host_tables`` the tables are also copied into pinned host memory,
+    so a backend planning an extend from them reads them without a D2H sync.
 
     Structural contract checks run whenever bounds or expected groups are
-    supplied. Every page ID is scanned against the bounds when they are
-    supplied; at long contexts the scan costs as much as the packing, so
-    callers pass bounds only when they mean to scan
-    (``CacheBatchMetadata.from_forward_op``'s ``validate_page_ids``).
+    supplied. Every page ID is scanned against the bounds, and every row
+    against its span, when they are supplied; at long contexts the scan
+    costs more than the packing, so callers pass bounds only when they mean
+    to scan (``CacheBatchMetadata.from_forward_op``'s ``validate_page_ids``).
 
     Args:
-        forward_op: Scheduler forward operation exporting CPU NumPy tables.
+        forward_op: Scheduler forward operation exporting CPU NumPy tables
+            and their row spans.
         device: Destination device for the packed tensor.
+        host_tables: Also return the tables in host memory (``tables_cpu``).
         num_reqs: Optional expected row count for every group.
         expected_group_ids: Optional contract order and exact key set.
         max_page_id: Optional common inclusive upper bound for page IDs.
         max_page_ids: Optional per-group inclusive upper bounds.
 
     Returns:
-        Device and host per-group tensor views in ``expected_group_ids``
-        order when supplied, otherwise preserving producer order.
+        Device and (with ``host_tables``) host per-group tensor views in
+        ``expected_group_ids`` order when supplied, otherwise preserving
+        producer order.
 
     Raises:
-        ValueError: If strict contract validation fails before device transfer.
+        ValueError: If strict contract validation or a row span fails before
+            device transfer.
     """
     if max_page_id is not None and max_page_ids is not None:
         raise ValueError("pass max_page_id or max_page_ids, not both")
@@ -626,6 +635,9 @@ def packed_block_tables_from_forward_op(
     array_items = [
         (str(key), arr) for key, arr in forward_op.block_tables_arrays().items()
     ]
+    spans_by_id = {
+        str(key): spans for key, spans in forward_op.block_table_spans().items()
+    }
     if strict_validation:
         normalized_group_ids: set[str] = set()
         collided_ids: set[str] = set()
@@ -680,7 +692,8 @@ def packed_block_tables_from_forward_op(
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
     out_cpu: dict[str, torch.Tensor] = {}
-    packable: list[tuple[str, Any, int]] = []
+    # (key, table, offset in the packed storage, window start per row, width)
+    packable: list[tuple[str, Any, int, np.ndarray, int]] = []
     total = 0
     for key, arr in ordered_items:
         if num_reqs is not None and arr.shape[0] != num_reqs:
@@ -690,30 +703,90 @@ def packed_block_tables_from_forward_op(
             )
         if arr.shape[0] == 0:
             continue
+        spans = spans_by_id.get(key)
+        if (
+            not isinstance(spans, np.ndarray)
+            or spans.dtype != np.int32
+            or spans.shape != (arr.shape[0], 2)
+        ):
+            raise ValueError(f"block_table_spans[{key}] must be int32 [rows, 2]")
+        released, pages = spans[:, 0], spans[:, 1]
+        if bool(((released < 0) | (released > pages) | (pages > arr.shape[1])).any()):
+            raise ValueError(f"block_table_spans[{key}] exceeds its table")
+        if max_page_id is not None or max_page_ids is not None:
+            column = np.arange(arr.shape[1])
+            if bool(
+                (arr[column < released[:, None]] != 0).any()
+                or (arr[column >= pages[:, None]] != -1).any()
+            ):
+                raise ValueError(
+                    f"cache group {key!r} holds entries outside its row spans"
+                )
         if arr.shape[1] == 0:
             # Kept out of the pack: CacheBatchMetadata rejects a zero-width table.
             out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
-            out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
+            if host_tables:
+                out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
             continue
-        packable.append((key, arr, total))
+        # One window width per group: the windows of a group form one block,
+        # and a window ending at a span's end starts at or before it.
+        width = int((pages - released).max())
+        first = np.maximum(pages.astype(np.int64) - width, 0)
+        packable.append((key, arr, total, first, width))
         total += arr.shape[0] * arr.shape[1]
     if not packable:
         return PackedBlockTables(out, out_cpu)
-    # Fresh pinned stage per step (event-fenced; reuse races overlap).
-    # arr is a read-only zero-copy view over the C++ buffer; np.copyto
-    # reads it into our own writable pinned tensor (never writes back).
-    staged = torch.empty(
-        total, dtype=torch.int32, pin_memory=device.type in ("cuda", "npu")
+    from tokenspeed_kernel.ops.metadata import (
+        BLOCK_TABLE_ROW_FIELDS,
+        expand_block_table_rows,
     )
-    staged_np = staged.numpy()
-    for key, arr, offset in packable:
-        np.copyto(staged_np[offset : offset + arr.size].reshape(arr.shape), arr)
-    packed = staged.to(device, non_blocking=True)
-    for key, arr, offset in packable:
-        out[key] = packed[offset : offset + arr.size].view(arr.shape[0], arr.shape[1])
-        out_cpu[key] = staged[offset : offset + arr.size].view(
-            arr.shape[0], arr.shape[1]
-        )
+
+    num_rows = sum(arr.shape[0] for _, arr, _, _, _ in packable)
+    fields = num_rows * BLOCK_TABLE_ROW_FIELDS
+    num_values = sum(arr.shape[0] * width for _, arr, _, _, width in packable)
+    # Fresh pinned stages per step (event-fenced; reuse races overlap).
+    # arr is a read-only zero-copy view over the C++ buffer; np.copyto
+    # reads it into our own writable pinned tensors (never writes back).
+    pin_memory = device.type in ("cuda", "npu")
+    upload = torch.empty(fields + num_values, dtype=torch.int32, pin_memory=pin_memory)
+    upload_np = upload.numpy()
+    row_fields = upload_np[:fields].reshape(num_rows, BLOCK_TABLE_ROW_FIELDS)
+    values = upload_np[fields:]
+    row_at = value_at = 0
+    for key, arr, offset, first, width in packable:
+        rows, columns = arr.shape
+        # (offset, width, start, end, source): expand_block_table_rows' fields.
+        group_fields = row_fields[row_at : row_at + rows]
+        group_fields[:, 0] = offset + np.arange(rows) * columns
+        group_fields[:, 1] = columns
+        group_fields[:, 2] = first
+        group_fields[:, 3] = first + width
+        group_fields[:, 4] = value_at + np.arange(rows) * width
+        windows = values[value_at : value_at + rows * width].reshape(rows, width)
+        if not first.any():
+            np.copyto(windows, arr[:, :width])
+        elif width:
+            np.copyto(
+                windows,
+                np.lib.stride_tricks.sliding_window_view(arr, width, axis=1)[
+                    np.arange(rows), first
+                ],
+            )
+        row_at += rows
+        value_at += rows * width
+    upload = upload.to(device, non_blocking=True)
+    packed = torch.empty(total, dtype=torch.int32, device=device)
+    expand_block_table_rows(
+        upload[:fields].view(num_rows, BLOCK_TABLE_ROW_FIELDS), upload[fields:], packed
+    )
+    for key, arr, offset, _, _ in packable:
+        out[key] = packed[offset : offset + arr.size].view(arr.shape)
+    if host_tables:
+        staged = torch.empty(total, dtype=torch.int32, pin_memory=pin_memory)
+        staged_np = staged.numpy()
+        for key, arr, offset, _, _ in packable:
+            np.copyto(staged_np[offset : offset + arr.size].reshape(arr.shape), arr)
+            out_cpu[key] = staged[offset : offset + arr.size].view(arr.shape)
     return PackedBlockTables(out, out_cpu)
 
 

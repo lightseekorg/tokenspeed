@@ -2050,6 +2050,9 @@ def moe_plan(
         "supports_valid_token_mask": "valid_token_mask" in apply_spec.features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
+        "fuse_shared_expert": getattr(
+            kernel.impl, "_tokenspeed_fuse_shared_expert", None
+        ),
         "a2a_backend": a2a_backend,
         "process_group": process_group,
         "deepep_mode": deepep_mode or "auto",
