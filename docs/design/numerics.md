@@ -721,3 +721,37 @@ runtime behavior on other platforms and widths. Tests preserve the old formula
 independently and compare weights/IDs byte-for-byte on ties, cutoff ties, bias,
 identity candidates, near ties, batch packing/reordering and CUDA graph replay.
 This does not promise cross-version PyTorch tie compatibility.
+
+## Input and output vocabularies
+
+The runtime uses `ModelConfig.input_vocab_size` for input token bounds and
+`ModelConfig.vocab_size` for the output vocabulary. The checkpoint convention
+is unchanged: its `vocab_size` is the embedding size and its optional
+`output_vocab_size` is the head size. A missing or null `output_vocab_size`
+means the two sizes are equal. Both must be positive integers, and the output
+vocabulary must fit within the input vocabulary for subsequent decoding.
+Invalid sizes are reported with both runtime field names and their values.
+The original Hugging Face config is not rewritten.
+
+Input buffer clamps, n-gram token validation and multimodal draft substitute
+validation use `input_vocab_size`. Sampling, draft probability tensors,
+grammar masks, logit bias and prompt-logprob validation keep using `vocab_size`.
+Prompt-logprob admission checks only the scored next-token targets,
+`input_ids[logprob_start_len + 1..]`, against the output vocabulary. Unscored
+context retains the input bounds, including the token at `logprob_start_len`;
+it feeds the first scored row rather than being that row's target.
+An input-only token can reach the model without becoming a valid output token
+or prompt-logprob target. Models or plugins with a reduced head must construct
+the embedding and head for their respective checkpoint sizes.
+
+After loading a target model, initialization checks the logits processor's
+logical vocabulary against the runtime output size. A mismatch fails before
+sampling buffers or CUDA graphs are built; TP shards and padded weight rows
+are not logical vocabulary sizes. Workers without logits and draft models
+(which may use their own vocabulary mapping) are outside this target check.
+
+Speculative input preparation bounds only draft candidate columns by the output
+vocabulary; the prompt and the first (verified) decode token retain input bounds.
+The existing defensive clamp still prevents a stale proposal from indexing
+outside output probability tensors. This extra clamp only runs for split
+vocabularies, stays on the device and is shared by eager and graph execution.
