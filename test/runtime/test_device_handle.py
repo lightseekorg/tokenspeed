@@ -1021,6 +1021,77 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
     assert trace[-2:] == ["submit", ("send", remote_decode)]
 
 
+class _PullingDecodeExecutor(DisaggDecodeExecutor):
+    """A D-role peer recording its pulls; the real ``__init__`` (sockets, KV
+    manager) is bypassed."""
+
+    def __init__(self, trace) -> None:
+        self._trace = trace
+
+    def execute(self, op) -> None:
+        self._trace.append(("pull", op))
+
+
+def _receiving_handle(trace, *, prepare=None):
+    handle = _handle(trace, kv_transfer=_PullingDecodeExecutor(trace))
+    executor = handle._executor
+    executor.prepare_remote_cache_slots = prepare or (
+        lambda slots: trace.append(("prepare", slots))
+    )
+    executor.reset_remote_prefill_cache_lengths = lambda op: trace.append("reset")
+    executor.zero_cache_pages = lambda pages: SimpleNamespace(
+        synchronize=lambda: trace.append("wait_zeroing")
+    )
+    return handle
+
+
+def _remote_prefill():
+    return SimpleNamespace(num_extends=lambda: 1, request_pool_indices=[3, 9])
+
+
+@pytest.mark.parametrize("forwards", [True, False])
+def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards):
+    """The zeroing fence the pull waits on is ordered behind the step in
+    flight; the round's forward is queued first so that wait never delays
+    its launch. A round without a batch still pulls."""
+    trace: list = []
+    handle = _receiving_handle(trace)
+    remote_prefill = _remote_prefill()
+
+    _execute(
+        handle,
+        _plan(pages_to_zero=[5], remote_prefill=remote_prefill),
+        _planned(num_extends=0) if forwards else None,
+    )
+
+    assert [entry for entry in trace if entry != "submit"] == [
+        ("prepare", [3]),
+        "reset",
+        *(["forward"] if forwards else []),
+        "wait_zeroing",
+        ("pull", remote_prefill),
+    ]
+
+
+def test_a_failed_slot_preparation_never_triggers_the_pull():
+    trace: list = []
+
+    def prepare(slots):
+        raise RuntimeError("slot preparation failed")
+
+    handle = _receiving_handle(trace, prepare=prepare)
+
+    _execute(
+        handle,
+        _plan(pages_to_zero=[5], remote_prefill=_remote_prefill()),
+        _planned(num_extends=0),
+    )
+
+    assert not any(isinstance(entry, tuple) and entry[0] == "pull" for entry in trace)
+    with pytest.raises(RuntimeError):
+        _execute(handle, _plan(), None)
+
+
 # ----------------------------------------------------------------------
 # EPD admission: encoder facts resolve past the gate, never before.
 # ----------------------------------------------------------------------

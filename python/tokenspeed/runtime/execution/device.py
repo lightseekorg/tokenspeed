@@ -529,17 +529,17 @@ class DeviceHandle:
                 self._thread.submit(lambda: peer.execute(remote_decode))
             )
         remote_prefill = execution_plan.remote_prefill
+        receive_prologue = None
         if remote_prefill is not None:
             # D role: the prompt prefills on the peer; pull its KV into the
-            # pages this plan admitted (and may be zeroing).
-            self._transfer_submissions.append(
-                self._submit_remote_prefill(remote_prefill, zero_future)
-            )
+            # pages this plan admitted (and may be zeroing). The slots are
+            # prepared here; the pull follows the round's forward below.
+            receive_prologue = self._submit_remote_prefill_prologue(remote_prefill)
+            self._transfer_submissions.append(receive_prologue)
 
         if planned is None:
-            return None
-
-        if self._role is DeviceRole.PD_PREFILL:
+            pending = None
+        elif self._role is DeviceRole.PD_PREFILL:
             # A prefill chunk. Arming its layerwise KV streaming must be
             # enqueued ahead of the forward it arms — same FIFO, first, and
             # submitted like everything else on the per-round path (waiting
@@ -549,14 +549,22 @@ class DeviceHandle:
             self._transfer_submissions.append(
                 self._thread.submit(lambda: peer.prepare_prefill(forward_op))
             )
-            return self._submit_forward(planned, capture_next_input_ids=True)
+            pending = self._submit_forward(planned, capture_next_input_ids=True)
+        else:
+            # Plain engine, or a D-role decode (the D role runs no local
+            # prefill: a retracted request resumes by restore, not by
+            # recompute). A constrained request's matcher was advanced past
+            # the prefill node's token when its RemotePrefillDoneEvent
+            # landed, so masking continues from the right state.
+            pending = self._submit_forward(planned)
 
-        # Plain engine, or a D-role decode (the D role runs no local prefill:
-        # a retracted request resumes by restore, not by recompute). A
-        # constrained request's matcher was advanced past the prefill node's
-        # token when its RemotePrefillDoneEvent landed, so masking continues
-        # from the right state.
-        return self._submit_forward(planned)
+        if receive_prologue is not None:
+            self._transfer_submissions.append(
+                self._submit_remote_prefill_pull(
+                    remote_prefill, receive_prologue, zero_future
+                )
+            )
+        return pending
 
     @property
     def role(self) -> DeviceRole:
@@ -702,28 +710,58 @@ class DeviceHandle:
         executor = self._executor
         self._thread.run(lambda: executor.execute_idle_forward(dp_metadata))
 
-    def _submit_remote_prefill(self, remote_prefill, zero_future):
-        """Queue a remote-prefill stream: pull its rows' KV from the peer.
+    def _submit_remote_prefill_prologue(self, remote_prefill):
+        """Queue a remote-prefill stream's slot preparation, ahead of the
+        round's forward.
 
         Slot preparation and the cache-length reset touch the execution
         stream, each behind the default stream (the store fence: the slot
         may be a victim's this plan imaged, and its slot-state export reads
-        it on the write stream); the RDMA trigger is CPU-issued but writes
-        the same device pages, so it must follow them and the zeroing fence
+        it on the write stream). Stream-ordered, so it never blocks.
+
+        Args:
+            remote_prefill: The plan's remote-prefill stream; supplies the
+                admitted rows.
+
+        Returns:
+            The submission future, for the settle queue and the pull.
+        """
+        executor = self._executor
+        num_extends = remote_prefill.num_extends()
+
+        def _prepare():
+            executor.prepare_remote_cache_slots(
+                list(remote_prefill.request_pool_indices[:num_extends])
+            )
+            executor.reset_remote_prefill_cache_lengths(remote_prefill)
+
+        return self._thread.submit(_prepare)
+
+    def _submit_remote_prefill_pull(self, remote_prefill, prologue, zero_future):
+        """Queue a remote-prefill stream's pull of its rows' KV from the peer,
+        behind the round's forward.
+
+        The RDMA trigger is CPU-issued but writes the device pages the
+        prologue prepared, so it must follow them and the zeroing fence
         (Mooncake and GPUDirect writes are not ordered by the zeroing
         stream, so the destination pages must be published from sanitized
         memory). The same fence covers a retraction's stream-ordered
         write-back reading pages this admission was granted: the zero event
         is recorded on the forward thread's stream AFTER that stream waited
         on the write-back's completion, so waiting on it waits on the copy
-        too. One ordered
-        unit, so one submission — asynchronous like every other: completion
-        arrives through the transfer events, and a submission failure
-        surfaces from the settle at the next round's execute.
+        too. The zeroing is ordered behind the step in flight, so this wait
+        holds the forward thread until that step ends; queued behind the
+        round's forward, it never delays that forward's launch.
+        Asynchronous like every other submission: completion arrives through
+        the transfer events, and a submission failure surfaces from the
+        settle at the next round's execute.
 
         Args:
             remote_prefill: The plan's remote-prefill stream; supplies the
                 admitted rows.
+            prologue: The stream's slot-preparation submission; a failed
+                one fails the pull too, so unprepared slots are never
+                published.
             zero_future: This plan's page-zeroing submission, or None when
                 the plan zeroes nothing (an admission always zeroes its fresh
                 pages, so a granted request's receive never sees None).
@@ -731,22 +769,17 @@ class DeviceHandle:
         Returns:
             The submission future, for the settle queue.
         """
-        executor = self._executor
         kv_transfer = self._kv_transfer
-        num_extends = remote_prefill.num_extends()
 
-        def _receive():
-            executor.prepare_remote_cache_slots(
-                list(remote_prefill.request_pool_indices[:num_extends])
-            )
-            executor.reset_remote_prefill_cache_lengths(remote_prefill)
+        def _pull():
+            prologue.result()
             if zero_future is not None:
                 zero_event = zero_future.result()
                 if zero_event is not None:
                     zero_event.synchronize()
             kv_transfer.execute(remote_prefill)
 
-        return self._thread.submit(_receive)
+        return self._thread.submit(_pull)
 
     def run_multimodal_work(self, work: Callable[[], Any], *, wait: bool = True) -> Any:
         """Run multimodal feature-lifecycle work on the data plane, in order.
