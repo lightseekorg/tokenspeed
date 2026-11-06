@@ -321,12 +321,10 @@ def _count_prefill_launches(monkeypatch) -> list[int]:
 
 
 @pytest.mark.parametrize("heads", [32, 64])
-def test_gluon_owned_page_prefill_rows_score_like_one_row_groups(
+def test_gluon_owned_page_prefill_rows_score_and_select_like_one_row_groups(
     heads, device, monkeypatch
 ):
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (
-        launch_gluon_dsa_index_candidates_gfx950,
-    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import index_candidates
 
     table, requests, lens, q, q_scales, weights, cache = _prefill_inputs(heads, device)
     pages = plan_dsa_index_candidates(
@@ -336,42 +334,24 @@ def test_gluon_owned_page_prefill_rows_score_like_one_row_groups(
     assert pages.pages.shape[1] * PAGE_SIZE > 4096
     assert (lengths == 0).any()
     launches = _count_prefill_launches(monkeypatch)
-    kwargs = dict(page_size=PAGE_SIZE, softmax_scale=0.1)
+    launch = index_candidates.launch_gluon_dsa_index_candidates_gfx950
     args = (q, q_scales, weights, cache, pages.pages, lengths)
 
-    one_row = launch_gluon_dsa_index_candidates_gfx950(*args, **kwargs)
+    one_row = launch(*args, page_size=PAGE_SIZE, softmax_scale=0.1)
     assert launches == []
-    blocks = launch_gluon_dsa_index_candidates_gfx950(
-        *args, query_requests=requests, request_count=table.shape[0], **kwargs
+    blocks = launch(
+        *args,
+        query_requests=requests,
+        request_count=table.shape[0],
+        page_size=PAGE_SIZE,
+        softmax_scale=0.1,
     )
     assert launches == [requests.numel()]
-
     columns = torch.arange(one_row.shape[1], device=device)
     valid = columns[None, :] < lengths[:, None]
     assert (one_row[valid] == float("-inf")).any()
     torch.testing.assert_close(blocks[valid], one_row[valid], rtol=0, atol=0)
 
-
-def test_gluon_owned_page_scorer_keeps_one_row_groups_below_prefill_size(device):
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (
-        _scores_prefill_rows,
-    )
-
-    assert _scores_prefill_rows(4096, 1, 32)
-    assert _scores_prefill_rows(212, 3, 32)
-    # Decode: a row per request, at any batch size.
-    assert not _scores_prefill_rows(256, 256, 32)
-    assert not _scores_prefill_rows(63, 1, 32)
-    assert not _scores_prefill_rows(4096, None, 32)
-    assert not _scores_prefill_rows(100, 26, 64)
-
-
-def test_gluon_owned_page_candidates_select_alike_through_prefill_rows(
-    device, monkeypatch
-):
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import index_candidates
-
-    table, requests, lens, q, q_scales, weights, cache = _prefill_inputs(32, device)
     kwargs = dict(
         page_size=PAGE_SIZE,
         topk=512,
@@ -379,15 +359,33 @@ def test_gluon_owned_page_candidates_select_alike_through_prefill_rows(
         initial_tokens=0,
         local_tokens=0,
         solution=None,
-        q_scales=q_scales,
     )
-    launches = _count_prefill_launches(monkeypatch)
-    blocks = dsa_index_candidates(q, weights, cache, table, requests, lens, **kwargs)
+    # Decode, a row per request, keeps the one-row scorer at any batch size.
+    decode_table, decode_requests, decode_lens, decode_q, decode_scales, decode_w = (
+        _owned_batch(256, 1, 16, device)
+    )
+    dsa_index_candidates(
+        decode_q,
+        decode_w,
+        cache,
+        decode_table,
+        decode_requests,
+        decode_lens,
+        q_scales=decode_scales,
+        **kwargs,
+    )
     assert launches == [requests.numel()]
+
+    selected = dsa_index_candidates(
+        q, weights, cache, table, requests, lens, q_scales=q_scales, **kwargs
+    )
+    assert launches == [requests.numel()] * 2
     monkeypatch.setattr(index_candidates, "_scores_prefill_rows", lambda *_: False)
-    one_row = dsa_index_candidates(q, weights, cache, table, requests, lens, **kwargs)
-    assert launches == [requests.numel()]
-    for got, want in zip(_by_offset(*blocks), _by_offset(*one_row), strict=True):
+    expected = dsa_index_candidates(
+        q, weights, cache, table, requests, lens, q_scales=q_scales, **kwargs
+    )
+    assert launches == [requests.numel()] * 2
+    for got, want in zip(_by_offset(*selected), _by_offset(*expected), strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
