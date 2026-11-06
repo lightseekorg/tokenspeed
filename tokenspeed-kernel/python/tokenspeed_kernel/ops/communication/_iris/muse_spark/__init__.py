@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.communication._iris import (
 from tokenspeed_kernel.ops.communication._iris.all_gather import (
     IrisAllGather,
     all_gather_columns_can_run,
+    iris_fused_lamport_allgather_rmsnorm,
     iris_fused_lamport_allgather_rmsnorm_mxfp4,
     iris_fused_pull_allgather_rmsnorm_mxfp4,
     iris_pull_allgather_rows,
@@ -1814,6 +1815,77 @@ class MuseIrisState:
             and total_width % 1024 == 0
             and rows * local_width <= self.reduction.lamport_max_numel
         )
+
+    def can_all_gather_rmsnorm(self, local: torch.Tensor, weight: torch.Tensor) -> bool:
+        """Check the TP4/TP8 gather-and-normalize contract (BF16 output)."""
+        return (
+            current_platform().is_cdna4
+            and self.world_size in (4, 8)
+            and local.ndim == 2
+            and local.dtype == torch.bfloat16
+            and local.device == self.all_reduce.device
+            and local.is_contiguous()
+            and weight.shape == (local.shape[1] * self.world_size,)
+            and weight.dtype == local.dtype
+            and weight.device == local.device
+            and weight.is_contiguous()
+            and self._lamport_gathers_rmsnorm_mxfp4(local)
+            # Four waves push one word of the shard each and poll whole
+            # 16-column runs of the row.
+            and local.shape[1] // 2 >= 256
+            and local.shape[1] * self.world_size % (16 * 256) == 0
+        )
+
+    def all_gather_rmsnorm(
+        self,
+        local: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+    ) -> torch.Tensor:
+        """Gather feature shards and return their RMSNorm as BF16 rows.
+
+        ``affine_rmsnorm`` of the gathered rows within one BF16 ulp (a rare
+        element rounds the other way), and a negative zero arrives as zero.
+
+        Args:
+            local: Contiguous BF16 ``[rows, width / world]`` shard.
+            weight: BF16 ``[width]`` norm weight.
+            eps: Epsilon added to the variance.
+            weight_offset: Center added to ``weight``.
+
+        Returns:
+            A new BF16 ``[rows, width]`` tensor.
+        """
+        if not self.can_all_gather_rmsnorm(local, weight):
+            raise RuntimeError("unsupported Iris gather-and-RMSNorm fusion")
+        if local.data_ptr() % 4:
+            # Rank-local fallback could split ranks across protocols.
+            raise ValueError(
+                "iris_fused_lamport_allgather_rmsnorm reads BF16 pairs as 32-bit "
+                f"words; local starts at byte {local.data_ptr() % 4} of a word"
+            )
+        rows, local_width = local.shape
+        total_width = local_width * self.world_size
+        output = local.new_empty((rows, total_width))
+        iris_fused_lamport_allgather_rmsnorm[(rows,)](
+            local,
+            weight,
+            output,
+            self.reduction.lamport_region,
+            self.reduction.lamport_epochs,
+            self.reduction.lamport_peer_addresses[: self.world_size],
+            rank=self.all_reduce.rank_in_group,
+            local_width=local_width,
+            total_width=total_width,
+            eps=eps,
+            weight_offset=weight_offset,
+            max_elements=self.reduction.lamport_max_numel,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            WAIT_STORES=self._arch.wait_stores,
+            num_warps=4,
+        )
+        return output
 
     def all_gather_rmsnorm_mxfp4_quant(
         self,

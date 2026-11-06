@@ -409,6 +409,29 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             )
         return self(x), None
 
+    def forward_rmsnorm(self, x: torch.Tensor, norm: MuseSparkRMSNorm) -> torch.Tensor:
+        """Project, gather and apply ``norm``: full-width normalized BF16 rows.
+
+        Small batches fuse the gather and the norm into one Lamport kernel,
+        which matches ``norm`` on the gathered rows within one BF16 ulp.
+        """
+        iris = self.iris_state
+        if (
+            iris is not None
+            and norm.weight is not None
+            and self.workspace is not None
+            and x.shape[0] <= min(_GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0])
+        ):
+            local_weight = self._local_weight()
+            local = x.new_empty((x.shape[0], local_weight.shape[0]))
+            if iris.can_all_gather_rmsnorm(local, norm.weight):
+                self._project(x, local_weight, local)
+                return iris.all_gather_rmsnorm(
+                    local, norm.weight, norm.eps, norm.weight_offset
+                )
+        rows = self(x)
+        return norm(rows, rows.dtype)
+
     def forward_mxfp4(
         self,
         x: torch.Tensor,
@@ -1649,11 +1672,12 @@ class MuseSparkMoE(nn.Module):
                     pdl_enabled(),
                 )
             else:
-                compressed = self.pre_expert_proj(hidden_states)
-                compressed_quantized = None
                 # MXFP4 kernels dynamically quantize this normalized BF16 row
                 # into OCP E2M1 values with group-32 E8M0 scales.
-                compressed = self.pre_expert_norm(compressed, compressed.dtype)
+                compressed = self.pre_expert_proj.forward_rmsnorm(
+                    hidden_states, self.pre_expert_norm
+                )
+                compressed_quantized = None
             with fork.branch():
                 router_logits = self.gate(router_input, pdl_enabled())
                 prepared = (
