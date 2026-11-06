@@ -1935,7 +1935,7 @@ class ProducerAllReduce:
     _ORDINARY_GRANULE = 64
 
     @staticmethod
-    def _lamport_two_shot_capacity(
+    def lamport_two_shot_capacity(
         max_numel: int, *, world_size: int, enable_lamport: bool
     ) -> int:
         """Return the TP8 Lamport two-shot capacity in elements, or 0."""
@@ -1959,7 +1959,7 @@ class ProducerAllReduce:
             if enable_lamport
             else 0
         )
-        two_shot = ProducerAllReduce._lamport_two_shot_capacity(
+        two_shot = ProducerAllReduce.lamport_two_shot_capacity(
             max_numel, world_size=world_size, enable_lamport=enable_lamport
         )
         alignment = world_size * 8
@@ -2036,7 +2036,7 @@ class ProducerAllReduce:
             self.lamport_peer_addresses = tuple(
                 base + offset for base in peers.addresses
             )
-        self.lamport_two_shot_max_numel = self._lamport_two_shot_capacity(
+        self.lamport_two_shot_max_numel = self.lamport_two_shot_capacity(
             max_numel, world_size=self.world_size, enable_lamport=enable_lamport
         )
         two_shot_shard = self.lamport_two_shot_max_numel // self.world_size

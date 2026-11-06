@@ -242,7 +242,7 @@ class MuseIrisState:
         It replaces the Lamport two-shot all-reduce of the routes, so it
         covers the same tokens.
         """
-        two_shot = ProducerAllReduce._lamport_two_shot_capacity(
+        two_shot = ProducerAllReduce.lamport_two_shot_capacity(
             max_numel, world_size=world_size, enable_lamport=enable_lamport
         )
         if world_size != 8 or not owned_route_max_rows or not two_shot:
