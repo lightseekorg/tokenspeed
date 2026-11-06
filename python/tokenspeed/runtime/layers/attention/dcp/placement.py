@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     compact_owned_slots,
     virtual_slots_to_local,
 )
+from tokenspeed_kernel.platform import current_platform
 
 
 @dataclass(frozen=True)
@@ -77,10 +78,13 @@ def resolve_write_slots(
     and reused while ``loc`` is the same, unmodified tensor. The entry holds
     ``loc``, so its storage cannot be reused for other slots meanwhile. A
     caller that forks streams resolves before the fork, on the stream every
-    branch is ordered after.
+    branch is ordered after. Only AMD keeps them; elsewhere every layer
+    resolves its own.
     """
     if placement is None:
         return loc, None
+    if not current_platform().is_amd:
+        return resolve_cache_slots(loc, placement)
     for cached_loc, version, cached_placement, resolved in share.write_slots:
         if (
             cached_placement == placement
