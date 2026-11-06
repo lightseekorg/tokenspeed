@@ -486,7 +486,12 @@ class ModelRunner:
             return False, str(e)
 
     def update_weights_from_mooncake(
-        self, version: int, models: list[torch.nn.Module], *, require_complete: bool
+        self,
+        version: int,
+        models: list[torch.nn.Module],
+        *,
+        require_complete: bool,
+        snapshot: dict | None = None,
     ) -> tuple[bool, str]:
         """Read one committed weight-store version into ``models`` in place.
 
@@ -502,6 +507,7 @@ class ModelRunner:
                 ``--model-update-draft-weights`` is ``refresh``.
             require_complete: Validate the entire canonical source inventory;
                 required whenever old model weights were discarded.
+            snapshot: Optional SDK publication directory for this version.
 
         Returns:
             ``(ok, message)`` for the control plane.
@@ -519,7 +525,7 @@ class ModelRunner:
                     "gloo", self.mapping.world_group
                 ),
             ):
-                result = self.model_update.update(models, version)
+                result = self.model_update.update(models, version, snapshot=snapshot)
             torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
             return True, f"applied model version {version}: {result}"
         except Exception as e:  # noqa: BLE001 - surface to the control plane

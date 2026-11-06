@@ -1002,6 +1002,7 @@ class DeviceHandle:
                     req.version,
                     self._mooncake_update_models(),
                     require_complete=require_complete,
+                    snapshot=req.snapshot,
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
