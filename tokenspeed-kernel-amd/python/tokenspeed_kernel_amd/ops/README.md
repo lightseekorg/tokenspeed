@@ -1410,10 +1410,10 @@ KV cache, and `gluon_mha_prefill_sliding_gfx950` the sliding-window variant.
 
 #### Algorithm
 
-Both kernels launch a persistent grid of 512 work-groups, each owning one
+Both kernels launch a persistent grid of 512 workgroups, each owning one
 128-row query block of one head at a time. The causal kernel gives every
-work-group a fixed batch slot, head and query slot: up to 512 / heads
-requests share a round, and the work-groups left per request become query
+workgroup a fixed batch slot, head and query slot: up to 512 / heads
+requests share a round, and the workgroups left per request become query
 slots, which take that request's query blocks in alternating directions so
 the long late blocks spread out. More requests take further rounds; in the
 last round, slots past the last request are skipped. With skip-softmax, a
