@@ -91,6 +91,7 @@ __all__ = [
     "rope_inplace",
     "rope_weights_inplace",
     "rope_pad_query",
+    "rope_quantize_fp8_grouped",
     "dspark_rows",
     "dspark_anchors",
     "dspark_block",
@@ -608,10 +609,12 @@ def index_topk(
             [T, candidate_topk], [T]), or None to allocate them.
         solution: Optional registered implementation restriction. Pass None for
             automatic kernel selection.
-        index_metadata: Object from new_index_metadata for these exact table and
-            length tensors, shared only within one invocation, or None (default). Native
+        index_metadata: Object from new_index_metadata for these exact table,
+            length and optional request-ID tensors, shared only within one
+            invocation, or None (default). Native
             kernels reuse Full schedules and matching immutable sparse candidate
-            geometry across layers. Table, lengths and candidate contents must
+            geometry across layers. Grouped paged Full reuses KV for consecutive
+            rows of one request. Table, lengths, request IDs and candidate contents must
             not change while sharing this object; graph replay refreshes the
             captured producers. A new invocation needs a fresh object.
 
@@ -637,7 +640,10 @@ def index_topk(
     FP8 ``index_v4`` rows into FP32 logits and the in-tree CuTe DSL DeepSelect
     kernel selects. This native accumulation
     differs from the portable reference's intermediate BF16 rounding.
-    Blackwell paged scoring uses query_chunk_size; zero-row-stride broadcast
+    Blackwell paged scoring uses query_chunk_size and optional request IDs;
+    its cleaned rows have native-aligned strides and are borrowed by TopK with
+    exclusive ends. Candidate block reduction only writes valid blocks and the
+    final aligned prefetch segment. Zero-row-stride broadcast
     scoring retains a 128MiB logits budget. Native logits and their cleaned
     copy can coexist. Hopper retains its 32MiB paged / 128MiB broadcast budgets.
     That broadcast layout gathers packed history once per call and packs Q
@@ -908,6 +914,35 @@ def rope_pad_query(
         solution=solution,
     )
     return kernel(values, positions, cos_sin_cache)
+
+
+def rope_quantize_fp8_grouped(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    groups: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate each head's interleaved RoPE tail and FP8-quantize grouped heads.
+
+    Args:
+        values: BF16 [T,H,512], unit channel stride, arbitrary token/head
+            strides; H divisible by groups.
+        positions: Int32/int64 [T]; negative positions use table row 0.
+        cos_sin_cache: FP32 [max_positions,64], cosine then sine halves, applied
+            with rope_inplace's formula (pass the inverse table to undo RoPE).
+        groups: Number of output head groups, each D = H/groups*512 wide.
+
+    Returns:
+        codes: FP8 E4M3 [T,groups,D], a view of contiguous [groups,T,D].
+        scales: Int32 [T,groups,D/128], MN-major and TMA-aligned (strides
+            (1, D/128*aligned_T, aligned_T), aligned_T = ceil(T/4)*4). Each
+            element packs four UE8M0 exponents of 32-channel groups, byte j
+            for group 4w+j, matching DeepGEMM's SM100 scale layout. The rotated
+            values are rounded to BF16 before quantizing.
+    """
+    return _kernel("rope_quantize_fp8_grouped", values)(
+        values, positions, cos_sin_cache, groups
+    )
 
 
 def dspark_rows(
@@ -1470,19 +1505,32 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
     return out
 
 
-def new_index_metadata(page_table: torch.Tensor, visible_lens: torch.Tensor) -> object:
+def new_index_metadata(
+    page_table: torch.Tensor,
+    visible_lens: torch.Tensor,
+    request_indices: torch.Tensor | None,
+) -> object:
     """Create invocation-owned reusable index geometry for these exact inputs.
 
-    page_table and visible_lens have the index_topk contract and must remain
-    unchanged for this object's lifetime. Share it only between layers of one
-    forward; create a new object for every eager invocation and graph capture.
-    Replay recomputes the captured producers. No KV values or scores are cached.
-    Consumers on other streams wait for metadata producers before reading.
-    Cached geometry is retained until this object is released.
+    page_table and visible_lens have the index_topk contract. request_indices
+    is contiguous int32 [queries] on the same device, or None for independent
+    rows. Equal consecutive IDs group queries of one request: their page tables
+    must match and their visible lengths must be nondecreasing. Rows with a
+    positive visible length must carry nonnegative IDs in that order; the values
+    are not scanned here because a device-to-host check would synchronize the
+    step. Rows whose visible length is 0 are relabeled with distinct negative
+    IDs before the grouped call, whatever ID they carry (decode padding carries
+    -1), so a padding row cannot end an active request's run. All supplied
+    tensors must remain unchanged for this object's lifetime. Share it only
+    between layers of one forward; create a new object for every eager
+    invocation and graph capture. Replay recomputes the captured producers. No
+    KV values or scores are cached. Consumers on other streams wait for metadata
+    producers before reading. Cached geometry is retained until this object is
+    released.
     """
     from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
-    return IndexMetadata(page_table, visible_lens)
+    return IndexMetadata(page_table, visible_lens, request_indices)
 
 
 def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
