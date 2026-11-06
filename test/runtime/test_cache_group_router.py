@@ -996,6 +996,52 @@ class TestCacheGroupRouterTest:
                 block_tables_cpu={},
             )
 
+    def test_page_sharded_leaves_get_the_host_table_on_pure_extends(self):
+        """A KVP page-sharded group's leaf gets the host page table on a pure
+        extend, prefix or not (the DSA leaf bounds each rank's owned index
+        pages from it), and on a MIXED round only with a prefix (its
+        prefix-chunk gathers); other groups never get it."""
+        router, leaves = self._router()
+        # configure_runtime marks the groups whose shard count exceeds one.
+        router._page_sharded_groups = frozenset({FULL})
+        tables = self._tables()
+
+        def init(mode, num_extends, prefix_lens):
+            new = torch.tensor([5, 4], dtype=torch.int32)[:num_extends]
+            prefix = torch.tensor(prefix_lens, dtype=torch.int32)
+            router.init_forward_metadata(
+                2,
+                num_extends,
+                torch.arange(2, dtype=torch.int32),
+                torch.tensor([9, 4], dtype=torch.int32),
+                mode,
+                block_tables=tables,
+                extend_seq_lens=new,
+                extend_seq_lens_cpu=new.clone(),
+                extend_prefix_lens=prefix,
+                extend_prefix_lens_cpu=prefix.clone(),
+                extend_replay_lens_cpu=torch.zeros_like(prefix),
+                extend_prompt_lens_cpu=prefix + new,
+                extend_with_prefix=bool(prefix.any()),
+                query_shard=None,
+                block_tables_cpu={gid: table.clone() for gid, table in tables.items()},
+            )
+            return {
+                gid: leaf.last_init_kwargs["page_table_cpu"]
+                for gid, leaf in leaves.items()
+            }
+
+        for prefix in ([0, 0], [4, 0]):
+            received = init(ForwardMode.EXTEND, 2, prefix)
+            # The host mirror of the extend rows' kernel pages (holes are 0).
+            assert received[FULL].tolist() == [[5, 6, 0], [9, 0, 2]]
+            assert received[SWA] is None
+        received = init(ForwardMode.MIXED, 1, [0])
+        assert received[FULL] is None and received[SWA] is None
+        received = init(ForwardMode.MIXED, 1, [4])
+        assert received[FULL].tolist() == [[5, 6, 0]]
+        assert received[SWA] is None
+
     def test_extend_init_rejects_bounded_replay_rows(self):
         """Paged leaves write every input row unconditionally, so a replayed
         prefix (rows the hit already holds) must fail loud instead of being
@@ -1755,7 +1801,12 @@ class TestPagedLeafRebindTest:
         )
 
         self._check(
-            MHAAttnBackend, ["forward_decode_metadata", "forward_extend_metadata"]
+            MHAAttnBackend,
+            [
+                "decode_schedule_buf",
+                "forward_decode_metadata",
+                "forward_extend_metadata",
+            ],
         )
 
     def test_msa_leaf_forgets_the_previous_forward(self):

@@ -229,6 +229,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # Block draft: one decode metadata entry per block position; see
         # block_decode_expansion.
         self.draft_block_decode = bool(config.draft_block_decode)
+        # Its queries attend causally within the block (Kimi-K3.1 DSpark).
+        self.draft_block_causal = bool(config.draft_block_causal)
 
         # MLA dimensions
         self.kv_lora_rank = spec.kv_lora_rank
@@ -266,11 +268,12 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # The model's unit-scale FP8 path quantizes Q/K/V for prefill;
         # BF16 cache keeps the model's BF16 Q/K/V throughout.
         d_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
-        warmup_compile_prefill(
-            q_dtype=self.data_type,
-            d_qk=d_qk,
-            d_v=self.v_head_dim,
-        )
+        with torch.cuda.device(config.device):
+            warmup_compile_prefill(
+                q_dtype=self.data_type,
+                d_qk=d_qk,
+                d_v=self.v_head_dim,
+            )
 
         self.num_local_heads = self._num_heads_per_tp
 
@@ -497,7 +500,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             lengths,
             page_size=self.kernel_page_size,
             query_count=self.spec_num_tokens,
-            causal=not self.block_decode_active,
+            causal=not self.block_decode_active or self.draft_block_causal,
         )
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
@@ -695,13 +698,10 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         causal_mask = True
         if self.block_decode_active:
             q_len_per_req = q.shape[0] // bs if bs > 0 else 1
-            # The block is non-causal, so the kernel takes it on the query axis
-            # with one page table row and one cache length per request. The
-            # metadata was expanded from rows [0, bs), which is what this query
-            # covers, so no extend offset applies on either layout.
+            # Causal row r ends at block end minus the rows after it; no extend offset.
             self._log_block_layout(layer.tp_q_head_num, q_len_per_req, window_left >= 0)
             if q_len_per_req == self.spec_num_tokens:
-                causal_mask = False
+                causal_mask = self.draft_block_causal
                 query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
                 page_table = metadata.block_page_table
                 cache_seqlens = metadata.block_seq_lens
@@ -711,6 +711,10 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 # every drafter this backend serves.
                 if self._dcp is not None:
                     raise ValueError("DCP block draft requires the full query block")
+                if self.draft_block_causal:
+                    raise ValueError(
+                        "a causal block draft requires the full query block"
+                    )
                 if window_left >= 0:
                     raise ValueError(
                         f"a {q_len_per_req}-wide draft forward over a "
@@ -878,12 +882,28 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         causal,
         out: torch.Tensor | None = None,
     ):
+        head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        destination = out
+        if logits_soft_cap not in (None, 0.0):
+            raise ValueError("TokenSpeed MLA prefill does not support logits_soft_cap")
+        if out is not None:
+            expected_shape = (
+                q.numel() // (self.num_local_heads * head_dim),
+                self.num_local_heads,
+                self.v_head_dim,
+            )
+            if out.shape != expected_shape or not out.is_contiguous():
+                raise ValueError(f"out must be contiguous with shape {expected_shape}")
+            if out.device != q.device or out.dtype != self.q_data_type:
+                raise ValueError(
+                    f"out must use device {q.device} and dtype {self.q_data_type}"
+                )
+
         if causal:
             step_counter = self.step_counter
             if step_counter is not None:
                 step_counter.record_cache()
 
-        head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The CuteDSL FMHA prefill kernel assumes packed (contiguous) Q/K/V; its
         # TMA descriptors ignore input strides. On the BF16 (NoPE, e.g. Kimi-K3)
         # path V arrives as a non-contiguous slice ``kv[..., qk_nope:]`` of the
@@ -908,7 +928,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             )
             CuteDSLMLABackend._logged_prefill = True
 
-        result = tokenspeed_mla_prefill(
+        out, lse = tokenspeed_mla_prefill(
             query=q,
             key=k,
             value=v,
@@ -921,15 +941,16 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             return_lse=True,
             cum_seq_lens_q=cum_seq_lens_q,
             max_seq_len_q=max_q_len,
-            out=out,
+            # The kernel stores BF16. FP16 models convert into the caller's
+            # output after launch, preserving the supplied destination.
+            out=out if out is None or out.dtype == torch.bfloat16 else None,
         )
 
-        if isinstance(result, tuple):
-            out, lse = result[0], result[1]
-        else:
-            out, lse = result, None
-
-        if out.dtype != self.q_data_type:
+        if destination is not None:
+            if out is not destination:
+                destination.copy_(out)
+            out = destination
+        elif out.dtype != self.q_data_type:
             out = out.to(self.q_data_type)
 
         return out, lse

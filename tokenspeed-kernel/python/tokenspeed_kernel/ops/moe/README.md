@@ -66,7 +66,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.2.post1 and compile isolated modules, operators, and tuning caches. They require
+0.7.3 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -141,7 +141,7 @@ replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.2.post1) initializes unused rows inside active
+The pinned FlashInfer version (0.7.3) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -543,6 +543,19 @@ one collective with no 128-token chunk loop. All layers and captured capacities
 continue to share stable workspace addresses. Kimi K3 writes packed activations
 and routes directly into views of this full-capacity symmetric allocation.
 
+## DeepSeek V4 MegaMoE shared expert (`deep_gemm.py`)
+
+DeepGEMM's MXFP4 MegaMoE can run one MXFP8 shared expert of the routed
+experts' intermediate size inside the same launch. The MoE plan exposes this
+as `fuse_shared_expert`; `MoELayer.fuse_shared_expert` hands over the shared
+expert's E4M3 weights and UE8M0 scale bytes once the routed weights are
+processed. They are re-laid out in place like a routed expert (gate/up rows
+interleaved by eight, scales packed four per int32 and UTCCP-transposed), and
+the routed output then includes the shared expert. The input staging kernel
+also writes the activation scales the shared expert reads: MN-major, with rows
+grouped by the BLOCK_M MegaMoE picks for the token count. The shared expert's
+SwiGLU uses the routed experts' clamp.
+
 ## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
 
 On Blackwell with one TP8 group shared by attention and MoE, a decode forward
@@ -595,7 +608,9 @@ o-projection shard). Each layer then does the following:
    with the block snapshots (AttnRes), reading a MoE layer's output row
    straight from the tail's ring.
 2. Run the packed input projection as a split-K GEMM with per-batch tactics.
-3. Run the attention core as usual.
+3. Run the attention core as usual, through the attention's `o_proj_input`
+   (Kimi-K3.1's DSA layers select their indexer's top-k there, as in their
+   `forward`).
 4. Multiply by this rank's o-projection shard and multicast the partial;
    a consumer kernel sums the partials, updates the prefix, and applies the
    post-attention AttnRes. Above 32 rows each rank sums its column share and

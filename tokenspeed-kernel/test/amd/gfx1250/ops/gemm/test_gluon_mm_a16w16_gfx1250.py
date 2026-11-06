@@ -123,6 +123,26 @@ def test_dsv4_linear_fp32_dispatches_to_gfx1250_kernel(m: int) -> None:
     torch.testing.assert_close(dsv4_linear_fp32(a, b), actual, atol=0, rtol=0)
 
 
+def test_dsv4_linear_fp32_wide_n_matches_reference() -> None:
+    # DeepSeek V4.1 DSpark base logits: TP4 vocabulary shard, 5 rows per draft
+    # request at CUDA graph batch sizes 1 to 16.
+    n, k = 32320, 5120
+    b = _operands(1, n, k, seed=0)[1]
+    for m in (5, 10, 20, 40, 80):
+        a = _operands(m, n, k, seed=m)[0]
+        actual = dsv4_linear_fp32(a, b, override="gluon_dsv4_linear_fp32_gfx1250")
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(
+            actual.double(), _reference(a, b), atol=_ATOL, rtol=_RTOL
+        )
+    with assert_no_triton_compile(mm_mod._wmma_tdm_dense_kernel):
+        for m in (1, 17, 64, 128):
+            a = _operands(m, n, k, seed=m)[0]
+            torch.testing.assert_close(
+                _mm_fp32(a, b).double(), _reference(a, b), atol=_ATOL, rtol=_RTOL
+            )
+
+
 @pytest.mark.parametrize("m", [1, 6, 33, 96, 512, 2048, 4096])
 def test_mm_a16w16_bf16_matches_reference(m: int) -> None:
     a, b = _operands(m, 1024, 4096, seed=m + 1)

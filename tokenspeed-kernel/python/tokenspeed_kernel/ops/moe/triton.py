@@ -182,7 +182,7 @@ def triton_minimax_sigmoid_bias_topk(
 
 
 # ===-----------------------------------------------------------------------===#
-# Routing: Kimi K3 packed sigmoid-bias top-k (NVIDIA, AMD gfx1250)
+# Routing: Kimi K3 packed sigmoid-bias top-k (NVIDIA, AMD gfx950, gfx1250)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -192,9 +192,9 @@ def triton_minimax_sigmoid_bias_topk(
 #: behind by 1024. One row stays with the decode specialist, and the
 #: gfx1250 Gluon remains available on these rows for explicit selection;
 #: the packed registration wins automatic selection by priority.
-#: CDNA4 one-token K3 stays on the decode specialist: on MI355X that kernel
-#: is ahead of packed, and it already covers this shape.
+#: CDNA4 (MI350X, graph replay): beats the gfx950 Gluon row kernel from 2 to 512 rows.
 _PACKED_ROWS_NVIDIA = range(1, 257)
+_PACKED_ROWS_CDNA4 = range(2, 513)
 _PACKED_ROWS_CDNA5 = range(2, 513)
 _PACKED_CONTRACT = {
     "experts": frozenset({896}),
@@ -324,6 +324,45 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
         logical_to_physical_map=logical_to_physical_map,
         weights_dtype=weights_dtype,
         out=out,
+    )
+
+
+@register_kernel(
+    "moe",
+    "sigmoid_bias_topk",
+    name="triton_kimi3_packed_sigmoid_bias_topk_gfx950",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_PACKED_SIGNATURES,
+    priority=Priority.SPECIALIZED + 1,
+    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_CDNA4},
+)
+def triton_kimi3_packed_sigmoid_bias_topk_gfx950(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    weights_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
+
+    Arguments follow ``kimi3_sigmoid_bias_topk`` with explicit ``topk=16``.
+    Layouts are made contiguous and correction bias is widened to FP32.
+    Returns ``[tokens, 16]`` weights in ``weights_dtype`` and INT32 ids.
+    """
+    return _invoke_packed(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        weights_dtype=weights_dtype,
     )
 
 

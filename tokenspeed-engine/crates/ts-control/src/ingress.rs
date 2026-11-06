@@ -94,7 +94,7 @@ impl LogprobServability {
     /// Why the engine cannot compute this prompt's logprobs, or `None`.
     fn prompt_logprobs_refusal(
         &self,
-        input_ids: &[i32],
+        target_ids: &[i32],
         has_multimodal_inputs: bool,
         vocab_size: i64,
     ) -> Option<String> {
@@ -113,13 +113,13 @@ impl LogprobServability {
                     .to_owned(),
             );
         }
-        let outside = input_ids
+        let outside = target_ids
             .iter()
             .any(|&id| id < 0 || i64::from(id) >= vocab_size);
         outside.then(|| {
             format!(
-                "prompt logprobs need every prompt token id inside the vocabulary \
-                 [0, {vocab_size}); input_ids contains one outside it."
+                "prompt logprobs need every scored target token id inside the vocabulary \
+                 [0, {vocab_size}); the scored input_ids suffix contains one outside it."
             )
         })
     }
@@ -255,7 +255,14 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
                     )
                 })
         })
-        .or_else(|| refusal(&view, &params, limits));
+        .or_else(|| {
+            refusal(
+                &view,
+                request.input_ids.as_deref().unwrap_or_default(),
+                &params,
+                limits,
+            )
+        });
 
     let prompt_len = request.input_ids.as_ref().map_or(0, Vec::len) as i64;
     let stop_token_ids: BTreeSet<i32> = if params.ignore_eos {
@@ -410,8 +417,6 @@ fn bootstrap_info(request: &TokenizedGenerateReqInput) -> Option<BootstrapInfo> 
 /// move out.
 struct RequestView {
     input_len: Option<usize>,
-    /// The prompt's smallest and largest token ids.
-    input_id_range: Option<(i32, i32)>,
     has_multimodal_inputs: bool,
     return_logprob: bool,
     top_logprobs_num: i64,
@@ -434,15 +439,8 @@ fn request_view(request: &TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     } else {
         None
     };
-    let input_ids = request.input_ids.as_deref().unwrap_or_default();
-    let input_id_range = input_ids
-        .iter()
-        .min()
-        .zip(input_ids.iter().max())
-        .map(|(&min, &max)| (min, max));
     RequestView {
         input_len: request.input_ids.as_ref().map(Vec::len),
-        input_id_range,
         has_multimodal_inputs: request.multimodal_inputs.is_some(),
         return_logprob: request.return_logprob,
         top_logprobs_num: request.top_logprobs_num,
@@ -459,6 +457,7 @@ fn request_view(request: &TokenizedGenerateReqInput, limits: &IngressLimits) -> 
 /// Why a request cannot run, or `None`.
 fn refusal(
     request: &RequestView,
+    input_ids: &[i32],
     params: &SamplingParams,
     limits: &IngressLimits,
 ) -> Option<String> {
@@ -512,9 +511,10 @@ fn refusal(
             ));
         }
         if start >= 0 && start < input_len - 1 {
-            let (min, max) = request.input_id_range.unwrap_or((0, 0));
+            // A scored row predicts the next token. Earlier context may use
+            // input-only ids that the output head cannot score.
             if let Some(reason) = limits.logprobs.prompt_logprobs_refusal(
-                &[min, max],
+                &input_ids[start as usize + 1..],
                 request.has_multimodal_inputs,
                 limits.vocab_size,
             ) {
@@ -963,6 +963,63 @@ mod tests {
     }
 
     #[test]
+    fn prompt_logprobs_accept_input_only_context() {
+        let limits = IngressLimits {
+            vocab_size: 64,
+            enable_output_logprobs: true,
+            ..limits()
+        };
+        for (input_ids, start) in [
+            (vec![100, 10, 11, 12], 0),
+            (vec![100, 100, 11, 12], 1),
+            (vec![100, 100, 100, 12], 2),
+            (vec![100, 100, 100, 100], 3),
+        ] {
+            let scored = TokenizedGenerateReqInput {
+                return_logprob: true,
+                logprob_start_len: start,
+                ..request(
+                    "input-only-context",
+                    input_ids.clone(),
+                    SamplingParams::default(),
+                )
+            };
+            let Some(Admitted::Run(admission)) = admit(scored, &limits) else {
+                panic!("unscored context must not be checked against the output vocabulary");
+            };
+            assert_eq!(admission.state.prompt_ids, input_ids);
+            assert_eq!(
+                admission.state.input_logprob_rows.as_ref().map(Vec::len),
+                (start < 3).then_some((3 - start) as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_logprobs_refuse_targets_outside_the_output_vocabulary() {
+        let limits = IngressLimits {
+            vocab_size: 64,
+            enable_output_logprobs: true,
+            ..limits()
+        };
+        for start in 0..3 {
+            for target_position in start + 1..4 {
+                for target in [-1, 64, 100] {
+                    let mut input_ids = vec![10; 4];
+                    input_ids[target_position] = target;
+                    let scored = TokenizedGenerateReqInput {
+                        return_logprob: true,
+                        logprob_start_len: start as i64,
+                        ..request("invalid-target", input_ids, SamplingParams::default())
+                    };
+                    assert!(refused_message(admit(scored, &limits).unwrap())
+                        .contains("inside the vocabulary"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn logprobs_the_engine_cannot_return_are_refused() {
         let limits = IngressLimits {
             enable_output_logprobs: true,
@@ -1003,6 +1060,11 @@ mod tests {
         };
         assert!(
             refused_message(admit(prompt("d", vec![1, 5000]), &limits).unwrap())
+                .contains("inside the vocabulary")
+        );
+        // An id outside the vocabulary with both prompt ends inside it.
+        assert!(
+            refused_message(admit(prompt("d2", vec![1, 5000, 2]), &limits).unwrap())
                 .contains("inside the vocabulary")
         );
         let narrowing = IngressLimits {
