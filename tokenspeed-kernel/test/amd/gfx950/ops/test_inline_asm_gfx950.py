@@ -103,6 +103,24 @@ _ATTENTION_POINTERS = {
 }
 
 
+def _mha_decode_sliding_split():
+    # Muse's 2048-token sliding window: 8 splits merged by the last arriver.
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        _mha_decode_sliding_split_atomic as fn,
+    )
+
+    types = dict(
+        _ATTENTION_POINTERS,
+        out_ptr="*bf16",
+        sink_ptr="*fp8e4nv",
+        counters_ptr="*i32",
+    )
+    constexprs = dict(
+        _ATTENTION, NUM_KV_SPLITS=8, WINDOW_LEFT=2047, HAS_SINK=False
+    )  # fmt: skip
+    return _compile_gfx950(fn, types, constexprs, 4, options=_sched_options())
+
+
 def _mha_decode_split():
     # Full attention split over the KV pages; the reduce kernel merges.
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
@@ -380,6 +398,7 @@ def _dsa_persistent_topk():
 
 VARIANTS = {
     "mha_decode_split": _mha_decode_split,
+    "mha_decode_sliding_split": _mha_decode_sliding_split,
     "mha_decode_balanced": _mha_decode_balanced,
     "attntail_lamport": _attntail_lamport,
     "routed_lamport": _routed_lamport,
