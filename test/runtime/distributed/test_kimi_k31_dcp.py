@@ -120,7 +120,9 @@ def _dense_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
     _assert_close_to_reference(replayed, reference[prompt + spec_width :], fraction)
 
 
-def _selection_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
+def _selection_case(
+    rank: int, kv_cache_dtype, spec_width: int, fraction: float, fused_query: bool
+):
     """History past index_topk: the group selects what one rank holding the
     whole history selects, and attends it to the same output."""
     from test.runtime.test_kimi_k31 import (
@@ -148,6 +150,9 @@ def _selection_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float)
         ):
             target.copy_(source)
     whole[0].w_kc, whole[0].w_vc = sharded[0].w_kc, sharded[0].w_vc
+    if fused_query:
+        sharded[0].fuse_query_projections()
+        whole[0].fuse_query_projections()
     prompt = 1200
     hidden = torch.randn(
         prompt + 2 * spec_width,
@@ -202,7 +207,9 @@ def _prefix_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
     _assert_close_to_reference(resumed, expected.float(), fraction)
 
 
-def _worker(rank: int, rendezvous: str, case, kv_cache_dtype, spec_width, fraction):
+def _worker(
+    rank: int, rendezvous: str, case, kv_cache_dtype, spec_width, fraction, *extra
+):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     # Runtime imports may initialize CUDA, so select the rank's device first.
@@ -235,12 +242,12 @@ def _worker(rank: int, rendezvous: str, case, kv_cache_dtype, spec_width, fracti
     # The dense delegate sizes its prefix chunks from the launch's chunk size.
     global_server_args_dict.update(mapping=mapping, chunked_prefill_size=8192)
     initialize_comm_backend(use_pynccl=False)
-    case(rank, kv_cache_dtype, spec_width, fraction)
+    case(rank, kv_cache_dtype, spec_width, fraction, *extra)
     # Clean runs only: after a failure a pending collective would make teardown wait.
     dist.destroy_process_group()
 
 
-def _spawn(tmp_path, case, kv_cache_dtype, spec_width, fraction):
+def _spawn(tmp_path, case, kv_cache_dtype, spec_width, fraction, *extra):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("requires two GPUs")
     mp.spawn(
@@ -251,6 +258,7 @@ def _spawn(tmp_path, case, kv_cache_dtype, spec_width, fraction):
             kv_cache_dtype,
             spec_width,
             fraction,
+            *extra,
         ),
         nprocs=2,
         join=True,
@@ -272,11 +280,12 @@ def test_kvp2_attention_matches_dense_mla_and_replays_in_a_decode_graph(
     _spawn(tmp_path, _dense_case, kv_cache_dtype, spec_width, fraction)
 
 
+@pytest.mark.parametrize("fused_query", [False, True])
 @pytest.mark.parametrize("kv_cache_dtype, spec_width, fraction", _DTYPES)
 def test_kvp2_selects_and_attends_like_one_rank_holding_the_history(
-    tmp_path, kv_cache_dtype, spec_width, fraction
+    tmp_path, kv_cache_dtype, spec_width, fraction, fused_query
 ):
-    _spawn(tmp_path, _selection_case, kv_cache_dtype, spec_width, fraction)
+    _spawn(tmp_path, _selection_case, kv_cache_dtype, spec_width, fraction, fused_query)
 
 
 @pytest.mark.parametrize(
