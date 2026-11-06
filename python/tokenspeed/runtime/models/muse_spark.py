@@ -278,9 +278,15 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         ):
             # gfx950 single rows take the GEMV even where gemm.mm would not.
             result = mv(x, weight, out=out)
-        elif x.dtype == weight.dtype and (out is None or out.is_contiguous()):
+        elif (
+            x.dtype == weight.dtype
+            and weight.shape[0] != weight.shape[1]
+            and (out is None or out.is_contiguous())
+        ):
             # gemm.mm selects the GEMV or GEMM the unquantized method would and
-            # writes ``out`` in place, saving a copy launch.
+            # writes ``out`` in place, saving a copy launch. It infers the
+            # weight layout from its shape, so a square [N, K] weight could be
+            # read as [K, N]; those take the unquantized method instead.
             result = mm(x, weight, out=out)
         else:
             result = self.quant_method.apply(SimpleNamespace(weight=weight), x, None)

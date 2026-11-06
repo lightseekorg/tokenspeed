@@ -1589,6 +1589,22 @@ def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
     assert torch.equal(local, mm(x, linear.weight))
 
 
+@requires_gpu
+def test_gathered_projection_reads_a_square_weight_as_out_by_in(
+    bf16_default_dtype,
+) -> None:
+    """A square local weight is still applied as [out, in], not transposed."""
+    torch.manual_seed(6)
+    with torch.device("cuda"):
+        linear = _shard_linear(256, 256, tp_rank=0, tp_size=1)
+    linear.weight.data.normal_(std=0.02)
+    x = torch.randn((16, 256), device="cuda", dtype=torch.bfloat16)
+
+    result = linear._project(x, linear.weight, None)
+
+    torch.testing.assert_close(result, x @ linear.weight.t(), atol=2**-8, rtol=2**-7)
+
+
 def _gathered_mxfp4_workspace_worker(
     rank: int, port: int, world_size: int, enable_lamport: bool
 ) -> None:
