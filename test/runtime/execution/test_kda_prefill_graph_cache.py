@@ -329,7 +329,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         kda_backend=backend_name,
         kda_recurrent_layout="v_major",
     )
-    backend._layer_state = lambda layer_id: (
+    backend.layer_state = lambda layer_id: (
         backend.forward_metadata.state_in_blocks_by_group["state"],
         backend.forward_metadata.state_out_blocks_by_group["state"],
         conv,
