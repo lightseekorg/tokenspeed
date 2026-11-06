@@ -41,7 +41,7 @@ class LogprobServability:
             ``torch``.
         pipeline_parallel: The engine runs pipeline stages.
         disaggregated: The engine is one role of a disaggregated deployment.
-        vocab_size: The model's vocabulary size.
+        vocab_size: The output head's vocabulary size, not the input embedding size.
     """
 
     enable_output_logprobs: bool

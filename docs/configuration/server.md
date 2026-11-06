@@ -173,7 +173,10 @@ reports this capability at startup and the host's ingress checks it before
 admitting the request, so the data plane never has to. The ingress also
 refuses multimodal prompts (their media positions carry content-hash ids,
 not tokens) and any prompt whose client-supplied `input_ids` fall outside
-the vocabulary. `logprob_start_len=-1` is always accepted.
+the output vocabulary. A reduced output head can therefore accept input-only
+tokens for generation while refusing to score those tokens as prompt-logprob
+targets. `logprob_start_len=-1` does not request prompt logprobs and is unaffected
+by this restriction.
 
 Under pipeline parallelism (`--pipeline-parallel-size > 1`) the last stage scores the prompt
 rows and the commit path carries both logprob vectors to the other stages

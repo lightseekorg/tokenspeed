@@ -40,8 +40,8 @@ use crate::{
 /// What the engine fixed at startup and every admission checks against.
 #[derive(Debug, Clone)]
 pub struct IngressLimits {
-    /// Token ids in the vocabulary.
-    pub vocab_size: i64,
+    /// Token ids represented by the output head.
+    pub output_vocab_size: i64,
     /// The model's EOS ids, which end every request not ignoring EOS.
     pub eos_token_ids: Vec<i32>,
     /// The selected sampler's exclusive finite top-k bound; `None` when
@@ -96,7 +96,7 @@ impl LogprobServability {
         &self,
         input_ids: &[i32],
         has_multimodal_inputs: bool,
-        vocab_size: i64,
+        output_vocab_size: i64,
     ) -> Option<String> {
         if !self.supports_prompt_logprobs {
             return Some(
@@ -115,11 +115,11 @@ impl LogprobServability {
         }
         let outside = input_ids
             .iter()
-            .any(|&id| id < 0 || i64::from(id) >= vocab_size);
+            .any(|&id| id < 0 || i64::from(id) >= output_vocab_size);
         outside.then(|| {
             format!(
                 "prompt logprobs need every prompt token id inside the vocabulary \
-                 [0, {vocab_size}); input_ids contains one outside it."
+                 [0, {output_vocab_size}); input_ids contains one outside it."
             )
         })
     }
@@ -516,7 +516,7 @@ fn refusal(
             if let Some(reason) = limits.logprobs.prompt_logprobs_refusal(
                 input_ids,
                 request.has_multimodal_inputs,
-                limits.vocab_size,
+                limits.output_vocab_size,
             ) {
                 return Some(reason);
             }
@@ -544,7 +544,8 @@ fn refusal(
                 .to_owned(),
         );
     }
-    sampling::verify_with_top_k_limit(params, limits.vocab_size, limits.top_k_exclusive_max).err()
+    sampling::verify_with_top_k_limit(params, limits.output_vocab_size, limits.top_k_exclusive_max)
+        .err()
 }
 
 /// More stop tokens than the sampler's stop table holds.
@@ -576,7 +577,7 @@ mod tests {
 
     fn limits() -> IngressLimits {
         IngressLimits {
-            vocab_size: 1000,
+            output_vocab_size: 1000,
             eos_token_ids: vec![2],
             top_k_exclusive_max: Some(sampling::TOP_K_FUSED_MAX),
             max_model_len: 100,
@@ -918,6 +919,34 @@ mod tests {
                 .as_deref(),
             Some(schema)
         );
+    }
+
+    #[test]
+    fn input_only_tokens_are_not_output_logprob_targets() {
+        let limits = IngressLimits {
+            output_vocab_size: 64,
+            enable_output_logprobs: true,
+            ..limits()
+        };
+        // The embedding can consume an ID outside the output head. Asking for
+        // sampled-token logprobs must not shrink the prompt's input domain.
+        let sampled = TokenizedGenerateReqInput {
+            return_logprob: true,
+            ..request("input-only", vec![1, 100], SamplingParams::default())
+        };
+        assert!(matches!(admit(sampled, &limits), Some(Admitted::Run(_))));
+        let scored = TokenizedGenerateReqInput {
+            return_logprob: true,
+            logprob_start_len: 0,
+            ..request("unscorable", vec![1, 100], SamplingParams::default())
+        };
+        assert!(refused_message(admit(scored, &limits).unwrap()).contains("[0, 64)"));
+        let scoreable = TokenizedGenerateReqInput {
+            return_logprob: true,
+            logprob_start_len: 0,
+            ..request("scoreable", vec![1, 63], SamplingParams::default())
+        };
+        assert!(matches!(admit(scoreable, &limits), Some(Admitted::Run(_))));
     }
 
     #[test]

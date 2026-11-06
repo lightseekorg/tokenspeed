@@ -709,3 +709,27 @@ runtime behavior on other platforms and widths. Tests preserve the old formula
 independently and compare weights/IDs byte-for-byte on ties, cutoff ties, bias,
 identity candidates, near ties, batch packing/reordering and CUDA graph replay.
 This does not promise cross-version PyTorch tie compatibility.
+
+## Input and output vocabularies
+
+`ModelConfig.input_vocab_size` is the checkpoint's embedding vocabulary;
+`output_vocab_size` is the head's vocabulary. Both must be positive integers.
+A missing or null checkpoint `output_vocab_size` means the two sizes are equal.
+The legacy `ModelConfig.vocab_size` alias retains the input meaning, as does
+the original Hugging Face config. A model with a smaller head must construct
+its head and logits processor for that output size.
+
+`ModelExecutorConfig` and `RuntimeStates` carry both sizes explicitly. Input
+buffer clamps, n-gram preparation and multimodal draft substitutions use the
+input size. Sampling, draft probability tensors, grammar masks, output-token
+validation and selected-token logprobs use the output size. The host's ingress
+also uses the output size to validate logit bias and prompt-logprob targets:
+an input-only token can be embedded, but cannot be scored by the output head.
+Model-specific relationships between input, text/hash and output vocabularies
+belong in the model or plugin config, not in the common runtime.
+
+At startup, the host warns about model or tokenizer EOS/stop ids outside the
+output vocabulary: the head cannot generate them. It retains the configured
+ids, since another reachable stop id or a token limit can still end a request;
+`ignore_eos` continues to disable stop-token termination. The grammar tokenizer
+keeps only tokens within the output vocabulary, preserving their original ids.

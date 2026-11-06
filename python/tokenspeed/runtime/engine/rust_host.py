@@ -158,7 +158,7 @@ logger = get_colorful_logger(__name__)
 
 
 def resolve_stop_token_ids(
-    sampling_params: SamplingParams, eos_token_ids, tokenizer
+    sampling_params: SamplingParams, eos_token_ids, tokenizer, *, output_vocab_size: int
 ) -> frozenset[int]:
     """The tokens that end a request: its own ``stop_token_ids``, the
     model's EOS ids and the tokenizer's EOS and additional stop ids; none
@@ -166,7 +166,9 @@ def resolve_stop_token_ids(
 
     The host hands them to the Rust control plane as the model's EOS ids,
     which its finish check and the device's verify cut (``StopCriteria``)
-    both read, so the two always end a request on the same token.
+    both read, so the two always end a request on the same token. At startup,
+    warn about configured stop ids that the output head cannot emit without
+    discarding them or rejecting deployments that use explicit token limits.
     """
     if sampling_params.ignore_eos:
         return frozenset()
@@ -176,7 +178,17 @@ def resolve_stop_token_ids(
     if eos_id is not None:
         ids.add(eos_id)
     ids.update(getattr(tokenizer, "additional_stop_token_ids", None) or ())
-    return frozenset(int(token_id) for token_id in ids)
+    ids = frozenset(int(token_id) for token_id in ids)
+    outside = sorted(
+        token_id for token_id in ids if not 0 <= token_id < output_vocab_size
+    )
+    if outside:
+        logger.warning(
+            f"EOS/stop token ids {outside} are outside the output vocabulary "
+            f"[0, {output_vocab_size}) and cannot be generated. "
+            "Requests must end on another reachable stop token or a token limit."
+        )
+    return ids
 
 
 # ----------------------------------------------------------------------
@@ -388,7 +400,7 @@ class HostConfig:
         engine_index: The engine identity this rank registers as.
         ready_response: The msgpack-encoded ``WireEngineCoreReadyResponse``.
         in_flight_depth: Dispatched forwards that may await commit.
-        vocab_size: Token ids in the vocabulary.
+        output_vocab_size: Token ids represented by the output head.
         eos_token_ids: The model's EOS ids.
         top_k_exclusive_max: The selected sampler's admission bound; None
             when the backend normalizes every positive finite top_k.
@@ -474,7 +486,7 @@ class HostConfig:
     engine_index: int
     ready_response: bytes
     in_flight_depth: int
-    vocab_size: int
+    output_vocab_size: int
     eos_token_ids: tuple[int, ...]
     top_k_exclusive_max: int | None
     max_model_len: int
@@ -1290,7 +1302,10 @@ class HostBootstrap:
                 **model_config.tokenizer_kwargs,
             )
             eos_token_ids = resolve_stop_token_ids(
-                SamplingParams(), model_config.hf_eos_token_id, tokenizer
+                SamplingParams(),
+                model_config.hf_eos_token_id,
+                tokenizer,
+                output_vocab_size=model_config.output_vocab_size,
             )
             regions = memory_regions(
                 device.handle,
@@ -1319,7 +1334,7 @@ class HostBootstrap:
                 in_flight_depth=(
                     mapping.pp_size if mapping.has_pp else overlap_schedule_depth
                 ),
-                vocab_size=model_config.vocab_size,
+                output_vocab_size=model_config.output_vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
                 top_k_exclusive_max=get_sampling_backend_class(
                     server_args
@@ -1329,7 +1344,7 @@ class HostBootstrap:
                 logprob_servability=LogprobServability.of(
                     server_args,
                     supports_prompt_logprobs=specs.supports_prompt_logprobs,
-                    vocab_size=model_config.vocab_size,
+                    vocab_size=model_config.output_vocab_size,
                 ),
                 lm_head_tp_under_dp=mapping.attn.has_dp and mapping.lm_head.has_tp,
                 stream_interval=server_args.stream_interval,
@@ -1410,7 +1425,7 @@ class HostBootstrap:
                     GrammarSettings(
                         tokenizer_info=grammar_tokenizer_info(
                             tokenizer,
-                            model_config.vocab_size,
+                            model_config.output_vocab_size,
                             model_config.hf_eos_token_id,
                         ),
                         any_whitespace=not server_args.disable_any_whitespace,

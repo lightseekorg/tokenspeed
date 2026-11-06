@@ -500,7 +500,9 @@ def test_idle_graph_grammar_adds_an_identity_batch():
         token_to_kv_pool=None,
         input_buffers=buffers,
         runtime_states=SimpleNamespace(
-            valid_cache_lengths=torch.zeros(1), vocab_size=32
+            valid_cache_lengths=torch.zeros(1),
+            input_vocab_size=32,
+            output_vocab_size=32,
         ),
         device="cpu",
         default_stream=None,
@@ -567,7 +569,8 @@ def test_drafter_future_inputs_keep_original_request_rows():
             future_input_map=future_inputs,
             valid_cache_lengths=torch.zeros(6, dtype=torch.int32),
             mark_spec_candidates_drafted=lambda rows: drafted.extend(rows.tolist()),
-            vocab_size=64,
+            input_vocab_size=64,
+            output_vocab_size=64,
         ),
         input_buffers=SimpleNamespace(
             state_write_req_pool_indices_buf=torch.tensor([4, 2, 5, 1]),
