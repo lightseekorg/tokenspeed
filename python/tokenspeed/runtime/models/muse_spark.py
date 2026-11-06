@@ -2607,6 +2607,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 "Muse communication was prepared below the requested capacity"
             )
         self.model.iris_state = state
+        # Startup might not reduce any payload in the two-shot pull's window.
+        state.warmup_reduce_outputs()
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state
