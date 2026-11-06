@@ -46,6 +46,9 @@ class _RecordingLayer(torch.nn.Module):
         self.events = events
         self.comm_manager = SimpleNamespace(needs_final_all_gather=lambda: False)
 
+    def prefetches_ple(self, rows: int, ctx: object) -> bool:
+        return self.ple is not None
+
     def forward(self, positions, hidden_states, residual, ctx, input_ids):
         self.events.append(("layer", self.layer_id, ctx))
         return hidden_states, residual
@@ -84,6 +87,7 @@ def test_qwen4_exp_prefetch_starts_at_preceding_layer(
         for layer_id in range(4)
     )
     model.hyper_connection_mixer = _RecordingMixer()
+    model.monokernel_state = None
     capture = _RecordingCapture() if capturing else None
     monkeypatch.setattr(
         qwen4_exp_module.BreakableCapture,
