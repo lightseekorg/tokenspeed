@@ -540,6 +540,12 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (32, 5120): frozenset({1, 4, 16}),
     # Attention QKV with the output gate, 8192-wide hidden.
     (2304, 8192): frozenset({4, 16}),
+    # Qwen3.8-27B TP1 and its EAGLE-4 draft layer.
+    (5120, 5120): frozenset({16}),  # draft attention o_proj
+    (5120, 6144): frozenset({16}),  # GDN out_proj, attention o_proj
+    (5120, 15360): frozenset({1, 4, 16}),  # draft fc
+    (5120, 16384): frozenset({16}),  # draft MLP down
+    (5120, 17408): frozenset({1, 4, 16}),  # MLP down
 }
 
 
