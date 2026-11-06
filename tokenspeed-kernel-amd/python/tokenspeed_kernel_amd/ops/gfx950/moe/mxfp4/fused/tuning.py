@@ -151,12 +151,11 @@ _EP8_ROUTE_TILES = _ID_ROUTE_TILES + (
 _ROUTE_TILE_CONFIGS = {
     (4096, 4096, 32, 256, 8): _EP8_ROUTE_TILES,
     (4096, 4096, 64, 256, 8): _DECODE_ROUTE_TILES,
-    # EP1 (TP8 intermediate shard), 14-16 rows: faster than the direct decode
-    # with recorded verify and plain decode routing, and even with uniform
-    # routing. Below 14 rows grouping won on average but lost on samples with
-    # few repeated experts, and at 8 rows it only broke even, so direct decode
-    # keeps them. 17-128 rows: faster than the staged package; with both
-    # uniform and Zipf routing it breaks even at 160 rows.
+    # EP1 (TP8 intermediate shard), 14-16 rows: route tiles beat direct decode
+    # with recorded routing but not with uniform routing, where few experts
+    # repeat (as in the CI kernel benchmark). Below 14 rows, route tiles lose
+    # on samples with few repeated experts, so direct decode keeps them.
+    # 17-128 rows: faster than the staged package, which catches up at 160 rows.
     (4096, 512, 256, 256, 8): (
         (14, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),
         (17, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2)),
