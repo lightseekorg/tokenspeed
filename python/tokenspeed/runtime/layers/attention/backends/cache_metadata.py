@@ -199,7 +199,7 @@ class CacheBatchMetadata:
 
     def tables(self, *, active_forward_op: Any) -> Mapping[str, torch.Tensor]:
         """Return every group's table view, in a read-only mapping, after
-        freshness validation. The views are this step's own upload, the
+        freshness validation. The views are this step's own upload, with the
         state groups' tables end to end at its tail: the executor pads
         stopped requests' state rows in them in place."""
         self._validate_active_forward_op(active_forward_op)
