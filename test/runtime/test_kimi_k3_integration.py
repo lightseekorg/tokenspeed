@@ -4,6 +4,7 @@ from test.runtime.conftest import (
     KIMI_GROUP_IDS,
     cache_metadata_for,
     make_kimi_pool,
+    whole_row_spans,
 )
 
 import numpy as np
@@ -61,6 +62,9 @@ class _ForwardTables:
     def block_tables_arrays(self) -> dict[str, np.ndarray]:
         return self.arrays
 
+    def block_table_spans(self) -> dict[str, np.ndarray]:
+        return whole_row_spans(self.arrays)
+
 
 def test_metadata_scans_page_ids_only_when_asked() -> None:
     contract = make_kimi_pool("cpu", usable_pages=2).arena.runtime_contract
@@ -74,6 +78,7 @@ def test_metadata_scans_page_ids_only_when_asked() -> None:
         contract=contract,
         num_requests=1,
         validate_page_ids=False,
+        host_tables=False,
     )
     tables = metadata.tables(active_forward_op=forward_op)
     assert tables["linear_attention_0"].item() == 3
@@ -85,6 +90,7 @@ def test_metadata_scans_page_ids_only_when_asked() -> None:
             contract=contract,
             num_requests=1,
             validate_page_ids=True,
+            host_tables=False,
         )
     # The structural checks run either way.
     with pytest.raises(ValueError, match="rows"):
@@ -94,4 +100,5 @@ def test_metadata_scans_page_ids_only_when_asked() -> None:
             contract=contract,
             num_requests=2,
             validate_page_ids=False,
+            host_tables=False,
         )
