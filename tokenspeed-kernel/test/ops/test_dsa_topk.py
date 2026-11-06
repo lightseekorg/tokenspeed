@@ -333,7 +333,7 @@ def test_quantize_index_query_weights_compiles_once_per_bucket():
 
     run(3, 32 * 128, 160, 0.5)
     with assert_no_triton_compile(_quantize_index_query_weights_kernel):
-        # Contiguous queries, then a split view of a stacked projection.
+        # A split view of a stacked projection, then contiguous queries.
         run(7, 5632, 160, 0.25)
         run(127, 32 * 128, 192, 0.125)
 
