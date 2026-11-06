@@ -99,7 +99,7 @@ def blockwise_logprobs(
         of the leaf's ``[rows, vocab // vocab_block]`` block partials.
     """
     if form not in ("negative-cross-entropy", "direct"):
-        raise ValueError(f"Unknown vocab-parallel logprob form: {form!r}")
+        raise ValueError(f"Unknown blockwise logprob form: {form!r}")
     if logits.ndim != 2:
         raise ValueError(f"logits must be [rows, vocab], got {tuple(logits.shape)}")
     rows, vocab = logits.shape
