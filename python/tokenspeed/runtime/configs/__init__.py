@@ -35,6 +35,7 @@ from tokenspeed.runtime.configs.kimi_k2_config import KimiK2Config
 from tokenspeed.runtime.configs.kimi_k3_config import (
     KimiK3Config,
     KimiK3VisionConfig,
+    KimiK31Config,
     KimiLinearConfig,
 )
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import KimiK3DSparkConfig
@@ -78,6 +79,7 @@ __all__ = [
     "KimiK2Config",
     "KimiK25Config",
     "KimiK3Config",
+    "KimiK31Config",
     "KimiK3DSparkConfig",
     "KimiK3VisionConfig",
     "KimiLinearConfig",

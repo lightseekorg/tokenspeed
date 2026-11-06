@@ -35,12 +35,17 @@ def workspace_indices_to_kv_slots(
     Args:
         workspace_indices: Top-k indices in the compact DSA prefill workspace.
             Negative entries are treated as invalid sentinels and preserved.
+            int16 indices are unsigned 16-bit with ``-1`` (0xFFFF) as the
+            sentinel.
         kv_workspace_slots: Lookup table mapping workspace rows to KV cache slots.
 
     Returns:
         A tensor with the same shape as ``workspace_indices`` containing int32 KV
         cache slot ids, or int32 ``workspace_indices`` when no lookup is provided.
     """
+    if workspace_indices.dtype == torch.int16:
+        widened = workspace_indices.to(torch.int32)
+        workspace_indices = torch.where(widened == -1, widened, widened & 0xFFFF)
     if kv_workspace_slots is None or workspace_indices.numel() == 0:
         return workspace_indices.to(torch.int32)
 

@@ -125,7 +125,10 @@ class IrisAllGather:
             rows = local.shape[0]
             elements_per_word = 8 // self.producer.data.element_size()
             local_words = rows * local_hidden_size // elements_per_word
-            block_words = subgroup_size * 1 * 4
+            num_warps = column_gather_num_warps(
+                local_words * 8, self.producer.peers.world_size
+            )
+            block_words = subgroup_size * num_warps * 4
             num_tiles = triton.cdiv(local_words, block_words)
             num_programs = min(num_tiles, 84)
             published_input = (
@@ -146,14 +149,28 @@ class IrisAllGather:
                 LOCAL_HIDDEN_WORDS=local_hidden_size // elements_per_word,
                 TOTAL_HIDDEN_WORDS=total_hidden_size // elements_per_word,
                 BLOCK_WORDS=block_words,
-                NUM_WARPS=1,
+                NUM_WARPS=num_warps,
                 WORDS_PER_LANE=4,
                 INPUT_PUBLISHED=published_input,
                 PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
                 PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
-                num_warps=1,
+                num_warps=num_warps,
             )
         return output
+
+
+# Measured TP8 BF16: two subgroups per program win from about 768 KiB per shard.
+_COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES = 768 << 10
+
+
+def column_gather_num_warps(local_bytes: int, world_size: int) -> int:
+    """Subgroups per column-gather program for a rank's shard of ``local_bytes``.
+
+    Only TP8 was measured; TP4 keeps one subgroup.
+    """
+    if world_size == 8 and local_bytes >= _COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES:
+        return 2
+    return 1
 
 
 def all_gather_columns_can_run(
