@@ -683,7 +683,8 @@ def _max_forward_tokens() -> int:
         else int(args["max_prefill_tokens"]) + int(args["max_model_len"])
     )
     decode_rows = max(
-        int(args["max_cudagraph_capture_size"] or 0), int(args["max_num_seqs"] or 0)
+        int(args["max_cudagraph_capture_size"] or 0),
+        int(args["request_state_seqs"] or 0),
     )
     if args["speculative_algorithm"]:
         decode_rows *= int(args["speculative_num_draft_tokens"])

@@ -683,7 +683,7 @@ def test_distributed_four_way_lookup(monkeypatch):
     for key, value in dict(
         mapping=mapping,
         chunked_prefill_size=16,
-        max_num_seqs=4,
+        request_state_seqs=4,
         max_prefill_tokens=16,
         max_model_len=32,
         speculative_algorithm=None,
