@@ -41,8 +41,8 @@ from unittest import mock
 import pytest
 import torch
 from safetensors.torch import save_file
+from tokenspeed_kernel.ops.moe import flashinfer as flashinfer_moe
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
-from tokenspeed_kernel.thirdparty.flashinfer import trtllm_bf16_moe
 
 from tokenspeed.runtime.configs import model_config as model_config_module
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -66,8 +66,8 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
+from test.runtime.models.beam_fixture import tiny_config as base_tiny_config
 from test.runtime.models.beam_fixture import (
-    tiny_config,
     tiny_weights,
     write_tiny_checkpoint,
 )
@@ -85,6 +85,13 @@ ROUTED_APPLY = "flashinfer_trtllm_unquant_routed_moe_apply"
 FP8_ROUTED = "flashinfer_trtllm_fp8_channel_routed_moe_apply"
 NVFP4_ROUTED = "flashinfer_trtllm_nvfp4_routed_moe_apply"
 FP8 = torch.float8_e4m3fn
+
+
+def tiny_config():
+    """Use the vendor BF16 kernel's 128-wide expert alignment for this suite."""
+    config = base_tiny_config()
+    config.moe_intermediate_size = 128
+    return config
 
 
 @pytest.fixture(autouse=True)
@@ -300,7 +307,7 @@ def test_ep8_rank_hands_global_routes_and_its_expert_offset_to_the_kernel(
     layer = _moe(_ep_mapping(5), _config(**EP_GRID)).experts
     out = torch.full((3, 128), 2.0, dtype=torch.bfloat16)
     launcher = mock.Mock(return_value=[out])
-    monkeypatch.setattr(trtllm_bf16_moe, "trtllm_bf16_routed_moe", launcher)
+    monkeypatch.setattr(flashinfer_moe, "trtllm_bf16_routed_moe", launcher)
     ids = torch.tensor([[0, 160, 191, 255, 3, 170, 7, 8]] * 3, dtype=torch.int32)
     weights = torch.rand(3, 8, dtype=torch.float32)
     hidden = torch.zeros(3, 128, dtype=torch.bfloat16)
@@ -310,7 +317,7 @@ def test_ep8_rank_hands_global_routes_and_its_expert_offset_to_the_kernel(
     # Global expert ids; the kernel keeps [160, 192) and skips the rest.
     assert (kwargs["local_expert_offset"], kwargs["local_num_experts"]) == (160, 32)
     assert (kwargs["num_experts"], kwargs["top_k"]) == (256, 8)
-    assert kwargs["intermediate_size"] == 64 and kwargs["do_finalize"] is True
+    assert kwargs["intermediate_size"] == 128 and kwargs["do_finalize"] is True
     topk_ids, topk_weights = kwargs["topk_ids"]
     assert torch.equal(topk_ids, ids)
     assert torch.equal(topk_weights, weights.to(torch.bfloat16))
@@ -959,9 +966,9 @@ def _assert_experts_hold(experts, tensors):
         gate, up, down = (
             f"{prefix}.{p}" for p in ("gate_proj", "up_proj", "down_proj")
         )
-        assert torch.equal(experts.w13_weight[expert, :64], tensors[f"{gate}.weight"])
-        assert torch.equal(experts.w13_weight[expert, 64:], tensors[f"{up}.weight"])
-        for rows, name in ((slice(0, 64), gate), (slice(64, 128), up)):
+        assert torch.equal(experts.w13_weight[expert, :128], tensors[f"{gate}.weight"])
+        assert torch.equal(experts.w13_weight[expert, 128:], tensors[f"{up}.weight"])
+        for rows, name in ((slice(0, 128), gate), (slice(128, 256), up)):
             assert torch.equal(
                 experts.w13_weight_scale[expert, rows].view(torch.uint8),
                 tensors[f"{name}.weight_scale"].view(torch.uint8),
