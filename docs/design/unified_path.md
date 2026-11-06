@@ -2310,7 +2310,7 @@ Scalar prefix-length reads share one binary across slice alignments.
 
 `test_startup_request_warmup.py` checks scheduler isolation and draining;
 `test_startup_compile_keys.py` checks binary reuse across runtime sizes;
-`test_chunked_history_indices.py` exercises a table offset beyond 2**31.
+`test_mla_prefix_chunks.py` exercises a table offset beyond 2**31.
 Full serving validation must additionally show no compilation after
 readiness with the compilation monitor enabled.
 
