@@ -42,7 +42,9 @@ Inline asm main already had is listed apart (``INLINE_ASM_ON_MAIN``).
 import importlib
 import inspect
 import re
+import sys
 from functools import cache
+from pathlib import Path
 
 import pytest
 import torch
@@ -54,6 +56,9 @@ from asm_checks import (
 )
 from test_iris_muse_spark import _compile_gfx950
 from tokenspeed_kernel.platform import ArchVersion
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "moe"))
+from moe_stream_helpers import compile_moe_stream  # noqa: E402
 
 
 def _peer_signal_store():
@@ -71,6 +76,12 @@ def _sched_options():
 # ---------------------------------------------------------------------------
 # The kernels, as their launches compile them
 # ---------------------------------------------------------------------------
+
+
+def _moe_stream(rows):
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_stream
+
+    return compile_moe_stream(rows, moe_stream.TAIL_SHARE)
 
 
 # The attention shapes of one TP8 rank: 16 query heads over 2 KV heads of 64,
@@ -378,7 +389,34 @@ def _dsa_persistent_topk():
     )
 
 
+def _moe_route_tiles_stage2():
+    # Stage 2 of the route-tiled MoE at 16 rows (EP1 down projection).
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
+        gluon_mxfp4_moe_stage2_route_tiles_gfx950 as fn,
+    )
+
+    types = {
+        "x": "*u8",
+        "xscale": "*u8",
+        "w": "*u8",
+        "wscale": "*u8",
+        "sorted_routes": "*i32",
+        "descriptors": "*i32",
+        "group_count": "*i32",
+        "descriptor_rows": "i32",
+        "out": "*bf16",
+    }
+    constexprs = dict(
+        INTERMEDIATE=512, OUTPUT=4096, XS0=16, XS1=1, WE=4096 * 256,
+        SE=4096 * 16, SS0=16, SS1=1, BLOCK_N=128, BLOCK_K=128, BLOCK_M=16,
+        PREFETCH_TILES=8,
+    )  # fmt: skip
+    return _compile_gfx950(fn, types, constexprs, 4, ("descriptor_rows",))
+
+
 VARIANTS = {
+    "moe_stream-rows8": lambda: _moe_stream(8),
+    "moe_stream-rows16": lambda: _moe_stream(16),
     "mha_decode_split": _mha_decode_split,
     "mha_decode_balanced": _mha_decode_balanced,
     "attntail_lamport": _attntail_lamport,
@@ -389,6 +427,7 @@ VARIANTS = {
     "mha_extend_warp_pipelined": _mha_extend_warp_pipelined,
     "mla_prefill_8wave": _mla_prefill_8wave,
     "dsa_persistent_topk": _dsa_persistent_topk,
+    "moe_route_tiles_stage2-rows16": _moe_route_tiles_stage2,
 }
 
 
@@ -407,7 +446,52 @@ def _compiled(name):
 # "module:name"; why no compiler-visible operation serves; the compiler
 # support that would retire it). A helper not listed here fails the gate.
 _AMD = "tokenspeed_kernel_amd.ops.gfx950."
-INLINE_ASM = {}
+_STREAM_SYNC = _AMD + "moe.mxfp4._stream_sync:"
+INLINE_ASM = {
+    # Empty templates (no instruction): a point the value must pass.
+    "_issue_here": (
+        _AMD + "moe.mxfp4.decode_stage2:_issue_here",
+        "keeps a scalar load above the job loop's bound check",
+        "a Gluon op that pins a value to a program point",
+    ),
+    # One instruction that changes only Gluon's type of a value.
+    "wave_scalar": (
+        _STREAM_SYNC + "wave_scalar",
+        "moves a wave-uniform value (from llvm.amdgcn.readfirstlane) into"
+        " Gluon's scalar type",
+        "a Gluon op that returns a per-wave scalar from a wave-uniform tensor",
+    ),
+    "opaque_zero": (
+        _STREAM_SYNC + "opaque_zero",
+        "a zero the compiler can neither fold nor hoist",
+        "an opaque-value op",
+    ),
+    "after": (
+        _STREAM_SYNC + "after",
+        "orders a store after a loaded value without using it",
+        "a data-dependence op that consumes no arithmetic",
+    ),
+    "lds_store_count": (
+        _STREAM_SYNC + "lds_store_count",
+        "LDS stores then a returning LDS add, in this wave's issue order",
+        "a Gluon LDS atomic on a shared-memory descriptor",
+    ),
+    "lds_spin_until": (
+        _STREAM_SYNC + "lds_spin_until",
+        "rereads LDS each round (a shared-memory load in a loop is hoisted)",
+        "a volatile shared-memory load",
+    ),
+    "scalar_load_glc_i64": (
+        _STREAM_SYNC + "scalar_load_glc_i64",
+        "scalar load past the scalar cache that is not hoisted out of a poll",
+        "a volatile or atomic scalar (SMEM) load with glc",
+    ),
+    "_tags16_differ": (
+        _STREAM_SYNC + "_tags16_differ",
+        "one 16-word scalar load of tags compared in scalar registers",
+        "a volatile or atomic scalar (SMEM) load with glc",
+    ),
+}
 # Inline asm that main already has, which the kernels above compile in.
 INLINE_ASM_ON_MAIN = {
     "_keep_in_cluster": (
