@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip(
@@ -39,6 +39,9 @@ from tokenspeed_kernel.numerics.torch.attention.dsa import (  # isort: skip
 from tokenspeed_kernel.ops.attention.dsa import (  # isort: skip
     dsa_index_candidates,
     plan_dsa_index_candidates,
+)
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (  # isort: skip
+    _owned_query_group_metadata,
 )
 
 PAGE_SIZE = 64
@@ -388,6 +391,123 @@ def test_gluon_owned_page_candidates_select_alike_through_prefill_rows(
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
+def _owned_batch(requests: int, rows: int, columns: int, device: str):
+    """``requests`` requests of ``rows`` consecutive rows each over a
+    ``columns``-page table of 320 cache pages, a third of them unowned."""
+    torch.manual_seed(97 * requests + 13 * rows + columns)
+    table = torch.randint(0, 320, (requests, columns), device=device)
+    table = torch.where(torch.rand(table.shape, device=device) < 0.3, -1, table)
+    table = table.to(torch.int32)
+    request_ids = torch.arange(requests, device=device, dtype=torch.int32)
+    request_ids = request_ids.repeat_interleave(rows)
+    first = torch.randint(1, columns * PAGE_SIZE - rows, (requests,), device=device)
+    lens = (first[:, None] + torch.arange(rows, device=device)[None, :]).reshape(-1)
+    q = torch.randn(requests * rows, 32, HEAD_DIM, device=device)
+    q_scales = q.abs().amax(dim=-1).clamp_min(1.0e-6) / 448.0
+    q_fp8 = (q / q_scales[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    weights = torch.randn(requests * rows, 32, device=device)
+    return table, request_ids, lens.to(torch.int32), q_fp8, q_scales.float(), weights
+
+
+def test_gluon_owned_page_scorer_compiles_once_across_batches(device):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (
+        launch_gluon_dsa_index_candidates_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (
+        gluon_dsa_decode_topk_fp8_rows_gfx950,
+        gluon_dsa_owned_prefill_topk_fp8_rows_gfx950,
+    )
+
+    cache, _ = _pack_index_k_cache(
+        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device)
+    )
+
+    def score(requests, rows, group, columns):
+        table, request_ids, lens, q, q_scales, weights = _owned_batch(
+            requests, rows, columns, device
+        )
+        pages = plan_dsa_index_candidates(
+            q, weights, cache, table, request_ids, lens, page_size=PAGE_SIZE
+        )
+        return launch_gluon_dsa_index_candidates_gfx950(
+            q,
+            q_scales,
+            weights,
+            cache,
+            pages.pages,
+            pages.lengths.reshape(-1),
+            page_size=PAGE_SIZE,
+            softmax_scale=0.1,
+            query_group_size=group,
+            query_requests=request_ids,
+            request_count=requests,
+        )
+
+    # Decode (one row per request), verify (four) and prefill (a block of
+    # rows per request) launches; warm Triton's integer classes (1, a
+    # multiple of 16, neither) and the decode scorer's chunk loop.
+    batches = [(1, 1, 1), (16, 1, 1), (3, 1, 1), (16, 4, 4), (3, 4, 4)]
+    batches += [(1, 64, 1), (1, 80, 1), (3, 70, 1)]
+    for columns in (16, 17, 96):
+        for batch in batches:
+            score(*batch, columns)
+    with assert_no_triton_compile(
+        gluon_dsa_decode_topk_fp8_rows_gfx950,
+        gluon_dsa_owned_prefill_topk_fp8_rows_gfx950,
+    ):
+        for columns in (18, 33, 48, 95):
+            for requests in (2, 5, 32, 37):
+                score(requests, 1, 1, columns)
+                score(requests, 4, 4, columns)
+            for requests, rows in ((1, 65), (2, 64), (2, 100), (3, 130)):
+                score(requests, rows, 1, columns)
+
+
+def test_gluon_owned_page_prefill_rows_store_past_int32_offsets(device):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (
+        launch_gluon_dsa_index_candidates_gfx950,
+    )
+
+    # A prefill chunk over a 1M-token table: the last rows' scores start past
+    # 2**31 logits elements. Short rows keep the scoring cheap.
+    rows, columns, tail = 2176, 16384, 64
+    torch.manual_seed(31)
+    cache, _ = _pack_index_k_cache(
+        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device)
+    )
+    pages = torch.randint(0, 320, (1, columns), device=device, dtype=torch.int32)
+    pages = pages.expand(rows, columns).contiguous()
+    lengths = 70 + torch.arange(rows, device=device, dtype=torch.int32) % 300
+    q = torch.randn(rows, 32, HEAD_DIM, device=device)
+    q_scales = q.abs().amax(dim=-1).clamp_min(1.0e-6) / 448.0
+    q = (q / q_scales[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    weights = torch.randn(rows, 32, device=device)
+    requests = torch.zeros(rows, dtype=torch.int32, device=device)
+
+    def score(rows_slice):
+        return launch_gluon_dsa_index_candidates_gfx950(
+            q[rows_slice],
+            q_scales.float()[rows_slice],
+            weights[rows_slice],
+            cache,
+            pages[rows_slice],
+            lengths[rows_slice],
+            page_size=PAGE_SIZE,
+            softmax_scale=0.1,
+            query_requests=requests[rows_slice],
+            request_count=1,
+        )
+
+    full = score(slice(None))
+    assert (rows - tail) * full.stride(0) > 2**31
+    last = score(slice(rows - tail, None))
+    positions = torch.arange(400, device=device)
+    valid = positions[None, :] < lengths[-tail:, None]
+    torch.testing.assert_close(
+        full[-tail:, :400][valid], last[:, :400][valid], rtol=0, atol=0
+    )
+
+
 def _set_key_scale(cache: torch.Tensor, slot: int, value: float) -> None:
     page, row = divmod(slot, PAGE_SIZE)
     page_floats = PAGE_SIZE * (HEAD_DIM + 4) // 4
@@ -493,3 +613,25 @@ def test_gluon_owned_page_scorer_forces_mandatory_windows(device, monkeypatch):
         assert forced.numel() > 0
         assert torch.isin(forced, got).all(), f"row {row} dropped a mandatory token"
         assert (scores[row][torch.isin(offsets[row], forced)] == float("inf")).all()
+
+
+@pytest.mark.parametrize("group", [1, 4])
+def test_grouped_owned_pages_are_a_live_view_of_each_groups_last_row(group):
+    q = torch.empty(8, 32, 128, dtype=torch.float8_e4m3fn)
+    pages = torch.arange(24, dtype=torch.int32).view(8, 3)
+    lengths = torch.tensor([64, 64, 64, 65, 66, 66, 66, 66], dtype=torch.int32)
+    table = _owned_query_group_metadata(q, pages, lengths, group)
+    torch.testing.assert_close(table, pages[group - 1 :: group], atol=0, rtol=0)
+    assert table.stride(0) == group * pages.stride(0)
+    pages[group - 1, 0] = 987
+    assert table[0, 0] == 987
+
+
+def test_grouped_owned_pages_reject_incomplete_groups_and_nondense_plans():
+    q = torch.empty(8, 32, 128, dtype=torch.float8_e4m3fn)
+    pages = torch.empty(8, 4, dtype=torch.int32)
+    lengths = torch.empty(8, dtype=torch.int32)
+    with pytest.raises(ValueError, match="complete"):
+        _owned_query_group_metadata(q[:7], pages[:7], lengths[:7], 4)
+    with pytest.raises(ValueError, match="contiguous"):
+        _owned_query_group_metadata(q, pages[:, ::2], lengths, 4)
