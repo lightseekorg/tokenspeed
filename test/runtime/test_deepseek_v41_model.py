@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import math
 import os
 import re
@@ -4281,3 +4282,60 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 torch.testing.assert_close(actual_tap, expected_tap, rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("case", ["fused", "limit_differs", "kernel_declines"])
+def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
+    """The MoE hands its FP8 shared expert to a kernel that fuses it, once, and
+    keeps it, saying why, when MegaMoE would clamp it with a different SwiGLU
+    limit or the kernel declines it."""
+    metadata = vars(_loader_config())
+    metadata["hidden_size"] = 256
+    metadata["moe_intermediate_size"] = 256
+    config = v41.DeepseekV41Config(text_config=metadata).text_config
+    mapping = _mapping(1, 1, 2)
+    _mock_loader_hardware(monkeypatch, mapping)
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
+    )
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
+    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    shared = moe.shared_experts
+    assert shared.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+    if case == "limit_differs":
+        shared.act_fn.swiglu_limit = 2 * moe.experts.swiglu_arg.limit
+    calls = []
+
+    def fuse(plan, layer, *tensors):
+        calls.append((layer, tensors))
+        return case == "fused"
+
+    moe.experts.plan["fuse_shared_expert"] = fuse
+    # The mocked loader hardware stubs the routed weight processing.
+    moe.experts._weights_processed = True
+    caplog.set_level(logging.INFO, logger=v4.__name__)
+    moe.process_weights_after_loading(moe)
+    moe.process_weights_after_loading(moe)
+
+    assert moe.shared_expert_fused is (case == "fused")
+    unfused = [
+        r.getMessage() for r in caplog.records if "outside MegaMoE" in r.getMessage()
+    ]
+    if case != "fused":
+        assert len(unfused) == 2
+        assert all(message.startswith("Layer 0 ") for message in unfused)
+        expected = "SwiGLU limit" if case == "limit_differs" else "weight shapes"
+        assert all(expected in message for message in unfused)
+        assert len(calls) == (0 if case == "limit_differs" else 2)
+        return
+    assert unfused == []
+    assert len(calls) == 1
+    layer, tensors = calls[0]
+    assert layer is moe.experts
+    params = (
+        shared.gate_up_proj.weight,
+        shared.gate_up_proj.weight_scale_inv,
+        shared.down_proj.weight,
+        shared.down_proj.weight_scale_inv,
+    )
+    assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
