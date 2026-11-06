@@ -271,6 +271,43 @@ def _moe_sorting_stage3_kernel(
     gl.store(num_valid_ids_ptr + 1, m_total)
 
 
+@gluon.jit
+def _earlier_same_expert_routes(
+    topk_ids_ptr,
+    chunk_start,
+    chunk_routes,
+    first_route,
+    expert_id,
+    ROUTE_TILE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    route_layout: gl.constexpr,
+):
+    """Count, for each route of a tile, the earlier chunk routes with its expert.
+
+    The tile holds chunk routes ``first_route + [0, ROUTE_TILE)``. Each lane
+    keeps one route and compares it with 64 chunk IDs per step held in its
+    own registers, so the count needs no cross-lane reduction.
+    """
+    COLUMNS: gl.constexpr = 64
+    matrix: gl.constexpr = gl.BlockedLayout(
+        [1, COLUMNS], [64, 1], [NUM_WARPS, 1], [1, 0]
+    )
+    rows: gl.constexpr = gl.SliceLayout(1, matrix)
+    columns: gl.constexpr = gl.SliceLayout(0, matrix)
+    route = first_route + gl.arange(0, ROUTE_TILE, layout=rows)
+    expert = gl.convert_layout(expert_id, rows)
+    count = gl.zeros([ROUTE_TILE], gl.int32, layout=rows)
+    # Routes after this tile's last one are never earlier.
+    for first in range(0, gl.minimum(chunk_routes, first_route + ROUTE_TILE), COLUMNS):
+        column = first + gl.arange(0, COLUMNS, layout=columns)
+        other = gl.load(
+            topk_ids_ptr + chunk_start + column, mask=column < chunk_routes, other=-1
+        )
+        same = (expert[:, None] == other[None, :]) & (column[None, :] < route[:, None])
+        count += gl.sum(same.to(gl.int32), 1)
+    return gl.convert_layout(count, route_layout)
+
+
 @gluon.jit(
     do_not_specialize=("num_programs", "block_shift", "numel", "tokens_per_program")
 )
@@ -292,13 +329,15 @@ def _moe_sorting_stage4_kernel(
     EXPERT_START: gl.constexpr,
     ROUTE_TILE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    DETERMINISTIC: gl.constexpr,
 ):
     """Fill ``expert_ids`` block map and scatter routed rows + weights.
 
     Expert programs write their block maps and padding, while route programs
     scatter one input chunk. Stage 2 gives each chunk a disjoint sub-range of
-    every expert, so atomics assign ranks only within a chunk and retain stable
-    ordering between chunks.
+    every expert. Within a chunk, atomics assign ranks in arrival order, or,
+    with ``DETERMINISTIC``, each route takes the count of earlier routes in the
+    chunk with the same expert, so the sorted order depends only on the IDs.
     """
     pid = gl.program_id(0)
 
@@ -331,13 +370,29 @@ def _moe_sorting_stage4_kernel(
             expert_id -= EXPERT_START
             valid &= (expert_id >= 0) & (expert_id < num_experts)
             safe_expert = gl.where(valid, expert_id, 0)
-            cursor = gl.atomic_add(
-                tokens_cnts_ptr + pid * num_experts + safe_expert,
-                one,
-                mask=valid,
-                sem="relaxed",
-                scope="gpu",
-            )
+            if DETERMINISTIC:
+                cursor = gl.load(
+                    tokens_cnts_ptr + pid * num_experts + safe_expert,
+                    mask=valid,
+                    other=0,
+                ) + _earlier_same_expert_routes(
+                    topk_ids_ptr,
+                    pid * tokens_per_program,
+                    gl.minimum(tokens_per_program, numel - pid * tokens_per_program),
+                    start,
+                    expert_id + EXPERT_START,
+                    ROUTE_TILE,
+                    NUM_WARPS,
+                    route_layout,
+                )
+            else:
+                cursor = gl.atomic_add(
+                    tokens_cnts_ptr + pid * num_experts + safe_expert,
+                    one,
+                    mask=valid,
+                    sem="relaxed",
+                    scope="gpu",
+                )
             rank = cursor + gl.load(cumsum_ptr + safe_expert, mask=valid, other=0)
             token_id = idx // TOPK
             topk_id = idx % TOPK
@@ -345,6 +400,36 @@ def _moe_sorting_stage4_kernel(
             gl.store(sorted_ids_ptr + rank, packed, mask=valid)
             weight = gl.load(topk_weights_ptr + idx, mask=valid, other=0.0)
             gl.store(sorted_weights_ptr + rank, weight, mask=valid)
+
+
+def route_chunks(
+    numel: int,
+    num_experts: int,
+    *,
+    use_minimum_route_chunks: bool,
+    runtime_rows: bool,
+) -> tuple[int, int, int]:
+    """Split ``numel`` routes into sort programs.
+
+    Returns:
+        ``(programs, routes per program, route tile width)``; the tile width is
+        a compile-time value of the sort kernels.
+    """
+    # Keep route chunks at a practical vector width. The chunk prefix scan
+    # preserves their source order even when there are fewer experts than
+    # required route programs.
+    max_routes_per_program = 32 if runtime_rows else 1024
+    num_programs = triton.cdiv(numel, max_routes_per_program)
+    if not use_minimum_route_chunks:
+        num_programs = max(num_experts, num_programs)
+    tokens_per_program = triton.cdiv(numel, num_programs)
+    # A lone program holds at most 1024 routes, where one vector beats looping over 256.
+    route_tile = (
+        max(_ROUTE_TILE, triton.next_power_of_2(tokens_per_program))
+        if num_programs == 1
+        else _ROUTE_TILE
+    )
+    return num_programs, tokens_per_program, route_tile
 
 
 def gluon_moe_sorting(
@@ -357,6 +442,7 @@ def gluon_moe_sorting(
     *,
     use_minimum_route_chunks: bool,
     runtime_rows: bool,
+    deterministic_order: bool,
     expert_start: int = 0,
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -379,6 +465,11 @@ def gluon_moe_sorting(
             this; larger prefills preserve their locality-oriented chunk count.
         runtime_rows: retain the fixed 32-route bound for medium batches.
             Every path already passes row and chunk counts as runtime values.
+        deterministic_order: order the routes of each expert by their flat
+            top-k index, so identical IDs give identical sorted rows on every
+            rank and call. Otherwise routes within a chunk keep arrival order.
+            Each route is compared with every earlier route of its chunk, so
+            the cost grows with the chunk length.
         expert_start: global ID of local expert zero.
         out: optional preallocated ``(M, model_dim)`` output buffer.
 
@@ -436,19 +527,11 @@ def gluon_moe_sorting(
             "MoE output must be a row-major, colocated (M, model_dim) tensor"
         )
 
-    # Keep route chunks at a practical vector width. The chunk prefix scan
-    # preserves their source order even when there are fewer experts than
-    # required route programs.
-    max_routes_per_program = 32 if runtime_rows else 1024
-    num_programs = triton.cdiv(numel, max_routes_per_program)
-    if not use_minimum_route_chunks:
-        num_programs = max(E, num_programs)
-    tokens_per_program = triton.cdiv(numel, num_programs)
-    # A lone program holds at most 1024 routes, where one vector beats looping over 256.
-    route_tile = (
-        max(_ROUTE_TILE, triton.next_power_of_2(tokens_per_program))
-        if num_programs == 1
-        else _ROUTE_TILE
+    num_programs, tokens_per_program, route_tile = route_chunks(
+        numel,
+        E,
+        use_minimum_route_chunks=use_minimum_route_chunks,
+        runtime_rows=runtime_rows,
     )
     expert_pad = triton.next_power_of_2(E + 1)
     program_pad = triton.next_power_of_2(num_programs)
@@ -523,6 +606,7 @@ def gluon_moe_sorting(
         EXPERT_START=int(expert_start),
         ROUTE_TILE=route_tile,
         NUM_WARPS=_SCAN_NUM_WARPS,
+        DETERMINISTIC=deterministic_order,
         num_warps=_SCAN_NUM_WARPS,
     )
 
