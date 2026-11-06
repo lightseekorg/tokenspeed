@@ -21,10 +21,16 @@
 """The --numerics envelope folds into the individual determinism switches."""
 
 import sys
+from pathlib import Path
 
 import pytest
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 class TestNumericsMode:

@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +48,11 @@ from tokenspeed.runtime.sampling.utils import (
     gather_token_logprobs_torch,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 VOCAB = 2 * BLOCKWISE_VOCAB_BLOCK
 POOL = 4
