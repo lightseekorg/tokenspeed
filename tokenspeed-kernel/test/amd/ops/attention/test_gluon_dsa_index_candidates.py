@@ -268,6 +268,126 @@ def test_gluon_owned_page_scorer_writes_scores_into_a_send_buffer(device):
     assert buffer[rows * topk :].isnan().all()
 
 
+def _prefill_inputs(heads: int, device: str):
+    """Prefill rows of three requests over a 96-page table, several key chunks
+    wide: a long history whose block of rows ends mid-block, five rows, and a
+    fresh prompt whose first page another rank owns (its early rows own
+    nothing)."""
+    torch.manual_seed(2311 + heads)
+    columns = 96
+    table = torch.randperm(320, device=device)[: 3 * columns].reshape(3, columns)
+    table = torch.where(torch.rand(table.shape, device=device) < 0.4, -1, table).to(
+        torch.int32
+    )
+    table[2, 0] = -1
+    steps = [(0, 5000, 77), (1, 64, 5), (2, 1, 130)]
+    requests = torch.cat(
+        [torch.full((count,), r, dtype=torch.int32) for r, _, count in steps]
+    ).to(device)
+    lens = torch.cat(
+        [
+            torch.arange(first, first + count, dtype=torch.int32)
+            for _, first, count in steps
+        ]
+    ).to(device)
+    rows = requests.numel()
+    q = torch.randn(rows, heads, HEAD_DIM, device=device)
+    q_scales = q.abs().amax(dim=-1).clamp_min(1.0e-6) / 448.0
+    q_fp8 = (q / q_scales[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    weights = torch.randn(rows, heads, device=device)
+    cache, _ = _pack_index_k_cache(
+        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device)
+    )
+    # A non-finite key scale: both scorers store its score as -inf.
+    _set_key_scale(cache, int(table[0][table[0] >= 0][3]) * PAGE_SIZE + 7, float("nan"))
+    return table, requests, lens, q_fp8, q_scales.float(), weights, cache
+
+
+def _count_prefill_launches(monkeypatch) -> list[int]:
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import index_candidates
+
+    launches = []
+    launch = index_candidates._launch_prefill_rows
+
+    def counted(q, *args, **kwargs):
+        launches.append(q.shape[0])
+        return launch(q, *args, **kwargs)
+
+    monkeypatch.setattr(index_candidates, "_launch_prefill_rows", counted)
+    return launches
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_gluon_owned_page_prefill_rows_score_like_one_row_groups(
+    heads, device, monkeypatch
+):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (
+        launch_gluon_dsa_index_candidates_gfx950,
+    )
+
+    table, requests, lens, q, q_scales, weights, cache = _prefill_inputs(heads, device)
+    pages = plan_dsa_index_candidates(
+        q, weights, cache, table, requests, lens, page_size=PAGE_SIZE
+    )
+    lengths = pages.lengths.reshape(-1)
+    assert pages.pages.shape[1] * PAGE_SIZE > 4096
+    assert (lengths == 0).any()
+    launches = _count_prefill_launches(monkeypatch)
+    kwargs = dict(page_size=PAGE_SIZE, softmax_scale=0.1)
+    args = (q, q_scales, weights, cache, pages.pages, lengths)
+
+    one_row = launch_gluon_dsa_index_candidates_gfx950(*args, **kwargs)
+    assert launches == []
+    blocks = launch_gluon_dsa_index_candidates_gfx950(
+        *args, query_requests=requests, request_count=table.shape[0], **kwargs
+    )
+    assert launches == [requests.numel()]
+
+    columns = torch.arange(one_row.shape[1], device=device)
+    valid = columns[None, :] < lengths[:, None]
+    assert (one_row[valid] == float("-inf")).any()
+    torch.testing.assert_close(blocks[valid], one_row[valid], rtol=0, atol=0)
+
+
+def test_gluon_owned_page_scorer_keeps_one_row_groups_below_prefill_size(device):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.index_candidates import (
+        _scores_prefill_rows,
+    )
+
+    assert _scores_prefill_rows(4096, 1, 32)
+    assert _scores_prefill_rows(212, 3, 32)
+    # Decode: a row per request, at any batch size.
+    assert not _scores_prefill_rows(256, 256, 32)
+    assert not _scores_prefill_rows(63, 1, 32)
+    assert not _scores_prefill_rows(4096, None, 32)
+    assert not _scores_prefill_rows(100, 26, 64)
+
+
+def test_gluon_owned_page_candidates_select_alike_through_prefill_rows(
+    device, monkeypatch
+):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import index_candidates
+
+    table, requests, lens, q, q_scales, weights, cache = _prefill_inputs(32, device)
+    kwargs = dict(
+        page_size=PAGE_SIZE,
+        topk=512,
+        softmax_scale=0.1,
+        initial_tokens=0,
+        local_tokens=0,
+        solution=None,
+        q_scales=q_scales,
+    )
+    launches = _count_prefill_launches(monkeypatch)
+    blocks = dsa_index_candidates(q, weights, cache, table, requests, lens, **kwargs)
+    assert launches == [requests.numel()]
+    monkeypatch.setattr(index_candidates, "_scores_prefill_rows", lambda *_: False)
+    one_row = dsa_index_candidates(q, weights, cache, table, requests, lens, **kwargs)
+    assert launches == [requests.numel()]
+    for got, want in zip(_by_offset(*blocks), _by_offset(*one_row), strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 def _set_key_scale(cache: torch.Tensor, slot: int, value: float) -> None:
     page, row = divmod(slot, PAGE_SIZE)
     page_floats = PAGE_SIZE * (HEAD_DIM + 4) // 4

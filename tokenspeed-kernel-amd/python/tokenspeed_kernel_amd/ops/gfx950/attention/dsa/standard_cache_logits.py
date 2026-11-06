@@ -1445,9 +1445,14 @@ def _multi_row_index_k_scores_body(
     CHUNK_LOOP: gl.constexpr,
     EXPLICIT_ROW_LENS: gl.constexpr = False,
     NONFINITE_TO_NEG_INF: gl.constexpr = False,
+    ROW_RUNS: gl.constexpr = False,
 ):
     # Program (i, j): rows i on chunk j; positive key scales apply after the head sum.
     # NONFINITE_TO_NEG_INF stores NaN and infinite scores as -inf.
+    # ROW_RUNS (prefill rows): row_starts holds each row's request and
+    # block_table each row's compact pages, which start at column 0 and are a
+    # prefix of a later row's of its request. Each request's rows in the block
+    # score their last row's pages.
     NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
     row_block = gl.program_id(0)
     split = gl.program_id(1)
@@ -1504,12 +1509,18 @@ def _multi_row_index_k_scores_body(
         row_valid = rows < num_rows
         m_rows = row_block * ROWS + m_local
         m_valid = m_rows < num_rows
-        starts = gl.maximum(
-            gl.amd.cdna4.buffer_load(
+        if ROW_RUNS:
+            row_requests = gl.amd.cdna4.buffer_load(
                 ptr=row_starts, offsets=rows, mask=row_valid, other=0
-            ),
-            0,
-        )
+            )
+            starts = gl.zeros([ROWS], gl.int32, layout=row_layout)
+        else:
+            starts = gl.maximum(
+                gl.amd.cdna4.buffer_load(
+                    ptr=row_starts, offsets=rows, mask=row_valid, other=0
+                ),
+                0,
+            )
         ends = gl.minimum(
             gl.amd.cdna4.buffer_load(
                 ptr=row_ends, offsets=rows, mask=row_valid, other=0
@@ -1580,7 +1591,64 @@ def _multi_row_index_k_scores_body(
         weight_1 = weight_0
 
     row_offsets = rows.to(gl.int64) * logits_stride
-    if CHUNK_LOOP:
+    if ROW_RUNS:
+        tl.static_assert(not CHUNK_LOOP and not IS_DECODE)
+        no_request = 2147483647
+        previous = gl.min(gl.where(row_valid, row_requests, no_request), axis=0) - 1
+        # One request per pass, in ascending order; a block holds at most ROWS.
+        for _ in range(0, ROWS):
+            request = gl.min(
+                gl.where(
+                    row_valid & (row_requests > previous), row_requests, no_request
+                ),
+                axis=0,
+            )
+            in_run = row_valid & (row_requests == request)
+            run_starts = gl.where(in_run, starts, num_candidates)
+            run_ends = gl.where(in_run, ends, 0)
+            run_start = gl.maximum(gl.min(run_starts, axis=0), candidate_start)
+            run_end = gl.minimum(gl.max(run_ends, axis=0), candidate_end)
+            if run_start < run_end:
+                _score_candidate_chunk(
+                    index_k,
+                    index_k_scale,
+                    kv_workspace_slots,
+                    block_table,
+                    logits,
+                    query_0,
+                    weight_0,
+                    query_1,
+                    weight_1,
+                    run_starts,
+                    run_ends,
+                    row_offsets,
+                    gl.max(gl.where(in_run, rows, 0), axis=0),
+                    block_table_stride,
+                    model_scale,
+                    run_start,
+                    run_end,
+                    mfma_layout,
+                    dot_b_layout,
+                    out_layout,
+                    col_layout,
+                    PAGE_SIZE,
+                    NUM_HEADS,
+                    HEAD_DIM,
+                    ROWS,
+                    BLOCK_N,
+                    CHUNK_N,
+                    NUM_WARPS,
+                    NUM_STAGES,
+                    True,
+                    PAGE_STRIDE_BYTES,
+                    KEY_FP8,
+                    Q_FP8,
+                    USE_BUFFER_LOAD,
+                    USE_BUFFER_STORE,
+                    NONFINITE_TO_NEG_INF,
+                )
+            previous = request
+    elif CHUNK_LOOP:
         for chunk in range(candidate_start // CHUNK_N, tl.cdiv(candidate_end, CHUNK_N)):
             _score_candidate_chunk(
                 index_k,
@@ -1937,6 +2005,107 @@ def gluon_dsa_prefill_topk_fp8_rows_gfx950(
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
         False,
+    )
+
+
+@gluon.jit(
+    launch_metadata=_fp8_index_k_launch_metadata,
+    do_not_specialize=(
+        "num_rows",
+        "num_candidates",
+        "block_table_stride",
+        "logits_stride",
+    ),
+    do_not_specialize_on_alignment=("row_requests", "row_lens", "block_table"),
+)
+def gluon_dsa_owned_prefill_topk_fp8_rows_gfx950(
+    q,
+    q_scales,
+    index_k_fp8,
+    index_k_scale,
+    weights,
+    row_requests,
+    row_lens,
+    block_table,
+    logits,
+    num_rows,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_w_row,
+    stride_w_head,
+    stride_qs_row,
+    stride_qs_head,
+    block_table_stride,
+    logits_stride,
+    model_scale,
+    num_candidates,
+    PAGE_SIZE: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
+    NUM_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    ROWS: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    CHUNK_N: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    Q_FP8: gl.constexpr,
+    USE_BUFFER_LOAD: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+):
+    """Prefill scorer over compact owned pages of an fp8_scaled paged plane.
+
+    The grid and spans are ``gluon_dsa_prefill_topk_fp8_rows_gfx950``'s;
+    row ``i`` (of request ``row_requests[i]``) scores its first
+    ``row_lens[i]`` slots of ``block_table[i]``'s pages, as
+    ``gluon_dsa_decode_topk_fp8_rows_gfx950`` scores a one-row group, with
+    the same arithmetic. NaN and infinite scores are stored as -inf.
+    """
+    _multi_row_index_k_scores_body(
+        q,
+        q_scales,
+        index_k_fp8,
+        index_k_scale,
+        weights,
+        block_table,
+        row_requests,
+        row_lens,
+        row_lens,
+        block_table,
+        logits,
+        num_rows,
+        stride_q_row,
+        stride_q_head,
+        stride_q_dim,
+        stride_w_row,
+        stride_w_head,
+        stride_qs_row,
+        stride_qs_head,
+        block_table_stride,
+        logits_stride,
+        model_scale,
+        num_candidates,
+        1,
+        PAGE_SIZE,
+        NUM_HEADS,
+        HEAD_DIM,
+        ROWS,
+        BLOCK_N,
+        CHUNK_N,
+        WARPS_M,
+        WARPS_N,
+        NUM_STAGES,
+        False,
+        PAGE_STRIDE_BYTES,
+        True,
+        Q_FP8,
+        USE_BUFFER_LOAD,
+        USE_BUFFER_STORE,
+        False,
+        False,
+        True,
+        True,
     )
 
 
