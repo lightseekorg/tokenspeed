@@ -169,13 +169,13 @@ def require_verified_numerics(
             model (none of which is verified under an envelope beyond auto).
         architecture: The model's architecture name, for the error.
         quantization: The checkpoint's resolved quantization method, or None.
-        vocab_size: The model's vocabulary size; the envelope's Megatron-order
+        vocab_size: The model's vocabulary size; the envelope's blockwise
             logprobs fold fixed ``BLOCKWISE_VOCAB_BLOCK``-wide blocks of it.
 
     Raises:
         ValueError: The envelope is not verified for this model, or its
             checkpoint validator rejects the storage or vocabulary. The RL
-            policy requires unquantized weights and whole Megatron vocab blocks.
+            policy requires unquantized weights and whole blockwise vocab blocks.
     """
     if numerics == "auto":
         return
