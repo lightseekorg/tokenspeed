@@ -141,15 +141,17 @@ class DSpark(DFlash):
         Returns a closure ``bias_fn(vocab_start, count) -> [rows, count]`` that
         supplies the Markov correction for a requested global vocab slice.
 
-        The Markov head only spans the original vocab (``markov_w2`` has
-        ``vocab_size`` rows). Any part of a requested slice that falls beyond
-        that range -- i.e. the target LM head's *added* vocab shard -- gets a
-        zero bias, so added tokens keep their plain base logit and only compete
-        unbiased.
+        The Markov projection spans its trained output domain. Any part of a
+        requested slice beyond that range -- i.e. the target LM head's *added*
+        vocab shard -- gets zero bias, so added tokens compete with their plain
+        base logit.
         """
         w2_weight = self.markov_head.markov_w2.weight
         vocab_size = int(w2_weight.shape[0])
-        latent = self.markov_head.get_prev_latent(prev_tokens.clamp(0, vocab_size - 1))
+        input_vocab_size = self.markov_head.markov_w1.num_embeddings
+        latent = self.markov_head.get_prev_latent(
+            prev_tokens.clamp(0, input_vocab_size - 1)
+        )
         rows = int(latent.shape[0])
 
         def bias_fn(vocab_start: int, count: int) -> torch.Tensor:

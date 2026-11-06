@@ -19,7 +19,9 @@ output domain, including shards containing no output tokens. Distributed
 argmax shortcuts require the physical and logical widths to match.
 
 DSpark's Markov embedding covers input tokens; its projection and checkpoint
-rows cover output tokens and use the same vocabulary shards as the LM head.
+rows cover output tokens. This applies to replicated generic/K3/MiniMax heads
+and V4.1 heads that use the same vocabulary shards as the LM head. Previous
+tokens are bounded by the input embedding, independently of output width.
 Padding-only shards contribute no candidate but still join every TP gather.
 
 Every model constructor receives the resolved `vocabulary` explicitly.

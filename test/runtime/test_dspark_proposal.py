@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.models.dspark import VanillaMarkov
@@ -30,7 +31,9 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     BaseDrafter.__init__(drafter, spec_num_tokens=spec_num_tokens)
     drafter.lm_head = None
     torch.manual_seed(0)
-    head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)
+    head = VanillaMarkov(
+        vocabulary=VocabularySpec(input_size=vocab, output_size=vocab), markov_rank=RANK
+    )
     drafter.markov_head = head
     return drafter
 

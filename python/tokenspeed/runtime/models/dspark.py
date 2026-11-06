@@ -50,16 +50,15 @@ class VanillaMarkov(nn.Module):
 
     markov_head_type = "vanilla"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(self, *, vocabulary: VocabularySpec, markov_rank: int) -> None:
         super().__init__()
-        self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
         if self.markov_rank <= 0:
             raise ValueError(
                 f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
             )
-        self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.markov_w1 = nn.Embedding(vocabulary.input_size, self.markov_rank)
+        self.markov_w2 = nn.Linear(self.markov_rank, vocabulary.output_size, bias=False)
 
     def get_prev_latent(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Look up the rank-space latent for the previous token(s)."""
@@ -69,7 +68,7 @@ class VanillaMarkov(nn.Module):
         return self.markov_w2(latent_states)
 
     def compute_step_bias(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Full-vocab bias for one block position given the previous token."""
+        """Output-domain bias for one block position given an input token."""
         return self.project_bias(self.get_prev_latent(token_ids))
 
 
@@ -122,14 +121,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 f"Unsupported DSpark markov_head_type={markov_head_type!r}; this "
                 f"static build only supports {SUPPORTED_MARKOV_HEAD_TYPES}."
             )
-        vocab_size = getattr(config, "vocab_size", None)
-        if vocab_size is None:
-            raise ValueError(
-                "DSpark draft config must define vocab_size for the Markov head."
-            )
-        self.markov_head = VanillaMarkov(
-            vocab_size=int(vocab_size), markov_rank=markov_rank
-        )
+        self.markov_head = VanillaMarkov(vocabulary=vocabulary, markov_rank=markov_rank)
 
 
 EntryClass = [DSparkDraftModel]

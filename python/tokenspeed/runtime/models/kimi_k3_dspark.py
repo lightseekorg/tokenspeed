@@ -406,7 +406,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         )
         self.markov_head = (
             VanillaMarkov(
-                vocab_size=int(config.vocab_size),
+                vocabulary=vocabulary,
                 markov_rank=int(config.markov_rank),
             )
             if mapping.is_last_pp_rank
