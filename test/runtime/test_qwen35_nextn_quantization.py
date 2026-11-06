@@ -103,7 +103,8 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp, 
         hidden_size=4,
         vocab_size=8,
         rms_norm_eps=1e-6,
-        num_hidden_layers=1,
+        num_hidden_layers=3,
+        full_attention_interval=3,
         tie_word_embeddings=tied,
     )
     # The GPU transformer and CUDA cache management are outside this test;
@@ -126,6 +127,11 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp, 
     draft = Qwen3_5ForConditionalGenerationNextN(
         model_init_config(config, is_draft=True),
         mapping,
+    )
+    assert (config.num_hidden_layers, config.full_attention_interval) == (3, 3)
+    assert (draft.config.num_hidden_layers, draft.config.full_attention_interval) == (
+        1,
+        1,
     )
     _check_shared_head_layout(target, draft)
     draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
