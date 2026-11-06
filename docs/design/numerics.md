@@ -538,9 +538,11 @@ afterwards, so chunked prefill and prefix-cache hits do not change a prompt
 logprob either -- the admission probe is capped at `logprob_start_len`
 (`scheduler.md` §1) so every scored position is actually recomputed.
 
-For bitwise agreement, `--logprob-order blockwise` uses negative cross-entropy
-and returns negative zero; `blockwise-direct` uses direct subtraction and returns
-positive zero. Both use the same reduction; `torch` is unchanged.
+The current trainer defaults to negative cross-entropy, `-(log(sum_exp) - target)`,
+yielding `-0.0` for a certain token; `rl-bitwise` defaults to `blockwise` to match
+these bits. This corrects the previous assumption that the trainer defaults to
+positive zero. `blockwise-direct` uses `target - log(sum_exp)` for trainers that
+require `+0.0`. Both use the same reduction; `torch` is unchanged.
 
 ## Prefix hits resume at any token: KV bitwise, recurrent state within tolerance
 
