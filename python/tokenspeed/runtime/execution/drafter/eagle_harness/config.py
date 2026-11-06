@@ -158,7 +158,8 @@ class EagleHarnessConfig:
     eos_token_id: int | None
     # Chain verify width per live batch size, exec modes 0/1; empty: the confidence rule decides.
     chain_width_table: ChainWidthTable
-    # --max-num-seqs: the most live requests of a round.
+    # --max-num-seqs: the most live requests of a round. The startup draft
+    # decode warmup, which can exceed it (request_state_seqs), begins no round.
     max_requests: int
     # (padded batch, floor) per decode graph: it serves floor + 1 to padded batch live requests.
     decode_graph_floors: tuple[tuple[int, int], ...]
@@ -179,7 +180,7 @@ class EagleHarnessConfig:
             seed=server_args.seed,
             eos_token_id=min(eos_token_ids) if eos_token_ids else None,
             chain_width_table=chain_width_table(server_args),
-            max_requests=server_args.request_state_seqs,
+            max_requests=server_args.max_num_seqs,
             decode_graph_floors=decode_graph_floors(server_args),
         )
 
