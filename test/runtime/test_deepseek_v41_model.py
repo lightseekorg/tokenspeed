@@ -2253,6 +2253,21 @@ class _TinyFp8WoAModel(BaseCausalLM):
         DeepseekV41ForCausalLM.post_quant_warmup(self)
 
 
+def test_output_warmup_covers_decode_rows_of_every_request_state_slot(monkeypatch):
+    """The output projection warmup covers a speculative decode forward over
+    every request the decode state holds, even when that exceeds the prefill
+    chunk and the decode graph ladder."""
+    for key, value in dict(
+        chunked_prefill_size=128,
+        max_cudagraph_capture_size=16,
+        request_state_seqs=64,
+        speculative_algorithm="MTP",
+        speculative_num_draft_tokens=4,
+    ).items():
+        monkeypatch.setitem(global_server_args_dict, key, value)
+    assert v41._max_forward_tokens() == 64 * 4
+
+
 @pytest.mark.skipif(
     not (
         torch.cuda.is_available()
@@ -4123,7 +4138,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
         chunked_prefill_size=512,
         max_prefill_tokens=512,
         max_model_len=512,
-        max_num_seqs=4,
+        request_state_seqs=4,
         ep_num_redundant_experts=0,
         speculative_algorithm=None,
     ).items():
