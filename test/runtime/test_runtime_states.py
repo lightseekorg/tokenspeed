@@ -22,6 +22,7 @@ import os
 import sys
 
 import pytest
+import tokenspeed_scheduler as ts
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -208,8 +209,6 @@ _PAGES = 17
 
 def _scheduled_batch():
     """Two prompts' first forward, as the scheduler plans it."""
-    import tokenspeed_scheduler as ts
-
     kinds = {"state": ts.AttnKind.State, "full_history": ts.AttnKind.Full}
     config = make_config(
         num_device_pages=_PAGES,
