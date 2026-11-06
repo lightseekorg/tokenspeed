@@ -58,6 +58,11 @@ cute_dsl_paged_row_all_gather = error_fn
 
 # The paged-row all-gather's modes, in the order a mode code numbers them.
 _PAGED_ROW_ALL_GATHER_MODES = ("multicast", "peer")
+# A paged-row all-gather slot (degree * cap_bytes) stays under this many bytes,
+# which bounds the receive workspace every rank reserves (two slots) before
+# the KV cache is sized. It also keeps the kernel's int32 store offsets in
+# range, which need only a rank's part of a slot (cap_bytes) under 2**31.
+PAGED_ROW_ALL_GATHER_SLOT_BYTES_LIMIT = 2**31
 
 
 def create_fused_tp_column_projection_state(
@@ -214,8 +219,8 @@ def create_paged_row_all_gather_state(
         device: This rank's CUDA device, with its index.
         row_bytes: Bytes per cache row, a multiple of 16; equal on every rank.
         cap_bytes: Receive bytes per rank and slot, a whole number of rows,
-            with the slot (``degree * cap_bytes``) under 2 GiB; equal on
-            every rank.
+            with the slot (``degree * cap_bytes``) under
+            ``PAGED_ROW_ALL_GATHER_SLOT_BYTES_LIMIT``; equal on every rank.
         timeout_ns: Bound of every in-kernel wait; a peer that does not reach
             the same window within it fails the kernel with a trap.
         modes: Modes in preference order, from ``multicast`` (one NVLink
@@ -248,8 +253,7 @@ def create_paged_row_all_gather_state(
         and row_bytes % 16 == 0
         and cap_bytes > 0
         and cap_bytes % row_bytes == 0
-        # Store offsets inside a rank's part of a slot stay int32 in the kernel.
-        and degree * cap_bytes < 2**31
+        and degree * cap_bytes < PAGED_ROW_ALL_GATHER_SLOT_BYTES_LIMIT
     )
     if local_ok:
         # A rendezvous over hosts the fabric cannot map would hang.
@@ -309,7 +313,8 @@ def create_paged_row_all_gather_state(
             logger.info(
                 f"paged_row_all_gather: ranks {ranks} keep their all-gather (a rank "
                 "is not eligible, or lacks an SM100 or SM103 GPU, group size, a "
-                "slot under 2 GiB, fabric or kernel module)"
+                f"slot under {PAGED_ROW_ALL_GATHER_SLOT_BYTES_LIMIT >> 30} GiB, "
+                "fabric or kernel module)"
             )
         return None
     return build_paged_row_all_gather_state(

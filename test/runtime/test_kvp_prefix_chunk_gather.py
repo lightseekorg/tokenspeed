@@ -1024,14 +1024,16 @@ def test_startup_keeps_nccl_where_a_fused_window_could_deadlock(
 
 @pytest.mark.parametrize(
     "chunked_prefill_size,multiplier,cap_rows",
-    [(2048, 2, 4096), (16384, 4, 65536), (-1, 4, None)],
+    # The last: a slot of 2 x 2**21 rows of 576 bytes, over 2 GiB.
+    [(2048, 2, 4096), (16384, 4, 65536), (-1, 4, None), (524288, 4, None)],
 )
 def test_startup_sizes_the_slot_from_the_history_capacity(
     monkeypatch, startup_verdicts, chunked_prefill_size, multiplier, cap_rows
 ):
     """A rank's part of a receive slot holds the MLA history capacity in
     rows, what the chunk planner expands at most a loop; without chunked
-    prefill no loop reads history and the group keeps NCCL."""
+    prefill no loop reads history, and a slot of 2 GiB or more is past the
+    factory's bound on the receive workspace: the group keeps NCCL."""
     from tokenspeed.runtime.configs.model_config import AttentionArch
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.attention.dcp.cache import (

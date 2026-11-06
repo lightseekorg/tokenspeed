@@ -670,15 +670,15 @@ def prepare_prefix_history_transport(
     call does nothing; after a refusal, it votes again. The group keeps
     the NCCL all-gather when its model reads no MLA prefix history through
     ``PrefixHistoryGather`` (DeepSeek V4.1 gathers its own) or reads
-    ``per_token_head`` rows, on a decode role, without chunked prefill, or
-    when a configured kernel could deadlock with a fused window
-    (``_FUSED_HISTORY_SAFE_MOE_BACKENDS``).
+    ``per_token_head`` rows, on a decode role, without chunked prefill, with
+    a receive slot of 2 GiB or more (the factory's bound on the receive
+    workspace), or when a configured kernel could deadlock with a fused
+    window (``_FUSED_HISTORY_SAFE_MOE_BACKENDS``).
 
     A rank's part of a receive slot holds the MLA history capacity
-    (``chunk.get_max_chunk_capacity``) in rows: the chunk planner expands at
-    most that many history rows a loop, so any one loop fits whatever its
-    owners hold, and the window planner packs loops by their owners' counts
-    to fit it.
+    (``chunk.get_max_chunk_capacity``) in rows: why, in
+    ``docs/design/cache-concepts.md``; the sizing and when the group keeps
+    NCCL, in ``docs/serving/parallelism.md``.
 
     Args:
         server_args: The launch's resolved server arguments.
@@ -695,6 +695,7 @@ def prepare_prefix_history_transport(
     # Not through the registry: a collective state factory, which votes on the
     # platform itself (every rank gets None off SM100 and SM103).
     from tokenspeed_kernel.ops.communication.cute_dsl import (
+        PAGED_ROW_ALL_GATHER_SLOT_BYTES_LIMIT,
         create_paged_row_all_gather_state,
     )
 
@@ -742,6 +743,14 @@ def prepare_prefix_history_transport(
         row_bytes = (
             model_config.kv_lora_rank + model_config.qk_rope_head_dim
         ) * resolve_dtype(server_args.kv_cache_dtype).itemsize
+        # The factory refuses such a slot too; checked here to name it.
+        slot_bytes = len(group) * cap_rows * row_bytes
+        if slot_bytes >= PAGED_ROW_ALL_GATHER_SLOT_BYTES_LIMIT:
+            reason = (
+                f"a receive slot of {slot_bytes / 2**20:.0f} MiB, not under the "
+                f"fused all-gather's {PAGED_ROW_ALL_GATHER_SLOT_BYTES_LIMIT >> 30} "
+                "GiB"
+            )
     for module in (module for model in models for module in model.modules()):
         if reason is not None:
             break
@@ -930,9 +939,9 @@ class PrefixHistoryGather:
         owner fits its receive slot, which any one loop does; NCCL windows
         keep ``PREFIX_HISTORY_WINDOW_LOOPS`` loops, which bounds their
         all-gather's transient buffer. A reader whose rows the transport does
-        not take (a draft caching another dtype than the target) plans NCCL
-        windows, judged from the pool's row layout: reading a plane would
-        wait for its layer's Host load.
+        not take (another row width, or virtual slots of another integer
+        type) plans NCCL windows, judged from the pool's row layout: reading a
+        plane would wait for its layer's Host load.
         """
         if self._windows is None:
             transport = self._transport

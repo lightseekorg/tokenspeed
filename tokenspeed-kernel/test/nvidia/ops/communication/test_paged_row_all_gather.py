@@ -19,36 +19,28 @@
 # SOFTWARE.
 
 """The fused paged-row all-gather against NCCL's all-gather of the packed rows,
-on two and four node-local SM100 or SM103 GPUs: every byte value, both slots,
-owners without rows, source offsets past 2**31, both modes with each group
-size's CTA count, windows of any row count on one compiled kernel,
-group-consistent refusals and argument errors, and the in-kernel failure
-records."""
+on node-local SM100 or SM103 GPUs: random windows of any row count, every byte
+value, both slots, owners without rows, and both modes with each group size's
+CTA count. The runtime's test of the KVP history reads through this kernel
+(``test/runtime/distributed/test_kvp_history_fused_gather.py``), which CI runs
+on two GPUs, checks the rest: no trace at launch, source offsets past 2**31,
+the refusal votes and argument errors, and the in-kernel failure records."""
 
-import json
-import multiprocessing
-import os
-import sys
 from datetime import timedelta
-from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 import torch.multiprocessing as mp
 from tokenspeed_kernel.ops.communication.cute_dsl import (
     create_paged_row_all_gather_state,
     cute_dsl_paged_row_all_gather,
 )
-from utils import assert_no_cute_compile, kernel_supported, move_pages_past_int32
+from utils import kernel_supported
 
 ROW_BYTES = 576
 CAP_ROWS = 4096
 PLANE_ROWS = 8192
-# Failure cases: in-kernel waits end after 2 s (the first window loads the
-# module on every rank inside this bound too).
-SHORT_TIMEOUT_NS = 2_000_000_000
 LONG_TIMEOUT_NS = 60_000_000_000
 
 
@@ -198,43 +190,8 @@ def _worker(rank, size, rendezvous):
         None if bound == LONG_TIMEOUT_NS else f"bound {bound}",
         "the wait bound after the first window",
     )
-    # The same rows past 2**31 bytes of the plane: int64 source offsets.
-    (far,), far_slots = move_pages_past_int32(
-        (plane,), torch.arange(PLANE_ROWS, dtype=torch.int32, device=device)
-    )
-    offset = int(far_slots[0])
-    _agree(
-        device,
-        None if offset * ROW_BYTES > 2**31 else "no offset past 2**31",
-        "the far plane",
-    )
-    # Windows of every row count, the far one included, launch the state's
-    # compiled kernel: nothing traces.
-    traced = None
-    try:
-        with assert_no_cute_compile():
-            failure = _check_windows(
-                state, device, size, plane, (shapes, generator), 64
-            )
-            owned = [max(count, 1) for count in _owned_rows(shapes, size)]
-            send_rows = max(owned)
-            fetch = _fetch(generator, owned[rank], send_rows, device)
-            # Held until the current stream waits for the window: the kernel
-            # reads them on the state's stream, and the agreement below
-            # allocates on the current stream before that wait.
-            far_fetch = fetch + offset
-            epoch, done = cute_dsl_paged_row_all_gather(
-                state, far, far_fetch, owned[rank], send_rows, 0
-            )
-    except AssertionError as error:
-        traced = str(error)
+    failure = _check_windows(state, device, size, plane, (shapes, generator), 64)
     _agree(device, failure, f"{expected} windows")
-    torch.cuda.current_stream().wait_event(done)
-    got = state.receive_view(epoch)[: size * send_rows].clone()
-    failure = _compare(got, _expected(plane, fetch, size), owned, send_rows)
-    _agree(device, failure, "rows past 2**31")
-    del far
-    _agree(device, traced, "launches after the state's creation")
     _agree(device, None if state.read_error() is None else "error record", "errors")
     state.close()
 
@@ -249,79 +206,10 @@ def _worker(rank, size, rendezvous):
     failure = _check_windows(peer, device, size, plane, (shapes, generator), 16)
     _agree(device, failure, "peer windows")
     peer.close()
-
-    # A refusal on one rank is every rank's: an allocation failure, then the
-    # caller's own verdict. Nobody waits in the rendezvous.
-    if rank == 1:
-        with patch.object(symm_mem, "empty", side_effect=RuntimeError("no memory")):
-            refused = _create(
-                group,
-                device,
-                modes=("multicast", "peer"),
-                eligible=True,
-                timeout_ns=LONG_TIMEOUT_NS,
-            )
-    else:
-        refused = _create(
-            group,
-            device,
-            modes=("multicast", "peer"),
-            eligible=True,
-            timeout_ns=LONG_TIMEOUT_NS,
-        )
-    _agree(device, None if refused is None else "a state", "an allocation failure")
-    refused = _create(
-        group,
-        device,
-        modes=("multicast", "peer"),
-        eligible=rank != 1,
-        timeout_ns=LONG_TIMEOUT_NS,
-    )
-    _agree(device, None if refused is None else "a state", "an ineligible rank")
-    # The same when the kernel module does not import on one rank.
-    with patch.dict(
-        sys.modules, {paged_row_all_gather.__name__: None} if rank == 1 else {}
-    ):
-        refused = _create(
-            group,
-            device,
-            modes=("multicast", "peer"),
-            eligible=True,
-            timeout_ns=LONG_TIMEOUT_NS,
-        )
-    _agree(device, None if refused is None else "a state", "a failed import")
-    # A bad argument on one rank raises there after the vote; the others get
-    # None. Unequal arguments raise on every rank.
-    try:
-        refused = _create(
-            group,
-            device,
-            modes=("bogus",) if rank == 1 else ("multicast", "peer"),
-            eligible=True,
-            timeout_ns=LONG_TIMEOUT_NS,
-        )
-        failure = "no error" if rank == 1 else (None if refused is None else "a state")
-    except ValueError:
-        failure = None if rank == 1 else "raised"
-    _agree(device, failure, "bad modes on one rank")
-    try:
-        create_paged_row_all_gather_state(
-            group,
-            device,
-            row_bytes=ROW_BYTES,
-            cap_bytes=(CAP_ROWS + rank) * ROW_BYTES,
-            timeout_ns=LONG_TIMEOUT_NS,
-            modes=("multicast", "peer"),
-            eligible=True,
-        )
-        failure = "no error"
-    except ValueError:
-        failure = None
-    _agree(device, failure, "unequal capacities")
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("size", [2, 4], ids=["tp2", "tp4"])
+@pytest.mark.parametrize("size", [2, 4, 8], ids=["tp2", "tp4", "tp8"])
 def test_paged_row_all_gather(size, tmp_path):
     if (
         torch.cuda.device_count() < size
@@ -336,98 +224,3 @@ def test_paged_row_all_gather(size, tmp_path):
         nprocs=size,
         join=True,
     )
-
-
-def _failing_worker(rank, size, rendezvous, case, out):
-    """Two good windows, then ``case`` on rank 1 in the third: ``header``
-    launches it with another header, ``skip`` skips its epoch and launches
-    the next one. Writes this rank's error record once the kernel trapped,
-    with host-only operations, then exits."""
-    device, group = _init(rank, size, rendezvous)
-    plane = torch.zeros((PLANE_ROWS, ROW_BYTES), dtype=torch.uint8, device=device)
-    state = _create(
-        group,
-        device,
-        modes=("multicast", "peer"),
-        eligible=True,
-        timeout_ns=SHORT_TIMEOUT_NS,
-    )
-    fetch = torch.arange(64, dtype=torch.int32, device=device)
-    record = None
-    try:
-        for window in range(3):
-            header = window
-            if rank == 1 and window == 2:
-                if case == "skip":
-                    # The declared epoch counter, moved past one window.
-                    state.epoch += 1
-                else:
-                    header += 1
-            _, done = cute_dsl_paged_row_all_gather(state, plane, fetch, 64, 64, header)
-            torch.cuda.current_stream().wait_event(done)
-        torch.cuda.synchronize(device)
-    except Exception:  # noqa: BLE001 - the trap surfaces as a CUDA error
-        record = state.read_error()
-    with open(os.path.join(out, f"rank{rank}.json"), "w") as f:
-        json.dump(record, f)
-    os._exit(0)
-
-
-@pytest.mark.parametrize("case", ["header", "skip"])
-def test_paged_row_all_gather_failures(case, tmp_path):
-    """Each rank in a process of its own (a trapped context cannot take part
-    in a collective, and ``mp.spawn`` stops the others when one fails): the
-    error records name the expected stage on every rank."""
-    size = 4
-    if (
-        torch.cuda.device_count() < size
-        or not kernel_supported("cute_dsl_paged_row_all_gather")
-        # The registered range admits 10.1 and 10.2 too.
-        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
-    ):
-        pytest.skip(f"requires {size} node-local SM100 or SM103 GPUs")
-    # Imported once the platform is known to have CuTe DSL.
-    from tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather import (
-        STAGE_ENTRY_AHEAD,
-        STAGE_ENTRY_TIMEOUT,
-        STAGE_HEADER,
-    )
-
-    context = multiprocessing.get_context("spawn")
-    rendezvous = f"file://{tmp_path / 'rendezvous'}"
-    workers = [
-        context.Process(
-            target=_failing_worker, args=(rank, size, rendezvous, case, str(tmp_path))
-        )
-        for rank in range(size)
-    ]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=300)
-    stuck = [rank for rank, worker in enumerate(workers) if worker.is_alive()]
-    for worker in workers:
-        if worker.is_alive():
-            worker.kill()
-    assert not stuck, f"ranks {stuck} did not finish"
-    records = []
-    for rank in range(size):
-        with open(tmp_path / f"rank{rank}.json") as f:
-            records.append(json.load(f))
-    assert all(record is not None for record in records), records
-    # Several CTAs fail at once on a rank; the record is still written whole.
-    assert all(record["complete"] for record in records), records
-    stages = [record["stage_code"] for record in records]
-    if case == "header":
-        assert stages == [STAGE_HEADER] * size, records
-    else:
-        # The others see rank 1's credit ahead of their epoch; rank 1 waits
-        # for credits that never come.
-        assert stages == [
-            STAGE_ENTRY_AHEAD,
-            STAGE_ENTRY_TIMEOUT,
-            STAGE_ENTRY_AHEAD,
-            STAGE_ENTRY_AHEAD,
-        ], records
-        others = [record for rank, record in enumerate(records) if rank != 1]
-        assert all(record["mask"] & 0b10 for record in others), records

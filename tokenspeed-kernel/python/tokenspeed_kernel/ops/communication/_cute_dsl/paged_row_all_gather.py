@@ -79,10 +79,15 @@ import torch.distributed._symmetric_memory as symm_mem
 from cuda.bindings import runtime as cudart
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Boolean, Int32, Int64, dsl_user_op
+from cutlass.cutlass_dsl import Boolean, Int32, Int64, Uint32, dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection_kernel import (
     _queue_poll_backoff,
+)
+from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.primitives import (
+    load_vector,
+    multicast_words,
+    store_words,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,15 +119,7 @@ _THREADS = 512
 _UNROLL = 8
 # CTAs per window, by mode and group size: a state launches its group size's
 # count every window (the grid is a launch argument, outside the compile).
-# Multicast: a GPU's stores leave at about 40 GB/s per CTA, and each GPU
-# receives a share from every rank, saturating near 600 GB/s, so the fewest
-# CTAs that saturate the receive side follow from the group size alone. A
-# window's rows and the row width change how much moves, and the reader's
-# queries the compute it overlaps; neither changes which side limits it: on
-# the GB300 sweeps (the communication README) no other count measured
-# shortens a window by more than 3 us, and more CTAs slow the compute a
-# window overlaps. Other hardware needs measuring again.
-# Peer stores keep 24 CTAs at every group size, not measured per size.
+# Why these counts: the communication README's launch configuration.
 _NUM_CTAS = {"multicast": {2: 8, 4: 4, 8: 2}, "peer": {2: 24, 4: 24, 8: 24}}
 
 # Error record (pinned host int64 words): stage, epoch, peer mask, rank,
@@ -157,80 +154,9 @@ STAGE_NAMES = {
 
 
 @dsl_user_op
-def _load_v4_no_allocate(address: Int64, *, loc=None, ip=None):
-    # Coherent 16-byte load that does not allocate in L1 (rows are read once).
-    scalar = Int32.mlir_type
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([scalar] * 4),
-        [address.ir_value(loc=loc, ip=ip)],
-        "ld.global.L1::no_allocate.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        Int32(llvm.extractvalue(scalar, result, [i], loc=loc, ip=ip)) for i in range(4)
-    )
-
-
-@dsl_user_op
-def _multimem_store_v4(
-    address: Int64, a: Int32, b: Int32, c: Int32, d: Int32, *, loc=None, ip=None
-):
-    # multimem.st takes at most 16 bytes and no .b32 vectors; .f32 moves the
-    # register bits unchanged (no arithmetic happens on a store).
-    llvm.inline_asm(
-        None,
-        [
-            address.ir_value(loc=loc, ip=ip),
-            a.ir_value(loc=loc, ip=ip),
-            b.ir_value(loc=loc, ip=ip),
-            c.ir_value(loc=loc, ip=ip),
-            d.ir_value(loc=loc, ip=ip),
-        ],
-        "multimem.st.relaxed.sys.global.v4.f32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _store_v4(
-    address: Int64, a: Int32, b: Int32, c: Int32, d: Int32, *, loc=None, ip=None
-):
-    # latent_moe_tail's store_global_u32x4 issues the same store without a
-    # memory clobber; the clobber keeps the payload stores where the exit's
-    # barrier and release expect them, as in _multimem_store_v4.
-    llvm.inline_asm(
-        None,
-        [
-            address.ir_value(loc=loc, ip=ip),
-            a.ir_value(loc=loc, ip=ip),
-            b.ir_value(loc=loc, ip=ip),
-            c.ir_value(loc=loc, ip=ip),
-            d.ir_value(loc=loc, ip=ip),
-        ],
-        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _trap(*, loc=None, ip=None):
-    # offload_hash's fail without a memory clobber: the clobber keeps the
-    # error record's stores ahead of the trap.
+    # offload_hash's fail plus a memory clobber, which keeps the error
+    # record's stores ahead of the trap.
     llvm.inline_asm(
         None,
         [],
@@ -526,7 +452,7 @@ class PagedRowAllGatherKernel:
         nvec = owned * row_vecs
         step = nthr * unroll
         slots = cute.make_rmem_tensor((unroll,), Int32)
-        regs = cute.make_rmem_tensor((4 * unroll,), Int32)
+        regs = cute.make_rmem_tensor((4 * unroll,), Uint32)
         first = bidx * _THREADS + tidx
         for u in cutlass.range_constexpr(unroll):
             v_first = first + u * nthr
@@ -539,8 +465,10 @@ class PagedRowAllGatherKernel:
                 if v_load < nvec:
                     row = v_load // row_vecs
                     src = plane_base + Int64(slots[u]) * self.row_bytes
-                    a, b, c, d = _load_v4_no_allocate(
-                        src + Int64((v_load - row * row_vecs) * 16)
+                    # Not allocated in L1: every row is read once.
+                    a, b, c, d = load_vector(
+                        src + Int64((v_load - row * row_vecs) * 16),
+                        cache="L1::no_allocate",
                     )
                     regs[4 * u] = a
                     regs[4 * u + 1] = b
@@ -555,22 +483,20 @@ class PagedRowAllGatherKernel:
                 v_store = base + u * nthr
                 if v_store < nvec:
                     offset = v_store * 16
+                    # Both stores carry a memory clobber, which keeps them
+                    # between the entry's barrier and the exit's release.
                     if cutlass.const_expr(self.mode == "multicast"):
-                        _multimem_store_v4(
+                        # multimem.st takes no .b32 vectors; .f32 moves the
+                        # register bits unchanged (a store does no arithmetic).
+                        multicast_words(
                             dst_base + Int64(offset),
-                            regs[4 * u],
-                            regs[4 * u + 1],
-                            regs[4 * u + 2],
-                            regs[4 * u + 3],
+                            tuple(regs[4 * u + k] for k in range(4)),
                         )
                     else:
                         for j in cutlass.range_constexpr(self.degree):
-                            _store_v4(
+                            store_words(
                                 targets[j] + Int64(offset),
-                                regs[4 * u],
-                                regs[4 * u + 1],
-                                regs[4 * u + 2],
-                                regs[4 * u + 3],
+                                tuple(regs[4 * u + k] for k in range(4)),
                             )
 
     # ------------------------------------------------------------------

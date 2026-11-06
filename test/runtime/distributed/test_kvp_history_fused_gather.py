@@ -30,11 +30,11 @@ hold. Every verdict that one rank could reach alone is agreed over the world
 first, so that a failing case fails on every rank and the next case's
 collectives still line up.
 
-``_worker`` runs every case on an initialized world; the test spawns it on two
-and four local GPUs. Run as a script under ``torchrun`` (eight ranks across
-two nodes), the same worker adds the case with real all-reduces in flight and
-skips the single-node ones. ``_layer_order_worker`` runs the one case that
-traps the kernel, in processes of its own.
+``_worker`` runs every case on an initialized world; the test spawns it on two,
+four and eight local GPUs. Run as a script under ``torchrun`` (eight ranks
+across two nodes), the same worker adds the case with real all-reduces in
+flight and skips the single-node ones. ``_trap_worker`` runs the cases that
+trap the kernel, in processes of their own, on gloo groups only.
 """
 
 import gc
@@ -79,7 +79,7 @@ SUBPAGES = 2
 GRANULARITY = PAGE_SIZE * SUBPAGES
 # The startup's process-group timeout: in-kernel waits end after 10 s.
 TIMEOUT_S = 20
-# The process groups' own timeout (NCCL watchdog).
+# The process groups' own timeout (NCCL, or gloo in the trap workers).
 PG_TIMEOUT_S = 300
 LATENT_LAYERS = (1, 3, 4)
 NUM_LAYERS = 6
@@ -386,11 +386,19 @@ def _nccl_then_fused(world: _World, layout: _Layout, transport):
 
 
 def _case_startup(world: _World):
-    """The startup function refuses on every rank alike -- a configured
-    kernel that could deadlock with a fused window, a decode role, an
-    allocation failure on one rank -- and the group's readers then gather on
-    NCCL; otherwise it builds the group's transport once, and the readers
-    gather through it."""
+    """The startup function refuses on every rank alike -- for a configured
+    kernel that could deadlock with a fused window or a decode role on every
+    rank, and for an allocation failure, a decode role or a failed import of
+    the kernel module on one rank only -- and the group's readers then
+    gather on NCCL; otherwise it builds the group's transport once, and the
+    readers gather through it. The factory's bad arguments raise after the
+    vote: modes on the rank that passed them (the others refuse), unequal
+    capacities on every rank."""
+    from tokenspeed_kernel.ops.communication._cute_dsl import paged_row_all_gather
+    from tokenspeed_kernel.ops.communication.cute_dsl import (
+        create_paged_row_all_gather_state,
+    )
+
     from tokenspeed.runtime.configs.model_config import AttentionArch
     from tokenspeed.runtime.layers.attention.dcp.cache import (
         _FUSED_HISTORY_TRANSPORTS,
@@ -433,6 +441,51 @@ def _case_startup(world: _World):
         None if world.group not in _FUSED_HISTORY_TRANSPORTS else "built",
         "an allocation failure on one rank",
     )
+    startup(**({"disaggregation_mode": "decode"} if world.rank == 1 else {}))
+    _agree(
+        world,
+        None if world.group not in _FUSED_HISTORY_TRANSPORTS else "built",
+        "a decode role on one rank",
+    )
+    with patch.dict(
+        sys.modules, {paged_row_all_gather.__name__: None} if world.rank == 1 else {}
+    ):
+        startup()
+    _agree(
+        world,
+        None if world.group not in _FUSED_HISTORY_TRANSPORTS else "built",
+        "a failed import on one rank",
+    )
+    try:
+        refused = create_paged_row_all_gather_state(
+            world.gloo,
+            world.device,
+            row_bytes=ROW,
+            cap_bytes=4096 * ROW,
+            timeout_ns=(TIMEOUT_S // 2) * 10**9,
+            modes=("bogus",) if world.rank == 1 else ("multicast", "peer"),
+            eligible=True,
+        )
+        failure = (
+            "no error" if world.rank == 1 else (None if refused is None else "a state")
+        )
+    except ValueError:
+        failure = None if world.rank == 1 else "raised"
+    _agree(world, failure, "bad modes on one rank")
+    try:
+        create_paged_row_all_gather_state(
+            world.gloo,
+            world.device,
+            row_bytes=ROW,
+            cap_bytes=(4096 + world.rank) * ROW,
+            timeout_ns=(TIMEOUT_S // 2) * 10**9,
+            modes=("multicast", "peer"),
+            eligible=True,
+        )
+        failure = "no error"
+    except ValueError:
+        failure = None
+    _agree(world, failure, "unequal capacities")
     refused = PrefixHistoryGather.on_history_groups(
         _placement(world, layout), page_size=PAGE_SIZE
     )
@@ -733,10 +786,10 @@ def _case_over_cap_alternates(world: _World):
 
 
 def _case_other_row_width(world: _World, transport):
-    """A plane of 2-byte elements (1152-byte rows, not the compiled 576: a
-    BF16 draft beside an FP8 target), and int64 virtual slots (which plan
-    int64 fetch slots, not the kernel's int32), plan NCCL windows and take
-    the NCCL all-gather in every one, on every rank, bitwise."""
+    """A plane of 2-byte elements (1152-byte rows, not the compiled 576),
+    and int64 virtual slots (which plan int64 fetch slots, not the kernel's
+    int32), plan NCCL windows and take the NCCL all-gather in every one, on
+    every rank, bitwise."""
     from tokenspeed.runtime.layers.attention.dcp.cache import (
         PREFIX_HISTORY_WINDOW_LOOPS,
     )
@@ -764,10 +817,11 @@ def _case_other_row_width(world: _World, transport):
 
 
 def _case_owner_without_rows(world: _World, transport):
-    """Only ranks 0 and 1 own history blocks: the others send no row, yet
-    enter and leave every window."""
+    """Only rank 0 owns history blocks, at every group size: the others send
+    no row, yet enter and leave every window, and every window is fused (one
+    epoch each)."""
     degree = len(world.group)
-    blocks = [first + k * degree for k in range(4) for first in (1, 2)]
+    blocks = [1 + k * degree for k in range(8)]
     layout = _layout(
         world.device,
         prefix_lens=[len(blocks) * GRANULARITY - 10],
@@ -776,7 +830,7 @@ def _case_owner_without_rows(world: _World, transport):
     )
     history, pool = _nccl_then_fused(world, layout, transport)
     for window in history.windows(pool):
-        assert window.owned_rows_per_rank[2:] == (0,) * (degree - 2)
+        assert window.owned_rows_per_rank[1:] == (0,) * (degree - 1)
 
 
 def _case_neighbour_rows_written(world: _World, transport):
@@ -785,7 +839,8 @@ def _case_neighbour_rows_written(world: _World, transport):
     the next rows; another thread keeps rewriting every non-history row of
     their blocks on a third stream while the fused forward is enqueued. The
     history rows read back intact."""
-    lengths = [128 * k + 2 * k + 1 for k in range(1, 13)]
+    # Six requests a rank: every rank owns some request's last block.
+    lengths = [128 * k + 2 * k + 1 for k in range(1, 6 * len(world.group) + 1)]
     layout = _layout(world.device, prefix_lens=lengths, chunk_len=128, seed=11)
     planes, local, owned = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
     pool = _LatentPool(planes)
@@ -916,7 +971,11 @@ def _case_host_load_event(world: _World, transport):
     """Event mode: a window prefetched while the previous latent layer reads
     waits for its own layer's load (the wait stays on the consumer stream, in
     ``get_key_buffer``, and the window's ready event follows it)."""
-    layout = _layout(world.device, prefix_lens=[6000, 2500], chunk_len=512, seed=12)
+    # About 33 blocks a rank: every rank owns resident and loaded rows.
+    scale = len(world.group) // 2
+    layout = _layout(
+        world.device, prefix_lens=[6000 * scale, 2500 * scale], chunk_len=512, seed=12
+    )
     readers = (_reader(world, layout, None), _reader(world, layout, transport))
     _host_load_case(
         world,
@@ -953,7 +1012,11 @@ def _case_late_release_flags(world: _World, transport):
     def release_flag(flag_ptr, index):
         tl.atomic_xchg(flag_ptr + index, 1, sem="release", scope="gpu")
 
-    layout = _layout(world.device, prefix_lens=[6000, 2500], chunk_len=512, seed=12)
+    # About 33 blocks a rank: every rank owns resident and loaded rows.
+    scale = len(world.group) // 2
+    layout = _layout(
+        world.device, prefix_lens=[6000 * scale, 2500 * scale], chunk_len=512, seed=12
+    )
     pool, landing, landing_rows, payloads, want = _host_load_planes(world, layout, 1500)
     planes = pool.kv_buffer
     readers = {
@@ -1041,7 +1104,13 @@ def _case_event_sets_rotate(world: _World):
     three event sets reused many times), with random device skew on every
     rank: the fused ready / done event pairs run over 1000 epochs, on a
     256-row slot that packs a few loops a window."""
-    layout = _layout(world.device, prefix_lens=[4096, 900], chunk_len=128, seed=14)
+    # About 20 blocks a rank: every rank owns resident and loaded rows, and a
+    # layer keeps reading many windows although more owners pack more loops
+    # into each.
+    scale = len(world.group) // 2
+    layout = _layout(
+        world.device, prefix_lens=[4096 * scale, 900 * scale], chunk_len=128, seed=14
+    )
     transport = _own_transport(world, cap_rows=256, modes=("multicast", "peer"))
     fused = _reader(world, layout, transport)
     start = transport.state.epoch
@@ -1281,6 +1350,56 @@ def _case_failed_cleanup_poisons(world: _World):
     transport.state.close()
 
 
+def _case_failed_launch_or_drain_poisons(world: _World):
+    """A launch that fails once its kernel is enqueued, and a drain whose
+    wait on the consumer stream fails, leave the transport poisoned, on
+    every rank: the next prepare keeps the window, whose kernel may still
+    read its fetch slots, and the next launch raises. Both failures are
+    injected, since neither happens on demand."""
+    layout = _layouts(world.device)["fragmented"]
+    planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
+    pool = _LatentPool(planes)
+    for failing in ("launch", "drain"):
+        transport = _own_transport(world, cap_rows=4096, modes=("multicast", "peer"))
+        history = _reader(world, layout, transport)
+        _prepare(history, layout)
+        reading = _read(history, pool, layout, LATENT_LAYERS[0])
+        if failing == "launch":
+            gather = transport._gather
+
+            def gather_then_fail(*args):
+                gather(*args)
+                raise RuntimeError("injected failure")
+
+            with patch.object(transport, "_gather", gather_then_fail):
+                with pytest.raises(RuntimeError, match="injected failure"):
+                    next(reading)
+        else:
+            next(reading)  # window 0 taken, the next launched
+            failed_wait = patch.object(
+                torch.cuda.Stream,
+                "wait_event",
+                side_effect=RuntimeError("injected failure"),
+            )
+            with failed_wait, pytest.raises(RuntimeError, match="injected failure"):
+                transport.drain(history)
+        failure = None if transport.poisoned else "the transport is not poisoned"
+        _prepare(history, layout)
+        if failure is None and not transport.holds(history):
+            failure = "the next prepare dropped the window"
+        if failure is None:
+            failure = "a launch went on"
+            try:
+                list(_read(history, pool, layout, LATENT_LAYERS[0]))
+            except RuntimeError as error:
+                failure = None if "refuses launches" in str(error) else repr(error)
+        reading.close()
+        torch.cuda.synchronize()
+        _agree(world, failure, f"a failed {failing}")
+        _assert_clean(world, transport)
+        transport.state.close()
+
+
 def _case_plane_beyond_2gib(world: _World, transport):
     """A plane of ~2.2 GB per layer with the history in its last blocks:
     source byte offsets past 2**31."""
@@ -1405,14 +1524,15 @@ def _case_real_collectives_in_flight(world: _World, transport):
     _assert_clean(world, transport)
 
 
-def _case_compiles_once(world: _World, transport):
-    """A fused forward compiles neither the all-gather (the state compiled
-    it once, at startup) nor any Triton read kernel after an NCCL forward of
-    the same layout (the slot views take the gathered rows'
-    specializations)."""
+def _case_compiles_once(world: _World):
+    """Fused forwards whose windows differ in rows per rank and owned rows
+    launch the all-gather the state compiled once, at its creation, without
+    tracing it again, and compile no Triton read kernel after an NCCL forward
+    of the same layout (the slot views take the gathered rows'
+    specializations). The first case: every window shape is new to the
+    process, so a compile keyed by a window's values would show."""
     import importlib.util
 
-    from tokenspeed_kernel.ops.communication._cute_dsl import paged_row_all_gather
     from tokenspeed_kernel.ops.kvcache.triton import (
         _get_mla_kv_buffer_kernel,
         _get_mla_kv_buffer_per_loc_kernel,
@@ -1431,30 +1551,40 @@ def _case_compiles_once(world: _World, transport):
     )
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
-    layout = _layouts(world.device)["small_segments"]
-    planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
-    pool = _LatentPool(planes)
-    want = _expected(pool, layout, dtype=FP8)
-    got = _forward(_reader(world, layout, None), pool, layout, between=None)
-    _assert_rows(world, got, want, "the NCCL reader")
-    compiles = patch.object(
-        paged_row_all_gather,
-        "compile_paged_row_all_gather",
-        wraps=paged_row_all_gather.compile_paged_row_all_gather,
-    )
-    with compiles as compile_calls, helper.assert_no_triton_compile(
-        _get_mla_kv_buffer_kernel, _get_mla_kv_buffer_per_loc_kernel
-    ):
-        got = _forward(_reader(world, layout, transport), pool, layout, between=None)
-    _assert_rows(world, got, want, "the fused reader")
-    assert compile_calls.call_count == 0
+    transport = _own_transport(world, cap_rows=4096, modes=("multicast", "peer"))
+    layouts = _layouts(world.device)
+    forwards = []
+    for name in ("small_segments", "fragmented"):
+        layout = layouts[name]
+        planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
+        pool = _LatentPool(planes)
+        want = _expected(pool, layout, dtype=FP8)
+        got = _forward(_reader(world, layout, None), pool, layout, between=None)
+        _assert_rows(world, got, want, f"the NCCL reader, {name}")
+        forwards.append((name, layout, pool, want))
+    got = {}
+    traced = None
+    try:
+        with helper.assert_no_cute_compile(), helper.assert_no_triton_compile(
+            _get_mla_kv_buffer_kernel, _get_mla_kv_buffer_per_loc_kernel
+        ):
+            for name, layout, pool, _ in forwards:
+                got[name] = _forward(
+                    _reader(world, layout, transport), pool, layout, between=None
+                )
+    except AssertionError as error:
+        traced = str(error)
+    _agree(world, traced, "fused forwards of new window shapes")
+    for name, _, _, want in forwards:
+        _assert_rows(world, got[name], want, f"the fused reader, {name}")
     _assert_clean(world, transport)
+    transport.state.close()
 
 
-def _world(rank: int, world_size: int, init_method: str) -> _World:
-    """A fresh world of ``world_size`` ranks, its KVP group and the named
-    history groups on it; the device is ``LOCAL_RANK`` under torchrun, else
-    ``rank``."""
+def _world(rank: int, world_size: int, init_method: str, backend: str) -> _World:
+    """A fresh world of ``world_size`` ranks on ``backend``, its KVP group and
+    the named history groups on it; the device is ``LOCAL_RANK`` under
+    torchrun, else ``rank``."""
     from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
 
     from tokenspeed.runtime.distributed.comm_backend import set_global_backend
@@ -1481,14 +1611,14 @@ def _world(rank: int, world_size: int, init_method: str) -> _World:
     pg_manager.init_distributed(
         mapping,
         distributed_init_method=init_method,
-        backend="nccl",
+        backend=backend,
         timeout=PG_TIMEOUT_S,
         device_id=device,
     )
-    pg_manager.register_process_group("nccl", mapping.world_group, dist.group.WORLD)
+    pg_manager.register_process_group(backend, mapping.world_group, dist.group.WORLD)
     group = tuple(mapping.attn.kvp_group)
     pg_manager.init_process_group(group)
-    pg_manager.init_process_group(group, backend="nccl", name=KVP_HISTORY_GROUP_NAME)
+    pg_manager.init_process_group(group, backend=backend, name=KVP_HISTORY_GROUP_NAME)
     gather_fabric_map()
     set_global_backend(NcclBackend())
     return _World(
@@ -1508,7 +1638,8 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
         _FUSED_HISTORY_TRANSPORTS,
     )
 
-    world = _world(rank, world_size, init_method)
+    world = _world(rank, world_size, init_method, "nccl")
+    _case_compiles_once(world)
     transport = _case_startup(world)
     _case_layouts(world, transport)
     _case_late_ranks(world, transport)
@@ -1532,33 +1663,60 @@ def _worker(rank: int, world_size: int, init_method: str) -> None:
         _case_nccl_window_then_fused_after_host_load(world)
         _case_capture(world)
         _case_failed_cleanup_poisons(world)
+        _case_failed_launch_or_drain_poisons(world)
         _case_plane_beyond_2gib(world, transport)
         _case_peer(world)
     else:
         _case_real_collectives_in_flight(world, transport)
-    _case_compiles_once(world, transport)
     torch.cuda.synchronize()
     dist.barrier()
     _FUSED_HISTORY_TRANSPORTS.pop(world.group).state.close()
     dist.destroy_process_group()
 
 
-def _layer_order_worker(rank: int, world_size: int, init_method: str, out: str) -> None:
-    """Even ranks start window 0 of the first latent layer, odd ranks window
-    0 of the second, of one prepared forward: the windows plan alike, so the
-    layer id in the window header is what the kernel finds unequal. Writes
-    this rank's error record once the kernel trapped, with host-only
-    operations, then exits."""
-    world = _world(rank, world_size, init_method)
-    layout = _layouts(world.device)["fragmented"]
-    transport = _own_transport(world, cap_rows=4096, modes=("multicast", "peer"))
+def _trap_worker(
+    rank: int, world_size: int, init_method: str, case: str, out: str
+) -> None:
+    """Every rank starts one window of one prepared forward, which ``case``
+    makes differ across ranks; the windows plan alike, so the difference is
+    what the kernel finds unequal. ``layer``: even ranks start window 0 of
+    the first latent layer, odd ranks window 0 of the second (the layer id in
+    the window header). ``window``: even ranks start window 0 of the first
+    latent layer, odd ranks window 1 (the window index in the header's
+    checksum). ``generation``: odd ranks prepared the forward once more first
+    (the prepare count in the checksum). ``skip``: rank 1's state moved past
+    one epoch first. Writes this rank's error record once the kernel
+    trapped, with host-only operations, then exits."""
+    # Gloo groups only: the trap leaves a sticky CUDA error, which an NCCL
+    # group's watchdog would rethrow, aborting the rank before it writes its
+    # record.
+    world = _world(rank, world_size, init_method, "gloo")
+    # Blocks in order, which the owners hold in turn, through slots of 256
+    # rows a rank: several fused windows a layer at every group size, the
+    # first two of one shape, so that only the index tells them apart.
+    layout = _layouts(world.device)["sequential"]
+    transport = _own_transport(world, cap_rows=256, modes=("multicast", "peer"))
     planes, _, _ = _planes(world, layout, dtype=FP8, payload_layer_offset=0)
     pool = _LatentPool(planes)
     history = _reader(world, layout, transport)
     _prepare(history, layout)
+    if case == "generation" and world.rank % 2:
+        _prepare(history, layout)
+    windows = history.windows(pool)
+    shapes = {(window.send_rows, window.owned_rows_per_rank) for window in windows[:2]}
+    _agree(
+        world,
+        None if len(windows) > 1 and len(shapes) == 1 else f"windows {shapes}",
+        "the layout",
+    )
+    odd = world.rank % 2
+    layer_id = LATENT_LAYERS[odd if case == "layer" else 0]
+    if case == "skip" and world.rank == 1:
+        # The state's epoch counter, moved on with no window in flight.
+        transport.state.epoch += 1
     record = None
     try:
-        history._launch(pool, LATENT_LAYERS[world.rank % 2], 0)
+        history._launch(pool, layer_id, odd if case == "window" else 0)
         torch.cuda.synchronize()
     except Exception:  # noqa: BLE001 - the trap surfaces as a CUDA error
         record = transport.state.read_error()
@@ -1567,7 +1725,7 @@ def _layer_order_worker(rank: int, world_size: int, init_method: str, out: str) 
     os._exit(0)
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_kvp_history_fused_gather(tmp_path, world_size):
     if torch.cuda.device_count() < world_size or (
         torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
@@ -1581,18 +1739,25 @@ def test_kvp_history_fused_gather(tmp_path, world_size):
     )
 
 
-def test_kvp_history_fused_gather_layer_order(tmp_path):
+@pytest.mark.parametrize("case", ["layer", "window", "generation", "skip"])
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_kvp_history_fused_gather_traps(tmp_path, world_size, case):
     """Each rank in a process of its own (a trapped context cannot take part
     in a collective, and ``mp.spawn`` stops the others when one fails): ranks
-    that start the same window of different layers trap with a header
-    mismatch on every rank instead of exchanging the wrong layer's rows."""
-    world_size = 2
+    that start different windows -- of different layers, different windows
+    of one layer, or one window after different prepares -- trap with a
+    header mismatch on every rank instead of exchanging each other's rows,
+    and a rank whose epoch runs ahead traps waiting for the others' credits,
+    which trap on its credit ahead of their epoch. Every error record is
+    written whole, although several CTAs fail at once on a rank."""
     if torch.cuda.device_count() < world_size or (
         torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
     ):
         pytest.skip(f"requires {world_size} node-local SM100 or SM103 GPUs")
     # Imported once the platform is known to have CuTe DSL.
     from tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather import (
+        STAGE_ENTRY_AHEAD,
+        STAGE_ENTRY_TIMEOUT,
         STAGE_HEADER,
     )
 
@@ -1600,8 +1765,8 @@ def test_kvp_history_fused_gather_layer_order(tmp_path):
     rendezvous = f"file://{tmp_path / 'rendezvous'}"
     workers = [
         context.Process(
-            target=_layer_order_worker,
-            args=(rank, world_size, rendezvous, str(tmp_path)),
+            target=_trap_worker,
+            args=(rank, world_size, rendezvous, case, str(tmp_path)),
         )
         for rank in range(world_size)
     ]
@@ -1619,7 +1784,16 @@ def test_kvp_history_fused_gather_layer_order(tmp_path):
         with open(tmp_path / f"rank{rank}.json") as f:
             records.append(json.load(f))
     stages = [record and record["stage_code"] for record in records]
-    assert stages == [STAGE_HEADER] * world_size, records
+    if case == "skip":
+        assert stages == [
+            STAGE_ENTRY_TIMEOUT if rank == 1 else STAGE_ENTRY_AHEAD
+            for rank in range(world_size)
+        ], records
+        others = [record for rank, record in enumerate(records) if rank != 1]
+        assert all(record["mask"] & 0b10 for record in others), records
+    else:
+        assert stages == [STAGE_HEADER] * world_size, records
+    assert all(record["complete"] for record in records), records
 
 
 if __name__ == "__main__":
