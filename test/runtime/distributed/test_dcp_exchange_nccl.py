@@ -414,7 +414,7 @@ def _partial_worker(rank, degree, rendezvous):
         chunked_prefill_size=16,
         max_prefill_tokens=16,
         max_model_len=1024,
-        max_num_seqs=4,
+        request_state_seqs=4,
         speculative_algorithm=None,
     )
 
