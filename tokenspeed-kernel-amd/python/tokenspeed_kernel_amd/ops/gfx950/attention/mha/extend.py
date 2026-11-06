@@ -1629,8 +1629,14 @@ def _extend(
     softmax_scale: float | None,
     compile_all_variants: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
-    # Picks the variant for this batch and launches it, or, with
-    # compile_all_variants, compiles every variant any batch can pick.
+    """Launch the extend variant this batch selects, or compile them all.
+
+    Picks the query tile, K/V pipeline depth, grid layout, and split count
+    from the batch, then launches that variant and returns its output (and
+    the LSE with ``return_lse``). With ``compile_all_variants``, it instead
+    compiles every variant any batch can select and returns None. Other
+    arguments are as for ``launch_gluon_mha_extend_gfx950``.
+    """
     head_dim = q.shape[2]
     n_heads = q.shape[1]
     n_kv_heads = k_cache.shape[2]
