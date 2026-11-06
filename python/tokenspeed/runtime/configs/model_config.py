@@ -982,7 +982,8 @@ class ModelConfig:
             and 0 < self.vocab_size <= self.input_vocab_size
         ):
             raise ValueError(
-                "Vocabulary sizes must be integers satisfying 0 < output <= input"
+                "Vocabulary sizes must be integers satisfying 0 < output <= input; "
+                f"got input_vocab_size={self.input_vocab_size!r}, vocab_size={self.vocab_size!r}"
             )
 
         # Verify quantization

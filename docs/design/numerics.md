@@ -718,6 +718,7 @@ is unchanged: its `vocab_size` is the embedding size and its optional
 `output_vocab_size` is the head size. A missing or null `output_vocab_size`
 means the two sizes are equal. Both must be positive integers, and the output
 vocabulary must fit within the input vocabulary for subsequent decoding.
+Invalid sizes are reported with both runtime field names and their values.
 The original Hugging Face config is not rewritten.
 
 Input buffer clamps, n-gram token validation and multimodal draft substitute

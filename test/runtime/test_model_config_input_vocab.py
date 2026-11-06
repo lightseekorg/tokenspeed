@@ -97,12 +97,16 @@ def test_invalid_vocabulary_is_rejected(tmp_path, size, domain):
     with pytest.raises(
         ValueError,
         match="Vocabulary sizes must be integers satisfying 0 < output <= input",
-    ):
+    ) as error:
         _load(
             tmp_path,
             input_vocab_size=size if domain == "input" else 128,
             output_fields={"output_vocab_size": size if domain == "output" else 64},
         )
+    assert f"input_vocab_size={size if domain == 'input' else 128!r}" in str(
+        error.value
+    )
+    assert f"vocab_size={size if domain == 'output' else 64!r}" in str(error.value)
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])
