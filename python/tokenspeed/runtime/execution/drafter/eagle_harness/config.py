@@ -179,7 +179,7 @@ class EagleHarnessConfig:
             seed=server_args.seed,
             eos_token_id=min(eos_token_ids) if eos_token_ids else None,
             chain_width_table=chain_width_table(server_args),
-            max_requests=server_args.max_num_seqs,
+            max_requests=server_args.request_state_seqs,
             decode_graph_floors=decode_graph_floors(server_args),
         )
 
@@ -201,7 +201,7 @@ def decode_graph_floors(server_args: ServerArgs) -> tuple[tuple[int, int], ...]:
     ladder = get_batch_sizes_to_capture(
         DecodeLadderArgs(
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
-            max_num_seqs=server_args.max_num_seqs,
+            max_num_seqs=server_args.request_state_seqs,
             data_parallel_size=dp_size,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
