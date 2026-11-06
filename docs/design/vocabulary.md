@@ -30,7 +30,9 @@ block sampler does not implement. The Markov projection and workspace use
 the head's group, independently of the attention TP width. Padding-only
 shards contribute no candidate but still join every TP gather.
 
-Every model constructor receives the resolved `vocabulary` explicitly.
+Every model entrypoint receives the resolved `vocabulary` explicitly. Wrappers
+that already forward `**kwargs` can pass it through unchanged; the constructor
+that consumes it declares the required parameter.
 `ModelExecutorConfig` and `RuntimeStates` retain that value, without legacy
 `vocab_size` aliases or per-layer defaults. Components that consume only one
 domain keep the local name `vocab_size`; callers select `input_size` or
