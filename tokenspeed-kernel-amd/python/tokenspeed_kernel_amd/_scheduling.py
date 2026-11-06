@@ -124,6 +124,26 @@ def sched_group(mask, size, _semantic):
 
 
 @tl.core.extern
+def release_drain(_semantic):
+    """Wait for this wave's vector memory operations (``s_waitcnt vmcnt(0)``),
+    keeping its earlier stores above the wait; no L2 write-back.
+
+    Only this wave's operations are waited for: follow it with
+    ``gl.barrier()`` when every wave's stores must land before one thread
+    publishes. Loads the wave issued earlier are waited for too (one
+    in-order counter). Launch with :func:`sched_compile_options`.
+    """
+    return tl.core.extern_elementwise(
+        _SCHED_LIBRARY_NAME,
+        _SCHED_LIBRARY_PATH,
+        [],
+        {(): ("__tokenspeed_sched_release_drain", tl.int32)},
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
 def wave_all_equal(a, b, _semantic):
     """1 where ``a == b`` (FP32, ordered) holds in every active lane of the
     wave, else 0, as an int32 tensor whose value is the same across the

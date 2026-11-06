@@ -51,6 +51,7 @@ from tokenspeed.runtime.engine.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
 )
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 from tokenspeed.runtime.multimodal.inputs import (
@@ -300,6 +301,21 @@ def _control_output_flush() -> list[bytes]:
     return [zmq_wire.encode_control(FlushCacheReqOutput(success=True))]
 
 
+def _control_update_mooncake() -> list[bytes]:
+    return _control(
+        UpdateWeightsFromMooncakeReqInput(
+            version=7,
+            flush_cache=True,
+            weight_version="7",
+            snapshot={
+                "format_version": 1,
+                "version": 7,
+                "publishers": [{"key": "weights/7"}],
+            },
+        )
+    )
+
+
 def _control_output_internal_state() -> list[bytes]:
     return [
         zmq_wire.encode_control(
@@ -463,6 +479,7 @@ FIXTURES = {
     "control_pause": _control_pause,
     "control_profile": _control_profile,
     "control_update_distributed": _control_update_distributed,
+    "control_update_mooncake": _control_update_mooncake,
     "control_output_flush": _control_output_flush,
     "control_output_internal_state": _control_output_internal_state,
     "output_slim": _output_slim,

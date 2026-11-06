@@ -31,6 +31,7 @@ from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -72,6 +73,14 @@ class ModelProfile:
             only once the bitwise invariance harness and the teacher-forced
             logprob comparison against the trainer pass for it; launching an
             unlisted envelope is refused.
+        create_attention_config: Model-owned construction of the
+            softmax attention configuration from the resolved launch, model
+            config, and draft flag. Explicitly pass None to keep the
+            architecture's generator.
+            Returns an ``AttnConfig``; the runtime adds the profile's linear
+            component afterwards. The factory owns validation of its cache
+            format and execution constraints; its errors are not retried
+            through the architecture's generator.
     """
 
     configure_attention: Callable[[ModelConfig, ServerArgs], None]
@@ -83,8 +92,17 @@ class ModelProfile:
     tokenizer_kwargs: Mapping[str, object]
     attention_instances_per_layer: int
     numerics_envelopes: frozenset[str]
+    create_attention_config: (
+        Callable[[ServerArgs, ModelConfig, bool], AttnConfig] | None
+    )
 
     def __post_init__(self) -> None:
+        if self.create_attention_config is not None and not callable(
+            self.create_attention_config
+        ):
+            raise TypeError(
+                "ModelProfile.create_attention_config must be callable or None"
+            )
         if not self.cache_family:
             raise ValueError("ModelProfile.cache_family must name a cache family")
         if self.linear_attention == "":

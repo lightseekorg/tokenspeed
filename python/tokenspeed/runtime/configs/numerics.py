@@ -130,10 +130,10 @@ LAYER_BOUNDARY_NORMS = ("fused", "unfused")
 ROUTER_TOPKS = ("fused", "torch")
 
 # ``--logprob-order``: the selected-token log-softmax behind every returned
-# logprob — ``torch.log_softmax``, or Megatron's vocab-parallel cross-entropy
-# order over fixed ``MEGATRON_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
-LOGPROB_ORDERS = ("torch", "megatron")
-MEGATRON_VOCAB_BLOCK = 32768
+# logprob — ``torch.log_softmax``, or fixed-width blockwise reduction
+# over ``BLOCKWISE_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
+LOGPROB_ORDERS = ("torch", "blockwise", "blockwise-direct")
+BLOCKWISE_VOCAB_BLOCK = 32768
 
 # ``--moe-combine-order``: how a token's routed-expert contributions meet
 # across the MoE TP-EP group — ``rank``: per-rank partials summed by the
@@ -169,13 +169,13 @@ def require_verified_numerics(
             model (none of which is verified under an envelope beyond auto).
         architecture: The model's architecture name, for the error.
         quantization: The checkpoint's resolved quantization method, or None.
-        vocab_size: The model's vocabulary size; the envelope's Megatron-order
-            logprobs fold fixed ``MEGATRON_VOCAB_BLOCK``-wide blocks of it.
+        vocab_size: The model's vocabulary size; the envelope's blockwise
+            logprobs fold fixed ``BLOCKWISE_VOCAB_BLOCK``-wide blocks of it.
 
     Raises:
         ValueError: The envelope is not verified for this model, or its
             checkpoint validator rejects the storage or vocabulary. The RL
-            policy requires unquantized weights and whole Megatron vocab blocks.
+            policy requires unquantized weights and whole blockwise vocab blocks.
     """
     if numerics == "auto":
         return
@@ -197,10 +197,10 @@ def require_verified_numerics(
             f"{architecture} is {quantization}-quantized, and no "
             "batch-invariant quantized GEMM leaf exists"
         )
-    if vocab_size % MEGATRON_VOCAB_BLOCK != 0:
+    if vocab_size % BLOCKWISE_VOCAB_BLOCK != 0:
         raise ValueError(
-            f"--numerics {numerics} folds --logprob-order megatron, whose "
-            f"sum(exp) runs over fixed {MEGATRON_VOCAB_BLOCK}-wide vocabulary "
+            f"--numerics {numerics} folds --logprob-order blockwise, whose "
+            f"sum(exp) runs over fixed {BLOCKWISE_VOCAB_BLOCK}-wide vocabulary "
             f"blocks; {architecture} has vocab_size {vocab_size}, not a "
             "multiple of it"
         )
@@ -211,7 +211,7 @@ __all__ = [
     "DSA_SLOT_ORDERS",
     "LAYER_BOUNDARY_NORMS",
     "LOGPROB_ORDERS",
-    "MEGATRON_VOCAB_BLOCK",
+    "BLOCKWISE_VOCAB_BLOCK",
     "MLA_LORA_SCALES",
     "MOE_COMBINE_ORDERS",
     "NUMERICS_ENVELOPES",

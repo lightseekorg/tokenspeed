@@ -253,6 +253,8 @@ control_struct! {
         flush_cache: bool,
         /// The L3 namespace afterwards; `None` for the version's default.
         weight_version: Option<String>,
+        /// Optional SDK publication directory; tensor data stays in the store.
+        snapshot: Option<Value> = None,
     }
     /// [`UpdateWeightsFromMooncakeReqInput`]'s reply.
     UpdateWeightsFromMooncakeReqOutput {
