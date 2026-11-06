@@ -316,6 +316,28 @@ def test_quantize_index_query_weights_matches_quantizer_then_combine(
     assert torch.equal(got_w, ref_w)
 
 
+@requires_cuda
+def test_quantize_index_query_weights_compiles_once_per_bucket():
+    """Token count, row pitches and the score scale stay runtime arguments
+    within one heads-per-program bucket."""
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
+        _quantize_index_query_weights_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    def run(tokens, query_pitch, weights_pitch, softmax_scale):
+        rows = torch.randn(tokens, query_pitch, device="cuda", dtype=torch.bfloat16)
+        q = rows[:, : 32 * 128].view(tokens, 32, 128)
+        fused = torch.randn(tokens, weights_pitch, device="cuda", dtype=torch.bfloat16)
+        quantize_index_query_weights(q, fused[:, -32:], softmax_scale)
+
+    run(3, 32 * 128, 160, 0.5)
+    with assert_no_triton_compile(_quantize_index_query_weights_kernel):
+        # Contiguous queries, then a split view of a stacked projection.
+        run(7, 5632, 160, 0.25)
+        run(127, 32 * 128, 192, 0.125)
+
+
 # ---------------------------------------------------------------------------
 # _prepare_logits_for_topk (DeepGEMM narrowed-logits widening + NaN/inf scrub)
 # ---------------------------------------------------------------------------

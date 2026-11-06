@@ -317,7 +317,8 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
     def fuse_query_projections(self) -> None:
         """Stack ``q_b_proj`` and the indexer's ``wq_b`` into one ``[q_b rows +
         index_heads * index_head_dim, q_lora_rank]`` weight, as
-        ``KimiK31Indexer.fuse_key_weight_projections`` stacks ``wk``. The two
+        ``KimiK31Indexer.fuse_key_weight_projections`` stacks ``wk``, for
+        decode rounds to project both from ``q_norm`` in one GEMM. The two
         parameters become views of its rows. Bitwise numerics and a quantized
         ``q_b_proj`` keep the separate GEMMs."""
         q_b, wq_b = self.q_b_proj.weight, self.indexer.wq_b.weight
@@ -435,7 +436,8 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             and not self.o_proj.supports_fp8_group128_input
         )
         projected_q = index_query = None
-        if self.q_b_wq_b_weight is not None:
+        # Decode rounds only: a prefill projects wq_b for its rank's top-k share of rows.
+        if self.q_b_wq_b_weight is not None and ctx.num_extends == 0:
             # Token-shaped, so it may run before the eager break.
             projected_q, index_query = mm(q_norm, self.q_b_wq_b_weight).split(
                 (self.q_b_proj.weight.shape[0], self.indexer.wq_b.weight.shape[0]),

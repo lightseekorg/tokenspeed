@@ -558,22 +558,23 @@ if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None
         )
         # Scrubbed compact view; the length-aware CuTe DSL top-k reads it in place.
         logits_full = _prepare_logits_for_topk(logits, seq_lens, next_n=q_len_per_req)
+        use_cute = not batch_invariant and _use_cute_dsl_decode_topk()
+        use_ragged = not (batch_invariant or use_cute) and has_ragged_decode_topk()
+        # Per-row lengths only where a consumer reads them, built once.
+        row_lengths = (
+            _causal_row_lengths(seq_lens, q_len_per_req)
+            if initial_tokens + local_tokens > 0 or not (use_cute or use_ragged)
+            else None
+        )
         if initial_tokens + local_tokens > 0:
             mark_forced_initial_local_logits(
                 logits_full,
-                _causal_row_lengths(seq_lens, q_len_per_req),
+                row_lengths,
                 initial_tokens=initial_tokens,
                 local_tokens=local_tokens,
             )
         local_topk_offsets = torch.empty_like(out)
-        if batch_invariant:
-            _row_invariant_topk(
-                logits,
-                _causal_row_lengths(seq_lens, q_len_per_req),
-                local_topk_offsets,
-                topk,
-            )
-        elif _use_cute_dsl_decode_topk():
+        if use_cute:
             # CuTe DSL cluster radix top-k: length-aware via seq_lens/q_len_per_req,
             # so no pre-masking needed; same local offsets as the ragged path.
             # The widened view is safe: rows never read past their seq_len bound.
@@ -584,7 +585,7 @@ if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None
                 next_n=q_len_per_req,
                 out=local_topk_offsets,
             )
-        elif has_ragged_decode_topk():
+        elif use_ragged:
             ragged_decode_topk(
                 logits,
                 local_topk_offsets,
@@ -595,13 +596,9 @@ if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None
                 enable_pdl=pdl_enabled(),
             )
         else:
-            # No ragged CUDA top-k: mask each row to its causal window first.
-            _row_invariant_topk(
-                logits,
-                _causal_row_lengths(seq_lens, q_len_per_req),
-                local_topk_offsets,
-                topk,
-            )
+            # Batch-invariant selection, or no ragged CUDA top-k: mask each row
+            # to its causal window first.
+            _row_invariant_topk(logits, row_lengths, local_topk_offsets, topk)
 
         return local_topk_to_global_slots(
             local_topk_offsets=local_topk_offsets,
