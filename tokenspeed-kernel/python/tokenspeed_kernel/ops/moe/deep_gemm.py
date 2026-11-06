@@ -304,10 +304,17 @@ def _warmup_mega_moe_jit(
         )
 
         output = torch.empty_like(hidden_states)
-        symm_buffer.x[:num_tokens].copy_(hidden_states.to(torch.float8_e4m3fn))
-        symm_buffer.x_sf[:num_tokens].fill_(1.0)
-        symm_buffer.topk_idx[:num_tokens].copy_(topk_ids)
-        symm_buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        # Staging through the runtime kernel also compiles each of its tile
+        # sizes before serving.
+        stage_mxfp4_mega_moe_inputs(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            symm_buffer.x[:num_tokens],
+            symm_buffer.x_sf[:num_tokens],
+            symm_buffer.topk_idx[:num_tokens],
+            symm_buffer.topk_weights[:num_tokens],
+        )
         fp8_fp4_mega_moe(
             output,
             transformed_l1_weights,
