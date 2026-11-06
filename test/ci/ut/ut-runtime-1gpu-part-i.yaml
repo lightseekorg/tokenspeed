@@ -10,7 +10,7 @@ runner:
     - h100-1gpu
     - b200-1gpu
     - gb200-1gpu
-    - amd-mi35x-1gpu-test
+    - amd-mi355-1gpu
 env:
   CI: "true"
 install:
