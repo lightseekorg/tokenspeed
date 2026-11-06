@@ -750,6 +750,11 @@ def _create_attn_config(
             raise TypeError(
                 "ModelProfile.create_attention_config must return AttnConfig"
             )
+        if config.is_draft != is_draft:
+            raise ValueError(
+                "ModelProfile.create_attention_config must build the config for "
+                f"is_draft={is_draft}, got is_draft={config.is_draft}"
+            )
         if config.component(LinearAttnConfig) is not None:
             raise ValueError(
                 "ModelProfile.create_attention_config must leave linear attention "

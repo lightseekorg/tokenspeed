@@ -258,10 +258,12 @@ architecture's default, its profile may provide
 `create_attention_config(server_args, model_config, is_draft)`. The factory
 returns the model-wide `AttnConfig` and its softmax component, validates its
 supported dtype and topology, and uses the same resolved launch for target
-and draft construction. The runtime still adds the profile's linear-attention
-component through the ordinary composition path. An omitted factory keeps
-the architecture's existing generator; a factory error propagates instead of
-falling back to a different cache format or numerical path.
+and draft construction. The runtime rejects a result whose `is_draft` differs
+from the requested role. It still adds the profile's linear-attention
+component through the ordinary composition path. Every profile must explicitly
+pass a factory or `None`; `None` keeps the architecture's existing generator.
+A factory error propagates instead of falling back to a different cache format
+or numerical path.
 
 Trainer alignment is a stronger claim than invariance and cannot be checked
 by the engine alone: a model earns `rl-bitwise` in
