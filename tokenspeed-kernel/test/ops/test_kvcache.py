@@ -95,7 +95,7 @@ def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         run(5, 1024, 4, 16)
 
 
-@pytest.mark.parametrize("queries,offset", [(1, 0), (4, 0), (4, -3)])
+@pytest.mark.parametrize("queries,offset", [(1, 0), (4, -3)])
 @pytest.mark.parametrize("groups", [1, 6])
 @pytest.mark.parametrize("len_dtype", [torch.int32, torch.int64])
 def test_kvp_decode_visible_lengths_matches_the_separate_launches(

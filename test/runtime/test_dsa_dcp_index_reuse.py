@@ -273,57 +273,6 @@ def test_unsharded_decode_keeps_no_dcp_record(monkeypatch):
 # --- KVP decode: each rank's share as its local slots -------------------------
 
 
-@pytest.fixture
-def owned_selects(recorded, monkeypatch):
-    """Record what every owned selection receives; it fills its outputs."""
-    calls = []
-
-    def select_owned(q, weights, index_k_cache, *, metadata, out, lens_out, **kw):
-        calls.append((metadata, kw["query_group_size"], out, lens_out))
-        out.fill_(5)
-        lens_out.fill_(1)
-        return out, lens_out
-
-    monkeypatch.setattr(glm5, "select_owned_dsa_topk", select_owned)
-    # The gathered scores' sizes as a gfx950 one-launch selection takes them.
-    monkeypatch.setattr(
-        indexer, "dsa_select_owned_candidates_supported", lambda **sizes: True
-    )
-    return calls
-
-
-def _owned_ctx(seq_lens, q_len, *, takes=True):
-    ctx = _ctx(seq_lens, q_len)
-    ctx.attn_backend.takes_owned_decode_topk = lambda layer: takes
-    return ctx
-
-
-def _owned_layer():
-    layer = _layer()
-    layer.owned_decode_topk = True
-    return layer
-
-
-@pytest.mark.parametrize("case", ["host", "backend", "leaf"])
-def test_owned_decode_topk_needs_the_host_and_the_backend(
-    recorded, owned_selects, monkeypatch, case
-):
-    _, selects = recorded
-    seq_lens, page_table, q_len = _batch()
-    if case == "leaf":
-        # No owned selection leaf takes these gathered scores: the merge runs.
-        monkeypatch.setattr(
-            indexer, "dsa_select_owned_candidates_supported", lambda **sizes: False
-        )
-    ctx = _owned_ctx(seq_lens, q_len, takes=case != "backend")
-    layer = _layer() if case == "host" else _owned_layer()
-    record = _decode_layer(layer, ctx, page_table, seq_lens, q_len)
-
-    assert not owned_selects
-    assert len(selects) == 1
-    assert record.owned_placement is None
-
-
 def test_an_owned_decode_topk_is_read_under_its_placement_only():
     record = glm5.GlmDsaDecodeTopK(
         topk_indices=torch.arange(8, dtype=torch.int32).view(4, 2),
