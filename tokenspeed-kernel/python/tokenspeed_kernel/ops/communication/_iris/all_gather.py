@@ -410,6 +410,7 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
     block_k: gl.constexpr,
     input_published: gl.constexpr,
     num_warps: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Gather BF16 feature shards, apply RMSNorm, and quantize to MXFP4.
 
@@ -437,6 +438,12 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
             local,
             mask=offsets < local_width,
         )
+        # The barrier the compiler inserts before the one-thread release does
+        # not wait for memory, and the releasing thread's buffer_wbl2 and
+        # s_waitcnt vmcnt(0) cover only its own subgroup's stores. So each
+        # subgroup first waits until its stores reach L2 (s_waitcnt vmcnt(0)
+        # on gfx950).
+        WAIT_STORES(args=[], constraints="=r,~{memory}")
 
     epoch_ptr = ready_flags + row * WORLD_SIZE + rank
     ready_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1

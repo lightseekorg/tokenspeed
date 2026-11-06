@@ -394,7 +394,11 @@ def _rounds(
     data at ``root``; ``late`` times its policy's launches (None: as served)."""
     nodes = shape.nodes
     states = RuntimeStates(
-        req_pool_size=POOL, vocab_size=VOCAB, output_length=nodes, device="cuda"
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=nodes,
+        device="cuda",
     )
     states.init_draft_trees(nodes)
     buffers = InputBuffers(

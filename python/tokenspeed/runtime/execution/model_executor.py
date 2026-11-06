@@ -372,6 +372,7 @@ class ModelExecutorConfig:
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
+    input_vocab_size: int
     # Logical context limit (user semantics: input validation, max_new_tokens
     # folding, stop checks all key off this).
     context_len: int
@@ -509,6 +510,7 @@ class ModelExecutorConfig:
             max_num_seqs=server_args.request_state_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
+            input_vocab_size=model_config.input_vocab_size,
             context_len=model_config.context_len,
             physical_context_len=(
                 model_config.context_len + server_args.spec_context_pad
@@ -632,10 +634,11 @@ class ModelExecutor:
         self.input_buffers.init_ngram_buffers(
             ngram_context,
             model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
-            config.vocab_size,
+            config.input_vocab_size,
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
+            input_vocab_size=config.input_vocab_size,
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
