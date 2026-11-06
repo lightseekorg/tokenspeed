@@ -49,6 +49,7 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged import dsa
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     INDEX_K_FORMATS,
+    DSAConfig,
     dsa_history_gather_workspace_bytes,
     dsa_index_k_row_bytes,
     index_k_row_bytes,
@@ -699,15 +700,50 @@ def test_the_history_gate_is_the_amd_kvp_prefill(monkeypatch):
     """The arm and its workspace go together: the target over KVP pages
     without query context parallelism, on AMD, outside a bitwise envelope."""
     from tokenspeed.runtime.layers.attention.configs import dsa as dsa_configs
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.dsa import (
         dsa_kvp_history_prefill,
     )
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    def config(**overrides):
-        fields = dict(qcp_size=1, kvp_size=WORLD, is_draft=False)
-        fields.update(overrides)
-        return SimpleNamespace(component=lambda cls: object(), **fields)
+    mla = dict(
+        num_attention_heads=8,
+        num_kv_heads=8,
+        attn_tp_size=1,
+        head_dim=192,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        scaling=1.0,
+        kv_cache_dim=576,
+    )
+    dsa = DSAConfig(
+        backend_name="dsa",
+        index_topk=4,
+        index_head_dim=INDEX_HEAD_DIM,
+        index_n_heads=4,
+        index_k_format="fp8_scaled",
+        **mla,
+    )
+
+    def config(kvp_size=WORLD, qcp_size=1, is_draft=False, spec=dsa):
+        return AttnConfig(
+            device="cuda",
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_quant_method="none",
+            context_len=256,
+            max_bs=1,
+            kernel_page_size=PAGE,
+            is_draft=is_draft,
+            kvp_size=kvp_size,
+            kvp_group=tuple(range(kvp_size)),
+            qcp_size=qcp_size,
+            qcp_group=tuple(range(qcp_size)),
+            components=(spec,),
+        )
 
     def on(is_amd: bool) -> None:
         monkeypatch.setattr(
@@ -721,9 +757,7 @@ def test_the_history_gate_is_the_amd_kvp_prefill(monkeypatch):
     assert not dsa_kvp_history_prefill(config(qcp_size=WORLD))
     assert not dsa_kvp_history_prefill(config(is_draft=True))
     assert not dsa_kvp_history_prefill(
-        SimpleNamespace(
-            qcp_size=1, kvp_size=WORLD, is_draft=False, component=lambda cls: None
-        )
+        config(spec=MLAConfig(backend_name="mla", **mla))
     )
     monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
     assert not dsa_kvp_history_prefill(config())
@@ -1227,7 +1261,7 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
         _prepare_fixed_workspaces(**kwargs, expected_bytes=planned + 1)
     # Off: nothing is allocated and nothing is checked.
     fresh = _backend(0, workspace_rows=0, qcp=False, index_k_format="fp8_scaled")
-    config.qcp_size = 1
+    config.qcp_size = config.kvp_size = 1
     _prepare_fixed_workspaces(
         **{**kwargs, "backend": _router(fresh, is_draft=False), "draft_backend": None},
         expected_bytes=0,

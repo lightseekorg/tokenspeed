@@ -1063,6 +1063,14 @@ def _lent_worker(rank, degree, rendezvous):
             check(*lent())
         # Both pulled through the exchange: two epochs a call.
         assert int(exchange.state[0]) == epoch + 4
+        # Queries and records it did not lend keep NCCL and its results.
+        check(
+            gather_query_heads(q, group),
+            combine_attention_partials(
+                output, lse, group=group, rank=rank, sink=None, keep_all_heads=False
+            ),
+        )
+        assert int(exchange.state[0]) == epoch + 4
         torch.cuda.synchronize()
         dist.barrier(group=coordination)
         graph = torch.cuda.CUDAGraph()

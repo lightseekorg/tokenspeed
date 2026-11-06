@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import textwrap
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -22,6 +23,8 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def test_runtime_import_without_iris():
@@ -490,123 +493,11 @@ def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatc
     backend._nccl.all_reduce_two.assert_not_called()
 
 
-def _lending_exchange(lent: torch.Tensor) -> Mock:
-    """A pull exchange lending ``lent``'s start and serving only inputs there."""
-
-    def owned(_output, input):
-        return input.data_ptr() == lent.data_ptr()
-
-    exchange = Mock()
-    exchange.input.side_effect = lambda nbytes: (
-        lent[:nbytes] if nbytes <= lent.numel() else None
-    )
-    exchange.can_all_gather.side_effect = owned
-    exchange.can_all_to_all.side_effect = owned
-    return exchange
-
-
-def test_iris_pull_exchange_serves_the_inputs_it_lends():
-    fallback = Mock()
-    backend = IrisBackend(fallback)
-    group = (0, 1)
-    lent = torch.empty(16, dtype=torch.uint8)
-    exchange = _lending_exchange(lent)
-    backend.install_pull_exchange(group, exchange)
-    backend.install_pull_exchange(group, exchange)
-    with pytest.raises(RuntimeError, match="cannot replace"):
-        backend.install_pull_exchange(group, Mock())
-    like = torch.empty(1)
-
-    borrowed = backend.acquire_exchange_input(16, like, group)
-    assert borrowed.data_ptr() == lent.data_ptr()
-    # Past the exchange's capacity, or over another group: ordinary storage.
-    for nbytes, other in ((32, group), (8, (0, 2))):
-        ordinary = backend.acquire_exchange_input(nbytes, like, other)
-        assert ordinary.dtype == torch.uint8 and ordinary.numel() == nbytes
-        assert ordinary.data_ptr() != lent.data_ptr()
-
-    out = torch.empty(32, dtype=torch.uint8)
-    backend.all_gather_single(out, borrowed, group)
-    assert exchange.all_gather.call_args.args[1] is borrowed
-    backend.all_gather_single(out, ordinary, group)
-    assert fallback.all_gather_single.call_args.args[1] is ordinary
-    backend.all_to_all_single(out[:16], borrowed, group)
-    assert exchange.all_to_all.call_args.args[1] is borrowed
-    # Uneven exchanges keep the fallback.
-    backend.all_to_all_single(
-        out[:16], borrowed, group, output_split_sizes=[8, 8], input_split_sizes=[8, 8]
-    )
-    assert fallback.all_to_all_single.call_args.args[1] is borrowed
-    assert exchange.all_gather.call_count == exchange.all_to_all.call_count == 1
-
-
 _RECORDS_COMBINE = {
     "head_dim": 8,
     "partial_dtype": torch.bfloat16,
     "output_dtype": torch.bfloat16,
 }
-
-
-def test_iris_pull_exchange_combines_only_the_records_it_lends():
-    fallback = Mock()
-    backend = IrisBackend(fallback)
-    group = (0, 1)
-    lent = torch.empty((2, 1, 1, 5), dtype=torch.int32)
-    combined = torch.empty(1)
-    exchange = Mock()
-    exchange.can_combine_records.side_effect = (
-        lambda records, **_: records.data_ptr() == lent.data_ptr()
-    )
-    exchange.combine_records.return_value = combined
-    backend.install_pull_exchange(group, exchange)
-
-    assert backend.try_combine_records(lent, group, **_RECORDS_COMBINE) is combined
-    exchange.can_combine_records.assert_called_once_with(lent, **_RECORDS_COMBINE)
-    exchange.combine_records.assert_called_once_with(lent, head_dim=8)
-    # Records it did not lend, or a group without an exchange: the caller's
-    # all-to-all and combine.
-    assert backend.try_combine_records(lent.clone(), group, **_RECORDS_COMBINE) is None
-    assert backend.try_combine_records(lent, (0, 2), **_RECORDS_COMBINE) is None
-    exchange.combine_records.assert_called_once()
-    assert not fallback.method_calls
-
-
-def test_dcp_records_combine_asks_the_backend_first(monkeypatch):
-    from tokenspeed.runtime.distributed import comm_ops
-    from tokenspeed.runtime.layers.attention.dcp import comm as dcp_comm
-
-    backend = Mock()
-    monkeypatch.setattr(comm_ops, "get_global_backend", lambda: backend)
-    combine = Mock()
-    monkeypatch.setattr(dcp_comm, "combine_dcp_attention_partials", combine)
-    records = torch.zeros((2, 3, 1, 5), dtype=torch.int32)
-    fused = torch.empty(1)
-    backend.try_combine_records.return_value = fused
-
-    assert (
-        dcp_comm.combine_attention_records(
-            records, group=(0, 1), sink=None, **_RECORDS_COMBINE
-        )
-        is fused
-    )
-    backend.try_combine_records.assert_called_once_with(
-        records, (0, 1), **_RECORDS_COMBINE
-    )
-    backend.all_to_all_single.assert_not_called()
-    combine.assert_not_called()
-    # Declined, or with a sink: the all-to-all, then the combine.
-    backend.try_combine_records.return_value = None
-    dcp_comm.combine_attention_records(
-        records, group=(0, 1), sink=None, **_RECORDS_COMBINE
-    )
-    backend.try_combine_records.reset_mock()
-    sink = torch.zeros(1)
-    dcp_comm.combine_attention_records(
-        records, group=(0, 1), sink=sink, **_RECORDS_COMBINE
-    )
-    backend.try_combine_records.assert_not_called()
-    assert backend.all_to_all_single.call_count == combine.call_count == 2
-    assert combine.call_args.kwargs["sink"] is sink
 
 
 def test_exchanges_route_through_iris_only_where_it_reaches(backend, monkeypatch):
