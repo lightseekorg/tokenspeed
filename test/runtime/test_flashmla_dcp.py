@@ -435,6 +435,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     from tokenspeed.runtime.layers.attention.backends.paged import flashmla
     from tokenspeed.runtime.layers.attention.dcp import cache as dcp_cache
     from tokenspeed.runtime.layers.attention.dcp.cache import (
+        PREFIX_HISTORY_WINDOW_LOOPS,
         plan_prefix_history_gather,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
@@ -556,6 +557,8 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
         chunk_bounds_cpu=torch.tensor([[0], [3]]),
         page_size=1,
         placement=backend.cache_placement(layer),
+        max_loops=PREFIX_HISTORY_WINDOW_LOOPS,
+        max_send_rows=None,
     )
     assert window.owned_rows_per_rank == (2, 1)
     assert window.send_rows == 2
