@@ -266,7 +266,7 @@ def test_mtp_shares_complete_quantized_lm_head(monkeypatch, tied):
     assert should_apply_lm_head_quant_method(draft.lm_head, draft.lm_head.quant_method)
 
     processor = LogitsProcessor(
-        output_vocab_size=4,
+        vocab_size=4,
         dp_lm_head_tp=False,
         final_logit_softcapping=None,
         use_fused_lm_head=False,

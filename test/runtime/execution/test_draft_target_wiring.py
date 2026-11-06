@@ -87,7 +87,7 @@ def _head_layout(**overrides) -> SimpleNamespace:
     """The LM-head layout the factory compares between a target and the draft
     sharing its head (``_check_shared_head_layout``): the logits processor's
     group, width and attention-DP flag. Default: one replicated head."""
-    layout = dict(tp_group=None, tp_size=1, dp_lm_head_tp=False, output_vocab_size=128)
+    layout = dict(tp_group=None, tp_size=1, dp_lm_head_tp=False, vocab_size=128)
     layout.update(overrides)
     return SimpleNamespace(**layout)
 
@@ -265,7 +265,7 @@ def test_shared_head_rejects_a_different_output_domain(share_module):
         SimpleNamespace(
             lm_head=head,
             get_embed_and_head=lambda: (torch.zeros(128, 4), head.weight),
-            logits_processor=_head_layout(output_vocab_size=64),
+            logits_processor=_head_layout(vocab_size=64),
         )
     )
     draft = _ModuleSharingDraft() if share_module else _HeadAliasingDraft()
@@ -280,11 +280,11 @@ def test_reduced_draft_keeps_its_own_output_domain():
         SimpleNamespace(
             lm_head=head,
             get_embed_and_head=lambda: (torch.zeros(128, 4), head.weight),
-            logits_processor=_head_layout(output_vocab_size=64),
+            logits_processor=_head_layout(vocab_size=64),
         )
     )
     draft = _WeightSharingDraft()
-    draft.logits_processor = _head_layout(output_vocab_size=32)
+    draft.logits_processor = _head_layout(vocab_size=32)
     factory._share_target_embed_and_head(target, draft)
     assert draft.get_embed_and_head()[1] == "DRAFT_HEAD"
 
@@ -813,7 +813,7 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
     drafter.token_to_kv_pool = SimpleNamespace(
         layer_num=1, head_num=1, head_dim=8, dtype=torch.bfloat16
     )
-    processor = SimpleNamespace(do_argmax=True, output_vocab_size=50)
+    processor = SimpleNamespace(do_argmax=True, vocab_size=50)
     drafter.draft_model_runner = SimpleNamespace(
         model=SimpleNamespace(logits_processor=processor)
     )

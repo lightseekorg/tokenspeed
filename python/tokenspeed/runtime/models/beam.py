@@ -1475,10 +1475,10 @@ class BeamModel(BaseTransformerModel):
 
 
 class BeamLogitsProcessor(LogitsProcessor):
-    def __init__(self, config: Any, mapping: Any, *, output_vocab_size: int) -> None:
+    def __init__(self, config: Any, mapping: Any, *, vocab_size: int) -> None:
         tp = mapping.attn
         super().__init__(
-            output_vocab_size,
+            vocab_size,
             final_logit_softcapping=None,
             use_fused_lm_head=False,
             tie_word_embeddings=False,
@@ -1629,7 +1629,7 @@ class BeamForCausalLM(BaseCausalLM):
 
     def resolve_logits_processor(self, config: Any):
         return BeamLogitsProcessor(
-            config, self.mapping, output_vocab_size=self.vocabulary.output_size
+            config, self.mapping, vocab_size=self.vocabulary.output_size
         )
 
     def prepare_model_kwargs(self, ctx: Any, input_ids: torch.Tensor, kwargs: dict):

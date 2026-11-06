@@ -171,7 +171,7 @@ def _build_processor(
     tp_group: tuple[int, ...],
 ):
     return LogitsProcessor(
-        output_vocab_size=getattr(config, "vocab_size", None),
+        vocab_size=getattr(config, "vocab_size", None),
         skip_all_gather=False,
         tp_rank=tp_rank,
         tp_size=tp_size,

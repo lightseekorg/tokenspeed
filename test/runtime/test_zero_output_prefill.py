@@ -319,7 +319,7 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
     # join the row exchange with no rows.)
     output = forward(
         SimpleNamespace(
-            output_vocab_size=32,
+            vocab_size=32,
             dp_lm_head_tp=False,
             _query_shard=lambda metadata: None,
         ),

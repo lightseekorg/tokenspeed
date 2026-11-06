@@ -197,7 +197,7 @@ def _run(rank: int, port: int, logprob_order: str) -> None:
 
     vocab = VOCABS[logprob_order]
     processor = LogitsProcessor(
-        output_vocab_size=vocab,
+        vocab_size=vocab,
         tp_rank=rank,
         tp_size=WORLD,
         tp_group=group,

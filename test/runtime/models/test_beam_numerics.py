@@ -431,9 +431,7 @@ def test_logits_projection_and_softcap_dtypes(loaded, softcap):
     model, weights = loaded
     config = copy(model.config)
     config.final_logit_softcapping = softcap
-    processor = BeamLogitsProcessor(
-        config, model.mapping, output_vocab_size=config.vocab_size
-    )
+    processor = BeamLogitsProcessor(config, model.mapping, vocab_size=config.vocab_size)
     hidden = torch.linspace(-1, 1, 2 * 128, device="cuda").reshape(2, 128).bfloat16()
     actual = processor._get_logits(
         hidden,
@@ -458,7 +456,7 @@ def test_logits_processor_fuses_argmax_only_without_softcap(softcap):
     config = tiny_config()
     config.final_logit_softcapping = softcap
     processor = BeamLogitsProcessor(
-        config, Mapping(rank=0, world_size=1), output_vocab_size=config.vocab_size
+        config, Mapping(rank=0, world_size=1), vocab_size=config.vocab_size
     )
     processor.fuse_argmax()
     assert processor.do_argmax is (softcap is None)

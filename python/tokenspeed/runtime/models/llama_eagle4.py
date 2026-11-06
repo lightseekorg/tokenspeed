@@ -510,10 +510,10 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
     """
 
     def __init__(
-        self, output_vocab_size: int, *, tp_rank: int, tp_size: int, tp_group
+        self, vocab_size: int, *, tp_rank: int, tp_size: int, tp_group
     ) -> None:
         super().__init__(
-            output_vocab_size,
+            vocab_size,
             final_logit_softcapping=None,
             use_fused_lm_head=False,
             tie_word_embeddings=False,

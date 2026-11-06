@@ -242,7 +242,7 @@ class EagleHarness(Eagle4):
         max_bs = self.input_buffers.max_bs
         self._bind_tree_lanes(config, max_bs)
         logits_processor = self.draft_model_runner.model.logits_processor
-        self.tree_vocab_size = logits_processor.output_vocab_size
+        self.tree_vocab_size = logits_processor.vocab_size
         logits_processor.draft_top_k = topk
         # Children come from draft_topk; the head's argmax would go unread.
         logits_processor.do_argmax = False

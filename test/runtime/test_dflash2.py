@@ -230,7 +230,7 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter.wire_target(target)
 
     assert drafter.candidate_logits_processor is not None
-    assert drafter.candidate_logits_processor.output_vocab_size == 32
+    assert drafter.candidate_logits_processor.vocab_size == 32
     assert drafter.candidate_logits_processor.logit_scale == 1.25
     assert drafter.candidate_logits_processor.final_logit_softcapping == 8.0
     # tp_size == 1 leaves nothing to gather, so the shard-local path stays off.

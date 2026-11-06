@@ -121,8 +121,8 @@ def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None
 
 
 def _check_shared_output_domain(target_model, draft_model) -> None:
-    target_size = target_model.logits_processor.output_vocab_size
-    draft_size = draft_model.logits_processor.output_vocab_size
+    target_size = target_model.logits_processor.vocab_size
+    draft_size = draft_model.logits_processor.vocab_size
     if draft_size != target_size:
         raise ValueError(
             f"A shared LM head requires matching output vocabulary sizes: "

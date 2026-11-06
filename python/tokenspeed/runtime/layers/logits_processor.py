@@ -310,7 +310,7 @@ class LogitsProcessor(nn.Module):
 
     def __init__(
         self,
-        output_vocab_size: int,
+        vocab_size: int,
         skip_all_gather: bool = False,
         do_argmax: bool = False,
         logit_scale: float | None = None,
@@ -323,7 +323,9 @@ class LogitsProcessor(nn.Module):
         use_fused_lm_head: bool,
         tie_word_embeddings: bool,
     ):
-        """``tp_*`` describe the group ``lm_head`` is vocab-sharded over.
+        """``vocab_size`` is the logical output width, excluding weight padding.
+
+        ``tp_*`` describe the group ``lm_head`` is vocab-sharded over.
 
         ``dp_lm_head_tp`` selects the layout where that group's ranks are
         data-parallel for attention and hold different rows: the rows are
@@ -333,9 +335,9 @@ class LogitsProcessor(nn.Module):
         today's layout: every rank of the group holds the same rows.
         """
         super().__init__()
-        if type(output_vocab_size) is not int or output_vocab_size <= 0:
-            raise ValueError("output_vocab_size must be a positive integer")
-        self.output_vocab_size = output_vocab_size
+        if type(vocab_size) is not int or vocab_size <= 0:
+            raise ValueError("vocab_size must be a positive integer")
+        self.vocab_size = vocab_size
         self.tie_word_embeddings = tie_word_embeddings
         self.skip_all_gather = skip_all_gather
         self.do_argmax = do_argmax
@@ -348,17 +350,14 @@ class LogitsProcessor(nn.Module):
 
         # --logprob-order: the log-softmax behind input (prompt) logprobs.
         self.logprob_order: str = global_server_args_dict["logprob_order"]
-        if (
-            self.logprob_order == "megatron"
-            and output_vocab_size % MEGATRON_VOCAB_BLOCK != 0
-        ):
-            # The logits every logprob reads are sliced to output_vocab_size
+        if self.logprob_order == "megatron" and vocab_size % MEGATRON_VOCAB_BLOCK != 0:
+            # The logits every logprob reads are sliced to vocab_size
             # (_get_logits), and the trainer's sum(exp) folds fixed-width
             # blocks of them; refuse at construction, not on the forward thread.
             raise ValueError(
                 "--logprob-order megatron folds sum(exp) over fixed "
                 f"{MEGATRON_VOCAB_BLOCK}-wide vocabulary blocks and needs a "
-                f"vocab_size that is a multiple of it; got {output_vocab_size}"
+                f"vocab_size that is a multiple of it; got {vocab_size}"
             )
 
         if tp_rank is None:
@@ -610,7 +609,7 @@ class LogitsProcessor(nn.Module):
 
         # A quantized head may keep its weight transposed or packed, so take the shard width and logits dtype instead.
         vocab_per_rank = lm_head.num_embeddings_per_partition
-        if vocab_per_rank * self.tp_size != self.output_vocab_size:
+        if vocab_per_rank * self.tp_size != self.vocab_size:
             return None  # padded vocab: sharded argmax could pick a pad column
         state = None
         if supports_dist_argmax_shape(vocab_per_rank, logits_dtype, self.tp_size):
@@ -650,7 +649,7 @@ class LogitsProcessor(nn.Module):
             self.tp_group,
             self.tp_rank,
             self.tp_size,
-            self.output_vocab_size,
+            self.vocab_size,
             geometry,
         )
         if (
@@ -747,7 +746,7 @@ class LogitsProcessor(nn.Module):
                 )
             else:
                 logits = hidden_states.new_empty(
-                    (0, self.output_vocab_size), dtype=torch.float32
+                    (0, self.vocab_size), dtype=torch.float32
                 )
             return LogitsProcessorOutput(
                 next_token_logits=logits, hidden_states=capture
@@ -1000,7 +999,7 @@ class LogitsProcessor(nn.Module):
             )
         # A k larger than the vocabulary returns every token
         # (``top_token_logprobs``), so the buffers below hold that many.
-        top_k = min(plan.top_k, self.output_vocab_size)
+        top_k = min(plan.top_k, self.vocab_size)
         if top_k > 0 and self.logprob_order != "torch":
             raise ValueError(
                 "top-k prompt logprobs need --logprob-order torch, not "
@@ -1244,7 +1243,7 @@ class LogitsProcessor(nn.Module):
                     dim=1,
                 )
 
-        logits = logits[:, : self.output_vocab_size].contiguous()
+        logits = logits[:, : self.vocab_size].contiguous()
 
         if self.final_logit_softcapping:
             fused_softcap_generic(logits, self.final_logit_softcapping)

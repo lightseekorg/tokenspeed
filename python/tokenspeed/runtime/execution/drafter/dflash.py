@@ -305,7 +305,7 @@ class DFlash(BaseDrafter):
             or not 2 <= tp_size <= 32
             or int(head.num_embeddings) != int(head.org_vocab_size)
             or shard * tp_size != int(head.org_vocab_size)
-            or int(head.num_embeddings) != self.logits_processor.output_vocab_size
+            or int(head.num_embeddings) != self.logits_processor.vocab_size
             or not _supports_dist_argmax_shape(shard, dtype, tp_size)
         ):
             return None
@@ -424,7 +424,7 @@ class DFlash(BaseDrafter):
         added_vocab_start = int(shard.added_vocab_start_index)
         # Checkpoint storage rows are not necessarily output tokens. Clip each
         # shard's logical ranges without changing its physical padding offsets.
-        output_vocab_size = self.logits_processor.output_vocab_size
+        output_vocab_size = self.logits_processor.vocab_size
         num_org = min(num_org, max(output_vocab_size - org_vocab_start, 0))
         num_added = min(num_added, max(output_vocab_size - added_vocab_start, 0))
 

@@ -32,8 +32,10 @@ shards contribute no candidate but still join every TP gather.
 
 Every model constructor receives the resolved `vocabulary` explicitly.
 `ModelExecutorConfig` and `RuntimeStates` retain that value, without legacy
-`vocab_size` aliases or per-layer defaults. `LogitsProcessor` takes an explicit
-`output_vocab_size` and projection policies, never an HF config. Tied common
+`vocab_size` aliases or per-layer defaults. Components that consume only one
+domain keep the local name `vocab_size`; callers select `input_size` or
+`output_size` at the boundary. `LogitsProcessor` takes the logical output width
+as `vocab_size` and explicit projection policies, never an HF config. Tied common
 heads require equal input and output sizes. Model adapters own any other
 checkpoint-specific layout or sharing rules. A draft that shares the target's
 head must resolve the same output domain before construction; mismatches are
@@ -50,6 +52,6 @@ Runtime plugin API 4 requires `ModelProfile.vocabulary` and the keyword-only
 model constructor argument `vocabulary`. A plugin interprets its checkpoint
 fields in `model_profile(hf_config)` and forwards that same value to its base
 model constructor. Text/hash vocabulary constraints remain model-owned.
-Plugins calling `LogitsProcessor` pass `output_vocab_size`,
+Plugins calling `LogitsProcessor` pass `vocab_size=vocabulary.output_size`,
 `final_logit_softcapping`, `use_fused_lm_head` and `tie_word_embeddings` explicitly;
 copying and rewriting a checkpoint config for logits is no longer necessary.
