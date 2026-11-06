@@ -1157,6 +1157,56 @@ def test_routed_lamport_polling_codegen(rank):
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
+def test_routed_pull_stores_reach_l2_before_release():
+    """Every subgroup's routed sum reaches L2 before the readiness release.
+
+    All eight subgroups store the token sum into the symmetric input, and the
+    release run by one thread waits only for its own subgroup's stores.
+    Compile without launching and check that, on every path, each subgroup
+    runs s_waitcnt vmcnt(0) before the barrier preceding the release. The
+    later completion release only reports returned peer reads, so it needs
+    just a barrier after them.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum as fn,
+    )
+    from utils import vmcnt_zero_before_barrier
+
+    types = {
+        "routes": "*bf16",
+        "route_map": "*i32",
+        "route_weights": "*fp32",
+        "norm_weight": "*bf16",
+        "symmetric_input": "*bf16",
+        "output": "*bf16",
+        "ready_flags": "*i32",
+        "heaps": ("i64",) * 8,
+        "row_stride": "i32",
+    }
+    kernel = _compile_gfx950(
+        fn,
+        types,
+        {
+            "rank": 3,
+            "width": 4096,
+            "topk": 8,
+            "eps": 1e-5,
+            "weight_offset": 1.0,
+            "block": 4096,
+            "num_warps": 8,
+            "WAIT_STORES": iris_arch_policy(ArchVersion(9, 5)).wait_stores,
+        },
+        num_warps=8,
+    )
+    releases = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"], fn.fn.__name__, r"\bglobal_atomic_add\b.*sc0 sc1"
+    )
+    assert len(releases) == 2, releases
+    assert releases[0][1], releases
+    assert releases[1][2], releases
+
+
 def test_route_sum_gather_lamport_polling_codegen():
     """Keep the expert TP8 route-sum gather's polls batched on the retry path.
 
@@ -1212,56 +1262,6 @@ def test_route_sum_gather_lamport_polling_codegen():
         == 14
     ), "publication and reset must use system-cache stores"
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
-
-
-def test_routed_pull_stores_reach_l2_before_release():
-    """Every subgroup's routed sum reaches L2 before the readiness release.
-
-    All eight subgroups store the token sum into the symmetric input, and the
-    release run by one thread waits only for its own subgroup's stores.
-    Compile without launching and check that, on every path, each subgroup
-    runs s_waitcnt vmcnt(0) before the barrier preceding the release. The
-    later completion release only reports returned peer reads, so it needs
-    just a barrier after them.
-    """
-    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
-    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
-        iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum as fn,
-    )
-    from utils import vmcnt_zero_before_barrier
-
-    types = {
-        "routes": "*bf16",
-        "route_map": "*i32",
-        "route_weights": "*fp32",
-        "norm_weight": "*bf16",
-        "symmetric_input": "*bf16",
-        "output": "*bf16",
-        "ready_flags": "*i32",
-        "heaps": ("i64",) * 8,
-        "row_stride": "i32",
-    }
-    kernel = _compile_gfx950(
-        fn,
-        types,
-        {
-            "rank": 3,
-            "width": 4096,
-            "topk": 8,
-            "eps": 1e-5,
-            "weight_offset": 1.0,
-            "block": 4096,
-            "num_warps": 8,
-            "WAIT_STORES": iris_arch_policy(ArchVersion(9, 5)).wait_stores,
-        },
-        num_warps=8,
-    )
-    releases = vmcnt_zero_before_barrier(
-        kernel.asm["amdgcn"], fn.fn.__name__, r"\bglobal_atomic_add\b.*sc0 sc1"
-    )
-    assert len(releases) == 2, releases
-    assert releases[0][1], releases
-    assert releases[1][2], releases
 
 
 def _attntail_lamport_assembly() -> str:
