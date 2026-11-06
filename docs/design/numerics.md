@@ -263,6 +263,16 @@ drafts fold no LoRA norm scale; a draft that
 does must read `--mla-lora-scale` exactly as the target does, folding only
 under `folded`.
 
+When a model owns a cache format or execution contract that differs from its
+architecture's default, its profile may provide
+`create_attention_config(server_args, model_config, is_draft)`. The factory
+returns the model-wide `AttnConfig` and its softmax component, validates its
+supported dtype and topology, and uses the same resolved launch for target
+and draft construction. The runtime still adds the profile's linear-attention
+component through the ordinary composition path. An omitted factory keeps
+the architecture's existing generator; a factory error propagates instead of
+falling back to a different cache format or numerical path.
+
 Trainer alignment is a stronger claim than invariance and cannot be checked
 by the engine alone: a model earns `rl-bitwise` in
 `ModelProfile.numerics_envelopes` through the invariance harness *and* the
