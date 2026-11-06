@@ -1295,6 +1295,10 @@ result = (Plane(), ts.Scheduler(cfg))
         // appears through any change — a take-then-restore included, the
         // shape that once parked a control thread forever (a closed
         // experiment added restore paths without notifying).
+        // This test stands alone: it never goes through `plane()`, so it
+        // starts the interpreter itself rather than relying on whichever
+        // test initialized it first.
+        interpreter();
         let shared = Arc::new(Shared::default());
         // Two distinct objects: `py.None()` is a singleton, and identity
         // against it would pass regardless of which entry came back.
