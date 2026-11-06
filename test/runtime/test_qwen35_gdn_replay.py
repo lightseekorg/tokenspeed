@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import sys
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -50,8 +49,6 @@ from test.runtime.test_gdn_state_paging import (
 
 from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
-    GdnChainVerifyForm,
-    gdn_decode_mtp,
     gdn_replay_commit_supported,
     gdn_tree_verify_needs_node_states,
 )
@@ -434,12 +431,18 @@ def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
     backend.set_kv_pool(pool)
 
     def supports(op, trait):
+        traits = {"head_dim": HEAD_K_DIM, "value_head_dim": HEAD_V_DIM}
+        if op == "gdn_decode_mtp":
+            traits.update(
+                verify_tokens=DRAFT_TOKENS,
+                output_only=False,
+                tree=False,
+            )
         return gdn_decode_supports(
             op,
             torch.bfloat16,
-            head_dim=HEAD_K_DIM,
-            value_head_dim=recurrent.shape[-2],
             state_dtype=recurrent.dtype,
+            traits=traits,
             trait=trait,
             solution=None,
         )
@@ -453,13 +456,10 @@ def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
     )
 
 
-@pytest.mark.parametrize("form", [GdnChainVerifyForm.STEP, GdnChainVerifyForm.TREE])
+@pytest.mark.parametrize("draft_tokens", [3, GDN_TREE_VERIFY_CHUNKED_MAX_NODES])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-def test_qwen_replay_chain_verifies_chunked_where_faster(state_dtype, form):
-    """A ReplaySSM chain hands the GDN verify its ancestor masks exactly where the
-    chunked form is faster, and matches the per-position scratch verify."""
-    chunked = form is GdnChainVerifyForm.TREE
-    draft_tokens = GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+def test_qwen_replay_chain_matches_staged_verify(state_dtype, draft_tokens):
+    """Unsupported WY geometry retains exact chain outputs and read-only state."""
     conv, recurrent = _initial_pools(state_dtype=state_dtype)
     replay_backend, replay_pool = _make_backend(
         conv.clone(), recurrent.clone(), replay=True, draft_tokens=draft_tokens
@@ -469,21 +469,11 @@ def test_qwen_replay_chain_verifies_chunked_where_faster(state_dtype, form):
     )
     inputs = _inputs(draft_tokens=draft_tokens)
 
-    module = MambaAttnBackend.__module__
-    with (
-        patch(f"{module}.gdn_chain_verify_form", return_value=form) as pick_form,
-        patch(f"{module}.gdn_decode_mtp", wraps=gdn_decode_mtp) as verify,
-    ):
-        replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
+    before = replay_pool.get_component(0, "recurrent_state").clone()
+    replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
     scratch_out = _prepare_verify(scratch_backend, scratch_pool, inputs)
-    # This backend's scan does not run the chain form (nor would its K != V heads).
-    pick_form.assert_called_with(
-        draft_tokens, BATCH * NUM_V_HEADS, state_dtype, chain_form=False
-    )
-    assert (verify.call_args.kwargs["tree_ancestors"] is not None) == chunked
-    # The chunked verify and the step-by-step one round differently.
-    tol = dict(atol=1e-4, rtol=2**-7) if chunked else dict(atol=0.0, rtol=0.0)
-    torch.testing.assert_close(replay_out, scratch_out, **tol)
+    assert torch.equal(replay_pool.get_component(0, "recurrent_state"), before)
+    torch.testing.assert_close(replay_out, scratch_out, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.parametrize(

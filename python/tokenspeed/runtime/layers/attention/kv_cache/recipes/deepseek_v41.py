@@ -331,12 +331,28 @@ class DeepseekV41Recipe(CacheRecipe):
         )
         # BF16 current SWA and compact [T,128+512] indices coexist with that KV.
         compact_metadata = queries * (V41_HEAD_DIM * 2 + (128 + 512) * 4)
-        # Packed index Q (32 global heads, one packed row each) and a 32-MiB
-        # logits tile plus selection copies; score/selection is bounded
-        # independently of the complete context or the prefill query count.
+        # Prefill bounds its logits tile; paged decode scores the whole batch.
+        # Reserve native BF16 logits plus cleaning and selection copies.
         index_queries = queries * 32 * (128 * 2 + rows.index_row_bytes)
         score_columns = (self.attn_config.context_len + 63) // 64 * 64
-        score_scratch = min(128 << 20, min(queries, 1024) * score_columns * 4)
+        decode_columns = (
+            v41_table_widths(self.attn_config.context_len, horizon)[
+                V41_GLOBAL_R1_GROUP_ID
+            ]
+            * 64
+        )
+        # Paged scoring produces [rows, capacity] BF16 logits and the cleaned
+        # copy beside them, whatever the caller's tile is; a window-less prefill
+        # takes that path with the 256-row prefill tile. One such buffer at a
+        # 1M-token context is 512 MiB, and the whole tile measured 1,041 MiB
+        # against 384 MiB from the old 128 MiB prefill cap alone. `3 *` below
+        # still covers the logits, the cleaned copy and the selection scratch.
+        paged_prefill = min(queries, 256) * score_columns * 2
+        score_scratch = max(
+            min(128 << 20, min(queries, 1024) * score_columns * 4),
+            paged_prefill,
+            max_bs * self.decode_input_tokens * decode_columns * 2,
+        )
         block_k = max(32, 1 << (min(2048, max(1, score_columns // 8)) - 1).bit_length())
         # Sixteen portable partitions plus bounded TopK merge temporaries.
         portable_scratch = min(queries, 256) * 24 * (512 + block_k) * 12

@@ -42,7 +42,8 @@ def virtual_block_to_local(block, DEGREE: tl.constexpr, RANK: tl.constexpr):
     return tl.where(owned, local, 0), owned
 
 
-@triton.jit
+# The slot count follows the batch; unspecialized so every count shares one binary.
+@triton.jit(do_not_specialize=["count"])
 def _translate_virtual_slots(
     source,
     destination,
@@ -141,6 +142,144 @@ def virtual_slots_to_local(
         out.copy_(torch.where(owned, local, 0))
         owner_mask.copy_(owned)
     return out, owner_mask
+
+
+@triton.jit(do_not_specialize=["SSTRIDE", "OSTRIDE", "WIDTH"])
+def _compact_owned_slots(
+    Slots,
+    Lens,
+    Out,
+    Counts,
+    # Batch-dependent width and strides stay runtime: one binary for every batch shape.
+    SSTRIDE,
+    OSTRIDE,
+    WIDTH,
+    ROWS: tl.constexpr,
+    VIRTUAL_COUNT: tl.constexpr,
+    DEGREE: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program per row carries the owned count, so owned slots keep selection order.
+    row = tl.program_id(0).to(tl.int64)
+    if Lens is None:
+        length = WIDTH
+    else:
+        length = tl.minimum(tl.maximum(tl.load(Lens + row), 0), WIDTH)
+    count = 0
+    for start in range(0, WIDTH, BLOCK):
+        col = start + tl.arange(0, BLOCK)
+        live = col < length
+        raw = tl.load(Slots + row * SSTRIDE + col, mask=live, other=-1).to(tl.int64)
+        safe = tl.maximum(raw, 0)
+        local, owner = virtual_block_to_local(safe // ROWS, DEGREE, RANK)
+        valid = live & owner & (raw >= ROWS) & (raw < VIRTUAL_COUNT * ROWS)
+        dest = count + tl.cumsum(valid.to(tl.int32), axis=0) - 1
+        tl.store(
+            Out + row * OSTRIDE + dest,
+            (local * ROWS + safe % ROWS).to(tl.int32),
+            mask=valid,
+        )
+        count += tl.sum(valid.to(tl.int32), axis=0)
+    # Padding is disjoint from the owned stores, so the loops need no ordering.
+    for start in range(0, WIDTH, BLOCK):
+        col = start + tl.arange(0, BLOCK)
+        tl.store(
+            Out + row * OSTRIDE + col,
+            tl.full((BLOCK,), -1, tl.int32),
+            mask=(col >= count) & (col < WIDTH),
+        )
+    tl.store(Counts + row, count)
+
+
+def compact_owned_slots(
+    slots: torch.Tensor,
+    lengths: torch.Tensor | None,
+    *,
+    rows_per_page: int,
+    virtual_block_count: int,
+    degree: int,
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack one owner's selected slots, as local slots, at each row's front.
+
+    A row's live entries are its first ``lengths[row]`` columns. Of those,
+    the ones ``virtual_slots_to_local`` marks as owned by ``rank`` move to
+    the front in their original order, translated to local slots; the rest
+    of the row is ``-1``. A sparse core that reads only ``[0, count)`` then
+    visits this rank's share of the selection instead of the whole width.
+
+    Args:
+        slots: Int32 or int64 virtual slots [rows, width]; negative entries
+            are invalid.
+        lengths: Int32 or int64 live entries per row [rows], clamped to
+            [0, width], or None when every column is live.
+        rows_per_page: Unchanged physical rows per owned cache block.
+        virtual_block_count: Scheduler capacity including null block 0.
+        degree: Number of owners (the KVP group width).
+        rank: Owner index in [0, degree).
+
+    Returns:
+        ``(local_slots, counts)``: int32 [rows, width] local slots, owned
+        entries first and ``-1`` after, and int32 [rows] owned counts. Both
+        are new tensors; ``slots`` is not modified.
+    """
+    if rows_per_page <= 0 or virtual_block_count <= 1 or degree <= 0:
+        raise ValueError(
+            "virtual slot geometry must be positive and include usable pages"
+        )
+    if not 0 <= rank < degree:
+        raise ValueError("virtual slot owner rank is out of range")
+    if slots.dtype not in (torch.int32, torch.int64):
+        raise TypeError("virtual slots must be int32 or int64")
+    if slots.dim() != 2:
+        raise ValueError("owned slot compaction takes [rows, width] slots")
+    if lengths is not None and (
+        lengths.shape != slots.shape[:1]
+        or lengths.dtype not in (torch.int32, torch.int64)
+        or lengths.device != slots.device
+    ):
+        raise ValueError(
+            "owned slot lengths must be int32 or int64 [rows] on the slots' device"
+        )
+    rows, width = slots.shape
+    out = torch.empty((rows, width), dtype=torch.int32, device=slots.device)
+    counts = torch.empty((rows,), dtype=torch.int32, device=slots.device)
+    if slots.numel() == 0:
+        return out, counts.zero_()
+    if slots.is_cuda:
+        source = slots if slots.stride(1) == 1 else slots.contiguous()
+        _compact_owned_slots[(rows,)](
+            source,
+            None if lengths is None else lengths.contiguous(),
+            out,
+            counts,
+            source.stride(0),
+            out.stride(0),
+            width,
+            ROWS=rows_per_page,
+            VIRTUAL_COUNT=virtual_block_count,
+            DEGREE=degree,
+            RANK=rank,
+            BLOCK=256,
+        )
+    else:
+        local, owned = virtual_slots_to_local(
+            slots,
+            rows_per_page=rows_per_page,
+            virtual_block_count=virtual_block_count,
+            degree=degree,
+            rank=rank,
+        )
+        cols = torch.arange(width, device=slots.device)
+        if lengths is not None:
+            owned &= cols < lengths.to(torch.int64).clamp(0, width).unsqueeze(1)
+        # Stable partition onto unique destinations: each output is written once.
+        prefix = owned.cumsum(1)
+        counts.copy_(prefix[:, -1])
+        destinations = torch.where(owned, prefix - 1, prefix[:, -1:] + cols - prefix)
+        out.scatter_(1, destinations, torch.where(owned, local, -1).to(torch.int32))
+    return out, counts
 
 
 @triton.jit(do_not_specialize=["COUNT", "SEND_ROWS"])

@@ -123,23 +123,36 @@ def _warmup_fp8_fp4_paged_mqa_logits(
         context_lens = torch.full(
             (num_tokens, 1), cache_block_size, dtype=torch.int32, device=device
         )
-        block_table = torch.arange(num_tokens, dtype=torch.int32, device=device).view(
-            num_tokens, 1
-        )
-        schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens, cache_block_size, num_sms
-        )
-        deep_gemm.fp8_fp4_paged_mqa_logits(
-            q=(q_values.view(torch.int8).unsqueeze(1), q_scales.unsqueeze(1)),
-            kv_cache=kv_cache,
-            weights=weights,
-            context_lens=context_lens,
-            block_table=block_table,
-            schedule_meta=schedule_meta,
-            max_context_len=cache_block_size,
-            clean_logits=False,
-            logits_dtype=logits_dtype,
-        )
+        rows = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        # Compile both independent rows and request-grouped verify rows before
+        # capture. Queries in a group share one physical history table. The
+        # group density is only a sample: DeepGEMM's optional ``indices``
+        # argument enters the host metadata builder, so a grouped call proves
+        # the installed build supports it and fails at startup instead of on
+        # the first decode step.
+        for indices in (None, rows // 4):
+            block_table = (rows if indices is None else indices).view(num_tokens, 1)
+            try:
+                schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens, cache_block_size, num_sms, indices=indices
+                )
+                deep_gemm.fp8_fp4_paged_mqa_logits(
+                    q=(q_values.view(torch.int8).unsqueeze(1), q_scales.unsqueeze(1)),
+                    kv_cache=kv_cache,
+                    weights=weights,
+                    context_lens=context_lens,
+                    block_table=block_table,
+                    schedule_meta=schedule_meta,
+                    max_context_len=cache_block_size,
+                    clean_logits=False,
+                    logits_dtype=logits_dtype,
+                    indices=indices,
+                )
+            except TypeError as error:
+                raise RuntimeError(
+                    "this DeepGEMM build has no grouped paged MQA logits "
+                    "(indices=...); the DSV4.1 paged indexer requires it"
+                ) from error
     torch.cuda.synchronize()
 
 

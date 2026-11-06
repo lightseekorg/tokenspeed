@@ -24,7 +24,7 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
@@ -1841,6 +1841,197 @@ def _launch_query(values, positions, cache, output, heads_to_write):
 
 
 @triton.jit
+def _ue8m0_inverse(exponent):
+    # Scales are powers of two, so multiplying by the exact reciprocal rounds
+    # exactly like dividing.
+    return tl.div_rn(1.0, (exponent << 23).to(tl.float32, bitcast=True))
+
+
+# Adapted from vLLM's fused_inv_rope_fp8_quant (Apache-2.0), TMA-aligned path only.
+@triton.jit(do_not_specialize=["T", "OG", "SG", "SK"])
+def _rope_quantize_fp8_grouped(
+    X,
+    POS,
+    CS,
+    OUT,
+    S,
+    T,
+    X0,
+    X1,
+    P0,
+    CS0,
+    OG,
+    OT,
+    SG,
+    SK,
+    HPG: tl.constexpr,
+    HB: tl.constexpr,
+    R: tl.constexpr,
+    MAX_POS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    # One program quantizes one token's group of HPG heads, as [head, 32-channel
+    # block, channel] tiles: 512 - R NoPE channels, then R interleaved RoPE ones.
+    token = tl.program_id(0).to(tl.int64)
+    group = tl.program_id(1).to(tl.int64)
+    head = tl.arange(0, HB)[:, None, None]
+    live = head < HPG
+    block = tl.arange(0, 16)[None, :, None]
+    # S is the int32 scale storage as bytes: each int32 word packs the UE8M0
+    # exponents of four 32-channel blocks, byte j (little endian) for block
+    # 4w+j, so every block's exponent is stored as one byte.
+    scale_row = S + 4 * (group * SG + token)
+    head2 = tl.arange(0, HB)[:, None]
+    block2 = tl.arange(0, 16)[None, :]
+    scale_ptr = scale_row + 4 * (head2 * 4 + block2 // 4).to(tl.int64) * SK + block2 % 4
+    # Rows past T only pad the TMA-aligned scale storage; they must read as 0.
+    if token >= T:
+        tl.store(scale_ptr, tl.zeros((HB, 16), dtype=tl.uint8), head2 < HPG)
+        return
+    position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
+    valid_position = position < MAX_POS
+    tl.device_assert(valid_position, "RoPE position is outside the cosine/sine table")
+    x_ptr = X + token * X0 + group * HPG * X1 + head * X1
+    out_ptr = OUT + group * OG + token * OT + head * 512
+
+    nope_blocks: tl.constexpr = (512 - R) // 32
+    nope = live & (block < nope_blocks)
+    offset = block * 32 + tl.arange(0, 32)[None, None, :]
+    values = tl.load(x_ptr + offset, nope, 0.0).to(tl.float32)
+    # As _fp8_group32_ue8m0_quantize_swizzled: amax floored at 1e-4, over 448.
+    amax = tl.maximum(tl.max(tl.abs(values), 2), 1.0e-4)
+    exponent = _ue8m0_exponent(amax * (1.0 / 448.0))
+    codes = values * _ue8m0_inverse(exponent)[:, :, None]
+    tl.store(out_ptr + offset, codes.to(tl.float8e4nv), nope)
+    tl.store(scale_ptr, exponent.to(tl.uint8), (head2 < HPG) & (block2 < nope_blocks))
+
+    # RoPE blocks, as (even, odd) channel pairs: pair = 16 * tail block + lane.
+    tail = tl.arange(0, R // 32)[None, :, None]
+    pair = tail * 16 + tl.arange(0, 16)[None, None, :]
+    offset = 512 - R + 2 * pair
+    even = tl.load(x_ptr + offset, live, 0.0)
+    odd = tl.load(x_ptr + offset + 1, live, 0.0)
+    cosine = tl.load(CS + position * CS0 + pair, valid_position, 1.0)
+    sine = tl.load(CS + position * CS0 + R // 2 + pair, valid_position, 0.0)
+    # Round to BF16 first, as the unfused path stores RoPE output before quantizing.
+    even_out = _rotate_interleaved(even, odd, cosine, sine, False).to(even.dtype)
+    odd_out = _rotate_interleaved(odd, even, cosine, sine, True).to(odd.dtype)
+    even_out = even_out.to(tl.float32)
+    odd_out = odd_out.to(tl.float32)
+    tail_amax = tl.maximum(tl.max(tl.abs(even_out), 2), tl.max(tl.abs(odd_out), 2))
+    tail_exponent = _ue8m0_exponent(tl.maximum(tail_amax, 1.0e-4) * (1.0 / 448.0))
+    inverse = _ue8m0_inverse(tail_exponent)[:, :, None]
+    tl.store(out_ptr + offset, (even_out * inverse).to(tl.float8e4nv), live)
+    tl.store(out_ptr + offset + 1, (odd_out * inverse).to(tl.float8e4nv), live)
+
+    block2 = nope_blocks + tl.arange(0, R // 32)[None, :]
+    tail_scale_ptr = (
+        scale_row + 4 * (head2 * 4 + block2 // 4).to(tl.int64) * SK + block2 % 4
+    )
+    tl.store(tail_scale_ptr, tail_exponent.to(tl.uint8), head2 < HPG)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_rope_quantize_fp8_grouped",
+    name="triton_dsv41_rope_quantize_fp8_grouped",
+    solution="triton",
+    # The packed scales use DeepGEMM's SM100 MN-major UE8M0 layout.
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0), vendors=frozenset({"nvidia"})
+    ),
+    signatures=_QUERY_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_rope_quantize_fp8_grouped(values, positions, cos_sin_cache, groups):
+    """Rotate each head's interleaved RoPE tail, then quantize heads in groups.
+
+    Args:
+        values: BF16 [T,H,512] with unit channel stride; token and head strides
+            may be arbitrary. H must be divisible by groups.
+        positions: Int32/int64 [T]; negative positions use table row 0, and
+            positions past the table assert on device.
+        cos_sin_cache: FP32 [max_positions,64], cosine then sine halves. The
+            rotation formula is rope_inplace's; pass the inverse table to undo
+            RoPE.
+        groups: Number of output head groups; each holds D = H/groups*512.
+
+    Returns:
+        (codes, scales). codes is FP8 E4M3 [T,groups,D], a transposed view of
+        contiguous [groups,T,D] storage. scales is int32 [T,groups,D/128] with
+        strides (1, D/128*aligned_T, aligned_T), aligned_T = ceil(T/4)*4; each
+        element packs the UE8M0 exponents of four consecutive 32-channel groups,
+        byte j for group 4w+j. Storage rows [T, aligned_T) are zero.
+    """
+    if values.dtype != torch.bfloat16 or values.ndim != 3:
+        raise ValueError("values must be BF16 [tokens,heads,512]")
+    if values.shape[2] != 512 or values.stride(2) != 1:
+        raise ValueError("values must have 512 channels with unit channel stride")
+    tokens, heads, _ = values.shape
+    if groups <= 0 or heads % groups != 0:
+        raise ValueError(f"heads {heads} must be divisible by groups {groups}")
+    if positions.dtype not in (torch.int32, torch.int64) or positions.shape != (
+        tokens,
+    ):
+        raise ValueError(f"positions must be int32/int64 [{tokens}]")
+    if (
+        cos_sin_cache.dtype != torch.float32
+        or cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape[1] != 64
+        or cos_sin_cache.stride(1) != 1
+    ):
+        raise ValueError("cos_sin_cache must be FP32 [max_positions,64], unit stride")
+    if positions.device != values.device or cos_sin_cache.device != values.device:
+        raise ValueError("values, positions and cos_sin_cache must share a device")
+    heads_per_group = heads // groups
+    dim = heads_per_group * 512
+    words = dim // 128
+    aligned_tokens = triton.cdiv(tokens, 4) * 4
+    codes = torch.empty(
+        (groups, tokens, dim), dtype=torch.float8_e4m3fn, device=values.device
+    )
+    storage = torch.empty(
+        groups * words * aligned_tokens, dtype=torch.int32, device=values.device
+    )
+    scales = storage.as_strided(
+        (tokens, groups, words), (1, words * aligned_tokens, aligned_tokens)
+    )
+    if tokens:
+        enable_pdl = pdl_enabled()
+        _rope_quantize_fp8_grouped[(aligned_tokens, groups)](
+            values,
+            positions,
+            cos_sin_cache,
+            codes,
+            storage.view(torch.uint8),
+            tokens,
+            values.stride(0),
+            values.stride(1),
+            positions.stride(0),
+            cos_sin_cache.stride(0),
+            codes.stride(0),
+            codes.stride(1),
+            words * aligned_tokens,
+            aligned_tokens,
+            heads_per_group,
+            triton.next_power_of_2(heads_per_group),
+            cos_sin_cache.shape[1],
+            cos_sin_cache.shape[0],
+            enable_pdl,
+            num_warps=4,
+            num_stages=1,
+            enable_fp_fusion=False,
+            debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
+    return codes.transpose(0, 1), scales
+
+
+@triton.jit
 def _dspark_row_value(
     X,
     W,
@@ -2548,7 +2739,7 @@ def safe_metadata(table, lengths, pages, capacity, page_size):
 
 
 @triton.jit(
-    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
+    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP", "O0"],
 )
 def _clean_logits(
     X,
@@ -2562,13 +2753,14 @@ def _clean_logits(
     TC,
     NP,
     CAP,
+    O0,
     P: tl.constexpr,
     PAGED: tl.constexpr,
     LIVE_TILES_ONLY: tl.constexpr,
     B: tl.constexpr,
 ):
-    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    end = tl.load(L + row * L0)
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), CAP)
     if not LIVE_TILES_ONLY or tile * B < end:
         column = tile * B + tl.arange(0, B)
         valid = (column < CAP) & (column < end)
@@ -2580,13 +2772,13 @@ def _clean_logits(
         value = tl.load(X + row * X0 + column, valid, other=-float("inf"))
         # Write the entire last live 1024-value tile, including its -inf tail.
         # DeepSelect can prefetch the last 512-value segment before masking it.
-        tl.store(O + row * CAP + column, value, column < CAP)
+        tl.store(O + row * O0 + column, value, column < O0)
 
 
 def clean_logits(values, lengths, table, pages, capacity, page_size):
     """Copy logits, masking every future row and invalid page to -inf."""
     return _clean_logits_output(
-        values, lengths, table, pages, capacity, page_size, False
+        values, lengths, table, pages, capacity, page_size, 1, False
     )
 
 
@@ -2715,28 +2907,41 @@ def _reduce_blocks(
     BLOCK_SIZE: tl.constexpr,
     GROUP: tl.constexpr,
     PIN_NEWEST: tl.constexpr,
+    FULL_WIDTH: tl.constexpr,
+    ALIGNMENT: tl.constexpr,
     B: tl.constexpr,
 ):
-    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    block = tile * B + tl.arange(0, B)
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     lane = tl.arange(0, GROUP)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
-    position = block[:, None] * BLOCK_SIZE + lane[None, :]
-    value = tl.load(
-        X + row * X0 + position * X1,
-        (position < end) & (lane[None, :] < BLOCK_SIZE),
-        other=-float("inf"),
-    )
-    scores = tl.max(value, axis=1)
-    if PIN_NEWEST:
-        scores = tl.where(
-            (end > 0) & (block == (end - 1) // BLOCK_SIZE) & (scores > -float("inf")),
-            float("inf"),
-            scores,
+    count = tl.cdiv(end, BLOCK_SIZE)
+    if FULL_WIDTH:
+        stop = SW
+    else:
+        # Native selection may prefetch the final aligned segment before masking.
+        stop = tl.cdiv(count, ALIGNMENT) * ALIGNMENT
+    for start in range(tile * B, stop, tl.num_programs(1) * B):
+        block = start + tl.arange(0, B)
+        position = block[:, None] * BLOCK_SIZE + lane[None, :]
+        value = tl.load(
+            X + row * X0 + position * X1,
+            (position < end) & (lane[None, :] < BLOCK_SIZE),
+            other=-float("inf"),
         )
-    tl.store(S + row * S0 + block, scores, block < SW)
+        # torch.amax propagates NaNs, including in the pinned newest block.
+        has_nan = tl.sum((value != value).to(tl.int32), axis=1) != 0
+        scores = tl.where(has_nan, float("nan"), tl.max(value, axis=1))
+        if PIN_NEWEST:
+            scores = tl.where(
+                (end > 0)
+                & (block == (end - 1) // BLOCK_SIZE)
+                & (scores > -float("inf")),
+                float("inf"),
+                scores,
+            )
+        tl.store(S + row * S0 + block, scores, block < stop)
     if tile == 0:
-        tl.store(E + row, (end + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        tl.store(E + row, count)
 
 
 @triton.jit(
@@ -2887,6 +3092,41 @@ def prepare_native_dense_scores(logits, lengths, alignment):
     return prepare_scores(logits, lengths, 1, alignment, False)
 
 
+def prepare_native_block_scores(logits, lengths, block_size, alignment):
+    """Return FP32 block maxima/newest pin and clamped native exclusive ends.
+
+    Rows have ``alignment``-element padding. Only live blocks and their final
+    aligned segment are initialized; native consumers must honor the ends.
+    """
+    width = logits.shape[1]
+    logical_width = (width + block_size - 1) // block_size
+    stride = (logical_width + alignment - 1) // alignment * alignment
+    scores = torch.empty(
+        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
+    )
+    ends = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    if logits.shape[0]:
+        _reduce_blocks[(logits.shape[0], 32)](
+            logits,
+            lengths,
+            scores,
+            ends,
+            logits.stride(0),
+            logits.stride(1),
+            lengths.stride(0),
+            stride,
+            width,
+            stride,
+            block_size,
+            triton.next_power_of_2(block_size),
+            True,
+            False,
+            alignment,
+            128,
+        )
+    return scores, ends
+
+
 def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
     """Fuse causal masking/alignment, optionally block maxima and newest pin."""
     width = logits.shape[1]
@@ -2924,6 +3164,8 @@ def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
             block_size,
             triton.next_power_of_2(block_size),
             pin_newest,
+            True,
+            alignment,
             128,
         )
     return scores, end
@@ -3912,20 +4154,22 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
     return out
 
 
-def clean_logits_for_selection(values, lengths, table, pages, capacity, page_size):
-    """Copy valid logits for bounded DeepSelect consumers, preserving row layout.
+def clean_logits_for_selection(
+    values, lengths, table, pages, capacity, page_size, alignment
+):
+    """Copy valid logits to rows padded to ``alignment`` elements for DeepSelect.
 
     Every live 1024-value tile is fully initialized, including its -inf tail;
     wholly future tiles are unspecified. Consumers must pass exclusive ends.
     Ordinary clean_logits retains its full-width contract, including on Hopper.
     """
     return _clean_logits_output(
-        values, lengths, table, pages, capacity, page_size, True
+        values, lengths, table, pages, capacity, page_size, alignment, True
     )
 
 
 def _clean_logits_output(
-    values, lengths, table, pages, capacity, page_size, live_tiles_only
+    values, lengths, table, pages, capacity, page_size, alignment, live_tiles_only
 ):
     if (
         values.ndim != 2
@@ -3935,11 +4179,12 @@ def _clean_logits_output(
         or values.dtype not in (torch.float32, torch.bfloat16)
     ):
         raise RuntimeError("DeepGEMM returned incompatible score geometry")
+    stride = (capacity + alignment - 1) // alignment * alignment
     output = torch.empty(
-        (values.shape[0], capacity), dtype=values.dtype, device=values.device
+        (values.shape[0], stride), dtype=values.dtype, device=values.device
     )
     if output.numel():
-        _clean_logits[(values.shape[0], triton.cdiv(capacity, 1024))](
+        _clean_logits[(values.shape[0], triton.cdiv(stride, 1024))](
             values,
             lengths,
             table if table is not None else lengths,
@@ -3951,6 +4196,7 @@ def _clean_logits_output(
             table.shape[1] if table is not None else 0,
             pages,
             capacity,
+            stride,
             page_size,
             table is not None,
             live_tiles_only,

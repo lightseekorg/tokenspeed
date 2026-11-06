@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX1250 mHC prenorm projection and reduction for hc=4 mixing coefficients."""
+"""GFX1250 hc=4 mHC: mixing coefficients, stream collapse and post-mapping."""
 
 from __future__ import annotations
 
@@ -26,34 +26,78 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 __all__ = [
-    "gluon_mhc_apply_pre_fp8_group32_gfx1250",
+    "gluon_mhc_apply_pre_gfx1250",
     "gluon_mhc_mixes_project_gfx1250",
     "gluon_mhc_mixes_reduce_gfx1250",
-    "launch_gluon_mhc_apply_pre_fp8_group32_gfx1250",
+    "gluon_mhc_post_gfx1250",
+    "launch_gluon_mhc_apply_pre_gfx1250",
+    "launch_gluon_mhc_mixes_gfx1250",
     "launch_gluon_mhc_mixes_project_gfx1250",
     "launch_gluon_mhc_mixes_reduce_gfx1250",
+    "launch_gluon_mhc_post_gfx1250",
+    "mhc_mixes_project_splits",
     "use_gluon_mhc_mixes_project_gfx1250",
 ]
 
-_BLOCK_M = 64
-_TILE_CONFIGS = ((128, 4), (64, 4), (64, 3))
-_WARP_BASES_M4 = ((1, 0), (2, 0))
+_BLOCK_K = 64
+_NUM_BUFFERS = 4
+# Projection CTAs to aim for: two per CU on 256 CUs.
+_PROJECT_MIN_CTAS = 512
 _REDUCE_WARPS = 4
 _APPLY_PRE_WARPS = 4
+_POST_BLOCK_H = 1024
+_POST_WARPS = 4
+# Above this many tokens, post streams its data with non-temporal accesses;
+# smaller calls keep caching so the next mixes read the new streams from cache.
+_POST_STREAM_TOKENS = 2048
 
 
 @gluon.jit
-def _project_tile(a, b, acc, correction, square_sum):
+def _split_weight(w):
+    """Split FP32 ``w`` into three BF16 terms whose sum is exactly ``w``.
+
+    The high and middle terms are 8-bit truncations and the remainder has at
+    most 8 significant bits. Masking the FP32 bits avoids widening BF16 back
+    to FP32, whose VOPD lowering stalls on an SGPR mask per pair.
+    """
+    high = (w.to(gl.int32, bitcast=True) & -65536).to(gl.float32, bitcast=True)
+    rest = w - high
+    middle = (rest.to(gl.int32, bitcast=True) & -65536).to(gl.float32, bitcast=True)
+    low = rest - middle
+    return high.to(gl.bfloat16), middle.to(gl.bfloat16), low.to(gl.bfloat16)
+
+
+@gluon.jit
+def _project_tile(
+    a,
+    b_smem,
+    split_smem,
+    w_layout: gl.constexpr,
+    dot_layout_b: gl.constexpr,
+    acc,
+    correction,
+    square_sum,
+    SHARED_SPLIT: gl.constexpr,
+):
     """Accumulate one K tile of ``a @ b`` and the row sums of ``a * a``.
 
-    ``b`` is FP32. Its BF16 rounding and two BF16 remainders sum back to it
-    exactly, and BF16 products are exact in FP32, so three BF16 WMMAs give the
-    FP32 product up to accumulation order.
+    ``b`` is FP32; BF16 products are exact in FP32, so the three BF16 WMMAs
+    of its exact split give the FP32 product up to accumulation order. With
+    SHARED_SPLIT the waves split disjoint rows of the tile once and share the
+    BF16 terms through LDS instead of each splitting the whole tile.
     """
-    high = b.to(gl.bfloat16)
-    rest = b - high.to(gl.float32)
-    middle = rest.to(gl.bfloat16)
-    low = (rest - middle.to(gl.float32)).to(gl.bfloat16)
+    if SHARED_SPLIT:
+        high, middle, low = _split_weight(b_smem.load(layout=w_layout))
+        split_smem.index(0).store(high)
+        split_smem.index(1).store(middle)
+        split_smem.index(2).store(low)
+        high = split_smem.index(0).permute([1, 0]).load(layout=dot_layout_b)
+        middle = split_smem.index(1).permute([1, 0]).load(layout=dot_layout_b)
+        low = split_smem.index(2).permute([1, 0]).load(layout=dot_layout_b)
+    else:
+        high, middle, low = _split_weight(
+            b_smem.permute([1, 0]).load(layout=dot_layout_b)
+        )
     acc = gl.amd.cdna5.wmma(a, high, acc)
     correction = gl.amd.cdna5.wmma(a, middle, correction)
     correction = gl.amd.cdna5.wmma(a, low, correction)
@@ -95,6 +139,8 @@ def gluon_mhc_mixes_project_gfx1250(
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     WARP_BASES: gl.constexpr,
+    SHARED_SPLIT: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
     """Store one K partition's ``x @ fn.T`` and ``sum(x * x)`` for a row tile.
 
@@ -103,7 +149,8 @@ def gluon_mhc_mixes_project_gfx1250(
     at least NUM_BUFFERS, and stores FP32 partials ``out_mul`` [splits, T, 24]
     and ``out_sqrsum`` [splits, T]. The 24 mixes pad to two 16-wide WMMA tiles;
     TDM zero-fills the padding rows of ``fn`` and the rows of ``x`` past
-    ``num_tokens``.
+    ``num_tokens``. WARP_BASES places the waves over rows and, for small
+    row tiles, over the two mix tiles.
     """
     BLOCK_N: gl.constexpr = 32
     MIXES: gl.constexpr = 24
@@ -124,6 +171,10 @@ def gluon_mhc_mixes_project_gfx1250(
     dot_layout_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=wmma_layout, k_width=8
     )
+    # Each wave splits BLOCK_N // NUM_WARPS weight rows with SHARED_SPLIT.
+    w_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [128 // BLOCK_K, BLOCK_K // 4], [NUM_WARPS, 1], [1, 0]
+    )
     shared_layout_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
     )
@@ -136,6 +187,15 @@ def gluon_mhc_mixes_project_gfx1250(
     b_smem = gl.allocate_shared_memory(
         fn_ptr.dtype.element_ty, [NUM_BUFFERS, BLOCK_N, BLOCK_K], shared_layout_b
     )
+    # Without SHARED_SPLIT the BF16 split buffers are not allocated.
+    split_smem = b_smem
+    if SHARED_SPLIT:
+        split_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+        )
+        split_smem = gl.allocate_shared_memory(
+            gl.bfloat16, [3, BLOCK_N, BLOCK_K], split_layout
+        )
     a_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=x_ptr + off_m.to(gl.int64) * K,
         shape=(num_tokens - off_m, K),
@@ -164,19 +224,37 @@ def gluon_mhc_mixes_project_gfx1250(
         gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
         slot = tile % NUM_BUFFERS
         a = a_smem.index(slot).load(layout=dot_layout_a)
-        b = b_smem.index(slot).permute([1, 0]).load(layout=dot_layout_b)
         prefetch_tile = tile + NUM_BUFFERS - 1
         prefetch = k_base + prefetch_tile * BLOCK_K
         prefetch_slot = prefetch_tile % NUM_BUFFERS
         gl.amd.cdna5.tdm.async_load(a_desc, [0, prefetch], a_smem.index(prefetch_slot))
         gl.amd.cdna5.tdm.async_load(b_desc, [0, prefetch], b_smem.index(prefetch_slot))
-        acc, correction, square_sum = _project_tile(a, b, acc, correction, square_sum)
+        acc, correction, square_sum = _project_tile(
+            a,
+            b_smem.index(slot),
+            split_smem,
+            w_layout,
+            dot_layout_b,
+            acc,
+            correction,
+            square_sum,
+            SHARED_SPLIT,
+        )
     for tail in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2 - tail))
         slot = (main_tiles + tail) % NUM_BUFFERS
         a = a_smem.index(slot).load(layout=dot_layout_a)
-        b = b_smem.index(slot).permute([1, 0]).load(layout=dot_layout_b)
-        acc, correction, square_sum = _project_tile(a, b, acc, correction, square_sum)
+        acc, correction, square_sum = _project_tile(
+            a,
+            b_smem.index(slot),
+            split_smem,
+            w_layout,
+            dot_layout_b,
+            acc,
+            correction,
+            square_sum,
+            SHARED_SPLIT,
+        )
 
     rows = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, wmma_layout))
     mixes = gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
@@ -195,18 +273,40 @@ def gluon_mhc_mixes_project_gfx1250(
     )
 
 
-def _tile_config(k: int, n_splits: int) -> tuple[int, int] | None:
-    """Return ``(block_k, num_buffers)`` whose K tiles split evenly and fill the
-    pipeline, or None."""
-    for block_k, num_buffers in _TILE_CONFIGS:
-        if k % (block_k * n_splits) == 0 and k // block_k // n_splits >= num_buffers:
-            return block_k, num_buffers
-    return None
+def _project_tiling(num_tokens: int) -> tuple[int, int, tuple, bool]:
+    """Return ``(block_m, num_warps, warp_bases, shared_split)`` for a batch.
+
+    Decode batches use 16-row tiles with one wave per mix tile, so the
+    weight split is not repeated for rows that do not exist; larger batches
+    put four waves over the rows and split each weight tile once per CTA.
+    """
+    if num_tokens <= 128:
+        return 16, 2, ((0, 1),), False
+    if num_tokens <= 2048:
+        return 64, 4, ((1, 0), (2, 0)), True
+    return 128, 4, ((1, 0), (2, 0)), True
 
 
-def use_gluon_mhc_mixes_project_gfx1250(k: int, n_splits: int) -> bool:
-    """Return whether the WMMA projection supports this K and split count."""
-    return _tile_config(k, n_splits) is not None
+def mhc_mixes_project_splits(num_tokens: int, k: int) -> int:
+    """Return the K partition count of the WMMA projection, or 0 if ``k``
+    does not split into whole 64-wide tiles that fill the TDM pipeline.
+
+    The count is the smallest divisor of the K tiles giving at least
+    _PROJECT_MIN_CTAS CTAs, capped so each partition fills the pipeline.
+    """
+    k_tiles, rest = divmod(k, _BLOCK_K)
+    if rest or k_tiles < _NUM_BUFFERS:
+        return 0
+    row_tiles = triton.cdiv(num_tokens, _project_tiling(num_tokens)[0])
+    divisors = [d for d in range(1, k_tiles // _NUM_BUFFERS + 1) if k_tiles % d == 0]
+    return next(
+        (d for d in divisors if row_tiles * d >= _PROJECT_MIN_CTAS), divisors[-1]
+    )
+
+
+def use_gluon_mhc_mixes_project_gfx1250(k: int) -> bool:
+    """Return whether the WMMA projection supports this K."""
+    return mhc_mixes_project_splits(1, k) > 0
 
 
 def launch_gluon_mhc_mixes_project_gfx1250(
@@ -224,28 +324,29 @@ def launch_gluon_mhc_mixes_project_gfx1250(
         out_mul: Contiguous FP32 [n_splits, T, 24] projection partials.
         out_sqrsum: Contiguous FP32 [n_splits, T] squared-sum partials.
         n_splits: Contiguous K partitions; each must hold a whole number of
-            K tiles that fill the TDM pipeline.
+            64-wide K tiles, at least four.
     """
     num_tokens, k = x.shape
-    config = _tile_config(k, n_splits)
-    if config is None:
+    if k % (_BLOCK_K * n_splits) or k // _BLOCK_K // n_splits < _NUM_BUFFERS:
         raise ValueError(
             f"n_splits={n_splits} cannot split K={k} into full TDM pipelines"
         )
-    block_k, num_buffers = config
-    gluon_mhc_mixes_project_gfx1250[(n_splits, triton.cdiv(num_tokens, _BLOCK_M))](
+    block_m, num_warps, warp_bases, shared_split = _project_tiling(num_tokens)
+    gluon_mhc_mixes_project_gfx1250[(n_splits, triton.cdiv(num_tokens, block_m))](
         x,
         fn,
         out_mul,
         out_sqrsum,
         num_tokens,
-        k // block_k // n_splits,
+        k // _BLOCK_K // n_splits,
         K=k,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_K=block_k,
-        NUM_BUFFERS=num_buffers,
-        WARP_BASES=_WARP_BASES_M4,
-        num_warps=4,
+        BLOCK_M=block_m,
+        BLOCK_K=_BLOCK_K,
+        NUM_BUFFERS=_NUM_BUFFERS,
+        WARP_BASES=warp_bases,
+        SHARED_SPLIT=shared_split,
+        NUM_WARPS=num_warps,
+        num_warps=num_warps,
     )
 
 
@@ -299,31 +400,27 @@ def gluon_mhc_mixes_reduce_gfx1250(
     row/column normalization rounds, the first row step a softmax. Rows past
     ``num_tokens`` are neither read nor stored.
     """
-    # Sixteen lanes own one 4x4 element each of a token's coefficients; split
-    # partials spread over registers, lane groups and waves. After the split
-    # sum, the Sinkhorn row and column sums are two-step lane reductions.
+    # Four lanes own a token's 4x4 matrix, one row of four contiguous FP32
+    # (one 16-byte load per split) each; split partials spread over
+    # registers, lane groups and waves. After the split sum, Sinkhorn row
+    # sums stay in registers and column sums are two-step lane reductions.
     # Prefill keeps splits in registers (no redundant Sinkhorn work); decode
     # has many splits per token and spreads them over lanes and waves.
-    TOKEN_LANES: gl.constexpr = 2 // SPLIT_LANES
+    TOKEN_LANES: gl.constexpr = 8 // SPLIT_LANES
     TOKEN_WARPS: gl.constexpr = NUM_WARPS // SPLIT_WARPS
     TOKENS: gl.constexpr = TOKEN_LANES * TOKEN_WARPS
     SPLIT_BLOCK: gl.constexpr = SPLIT_REGS * SPLIT_LANES * SPLIT_WARPS
     layout: gl.constexpr = gl.BlockedLayout(
-        [SPLIT_REGS, 1, 1, 1],
-        [SPLIT_LANES, TOKEN_LANES, 4, 4],
+        [SPLIT_REGS, 1, 1, 4],
+        [SPLIT_LANES, TOKEN_LANES, 4, 1],
         [SPLIT_WARPS, TOKEN_WARPS, 1, 1],
         [3, 2, 1, 0],
     )
     matrix_layout: gl.constexpr = gl.SliceLayout(0, layout)
-    splits = gl.arange(
-        0,
-        SPLIT_BLOCK,
-        layout=gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, layout))),
-    )
+    split_token_layout: gl.constexpr = gl.SliceLayout(2, gl.SliceLayout(3, layout))
+    splits = gl.arange(0, SPLIT_BLOCK, layout=gl.SliceLayout(1, split_token_layout))
     tokens = gl.program_id(0) * TOKENS + gl.arange(
-        0,
-        TOKENS,
-        layout=gl.SliceLayout(0, gl.SliceLayout(2, gl.SliceLayout(3, layout))),
+        0, TOKENS, layout=gl.SliceLayout(0, split_token_layout)
     )
     rows = gl.arange(
         0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, layout)))
@@ -332,23 +429,28 @@ def gluon_mhc_mixes_reduce_gfx1250(
         0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, layout)))
     )
     matrix = rows[None, None, :, None] * 4 + cols[None, None, None, :]
-    token_live = (tokens < num_tokens)[None, :, None, None]
+    head_rows = (rows < 2)[None, None, :, None]
 
     # ``head`` covers projection columns 0..15 (pre, post and two comb rows,
-    # only the first two rows are used); ``comb`` covers columns 8..23.
+    # only the first two rows are loaded); ``comb`` covers columns 8..23.
     head = gl.zeros([SPLIT_BLOCK, TOKENS, 4, 4], gl.float32, layout)
     comb = gl.zeros([SPLIT_BLOCK, TOKENS, 4, 4], gl.float32, layout)
-    squares = gl.zeros([SPLIT_BLOCK, TOKENS, 4, 4], gl.float32, layout)
+    squares = gl.zeros([SPLIT_BLOCK, TOKENS], gl.float32, split_token_layout)
     for split_start in range(0, n_splits, SPLIT_BLOCK):
-        split = (split_start + splits)[:, None, None, None]
-        live = (split < n_splits) & token_live
-        row = split * num_tokens + tokens[None, :, None, None]
-        head += gl.load(projection + row * 24 + matrix, mask=live, other=0.0)
-        comb += gl.load(projection + row * 24 + 8 + matrix, mask=live, other=0.0)
-        squares += gl.load(square_sum + row + matrix * 0, mask=live, other=0.0)
+        split = split_start + splits
+        live = (split[:, None] < n_splits) & (tokens[None, :] < num_tokens)
+        row = split[:, None] * num_tokens + tokens[None, :]
+        offsets = row[:, :, None, None] * 24 + matrix
+        matrix_live = live[:, :, None, None]
+        head += gl.load(projection + offsets, mask=matrix_live & head_rows, other=0.0)
+        comb += gl.load(projection + offsets + 8, mask=matrix_live, other=0.0)
+        squares += gl.load(square_sum + row, mask=live, other=0.0)
     head = gl.sum(head, axis=0)
     comb = gl.sum(comb, axis=0)
-    inverse_rms = gl.rsqrt(gl.sum(squares, axis=0) / (4 * HIDDEN_SIZE) + RMS_EPS)
+    square_total = gl.convert_layout(
+        gl.sum(squares, axis=0), gl.SliceLayout(1, gl.SliceLayout(2, matrix_layout))
+    )
+    inverse_rms = gl.rsqrt(square_total / (4 * HIDDEN_SIZE) + RMS_EPS)[:, None, None]
 
     out_rows = gl.arange(
         0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, matrix_layout))
@@ -381,7 +483,7 @@ def gluon_mhc_mixes_reduce_gfx1250(
     comb = comb * inverse_rms * gl.load(hc_scale + 2) + gl.load(
         hc_base + 8 + out_matrix
     )
-    # The Sinkhorn chain is latency-bound on one element per lane; dividing
+    # The Sinkhorn chain is latency-bound on four elements per lane; dividing
     # through the hardware reciprocal (~1 ulp) instead of the IEEE division
     # sequence shortens each of its 40 steps and stays far inside the mixes'
     # tolerance.
@@ -437,15 +539,19 @@ def launch_gluon_mhc_mixes_reduce_gfx1250(
     """
     if not num_tokens:
         return
-    # Splits sit in registers for prefill, and also spread over lanes (and
-    # waves when there are few tokens) as the split count grows.
+    # Up to eight splits (prefill) sit in registers and two lane groups; more
+    # splits spread over more lane groups (and every wave for decode), so one
+    # pass loads them all.
     if n_splits <= 8:
-        split_regs, split_lanes, split_warps = 8, 1, 1
+        split_regs, split_lanes, split_warps = 4, 2, 1
     elif num_tokens > 256:
-        split_regs, split_lanes, split_warps = 8, 2, 1
+        split_regs, split_lanes, split_warps = (
+            (8, 4, 1) if n_splits <= 32 else (4, 4, 4)
+        )
     else:
-        split_regs, split_lanes, split_warps = 8, 2, 4
-    tokens_per_cta = (2 // split_lanes) * (_REDUCE_WARPS // split_warps)
+        split_regs = min(triton.next_power_of_2(triton.cdiv(n_splits, 32)), 4)
+        split_lanes, split_warps = 8, _REDUCE_WARPS
+    tokens_per_cta = (8 // split_lanes) * (_REDUCE_WARPS // split_warps)
     gluon_mhc_mixes_reduce_gfx1250[(triton.cdiv(num_tokens, tokens_per_cta),)](
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -468,24 +574,82 @@ def launch_gluon_mhc_mixes_reduce_gfx1250(
     )
 
 
-def _mhc_apply_pre_fp8_metadata(grid, kernel, args):
-    """Report the four streams read and the BF16 output, codes and scales
-    written per token."""
+def launch_gluon_mhc_mixes_gfx1250(
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute hc=4 mHC pre/post/combination coefficients on gfx1250.
+
+    Args:
+        residual: Contiguous BF16 residual streams ``[T, 4, H]`` with
+            ``use_gluon_mhc_mixes_project_gfx1250(4 * H)``.
+        weight: Contiguous FP32 mixing projection ``[24, 4 * H]``.
+        scale: FP32 pre/post/combination scales ``[3]``.
+        base: FP32 mixing biases ``[24]``.
+        rms_eps: Epsilon of the residual RMS normalization.
+        hc_eps: Epsilon of the pre-mix and Sinkhorn normalization.
+        sinkhorn_iters: Positive number of Sinkhorn iterations.
+
+    Returns:
+        FP32 pre ``[T, 4]``, post ``[T, 4]`` and combination ``[T, 4, 4]``
+        indexed [input stream, output stream].
+    """
+    tokens, hc_mult, hidden_size = residual.shape
+    k = 4 * hidden_size
+    splits = mhc_mixes_project_splits(tokens, k)
+    if hc_mult != 4 or not splits:
+        raise ValueError(f"GFX1250 mHC mixes cannot tile [T, {hc_mult}, {hidden_size}]")
+    device = residual.device
+    pre = torch.empty((tokens, 4), device=device, dtype=torch.float32)
+    post = torch.empty_like(pre)
+    comb = torch.empty((tokens, 4, 4), device=device, dtype=torch.float32)
+    if tokens == 0:
+        return pre, post, comb
+    projection = torch.empty((splits, tokens, 24), device=device, dtype=torch.float32)
+    square_sum = torch.empty((splits, tokens), device=device, dtype=torch.float32)
+    launch_gluon_mhc_mixes_project_gfx1250(
+        residual.view(tokens, k), weight, projection, square_sum, splits
+    )
+    launch_gluon_mhc_mixes_reduce_gfx1250(
+        projection,
+        square_sum,
+        scale,
+        base,
+        pre,
+        post,
+        comb,
+        hidden_size=hidden_size,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        n_splits=splits,
+        num_tokens=tokens,
+    )
+    return pre, post, comb
+
+
+def _mhc_apply_pre_metadata(grid, kernel, args):
+    """Report the four streams read and the BF16 output (plus FP8 codes and
+    scales) written per token."""
     tokens = args["num_tokens"]
     hidden = args["HIDDEN_SIZE"]
+    quant = args["QUANT"]
     return {
         "name": kernel.name,
-        "bytes": tokens * hidden * (8 + 2 + 1)
-        + tokens * (16 + hidden // 32)
-        + hidden * args["norm_weight"].element_size(),
-        "flops32": tokens * hidden * 12,
+        "bytes": tokens * hidden * (8 + 2 + (1 if quant else 0))
+        + tokens * (16 + (hidden // 32 if quant else 0))
+        + (hidden * args["norm_weight"].element_size() if args["NORM"] else 0),
+        "flops32": tokens * hidden * (12 if args["NORM"] else 8),
     }
 
 
-@gluon.jit(
-    launch_metadata=_mhc_apply_pre_fp8_metadata, do_not_specialize=("num_tokens",)
-)
-def gluon_mhc_apply_pre_fp8_group32_gfx1250(
+@gluon.jit(launch_metadata=_mhc_apply_pre_metadata, do_not_specialize=("num_tokens",))
+def gluon_mhc_apply_pre_gfx1250(
     pre_mix,
     residual,
     norm_weight,
@@ -495,16 +659,19 @@ def gluon_mhc_apply_pre_fp8_group32_gfx1250(
     num_tokens,
     HIDDEN_SIZE: gl.constexpr,
     BLOCK_H: gl.constexpr,
+    NORM: gl.constexpr,
     EPS: gl.constexpr,
+    QUANT: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Collapse four BF16 streams with ``pre_mix``, apply RMSNorm, and store
-    the BF16 result with its group-32 E4M3 codes and UE8M0 scales.
+    """Collapse four BF16 streams with ``pre_mix``, optionally apply RMSNorm,
+    and store the BF16 result (with its group-32 E4M3 codes and UE8M0 scales
+    when QUANT).
 
-    One token per CTA so RMSNorm reduces the row in one pass; every lane moves
-    eight contiguous BF16 values (16-byte accesses), so four lanes hold one
-    quantization group. Rounded like ``gluon_quantize_fp8_group32_ue8m0_gfx1250``
-    reading the BF16 output.
+    One token per CTA so RMSNorm reduces the row in one pass; every lane
+    moves eight contiguous BF16 values (16-byte accesses), so four lanes hold
+    one quantization group. Codes are rounded like
+    ``gluon_quantize_fp8_group32_ue8m0_gfx1250`` reading the BF16 output.
     """
     token = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
@@ -519,58 +686,75 @@ def gluon_mhc_apply_pre_fp8_group32_gfx1250(
         ).to(gl.float32)
     # The weighted stream sum is rounded to BF16 before RMSNorm reads it, as
     # in the unfused path.
-    normed = acc.to(gl.bfloat16).to(gl.float32)
-    variance = gl.sum(normed * normed, axis=0) / HIDDEN_SIZE
-    scale = gl.rsqrt(variance + EPS)
-    weight = gl.amd.cdna5.buffer_load(norm_weight, hidden, mask=mask).to(gl.float32)
-    values = (normed * scale * weight).to(gl.bfloat16)
+    values = acc.to(gl.bfloat16)
+    if NORM:
+        normed = values.to(gl.float32)
+        variance = gl.sum(normed * normed, axis=0) / HIDDEN_SIZE
+        scale = gl.rsqrt(variance + EPS)
+        weight = gl.amd.cdna5.buffer_load(norm_weight, hidden, mask=mask).to(gl.float32)
+        values = (normed * scale * weight).to(gl.bfloat16)
     gl.amd.cdna5.buffer_store(values, out, token * HIDDEN_SIZE + hidden, mask=mask)
-    groups = gl.reshape(values.to(gl.float32), [BLOCK_H // 32, 32])
-    amax = gl.maximum(gl.max(gl.abs(groups), 1), 1.0e-4)
-    bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
-    group_scale = (exponent << 23).to(gl.float32, bitcast=True)
-    quantized = gl.div_rn(groups, group_scale[:, None]).to(gl.float8e4nv)
-    quantized = gl.convert_layout(gl.reshape(quantized, [BLOCK_H]), layout)
-    gl.amd.cdna5.buffer_store(quantized, codes, token * HIDDEN_SIZE + hidden, mask=mask)
-    group = gl.arange(0, BLOCK_H // 32, layout=gl.SliceLayout(1, groups.type.layout))
-    gl.amd.cdna5.buffer_store(
-        exponent.to(gl.uint8),
-        scales,
-        token * (HIDDEN_SIZE // 32) + group,
-        mask=group < HIDDEN_SIZE // 32,
-    )
+    if QUANT:
+        groups = gl.reshape(values.to(gl.float32), [BLOCK_H // 32, 32])
+        amax = gl.maximum(gl.max(gl.abs(groups), 1), 1.0e-4)
+        bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+        # The scale is a power of two, so multiplying by its exact reciprocal
+        # rounds like the division.
+        inverse = ((254 - exponent) << 23).to(gl.float32, bitcast=True)
+        quantized = (groups * inverse[:, None]).to(gl.float8e4nv)
+        quantized = gl.convert_layout(gl.reshape(quantized, [BLOCK_H]), layout)
+        gl.amd.cdna5.buffer_store(
+            quantized, codes, token * HIDDEN_SIZE + hidden, mask=mask
+        )
+        group = gl.arange(
+            0, BLOCK_H // 32, layout=gl.SliceLayout(1, groups.type.layout)
+        )
+        gl.amd.cdna5.buffer_store(
+            exponent.to(gl.uint8),
+            scales,
+            token * (HIDDEN_SIZE // 32) + group,
+            mask=group < HIDDEN_SIZE // 32,
+        )
 
 
-def launch_gluon_mhc_apply_pre_fp8_group32_gfx1250(
+def launch_gluon_mhc_apply_pre_gfx1250(
     residual: torch.Tensor,
     pre_mix: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Mix four BF16 streams with ``pre_mix``, apply RMSNorm and quantize.
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+    quantize: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mix four BF16 streams with ``pre_mix``, optionally apply RMSNorm and
+    quantize.
 
     Args:
-        residual: Contiguous BF16 residual streams ``[..., 4, hidden_size]``,
-            ``hidden_size`` divisible by 32.
+        residual: Contiguous BF16 residual streams ``[..., 4, hidden_size]``.
         pre_mix: Contiguous FP32 coefficients ``[..., 4]``.
-        norm_weight: Contiguous BF16 or FP32 RMSNorm weight ``[hidden_size]``.
-        norm_eps: RMSNorm epsilon.
+        norm_weight: Optional contiguous BF16 or FP32 RMSNorm weight
+            ``[hidden_size]``; required when ``quantize``.
+        norm_eps: RMSNorm epsilon, given together with ``norm_weight``.
+        quantize: Also return group-32 E4M3 codes ``[tokens, hidden_size]``
+            and uint8 UE8M0 scales ``[tokens, hidden_size // 32]`` of the
+            output; needs ``hidden_size % 32 == 0``.
 
     Returns:
-        BF16 layer input ``[..., hidden_size]``, its group-32 E4M3 codes
-        ``[tokens, hidden_size]`` and uint8 UE8M0 scales
-        ``[tokens, hidden_size // 32]``.
+        BF16 layer input ``[..., hidden_size]``, plus codes and scales when
+        ``quantize`` is set.
     """
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
+    if quantize and norm_weight is None:
+        raise ValueError("GFX1250 mHC apply-pre quantizes only the normed input")
     hidden_size = residual.shape[-1]
     if residual.shape[-2] != 4 or pre_mix.shape[-1] != 4:
         raise ValueError("GFX1250 mHC apply-pre requires four residual streams")
-    if norm_weight.shape != (hidden_size,) or hidden_size % 32:
-        raise ValueError(
-            "GFX1250 mHC apply-pre needs a [hidden_size] norm weight and "
-            "hidden_size % 32 == 0"
-        )
-    if not all(t.is_contiguous() for t in (pre_mix, residual, norm_weight)):
+    if norm_weight is not None and norm_weight.shape != (hidden_size,):
+        raise ValueError("GFX1250 mHC apply-pre needs a [hidden_size] norm weight")
+    if quantize and hidden_size % 32:
+        raise ValueError("GFX1250 mHC apply-pre quantization needs hidden_size % 32")
+    tensors = (pre_mix, residual) + (() if norm_weight is None else (norm_weight,))
+    if not all(t.is_contiguous() for t in tensors):
         raise ValueError("GFX1250 mHC apply-pre tensors must be contiguous")
     if residual.dtype != torch.bfloat16 or pre_mix.dtype != torch.float32:
         raise ValueError("GFX1250 mHC apply-pre needs BF16 streams, FP32 pre_mix")
@@ -578,25 +762,157 @@ def launch_gluon_mhc_apply_pre_fp8_group32_gfx1250(
         raise ValueError("GFX1250 mHC apply-pre exceeds 32-bit buffer offsets")
     out = residual.new_empty((*residual.shape[:-2], hidden_size))
     num_tokens = residual.numel() // (4 * hidden_size)
-    codes = torch.empty(
-        (num_tokens, hidden_size), dtype=torch.float8_e4m3fn, device=out.device
-    )
-    scales = torch.empty(
-        (num_tokens, hidden_size // 32), dtype=torch.uint8, device=out.device
-    )
+    codes = scales = out
+    if quantize:
+        codes = torch.empty(
+            (num_tokens, hidden_size), dtype=torch.float8_e4m3fn, device=out.device
+        )
+        scales = torch.empty(
+            (num_tokens, hidden_size // 32), dtype=torch.uint8, device=out.device
+        )
     if num_tokens:
-        gluon_mhc_apply_pre_fp8_group32_gfx1250[(num_tokens,)](
+        norm = norm_weight is not None
+        gluon_mhc_apply_pre_gfx1250[(num_tokens,)](
             pre_mix,
             residual,
-            norm_weight,
+            norm_weight if norm else out,
             out,
             codes,
             scales,
             num_tokens,
             HIDDEN_SIZE=hidden_size,
             BLOCK_H=triton.next_power_of_2(hidden_size),
-            EPS=norm_eps,
+            NORM=norm,
+            EPS=norm_eps if norm else 0.0,
+            QUANT=quantize,
             NUM_WARPS=_APPLY_PRE_WARPS,
             num_warps=_APPLY_PRE_WARPS,
+            # Match the portable kernels' rounding: the plain collapse rounds
+            # each product (no FMA), the normalized one contracts to FMA.
+            enable_fp_fusion=norm,
         )
-    return out, codes, scales
+    return (out, codes, scales) if quantize else out
+
+
+def _mhc_post_metadata(grid, kernel, args):
+    """Report the layer output and four streams read and the four streams
+    written per token."""
+    tokens = args["num_tokens"]
+    hidden = args["HIDDEN_SIZE"]
+    return {
+        "name": kernel.name,
+        "bytes": tokens * hidden * (2 + 8 + 8) + tokens * 20 * 4,
+        "flops32": tokens * hidden * 4 * 9,
+    }
+
+
+@gluon.jit(launch_metadata=_mhc_post_metadata, do_not_specialize=("num_tokens",))
+def gluon_mhc_post_gfx1250(
+    hidden_states,
+    residual,
+    post,
+    comb,
+    out,
+    num_tokens,
+    HIDDEN_SIZE: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    STREAM: gl.constexpr,
+):
+    """Store ``post * hidden_states + comb^T residual`` for one hidden block of
+    a token, rounded like the portable kernel: ``post * x`` and then one FMA
+    per input stream, in stream order.
+
+    One token per CTA keeps the twenty coefficients scalar loads; each lane
+    moves eight contiguous BF16 values (16-byte accesses). STREAM flattens
+    the grid so consecutive CTAs cover adjacent hidden blocks of one token
+    and makes every vector access non-temporal.
+    """
+    if STREAM:
+        hidden_blocks: gl.constexpr = (HIDDEN_SIZE + BLOCK_H - 1) // BLOCK_H
+        token = gl.program_id(0) // hidden_blocks
+        hidden_block = gl.program_id(0) % hidden_blocks
+    else:
+        token = gl.program_id(0)
+        hidden_block = gl.program_id(1)
+    cache: gl.constexpr = ".cs" if STREAM else ""
+    layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
+    hidden = hidden_block * BLOCK_H + gl.arange(0, BLOCK_H, layout=layout)
+    mask = hidden < HIDDEN_SIZE
+    x = gl.amd.cdna5.buffer_load(
+        hidden_states, token * HIDDEN_SIZE + hidden, mask=mask, cache=cache
+    ).to(gl.float32)
+    base = token * (4 * HIDDEN_SIZE) + hidden
+    r0 = gl.amd.cdna5.buffer_load(residual, base, mask=mask, cache=cache).to(gl.float32)
+    r1 = gl.amd.cdna5.buffer_load(
+        residual, base + HIDDEN_SIZE, mask=mask, cache=cache
+    ).to(gl.float32)
+    r2 = gl.amd.cdna5.buffer_load(
+        residual, base + 2 * HIDDEN_SIZE, mask=mask, cache=cache
+    ).to(gl.float32)
+    r3 = gl.amd.cdna5.buffer_load(
+        residual, base + 3 * HIDDEN_SIZE, mask=mask, cache=cache
+    ).to(gl.float32)
+    for stream in gl.static_range(4):
+        value = gl.load(post + token * 4 + stream) * x
+        value = gl.fma(gl.load(comb + token * 16 + stream), r0, value)
+        value = gl.fma(gl.load(comb + token * 16 + 4 + stream), r1, value)
+        value = gl.fma(gl.load(comb + token * 16 + 8 + stream), r2, value)
+        value = gl.fma(gl.load(comb + token * 16 + 12 + stream), r3, value)
+        gl.amd.cdna5.buffer_store(
+            value.to(gl.bfloat16),
+            out,
+            base + stream * HIDDEN_SIZE,
+            mask=mask,
+            cache=cache,
+        )
+
+
+def launch_gluon_mhc_post_gfx1250(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the hc=4 mHC post-mapping and residual update.
+
+    Args:
+        hidden_states: Contiguous BF16 layer output ``[..., hidden_size]``.
+        residual: Contiguous BF16 residual streams ``[..., 4, hidden_size]``.
+        post: Contiguous FP32 post coefficients ``[..., 4, 1]``.
+        comb: Contiguous FP32 combination ``[..., 4, 4]`` indexed
+            [input, output].
+
+    Returns:
+        BF16 ``post * hidden_states + comb^T residual`` shaped like ``residual``.
+    """
+    hidden_size = residual.shape[-1]
+    if residual.shape[-2] != 4:
+        raise ValueError("GFX1250 mHC post requires four residual streams")
+    tensors = (hidden_states, residual, post, comb)
+    if not all(t.is_contiguous() for t in tensors):
+        raise ValueError("GFX1250 mHC post tensors must be contiguous")
+    if residual.numel() >= 2**31:
+        raise ValueError("GFX1250 mHC post exceeds 32-bit buffer offsets")
+    out = torch.empty_like(residual)
+    num_tokens = residual.numel() // (4 * hidden_size)
+    if num_tokens:
+        hidden_blocks = triton.cdiv(hidden_size, _POST_BLOCK_H)
+        stream = num_tokens > _POST_STREAM_TOKENS
+        # The streaming grid is flat, so the token count is not bounded by
+        # the 65535 limit of the second grid dimension.
+        grid = (num_tokens * hidden_blocks,) if stream else (num_tokens, hidden_blocks)
+        gluon_mhc_post_gfx1250[grid](
+            hidden_states,
+            residual,
+            post,
+            comb,
+            out,
+            num_tokens,
+            HIDDEN_SIZE=hidden_size,
+            BLOCK_H=_POST_BLOCK_H,
+            NUM_WARPS=_POST_WARPS,
+            STREAM=stream,
+            num_warps=_POST_WARPS,
+        )
+    return out

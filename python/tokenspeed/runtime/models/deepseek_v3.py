@@ -112,7 +112,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
     should_exclude_quant_module,
 )
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import get_rope, yarn_get_mscale
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -149,11 +149,17 @@ def _prepare_mla_kv_b_proj_weights(
     When ``self_attn`` already holds a pair of the same geometry (a live
     weight update re-running ``post_load_weights``), the new values are
     copied into it so captured CUDA graphs keep valid addresses.
+
+    An attention with ``absorbed_weights_k_major`` set runs both absorbed
+    products as plain GEMMs and keeps their reduction dim contiguous
+    regardless of the fused value-projection kernel's preference.
     """
     w_kc, w_vc = w.unflatten(
         0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
     ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-    if mla_project_value_prefers_contiguous_weight(
+    if not getattr(
+        self_attn, "absorbed_weights_k_major", False
+    ) and mla_project_value_prefers_contiguous_weight(
         dtype=w.dtype,
         heads=w_vc.shape[0],
         latent_dim=w_vc.shape[2],
@@ -428,14 +434,6 @@ class DeepseekV3MoE(MoEBlock):
             alt_stream,
             fusions=(MoEBlockFusion.FINALIZE_ADD_SHARED,),
         )
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):

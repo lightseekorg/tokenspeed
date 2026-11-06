@@ -66,6 +66,53 @@ def test_fp8_query_gather_preserves_bytes(monkeypatch, dtype):
     assert comm.gather_query_heads(query, (0,)) is query
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_rank_major_query_gather_skips_the_relayout(monkeypatch, dtype):
+    from tokenspeed.runtime.layers.attention.dcp import comm
+
+    tokens, heads, dim = 3, 4, 16
+    # Arbitrary bytes per rank; this process is rank 0 of two.
+    generator = torch.Generator().manual_seed(11)
+    width = dim * dtype.itemsize
+
+    def random_query():
+        raw = torch.randint(0, 256, (tokens, heads, width), generator=generator)
+        return raw.to(torch.uint8).view(dtype)
+
+    local, peer = random_query(), random_query()
+    wire = torch.uint8 if dtype == torch.float8_e4m3fn else dtype
+
+    def payload(query):
+        return query.reshape(tokens, heads * dim).view(wire)
+
+    buffers = []
+
+    def gather_single(output, sent, group):
+        assert group == (0, 1) and sent.is_contiguous() and sent.dtype == wire
+        assert torch.equal(sent.view(torch.uint8), payload(local).view(torch.uint8))
+        buffers.append(output)
+        output.copy_(torch.cat((sent, payload(peer)), dim=0))
+
+    def gather(sent, group, dim):
+        assert group == (0, 1) and dim == -1
+        return torch.cat((sent, payload(peer)), dim=-1)
+
+    monkeypatch.setattr(comm, "all_gather_single", gather_single)
+    monkeypatch.setattr(comm, "all_gather", gather)
+    rank_major = comm.gather_query_heads_rank_major(local, (0, 1))
+    assert rank_major.shape == (2, tokens, heads, dim) and rank_major.dtype == dtype
+    # A view of the buffer the collective filled, not a copy.
+    (buffer,) = buffers
+    assert rank_major.data_ptr() == buffer.data_ptr()
+    # Rank r's head h is gathered head r * heads + h of the token-major form.
+    token_major = comm.gather_query_heads(local, (0, 1))
+    relaid = rank_major.view(torch.uint8).permute(1, 0, 2, 3).reshape(tokens, -1)
+    assert torch.equal(relaid, token_major.view(torch.uint8).reshape(tokens, -1))
+    alone = comm.gather_query_heads_rank_major(local, (0,))
+    assert alone.shape == (1, tokens, heads, dim)
+    assert alone.data_ptr() == local.data_ptr()
+
+
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_noncontiguous_pages_and_partial_tail(degree, device):
@@ -819,9 +866,15 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     # combine form.
     backend.num_attention_heads = 8
     backend.num_local_heads = 2
+    # A target verify publishing no causal lengths: _k_row_causal_lengths derives them.
+    backend.is_draft = False
+    backend.spec_num_tokens = query_width
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
-            num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128
+            num_extends=0,
+            seq_lens_k=torch.tensor([128]),
+            max_seq_len_k=128,
+            _dsa_kv_seq_lens=None,
         )
     )
     query = torch.zeros(query_width, 2, 128, dtype=torch.bfloat16)
@@ -849,9 +902,13 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
             kwargs["kv_seq_lens"],
             torch.arange(129 - query_width, 129, dtype=torch.int32),
         )
+        # Owned local slot 64 moves first; the owned count is the core's length.
         expected = torch.full_like(slots, -1)
-        expected[:, rank] = 64
+        expected[:, 0] = 64
         torch.testing.assert_close(kwargs["topk_slots"], expected)
+        torch.testing.assert_close(
+            kwargs["topk_lens"], torch.ones(query_width, dtype=torch.int32)
+        )
         assert kwargs["q"].shape == (query_width, 8, 128)
         return torch.full((query_width, 8, 128), 7.0), torch.zeros(query_width, 8)
 
@@ -874,6 +931,159 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     )
     assert out.shape == (query_width, 256)
     assert (out == 7).all()
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize(
+    "arm",
+    [
+        # Query layout off, as under a pinned prefill plan.
+        "query_layout_off",
+        # Query layout on, but the leaf's prefill selection is not the Triton core.
+        "unprobed",
+        # Query layout on a prefill whose Triton launch would split its keys.
+        "split_size",
+        # Query layout: rank-major gather, records core, records exchange.
+        "records",
+    ],
+)
+def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
+    monkeypatch, rank, arm
+):
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+
+    backend = object.__new__(dsa.DSABackend)
+    backend.kernel_page_size = 64
+    backend.kernel_solution = None
+    backend.prefill_kernel_plan = None
+    backend.decode_kernel_plan = None
+    backend.slot_order = "selection"
+    backend.data_type = torch.bfloat16
+    backend.kv_lora_rank = 128
+    backend.qk_nope_head_dim = 128
+    backend.qk_rope_head_dim = 0
+    backend.index_topk = 512
+    backend.kvp_group = (0, 1, 2, 3)
+    backend.kvp_rank = rank
+    backend.kvp_block_granularity = 64
+    backend.kvp_virtual_block_count = 5
+    backend.query_shard_metadata = None
+    backend.step_counter = None
+    backend.kvp_prefill_query_layout = arm != "query_layout_off"
+    # The probe's verdict, set directly: the forward reads only this flag, any dtype.
+    backend._dcp_records_core = arm != "unprobed"
+    backend._dcp_padded_query = False
+    # The attention-TP slice (2 of 8 heads): the sharded-head combine form.
+    backend.num_attention_heads = 8
+    backend.num_local_heads = 2
+    query = torch.zeros(2, 2, 128, dtype=torch.bfloat16)
+    slots = torch.full((2, 512), -1, dtype=torch.int32)
+    slots[:, :4] = torch.tensor([64, 128, 192, 256])
+    # The second row's length excludes rank 3's candidate.
+    lengths = torch.tensor([4, 3], dtype=torch.int32)
+    kv_seq_lens = torch.tensor([300, 301], dtype=torch.int32)
+    pool = SimpleNamespace(
+        quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        head_dim=128,
+        v_head_dim=128,
+        scaling=0.1,
+        logit_cap=0.0,
+    )
+
+    calls = []
+    sizes = []
+
+    def check_selection(kwargs):
+        # Owned local slot 64 comes first; rank 3 owns nothing live in the second row.
+        expected = torch.full_like(slots, -1)
+        expected[:, 0] = 64
+        expected_lens = torch.ones(2, dtype=torch.int32)
+        if rank == 3:
+            expected[1, 0] = -1
+            expected_lens[1] = 0
+        torch.testing.assert_close(kwargs["topk_slots"], expected)
+        torch.testing.assert_close(kwargs["topk_lens"], expected_lens)
+
+    def gather(q, group):
+        calls.append("gather")
+        assert group == backend.kvp_group
+        return q.repeat(1, 4, 1)
+
+    def prefill(**kwargs):
+        calls.append("prefill")
+        assert kwargs["return_lse"] is True
+        torch.testing.assert_close(kwargs["kv_seq_lens"], kv_seq_lens)
+        check_selection(kwargs)
+        assert kwargs["q"].shape == (2, 8, 128)
+        return torch.full((2, 8, 128), 7.0), torch.zeros(2, 8)
+
+    def combine(out, lse, *, group, rank, sink, keep_all_heads):
+        calls.append("combine")
+        assert sink is None and group == backend.kvp_group
+        assert keep_all_heads is False
+        assert lse.shape == out.shape[:-1]
+        return out[:, rank * 2 : (rank + 1) * 2]
+
+    def supported(*, tokens, heads, topk):
+        # Host-side sizes every rank shares: rows, gathered heads, selection width.
+        sizes.append((tokens, heads, topk))
+        return arm == "records"
+
+    def gather_rank_major(q, group):
+        calls.append("gather_rank_major")
+        assert group == backend.kvp_group
+        return q.unsqueeze(0).repeat(4, 1, 1, 1)
+
+    def records_core(**kwargs):
+        calls.append("records_core")
+        check_selection(kwargs)
+        assert kwargs["q"].shape == (4, 2, 2, 128)
+        assert kwargs["kv_lora_rank"] == 128 and kwargs["softmax_scale"] == 0.1
+        assert kwargs["solution"] is None and kwargs["slot_order"] == "selection"
+        return torch.zeros((4, 2, 2, 65), dtype=torch.int32)
+
+    def combine_records(records, *, group, head_dim, partial_dtype, output_dtype, sink):
+        calls.append("combine_records")
+        assert records.shape == (4, 2, 2, 65)
+        assert group == backend.kvp_group and sink is None and head_dim == 128
+        assert partial_dtype == output_dtype == torch.bfloat16
+        return torch.full((2, 2, 128), 7.0)
+
+    monkeypatch.setattr(dsa, "gather_query_heads", gather)
+    monkeypatch.setattr(dsa, "dsa_prefill", prefill)
+    monkeypatch.setattr(dsa, "combine_attention_partials", combine)
+    monkeypatch.setattr(dsa, "dsa_prefill_dcp_records_supported", supported)
+    monkeypatch.setattr(dsa, "gather_query_heads_rank_major", gather_rank_major)
+    monkeypatch.setattr(dsa, "dsa_prefill_dcp_records", records_core)
+    monkeypatch.setattr(dsa, "combine_attention_records", combine_records)
+    out = backend.forward_sparse_prefill(
+        q=query,
+        layer=layer,
+        token_to_kv_pool=pool,
+        kv_seq_lens=kv_seq_lens,
+        topk_slots=slots,
+        topk_lens=lengths,
+        max_seq_len=301,
+    )
+    assert out.shape == (2, 256)
+    assert (out == 7).all()
+    # The size check runs only once the lever and the probe allow the arm.
+    asked = arm in ("split_size", "records")
+    assert sizes == ([(2, 8, 512)] if asked else [])
+    assert calls == (
+        ["gather_rank_major", "records_core", "combine_records"]
+        if arm == "records"
+        else ["gather", "prefill", "combine"]
+    )
+    # The caller's selection and lengths are not modified in place.
+    assert slots[:, :4].tolist() == [[64, 128, 192, 256]] * 2
+    assert lengths.tolist() == [4, 3]
 
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
@@ -947,6 +1157,373 @@ def test_global_index_candidate_merge_ties_and_empty_shards(
         assert chosen == expected
     assert (selected[0, len(chosen) :] == -1).all()
     assert counts.tolist() == [min(4, degree * 2), 0]
+
+
+def test_select_dsa_topk_merges_every_tile_once(monkeypatch):
+    from tokenspeed_kernel.ops.attention.dsa import DSAIndexCandidatePages
+
+    from tokenspeed.runtime.layers.attention.dcp import indexer
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+    degree, rows, columns, page_size, topk = 4, 10, 6, 64, 4
+    placement = CachePlacement(64, 64, tuple(range(degree)), 1)
+    requests = torch.arange(rows, dtype=torch.int32) // 2
+    page_table = torch.arange(1, 5 * columns + 1, dtype=torch.int32).reshape(5, -1)
+    causal_lens = torch.arange(rows) * 37 + 5
+    q, weights = torch.zeros(rows, 2, 8), torch.zeros(rows, 2)
+    cache = torch.zeros(64, 132, dtype=torch.uint8)
+    plans, calls, gathers = [], [], []
+
+    def plan(
+        q, weights, index_k_cache, local_table, requests, causal, *, page_size, columns
+    ):
+        # Decode's metadata plans the table's width.
+        assert columns is None
+        plans.append(local_table)
+        n = q.shape[0]
+        return DSAIndexCandidatePages(
+            "fake",
+            torch.zeros(n, local_table.shape[1], dtype=torch.int32),
+            torch.zeros(n, local_table.shape[1], dtype=torch.int32),
+            torch.arange(n, dtype=torch.int32).unsqueeze(1),
+        )
+
+    def candidates(q, weights, index_k_cache, local_table, requests, causal, **kw):
+        assert local_table.shape == page_table.shape
+        pages = kw["pages"]
+        calls.append(None if pages is None else pages.lengths.flatten().tolist())
+        # Distinct row-dependent candidates; the causal length names the row.
+        offsets = causal.to(torch.int32).unsqueeze(1) * 8 + torch.arange(
+            topk, dtype=torch.int32
+        )
+        scores = causal.float().unsqueeze(1) + torch.arange(topk) / 8
+        return offsets, scores
+
+    def gather(x, group, dim):
+        # x is [rows, topk * 2] (offset, score bits); fake the other ranks' records.
+        assert group == placement.group and dim == -1
+        gathers.append(x.shape[0])
+        pairs = x.reshape(x.shape[0], -1, 2)
+        parts = [x]
+        for rank in range(1, degree):
+            scores = pairs[..., 1].contiguous().view(torch.float32) - 0.3 * rank
+            parts.append(
+                torch.stack(
+                    (pairs[..., 0] + 1000 * rank, scores.view(torch.int32)), dim=-1
+                ).flatten(1)
+            )
+        return torch.cat(parts, dim=dim)
+
+    monkeypatch.setattr(indexer, "plan_dsa_index_candidates", plan)
+    monkeypatch.setattr(indexer, "dsa_index_candidates", candidates)
+    monkeypatch.setattr(indexer, "all_gather", gather)
+    metadata = indexer.build_dcp_index_metadata(
+        q,
+        weights,
+        cache,
+        page_table,
+        requests,
+        causal_lens,
+        placement=placement,
+        page_size=page_size,
+    )
+    assert len(plans) == 1 and metadata.pages.kernel == "fake"
+    assert metadata.local_page_table.dtype == torch.int32
+    # The local table keeps the global columns; foreign pages are -1.
+    slots, owned = virtual_slots_to_local(
+        page_table.long() * page_size,
+        rows_per_page=64,
+        virtual_block_count=64,
+        degree=degree,
+        rank=1,
+    )
+    torch.testing.assert_close(
+        metadata.local_page_table,
+        torch.where(owned, slots // page_size, -1).to(torch.int32),
+    )
+    expected = []
+    for start in range(0, rows, 3):
+        tile = candidates(
+            q[start : start + 3],
+            None,
+            None,
+            page_table,
+            None,
+            causal_lens[start : start + 3],
+            pages=None,
+        )
+        expected.append(
+            indexer.merge_index_candidates(*tile, topk=topk, group=placement.group)
+        )
+    expected = tuple(torch.cat(part) for part in zip(*expected))
+    kwargs = dict(
+        placement=placement,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=0.1,
+        initial_tokens=0,
+        local_tokens=0,
+    )
+    one_row = columns * page_size * 4
+    # An exchange holds degree * topk * 12 bytes per row.
+    assert one_row // (degree * topk * 12) == 8
+    cases = [
+        # Three rows per tile: four tiles, one exchange of every row.
+        (3 * one_row, metadata, [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]], [rows]),
+        (None, metadata, [list(range(rows))], [rows]),
+        (0, metadata, [list(range(rows))], [rows]),
+        # One row per tile; the budget bounds an exchange at eight rows.
+        (one_row, metadata, [[row] for row in range(rows)], [8, 2]),
+        # Without metadata every tile compacts its own rows.
+        (None, None, [None], [rows]),
+        (3 * one_row, None, [None] * 4, [rows]),
+        (one_row, None, [None] * rows, [8, 2]),
+    ]
+    for budget, tile_metadata, tile_rows, exchanges in cases:
+        calls.clear()
+        gathers.clear()
+        result = indexer.select_dsa_topk(
+            q,
+            weights,
+            cache,
+            page_table,
+            requests,
+            causal_lens,
+            max_logits_bytes=budget,
+            metadata=tile_metadata,
+            **kwargs,
+        )
+        assert calls == tile_rows
+        assert gathers == exchanges
+        for actual, reference in zip(result, expected, strict=True):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    assert len(plans) == 1
+    with pytest.raises(ValueError, match="another placement"):
+        indexer.select_dsa_topk(
+            q,
+            weights,
+            cache,
+            page_table,
+            requests,
+            causal_lens,
+            max_logits_bytes=None,
+            metadata=metadata,
+            **{**kwargs, "placement": CachePlacement(64, 64, (0, 1), 1)},
+        )
+
+
+def test_select_dsa_topk_tiles_stay_within_int32_logits():
+    from tokenspeed.runtime.layers.attention.dcp import indexer
+
+    # DeepGEMM pads the 1M table's logits rows to 1048832; 2048 rows would pass 2**31.
+    assert 2047 * 1048832 < 1 << 31 < 2048 * 1048832
+    assert indexer._tile_rows(512, 16386, 64, None) == 512
+    for budget in (None, 0):
+        assert indexer._tile_rows(4096, 16386, 64, budget) == 2047
+    # A budget bounds tiles further, never past the 32-bit limit.
+    assert indexer._tile_rows(4096, 16386, 64, 64 << 20) == 15
+    assert indexer._tile_rows(4096, 16386, 64, 64 << 30) == 2047
+    assert indexer._tile_rows(4096, 128, 64, 512 << 20) == 4096
+    assert indexer._tile_rows(4096, 128, 64, 1) == 1
+
+
+def test_select_dsa_topk_exchanges_stay_within_the_budget():
+    from tokenspeed.runtime.layers.attention.dcp import indexer
+
+    # KVP 8, topk 2048, the default 512 MiB budget: 12 bytes per gathered candidate.
+    budget = 512 << 20
+    assert budget // (8 * 2048 * 12) == 2730
+    # A prefix-free 16K chunk: 8192-row tiles, each exchanged by itself.
+    assert indexer._exchange_rows(16384, 8192, 8, 2048, budget) == 8192
+    # A 1M-context chunk: 127-row tiles, 21 of them per exchange.
+    assert indexer._exchange_rows(16384, 127, 8, 2048, budget) == 2667
+    # Decode keeps one exchange without a budget; 64 MiB joins 22 tiles.
+    for no_budget in (None, 0):
+        assert indexer._exchange_rows(512, 512, 8, 2048, no_budget) == 512
+    assert indexer._exchange_rows(512, 15, 8, 2048, 64 << 20) == 330
+
+
+def test_select_dsa_topk_row_owner_exchanges_stay_within_the_budget():
+    from tokenspeed.runtime.layers.attention.dcp import indexer
+
+    # Records sent and received, merge scores, selections: topk * 24 B/row at any KVP.
+    budget = 512 << 20
+    assert budget // (2048 * 24) == 10922
+
+    def plan(rows, tile_rows, degree, max_logits_bytes):
+        return indexer._exchange_rows(
+            rows, tile_rows, degree, 2048, max_logits_bytes, row_owner=True
+        )
+
+    for degree in (2, 8):
+        # 16K after 200K cached: 17 tiles of 620 per exchange, two exchanges, not seven.
+        assert plan(16384, 620, degree, budget) == 10540
+        assert plan(16384, 8192, degree, budget) == 8192
+        assert plan(16384, 127, degree, budget) == 10922
+    for no_budget in (None, 0):
+        assert plan(16384, 620, 8, no_budget) == 16384
+    # A tile above the budget is still exchanged by itself.
+    assert plan(16384, 16384, 8, 1 << 20) == 16384
+
+
+def test_owned_width_tiles_keep_the_table_width_exchange():
+    from tokenspeed.runtime.layers.attention.dcp import indexer
+
+    budget = 512 << 20
+
+    def owned(
+        rows, table_columns, columns, max_logits_bytes=budget, *, row_owner=False
+    ):
+        full = indexer._tile_rows(rows, table_columns, 64, max_logits_bytes)
+        return indexer._owned_tile_rows(
+            rows, columns, full, 64, 8, 2048, max_logits_bytes, row_owner=row_owner
+        )
+
+    # 200K + 16K at KVP 8: 3381 table pages, 432 owned, one exchange holding 2730 rows.
+    assert indexer._tile_rows(16384, 3381, 64, budget) == 620
+    assert indexer._tile_rows(16384, 432, 64, budget) == 4854
+    assert owned(16384, 3381, 432) == 2730
+    # Skewed ownership: owned tiles fit inside one exchange anyway.
+    assert owned(16384, 3381, 2368) == indexer._tile_rows(16384, 2368, 64, budget)
+    # Cold 16K chunk: the 8192-row table-width tile bounds the owned tile.
+    assert owned(16384, 256, 32) == 8192
+    # Owned tiles never get narrower than the table-width ones.
+    assert owned(16384, 3381, 3381) == 620
+    for no_budget in (None, 0):
+        assert owned(16384, 3381, 432, no_budget) == 16384
+
+    # Row-owner exchanges fit 10922 rows, so the owned tile keeps 4854: 4 tiles, not 27.
+    tile = owned(16384, 3381, 432, row_owner=True)
+    assert tile == 4854
+    exchange = indexer._exchange_rows(16384, tile, 8, 2048, budget, row_owner=True)
+    assert exchange == 2 * tile
+    assert -(-16384 // tile) == 4 and -(-16384 // exchange) == 2
+    # The cold 16K chunk's owned tile grows to one row-owner exchange.
+    assert owned(16384, 256, 32, row_owner=True) == 10922
+    assert owned(16384, 3381, 3381, row_owner=True) == 620
+
+
+def test_select_dsa_topk_plans_owned_width_tiles(monkeypatch):
+    from tokenspeed_kernel.ops.attention.dsa import DSAIndexCandidatePages
+
+    from tokenspeed.runtime.layers.attention.dcp import indexer
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+    degree, rows, columns, page_size, topk = 4, 10, 6, 64, 4
+    placement = CachePlacement(64, 64, tuple(range(degree)), 1)
+    requests = torch.arange(rows, dtype=torch.int32) // 2
+    page_table = torch.arange(1, 5 * columns + 1, dtype=torch.int32).reshape(5, -1)
+    causal_lens = torch.arange(rows) * 37 + 5
+    q, weights = torch.zeros(rows, 2, 8), torch.zeros(rows, 2)
+    cache = torch.zeros(64, 132, dtype=torch.uint8)
+    plans, calls, gathers = [], [], []
+    accepts = [True]
+
+    def plan(q, weights, index_k_cache, local_table, requests, causal, **kw):
+        n, width = q.shape[0], kw["columns"] or local_table.shape[1]
+        plans.append((n, kw["columns"]))
+        return DSAIndexCandidatePages(
+            "fake",
+            torch.zeros(n, width, dtype=torch.int32),
+            torch.zeros(n, width, dtype=torch.int32),
+            torch.zeros(n, 1, dtype=torch.int32),
+            None if kw["columns"] is None else torch.zeros(n, dtype=torch.int32),
+        )
+
+    def candidates(q, weights, index_k_cache, local_table, requests, causal, **kw):
+        assert local_table.shape == page_table.shape
+        pages = kw["pages"]
+        calls.append(None if pages is None else (q.shape[0], pages.pages.shape[1]))
+        offsets = causal.to(torch.int32).unsqueeze(1) * 8 + torch.arange(
+            topk, dtype=torch.int32
+        )
+        return offsets, causal.float().unsqueeze(1) + torch.arange(topk) / 8
+
+    def gather(x, group, dim):
+        # Other ranks' records: distinct positions, interleaved scores.
+        gathers.append(x.shape[0])
+        pairs = x.reshape(x.shape[0], -1, 2)
+        parts = [x]
+        for rank in range(1, degree):
+            scores = pairs[..., 1].contiguous().view(torch.float32) - 0.3 * rank
+            parts.append(
+                torch.stack(
+                    (pairs[..., 0] + 1000 * rank, scores.view(torch.int32)), dim=-1
+                ).flatten(1)
+            )
+        return torch.cat(parts, dim=dim)
+
+    monkeypatch.setattr(
+        indexer, "dsa_index_candidates_accepts_pages", lambda *a, **kw: accepts[0]
+    )
+    monkeypatch.setattr(indexer, "plan_dsa_index_candidates", plan)
+    monkeypatch.setattr(indexer, "dsa_index_candidates", candidates)
+    monkeypatch.setattr(indexer, "all_gather", gather)
+    kwargs = dict(
+        placement=placement,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=0.1,
+        initial_tokens=0,
+        local_tokens=0,
+    )
+    # A tile fits three owned-width rows (two columns) or one table-width row.
+    budget = 3 * 2 * page_size * 4
+    assert budget // (degree * topk * 12) == 8
+
+    def select(**call):
+        for record in (plans, calls, gathers):
+            record.clear()
+        return indexer.select_dsa_topk(
+            q,
+            weights,
+            cache,
+            page_table,
+            requests,
+            causal_lens,
+            max_logits_bytes=budget,
+            **kwargs,
+            **call,
+        )
+
+    expected = select()
+    assert calls == [None] * rows and gathers == [8, 2]
+
+    # Without metadata, each owned-width tile plans its own pages.
+    for actual, want in zip(select(columns=2), expected, strict=True):
+        torch.testing.assert_close(actual, want, rtol=0, atol=0)
+    assert plans == [(3, 2), (3, 2), (3, 2), (1, 2)]
+    assert calls == [(3, 2), (3, 2), (3, 2), (1, 2)]
+    assert gathers == [6, 4]
+
+    # Metadata planned at the owned width once serves every tile.
+    plans.clear()
+    metadata = indexer.build_dcp_index_metadata(
+        q,
+        weights,
+        cache,
+        page_table,
+        requests,
+        causal_lens,
+        placement=placement,
+        page_size=page_size,
+        columns=2,
+    )
+    assert metadata.columns == 2 and plans == [(rows, 2)]
+    for actual, want in zip(select(metadata=metadata), expected, strict=True):
+        torch.testing.assert_close(actual, want, rtol=0, atol=0)
+    assert not plans and calls == [(3, 2), (3, 2), (3, 2), (1, 2)]
+    with pytest.raises(ValueError, match="carries its own columns"):
+        select(metadata=metadata, columns=2)
+
+    # A bound wider than the table tiles by the table.
+    select(columns=9)
+    assert plans == [(1, 6)] * rows and gathers == [8, 2]
+
+    # A leaf that compacts per call sizes its logits by the table: no plan.
+    accepts[0] = False
+    select(columns=2)
+    assert not plans and calls == [None] * rows and gathers == [8, 2]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

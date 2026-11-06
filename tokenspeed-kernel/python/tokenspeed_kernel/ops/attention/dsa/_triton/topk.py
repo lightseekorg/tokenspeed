@@ -104,6 +104,58 @@ def mark_forced_initial_local_logits(
 
 
 @triton.jit
+def _scrub_nonfinite_logits_kernel(
+    logits_ptr,
+    logits_row_stride,
+    lengths_ptr,
+    # Width follows the block table; runtime so every width shares one binary.
+    num_cols,
+    SPLITS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    length = tl.minimum(tl.load(lengths_ptr + row).to(tl.int32), num_cols)
+    for start in range(tl.program_id(1) * BLOCK, length, SPLITS * BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        ptrs = logits_ptr + row * logits_row_stride + cols
+        score = tl.load(ptrs, mask=cols < length, other=0.0)
+        bad = (score != score) | (score == float("inf"))
+        tl.store(ptrs, float("-inf"), mask=(cols < length) & bad)
+
+
+def scrub_nonfinite_logits(logits: torch.Tensor, lengths: torch.Tensor) -> None:
+    """Set NaN and +inf scores to -inf in each row's first ``lengths`` columns.
+
+    Columns past a row's length are left as they are: the length-aware top-k
+    kernels never read them, so the work follows the context, not the width.
+
+    Args:
+        logits: ``[rows, candidates]`` FP32 scores, unit column stride; mutated.
+        lengths: ``[rows]`` valid candidates per row, clamped to the width.
+    """
+    if logits.dim() != 2 or logits.stride(1) != 1:
+        raise ValueError("logits must be a 2-D tensor with unit column stride")
+    if lengths.shape != (logits.shape[0],):
+        raise ValueError(
+            f"lengths must have shape ({logits.shape[0]},), got {tuple(lengths.shape)}"
+        )
+    if logits.numel() == 0:
+        return
+    lengths = lengths.to(device=logits.device, dtype=torch.int32).contiguous()
+    splits = 16
+    _scrub_nonfinite_logits_kernel[(logits.shape[0], splits)](
+        logits,
+        logits.stride(0),
+        lengths,
+        num_cols=logits.shape[1],
+        SPLITS=splits,
+        BLOCK=1024,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+@triton.jit
 def _local_topk_to_global_slots_kernel(
     global_topk_slots_ptr,
     global_topk_slots_stride,
@@ -311,12 +363,19 @@ def _workspace_topk_to_global_slots_kernel(
     kv_workspace_slots_ptr,
     total,
     BLOCK: tl.constexpr,
+    U16_INDICES: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < total
     workspace_idx = tl.load(workspace_indices_ptr + offsets, mask=mask, other=-1)
-    valid = mask & (workspace_idx >= 0)
+    if U16_INDICES:
+        # int16 storage of unsigned indices; 0xFFFF (-1) marks an empty slot.
+        workspace_idx = workspace_idx.to(tl.int32)
+        valid = mask & (workspace_idx != -1)
+        workspace_idx = workspace_idx & 0xFFFF
+    else:
+        valid = mask & (workspace_idx >= 0)
     slots = tl.load(kv_workspace_slots_ptr + workspace_idx, mask=valid, other=-1)
     tl.store(out_ptr + offsets, tl.where(valid, slots, -1), mask=mask)
 
@@ -327,9 +386,15 @@ def workspace_topk_to_global_slots(
     kv_workspace_slots: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if workspace_indices.dtype != torch.int32:
+    """Map workspace top-k indices to int32 global KV slots, -1 where empty.
+
+    int16 ``workspace_indices`` hold unsigned 16-bit indices with ``-1``
+    (0xFFFF) as the empty marker, so the workspace must have fewer than 65535
+    rows; int32 indices mark empty entries with any negative value.
+    """
+    if workspace_indices.dtype not in (torch.int32, torch.int16):
         raise TypeError(
-            f"workspace_indices must be int32, got {workspace_indices.dtype}"
+            f"workspace_indices must be int32 or int16, got {workspace_indices.dtype}"
         )
     if workspace_indices.dim() != 2:
         raise ValueError(
@@ -340,8 +405,13 @@ def workspace_topk_to_global_slots(
         raise ValueError(
             f"kv_workspace_slots must be 1-D, got {tuple(kv_workspace_slots.shape)}"
         )
+    if workspace_indices.dtype == torch.int16 and kv_workspace_slots.numel() >= 0xFFFF:
+        raise ValueError(
+            "int16 workspace_indices need fewer than 65535 workspace rows, got "
+            f"{kv_workspace_slots.numel()}"
+        )
     if out is None:
-        out = torch.empty_like(workspace_indices)
+        out = torch.empty_like(workspace_indices, dtype=torch.int32)
     elif (
         out.shape != workspace_indices.shape
         or out.dtype != torch.int32
@@ -371,6 +441,7 @@ def workspace_topk_to_global_slots(
         kv_workspace_slots,
         total=total,
         BLOCK=block,
+        U16_INDICES=workspace_indices.dtype == torch.int16,
         num_warps=4,
         num_stages=1,
     )
@@ -1524,5 +1595,6 @@ __all__ = [
     "triton_topk_from_logits",
     "local_topk_to_global_slots",
     "mark_forced_initial_local_logits",
+    "scrub_nonfinite_logits",
     "workspace_topk_to_global_slots",
 ]

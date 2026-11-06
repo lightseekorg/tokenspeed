@@ -682,6 +682,7 @@ impl Shared {
         }
         if let Some(metrics) = &self.metrics {
             metrics.observe_latency(started.elapsed().as_secs_f64());
+            metrics.record_size(copies.iter().map(Copy::bytes).sum());
         }
         Ok(())
     }

@@ -37,6 +37,7 @@ register_cuda_ci(est_time=240, suite="runtime-1gpu")
 
 KEYS = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
 SETTING = "pinned_max_round_threshold_mb:1024"
+BACKGROUND = "pinned_use_background_threads:True"
 pytestmark = pytest.mark.skipif(
     torch.version.cuda is None and torch.version.hip is None,
     reason="Requires a CUDA or ROCm allocator",
@@ -49,8 +50,7 @@ def allocator_environment(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-@pytest.fixture(scope="module")
-def native_supports_threshold():
+def _native_supports(setting):
     # Read actual parser support independently of the launcher's defaults.
     # Isolate its mutable settings and keep the probe independent of GPU access.
     env = dict(
@@ -65,60 +65,81 @@ def native_supports_threshold():
         [
             sys.executable,
             "-c",
-            f"import torch; torch.cuda.memory._set_allocator_settings({SETTING!r})",
+            f"import torch; torch.cuda.memory._set_allocator_settings({setting!r})",
         ],
         env=env,
         capture_output=True,
         text=True,
         timeout=60,
     )
+    name = setting.split(":", 1)[0]
     if result.returncode:
         assert (
-            "Unrecognized CachingAllocator option: pinned_max_round_threshold_mb"
-            in result.stderr
-            or "Unrecognized key 'pinned_max_round_threshold_mb'" in result.stderr
+            f"Unrecognized CachingAllocator option: {name}" in result.stderr
+            or f"Unrecognized key '{name}'" in result.stderr
         ), (result.stdout + result.stderr)
     return result.returncode == 0
+
+
+@pytest.fixture(scope="module")
+def native_supports_threshold():
+    return _native_supports(SETTING)
+
+
+@pytest.fixture(scope="module")
+def background_suffix():
+    """What the launcher appends for the helper-thread setting, if supported."""
+    return f",{BACKGROUND}" if _native_supports(BACKGROUND) else ""
 
 
 @pytest.mark.parametrize("key", KEYS)
 @pytest.mark.parametrize("config", ["", "max_split_size_mb:64,"])
 def test_preserves_existing_options(
-    monkeypatch, native_supports_threshold, key, config
+    monkeypatch, native_supports_threshold, background_suffix, key, config
 ):
     monkeypatch.setenv(key, config)
     launcher.set_pinned_allocator_default()
+    added = (f",{SETTING}" if native_supports_threshold else "") + background_suffix
     existing = config.rstrip(",")
-    expected = f"{existing},{SETTING}" if existing else SETTING
-    assert os.environ[key] == (expected if native_supports_threshold else config)
+    expected = f"{existing}{added}" if existing else added.lstrip(",")
+    assert os.environ[key] == (expected if added else config)
     assert all(other not in os.environ for other in KEYS if other != key)
 
 
-def test_no_existing_variable(native_supports_threshold):
+def test_no_existing_variable(native_supports_threshold, background_suffix):
     launcher.set_pinned_allocator_default()
-    assert os.environ.get("PYTORCH_ALLOC_CONF") == (
-        SETTING if native_supports_threshold else None
-    )
+    added = (f",{SETTING}" if native_supports_threshold else "") + background_suffix
+    assert os.environ.get("PYTORCH_ALLOC_CONF") == (added.lstrip(",") or None)
     assert all(key not in os.environ for key in KEYS[:2])
 
 
-def test_explicit_threshold_and_variable_precedence(monkeypatch):
+def test_explicit_settings_and_variable_precedence(monkeypatch, background_suffix):
     monkeypatch.setenv(KEYS[0], "pinned_max_round_threshold_mb:256")
     monkeypatch.setenv(KEYS[1], "max_split_size_mb:64")
     monkeypatch.setenv(KEYS[2], "max_split_size_mb:128")
     before = {key: os.environ[key] for key in KEYS}
     launcher.set_pinned_allocator_default()
+    before[KEYS[0]] += background_suffix
     assert {key: os.environ[key] for key in KEYS} == before
+
+    monkeypatch.setenv(
+        KEYS[0],
+        "pinned_max_round_threshold_mb:256,pinned_use_background_threads:False",
+    )
+    launcher.set_pinned_allocator_default()
+    assert os.environ[KEYS[0]] == (
+        "pinned_max_round_threshold_mb:256,pinned_use_background_threads:False"
+    )
 
 
 def test_highest_precedence_variable_gets_default(
-    monkeypatch, native_supports_threshold
+    monkeypatch, native_supports_threshold, background_suffix
 ):
     monkeypatch.setenv(KEYS[0], "max_split_size_mb:64")
     monkeypatch.setenv(KEYS[1], "max_split_size_mb:128")
     monkeypatch.setenv(KEYS[2], "max_split_size_mb:256")
     launcher.set_pinned_allocator_default()
-    suffix = f",{SETTING}" if native_supports_threshold else ""
+    suffix = (f",{SETTING}" if native_supports_threshold else "") + background_suffix
     assert os.environ[KEYS[0]] == f"max_split_size_mb:64{suffix}"
     assert os.environ[KEYS[1]] == "max_split_size_mb:128"
     assert os.environ[KEYS[2]] == "max_split_size_mb:256"
@@ -165,6 +186,11 @@ if pid == 0:
     assert settings["max_split_size"] == 64 * 1024 * 1024
     if os.environ["EXPECT_PINNED_THRESHOLD"] == "1":
         assert settings["max_round_threshold"] == 1024 * 1024 * 1024
+    staged = tensor.to("cpu", non_blocking=True)
+    torch.cuda.synchronize()
+    assert staged.item() == 1
+    del staged
+    assert torch.empty(1, pin_memory=True).is_pinned()
     os._exit(0)
 _, status = os.waitpid(pid, 0)
 assert os.waitstatus_to_exitcode(status) == 0
@@ -177,6 +203,11 @@ settings = torch.cuda.memory._snapshot()["allocator_settings"]
 assert settings["max_split_size"] == 64 * 1024 * 1024
 if os.environ["EXPECT_PINNED_THRESHOLD"] == "1":
     assert settings["max_round_threshold"] == 1024 * 1024 * 1024
+staged = tensor.to("cpu", non_blocking=True)
+torch.cuda.synchronize()
+assert staged.item() == 1
+del staged
+assert torch.empty(1, pin_memory=True).is_pinned()
 """
 result = os.spawnve(os.P_WAIT, sys.executable,
     [sys.executable, "-c", worker],

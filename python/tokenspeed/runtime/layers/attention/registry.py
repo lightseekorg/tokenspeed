@@ -301,6 +301,10 @@ _HYBRID_MAMBA2_ARCHITECTURES = {
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
+# Kimi-K3.1: the K3 layout with DSA sparse MLA on its full-attention layers.
+_HYBRID_KIMI_DSA_KDA_ARCHITECTURES = {
+    "KimiK31ForConditionalGeneration",
+}
 _HYBRID_DSA_KDA_TARGET_ARCHITECTURES = {
     "Glm53FlashForConditionalGeneration",
 }
@@ -336,6 +340,8 @@ class _AttnSideProfile:
     # subset of ``is_kda`` that selects the DSA history consumer and the
     # glm53_flash cache family.
     is_dsa_kda: bool
+    # Kimi-K3.1: subset of is_kda that selects only the DSA history consumer.
+    is_kimi_dsa_kda: bool
     is_qwen4_exp: bool
     is_qsa: bool
     is_inkling: bool
@@ -379,6 +385,7 @@ def _resolve_attn_side(
             is_mamba2=False,
             is_kda=False,
             is_dsa_kda=False,
+            is_kimi_dsa_kda=False,
             is_qwen4_exp=False,
             is_qsa=False,
             is_inkling=False,
@@ -389,14 +396,19 @@ def _resolve_attn_side(
     qwen4_exp = is_qwen4_exp(hf_config)
     is_dspark = any(a in _DSPARK_DRAFT_ARCHITECTURES for a in architectures)
     is_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
+    is_kimi_dsa_kda = any(
+        a in _HYBRID_KIMI_DSA_KDA_ARCHITECTURES for a in architectures
+    )
     return _AttnSideProfile(
         architectures=tuple(architectures),
         requested_backend=requested_backend,
         is_hybrid_gdn=any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures),
         is_mamba2=any(a in _HYBRID_MAMBA2_ARCHITECTURES for a in architectures),
         is_kda=is_dsa_kda
+        or is_kimi_dsa_kda
         or any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
         is_dsa_kda=is_dsa_kda,
+        is_kimi_dsa_kda=is_kimi_dsa_kda,
         is_qwen4_exp=qwen4_exp,
         is_qsa=qwen4_exp and getattr(text_config, "indexer_n_heads", None) is not None,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
@@ -490,7 +502,7 @@ def _resolve_full_attn_backend_name(
         return _resolve_hybrid_full_backend_name(
             hybrid_request,
             is_kda=profile.is_kda,
-            is_dsa=profile.is_dsa_kda,
+            is_dsa=profile.is_dsa_kda or profile.is_kimi_dsa_kda,
             is_qsa=profile.is_qsa,
         )
     return softmax_attn.backend_name
@@ -717,6 +729,7 @@ _LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
     for arch in (
         *_HYBRID_GDN_ARCHITECTURES,
         *_HYBRID_MLA_KDA_ARCHITECTURES,
+        *_HYBRID_KIMI_DSA_KDA_ARCHITECTURES,
         # GLM NextN is one DSA layer. It reuses the target's mixed-layer
         # metadata but must not acquire a linear-attention component.
         *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,

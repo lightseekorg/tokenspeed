@@ -29,7 +29,9 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
@@ -56,6 +58,15 @@ not need writable properties.
 namespace nb = nanobind;
 
 namespace {
+
+nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>> ReadonlyTokenView(const std::vector<std::int32_t>& tokens,
+                                                                          nb::handle owner) {
+    // NumPy treats a null data pointer as a request for writable storage,
+    // even for an empty array. A non-null sentinel preserves read-only views.
+    static constexpr std::int32_t empty = 0;
+    const auto* data = tokens.empty() ? &empty : tokens.data();
+    return {data, {tokens.size()}, owner};
+}
 
 template <typename Op, typename Cls>
 void BindForwardCommonFields(Cls& cls) {
@@ -439,8 +450,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     auto forward_batch = nb::class_<tokenspeed::ForwardBatch>(forward, "Batch");
     BindForwardCommonFields<tokenspeed::ForwardBatch>(forward_batch);
-    forward_batch.def_ro("input_ids", &tokenspeed::ForwardBatch::input_ids)
-        .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
+    // Token views avoid boxing every prefill token on each property read.
+    // As with block_tables_arrays, `self` keeps the backing batch alive.
+    forward_batch
+        .def_prop_ro("input_ids",
+                     [](nb::handle self) {
+                         auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                         return ReadonlyTokenView(op.input_ids, self);
+                     })
+        .def_prop_ro("shifted_input_ids",
+                     [](nb::handle self) {
+                         auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                         return ReadonlyTokenView(op.shifted_input_ids, self);
+                     })
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
         .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
         // Per extend row (the D role's remote admission only): every State
@@ -471,6 +493,20 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                      const std::size_t columns = rows == 0 ? 0 : buf.size() / rows;
                      out[nb::str(gid.c_str())] =
                          nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, columns}, self);
+                 }
+                 return out;
+             })
+        .def("block_table_spans",
+             [](nb::handle self) {
+                 // Zero-copy [rows, 2] int32 (released, pages) views parallel
+                 // to block_tables_arrays; `self` keeps the batch alive too.
+                 auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                 nb::dict out;
+                 for (auto& [gid, buf] : op.block_table_spans) {
+                     const std::size_t rows = op.request_ids.size();
+                     tokenspeed::FatalCheck(buf.size() == 2 * rows, "block-table spans must cover every row");
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, 2}, self);
                  }
                  return out;
              })

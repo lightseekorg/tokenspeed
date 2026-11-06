@@ -18,7 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Python API for the TokenSpeed scheduler."""
+"""Python API for the TokenSpeed scheduler.
+
+``Forward.Batch.input_ids`` and ``shifted_input_ids`` are one-dimensional,
+read-only NumPy int32 views. Repeated reads share the batch's token storage;
+each view keeps its batch alive independently of the execution plan. Both
+arrays are empty on decode-only batches. Use ``.tolist()`` for Python integers,
+or ``np.array(view, dtype=np.int32, copy=True)`` for writable storage (including
+when passing the data to PyTorch). The explicit dtype also accepts token lists
+from older scheduler releases without changing the result's dtype.
+
+``Forward.Batch.block_tables_arrays()`` gives every group's ``[rows, columns]``
+int32 table, read-only and zero-copy, and ``block_table_spans()`` each row's
+``(released, pages)``: the row's columns before ``released`` are null holes (0)
+and those from ``pages`` on are -1 padding.
+"""
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
@@ -54,8 +68,8 @@ def _forward_batch_repr(self):
         f"request_ids={list(self.request_ids)}, "
         f"request_pool_indices={list(self.request_pool_indices)}, "
         f"input_lengths={list(self.input_lengths)}, "
-        f"input_ids={list(self.input_ids)}, "
-        f"shifted_input_ids={list(self.shifted_input_ids)}, "
+        f"input_ids={self.input_ids.tolist()}, "
+        f"shifted_input_ids={self.shifted_input_ids.tolist()}, "
         f"extend_prefix_lens={list(self.extend_prefix_lens)}, "
         f"extend_replay_lens={list(self.extend_replay_lens)}, "
         f"num_extends={self.num_extends()}"

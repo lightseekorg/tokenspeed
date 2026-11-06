@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -42,13 +43,25 @@ if current_platform().is_amd:
         launch_gluon_dsa_prefill_gfx950 as _dsa_prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        launch_gluon_dsa_decode_topk_bf16_gfx950 as _dsa_decode_topk_bf16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         launch_gluon_dsa_decode_topk_fp8_gfx950 as _dsa_decode_topk_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        launch_gluon_dsa_decode_topk_fp8_rows_gfx950 as _dsa_decode_topk_fp8_rows_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         launch_gluon_dsa_decode_topk_standard_gfx950 as _dsa_decode_topk_standard_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        launch_gluon_dsa_prefill_topk_bf16_gfx950 as _dsa_prefill_topk_bf16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         launch_gluon_dsa_prefill_topk_fp8_gfx950 as _dsa_prefill_topk_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        launch_gluon_dsa_prefill_topk_fp8_rows_gfx950 as _dsa_prefill_topk_fp8_rows_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         launch_gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
@@ -138,6 +151,138 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_topk_standard_gfx950(*args, **kwargs):
         return _dsa_prefill_topk_standard_impl(*args, **kwargs)
+
+    # E4M3 queries share each gathered key tile across rows; BF16 stays standard.
+    @register_kernel(
+        "attention",
+        "dsa_decode_topk",
+        name="gluon_dsa_decode_topk_fp8_rows_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e4m3fn),
+                    weights=dense_tensor_format(weight_dtype),
+                )
+                for weight_dtype in (torch.bfloat16, torch.float32)
+            }
+        ),
+        priority=Priority.SPECIALIZED + 2,
+        traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "index_heads": frozenset({32, 64}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
+        },
+    )
+    def gluon_dsa_decode_topk_fp8_rows_gfx950(*args, **kwargs):
+        return _dsa_decode_topk_fp8_rows_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsa_prefill_topk",
+        name="gluon_dsa_prefill_topk_fp8_rows_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e4m3fn),
+                    weights=dense_tensor_format(weight_dtype),
+                )
+                for weight_dtype in (torch.bfloat16, torch.float32)
+            }
+        ),
+        priority=Priority.SPECIALIZED + 2,
+        traits={
+            "index_heads": frozenset({32, 64}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
+        },
+    )
+    def gluon_dsa_prefill_topk_fp8_rows_gfx950(*args, **kwargs):
+        return _dsa_prefill_topk_fp8_rows_impl(*args, **kwargs)
+
+    # BF16 plane scorers; radix ties are not lowest-index, so not batch_invariant.
+    @register_kernel(
+        "attention",
+        "dsa_decode_topk",
+        name="gluon_dsa_decode_topk_bf16_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    weights=dense_tensor_format(weight_dtype),
+                )
+                for weight_dtype in (torch.bfloat16, torch.float32)
+            }
+        ),
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "index_heads": frozenset({32, 64}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048}),
+            "index_k_format": frozenset({"bf16"}),
+            "index_k_layout": frozenset({"packed"}),
+        },
+    )
+    def gluon_dsa_decode_topk_bf16_gfx950(*args, **kwargs):
+        return _dsa_decode_topk_bf16_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsa_prefill_topk",
+        name="gluon_dsa_prefill_topk_bf16_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    weights=dense_tensor_format(weight_dtype),
+                )
+                for weight_dtype in (torch.bfloat16, torch.float32)
+            }
+        ),
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "index_heads": frozenset({32, 64}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048}),
+            "index_k_format": frozenset({"bf16"}),
+            "index_k_layout": frozenset({"packed"}),
+        },
+    )
+    def gluon_dsa_prefill_topk_bf16_gfx950(*args, **kwargs):
+        return _dsa_prefill_topk_bf16_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -242,7 +387,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_decode_impl(*args, **kwargs)
+        return _dsa_decode_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
 
     @register_kernel(
         "attention",
@@ -276,7 +421,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_prefill_impl(*args, **kwargs)
+        return _dsa_prefill_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
 
     @register_kernel(
         "attention",
@@ -311,7 +456,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_prefill_impl(*args, **kwargs)
+        return _dsa_prefill_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
 
     @register_kernel(
         "attention",

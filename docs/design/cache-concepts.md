@@ -493,6 +493,14 @@ would race the load. `PrefillGraph.replay` therefore waits for the plan's whole
 Host load before the first segment; a replayed forward overlaps only its
 embedding with that load.
 
+A write needs the fence as much as a read: a Host tail hit
+loads its partially filled last block whole, and the forward appends its new
+tokens to the rest of that block, so a row written before the copy lands is
+overwritten by it. A pool's setters must therefore wait as its getters do. A
+draft view has its own tracker, and its layers land after all of the target's
+on either copy path, so no per-layer wait of the target forward covers a draft
+layer: the context rows a draft writes before its forward must wait themselves.
+
 A batched post-verification commit is the one side-cache writer that issues no
 fence of its own. It moves every bound layer's fields in a single launch, so it
 cannot fence per layer, and it relies on two invariants instead: it runs after
@@ -1949,8 +1957,8 @@ MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
 Before allocating the arena, the hybrid KVP check validates these declared group shard
 counts rather than the recipe name or its inheritance. Plugin recipes follow
 the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
-require the full-attention backend to declare `supports_mla_dcp`; FlashMLA and
-TokenSpeed MLA (CuTe MLA) both declare this capability.
+require the full-attention backend to declare `supports_mla_dcp`; FlashMLA,
+TokenSpeed MLA (CuTe MLA) and DSA declare this capability.
 Decode (DCP) gathers query heads, computes attention over owned history, and
 merges partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reads its bounded prefix chunks through the backend
@@ -2254,6 +2262,15 @@ allocation follows actual referenced pages and current rows, not cache capacity.
 The null page and receive alignment are physical overhead.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
+
+Kimi-K3.1 keeps the `kimi_k3` family: a DSA target config adds one index-K
+field per MLA layer to the full-attention group, in a plane of its own (the
+latent plane's page stride must stay its payload) that KDA state never
+shares, so the K3 packing is unchanged. Its pool
+(`HybridKDADSATokenToKVPool`) writes, gathers and scores those planes in the
+DSA leaf's kernel pages (`index_k_page_size`), which subdivide the 128-token
+cache blocks exactly as the router's page tables do; the ordinary DSA family
+runs its kernel page at the arena page.
 
 Qwen4-Exp selects its cache recipe by model family, including targets with
 only full-attention layers. PLE and QSA fields and their verify budget do

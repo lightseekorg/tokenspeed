@@ -26,7 +26,9 @@ and never an FP8 one; index keys handed as rows in workspace-row order
 (``index_k_fp8`` + ``index_k_scale``, ``index_k_bf16``) select only leaves
 declaring ``INDEX_K_WORKSPACE_ROWS_FEATURE`` for their format; ``slot_order``
 on the top-k leaves and the sparse cores is a trait plus a keyword that only
-declaring kernels receive. Fake leaves on CPU; no kernel runs.
+declaring kernels receive, as are index-candidate pages planned once per
+forward (``INDEX_CANDIDATE_PAGES_FEATURE``). Fake leaves on CPU; no kernel
+runs.
 """
 
 from __future__ import annotations
@@ -722,3 +724,95 @@ def test_topk_passes_preallocated_buffers_and_forced_window_policy(topk_leaves, 
     call = bf16[mode][0]
     assert call["out"] is out and call["lens_out"] is lens
     assert call["initial_tokens"] == 1 and call["local_tokens"] == 2
+
+
+# --- index candidates: pages planned once per forward -------------------------
+
+
+def test_planned_index_candidate_pages_reach_only_declaring_leaves(
+    fresh_registry, h100_platform, monkeypatch
+):
+    """``plan_dsa_index_candidates`` compacts once for a leaf declaring
+    ``INDEX_CANDIDATE_PAGES_FEATURE`` and returns ``None`` for any other.
+    ``dsa_index_candidates`` hands a tile's rows of the plan to the declaring
+    leaf only, and refuses pages planned for another leaf or other rows."""
+    _ = fresh_registry
+    compactions = []
+
+    def compact(table, requests, causal, page_size):
+        compactions.append(table)
+        shape = (requests.numel(), table.shape[1])
+        return (
+            torch.zeros(shape, dtype=torch.int32),
+            torch.zeros(shape, dtype=torch.int32),
+            torch.zeros((shape[0], 1), dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(dsa_pkg, "compact_index_pages", compact)
+    seen: dict[str, list] = {"silent": [], "declaring": []}
+
+    def register(name: str, *, declares: bool):
+        def leaf(q, *args, topk, **kwargs):
+            seen[name].append(kwargs)
+            return (
+                torch.full((q.shape[0], topk), -1, dtype=torch.int32),
+                torch.full((q.shape[0], topk), -torch.inf),
+            )
+
+        KernelRegistry.get().register(
+            KernelSpec(
+                name=name,
+                family="attention",
+                mode="dsa_index_candidates",
+                solution=name,
+                format_signatures=_topk_signature(),
+                features=frozenset(
+                    {dsa_pkg.INDEX_CANDIDATE_PAGES_FEATURE} if declares else ()
+                ),
+                priority=Priority.PORTABLE,
+            ),
+            leaf,
+        )
+
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    try:
+        register("silent", declares=False)
+        register("declaring", declares=True)
+        rows = 3
+        inputs = (
+            torch.zeros((rows, 2, HEAD_DIM), dtype=torch.bfloat16),
+            torch.zeros((rows, 2)),
+            torch.zeros((128, FP8_ROW_BYTES), dtype=torch.uint8),
+            torch.ones((1, 4), dtype=torch.int32),
+            torch.zeros((rows,), dtype=torch.int32),
+            torch.full((rows,), 100, dtype=torch.int32),
+        )
+        kwargs = dict(
+            page_size=64, topk=4, softmax_scale=1.0, initial_tokens=0, local_tokens=0
+        )
+        plan = dsa_pkg.plan_dsa_index_candidates
+        assert plan(*inputs, page_size=64, solution="silent") is None
+        assert not compactions
+        pages = plan(*inputs, page_size=64, solution="declaring")
+        assert pages.kernel == "declaring" and compactions == [inputs[3]]
+
+        tile = [x[1:] if x.shape[0] == rows else x for x in inputs]
+        dsa_pkg.dsa_index_candidates(
+            *tile, solution="declaring", pages=pages.rows(1, rows), **kwargs
+        )
+        [call] = seen["declaring"]
+        assert call["pages"].pages.shape == (rows - 1, 4)
+        dsa_pkg.dsa_index_candidates(*inputs, solution="silent", **kwargs)
+        assert "pages" not in seen["silent"][0]
+        with pytest.raises(ValueError, match="planned for 'declaring'"):
+            dsa_pkg.dsa_index_candidates(
+                *inputs, solution="silent", pages=pages, **kwargs
+            )
+        with pytest.raises(ValueError, match="rows x columns"):
+            dsa_pkg.dsa_index_candidates(
+                *inputs, solution="declaring", pages=pages.rows(0, 2), **kwargs
+            )
+        assert len(compactions) == 1 and len(seen["silent"]) == 1
+    finally:
+        Platform.override(real_platform)

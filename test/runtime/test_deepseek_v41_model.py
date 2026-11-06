@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import math
 import os
 import re
@@ -49,7 +50,13 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
-from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.gemm import (
+    fp8_projection,
+    grouped_fp8_projection,
+    grouped_fp8_projection_quantize_fp8,
+    has_grouped_fp8_projection,
+    mm,
+)
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
@@ -2220,6 +2227,198 @@ def test_sharded_state_load_prepares_fp8_scales_from_loaded_state(
     torch.testing.assert_close(model.proj(x)[0], source.proj(x)[0], rtol=0, atol=0)
 
 
+class _TinyFp8WoAModel(BaseCausalLM):
+    """One V4.1 attention layer behind the V4.1 wo_a loading and warmup hooks."""
+
+    def __init__(self, config):
+        mapping = _mapping(0, 1, 1)
+        super().__init__(config=SimpleNamespace(), mapping=mapping, encoder_only=True)
+        layer = nn.Module()
+        layer.attn = DeepseekV41Attention(
+            config,
+            mapping,
+            0,
+            0,
+            v41_mxfp8_config(_quant()),
+            "layers.0.attn",
+            aux_stream=None,
+        )
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([layer])
+
+    def post_load_weights(self):
+        DeepseekV41ForCausalLM.post_load_weights(self)
+
+    def post_quant_warmup(self):
+        DeepseekV41ForCausalLM.post_quant_warmup(self)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        # The test's o_lora_rank and wo_a input width.
+        and has_grouped_fp8_projection(torch.device("cuda"), 128, 512)
+    ),
+    reason="needs a grouped FP8 kernel for wo_a",
+)
+@torch.inference_mode()
+def test_sharded_state_load_restores_fp8_wo_a(monkeypatch, tmp_path):
+    """A state dict saved after loading FP8 wo_a fits a freshly built model,
+    and the sharded-state load rederives the kernels' wo_a and wo_b scales."""
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    monkeypatch.setattr(v41, "_max_forward_tokens", lambda: 32)
+    config = _config()
+    config.hidden_size = 256
+    config.num_attention_heads = config.o_groups = 2
+    config.head_dim, config.qk_rope_head_dim = 512, 64
+    config.q_lora_rank = 128
+    # A 128-wide wo_a group output lets FP8 kernels serve wo_a and wo_b.
+    config.o_lora_rank = 128
+    torch.manual_seed(17)
+    with torch.device("cuda"):
+        source = _TinyFp8WoAModel(config)
+        a_codes = torch.randn(256, 512).to(torch.float8_e4m3fn)
+        a_scales = torch.randint(118, 124, (8, 16), dtype=torch.uint8)
+        b_codes = torch.randn(256, 256).to(torch.float8_e4m3fn)
+        b_scales = torch.randint(118, 124, (8, 8), dtype=torch.uint8)
+    pending = {}
+    for field, tensor in (("weight", a_codes), ("scale", a_scales)):
+        DeepseekV41ForCausalLM._load_wo_a(
+            source, f"layers.0.attn.wo_a.{field}", tensor, pending
+        )
+    source.load_weights(
+        [
+            ("model.layers.0.attn.wo_b.weight", b_codes),
+            ("model.layers.0.attn.wo_b.weight_scale_inv", b_scales),
+        ]
+    )
+    source.post_load_weights()
+    save_file(
+        {name: value.contiguous() for name, value in source.state_dict().items()},
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+
+    monkeypatch.setattr(
+        loader_module,
+        "_initialize_model",
+        lambda model_config, load_config: _TinyFp8WoAModel(config),
+    )
+    loader = loader_module.ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    model = loader.load_model(
+        model_config=SimpleNamespace(
+            model_path=str(tmp_path),
+            revision=None,
+            dtype=torch.bfloat16,
+            mapping=SimpleNamespace(rank=0),
+        ),
+        device_config=SimpleNamespace(device="cuda"),
+    )
+    attn = model.model.layers[0].attn
+    assert attn.wo_a_fp8 and attn.wo_b_fp8
+    _assert_fp8_wo_a_matches_checkpoint(attn, a_codes, a_scales, b_codes, b_scales)
+    with pytest.raises(ValueError, match="BF16 wo_a"):
+        DeepseekV41ForCausalLM._load_wo_a(
+            model, "layers.0.attn.wo_a.weight", a_codes.bfloat16(), {}
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
+    reason="requires Blackwell MXFP8",
+)
+@pytest.mark.parametrize("layer_id", [0, 20, 24])
+@pytest.mark.parametrize("rows", ["all", "narrowed", "partitioned"])
+@torch.inference_mode()
+def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows):
+    """wq_b and the indexer's wq_b read the fused norm's F8_128x4 scales as
+    written. A narrowed batch keeps the canonical scales it selects rows of; an
+    indexer partition quantizes its local BF16 rows into the same codes."""
+    from tokenspeed.runtime.layers.attention.query_partition import (
+        InterleavedQueryPlan,
+    )
+
+    class Partitioned(_Backend):
+        def __init__(self, positions, requests, view):
+            super().__init__(positions, requests, view)
+            self.selections = []
+
+        def plan_indexer_queries(self, *args):
+            return InterleavedQueryPlan(total_rows=6, rank=1, size=2)
+
+        def prepare_global_selection(
+            self, layer_id, index_q, index_weights, *args, **kwargs
+        ):
+            assert kwargs["projected_partition"] is not None
+            self.selections.append((index_q.clone(), index_weights.clone()))
+            return None
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    previous_pdl = pdl_enabled()
+    pdl_enabled(True)
+    try:
+        config = _config()
+        config.q_lora_rank = 128
+        torch.manual_seed(23)
+        with torch.device("cuda:0"):
+            attn = DeepseekV41Attention(
+                config,
+                _mapping(0, 1, 1),
+                layer_id,
+                layer_id if rows == "narrowed" else v41._ced_decoder_start(config),
+                v41_mxfp8_config(_quant()),
+                f"layers.{layer_id}.attn",
+                aux_stream=None,
+            )
+        _initialize(attn)
+        for module in attn.modules():
+            if isinstance(module, LinearBase):
+                module.quant_method.process_weights_after_loading(module)
+        assert v41._reads_swizzled_scales(attn.wq_b)
+        positions = torch.arange(6, device="cuda:0")
+        requests = torch.zeros(6, dtype=torch.int64, device="cuda:0")
+        x = torch.randn(6, 128, dtype=torch.bfloat16, device="cuda:0")
+        layouts = []
+        quantize = v41.rmsnorm_quantize_fp8_group32
+
+        def recording(*args, **kwargs):
+            layouts.append(kwargs["swizzled_scales"])
+            return quantize(*args, **kwargs)
+
+        monkeypatch.setattr(v41, "rmsnorm_quantize_fp8_group32", recording)
+
+        def run():
+            view = None
+            if rows == "narrowed":
+                keep = torch.tensor([1, 3, 5], device="cuda:0")
+                query = SimpleNamespace(
+                    positions=positions[keep], request_indices=requests[keep]
+                )
+                view = V41DecoderView(query, None, (), keep, None)
+            backend = (Partitioned if rows == "partitioned" else _Backend)(
+                positions, requests, view
+            )
+            out = attn(
+                positions, x, _ctx(backend, 6, ForwardMode.EXTEND), reduce_output=True
+            )
+            selections = backend.selections if rows == "partitioned" else []
+            return out, [*backend.calls[-1][1:5], *sum(selections, ())]
+
+        actual, actual_inputs = run()
+        monkeypatch.setattr(v41, "_reads_swizzled_scales", lambda layer: False)
+        expected, expected_inputs = run()
+        assert layouts == [rows != "narrowed", False]
+        if rows == "partitioned" and attn.indexer is not None:
+            assert len(actual_inputs) == 6
+        assert torch.equal(actual, expected)
+        assert len(actual_inputs) == len(expected_inputs)
+        for got, want in zip(actual_inputs, expected_inputs):
+            assert (got is None) == (want is None)
+            if got is not None:
+                assert torch.equal(got, want)
+    finally:
+        pdl_enabled(previous_pdl)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
     reason="requires Blackwell MXFP8",
@@ -2323,6 +2522,8 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     config.num_attention_heads = config.o_groups = config.index_n_heads = 2
     config.head_dim, config.index_head_dim = 512, 128
     config.qk_rope_head_dim, config.q_lora_rank = 64, 128
+    # A 128-wide wo_a group output lets FP8 kernels serve wo_a and wo_b.
+    config.o_lora_rank = 128
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     torch.manual_seed(41)
     with torch.device("cuda:0"):
@@ -2333,11 +2534,35 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
             is_multimodal_active=False,
             mm_attention_backend=None,
         )
-    adapter.load_weights(
-        _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
-    )
+    weights = _checkpoint(config)
+    adapter.load_weights(_bind_engram_tables(adapter, weights, tmp_path).items())
     adapter.initialize_engram(_Tokenizer())
     model = adapter.model
+    # GPUs with a grouped FP8 kernel run wo_a on its FP8 codes and feed wo_b
+    # its FP8 output; other GPUs dequantize wo_a.
+    fp8_wo_a = has_grouped_fp8_projection(
+        torch.device("cuda:0"),
+        config.o_lora_rank,
+        config.num_attention_heads * config.head_dim // config.o_groups,
+    )
+    for layer in model.layers:
+        assert layer.attn.wo_a_fp8 is fp8_wo_a
+        assert layer.attn.wo_b_fp8 is (True if fp8_wo_a else None)
+        assert layer.attn.wo_a.weight.dtype == (
+            torch.float8_e4m3fn if fp8_wo_a else torch.bfloat16
+        )
+    if fp8_wo_a and execution_mode == "eager":
+        _assert_fp8_wo_a_matches_checkpoint(
+            model.layers[0].attn,
+            *(
+                weights[f"layers.0.attn.{name}"]
+                for name in ("wo_a.weight", "wo_a.scale")
+            ),
+            *(
+                weights[f"layers.0.attn.{name}"]
+                for name in ("wo_b.weight", "wo_b.scale")
+            ),
+        )
     for module in model.modules():
         if isinstance(module, LinearBase):
             module.quant_method.process_weights_after_loading(module)
@@ -2401,6 +2626,47 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     _assert_decode_graph_matches_eager(
         adapter, backend, tables, "cuda:0", ((6, 1), (7, 1), (8, 1), (1, 0), (9, 1))
     )
+
+
+def _dequantize_checkpoint(codes, scales):
+    exponents = scales.view(torch.uint8).repeat_interleave(32, 0)
+    exponents = exponents.repeat_interleave(32, 1).cuda().to(torch.int32)
+    return codes.cuda().float() * (exponents << 23).view(torch.float32)
+
+
+def _dequantize_packed(codes, scales):
+    exponents = torch.stack(
+        [(scales >> (8 * byte)) & 255 for byte in range(4)], dim=-1
+    ).flatten(-2)
+    values = codes.float().unflatten(-1, (-1, 32))
+    return (values * (exponents << 23).view(torch.float32)[..., None]).flatten(-2)
+
+
+def _assert_fp8_wo_a_matches_checkpoint(attn, a_codes, a_scales, b_codes, b_scales):
+    """The loaded FP8 wo_a and wo_b compute the checkpoint's dequantized
+    projections of their FP8-rounded inputs."""
+    groups, rank = attn.n_local_groups, attn.o_lora_rank
+    torch.manual_seed(5)
+    out = torch.randn(9, attn.n_local_heads, 512, device="cuda").bfloat16()
+    x, x_scales = attn.rotary_emb.inverse_quantize_grouped(
+        out, torch.arange(9, device="cuda"), groups
+    )
+    wo_a = attn.wo_a.weight.view(groups, rank, -1)
+    actual = grouped_fp8_projection(x, x_scales, wo_a, attn.wo_a_scales, None)
+    expected = torch.einsum(
+        "tgk,grk->tgr",
+        _dequantize_packed(x, x_scales).double(),
+        _dequantize_checkpoint(a_codes, a_scales).view(groups, rank, -1).double(),
+    )
+    torch.testing.assert_close(actual.double(), expected, rtol=2**-8, atol=1e-3)
+    z, z_scales = grouped_fp8_projection_quantize_fp8(
+        x, x_scales, wo_a, attn.wo_a_scales
+    )
+    actual = fp8_projection(z, z_scales, attn.wo_b.weight, attn.wo_b_scales, None)
+    expected = _dequantize_packed(z, z_scales).double() @ (
+        _dequantize_checkpoint(b_codes, b_scales).double().T
+    )
+    torch.testing.assert_close(actual.double(), expected, rtol=2**-8, atol=1e-3)
 
 
 @torch.inference_mode()
@@ -4016,3 +4282,60 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 torch.testing.assert_close(actual_tap, expected_tap, rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("case", ["fused", "limit_differs", "kernel_declines"])
+def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
+    """The MoE hands its FP8 shared expert to a kernel that fuses it, once, and
+    keeps it, saying why, when MegaMoE would clamp it with a different SwiGLU
+    limit or the kernel declines it."""
+    metadata = vars(_loader_config())
+    metadata["hidden_size"] = 256
+    metadata["moe_intermediate_size"] = 256
+    config = v41.DeepseekV41Config(text_config=metadata).text_config
+    mapping = _mapping(1, 1, 2)
+    _mock_loader_hardware(monkeypatch, mapping)
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
+    )
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
+    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    shared = moe.shared_experts
+    assert shared.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+    if case == "limit_differs":
+        shared.act_fn.swiglu_limit = 2 * moe.experts.swiglu_arg.limit
+    calls = []
+
+    def fuse(plan, layer, *tensors):
+        calls.append((layer, tensors))
+        return case == "fused"
+
+    moe.experts.plan["fuse_shared_expert"] = fuse
+    # The mocked loader hardware stubs the routed weight processing.
+    moe.experts._weights_processed = True
+    caplog.set_level(logging.INFO, logger=v4.__name__)
+    moe.process_weights_after_loading(moe)
+    moe.process_weights_after_loading(moe)
+
+    assert moe.shared_expert_fused is (case == "fused")
+    unfused = [
+        r.getMessage() for r in caplog.records if "outside MegaMoE" in r.getMessage()
+    ]
+    if case != "fused":
+        assert len(unfused) == 2
+        assert all(message.startswith("Layer 0 ") for message in unfused)
+        expected = "SwiGLU limit" if case == "limit_differs" else "weight shapes"
+        assert all(expected in message for message in unfused)
+        assert len(calls) == (0 if case == "limit_differs" else 2)
+        return
+    assert unfused == []
+    assert len(calls) == 1
+    layer, tensors = calls[0]
+    assert layer is moe.experts
+    params = (
+        shared.gate_up_proj.weight,
+        shared.gate_up_proj.weight_scale_inv,
+        shared.down_proj.weight,
+        shared.down_proj.weight_scale_inv,
+    )
+    assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))

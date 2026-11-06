@@ -80,7 +80,14 @@ def _supports_allocator_setting(setting: str) -> bool:
 
 
 def set_pinned_allocator_default() -> None:
-    """Default large pinned buffers to exact sizes in fresh worker processes."""
+    """Default the pinned host allocator for fresh worker processes.
+
+    Large pinned buffers take exact sizes. A helper thread checks freed
+    blocks' events: when the forward thread checks them itself, for its
+    per-step staging copies, a CUDA host function in flight (the captured
+    grammar fill) can hold its ``cudaEventQuery`` for tens of milliseconds.
+    Each setting applies only where the native allocator parses it.
+    """
     # PyTorch reads the first defined variable in this order.
     key = next(
         (
@@ -95,10 +102,18 @@ def set_pinned_allocator_default() -> None:
         "PYTORCH_ALLOC_CONF",
     )
     config = os.environ.get(key, "").strip().rstrip(",")
-    if "pinned_max_round_threshold_mb" not in config:
-        default = "pinned_max_round_threshold_mb:1024"
-        if _supports_allocator_setting(default):
-            os.environ[key] = f"{config},{default}" if config else default
+    added = False
+    for default in (
+        "pinned_max_round_threshold_mb:1024",
+        "pinned_use_background_threads:True",
+    ):
+        if default.split(":", 1)[0] not in config and _supports_allocator_setting(
+            default
+        ):
+            config = f"{config},{default}" if config else default
+            added = True
+    if added:
+        os.environ[key] = config
 
 
 def set_rocm_tool_registration_default() -> None:

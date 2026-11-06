@@ -26,8 +26,8 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     finish_selection,
     prepare_candidate_scores,
+    prepare_native_block_scores,
     prepare_native_dense_scores,
-    prepare_scores,
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -130,8 +130,8 @@ def select_candidates(logits, valid_lengths, topk_blocks, block_size):
         )
     input_alignment, _ = deep_select_alignment()
     # block_size=1 still needs newest pin, unlike ordinary token preparation.
-    scores, ends = prepare_scores(
-        logits, valid_lengths, block_size, input_alignment // 4, True
+    scores, ends = prepare_native_block_scores(
+        logits, valid_lengths, block_size, input_alignment // 4
     )
     indices = _native_indices(scores, ends, topk_blocks)
     return finish_selection(

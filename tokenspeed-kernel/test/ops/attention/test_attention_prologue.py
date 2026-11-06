@@ -2396,6 +2396,48 @@ def test_mla_token_count_reuses_compiled_tiles():
             run(count)
 
 
+def test_mla_token_count_needs_one_binary_per_token_tile():
+    """The token count is unspecialized: one count per token tile size warms
+    every count of that tile, including 1 and multiples of 16."""
+    from tokenspeed_kernel.ops.embedding.triton import (
+        _mla_rope_set_kv_buffer_kernel,
+        select_mla_kv_block_n,
+    )
+
+    heads, rank, rope = 4, 512, 64
+    table = cos_sin_cache(rope)
+    cache = poisoned_latent(2048, rank + rope, BF16)
+
+    def run(count):
+        q_nope, q_pe, latent = mla_inputs(count, heads, rank, rope, seed=204)
+        out = mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe,
+            latent,
+            expanded=None,
+            rotary=Rotary(
+                table, torch.arange(count, device="cuda"), RopeStyle.NEOX, None
+            ),
+            cache=latent_target(cache, torch.arange(count, device="cuda")),
+            solution="triton",
+            override=None,
+        )
+        assert bytes_equal(out.query[..., :rank], q_nope)
+        assert bytes_equal(cache[:count, 0, :rank], latent[:, :rank])
+
+    # Warm counts are neither 1 nor multiples of 16, a class the sweep never hits.
+    warm = (33, 257, 449, 673, 897, 1121)
+    sweep = (1, 16, 48, 208, 224, 256, 320, 432, 448, 512, 640, 672, 768, 880, 896)
+    sweep += (960, 1088, 1120, 1280, 1536)
+    tiles = {select_mla_kv_block_n(count, heads) for count in warm}
+    assert {select_mla_kv_block_n(count, heads) for count in sweep} <= tiles
+    for count in warm:
+        run(count)
+    with assert_no_triton_compile(_mla_rope_set_kv_buffer_kernel):
+        for count in sweep:
+            run(count)
+
+
 @pytest.mark.parametrize("fused", ["composite", "triton"])
 @pytest.mark.parametrize("masked", [False, True])
 def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked, fused):
