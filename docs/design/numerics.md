@@ -724,6 +724,10 @@ The original Hugging Face config is not rewritten.
 Input buffer clamps, n-gram token validation and multimodal draft substitute
 validation use `input_vocab_size`. Sampling, draft probability tensors,
 grammar masks, logit bias and prompt-logprob validation keep using `vocab_size`.
+Prompt-logprob admission checks only the scored next-token targets,
+`input_ids[logprob_start_len + 1..]`, against the output vocabulary. Unscored
+context retains the input bounds, including the token at `logprob_start_len`;
+it feeds the first scored row rather than being that row's target.
 An input-only token can reach the model without becoming a valid output token
 or prompt-logprob target. Models or plugins with a reduced head must construct
 the embedding and head for their respective checkpoint sizes.
