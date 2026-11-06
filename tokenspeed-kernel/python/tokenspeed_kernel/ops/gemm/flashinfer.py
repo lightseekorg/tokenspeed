@@ -954,11 +954,12 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 # chosen here rather than by FI's tuner: the deepest-staged tile whose grid
 # fits in one wave. Without PDL there is no overlap, and cuBLASLt stays.
 #
-# FI's tuner keeps every 2-CTA TGV tactic blocklisted (autotune() in
-# ops/tuning.py) after replay failures of FI 0.6.18's C++ TGV kernel. FI
-# 0.7.2.post1 runs TGV as a CuTe DSL rewrite (tgv_gemm_cute_ext), which these
-# tiles call directly, outside the tuner. The GPU tests capture and replay
-# each tile, alone and in a chain of PDL kernels.
+# FI's tuner keeps the 2-CTA TGV tactics 16 to 28, these tiles among them,
+# blocklisted (autotune() in ops/tuning.py) after replay failures of FI
+# 0.6.18's C++ TGV kernel. FI 0.7.2.post1 runs TGV as a CuTe DSL rewrite
+# (tgv_gemm_cute_ext), which these tiles call directly, outside the tuner.
+# The GPU tests capture and replay each tile, alone and in a chain of PDL
+# kernels.
 
 # The policy routes rows above TGV_DECODE_MIN_M, the joint FlashInfer path's
 # bound on SM100 and SM103 (BF16_GEMM_MAX_M there; the GPU tests check that

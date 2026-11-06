@@ -39,9 +39,11 @@ SM107 = ArchVersion(10, 7)
 TILE16, TILE32, TILE64 = fi.TGV_DECODE_TILES
 MIB = 1 << 20
 
-# FlashInfer 0.7.2.post1's TGV tactic table, the release requirements/cuda.txt
-# pins: (cta_m, cta_n, num_ab_stage, use_2cta) at position = tactic id.
-FLASHINFER_0_7_2_TACTICS = [
+# FlashInfer 0.7.3's TGV tactic table, the release requirements/cuda.txt pins:
+# (cta_m, cta_n, num_ab_stage, use_2cta) at position = tactic id. Ids 0 to 28
+# are those of 0.7.2.post1; 0.7.3 appends deeper-staged tiles that fit only
+# SM107's larger shared memory and run only there.
+FLASHINFER_0_7_3_TACTICS = [
     *((64, 8, stages, False) for stages in (6, 8, 10, 12)),
     *((64, 16, stages, False) for stages in (6, 8, 11)),
     *((64, 32, stages, False) for stages in (6, 9)),
@@ -60,6 +62,25 @@ FLASHINFER_0_7_2_TACTICS = [
     (128, 32, 6, True),
     (128, 64, 5, True),
     (128, 128, 4, True),
+    # SM107 only, from id 29.
+    (64, 8, 18, False),
+    (64, 16, 16, False),
+    (64, 32, 13, False),
+    (64, 64, 10, False),
+    (64, 128, 6, False),
+    (128, 8, 9, False),
+    (128, 16, 9, False),
+    (128, 32, 8, False),
+    (128, 64, 6, False),
+    (128, 128, 5, False),
+    (64, 16, 18, True),
+    (64, 32, 16, True),
+    (64, 64, 13, True),
+    (64, 128, 10, True),
+    (128, 16, 9, True),
+    (128, 32, 9, True),
+    (128, 64, 8, True),
+    (128, 128, 6, True),
 ]
 
 
@@ -186,25 +207,27 @@ def test_tile_only_grows_with_rows(n, sm_count):
 
 
 def test_tactics_are_found_by_shape():
-    assert fi.resolve_tgv_tactics(FLASHINFER_0_7_2_TACTICS) == {
+    assert fi.resolve_tgv_tactics(FLASHINFER_0_7_3_TACTICS) == {
         TILE16: 18,
         TILE32: 21,
         TILE64: 23,
     }
-    # A release that reorders or extends the table moves the ids.
-    reordered = FLASHINFER_0_7_2_TACTICS[::-1]
+    # A release that reorders or extends the table moves the ids. Reversed,
+    # the SM107 tiles of the pinned shapes, with more stages, come first.
+    reordered = FLASHINFER_0_7_3_TACTICS[::-1]
     assert fi.resolve_tgv_tactics(reordered) == {
-        TILE16: 28 - 18,
-        TILE32: 28 - 21,
-        TILE64: 28 - 23,
+        TILE16: 46 - 18,
+        TILE32: 46 - 21,
+        TILE64: 46 - 23,
     }
-    extended = [(64, 16, 4, True), (64, 256, 2, True), *FLASHINFER_0_7_2_TACTICS]
+    extended = [(64, 16, 4, True), (64, 256, 2, True), *FLASHINFER_0_7_3_TACTICS]
     assert fi.resolve_tgv_tactics(extended) == {TILE16: 20, TILE32: 23, TILE64: 25}
 
 
 @pytest.mark.parametrize(
     "missing,replacement",
     [
+        # SM107's tile of the same shape does not stand in for it.
         (TILE32, None),
         # Same tile shape with fewer stages: no longer the pinned tile.
         (TILE16, (64, 16, 10, True)),
@@ -213,7 +236,7 @@ def test_tactics_are_found_by_shape():
 )
 def test_table_without_a_pinned_tile_resolves_to_nothing(missing, replacement):
     table = [
-        replacement if entry == missing else entry for entry in FLASHINFER_0_7_2_TACTICS
+        replacement if entry == missing else entry for entry in FLASHINFER_0_7_3_TACTICS
     ]
     assert fi.resolve_tgv_tactics([entry for entry in table if entry]) is None
     assert fi.resolve_tgv_tactics([]) is None
