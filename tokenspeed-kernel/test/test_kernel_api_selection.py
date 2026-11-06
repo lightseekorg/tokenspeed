@@ -7694,17 +7694,27 @@ def test_attn_merge_state_routes_to_triton_on_cdna4(
 
 
 @pytest.mark.parametrize(
-    ("entrypoint_name", "implementation_name"),
+    ("entrypoint_name", "implementation_name", "added"),
     [
-        ("gluon_dsa_prefill_gfx950", "_dsa_prefill_impl"),
-        ("gluon_dsa_prefill_fp8_dense_gfx950", "_dsa_prefill_impl"),
-        ("gluon_dsa_prefill_gfx1250", "_dsa_prefill_gfx1250_impl"),
-        ("gluon_dsa_prefill_fp8_dense_gfx1250", "_dsa_prefill_gfx1250_impl"),
+        # gfx950 also forwards whether a warmup compiles its split-KV variants.
+        (
+            "gluon_dsa_prefill_gfx950",
+            "_dsa_prefill_impl",
+            {"warm_split_variants": False},
+        ),
+        (
+            "gluon_dsa_prefill_fp8_dense_gfx950",
+            "_dsa_prefill_impl",
+            {"warm_split_variants": False},
+        ),
+        ("gluon_dsa_prefill_gfx1250", "_dsa_prefill_gfx1250_impl", {}),
+        ("gluon_dsa_prefill_fp8_dense_gfx1250", "_dsa_prefill_gfx1250_impl", {}),
     ],
 )
 def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     entrypoint_name: str,
     implementation_name: str,
+    added: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entrypoint = getattr(_attention_gluon_dsa, entrypoint_name, None)
@@ -7725,7 +7735,7 @@ def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     result = entrypoint(marker=marker, kv_seq_lens=object())
 
     assert result is expected
-    assert forwarded == {"marker": marker}
+    assert forwarded == {"marker": marker, **added}
 
 
 @pytest.mark.parametrize(
