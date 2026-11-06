@@ -388,7 +388,7 @@ class HostConfig:
         engine_index: The engine identity this rank registers as.
         ready_response: The msgpack-encoded ``WireEngineCoreReadyResponse``.
         in_flight_depth: Dispatched forwards that may await commit.
-        vocab_size: Token ids in the vocabulary.
+        output_vocab_size: Token ids represented by the output head.
         eos_token_ids: The model's EOS ids.
         top_k_exclusive_max: The selected sampler's admission bound; None
             when the backend normalizes every positive finite top_k.
@@ -474,7 +474,7 @@ class HostConfig:
     engine_index: int
     ready_response: bytes
     in_flight_depth: int
-    vocab_size: int
+    output_vocab_size: int
     eos_token_ids: tuple[int, ...]
     top_k_exclusive_max: int | None
     max_model_len: int
@@ -1319,7 +1319,7 @@ class HostBootstrap:
                 in_flight_depth=(
                     mapping.pp_size if mapping.has_pp else overlap_schedule_depth
                 ),
-                vocab_size=model_config.vocab_size,
+                output_vocab_size=model_config.output_vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
                 top_k_exclusive_max=get_sampling_backend_class(
                     server_args
@@ -1329,7 +1329,7 @@ class HostBootstrap:
                 logprob_servability=LogprobServability.of(
                     server_args,
                     supports_prompt_logprobs=specs.supports_prompt_logprobs,
-                    vocab_size=model_config.vocab_size,
+                    vocab_size=model_config.output_vocab_size,
                 ),
                 lm_head_tp_under_dp=mapping.attn.has_dp and mapping.lm_head.has_tp,
                 stream_interval=server_args.stream_interval,
@@ -1410,7 +1410,7 @@ class HostBootstrap:
                     GrammarSettings(
                         tokenizer_info=grammar_tokenizer_info(
                             tokenizer,
-                            model_config.vocab_size,
+                            model_config.output_vocab_size,
                             model_config.hf_eos_token_id,
                         ),
                         any_whitespace=not server_args.disable_any_whitespace,

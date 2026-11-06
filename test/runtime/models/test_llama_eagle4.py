@@ -122,7 +122,8 @@ def _static_tree_drafter(model: LlamaForCausalLMEagle4, topk: int) -> Eagle4:
         ),
         runtime_states=RuntimeStates(
             req_pool_size=max_bs,
-            vocab_size=model.config.vocab_size,
+            input_vocab_size=model.config.vocab_size,
+            output_vocab_size=model.config.vocab_size,
             output_length=nodes,
             device="cuda",
         ),

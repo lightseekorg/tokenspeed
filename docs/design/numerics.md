@@ -1,5 +1,23 @@
 # Numerics envelopes
 
+## Input and output vocabularies
+
+`ModelConfig.input_vocab_size` is the checkpoint's embedding vocabulary;
+`output_vocab_size` is the head's vocabulary. Both must be positive integers.
+A missing or null checkpoint `output_vocab_size` means the two sizes are equal.
+The legacy `ModelConfig.vocab_size` alias retains the input meaning, as does
+the original Hugging Face config. A model with a smaller head must construct
+its head and logits processor for that output size.
+
+`ModelExecutorConfig` and `RuntimeStates` carry both sizes explicitly. Input
+buffer clamps, n-gram preparation and multimodal draft substitutions use the
+input size. Sampling, draft probability tensors, grammar masks, output-token
+validation and selected-token logprobs use the output size. The host's ingress
+also uses the output size to validate logit bias and prompt-logprob targets:
+an input-only token can be embedded, but cannot be scored by the output head.
+Model-specific relationships between input, text/hash and output vocabularies
+belong in the model or plugin config, not in the common runtime.
+
 `--numerics` names, at launch level, the numerical contract a deployment
 promises. Every capability under it exists as an individual switch; the
 envelope's whole job is to keep the set coherent, because RL rollout

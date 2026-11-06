@@ -406,7 +406,7 @@ impl HostConfig {
                 .to_vec(),
             in_flight_depth: config.getattr("in_flight_depth")?.extract()?,
             limits: IngressLimits {
-                vocab_size: config.getattr("vocab_size")?.extract()?,
+                output_vocab_size: config.getattr("output_vocab_size")?.extract()?,
                 eos_token_ids: config.getattr("eos_token_ids")?.extract()?,
                 top_k_exclusive_max: config.getattr("top_k_exclusive_max")?.extract()?,
                 max_model_len: config.getattr("max_model_len")?.extract()?,

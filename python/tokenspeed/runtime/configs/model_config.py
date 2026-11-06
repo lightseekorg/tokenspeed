@@ -971,7 +971,21 @@ class ModelConfig:
                 )
                 if nextn_layers is not None and nextn_layers > 0:
                     self.num_attention_layers = nextn_layers
-        self.vocab_size = self.hf_text_config.vocab_size
+        self.input_vocab_size = self.hf_text_config.vocab_size
+        output_vocab_size = getattr(self.hf_text_config, "output_vocab_size", None)
+        self.output_vocab_size = (
+            self.input_vocab_size if output_vocab_size is None else output_vocab_size
+        )
+        for name, size in (
+            ("input", self.input_vocab_size),
+            ("output", self.output_vocab_size),
+        ):
+            if type(size) is not int or size <= 0:
+                raise ValueError(
+                    f"The {name} vocabulary size must be a positive integer"
+                )
+        # Retain the checkpoint meaning for callers that build input embeddings.
+        self.vocab_size = self.input_vocab_size
 
         # Verify quantization
         self._verify_quantization()
