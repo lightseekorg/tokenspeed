@@ -444,6 +444,7 @@ class TestModelVerificationGate:
 
         return ModelProfile(
             configure_attention=configure_mla_attention,
+            create_attention_config=None,
             cache_family="fixture_family",
             linear_attention=None,
             default_attention_backend=None,
