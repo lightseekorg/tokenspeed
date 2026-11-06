@@ -413,6 +413,7 @@ class DSABackend(PagedAttentionBackend):
                 page_size=self.kernel_page_size,
                 batch_invariant=self.batch_invariant,
                 solution=self.kernel_solution,
+                row_starts_cpu=False,
             )
         except NoKernelFoundError as e:
             raise NoKernelFoundError(
