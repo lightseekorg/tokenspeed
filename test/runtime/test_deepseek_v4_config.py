@@ -658,6 +658,7 @@ class TestDeepseekV4Config:
             config=SimpleNamespace(num_experts_per_tok=2, norm_topk_prob=True),
             n_shared_experts=1,
             shared_experts=shared_experts,
+            shared_expert_fused=False,
             stream_fork=StreamFork(None),
             routed_scaling_factor=1.0,
             experts=routed_experts,

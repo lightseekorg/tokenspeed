@@ -106,6 +106,7 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
             padded_write_locations=lambda layer, m, rows: handed.update(rows=rows)
             or slots,
             cache_placement=lambda layer: None,
+            query_dtype=lambda layer, mode, activation: activation,
         ),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: HeadKVCache(cache, cache, None, s)

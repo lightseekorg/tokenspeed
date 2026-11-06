@@ -29,6 +29,7 @@ test_kernel_api_selection.py.
 from __future__ import annotations
 
 import importlib
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -592,3 +593,65 @@ def test_mla_prefill_gluon_launch_metadata(
         "bytes": tensor_bytes + (lse.numel() * 4 if has_lse else 0),
     }
     assert getattr(module, kernel).launch_metadata is module.prefill_launch_metadata
+
+
+def test_mla_prefill_8wave_votes_on_maxima_in_compiled_code():
+    """The 8-wave kernel's maxima vote is code the compiler sees.
+
+    The compiler inserts the wait states an asm block would hide, and the
+    vote stays one compare against EXEC per online-softmax update (a
+    wave-uniform scalar condition). Compiles for gfx950 without launching.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla import prefill_8wave
+
+    config = prefill_8wave.get_config(
+        q=torch.empty(1, 16, 192, dtype=torch.bfloat16),
+        k=torch.empty(1, 16, 192, dtype=torch.bfloat16),
+    )
+    fn = prefill_8wave.gluon_mla_prefill_8wave_gfx950
+    pointers = {
+        "q_ptr": "*bf16",
+        "k_ptr": "*bf16",
+        "v_ptr": "*bf16",
+        "output_ptr": "*bf16",
+        "lse_ptr": "*fp32",
+        "cu_seqlens_q_ptr": "*i32",
+        "cu_seqlens_kv_ptr": "*i32",
+    }
+    signature = dict(pointers, batch_size="i32", max_seqlen_q="i32")
+    constexprs = dict(
+        Q_STRIDE_T=16 * 192, Q_STRIDE_H=192, K_STRIDE_T=16 * 192, K_STRIDE_H=192,
+        V_STRIDE_T=16 * 128, V_STRIDE_H=128, O_STRIDE_T=16 * 128, O_STRIDE_H=128,
+        LSE_STRIDE_T=16, LSE_STRIDE_H=1, N_HEADS=config.n_heads,
+        N_KV_HEADS=config.n_kv_heads, HEAD_DIM=config.head_dim,
+        ROPE_DIM=config.rope_dim, SM_SCALE=0.0721, IS_CAUSAL=True,
+        HAS_LSE=False, BLOCK_M=config.block_m, BLOCK_N=config.block_n,
+        NUM_WARPS=config.num_warps, IS_FP8=False,
+    )  # fmt: skip
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn,
+            {name: signature[name] for name in fn.arg_names if name in signature},
+            constexprs=constexprs,
+            attrs=attrs,
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options=dict(
+            num_warps=config.num_warps,
+            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+            **sched_compile_options(),
+        ),
+    )
+    assembly = kernel.asm["amdgcn"]
+    asm_blocks = re.findall(r";;#ASMSTART(.*?);;#ASMEND", assembly, flags=re.S)
+    assert not any("_cmp_" in block for block in asm_blocks)
+    # One vote in each of the two online-softmax updates (masked and
+    # unmasked tiles).
+    assert assembly.count("s_cmp_eq_u64 vcc, exec") == 2

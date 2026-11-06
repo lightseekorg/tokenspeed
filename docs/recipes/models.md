@@ -445,9 +445,8 @@ Notes:
 - The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly.
   You no longer need a flattened local checkpoint and a separately staged
   remote-code cache.
-- The checkpoint carries no FP8 KV scaling factors. When the target K3 uses an
-  FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
-  BF16 so context injection and draft attention match the reference precision.
+- K3's target and DSpark draft MLA caches follow the shared `--kv-cache-dtype`
+  setting, as with EAGLE3: `fp8` selects FP8; `auto` and `bfloat16` select BF16.
 - DSpark proposal blocks use non-causal MLA draft attention. Both the `mla` and
   `trtllm_mla` draft backends preserve every block row during eager execution
   and CUDA graph capture. When K3's 128-token logical cache pages feed the

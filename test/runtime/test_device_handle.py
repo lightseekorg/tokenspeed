@@ -216,6 +216,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch.setattr(scheduler_utils, "pool_to_cache_groups", lambda pool: [])
     args = SimpleNamespace(
         disaggregation_mode="null",
+        mapping=Mapping(rank=0, world_size=1),
         # Read by the EPD receive pool sizing (#2714): no external encoder here.
         enable_external_encoder=False,
         chunked_prefill_size=8192,

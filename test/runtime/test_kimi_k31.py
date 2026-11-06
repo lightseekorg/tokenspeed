@@ -1059,6 +1059,57 @@ def test_the_fused_key_and_head_weight_projection_matches_the_two_gemms(
     assert eager.query_proj is None and eager.query.shape == (37, 32, 128)
 
 
+@requires_gpu
+def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
+    """One GEMM over ``q_norm`` for ``q_b_proj`` and the indexer's ``wq_b``
+    gives the two projections, keeps tracking in-place loads into either
+    parameter, and is skipped under bitwise numerics."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.manual_seed(0)
+    attention = _indexer_attention(index_topk=2048)
+    with torch.no_grad():
+        for linear in (attention.q_b_proj, attention.indexer.wq_b):
+            linear.weight.normal_(0.0, 0.05)
+    q_norm = torch.randn(37, 128, device="cuda", dtype=torch.bfloat16)
+    want_q = attention.q_b_proj(q_norm)[0].float()
+    want_index = attention.indexer._project_query(q_norm).float()
+
+    attention.fuse_query_projections()
+    fused = attention.q_b_wq_b_weight
+    rows = attention.q_b_proj.weight.shape[0]
+    assert fused.shape == (rows + 32 * 128, 128)
+    got_q, got_index = mm(q_norm, fused).split((rows, 32 * 128), dim=-1)
+    torch.testing.assert_close(got_q.float(), want_q, rtol=2**-7, atol=1e-5)
+    torch.testing.assert_close(
+        got_index.float().view(37, 32, 128), want_index, rtol=2**-7, atol=1e-5
+    )
+
+    with torch.no_grad():
+        attention.q_b_proj.weight.normal_(0.0, 0.05)
+        attention.indexer.wq_b.weight.normal_(0.0, 0.05)
+    got_q, got_index = mm(q_norm, fused).split((rows, 32 * 128), dim=-1)
+    torch.testing.assert_close(
+        got_q.float(),
+        q_norm.float() @ attention.q_b_proj.weight.float().T,
+        atol=2e-3,
+        rtol=1.6e-2,
+    )
+    torch.testing.assert_close(
+        got_index.float(),
+        q_norm.float() @ attention.indexer.wq_b.weight.float().T,
+        atol=2e-3,
+        rtol=1.6e-2,
+    )
+
+    bitwise = _indexer_attention(index_topk=2048)
+    monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
+    bitwise.fuse_query_projections()
+    assert bitwise.q_b_wq_b_weight is None
+
+
 def _separable_keys(num_tokens: int, bad: torch.Tensor, device):
     """Index rows whose top-k is unambiguous: every head's query is the same
     direction ``u``; good keys point along it (positive score), bad keys
@@ -2113,6 +2164,7 @@ def _prefill_then_decode_twice(
 
 
 @requires_gpu
+@pytest.mark.parametrize("fused_query", [False, True])
 @pytest.mark.parametrize(
     "kv_cache_dtype, spec_width, fraction",
     [
@@ -2124,7 +2176,7 @@ def _prefill_then_decode_twice(
     ],
 )
 def test_k31_attention_matches_dense_mla_and_replays_in_a_decode_graph(
-    monkeypatch, kv_cache_dtype, spec_width, fraction
+    monkeypatch, kv_cache_dtype, spec_width, fraction, fused_query
 ) -> None:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -2140,6 +2192,9 @@ def test_k31_attention_matches_dense_mla_and_replays_in_a_decode_graph(
         kvp_size=1,
         kvp_rank=0,
     )
+    if fused_query:
+        attention.fuse_query_projections()
+        assert attention.q_b_wq_b_weight is not None
     prompt = 40
     hidden = torch.randn(
         prompt + 2 * spec_width, 256, device="cuda", dtype=torch.bfloat16

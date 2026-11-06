@@ -134,9 +134,10 @@ for decode, MTP, BF16 state, and prefill.
 
 ## Rubin FlashInfer
 
-The pinned FlashInfer Python/cubin release is `0.7.2.post1`, which includes
-both Rubin entry points. Registrations live in `flashinfer.py`; the explicit
-`flashinfer_rubin` decode solution remains available.
+The audited FlashInfer Python/cubin release for these adapters is `0.7.2.post1`.
+The current `0.7.3` dependency pin uses the portable fallback until its sources
+are audited. Registrations live in `flashinfer.py`; the explicit
+`flashinfer_rubin` decode solution requires the audited release.
 
 The Rubin adapters check the release version, API parameters, and SHA256 of
 the upstream sources before registration. Source checks cover the decode CTA
