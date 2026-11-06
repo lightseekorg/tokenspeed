@@ -31,7 +31,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -218,18 +218,17 @@ class BaseCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: ModelInitConfig[PretrainedConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         encoder_only: bool = False,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
 
-        self.vocabulary = vocabulary
+        hf_config = config.hf_config
+        self.vocabulary = config.vocabulary
         super().__init__()
-        self.config = config
+        self.config = hf_config
         self.mapping = mapping
         self.quant_config = quant_config
         self.capture_aux_hidden_states: bool = False
@@ -252,10 +251,10 @@ class BaseCausalLM(nn.Module):
             self.lm_head = None
             self.logits_processor = None
         else:
-            self.model = self.resolve_model(config, mapping, quant_config, prefix)
+            self.model = self.resolve_model(hf_config, mapping, quant_config, prefix)
             if mapping.is_last_pp_rank:
-                self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
-                self.logits_processor = self.resolve_logits_processor(config)
+                self.lm_head = self.resolve_lm_head(hf_config, quant_config, prefix)
+                self.logits_processor = self.resolve_logits_processor(hf_config)
             else:
                 # Mid-pipeline stages emit hidden states, never logits.
                 self.lm_head = None

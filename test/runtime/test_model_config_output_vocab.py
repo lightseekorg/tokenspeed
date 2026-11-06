@@ -32,6 +32,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.model_config import ModelConfig  # noqa: E402
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
@@ -197,9 +198,15 @@ def test_common_model_builds_head_from_resolved_output_domain(tied):
     mapping = Mapping(rank=0, world_size=1)
     if tied:
         with pytest.raises(ValueError, match="equal vocabulary sizes"):
-            CausalModel(config, mapping, vocabulary=vocabulary)
+            CausalModel(
+                ModelInitConfig(hf_config=config, vocabulary=vocabulary),
+                mapping,
+            )
         return
-    model = CausalModel(config, mapping, vocabulary=vocabulary)
+    model = CausalModel(
+        ModelInitConfig(hf_config=config, vocabulary=vocabulary),
+        mapping,
+    )
     hidden = model.model.embed_tokens(torch.tensor([127]))
     model.logits_processor.prepare_communication(model.lm_head)
     logits = model.logits_processor._get_logits(
@@ -215,14 +222,79 @@ def test_target_outputs_must_be_valid_input_ids(tmp_path):
         _load(tmp_path, input_vocab_size=64, output_fields={"output_vocab_size": 128})
 
 
+@pytest.mark.parametrize("output_size", [64, 65, 128])
+def test_multimodal_wrapper_keeps_resolved_vocabulary(output_size):
+    import torch
+
+    from tokenspeed.runtime.configs.qwen3_5_config import (
+        Qwen3_5Config,
+        Qwen3_5TextConfig,
+    )
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+
+    if not torch.cuda.is_available():
+        pytest.skip("Model construction requires CUDA")
+    text_config = Qwen3_5TextConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+        layer_types=["full_attention"],
+        full_attention_interval=1,
+        tie_word_embeddings=False,
+    )
+    hf_config = Qwen3_5Config(text_config=text_config)
+    vocabulary = VocabularySpec(input_size=128, output_size=output_size)
+    with torch.device("cuda"):
+        model = Qwen3_5ForConditionalGeneration(
+            ModelInitConfig(hf_config=hf_config, vocabulary=vocabulary),
+            mapping=Mapping(rank=0, world_size=1),
+            is_multimodal_active=False,
+        )
+        with torch.no_grad():
+            model.model.embed_tokens.weight.fill_(1)
+            model.lm_head.weight.zero_()
+            hidden = model.model.embed_tokens(torch.tensor([127]))
+            logits = model.logits_processor._get_logits(
+                hidden, model.lm_head, None, require_full_vocab=True
+            )
+    assert model.vocabulary is vocabulary
+    assert model.config is text_config
+    assert text_config.vocab_size == 128
+    torch.testing.assert_close(
+        logits, torch.zeros(1, output_size, dtype=logits.dtype, device=logits.device)
+    )
+
+
 def test_model_profile_owns_checkpoint_vocabulary_meaning(tmp_path, monkeypatch):
+    import torch
+
+    from tokenspeed.runtime.configs.load_config import LoadConfig
     from tokenspeed.runtime.configs.model_config import configure_mha_attention
     from tokenspeed.runtime.configs.model_profile import ModelProfile
+    from tokenspeed.runtime.model_loader.loader import _initialize_model
     from tokenspeed.runtime.plugins import registry
 
     vocabulary = VocabularySpec(input_size=256, output_size=64)
 
-    class ProfiledVocabularyModel:
+    class ProfiledVocabularyModel(torch.nn.Module):
+        def __init__(self, config: ModelInitConfig, mapping, quant_config):
+            super().__init__()
+            self.vocabulary = config.vocabulary
+            self.embedding = torch.nn.Embedding(
+                config.vocabulary.input_size, config.hf_config.hidden_size
+            )
+            self.head = torch.nn.Linear(
+                config.hf_config.hidden_size, config.vocabulary.output_size
+            )
+
+        def forward(self, input_ids):
+            return self.head(self.embedding(input_ids))
+
         @classmethod
         def model_profile(cls, hf_config):
             return ModelProfile(
@@ -251,3 +323,8 @@ def test_model_profile_owns_checkpoint_vocabulary_meaning(tmp_path, monkeypatch)
     assert model.vocabulary is vocabulary
     assert model.hf_text_config.vocab_size == 128
     assert model.hf_text_config.output_vocab_size == 32
+    # Model construction must reuse the profile, not normalize the HF fields
+    # (128 inputs / 32 outputs) again or infer output width from the input size.
+    built = _initialize_model(model, LoadConfig())
+    assert built.vocabulary is vocabulary
+    assert built(torch.tensor([255])).shape == (1, 64)

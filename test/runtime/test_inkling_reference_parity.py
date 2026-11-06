@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -73,9 +74,11 @@ def _build_replica():
         torch.set_default_dtype(torch.bfloat16)
         try:
             model = InklingForConditionalGeneration(
-                config,
+                ModelInitConfig(
+                    hf_config=config,
+                    vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+                ),
                 mapping,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
             )
         finally:
             torch.set_default_dtype(torch.float32)

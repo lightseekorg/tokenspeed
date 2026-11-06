@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -173,10 +174,14 @@ class TestInklingRealCheckpointLoad:
             torch.set_default_dtype(torch.bfloat16)
             try:
                 model = InklingForConditionalGeneration(
-                    config,
+                    ModelInitConfig(
+                        hf_config=config,
+                        vocabulary=VocabularySpec.from_hf_config(
+                            config, is_draft=False
+                        ),
+                    ),
                     mapping,
                     quant_config=quant_config,
-                    vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
                 )
             finally:
                 torch.set_default_dtype(torch.float32)

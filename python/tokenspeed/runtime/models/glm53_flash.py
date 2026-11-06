@@ -47,7 +47,7 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashTextConfig,
     Glm53FlashVisionConfig,
 )
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -1701,35 +1701,33 @@ class Glm53FlashForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: Glm53FlashConfig,
+        config: ModelInitConfig[Glm53FlashConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        self.vocabulary = vocabulary
+        hf_config = config.hf_config
+        self.vocabulary = config.vocabulary
         super().__init__()
-        self.config = config
+        self.config = hf_config
         self.mapping = mapping
         self.quant_config = quant_config
         self.is_multimodal_active = is_multimodal_active
-        encoder_only = hasattr(config, "encoder_only") and config.encoder_only
+        encoder_only = hasattr(hf_config, "encoder_only") and hf_config.encoder_only
         self.language_model = (
             None
             if encoder_only
             else Glm53FlashForCausalLM(
-                config.text_config,
+                config.with_hf_config(hf_config.text_config),
                 mapping=mapping,
                 quant_config=quant_config,
-                vocabulary=vocabulary,
             )
         )
         if is_multimodal_active:
             self.vision = Glm53FlashVision(
-                config.vision_config,
+                hf_config.vision_config,
                 mapping,
                 prefix=add_prefix("visual", prefix),
                 mm_attention_backend=mm_attention_backend,

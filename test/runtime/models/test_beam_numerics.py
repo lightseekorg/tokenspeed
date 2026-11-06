@@ -40,6 +40,7 @@ import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from torch.nn import functional as F
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.gating import apply_attention_output_gate
@@ -87,10 +88,12 @@ def cpu_rmsnorm(monkeypatch):
 
 def _tiny_model():
     return BeamForCausalLM(
-        tiny_config(),
+        ModelInitConfig(
+            hf_config=tiny_config(),
+            vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
+        ),
         Mapping(rank=0, world_size=1),
         None,
-        vocabulary=VocabularySpec.from_hf_config(tiny_config(), is_draft=False),
     )
 
 
@@ -294,10 +297,12 @@ def loaded(monkeypatch):
     weights = tiny_weights(config)
     with torch.device("cuda"):
         model = BeamForCausalLM(
-            config,
+            ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+            ),
             Mapping(rank=0, world_size=1),
             quant_config=None,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
         )
     assert model.load_weights(weights.items()) == weights.keys()
     return model.eval(), {name: value.cuda() for name, value in weights.items()}

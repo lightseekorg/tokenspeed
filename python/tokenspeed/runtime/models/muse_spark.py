@@ -70,9 +70,9 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch import nn
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -2474,14 +2474,13 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
 
     def __init__(
         self,
-        config: MuseSparkConfig,
+        config: ModelInitConfig[MuseSparkConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
+        hf_config = config.hf_config
         if mapping.pp_size > 1:
             raise ValueError(
                 "Muse Spark builds every layer on each rank; pp_size must be 1"
@@ -2492,7 +2491,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             quant_config=quant_config,
             prefix="",
             encoder_only=False,
-            vocabulary=vocabulary,
         )
         self.is_multimodal_active = is_multimodal_active
         self._loaded_audio: set[str] = set()
@@ -2508,17 +2506,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             return
 
         self.vision_tower = MuseSparkVisionTower(
-            raw_config=config.vision_config,
-            out_hidden_size=config.out_hidden_size,
-            projector_hidden_size=config.projector_hidden_size,
+            raw_config=hf_config.vision_config,
+            out_hidden_size=hf_config.out_hidden_size,
+            projector_hidden_size=hf_config.projector_hidden_size,
             mapping=mapping,
             prefix="vision_tower",
             mm_attention_backend=mm_attention_backend,
         )
         vision = mapping.vision
         self.vision_projection = RowParallelLinear(
-            input_size=config.projector_hidden_size,
-            output_size=config.hidden_size,
+            input_size=hf_config.projector_hidden_size,
+            output_size=hf_config.hidden_size,
             bias=False,
             input_is_parallel=False,
             skip_bias_add=False,
@@ -2531,7 +2529,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             reduce_results=True,
         )
         self.audio_tower = MuseSparkAudioTower.from_config(
-            config.audio_config, config.hidden_size
+            hf_config.audio_config, hf_config.hidden_size
         )
 
     def get_vision_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:

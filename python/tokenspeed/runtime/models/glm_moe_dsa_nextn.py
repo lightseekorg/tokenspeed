@@ -28,7 +28,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -150,18 +150,17 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: ModelInitConfig[PretrainedConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        self.vocabulary = vocabulary
+        hf_config = config.hf_config
+        self.vocabulary = config.vocabulary
         nn.Module.__init__(self)
-        self.config = config
+        self.config = hf_config
         self.mapping = mapping
         self.index_share_for_mtp_iteration = bool(
-            getattr(config, "index_share_for_mtp_iteration", False)
+            getattr(hf_config, "index_share_for_mtp_iteration", False)
         )
         self._init_indexer_pairing_state()
         # ``q_a_proj`` / ``kv_a_proj_with_mqa`` checkpoint tensors waiting for
@@ -176,19 +175,19 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         self.quant_config = quant_config
 
         self.model = GlmMoeDsaModelNextN(
-            config, mapping=self.mapping, quant_config=quant_config
+            hf_config, mapping=self.mapping, quant_config=quant_config
         )
 
         if self.mapping.attn.has_dp:
             self.lm_head = ReplicatedLinear(
-                config.hidden_size,
+                hf_config.hidden_size,
                 self.vocabulary.output_size,
                 bias=False,
             )
         else:
             self.lm_head = ParallelLMHead(
                 self.vocabulary.output_size,
-                config.hidden_size,
+                hf_config.hidden_size,
                 quant_config=quant_config,
                 tp_rank=self.mapping.attn.tp_rank,
                 tp_size=self.mapping.attn.tp_size,
@@ -202,9 +201,9 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     prepare_dsa_topk_for_mtp_decode = staticmethod(_prepare_dsa_topk_for_mtp_decode)

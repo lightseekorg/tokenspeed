@@ -32,7 +32,7 @@ from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV
 from torch import nn
 
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -592,15 +592,15 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
 
     def __init__(
         self,
-        config,
+        config: ModelInitConfig,
         mapping,
         quant_config=None,
         prefix="",
         *,
         is_multimodal_active=False,
         mm_attention_backend=None,
-        vocabulary: VocabularySpec,
     ):
+        hf_config = config.hf_config
         if is_multimodal_active:
             raise NotImplementedError(
                 "dots3-note encoders are not implemented; use --language-model-only"
@@ -613,11 +613,11 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
                 "dots3-note does not yet support attention head TP"
             )
         if (
-            not config.apply_mla_qkv_lora_rescale
-            or config.attention_gate_type != "headwise"
-            or config.swa_attention_gate_type != "headwise"
-            or config.attention_bias
-            or config.rope_scaling is not None
+            not hf_config.apply_mla_qkv_lora_rescale
+            or hf_config.attention_gate_type != "headwise"
+            or hf_config.swa_attention_gate_type != "headwise"
+            or hf_config.attention_bias
+            or hf_config.rope_scaling is not None
         ):
             raise ValueError("Unsupported dots3-note attention configuration")
         super().__init__(
@@ -625,7 +625,6 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
             mapping,
             quant_config=quant_config,
             prefix=prefix,
-            vocabulary=vocabulary,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

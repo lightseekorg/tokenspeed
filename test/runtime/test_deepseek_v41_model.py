@@ -62,6 +62,7 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enable
 from torch import nn
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -2164,8 +2165,10 @@ class _TinyFp8Model(BaseCausalLM):
 
     def __init__(self):
         super().__init__(
-            vocabulary=VocabularySpec(input_size=1, output_size=1),
-            config=SimpleNamespace(),
+            config=ModelInitConfig(
+                hf_config=SimpleNamespace(),
+                vocabulary=VocabularySpec(input_size=1, output_size=1),
+            ),
             mapping=SimpleNamespace(),
             encoder_only=True,
         )
@@ -2238,8 +2241,10 @@ class _TinyFp8WoAModel(BaseCausalLM):
     def __init__(self, config):
         mapping = _mapping(0, 1, 1)
         super().__init__(
-            vocabulary=VocabularySpec(input_size=1, output_size=1),
-            config=SimpleNamespace(),
+            config=ModelInitConfig(
+                hf_config=SimpleNamespace(),
+                vocabulary=VocabularySpec(input_size=1, output_size=1),
+            ),
             mapping=mapping,
             encoder_only=True,
         )
@@ -2538,14 +2543,16 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     torch.manual_seed(41)
     with torch.device("cuda:0"):
         adapter = DeepseekV41ForCausalLM(
-            SimpleNamespace(text_config=config),
+            ModelInitConfig(
+                hf_config=SimpleNamespace(text_config=config),
+                vocabulary=VocabularySpec.from_hf_config(
+                    SimpleNamespace(text_config=config), is_draft=False
+                ),
+            ),
             _mapping(0, 1, 1),
             _quant(),
             is_multimodal_active=False,
             mm_attention_backend=None,
-            vocabulary=VocabularySpec.from_hf_config(
-                SimpleNamespace(text_config=config), is_draft=False
-            ),
         )
     weights = _checkpoint(config)
     adapter.load_weights(_bind_engram_tables(adapter, weights, tmp_path).items())
@@ -3162,14 +3169,16 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         config.qk_rope_head_dim, config.q_lora_rank = 64, 128
         with set_default_torch_dtype(torch.bfloat16), torch.device(device):
             adapter = DeepseekV41ForCausalLM(
-                SimpleNamespace(text_config=config),
+                ModelInitConfig(
+                    hf_config=SimpleNamespace(text_config=config),
+                    vocabulary=VocabularySpec.from_hf_config(
+                        SimpleNamespace(text_config=config), is_draft=False
+                    ),
+                ),
                 mapping,
                 _quant(),
                 is_multimodal_active=False,
                 mm_attention_backend=None,
-                vocabulary=VocabularySpec.from_hf_config(
-                    SimpleNamespace(text_config=config), is_draft=False
-                ),
             )
         adapter.load_weights(
             _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
@@ -3299,12 +3308,14 @@ def _loader_model(monkeypatch, config, rank, device):
     monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
     with torch.device(device):
         return DeepseekV41ForCausalLM(
-            wrapper,
+            ModelInitConfig(
+                hf_config=wrapper,
+                vocabulary=VocabularySpec.from_hf_config(wrapper, is_draft=False),
+            ),
             mapping,
             _quant(),
             is_multimodal_active=False,
             mm_attention_backend=None,
-            vocabulary=VocabularySpec.from_hf_config(wrapper, is_draft=False),
         )
 
 
@@ -3439,12 +3450,14 @@ def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only)
     )
     with set_default_torch_dtype(torch.bfloat16):
         model = v41.DeepseekV41ForCausalLM(
-            config=config,
+            config=ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+            ),
             mapping=mapping,
             quant_config=_quant(),
             is_multimodal_active=active,
             mm_attention_backend="triton_attn",
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
         )
     weights = {} if encoder_only else _checkpoint(text_config)
     if active:
@@ -4162,14 +4175,16 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
         config.qk_rope_head_dim, config.q_lora_rank = 64, 128
         with set_default_torch_dtype(torch.bfloat16), torch.device(device):
             adapter = DeepseekV41ForCausalLM(
-                SimpleNamespace(text_config=config),
+                ModelInitConfig(
+                    hf_config=SimpleNamespace(text_config=config),
+                    vocabulary=VocabularySpec.from_hf_config(
+                        SimpleNamespace(text_config=config), is_draft=False
+                    ),
+                ),
                 mapping,
                 _quant(),
                 is_multimodal_active=False,
                 mm_attention_backend=None,
-                vocabulary=VocabularySpec.from_hf_config(
-                    SimpleNamespace(text_config=config), is_draft=False
-                ),
             )
         adapter.load_weights(
             _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()

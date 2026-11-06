@@ -54,7 +54,7 @@ from tokenspeed.runtime.configs.inkling_config import (
     InklingModelConfig,
     inkling_mtp_text_config,
 )
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -209,21 +209,20 @@ class InklingMultiTokenPredictor(nn.Module):
 class InklingForConditionalGenerationNextN(nn.Module):
     def __init__(
         self,
-        config: InklingMMConfig,
+        config: ModelInitConfig[InklingMMConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        self.vocabulary = vocabulary
+        hf_config = config.hf_config
+        self.vocabulary = config.vocabulary
         del is_multimodal_active, mm_attention_backend  # draft is text-only
         super().__init__()
-        self.config = config
+        self.config = hf_config
         self.mapping = mapping
-        text_config = config.get_text_config()
+        text_config = hf_config.get_text_config()
         if text_config.num_nextn_predict_layers <= 0:
             raise ValueError(
                 "Inkling NextN requires mtp_config.num_nextn_predict_layers > 0"

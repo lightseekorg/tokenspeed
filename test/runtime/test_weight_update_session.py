@@ -39,6 +39,7 @@ import pytest
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.model_loader.weight_utils import bind_or_copy
 from tokenspeed.runtime.models import deepseek_nextn
@@ -76,8 +77,10 @@ class _TinyLM(BaseCausalLM):
 
     def __init__(self) -> None:
         super().__init__(
-            vocabulary=VocabularySpec(input_size=1, output_size=1),
-            config=SimpleNamespace(),
+            config=ModelInitConfig(
+                hf_config=SimpleNamespace(),
+                vocabulary=VocabularySpec(input_size=1, output_size=1),
+            ),
             mapping=SimpleNamespace(),
             encoder_only=True,
         )
@@ -455,10 +458,12 @@ def nextn() -> DeepseekV3ForCausalLMNextN:
     )
     with mock.patch.object(deepseek_nextn, "DeepseekModelNextN", _DraftModel):
         return DeepseekV3ForCausalLMNextN(
-            config,
+            ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+            ),
             mapping,
             None,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
         )
 
 

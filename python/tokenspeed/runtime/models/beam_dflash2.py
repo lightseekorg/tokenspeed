@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import copy
 
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.models.dflash2 import DFlash2DraftModel
@@ -50,18 +50,17 @@ class DFlash2BeamDraftModel(DFlash2DraftModel):
 
     def __init__(
         self,
-        config,
+        config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
         # The checkpoint's max_position_embeddings is also the longest
         # --max-model-len the draft accepts; --max-model-len exceeds it only
         # under TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.
+        hf_config = config.hf_config
         context = max(
-            int(config.max_position_embeddings),
+            int(hf_config.max_position_embeddings),
             int(global_server_args_dict["max_model_len"] or 0),
         )
         # While the model is built, only the RoPE tables read
@@ -70,16 +69,15 @@ class DFlash2BeamDraftModel(DFlash2DraftModel):
         # bit for bit. On the CPU, torch's vectorized cos/sin can round an
         # element one ulp differently when the thread split moves the vector
         # boundaries. The loaded config keeps its value.
-        rope_config = copy.copy(config)
-        rope_config.max_position_embeddings = draft_rope_positions(config, context)
+        rope_config = copy.copy(hf_config)
+        rope_config.max_position_embeddings = draft_rope_positions(hf_config, context)
         super().__init__(
-            config=rope_config,
+            config=config.with_hf_config(rope_config),
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
-            vocabulary=vocabulary,
         )
-        self.config = config
+        self.config = hf_config
         self.rope_positions = rope_config.max_position_embeddings
 
     def configure_target(self, target_model, target_config) -> None:

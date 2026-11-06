@@ -30,9 +30,16 @@ block sampler does not implement. The Markov projection and workspace use
 the head's group, independently of the attention TP width. Padding-only
 shards contribute no candidate but still join every TP gather.
 
-Every model entrypoint receives the resolved `vocabulary` explicitly. Wrappers
-that already forward `**kwargs` can pass it through unchanged; the constructor
-that consumes it declares the required parameter.
+Every model entrypoint receives a `ModelInitConfig` through its `config`
+argument. This lightweight, frozen envelope contains the model-specific
+`hf_config` and the already resolved `vocabulary`; it has no loading or serving
+policy and does not forward unknown attributes to the HF config. Construction
+never resolves the vocabulary again. Wrappers forward the envelope unchanged
+or use `with_hf_config(text_config)` to select checkpoint metadata while keeping
+the same vocabulary object. Drafts receive their own resolved vocabulary.
+The envelope does not freeze the HF object: adapters that modify checkpoint
+metadata copy it first. Internal layers continue to receive their existing
+HF config or the domain sizes they consume.
 `ModelExecutorConfig` and `RuntimeStates` retain that value, without legacy
 `vocab_size` aliases or per-layer defaults. Components that consume only one
 domain keep the local name `vocab_size`; callers select `input_size` or
@@ -50,10 +57,12 @@ used as context; requesting prompt logprobs that score them is rejected, rather
 than silently scoring a clamped ID. Internal graph padding may still use safe
 indices after the corresponding validity checks.
 
-Runtime plugin API 4 requires `ModelProfile.vocabulary` and the keyword-only
-model constructor argument `vocabulary`. A plugin interprets its checkpoint
-fields in `model_profile(hf_config)` and forwards that same value to its base
-model constructor. Text/hash vocabulary constraints remain model-owned.
+Runtime plugin API 4 requires `ModelProfile.vocabulary` and a model constructor
+that accepts `config: ModelInitConfig`. A plugin interprets its checkpoint
+fields in `model_profile(hf_config)`; the loader binds that resolved vocabulary
+to the construction config. Plugins forward the envelope to base model
+constructors and read checkpoint fields from `config.hf_config`. Text/hash
+vocabulary constraints remain model-owned.
 Plugins calling `LogitsProcessor` pass `vocab_size=vocabulary.output_size`,
 `final_logit_softcapping`, `use_fused_lm_head` and `tie_word_embeddings` explicitly;
 copying and rewriting a checkpoint config for logits is no longer necessary.

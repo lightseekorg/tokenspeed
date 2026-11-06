@@ -33,6 +33,7 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(
@@ -86,9 +87,11 @@ def _build_model(
     try:
         with torch.device(device):
             return LlamaForCausalLMEagle4(
-                config,
+                ModelInitConfig(
+                    hf_config=config,
+                    vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+                ),
                 mapping,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
             )
     finally:
         torch.set_default_dtype(old_dtype)

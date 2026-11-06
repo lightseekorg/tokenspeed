@@ -41,6 +41,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import register_numerics_envelope
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
@@ -89,6 +90,7 @@ __all__ = [
     "TraceProvider",
     "register_drafter",
     "ModelProfile",
+    "ModelInitConfig",
     "VocabularySpec",
     "RegisteredModel",
     "register_attention_backend",

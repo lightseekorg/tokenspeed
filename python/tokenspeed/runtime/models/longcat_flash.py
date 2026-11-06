@@ -34,9 +34,9 @@ from tokenspeed_kernel.thirdparty.cuda import (
 )
 from transformers import PretrainedConfig as _PretrainedConfig
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
 from tokenspeed.runtime.execution.context import ForwardContext as _ForwardContext
@@ -959,20 +959,18 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
 
     def __init__(
         self,
-        config: _PretrainedConfig,
+        config: ModelInitConfig[_PretrainedConfig],
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None = None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        _ensure_longcat_config(config)
+        hf_config = config.hf_config
+        _ensure_longcat_config(hf_config)
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
-            vocabulary=vocabulary,
         )
 
     def post_init(self) -> None:

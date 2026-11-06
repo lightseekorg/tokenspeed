@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -105,11 +106,13 @@ class TestQwen3MoeConfig:
         from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
 
         model = Qwen3MoeForCausalLM(
-            _tiny_qwen3_moe_config(),
-            mapping=_single_rank_mapping(),
-            vocabulary=VocabularySpec.from_hf_config(
-                _tiny_qwen3_moe_config(), is_draft=False
+            ModelInitConfig(
+                hf_config=_tiny_qwen3_moe_config(),
+                vocabulary=VocabularySpec.from_hf_config(
+                    _tiny_qwen3_moe_config(), is_draft=False
+                ),
             ),
+            mapping=_single_rank_mapping(),
         )
 
         assert isinstance((model.model.layers[0].mlp), (Qwen3_5MoeSparseMoeBlock))
@@ -121,11 +124,13 @@ class TestQwen3MoeConfig:
         from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
 
         model = Qwen3MoeForCausalLM(
-            _tiny_qwen3_moe_config(),
-            mapping=_single_rank_mapping(),
-            vocabulary=VocabularySpec.from_hf_config(
-                _tiny_qwen3_moe_config(), is_draft=False
+            ModelInitConfig(
+                hf_config=_tiny_qwen3_moe_config(),
+                vocabulary=VocabularySpec.from_hf_config(
+                    _tiny_qwen3_moe_config(), is_draft=False
+                ),
             ),
+            mapping=_single_rank_mapping(),
         )
         weights = []
         for expert_id in range(4):
@@ -159,11 +164,13 @@ class TestQwen3MoeConfig:
         from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
 
         model = Qwen3MoeForCausalLM(
-            _tiny_qwen3_moe_config(),
-            mapping=_ep_rank_mapping(rank=0),
-            vocabulary=VocabularySpec.from_hf_config(
-                _tiny_qwen3_moe_config(), is_draft=False
+            ModelInitConfig(
+                hf_config=_tiny_qwen3_moe_config(),
+                vocabulary=VocabularySpec.from_hf_config(
+                    _tiny_qwen3_moe_config(), is_draft=False
+                ),
             ),
+            mapping=_ep_rank_mapping(rank=0),
         )
         model.load_weights(
             [
@@ -206,11 +213,13 @@ class TestQwen3MoeConfig:
                 return hidden_states, residual
 
         model = Qwen3MoeForCausalLM(
-            _tiny_qwen3_moe_config(),
-            mapping=_single_rank_mapping(),
-            vocabulary=VocabularySpec.from_hf_config(
-                _tiny_qwen3_moe_config(), is_draft=False
+            ModelInitConfig(
+                hf_config=_tiny_qwen3_moe_config(),
+                vocabulary=VocabularySpec.from_hf_config(
+                    _tiny_qwen3_moe_config(), is_draft=False
+                ),
             ),
+            mapping=_single_rank_mapping(),
         )
         model.model.layers = nn.ModuleList([IdleLayer()])
         ctx = ForwardContext(

@@ -37,6 +37,7 @@ from unittest import mock
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 # CI registration (AST-parsed, runtime no-op).
@@ -411,8 +412,10 @@ class _TinyDiscardModel(BaseCausalLM):
 
     def __init__(self):
         super().__init__(
-            vocabulary=VocabularySpec(input_size=1, output_size=1),
-            config=SimpleNamespace(),
+            config=ModelInitConfig(
+                hf_config=SimpleNamespace(),
+                vocabulary=VocabularySpec(input_size=1, output_size=1),
+            ),
             mapping=SimpleNamespace(),
             encoder_only=True,
         )

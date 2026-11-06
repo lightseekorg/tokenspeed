@@ -28,7 +28,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -140,17 +140,16 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
 
     def __init__(
         self,
-        config: Glm53FlashConfig,
+        config: ModelInitConfig[Glm53FlashConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        self.vocabulary = vocabulary
+        hf_config = config.hf_config
+        self.vocabulary = config.vocabulary
         super().__init__()
         del prefix
-        self.config = config.text_config
+        self.config = hf_config.text_config
         self.mapping = mapping
         self.quant_config = quant_config
         self.index_share_for_mtp_iteration = self.config.index_share_for_mtp_iteration

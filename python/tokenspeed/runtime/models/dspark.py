@@ -38,6 +38,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -96,21 +97,19 @@ class DSparkDraftModel(DFlashDraftModel):
 
     def __init__(
         self,
-        config,
+        config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
+        hf_config = config.hf_config
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
-            vocabulary=vocabulary,
         )
-        markov_rank, markov_head_type = _get_markov_params(config)
+        markov_rank, markov_head_type = _get_markov_params(hf_config)
         if markov_rank <= 0:
             raise ValueError(
                 "DSpark draft requires markov_rank > 0 (the Markov head is the "
@@ -121,7 +120,9 @@ class DSparkDraftModel(DFlashDraftModel):
                 f"Unsupported DSpark markov_head_type={markov_head_type!r}; this "
                 f"static build only supports {SUPPORTED_MARKOV_HEAD_TYPES}."
             )
-        self.markov_head = VanillaMarkov(vocabulary=vocabulary, markov_rank=markov_rank)
+        self.markov_head = VanillaMarkov(
+            vocabulary=config.vocabulary, markov_rank=markov_rank
+        )
 
 
 EntryClass = [DSparkDraftModel]

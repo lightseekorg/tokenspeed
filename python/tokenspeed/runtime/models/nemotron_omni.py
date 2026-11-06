@@ -44,8 +44,8 @@ import torch
 from tokenspeed_kernel.ops.activation import relu2
 from torch import nn
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -134,21 +134,20 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
 
     def __init__(
         self,
-        config: NemotronHOmniConfig,
+        config: ModelInitConfig[NemotronHOmniConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         *,
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
-        vocabulary: VocabularySpec,
     ) -> None:
+        hf_config = config.hf_config
         super().__init__(
-            config=config.text_config,
+            config=config.with_hf_config(hf_config.text_config),
             mapping=mapping,
             quant_config=quant_config,
-            vocabulary=vocabulary,
         )
-        self.omni_config = config
+        self.omni_config = hf_config
         self.is_multimodal_active = is_multimodal_active
         self.visual: RadioVisionModel | None = None
         self.vision_final_norm: nn.LayerNorm | None = None
@@ -162,15 +161,15 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
         if not is_multimodal_active:
             return
 
-        vision = config.vision_config
-        text_hidden = config.text_config.hidden_size
+        vision = hf_config.vision_config
+        text_hidden = hf_config.text_config.hidden_size
         self.visual = RadioVisionModel(
             vision,
             mapping,
             mm_attention_backend=mm_attention_backend,
             prefix="visual",
         )
-        if config.vision_final_layernorm:
+        if hf_config.vision_final_layernorm:
             if vision.final_norm:
                 raise NotImplementedError(
                     "C-RADIO with both its own final norm and the projector's"
@@ -178,17 +177,17 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
             self.vision_final_norm = nn.LayerNorm(
                 vision.hidden_size, eps=vision.layer_norm_eps
             )
-        merge = round(1 / config.downsample_ratio)
+        merge = round(1 / hf_config.downsample_ratio)
         if merge != 2:
             raise NotImplementedError(f"Nemotron-H Omni {merge}x{merge} pixel shuffle")
         self.vision_projector = NemotronOmniProjector(
             vision.hidden_size * merge * merge,
-            config.projector_hidden_size,
+            hf_config.projector_hidden_size,
             text_hidden,
             bias=False,
             eps=1e-5,
         )
-        sound = config.sound_config
+        sound = hf_config.sound_config
         if sound is not None:
             self.audio_tower = ParakeetEncoder(sound)
             self.audio_projector = NemotronOmniProjector(
@@ -414,15 +413,16 @@ class NemotronH_Omni_Reasoning_V3NextN(NemotronHForCausalLMNextN):  # noqa: N801
 
     def __init__(
         self,
-        config: NemotronHOmniConfig,
+        config: ModelInitConfig[NemotronHOmniConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
-            config.text_config, mapping, quant_config, prefix, vocabulary=vocabulary
+            config.with_hf_config(config.hf_config.text_config),
+            mapping,
+            quant_config,
+            prefix,
         )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:

@@ -33,6 +33,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
 
@@ -227,12 +228,16 @@ def _single_rank_mapping() -> Mapping:
 def _tiny_model() -> MuseSparkForConditionalGeneration:
     with torch.device("cuda"):
         return MuseSparkForConditionalGeneration(
-            config=_tiny_config(),
+            config=ModelInitConfig(
+                hf_config=_tiny_config(),
+                vocabulary=VocabularySpec.from_hf_config(
+                    _tiny_config(), is_draft=False
+                ),
+            ),
             mapping=_single_rank_mapping(),
             quant_config=None,
             is_multimodal_active=True,
             mm_attention_backend="triton_attn",
-            vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=False),
         )
 
 
@@ -605,12 +610,14 @@ def test_tensor_parallel_checkpoint_loading_preserves_gate_up_pairing(
     )
     with torch.device("cuda"):
         model = MuseSparkForConditionalGeneration(
-            config,
+            ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+            ),
             mapping,
             quant_config,
             is_multimodal_active=False,
             mm_attention_backend=None,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
         )
     moe = model.model.layers[0].mlp
     if quantized and current_platform().is_cdna4:

@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 # ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``).
@@ -1479,12 +1480,14 @@ def _tiny_model(*, dsa: bool):
     try:
         with torch.device("cuda"):
             return KimiLinearForCausalLM(
-                _tiny_text_config(dsa=dsa),
+                ModelInitConfig(
+                    hf_config=_tiny_text_config(dsa=dsa),
+                    vocabulary=VocabularySpec.from_hf_config(
+                        _tiny_text_config(dsa=dsa), is_draft=False
+                    ),
+                ),
                 mapping=Mapping(rank=0),
                 quant_config=None,
-                vocabulary=VocabularySpec.from_hf_config(
-                    _tiny_text_config(dsa=dsa), is_draft=False
-                ),
             )
     finally:
         torch.set_default_dtype(default_dtype)

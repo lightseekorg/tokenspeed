@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from copy import deepcopy
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from torch import nn
 from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -133,46 +134,49 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: ModelInitConfig[PretrainedConfig],
         mapping: Mapping,
         quant_config=None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        self.vocabulary = vocabulary
+        hf_config = deepcopy(config.hf_config)
+        self.vocabulary = config.vocabulary
         nn.Module.__init__(self)
 
-        if hasattr(config, "text_config"):
-            config = config.text_config
+        if hasattr(hf_config, "text_config"):
+            hf_config = hf_config.text_config
 
         quant_config = _resolve_mtp_quant_config(quant_config)
 
-        self.config = config
+        self.config = hf_config
         self.mapping = mapping
         self.quant_config = quant_config
 
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.fc = nn.Linear(
+            2 * hf_config.hidden_size, hf_config.hidden_size, bias=False
+        )
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
-            config.hidden_size, config.rms_norm_eps
+            hf_config.hidden_size, hf_config.rms_norm_eps
         )
-        self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
-        config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        self.pre_fc_norm_hidden = RMSNorm_cls(
+            hf_config.hidden_size, hf_config.rms_norm_eps
+        )
+        hf_config.num_hidden_layers = 1
+        hf_config.full_attention_interval = 1
         self.model = Qwen3_5DraftForCausalLM(
-            config,
+            hf_config,
             mapping=self.mapping,
             quant_config=quant_config,
             prefix=add_prefix("mtp", prefix),
         )
 
-        if config.tie_word_embeddings:
+        if hf_config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
                 self.lm_head = ReplicatedLinear(
-                    config.hidden_size,
+                    hf_config.hidden_size,
                     self.vocabulary.output_size,
                     bias=False,
                     quant_config=quant_config,
@@ -181,7 +185,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             else:
                 self.lm_head = ParallelLMHead(
                     self.vocabulary.output_size,
-                    config.hidden_size,
+                    hf_config.hidden_size,
                     quant_config=quant_config,
                     tp_rank=self.mapping.lm_head.tp_rank,
                     tp_size=self.mapping.lm_head.tp_size,
@@ -199,9 +203,9 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             tp_group=self.mapping.lm_head.tp_group,
             do_argmax=True,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
-            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self):

@@ -33,6 +33,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -653,9 +654,13 @@ def test_mtp_draft_reads_the_language_model_mtp_tensors():
 
     with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
         draft = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN(
-            _mtp_omni_config(),
+            ModelInitConfig(
+                hf_config=_mtp_omni_config(),
+                vocabulary=VocabularySpec.from_hf_config(
+                    _mtp_omni_config(), is_draft=True
+                ),
+            ),
             Mapping(rank=0, world_size=1),
-            vocabulary=VocabularySpec.from_hf_config(_mtp_omni_config(), is_draft=True),
         )
     names = [
         "language_model.mtp.layers.0.enorm.weight",
@@ -680,17 +685,21 @@ def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
     mapping = Mapping(rank=0, world_size=1)
     with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
         target = nemotron_omni.NemotronH_Omni_Reasoning_V3(
-            config,
+            ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+            ),
             mapping,
             None,
             is_multimodal_active=False,
             mm_attention_backend=None,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
         )
         draft = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN(
-            config,
+            ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+            ),
             mapping,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
         )
     scales = {
         "language_model.backbone.layers.1.mixer.k_proj.k_scale": 0.25,

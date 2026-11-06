@@ -43,6 +43,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
@@ -166,8 +167,9 @@ def _initialize_model(
         extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
     return model_class(
-        config=model_config.hf_config,
-        vocabulary=model_config.vocabulary,
+        config=ModelInitConfig(
+            hf_config=model_config.hf_config, vocabulary=model_config.vocabulary
+        ),
         mapping=mapping,
         quant_config=quant_config,
         **extra_kwargs,

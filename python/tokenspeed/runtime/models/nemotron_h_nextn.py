@@ -35,8 +35,8 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -88,20 +88,19 @@ class NemotronHForCausalLMNextN(nn.Module):
 
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: ModelInitConfig[NemotronHConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        self.vocabulary = vocabulary
+        hf_config = config.hf_config
+        self.vocabulary = config.vocabulary
         super().__init__()
         del prefix
         require_single_tp_group(mapping)
-        block_types = tuple(config.mtp_layers_block_type)
+        block_types = tuple(hf_config.mtp_layers_block_type)
         if (
-            config.num_nextn_predict_layers != 1
+            hf_config.num_nextn_predict_layers != 1
             or block_types[:1] != ("attention",)
             or block_types.count("attention") != 1
             or "mamba" in block_types
@@ -110,18 +109,18 @@ class NemotronHForCausalLMNextN(nn.Module):
             raise NotImplementedError(
                 "Nemotron-H MTP needs one predict layer that opens with its only "
                 "attention block and has no Mamba2 blocks, got "
-                f"{config.num_nextn_predict_layers} of {block_types}"
+                f"{hf_config.num_nextn_predict_layers} of {block_types}"
             )
         # An export that quantizes no MTP module (Nemotron 3 Super) left it in BF16.
         if quant_config is not None and not quant_config.quantizes_any("mtp."):
             quant_config = None
-        self.config = config
+        self.config = hf_config
         self.mapping = mapping
         attn = mapping.attn
-        hidden = config.hidden_size
-        eps = config.layer_norm_epsilon
+        hidden = hf_config.hidden_size
+        eps = hf_config.layer_norm_epsilon
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
+            hf_config.vocab_size,
             hidden,
             tp_rank=attn.tp_rank,
             tp_size=attn.tp_size,
@@ -139,11 +138,11 @@ class NemotronHForCausalLMNextN(nn.Module):
         alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
             NemotronHBlock(
-                config,
+                hf_config,
                 mapping,
                 block_type,
                 0 if block_type == "attention" else None,
-                config.num_hidden_layers + i,
+                hf_config.num_hidden_layers + i,
                 quant_config,
                 f"mtp.layers.{i}",
                 alt_stream,
@@ -151,7 +150,7 @@ class NemotronHForCausalLMNextN(nn.Module):
             for i, block_type in enumerate(block_types)
         )
         self.final_layernorm = NemotronHNorm(
-            hidden, eps, mapping, config.num_hidden_layers + len(block_types)
+            hidden, eps, mapping, hf_config.num_hidden_layers + len(block_types)
         )
         self.lm_head = ParallelLMHead(
             self.vocabulary.output_size,
@@ -167,9 +166,9 @@ class NemotronHForCausalLMNextN(nn.Module):
             tp_size=attn.tp_size,
             tp_group=attn.tp_group,
             dp_lm_head_tp=False,
-            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
-            use_fused_lm_head=(getattr(config, "model_type", None) == "kimi_k2"),
-            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", None),
+            use_fused_lm_head=(getattr(hf_config, "model_type", None) == "kimi_k2"),
+            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
         )
 
     def get_hot_token_id(self) -> None:

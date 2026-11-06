@@ -62,7 +62,7 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
 
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -1542,13 +1542,12 @@ class BeamForCausalLM(BaseCausalLM):
 
     def __init__(
         self,
-        config: Any,
+        config: ModelInitConfig[Any],
         mapping: Any,
         quant_config: Any,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        config.validate()
+        hf_config = config.hf_config
+        hf_config.validate()
         # beam_quant_policy admits or refuses a quantized checkpoint.
         quant = None if quant_config is None else beam_quant_policy(quant_config)
         if (
@@ -1560,7 +1559,7 @@ class BeamForCausalLM(BaseCausalLM):
                 "--moe-backend flashinfer_trtllm (Beam's default on NVIDIA SM100 "
                 "to SM103 where it applies)"
             )
-        config.validate_parallelism(
+        hf_config.validate_parallelism(
             tensor_parallel_size=mapping.attn.tp_size, ep_size=mapping.moe.ep_size
         )
         if global_server_args_dict["ep_num_redundant_experts"]:
@@ -1586,7 +1585,6 @@ class BeamForCausalLM(BaseCausalLM):
                 quant_config=quant_config,
                 prefix="",
                 encoder_only=False,
-                vocabulary=vocabulary,
             )
         self.beam_quant = quant
         # The positions the sliding layers' shared RoPE table covers, which the

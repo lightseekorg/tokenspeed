@@ -13,6 +13,7 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashTextConfig,
     Glm53FlashVisionConfig,
 )
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -55,7 +56,7 @@ class _FakeBackbone(nn.Module):
 class _FakeLanguageModel(nn.Module):
     def __init__(self, config, **_kwargs) -> None:
         super().__init__()
-        self.model = _FakeBackbone(config.hidden_size)
+        self.model = _FakeBackbone(config.hf_config.hidden_size)
         self.lm_head = nn.Identity()
         self.logits_processor = object()
         self.forward_kwargs = None
@@ -249,9 +250,11 @@ def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
 def _build_model(monkeypatch) -> Glm53FlashForConditionalGeneration:
     monkeypatch.setattr(glm53_flash, "Glm53FlashForCausalLM", _FakeLanguageModel)
     return Glm53FlashForConditionalGeneration(
-        _tiny_config(),
+        ModelInitConfig(
+            hf_config=_tiny_config(),
+            vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=False),
+        ),
         mapping=Mapping(rank=0, world_size=1),
-        vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=False),
     )
 
 
@@ -442,14 +445,20 @@ def test_text_and_nextn_model_hierarchies(monkeypatch) -> None:
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
 
     causal = Glm53FlashForCausalLM(
-        _tiny_text_config(),
+        ModelInitConfig(
+            hf_config=_tiny_text_config(),
+            vocabulary=VocabularySpec.from_hf_config(
+                _tiny_text_config(), is_draft=False
+            ),
+        ),
         mapping,
-        vocabulary=VocabularySpec.from_hf_config(_tiny_text_config(), is_draft=False),
     )
     nextn = Glm53FlashForConditionalGenerationNextN(
-        _tiny_config(),
+        ModelInitConfig(
+            hf_config=_tiny_config(),
+            vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=True),
+        ),
         mapping,
-        vocabulary=VocabularySpec.from_hf_config(_tiny_config(), is_draft=True),
     )
 
     assert causal.model.layers[0].is_kda_layer
@@ -483,12 +492,20 @@ def test_nextn_reuses_first_draft_selection_only_when_configured(
     config = Glm53FlashConfig.from_dict(checkpoint_config)
     assert config.text_config.index_share_for_mtp_iteration is bool(share_indices)
     model = Glm53FlashForConditionalGenerationNextN(
-        config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
+        ModelInitConfig(
+            hf_config=config,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        ),
+        mapping,
     )
     target = Glm53FlashForCausalLM(
-        config.text_config,
+        ModelInitConfig(
+            hf_config=config.text_config,
+            vocabulary=VocabularySpec.from_hf_config(
+                config.text_config, is_draft=False
+            ),
+        ),
         mapping,
-        vocabulary=VocabularySpec.from_hf_config(config.text_config, is_draft=False),
     )
     assert model.index_share_for_mtp_iteration is bool(share_indices)
     assert not target.model.layers[3].self_attn.skip_indexer_topk

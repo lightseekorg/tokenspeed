@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -184,9 +185,11 @@ def _causal_lm(mapping: Mapping) -> _StubModel:
         hidden_size=16, vocab_size=64, tie_word_embeddings=False, model_type="t"
     )
     return _StubModel(
-        config,
+        ModelInitConfig(
+            hf_config=config,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+        ),
         mapping,
-        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
     )
 
 

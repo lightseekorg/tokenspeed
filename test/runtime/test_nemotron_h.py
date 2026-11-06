@@ -30,6 +30,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -810,9 +811,11 @@ def test_mtp_head_refuses_patterns_its_narrowing_cannot_serve(blocks: list[str])
     assert list(config.mtp_layers_block_type) == blocks
     with pytest.raises(NotImplementedError, match="opens with its only attention"):
         NemotronHForCausalLMNextN(
-            config,
+            ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+            ),
             Mapping(rank=0, world_size=1),
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
         )
 
 
@@ -843,10 +846,12 @@ def test_mtp_head_follows_the_checkpoint_quantization(mtp_quantized: bool):
     )
     with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
         head = NemotronHForCausalLMNextN(
-            config,
+            ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+            ),
             Mapping(rank=0, world_size=1),
             quant_config,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
         )
     expected = "nvfp4" if mtp_quantized else "unquant"
     assert head.layers[1].mixer.experts._quant_kind == expected
@@ -1244,9 +1249,11 @@ def test_mtp_head_takes_its_checkpoint_kv_cache_scales_at_startup_only(
     mapping = Mapping(rank=0, world_size=1)
     with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
         head = NemotronHForCausalLMNextN(
-            config,
+            ModelInitConfig(
+                hf_config=config,
+                vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+            ),
             mapping,
-            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
         )
     attn = head.layers[0].mixer.attn
     scales = {
@@ -1324,9 +1331,11 @@ def test_eagle_taps_are_the_full_stream_after_each_named_block(
     try:
         with torch.device("cuda"):
             model = NemotronHForCausalLM(
-                config,
+                ModelInitConfig(
+                    hf_config=config,
+                    vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+                ),
                 mapping,
-                vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
             )
     finally:
         torch.set_default_dtype(old_dtype)

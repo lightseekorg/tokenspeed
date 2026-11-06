@@ -98,7 +98,7 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
@@ -5310,38 +5310,36 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: KimiK3Config,
+        config: ModelInitConfig[KimiK3Config],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
-        *,
-        vocabulary: VocabularySpec,
         **kwargs,
     ) -> None:
-        self.vocabulary = vocabulary
+        hf_config = config.hf_config
+        self.vocabulary = config.vocabulary
         super().__init__()
-        self.config = config
+        self.config = hf_config
         self.mapping = mapping
         self.quant_config = quant_config
         self.is_multimodal_active = is_multimodal_active
 
         # EPD encode workers own only the vision tower.
         self.language_model = None
-        if not getattr(config, "encoder_only", False):
+        if not getattr(hf_config, "encoder_only", False):
             self.language_model = KimiLinearForCausalLM(
-                config.text_config,
+                config.with_hf_config(hf_config.text_config),
                 mapping=mapping,
                 quant_config=quant_config,
-                vocabulary=vocabulary,
             )
 
         # Multimodal path. ``image_encoder`` may later be replaced by
         # ModelExecutor with the encoder CUDA-graph wrapper.
         if is_multimodal_active:
             self.vision = KimiK3Vision(
-                config.vision_config,
+                hf_config.vision_config,
                 mapping=mapping,
                 quant_config=quant_config,
                 mm_attention_backend=mm_attention_backend,

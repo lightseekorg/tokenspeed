@@ -37,7 +37,7 @@ from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3Config,
     MiniMaxM3VisionConfig,
 )
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
@@ -1368,23 +1368,21 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
 
     def __init__(
         self,
-        config: MiniMaxM3Config,
+        config: ModelInitConfig[MiniMaxM3Config],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        self.vl_config = config
+        hf_config = config.hf_config
+        self.vl_config = hf_config
         self.is_multimodal_active = is_multimodal_active
         super().__init__(
-            config=config.text_config,
+            config=config.with_hf_config(hf_config.text_config),
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
-            vocabulary=vocabulary,
         )
 
         if not is_multimodal_active:
@@ -1397,23 +1395,23 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             return
 
         self.vision_tower = MiniMaxM3VisionTower(
-            config.vision_config,
+            hf_config.vision_config,
             mapping,
             prefix=add_prefix("vision_tower", prefix),
             mm_attention_backend=mm_attention_backend,
         )
         self.multi_modal_projector = MiniMaxM3MultiModalProjector(
-            vision_hidden_size=config.vision_config.hidden_size,
-            projector_hidden_size=config.projector_hidden_size,
-            text_hidden_size=config.text_config.hidden_size,
+            vision_hidden_size=hf_config.vision_config.hidden_size,
+            projector_hidden_size=hf_config.projector_hidden_size,
+            text_hidden_size=hf_config.text_config.hidden_size,
             mapping=mapping,
             prefix=add_prefix("multi_modal_projector", prefix),
             bias=True,
         )
         self.patch_merge_mlp = MiniMaxM3PatchMergeMLP(
-            spatial_merge_size=config.vision_config.spatial_merge_size,
-            text_hidden_size=config.text_config.hidden_size,
-            projector_hidden_size=config.projector_hidden_size,
+            spatial_merge_size=hf_config.vision_config.spatial_merge_size,
+            text_hidden_size=hf_config.text_config.hidden_size,
+            projector_hidden_size=hf_config.projector_hidden_size,
             mapping=mapping,
             prefix=add_prefix("patch_merge_mlp", prefix),
             bias=True,

@@ -30,13 +30,13 @@ import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3_5TextConfig,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 
 # Distributed
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -1171,22 +1171,20 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
 
     def __init__(
         self,
-        config: Qwen3_5Config,
+        config: ModelInitConfig[Qwen3_5Config],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
-        *,
-        vocabulary: VocabularySpec,
     ):
+        hf_config = config.hf_config
         super().__init__(
-            config=config.text_config,
+            config=config.with_hf_config(hf_config.text_config),
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
-            encoder_only=getattr(config, "encoder_only", False),
-            vocabulary=vocabulary,
+            encoder_only=getattr(hf_config, "encoder_only", False),
         )
 
         rope_config = get_rope_parameters(self.config)
@@ -1201,9 +1199,9 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             self.video_encoder = None
         else:
             self.visual = Qwen3VLMoeVisionModel(
-                config.vision_config,
+                hf_config.vision_config,
                 quant_config=None,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                norm_eps=getattr(hf_config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 mapping=mapping,
                 mm_attention_backend=mm_attention_backend,
@@ -1515,14 +1513,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     def __init__(
         self,
-        config: Qwen3_5Config,
+        config: ModelInitConfig[Qwen3_5Config],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config=config,
@@ -1531,7 +1527,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             prefix=prefix,
             is_multimodal_active=is_multimodal_active,
             mm_attention_backend=mm_attention_backend,
-            vocabulary=vocabulary,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -1659,24 +1654,22 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
 
     def __init__(
         self,
-        config,
+        config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        if not hasattr(config, "text_config"):
-            archs = list(getattr(config, "architectures", None) or [])
-            config = Qwen3_5MoeConfig(text_config=config)
-            config.__dict__["architectures"] = archs or ["Qwen3_5MoeForCausalLM"]
+        hf_config = config.hf_config
+        if not hasattr(hf_config, "text_config"):
+            archs = list(getattr(hf_config, "architectures", None) or [])
+            hf_config = Qwen3_5MoeConfig(text_config=hf_config)
+            hf_config.__dict__["architectures"] = archs or ["Qwen3_5MoeForCausalLM"]
         super().__init__(
-            config=config,
+            config=config.with_hf_config(hf_config),
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
             is_multimodal_active=False,
-            vocabulary=vocabulary,
         )
 
     def resolve_model(

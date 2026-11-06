@@ -29,12 +29,12 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -796,16 +796,18 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
 
     def __init__(
         self,
-        config,
+        config: ModelInitConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        text_config = getattr(config, "text_config", config)
+        hf_config = config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
         super().__init__(
-            text_config, mapping, quant_config, prefix, vocabulary=vocabulary
+            config.with_hf_config(text_config),
+            mapping,
+            quant_config,
+            prefix,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -834,14 +836,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     def __init__(
         self,
-        config: Qwen4ExpConfig,
+        config: ModelInitConfig[Qwen4ExpConfig],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
         super().__init__(
             config,
@@ -850,7 +850,6 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             prefix,
             is_multimodal_active,
             mm_attention_backend,
-            vocabulary=vocabulary,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

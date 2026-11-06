@@ -28,7 +28,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from tokenspeed.runtime.configs.vocabulary import VocabularySpec
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -50,23 +50,22 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: Any,
+        config: ModelInitConfig[Any],
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
-        *,
-        vocabulary: VocabularySpec,
     ) -> None:
-        self.vocabulary = vocabulary
+        hf_config = config.hf_config
+        self.vocabulary = config.vocabulary
         super().__init__()
-        self.config = config
+        self.config = hf_config
         self.mapping = mapping
         self.quant_config = quant_config
         self.is_multimodal_active = is_multimodal_active
 
-        thinker_config = getattr(config, "thinker_config", config)
+        thinker_config = getattr(hf_config, "thinker_config", hf_config)
         self.thinker_config = thinker_config
         text_config = thinker_config.text_config
         audio_config = getattr(thinker_config, "audio_config", None)
@@ -82,10 +81,9 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         # nesting it under this attribute yields the desired runtime parameter
         # names (language_model.model.*, language_model.lm_head.*).
         self.language_model = Qwen3ForCausalLM(
-            text_config,
+            config.with_hf_config(text_config),
             mapping=mapping,
             quant_config=quant_config,
-            vocabulary=vocabulary,
         )
         if is_multimodal_active:
             self.audio_tower = Qwen3AudioEncoder(

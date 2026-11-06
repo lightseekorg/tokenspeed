@@ -42,6 +42,7 @@ import tokenspeed.runtime.layers.attention.qsa.metadata as qsa_metadata_module
 import tokenspeed.runtime.layers.logits_processor as logits_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_qwen4_exp
+from tokenspeed.runtime.configs.model_init import ModelInitConfig
 from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -1565,7 +1566,10 @@ class _HeadOnlyTarget(BaseCausalLM):
 
 @pytest.mark.parametrize("rank", range(8))
 @pytest.mark.parametrize("attn_tp", [1, 2, 4])
-def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
+@pytest.mark.parametrize("output_size", [4, 8])
+def test_attention_dp_mtp_shares_target_head_layout(
+    monkeypatch, rank, attn_tp, output_size
+):
     mapping = Mapping(
         rank=rank, world_size=8, attn_tp_size=attn_tp, attn_dp_size=8 // attn_tp
     )
@@ -1574,7 +1578,7 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
         hidden_size=4,
         vocab_size=8,
         rms_norm_eps=1e-6,
-        num_hidden_layers=1,
+        num_hidden_layers=3,
         tie_word_embeddings=False,
     )
     # The GPU transformer and CUDA cache management are outside this test;
@@ -1583,9 +1587,11 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     target = _HeadOnlyTarget(
-        config,
+        ModelInitConfig(
+            hf_config=config,
+            vocabulary=VocabularySpec(input_size=8, output_size=output_size),
+        ),
         mapping,
-        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
     )
     with torch.no_grad():
         target.lm_head.weight.copy_(
@@ -1596,8 +1602,15 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
             - 0.16
         )
     draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
-        config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
+        ModelInitConfig(
+            hf_config=config,
+            vocabulary=VocabularySpec(input_size=8, output_size=output_size),
+        ),
+        mapping,
     )
+    assert config.num_hidden_layers == 3
+    assert draft.config.num_hidden_layers == 1
+    assert draft.vocabulary.output_size == output_size
     _check_shared_head_layout(target, draft)
     draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
 
@@ -1629,12 +1642,18 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     target = _HeadOnlyTarget(
-        config,
+        ModelInitConfig(
+            hf_config=config,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
+        ),
         mapping,
-        vocabulary=VocabularySpec.from_hf_config(config, is_draft=False),
     )
     draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
-        config, mapping, vocabulary=VocabularySpec.from_hf_config(config, is_draft=True)
+        ModelInitConfig(
+            hf_config=config,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        ),
+        mapping,
     )
     _check_shared_head_layout(target, draft)
     full_weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4) / 100
@@ -3945,10 +3964,12 @@ def test_qwen4_exp_nextn_shares_unquantized_target_head(monkeypatch, attention_d
         exclude_modules=["lm_head", "mtp.fc_embedding", "mtp.fc_hidden"]
     )
     draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(
-        config,
+        ModelInitConfig(
+            hf_config=config,
+            vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
+        ),
         mapping,
         quant,
-        vocabulary=VocabularySpec.from_hf_config(config, is_draft=True),
     )
     target_head = ReplicatedLinear(
         128,
