@@ -53,6 +53,7 @@ from tokenspeed.runtime.models.deepseek_v3 import absorb_mla_kv_b_proj
 from tokenspeed.runtime.models.glm5 import (
     GlmMoeDsaDecoderLayer,
     GlmMoeDsaForCausalLM,
+    load_fused_indexer_projection,
     pad_fused_qkv_a_proj_weight_for_fp8_blockscale,
 )
 
@@ -311,13 +312,16 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                self._try_load_fused_indexer_projection(
-                    name=name,
-                    loaded_weight=loaded_weight,
+                load_fused_indexer_projection(
+                    name,
+                    loaded_weight,
                     params_dict=params_dict,
                     modules_dict=modules_dict,
                     pending_fp8_wk=pending_fp8_wk,
                     loaded_shards=loaded_fused_indexer_shards,
+                    weight_block_size=getattr(
+                        self.quant_config, "weight_block_size", None
+                    ),
                 )
                 continue
 

@@ -52,6 +52,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -1046,6 +1047,75 @@ def test_full_metadata_reuses_schedule_and_refreshes_live_inputs(monkeypatch):
         assert schedule.call_count == before + 1
         torch.testing.assert_close(eager, expected, rtol=0, atol=0)
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+def _reference_clean(values, lengths, table, pages, capacity, width, page_size):
+    """Torch oracle: valid logits, -inf for future columns and invalid pages."""
+    columns = torch.arange(width, device=values.device)
+    valid = (columns[None, :] < capacity) & (
+        columns[None, :] < lengths.clamp(0, capacity)[:, None]
+    )
+    page_index = columns // page_size
+    page = table[:, page_index.clamp(max=table.shape[1] - 1)]
+    valid &= (page_index < table.shape[1])[None, :] & (page >= 0) & (page < pages)
+    padded = torch.full(
+        (values.shape[0], width), -float("inf"), dtype=values.dtype, device="cuda"
+    )
+    padded[:, :capacity] = values[:, :capacity]
+    return torch.where(valid, padded, -float("inf"))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_wide_clean_logits_strides_each_row_over_its_tiles(dtype):
+    # 256 rows of a 40-tile capacity launch 16 programs per row, each looping.
+    rows, capacity, page_size = 256, 40 * 1024 - 37, 64
+    pages = triton.cdiv(capacity, page_size)
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    values = torch.randn((rows, capacity + 64), device="cuda", generator=generator).to(
+        dtype
+    )
+    lengths = torch.randint(
+        -3, capacity + 500, (rows,), device="cuda", generator=generator
+    )
+    lengths[:4] = torch.tensor([0, 1, capacity, 1024], device="cuda")
+    table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    table[::3, 5::7] = -1
+    table[1::4, 9::11] = pages + 2
+    alignment = deep_select_alignment()[0] // values.element_size()
+    width = triton.cdiv(capacity, alignment) * alignment
+    expected = _reference_clean(
+        values, lengths, table, pages, capacity, width, page_size
+    )
+    full = clean_logits(values, lengths, table, pages, capacity, page_size)
+    torch.testing.assert_close(full, expected[:, :capacity], rtol=0, atol=0)
+    live = clean_logits_for_selection(
+        values, lengths, table, pages, capacity, page_size, alignment
+    )
+    assert live.shape == (rows, width)
+    written = (lengths.clamp(0, capacity) + 1023) // 1024 * 1024
+    initialized = torch.arange(width, device="cuda")[None, :] < written[:, None]
+    torch.testing.assert_close(live[initialized], expected[initialized], rtol=0, atol=0)
+    # Row counts and lengths change the grid and the loop, not the program.
+    with assert_no_triton_compile(_clean_logits):
+        for count in (1, 3, 64, 255):
+            clean_logits_for_selection(
+                values[:count],
+                lengths[:count],
+                table[:count],
+                pages,
+                capacity,
+                page_size,
+                alignment,
+            )
+            clean_logits(
+                values[:count],
+                lengths[:count],
+                table[:count],
+                pages,
+                capacity,
+                page_size,
+            )
+    torch.cuda.synchronize()
 
 
 def _full_inputs():

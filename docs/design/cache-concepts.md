@@ -261,6 +261,10 @@ storage the cache layer allocated. The scheduler owns allocation, so its output 
 Consumers outside the cache layer treat the ids as opaque.
 Export preserves every logical slot, including holes in a released prefix.
 Export and active-parent accounting skip reading those released references.
+On PD decode admission, a partial leading history block is a landing slot
+for the prefill peer. Installing its private writable block also rewinds
+the released-prefix frontier to include that slot: the outgoing destination
+table must carry the real block ID, even at logical slot zero.
 
 A table resolves a block's id once, when the block enters a slot, and keeps
 it beside the reference (`BlockTable::PageIds`): a forward batch exports
@@ -1977,8 +1981,14 @@ amplifying FP8 attention rounding when changing the softmax partitioning.
 The gathers run on a named
 copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
-before its layer instead of queueing with those collectives. GPU DSA sparse
-prefill instead combines local sparse-attention partials.
+before its layer instead of queueing with those collectives. On SM100 and SM103
+a KVP group may gather the same raw rows with a fused paged-row all-gather on a
+stream of its own instead (`ops/communication/README.md` in
+`tokenspeed-kernel`), still one window ahead: each owner reads its rows in
+place and stores them into every rank's receive slot. A receive slot holds the
+history-expansion capacity from every owner, so any one loop fits however its
+pages are owned, and a window packs loops while each owner's rows still fit.
+GPU DSA sparse prefill instead combines local sparse-attention partials.
 Ascend's generic MLA prefill gathers each layer's complete cache plane into
 an owner-major temporary view. That view is not published as persistent cache;
 its allocation and communication scale with layer capacity, including unused
@@ -2041,8 +2051,11 @@ because every path keeps three invariants:
    a peer's cache.
 2. Off the execution stream, a read of a page the plan grants again forks
    from it after the forward's prologue, which waits on the default stream
-   and with it on the plan's store fence and zeroing; the history gather's
-   all-gather, for one, reads rows the execution stream copied out. Only the
+   and with it on the plan's store fence and zeroing. The history gather's
+   NCCL all-gather, for one, reads rows the execution stream copied out; its
+   fused all-gather reads the owner's pages in place, from a kernel forked
+   through an event the execution stream records after the prologue and the
+   layer's Host-load wait, and writes only the ranks' receive slots. Only the
    eviction copies, which the fence orders, read such a page earlier: on the
    write stream, behind the forward that wrote it.
 3. A kernel that would read a peer's KV in place (one-sided or

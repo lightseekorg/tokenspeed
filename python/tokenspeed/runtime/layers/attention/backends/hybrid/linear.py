@@ -153,6 +153,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def reads_fp8_kv_scales(self, layer):
         return self._backend_for_layer(layer.layer_id).reads_fp8_kv_scales(layer)
 
+    def query_dtype(self, layer, forward_mode, activation):
+        return self._backend_for_layer(layer.layer_id).query_dtype(
+            layer, forward_mode, activation
+        )
+
     @property
     def cache_consumer_attn_kinds(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""

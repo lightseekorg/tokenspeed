@@ -70,3 +70,18 @@ entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 256, i32 1, i32 0)
   ret i32 0
 }
+
+; 1 when %a == %b (ordered, as v_cmp_eq_f32) in every active lane of the wave,
+; else 0; the same in every lane, in an SGPR: one compare into a lane mask
+; (llvm.amdgcn.ballot) tested against the active lanes (EXEC).
+declare i64 @llvm.amdgcn.ballot.i64(i1)
+
+define i32 @__tokenspeed_sched_wave_all_equal_f32(float %a, float %b) alwaysinline {
+entry:
+  %eq = fcmp oeq float %a, %b
+  %set = call i64 @llvm.amdgcn.ballot.i64(i1 %eq)
+  %active = call i64 @llvm.amdgcn.ballot.i64(i1 true)
+  %all = icmp eq i64 %set, %active
+  %r = zext i1 %all to i32
+  ret i32 %r
+}
