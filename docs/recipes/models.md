@@ -91,9 +91,9 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
 workloads with long cached prefixes need; prefix caching is on by default.
 
 With MXFP4 experts at MoE TP8 and EP1, startup also builds a column-split copy
-of the expert down-projection weights for prefill. The copy takes one more set
-of those weights on each GPU, which leaves less memory for the KV cache, and
-live weight updates are refused while it exists.
+of the expert down-projection weights for prefill. The copy holds one more set
+of those weights on each GPU, which leaves less memory for the KV cache. While
+the copy exists, TokenSpeed refuses live weight updates.
 
 The two HIP runtime settings are needed for speed; TokenSpeed does not set them
 itself. `DEBUG_HIP_FORCE_GRAPH_QUEUES=1` matters most for the two-stream
