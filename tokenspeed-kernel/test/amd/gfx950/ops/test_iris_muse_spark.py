@@ -372,7 +372,7 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
             outputs.append(boundary(values, stream, weight))
             if sharded:
                 # Alternate Lamport and pull reductions over the boundary's scratch.
-                n = 129 * 8192 if index % 2 else 43 * 4096
+                n = 173 * 8192 if index % 2 else 43 * 4096
                 generic = state.all_reduce.acquire_outputs(((n,),))[0]
                 generic.fill_(rank + 1)
                 state.reduce_outputs((generic,))
@@ -454,6 +454,8 @@ def _muse_collective_policy_worker(rank, world_size, device):
         27 * 8192,
         128 * 8192,
         129 * 8192,
+        172 * 8192,
+        173 * 8192,
         8191 * 8192,
         8192 * 8192,
         32,
@@ -1071,6 +1073,63 @@ def test_routed_lamport_polling_codegen(rank):
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
+def test_route_sum_gather_lamport_polling_codegen():
+    """Keep the expert TP8 route-sum gather's polls batched on the retry path.
+
+    Each subgroup polls its own 16-byte packs: a retry issues all seven peer
+    reads before waiting and branches on one subgroup lane mask, with no
+    workgroup barrier inside the loop.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_routed_rmsnorm_sum_lamport_allgather,
+    )
+
+    policy = iris_arch_policy(ArchVersion(9, 5))
+    types = {
+        "routes": "*bf16",
+        "route_weights": "*fp32",
+        "norm_weight": "*bf16",
+        "output": "*bf16",
+        "region": "*bf16",
+        "epochs": "*i32",
+        "regions": ("i64",) * 8,
+        "rows": "i32",
+    }
+    constexprs = {
+        "RANK": 5,
+        "WIDTH": 4096,
+        "EPS": 1e-5,
+        "WEIGHT_OFFSET": 1.0,
+        "MAX_ELEMENTS": 43 * 4096,
+        "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
+        "WAIT_STORES": policy.wait_stores,
+    }
+    kernel = _compile_gfx950(
+        iris_fused_routed_rmsnorm_sum_lamport_allgather,
+        types,
+        constexprs,
+        8,
+        unspecialized=("rows",),
+    )
+    assembly = kernel.asm["amdgcn"]
+    polls = [
+        cycle for cycle in polling_cycles(assembly) if _batched_peer_reads(cycle, 7)
+    ]
+    assert polls, "all seven system-cache reads must issue together on a retry"
+    assert all(votes_with_subgroup_mask(cycle) for cycle in polls)
+    assert not any("s_barrier" in line for cycle in polls for line in cycle)
+    # Seven pushes and seven mailbox resets.
+    assert (
+        sum(
+            bool(re.search(r"\bbuffer_store_dwordx4\b", line)) and "sc0 sc1" in line
+            for line in assembly.splitlines()
+        )
+        == 14
+    ), "publication and reset must use system-cache stores"
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
 def test_routed_pull_stores_reach_l2_before_release():
     """Every subgroup's routed sum reaches L2 before the readiness release.
 
@@ -1344,7 +1403,8 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
             num_warps=1,
         )
 
-    for rows in (1, 3, 16):
+    # 128 rows exceed the pull variant's 84 ready flags; Lamport needs none.
+    for rows in (1, 3, 16, 128):
         if rows == 1:
             published = state.all_reduce.acquire_outputs(((1, width),))[0]
             local = published[:, rank * local_width : (rank + 1) * local_width]
@@ -1429,7 +1489,7 @@ def _muse_routed_lamport_worker(rank, world_size, device):
         iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
     )
     from tokenspeed_kernel.ops.moe._triton.routed_norm import (
-        triton_routed_input_scale_rmsnorm_sum_gathered,
+        _launch_routed_input_scale_sum,
     )
     from utils import assert_no_triton_compile
 
@@ -1513,17 +1573,22 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             raw(1)
             if rows > 16:
                 local = state.all_reduce.producer.data[: rows * 4096].view(rows, 4096)
-                triton_routed_input_scale_rmsnorm_sum_gathered(
+                # The fused kernel keeps the two-launch routed sum's order; CDNA4
+                # dispatches the one-launch sum, within one BF16 ULP of it.
+                _launch_routed_input_scale_sum(
                     routes,
                     mapping,
-                    rows,
-                    8,
-                    weights,
-                    norm,
-                    1e-5,
-                    1.0,
-                    False,
-                    local,
+                    row_stride=routes.stride(0),
+                    route_weights=weights,
+                    norm_weight=norm,
+                    output=local,
+                    num_tokens=rows,
+                    topk=8,
+                    eps=1e-5,
+                    weight_offset=1.0,
+                    block=4096,
+                    single_pass=False,
+                    enable_pdl=False,
                 )
                 expected = state.reduction.run(
                     local,
@@ -2151,7 +2216,8 @@ def _muse_tp_routes_worker(rank, world_size, device):
     cases = [
         (n, c, False) for n, c in ((1, False), (3, False), (16, False), (2049, False))
     ]
-    cases += [(n, True, False) for n in (3, 6, 33)]
+    cases += [(n, True, False) for n in (3, 6, 33, 44, 49, 128)]
+    cases += [(64, False, False)]
     cases += [
         (192, True, True),
         (193, True, True),
@@ -2167,13 +2233,23 @@ def _muse_tp_routes_worker(rank, world_size, device):
         weights = (
             torch.linspace(0.01, 1, topk, device=device).expand(tokens, -1).contiguous()
         )
+        # Decode rows completed on token owners have the expert write the
+        # route staging buffer directly.
+        scattered = not owned and canonical
+        scattered = (
+            scattered and state.can_reduce_scatter_routed_rmsnorm_sum_all_gather(tokens)
+        )
         routes = (
             state.acquire_owned_route_input(tokens)
             if owned and canonical
-            else torch.empty(
-                (indices.numel(), width if canonical else width + 16),
-                device=device,
-                dtype=torch.bfloat16,
+            else (
+                moe._acquire_route_destination(tokens, False)
+                if scattered
+                else torch.empty(
+                    (indices.numel(), width if canonical else width + 16),
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
             )
         )
 
@@ -2220,8 +2296,14 @@ def _muse_tp_routes_worker(rank, world_size, device):
                 owned_rows=owned,
             )
 
+        if scattered:
+            assert routes.data_ptr() == state.owned_route_input.data_ptr()
         update(0)
+        flags = state.owned_route_scatter_flags.clone()
         actual = run()
+        # Only owned rows and the decode window use the route reduce-scatter.
+        assert scattered or owned or torch.equal(flags, state.owned_route_scatter_flags)
+        assert not scattered or not torch.equal(flags, state.owned_route_scatter_flags)
         torch.testing.assert_close(actual, reference(0), rtol=0, atol=2**-8)
         if tokens == 192 and owned and canonical:
             before = routes.clone()
@@ -2234,7 +2316,7 @@ def _muse_tp_routes_worker(rank, world_size, device):
             with pytest.raises(ValueError, match="must not overlap"):
                 state.reduce_scatter_owned_routes(shifted, None, tokens)
             torch.testing.assert_close(routes, before, rtol=0, atol=0)
-        if tokens <= 33 or owned:
+        if tokens <= 128 or owned:
             if owned:
                 state.owned_route_scatter_flags.view(torch.int32).fill_(-2)
                 state.all_reduce.peers.ctx.device_barrier()
@@ -2255,6 +2337,202 @@ def _muse_tp_routes_worker(rank, world_size, device):
                 torch.testing.assert_close(
                     captured, reference(step), rtol=0, atol=2**-8
                 )
+        dist.barrier()
+
+
+def _muse_tp_route_scatter_worker(rank, world_size, device):
+    """Expert TP8 completes decode routes on token owners and gathers the sums.
+
+    Owners sum routes in rank order, as the TP8 Lamport two-shot does, so the
+    completed routes match that all-reduce bit for bit; the owner's fused
+    weighted accumulation keeps the sums within BF16 rounding of the portable
+    routed norm. One graph interleaves row counts with and without padding
+    owners, a route source already in the staging buffer and one that is
+    copied there, an owned prefill reduce-scatter that shares the staging
+    buffer and flags, and a Lamport one-shot all-reduce that shares the
+    gather's mailbox; one rank is delayed in each replay.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+        iris_lamport_bf16_allreduce,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_routed_rmsnorm_sum_lamport_allgather,
+    )
+    from tokenspeed_kernel.ops.moe import routed_input_scale_rmsnorm_sum
+    from utils import assert_no_triton_compile
+
+    torch.set_grad_enabled(False)
+    capacity = 256
+    state = prepare_muse_communication(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        producer_direct_max_numel=capacity * 8192,
+        enable_lamport=True,
+        owned_route_max_rows=capacity,
+        all_reduce=None,
+        device=device,
+    )
+    if world_size != 8:
+        # Only the TP8 crossover was measured.
+        return
+    # The window ends where owned rows take over.
+    assert [
+        state.can_reduce_scatter_routed_rmsnorm_sum_all_gather(rows)
+        for rows in (43, 44, 49, 191, 192)
+    ] == [False, True, True, True, False]
+    norm = torch.linspace(-0.25, 0.25, 4096, device=device).bfloat16()
+    state.warmup_reduce_scatter_routed_rmsnorm_sum_all_gather(norm, 1e-5, 1.0)
+
+    def partial_routes(rows, peer, phase):
+        generator = torch.Generator(device=device).manual_seed(
+            (rows * 64 + peer) * 4 + phase
+        )
+        return torch.randn(
+            rows * 8, 4096, generator=generator, device=device
+        ).bfloat16()
+
+    def complete_routes(rows, phase):
+        # FP32 in rank order, rounded once, as the owners sum them.
+        total = partial_routes(rows, 0, phase).float()
+        for peer in range(1, world_size):
+            total += partial_routes(rows, peer, phase).float()
+        return total.bfloat16()
+
+    def route_weights(rows, phase):
+        generator = torch.Generator(device=device).manual_seed(rows * 4 + phase)
+        weights = torch.rand(rows, 8, generator=generator, device=device)
+        return weights / weights.sum(-1, keepdim=True)
+
+    def reference(rows, phase):
+        return routed_input_scale_rmsnorm_sum(
+            complete_routes(rows, phase).view(rows, 8, 4096),
+            route_weights(rows, phase),
+            norm,
+            1e-5,
+            1.0,
+            False,
+            None,
+        )
+
+    raw_input = torch.empty(3 * 4096, dtype=torch.bfloat16, device=device)
+    raw_output = torch.empty_like(raw_input)
+
+    def raw():
+        iris_lamport_bf16_allreduce[(raw_input.numel() // 512,)](
+            raw_input,
+            state.reduction.lamport_region,
+            raw_output,
+            state.reduction.lamport_epochs,
+            state.reduction.lamport_peer_addresses[:world_size],
+            RANK=rank,
+            WORLD_SIZE=world_size,
+            total_elements=raw_input.numel(),
+            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            NUM_STAGES=3,
+            PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
+            num_warps=1,
+        )
+
+    # Owned prefill rows; their staging copy and flags are shared.
+    prefill_rows = 192
+    prefill = torch.empty(prefill_rows * 8, 4096, dtype=torch.bfloat16, device=device)
+    prefill_local = prefill_rows // world_size
+    plain = torch.empty(capacity * 8, 4096, dtype=torch.bfloat16, device=device)
+    weights = [torch.empty(capacity, 8, device=device) for _ in range(2)]
+    # The first call reads the staging buffer in place, the second copies in.
+    # At 49 rows the last owner has no token; two such calls run back to back.
+    for index, counts in enumerate(((64, 44), (128, 191), (49, 49))):
+        staged_rows, copied_rows = counts
+
+        def update(phase):
+            state.acquire_owned_route_input(staged_rows).copy_(
+                partial_routes(staged_rows, rank, phase)
+            )
+            plain.fill_(torch.nan)
+            plain[: copied_rows * 8].copy_(partial_routes(copied_rows, rank, phase))
+            for weight, rows in zip(weights, counts):
+                weight[:rows].copy_(route_weights(rows, phase))
+            prefill.copy_(partial_routes(prefill_rows, rank, phase))
+            raw_input.fill_((rank + 1) * (phase + 1) / 16)
+
+        def run():
+            outputs = [
+                state.reduce_scatter_routed_rmsnorm_sum_all_gather(
+                    state.acquire_owned_route_input(staged_rows),
+                    staged_rows,
+                    weights[0][:staged_rows],
+                    norm,
+                    1e-5,
+                    1.0,
+                )
+            ]
+            raw()
+            owned = state.reduce_scatter_owned_routes(prefill, None, prefill_rows)
+            # The next call restages over the owned result's source.
+            owned_copy = owned.clone()
+            outputs.append(
+                state.reduce_scatter_routed_rmsnorm_sum_all_gather(
+                    plain[: copied_rows * 8],
+                    copied_rows,
+                    weights[1][:copied_rows],
+                    norm,
+                    1e-5,
+                    1.0,
+                )
+            )
+            return outputs, owned_copy
+
+        def check(results, phase):
+            outputs, owned = results
+            for output, rows in zip(outputs, counts):
+                # One BF16 ULP, with an absolute floor for sums that cancel.
+                torch.testing.assert_close(
+                    output, reference(rows, phase), atol=2**-8, rtol=2**-7
+                )
+            first = rank * prefill_local
+            expected = complete_routes(prefill_rows, phase).view(prefill_rows, 8, 4096)
+            torch.testing.assert_close(
+                owned.view(torch.int16),
+                expected[first : first + prefill_local].view(torch.int16),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                raw_output,
+                torch.full_like(
+                    raw_output,
+                    (world_size * (world_size + 1) // 2) * (phase + 1) / 16,
+                ),
+                rtol=0,
+                atol=0,
+            )
+
+        update(0)
+        if index == 0:
+            # Startup's compile-only warmup covers the gather.
+            with assert_no_triton_compile(
+                iris_fused_routed_rmsnorm_sum_lamport_allgather
+            ):
+                check(run(), 0)
+        else:
+            check(run(), 0)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        for phase in range(1, 4):
+            update(phase)
+            if rank == (phase * 3 + index) % world_size:
+                torch.cuda._sleep(20000)
+            graph.replay()
+            torch.cuda.synchronize()
+            check(captured, phase)
         dist.barrier()
 
 
@@ -2560,6 +2838,284 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     dist.barrier()
 
 
+def _muse_owned_stream_tap_worker(rank, world_size, device):
+    """Gather BF16-rounded owned FP32 residual rows between other collectives
+    that use pull scratch."""
+    torch.set_grad_enabled(False)
+    state = _muse_state(rank, device, 8192, False)
+
+    def make_inputs(rows):
+        local_rows = (rows + world_size - 1) // world_size
+        stream = torch.empty((local_rows, 8192), device=device, dtype=torch.float32)
+        branch = torch.empty((rows, 8192), device=device, dtype=torch.bfloat16)
+        return rows, stream, branch
+
+    def update(item, step):
+        rows, stream, branch = item
+        local_rows = stream.shape[0]
+        # Every rank derives every owner's rows; random FP32 exercises rounding.
+        generator = torch.Generator(device=device).manual_seed(rows * 31 + step)
+        full = torch.randn(
+            (world_size * local_rows, 8192),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        full[rows:] = float("nan")
+        stream.copy_(full[rank * local_rows : (rank + 1) * local_rows])
+        branch.fill_((rank + 1) * (step + 1))
+        return full[:rows].bfloat16()
+
+    def one(item):
+        rows, stream, branch = item
+        # A reduce-scatter result occupies pull scratch first, as attention
+        # output does.
+        reduced = state.reduce_scatter_owned_rows(branch)
+        retained = state.all_gather_owned_rows(reduced, rows, True)
+        if rank == rows % world_size:
+            torch.cuda._sleep(20000)
+        tap = state.all_gather_owned_stream_bf16(stream, rows)
+        # Staging different data right away fails the check below if a peer
+        # is still reading the gathered rows.
+        staged = state.all_gather_owned_rows((-stream).bfloat16(), rows, False)
+        return retained, tap, staged
+
+    inputs = [make_inputs(rows) for rows in (192, 193, 8191)]
+    for item in inputs:
+        update(item, 0)
+        one(item)
+    state.row_gather_flags.fill_(2**32 - 2)
+    state.row_scatter_flags.fill_(2**32 - 2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = [one(item) for item in inputs]
+    for step in range(4):
+        expected = [update(item, step) for item in inputs]
+        graph.replay()
+        for (retained, tap, staged), full in zip(outputs, expected):
+            torch.testing.assert_close(
+                tap.view(torch.int16), full.view(torch.int16), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                staged.view(torch.int16), (-full).view(torch.int16), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                retained,
+                torch.full_like(
+                    retained, (world_size * (world_size + 1) // 2) * (step + 1)
+                ),
+                atol=0,
+                rtol=0,
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def _muse_ordinary_all_reduce_worker(rank, world_size, device):
+    """Ordinary all-reduces on Muse's group, such as a draft model's per-layer
+    reductions, use its prepared reduction: they match RCCL bit for bit, stay
+    in caller storage across later collectives and another stream's reads,
+    replay from a graph interleaved with Muse's own reductions, and hand
+    payloads past the limit, views of state storage and MAX to RCCL or
+    staging. Muse's own ordinary reduce takes the same policy."""
+    torch.set_grad_enabled(False)
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        ProducerAllReduce,
+        iris_lamport_bf16_allreduce,
+        iris_lamport_twoshot_bf16_allreduce,
+        iris_pull_oneshot,
+        iris_pull_twoshot,
+        iris_push_twoshot_allreduce,
+    )
+    from utils import assert_no_triton_compile
+
+    from tokenspeed.runtime.distributed.comm_backend.registry import (
+        get_global_backend,
+    )
+    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+    group, state = _prepare_muse_backend(world_size, None, None, expert_tp_size=1)
+    iris = get_global_backend().iris
+    generator = torch.Generator(device=device).manual_seed(rank)
+
+    def operands(rows, width=8192):
+        # Small integers sum exactly in any order, so every protocol must
+        # match RCCL bit for bit. Negative zeros look like the Lamport empty
+        # marker and must still be reduced as zeros.
+        values = torch.randint(
+            -16, 17, (rows, width), generator=generator, device=device
+        ).bfloat16()
+        values[:, rank::7] = -0.0
+        expected = values.clone()
+        dist.all_reduce(expected)
+        return values, expected
+
+    # Lamport one-shot and (TP8) two-shot windows, the two-shot's largest
+    # payload (172 rows) and one row past it, the TP4 push window, the
+    # producer pull, a width outside the Lamport windows (the one-shot pull
+    # at TP4, staging at TP8), and the largest payload served.
+    limit_rows = ProducerAllReduce.ORDINARY_MAX_BYTES[world_size] // (8192 * 2)
+    for rows, width in (
+        (1, 8192),
+        (8, 8192),
+        (21, 8192),
+        (22, 8192),
+        (33, 8192),
+        (64, 8192),
+        (128, 8192),
+        (129, 8192),
+        (172, 8192),
+        (173, 8192),
+        (limit_rows, 8192),
+        (5, 4096),
+        (1, 768),
+    ):
+        values, expected = operands(rows, width)
+        assert iris.can_run(values, group)
+        result = all_reduce(values, group)
+        assert result.data_ptr() == values.data_ptr()
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+    values, expected = operands(limit_rows + 1)
+    assert not state.reduction.can_reduce_ordinary(values, rccl_fallback=True)
+    assert not iris.can_run(values, group)
+    torch.testing.assert_close(all_reduce(values, group), expected, atol=0, rtol=0)
+    # Muse's own reduce has no RCCL fallback and serves it through the policy.
+    values, expected = operands(limit_rows + 1)
+    torch.testing.assert_close(state.reduce(values), expected, atol=0, rtol=0)
+    values, expected = operands(64)
+    torch.testing.assert_close(state.reduce(values), expected, atol=0, rtol=0)
+
+    values, _ = operands(8)
+    maximum = values.clone()
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    assert not iris.can_run(values, group, op=dist.ReduceOp.MAX)
+    torch.testing.assert_close(
+        all_reduce(values, group, op=dist.ReduceOp.MAX), maximum, atol=0, rtol=0
+    )
+
+    # A reduce-scatter result lives in pull scratch; reducing it in place
+    # through the pull would overwrite it, so the policy declines it.
+    full, _ = operands(192)
+    owned = state.reduce_scatter_owned_rows(full)
+    # Refill the view with small integers so the reduction stays exact.
+    values, expected = operands(owned.shape[0])
+    owned.copy_(values)
+    assert not state.reduction.can_reduce_ordinary(owned, rccl_fallback=True)
+    torch.testing.assert_close(all_reduce(owned, group), expected, atol=0, rtol=0)
+
+    # Reduce Lamport-sized and pull-sized payloads, then keep the model's
+    # own reduction and more ordinary ones running on the main stream while
+    # another stream, delayed, copies the first two results. A result that
+    # borrowed state storage would be overwritten by then.
+    aux = torch.cuda.Stream(device)
+    # The last two sizes take the Lamport one-shot over 48 tiles, while
+    # Muse's 5-row reduction between them uses 80 tiles of the same mailbox.
+    shapes = ((64, 8192), (172, 8192), (8, 8192), (3, 8192))
+    sources = [
+        torch.empty(shape, dtype=torch.bfloat16, device=device) for shape in shapes
+    ]
+    reduced = [torch.empty_like(source) for source in sources]
+    copies = [torch.empty_like(source) for source in sources[:2]]
+    target_source = torch.empty((26, 8192), dtype=torch.bfloat16, device=device)
+    fork = torch.cuda.Event()
+    join = torch.cuda.Event()
+
+    def step():
+        first = all_reduce(reduced[0], group)
+        fork.record()
+        with torch.cuda.stream(aux):
+            aux.wait_event(fork)
+            torch.cuda._sleep(50000)
+            copies[0].copy_(first)
+        second = all_reduce(reduced[1], group)
+        branch = state.all_reduce.acquire_outputs(((26, 8192),))[0]
+        branch.copy_(target_source)
+        target = state.reduce_outputs((branch,))[0].clone()
+        all_reduce(reduced[2], group)
+        small = state.all_reduce.acquire_outputs(((5, 8192),))[0]
+        small.copy_(target_source[:5])
+        small_target = state.reduce_outputs((small,))[0].clone()
+        all_reduce(reduced[3], group)
+        fork.record()
+        with torch.cuda.stream(aux):
+            aux.wait_event(fork)
+            copies[1].copy_(second)
+            join.record()
+        torch.cuda.current_stream().wait_event(join)
+        return target, small_target
+
+    def load(step_index):
+        expected = []
+        for source, destination in zip(sources, reduced):
+            values, total = operands(source.shape[0])
+            source.copy_(values)
+            destination.copy_(values)
+            expected.append(total)
+        target_source.fill_((rank + 1) * (step_index + 1))
+        return expected
+
+    def check(expected, targets, step_index):
+        for actual, total in zip(reduced, expected):
+            torch.testing.assert_close(actual, total, atol=0, rtol=0)
+        for actual, total in zip(copies, expected):
+            torch.testing.assert_close(actual, total, atol=0, rtol=0)
+        for target in targets:
+            torch.testing.assert_close(
+                target,
+                torch.full_like(
+                    target, world_size * (world_size + 1) // 2 * (step_index + 1)
+                ),
+                atol=0,
+                rtol=0,
+            )
+
+    expected = load(0)
+    check(expected, step(), 0)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        targets = step()
+    for step_index in range(6):
+        expected = load(step_index)
+        torch.cuda.synchronize()
+        if rank == step_index % world_size:
+            torch.cuda._sleep(20000)
+        graph.replay()
+        check(expected, targets, step_index)
+
+    # Sizes between and around the ones above reuse the compiled kernels: the
+    # pulls take their workgroup and tile counts unspecialized.
+    with assert_no_triton_compile(
+        iris_lamport_bf16_allreduce,
+        iris_lamport_twoshot_bf16_allreduce,
+        iris_pull_oneshot,
+        iris_pull_twoshot,
+        iris_push_twoshot_allreduce,
+    ):
+        for rows, width in (
+            (3, 8192),
+            (17, 8192),
+            (40, 8192),
+            (80, 8192),
+            (100, 8192),
+            (136, 8192),
+            (150, 8192),
+            (200, 8192),
+            (300, 8192),
+            (3, 768),
+        ):
+            values, expected = operands(rows, width)
+            torch.testing.assert_close(
+                all_reduce(values, group), expected, atol=0, rtol=0
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 @pytest.mark.parametrize(
     "check,backend",
     [
@@ -2582,7 +3138,12 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(_muse_moetail_worker, "nccl", id="moetail"),
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
+        pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
+        pytest.param(
+            _muse_ordinary_all_reduce_worker, "nccl", id="ordinary_all_reduce"
+        ),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
+        pytest.param(_muse_tp_route_scatter_worker, "nccl", id="tp_route_scatter"),
         pytest.param(
             partial(_muse_tp_owned_forward_worker, quantized=False),
             "nccl",
