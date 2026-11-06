@@ -1047,7 +1047,7 @@ def _decode_graph_rows() -> set[int]:
     ladder = get_batch_sizes_to_capture(
         DecodeLadderArgs(
             cudagraph_capture_sizes=args["cudagraph_capture_sizes"],
-            max_num_seqs=args["max_num_seqs"],
+            max_num_seqs=args["request_state_seqs"],
             data_parallel_size=args["mapping"].attn.dp_size,
             disable_cuda_graph_padding=args["disable_cuda_graph_padding"],
             max_cudagraph_capture_size=args["max_cudagraph_capture_size"],
@@ -2474,7 +2474,7 @@ class KimiLinearMoE(nn.Module):
                     model_scope=model_scope,
                     max_tokens=max(
                         int(global_server_args_dict["max_prefill_tokens"]),
-                        int(global_server_args_dict["max_num_seqs"])
+                        int(global_server_args_dict["request_state_seqs"])
                         * int(
                             global_server_args_dict.get("speculative_num_draft_tokens")
                             or 1

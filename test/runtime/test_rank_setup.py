@@ -53,6 +53,8 @@ from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E40
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
     rank_process_title,
+    request_state_slots,
+    scheduler_batch_slots,
     scheduler_config_from_args,
 )
 from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
@@ -638,3 +640,20 @@ def test_a_rank_is_titled_by_its_parallel_ranks(mapping, title):
     # The attention TP rank always shows; another dimension only when it
     # has more than one rank.
     assert rank_process_title(mapping) == title
+
+
+@pytest.mark.parametrize("cap", [1, 2])
+def test_a_speculative_cap_below_attention_tp_sizes_state_for_the_warmup(cap):
+    # The draft decode warmup decodes one request per attention-TP peer, so
+    # the decode state is sized for 8 while the scheduler still runs `cap`.
+    args = ServerArgs(
+        model="x",
+        dtype="bfloat16",
+        world_size=8,
+        attn_tp_size=8,
+        ep_size=8,
+        max_num_seqs=cap,
+        speculative_algorithm="MTP",
+    )
+    assert (args.max_num_seqs, args.request_state_seqs) == (cap, 8)
+    assert (scheduler_batch_slots(args), request_state_slots(args)) == (cap, 8)

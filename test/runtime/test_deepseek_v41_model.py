@@ -3140,7 +3140,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
         monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
         monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 128)
-        monkeypatch.setitem(global_server_args_dict, "max_num_seqs", 8)
+        monkeypatch.setitem(global_server_args_dict, "request_state_seqs", 8)
         config = _loader_config()
         config.hidden_size = 512
         config.moe_intermediate_size = 256
