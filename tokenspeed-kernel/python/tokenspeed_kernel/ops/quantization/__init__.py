@@ -76,6 +76,7 @@ def rmsnorm_quantize_fp8_group32(
     weight: torch.Tensor,
     eps: float,
     *,
+    swizzled_scales: bool,
     override: str | None,
     solution: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -88,12 +89,17 @@ def rmsnorm_quantize_fp8_group32(
         x: BF16 rows ``[M, K]`` with unit inner stride; K divisible by 32.
         weight: Contiguous BF16 RMSNorm weight ``[K]`` on x's device.
         eps: Positive epsilon added to the row mean square.
+        swizzled_scales: Write the scales in FlashInfer's F8_128x4 layout,
+            which ``mm(prepacked_scales=True)`` reads without repacking them,
+            instead of the canonical one.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
     Returns:
-        BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and canonical
-        uint8 UE8M0 scales ``[M, K/32]``.
+        BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and uint8
+        UE8M0 scales: canonical ``[M, K/32]``, or with ``swizzled_scales``
+        1-D F8_128x4 bytes for ``M`` rows padded to 128 and ``K/32`` scale
+        columns padded to 4, the padding zero.
     """
     kernel = select_kernel(
         "quantization",
@@ -103,7 +109,7 @@ def rmsnorm_quantize_fp8_group32(
         override=override,
         solution=solution,
     )
-    return kernel(x, weight, eps)
+    return kernel(x, weight, eps, swizzled_scales=swizzled_scales)
 
 
 def silu_and_mul_quantize_fp8_group32(
