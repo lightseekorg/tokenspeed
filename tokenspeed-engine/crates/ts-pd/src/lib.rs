@@ -30,9 +30,9 @@
 //! plane only builds the rank's cache transfer contract at startup and
 //! tells the forward thread when a plan's remote stream may go out
 //! ([`PrefillOutbox`], [`DecodeOutbox`]). The bootstrap server the nodes
-//! rendezvous through is here too ([`bootstrap`]). The wire formats are
-//! unchanged from the Python peers this crate replaced, so nodes of either
-//! version interoperate.
+//! rendezvous through is here too ([`bootstrap`]). Cache registrations carry
+//! an independent cache identity as well as a transport address; both P/D
+//! nodes must use this protocol version.
 
 mod batch;
 pub mod bootstrap;
@@ -46,9 +46,13 @@ mod prefill;
 mod status;
 mod wire;
 
+#[cfg(test)]
+mod tests_support;
+
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -120,6 +124,9 @@ pub enum StartError {
     /// A thread did not start.
     #[error("starting a PD thread: {0}")]
     Thread(#[from] std::io::Error),
+    /// The cache incarnation could not get an independent identity.
+    #[error("creating a cache identity: {0}")]
+    CacheIdentity(std::io::Error),
     /// The rank's cache transfer contract is malformed.
     #[error(transparent)]
     Layout(#[from] LayoutError),
@@ -154,7 +161,16 @@ struct Transport {
     regions: Vec<(usize, usize)>,
     /// Replaced when a sleeping Decode rank wakes under a fresh session.
     engine: RwLock<Arc<Engine>>,
+    /// Cache writes can replace their engine without changing the address
+    /// advertised to EPD senders that still use the public engine.
+    cache_sender: Mutex<CacheSender>,
     sockets: net::Sockets,
+}
+
+struct CacheSender {
+    engine: Arc<Engine>,
+    /// The cache incarnation last addressed through each transport endpoint.
+    sessions: HashMap<String, String>,
 }
 
 impl Transport {
@@ -179,13 +195,18 @@ impl Transport {
             "Mooncake transfer engine ready"
         );
         let sockets = net::Sockets::start(&config.local_ip, incoming)?;
+        let engine = Arc::new(engine);
         Ok(Arc::new(Self {
             library,
             local_ip: config.local_ip.clone(),
             protocol: config.protocol.clone(),
             ib_device: config.ib_device.clone(),
             regions: config.regions.clone(),
-            engine: RwLock::new(Arc::new(engine)),
+            engine: RwLock::new(engine.clone()),
+            cache_sender: Mutex::new(CacheSender {
+                engine,
+                sessions: HashMap::new(),
+            }),
             sockets,
         }))
     }
@@ -206,11 +227,22 @@ impl Transport {
     /// Deregister the cache before a sleep unmaps its memory.
     fn release_regions(&self) -> Result<(), String> {
         let engine = self.engine();
-        let failed = self
+        let sender = self
+            .cache_sender
+            .lock()
+            .expect("the cache sender lock is poisoned");
+        let mut failed = self
             .regions
             .iter()
             .filter(|&&(addr, _)| engine.unregister(addr).is_err())
             .count();
+        if !Arc::ptr_eq(&engine, &sender.engine) {
+            failed += self
+                .regions
+                .iter()
+                .filter(|&&(addr, _)| sender.engine.unregister(addr).is_err())
+                .count();
+        }
         if failed > 0 {
             return Err(format!(
                 "Mooncake failed to deregister {failed} cache region(s) before the memory release"
@@ -236,11 +268,22 @@ impl Transport {
         } else {
             self.engine()
         };
-        let failed = self
+        let mut sender = self
+            .cache_sender
+            .lock()
+            .expect("the cache sender lock is poisoned");
+        let mut failed = self
             .regions
             .iter()
             .filter(|&&(addr, length)| engine.register(addr, length).is_err())
             .count();
+        if !fresh_session && !Arc::ptr_eq(&engine, &sender.engine) {
+            failed += self
+                .regions
+                .iter()
+                .filter(|&&(addr, length)| sender.engine.register(addr, length).is_err())
+                .count();
+        }
         if failed > 0 {
             return Err(format!(
                 "Mooncake failed to register {failed} cache region(s) after the memory resume"
@@ -248,7 +291,9 @@ impl Transport {
         }
         if fresh_session {
             tracing::info!(session = engine.session_id(), "a fresh transfer session");
-            *self.engine.write().expect("the engine lock is poisoned") = engine;
+            *self.engine.write().expect("the engine lock is poisoned") = engine.clone();
+            sender.engine = engine;
+            sender.sessions.clear();
         }
         Ok(())
     }
@@ -256,6 +301,53 @@ impl Transport {
     /// Run one transfer's copies to `session`.
     fn write(&self, session: &str, copies: &[Copy]) -> Result<(), ts_mooncake::Error> {
         let engine = self.engine();
+        Self::write_on_engine(&engine, session, copies)
+    }
+
+    /// Address one cache incarnation without retaining the native keys of
+    /// an earlier cache that used the same endpoint. Mooncake's current C
+    /// ABI has no segment invalidation call, so replace only the sender.
+    fn write_cache(
+        &self,
+        session: &str,
+        cache_id: &str,
+        copies: &[Copy],
+    ) -> Result<(), ts_mooncake::Error> {
+        let engine = {
+            let mut sender = self
+                .cache_sender
+                .lock()
+                .expect("the cache sender lock is poisoned");
+            if sender
+                .sessions
+                .get(session)
+                .is_some_and(|previous| previous != cache_id)
+            {
+                let engine = Engine::start(
+                    self.library.clone(),
+                    &self.local_ip,
+                    &self.protocol,
+                    &self.ib_device,
+                )?;
+                for &(addr, length) in &self.regions {
+                    engine.register(addr, length)?;
+                }
+                sender.engine = Arc::new(engine);
+                sender.sessions.clear();
+            }
+            sender
+                .sessions
+                .insert(session.to_owned(), cache_id.to_owned());
+            sender.engine.clone()
+        };
+        Self::write_on_engine(&engine, session, copies)
+    }
+
+    fn write_on_engine(
+        engine: &Engine,
+        session: &str,
+        copies: &[Copy],
+    ) -> Result<(), ts_mooncake::Error> {
         for copy in copies {
             match copy {
                 Copy::Pages(grid) => engine.write_pages(session, grid, DESCRIPTOR_BATCH)?,
@@ -320,3 +412,7 @@ mod tests {
         assert_eq!(spans.bytes(), 30);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/transport.rs"]
+mod transport_tests;
