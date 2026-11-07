@@ -90,8 +90,9 @@ def backup_weights(
 class WeightMemoryState:
     """A failed transition poisons the deployment until it is restarted."""
 
-    def __init__(self, *, policy: str, models: Sequence[nn.Module]) -> None:
-        if policy not in ("cpu_backup", "discard"):
+    def __init__(self, *, policy: str | None, models: Sequence[nn.Module]) -> None:
+        # No allocator policy still needs the same weight-update validity gate.
+        if policy not in (None, "cpu_backup", "discard"):
             raise ValueError(f"Invalid weight memory policy: {policy}")
         self.policy = policy
         self.resident = True

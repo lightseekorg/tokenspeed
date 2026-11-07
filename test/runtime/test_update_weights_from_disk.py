@@ -36,6 +36,7 @@ import json
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -56,6 +57,7 @@ from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
+from tokenspeed.runtime.execution.types import PlannedForward  # noqa: E402
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod  # noqa: E402
 from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
     UnquantizedLinearMethod,
@@ -118,16 +120,43 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     return runner
 
 
+@dataclass
+class _DiskExecutor:
+    model_runner: ModelRunner
+    drafter: object | None
+    device: str
+
+    def complete_pending_drafting(self):
+        pass
+
+    def execute_idle_forward(self, dp_metadata):
+        model = self.model_runner.model
+        return torch.nn.functional.linear(torch.ones(1, 3), model.w, model.b)
+
+
 def _device_handle(runner, drafter=None) -> DeviceHandle:
-    handle = DeviceHandle.__new__(DeviceHandle)
-    # No drafter round is pending for ``settle`` to finish.
-    handle._executor = SimpleNamespace(
-        model_runner=runner, drafter=drafter, complete_pending_drafting=lambda: None
+    return DeviceHandle(
+        _DiskExecutor(model_runner=runner, drafter=drafter, device="cpu")
     )
-    handle._l2 = None
-    # No memory saver: weight loads skip the validity state.
-    handle._weight_memory = None
-    return handle
+
+
+def _require_blocked_forwards(handle, message):
+    with pytest.raises(RuntimeError, match=message):
+        handle.run_idle_forward(None)
+    planned = PlannedForward(
+        forward_op=None,
+        sampling_params_list=[],
+        dp_metadata=None,
+        grammar_inputs=None,
+        multimodal_context=None,
+        ngram_inputs=None,
+        request_history_seeds=None,
+        input_logprob_plan=None,
+        sampled_top_k=0,
+        stop_criteria=(),
+    )
+    with pytest.raises(RuntimeError, match=message):
+        handle.execute(None, planned, cache_ops=())
 
 
 class TestDeviceRouting:
@@ -162,6 +191,56 @@ class TestRealCheckpoint:
         return runner.update_weights_from_disk(
             UpdateWeightFromDiskReqInput(model_path=str(path), **kwargs)
         )
+
+    def test_partial_load_without_memory_saver_blocks_forwards_and_retry(self):
+        class FailingModel(_TinyModel):
+            def load_weights(self, weights):
+                weights = iter(weights)
+                super().load_weights([next(weights)])
+                raise RuntimeError("load interrupted")
+
+        _write_checkpoint(self.root / "step-0", scale=0.0)
+        updated = _write_checkpoint(self.root / "step-1", scale=7.0)
+        model = FailingModel()
+        handle = _device_handle(_runner(model, self.root / "step-0"))
+        req = UpdateWeightFromDiskReqInput(model_path=str(self.root / "step-1"))
+
+        ok, message = handle.update_weights(req)
+
+        assert not ok and "load interrupted" in message
+        assert len(model.seen) == 1
+        name = model.seen[0]
+        torch.testing.assert_close(dict(model.named_parameters())[name], updated[name])
+        _require_blocked_forwards(handle, "restart")
+        handle.commit_weight_update(False)
+        _require_blocked_forwards(handle, "restart")
+        ready, message = handle.check_weight_update(req)
+        assert not ready and "restart" in message
+        ok, message = handle.update_weights(req)
+        assert not ok and "restart" in message
+
+    @pytest.mark.parametrize("commit_success", [True, False])
+    def test_load_without_memory_saver_waits_for_replica_commit(self, commit_success):
+        _write_checkpoint(self.root / "step-0", scale=0.0)
+        updated = _write_checkpoint(self.root / "step-1", scale=7.0)
+        model = _TinyModel()
+        handle = _device_handle(_runner(model, self.root / "step-0"))
+        req = UpdateWeightFromDiskReqInput(model_path=str(self.root / "step-1"))
+
+        ok, message = handle.update_weights(req)
+
+        assert ok, message
+        torch.testing.assert_close(model.w, updated["w"])
+        torch.testing.assert_close(model.b, updated["b"])
+        _require_blocked_forwards(handle, "unavailable")
+        handle.commit_weight_update(commit_success)
+        ready, message = handle.check_weight_update(req)
+        assert ready is commit_success
+        if commit_success:
+            handle.run_idle_forward(None)
+        else:
+            assert "restart" in message
+            _require_blocked_forwards(handle, "restart")
 
     def test_weights_arrive_from_the_named_checkpoint(self):
         original = _write_checkpoint(self.root / "step-0", scale=1.0)
