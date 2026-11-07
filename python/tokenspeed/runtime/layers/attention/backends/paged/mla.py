@@ -289,7 +289,7 @@ class MLAAttnBackend(PagedAttentionBackend):
             "qk_rope_head_dim": self.qk_rope_head_dim,
             "page_size": self.kernel_page_size,
             "noncausal_block_size": 1,
-            "block_on_query_axis": False,
+            "block_on_query_axis": True,
             "logit_cap": False,
             "return_lse": True,
             "sliding_window": False,

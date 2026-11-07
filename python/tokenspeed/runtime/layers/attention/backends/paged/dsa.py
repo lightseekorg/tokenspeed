@@ -1595,7 +1595,7 @@ class DSABackend(PagedAttentionBackend):
         """Assemble one group's latent rows in position order.
 
         Returns a ``[pages * kernel_page_size, kv_cache_dim]`` view of the
-        gather workspace (valid until the next group's gather) whose leading
+        gather workspace (valid until the next gather into it) whose leading
         ``group.rows`` rows are the history: a whole number of kernel pages, so
         every ``dsa_prefill`` solution's view of a flat ``[slots, dim]`` cache
         holds, paged or not; the padding rows are never selected. A collective
@@ -1620,7 +1620,7 @@ class DSABackend(PagedAttentionBackend):
         FP8 bytes and ``[rows, groups]`` fp32 scales (``index_k_fp8`` /
         ``index_k_scale``); ``bf16`` gives ``[rows, index_head_dim]`` bf16 keys
         and ``None`` (``index_k_bf16``). Views of the gather workspace, valid
-        until the next group's gather. One collective over the page owners
+        until the next gather into it. One collective over the page owners
         moves the rows packed as bytes."""
         if self._history_workspace is None:
             raise RuntimeError("DSA history gather workspace is not allocated")
