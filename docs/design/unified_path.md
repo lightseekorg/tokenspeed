@@ -775,6 +775,58 @@ consumer rows carry no deferred post. Cache-only narrowing completes the incomin
 post before the global KV producer and skips new HC mixes; idle ranks still
 participate in expert-owned dispatch/combine, which never defers another reduction.
 
+### Drafter prefill graphs
+
+With `--enable-drafter-prefill-graph` the drafter's work inside an extend
+forward replays from graphs too. The drafter declares what it records
+(`BaseDrafter.extend_graph_plan`), and the capture and the CUDA-graph memory
+projection read that one plan: Eagle's step 0 per target token bucket at each
+exact request count of `--prefill-graph-capture-batch-sizes`
+(`prefill:drafter-step0`), and its decode steps per request count
+(`prefill:drafter-decode`). They are breakable graphs in one private pool,
+apart from the target's prefill and decode pools. Their static buffers (the
+target's hidden rows at the largest bucket) are allocated outside the
+measured windows, like the target graph's static outputs, so the utilization
+headroom funds them. A drafter's single prefill graph of its own
+(`captures_prefill_graph`, the `prefill:drafter` ladder) is a separate hook
+with its own contract.
+
+Step 0 is token-shaped up to the narrowing and one row per request after it,
+so its graph pads the rows to the bucket and bakes the request count. The
+sequence mixers stay at their breaks (the QSA indexer, `PagedAttention.attend`),
+and so do the drafter steps that publish backend state a later break reads:
+the accepted-prefix publication, and per decode step the top-k reset, the
+seq_lens advance and the write window (`run_eager`). Recorded into a segment
+they would pin per-forward host state to the capture's batch (the indexer
+backend's active metadata, the router's published window). Step 0's context
+is one fixed object per (bucket, requests); the replay stages its inputs into
+static buffers (the target's hidden rows with a zero tail, the gather rows,
+the frontier), and its outputs land in static buffers the decode steps read.
+The draft prologue writes K/V inside a captured segment, which holds no
+per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
+whole Host load, as the target's replay does. These captures run each segment
+as soon as it is captured (`run_segments_while_capturing`): their breaks index
+with values a segment computes (the top-k rows the narrowing gathers, the
+decode steps' positions), which a capture alone leaves unwritten when the
+break runs.
+
+A round replays only what the graphs baked: a pure extend (MIXED rounds run
+eager), no attention DP or query shard, a fitting bucket at the exact request
+count (a round over the largest bucket still replays the decode steps). Only a
+chain drafter on one rank, without a draft sampler, token history or a top-k
+carried across steps, over a draft model that declares
+`supports_breakable_draft_extend` (its draft backend also attends in the mode
+a break passes it), captures at all. `ServerArgs` refuses the switch for the
+launches its arguments rule out, and `ModelExecutor` for a boot whose plan is
+empty.
+
+A replay is not bit-identical to a serving-time eager round in general. The
+graphs keep the kernels startup dispatch chose for them, as the decode graphs
+do: small-M BF16 GEMMs route to FlashInfer only before serving
+(`compile_monitor.is_serving`). A padded replay also runs the token-shaped
+kernels at the bucket's row count, where a kernel may pick its implementation
+or tactic by row count, as the target's padded replays do.
+
 ### Prefill requests without generated outputs
 
 The original execution batch and cache metadata always contain every request.
