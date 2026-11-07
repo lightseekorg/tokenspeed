@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 
 PYPI = "https://pypi.org/simple"
@@ -51,6 +52,9 @@ CUDA13_UNSUFFIXED_PACKAGES = {
     "nvidia-cuda-runtime",
     "nvidia-cuda-nvrtc",
 }
+# cuDNN frontend requests the cu13 DSL extra even in a cu12 installation.
+# This leaf can coexist with cu12; keep the exception at the validated version.
+CUTLASS_DSL_CU13_VERSION = "4.8.0"
 CUDA_VERSIONED_PACKAGES = {"cuda-toolkit", "cuda-python", "cuda-bindings"}
 
 
@@ -86,24 +90,7 @@ def validate_environment(workspace: Path, cuda_home: Path) -> None:
                 f"Incomplete TokenSpeed checkout: missing {workspace / relative}"
             )
 
-    conflicts = []
-    for distribution in importlib.metadata.distributions():
-        name = re.sub(r"[-_.]+", "-", distribution.metadata.get("Name", "")).lower()
-        version = distribution.version
-        if (
-            (name.startswith("nvidia-") and name.endswith("-cu13"))
-            or name in CUDA13_UNSUFFIXED_PACKAGES
-            or (name in CUDA_VERSIONED_PACKAGES and re.match(r"^13(?:\.|$)", version))
-            or (name in {"torch", "torchvision"} and re.search(r"\+cu13[0-9]", version))
-        ):
-            conflicts.append(f"{name}=={version}")
-    if conflicts:
-        raise RuntimeError(
-            "CUDA 13 packages are already installed: "
-            + ", ".join(sorted(conflicts))
-            + ". Use a fresh Python 3.11 venv for cu129; this installer will not "
-            "uninstall or replace an existing CUDA 13 environment."
-        )
+    validate_cuda_distributions(importlib.metadata.distributions())
     nvcc = cuda_home / "bin" / "nvcc"
     try:
         result = subprocess.run(
@@ -120,6 +107,35 @@ def validate_environment(workspace: Path, cuda_home: Path) -> None:
     if match is None or tuple(map(int, match.groups())) != (12, 9):
         raise RuntimeError(
             f"CUDA_HOME must select CUDA Toolkit 12.9, got {result.stdout.strip()!r}"
+        )
+
+
+def validate_cuda_distributions(
+    distributions: Iterable[importlib.metadata.Distribution],
+) -> None:
+    """Reject CUDA 13 packages except the pinned CUTLASS DSL companion library."""
+    conflicts = []
+    for distribution in distributions:
+        name = re.sub(r"[-_.]+", "-", distribution.metadata.get("Name", "")).lower()
+        version = distribution.version
+        if (
+            name == "nvidia-cutlass-dsl-libs-cu13"
+            and version == CUTLASS_DSL_CU13_VERSION
+        ):
+            continue
+        if (
+            (name.startswith("nvidia-") and name.endswith("-cu13"))
+            or name in CUDA13_UNSUFFIXED_PACKAGES
+            or (name in CUDA_VERSIONED_PACKAGES and re.match(r"^13(?:\.|$)", version))
+            or (name in {"torch", "torchvision"} and re.search(r"\+cu13[0-9]", version))
+        ):
+            conflicts.append(f"{name}=={version}")
+    if conflicts:
+        raise RuntimeError(
+            "CUDA 13 packages are already installed: "
+            + ", ".join(sorted(conflicts))
+            + ". Use a fresh Python 3.11 venv for cu129; this installer will not "
+            "uninstall or replace an existing CUDA 13 environment."
         )
 
 
@@ -163,7 +179,7 @@ def main() -> None:
                     "cuda-python==12.9.7",
                     "cuda-bindings==12.9.7",
                     "tokenspeed-mooncake==0.3.13.post20261026",
-                    "nvidia-cutlass-dsl-libs-cu13<0",
+                    f"nvidia-cutlass-dsl-libs-cu13=={CUTLASS_DSL_CU13_VERSION}",
                     "nvidia-cublas<0",
                     "nvidia-cuda-runtime<0",
                     "nvidia-cuda-nvrtc<0",
