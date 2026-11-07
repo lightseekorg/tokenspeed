@@ -20,7 +20,10 @@
 
 #include <gtest/gtest.h>
 
+#include <bit>
 #include <cstdint>
+#include <limits>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -214,6 +217,59 @@ TEST(HashPrefixPageTest, FramingDisambiguatesTokensFromExtraKeys) {
 
     EXPECT_NE(HashPrefixPage(Tokens(short_toks), "", Keys(one_key)),
               HashPrefixPage(Tokens(long_toks), "", Keys(no_keys)));
+}
+
+// Serialize the framed bytes independently of the streaming implementation.
+TEST(HashPrefixPageTest, PreservesFramedBytesAndChainingAcrossTokenBatchBoundaries) {
+    std::mt19937 random(871923);
+    std::string prior;
+    for (const std::size_t length : {0u, 1u, 2u, 15u, 16u, 17u, 63u, 64u, 65u, 255u, 256u, 257u, 4096u}) {
+        std::vector<std::int32_t> tokens(length);
+        for (auto& token : tokens) {
+            token = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(random()));
+        }
+        if (length >= 3) {
+            tokens[0] = std::numeric_limits<std::int32_t>::min();
+            tokens[1] = std::numeric_limits<std::int32_t>::max();
+            tokens[2] = -1;
+        }
+        for (const auto& keys : std::vector<std::vector<std::string>>{{}, {""}, {std::string("a\0b", 3), "salt"}}) {
+            std::vector<unsigned char> bytes;
+            const auto append_u32 = [&](std::uint32_t value) {
+                for (unsigned shift = 0; shift < 32; shift += 8) {
+                    bytes.push_back(static_cast<unsigned char>(value >> shift));
+                }
+            };
+            const auto prior_bytes = HexToBytes(prior);
+            append_u32(static_cast<std::uint32_t>(prior_bytes.size()));
+            bytes.insert(bytes.end(), prior_bytes.begin(), prior_bytes.end());
+            append_u32(static_cast<std::uint32_t>(tokens.size()));
+            const auto token_begin = bytes.size();
+            for (const auto token : tokens) {
+                append_u32(static_cast<std::uint32_t>(token));
+            }
+            const auto token_end = bytes.size();
+            if (!keys.empty()) {
+                append_u32(static_cast<std::uint32_t>(keys.size()));
+                for (const auto& key : keys) {
+                    append_u32(static_cast<std::uint32_t>(key.size()));
+                    bytes.insert(bytes.end(), key.begin(), key.end());
+                }
+            }
+            unsigned char digest[SHA256_DIGEST_LENGTH];
+            SHA256(bytes.data(), bytes.size(), digest);
+            const auto expected = DigestToHex(digest);
+            EXPECT_EQ(HashPrefixPage(tokens, prior, keys), expected) << "token count " << length;
+            SHA256_CTX explicit_ctx;
+            SHA256_Init(&explicit_ctx);
+            SHA256_Update(&explicit_ctx, bytes.data(), token_begin);
+            Sha256UpdateTokensExplicitLE(explicit_ctx, tokens);
+            SHA256_Update(&explicit_ctx, bytes.data() + token_end, bytes.size() - token_end);
+            SHA256_Final(digest, &explicit_ctx);
+            EXPECT_EQ(DigestToHex(digest), expected) << "explicit encoding, token count " << length;
+            prior = expected;
+        }
+    }
 }
 
 // ---- ComputePrefixHashes (chaining) -------------------------------------
