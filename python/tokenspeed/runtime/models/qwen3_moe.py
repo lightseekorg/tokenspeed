@@ -22,8 +22,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-
 import torch
 
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
@@ -32,10 +30,10 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
+    MoECheckpointLoader,
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.qwen3 import (
     Qwen3DecoderLayer,
     Qwen3ForCausalLM,
@@ -196,30 +194,9 @@ class Qwen3MoeModel(Qwen3Model):
 class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
     model_cls = Qwen3MoeModel
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        ignore_suffixes = (
-            ".bias",
-            "_bias",
-            ".k_scale",
-            "_k_scale",
-            ".v_scale",
-            "_v_scale",
-            ".weight_scale",
-            "_weight_scale",
-            ".input_scale",
-            "_input_scale",
-        )
-
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        moe_loader = build_moe_checkpoint_loader(
-            params_dict=params_dict,
+    def get_expert_checkpoint_loader(self) -> MoECheckpointLoader:
+        return build_moe_checkpoint_loader(
+            params_dict=dict(self.named_parameters(remove_duplicate=False)),
             expert_schema=ExpertCheckpointSchema(
                 gate_proj_name="gate_proj",
                 down_proj_name="down_proj",
@@ -233,46 +210,6 @@ class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
         )
-
-        for name, loaded_weight in weights:
-            if "Embedding" in self.config.name_or_path:
-                name = add_prefix(name, "model")
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if "mlp.experts" in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(ignore_suffixes) and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name.endswith((".bias", "_bias")) and name not in params_dict:
-                    continue
-                if moe_loader.matches(name):
-                    moe_loader.load(name, loaded_weight)
-                    continue
-                if name.endswith(ignore_suffixes) and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
 
 
 EntryClass = Qwen3MoeForCausalLM
