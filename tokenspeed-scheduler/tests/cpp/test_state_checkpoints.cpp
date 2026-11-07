@@ -24,7 +24,7 @@
 // published at prompt end, finish and retraction only; hits resuming from
 // them; the two-blocks-per-request capacity; the retraction image of both
 // slots; and the dead prompt ends and finishes the in-forward checkpoint
-// skips.
+// skips, with the short prompt ends the P role may drop beside them.
 
 #include <gtest/gtest.h>
 
@@ -1659,6 +1659,360 @@ TEST_F(DropDeadCheckpointsAlignedSuite, NoAlignedCheckpointIsSkipped) {
         std::vector<std::int32_t> continued = tokens;
         continued.insert(continued.end(), {900, 901, 77});
         EXPECT_EQ(Probe("continued", continued).prefix_tokens, c.longer_resumes);
+    }
+}
+
+// drop_short_prompt_end_checkpoints on the P role, with the in-forward
+// checkpoint. Under the 8-token chunk budget a prompt of 8 tokens or fewer
+// has no pre-tail checkpoint to cover its end; with the flag its finish
+// publishes that end like a chunk end when it lies inside a page -- its full
+// pages, no tail and no state -- and marks no input superseded.
+class DropShortPromptEndsSuite : public StateCheckpointInForwardPrefillRoleSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointInForwardPrefillRoleSuite::MakeConfig();
+        cfg.drop_short_prompt_end_checkpoints = drop_;
+        cfg.device_allocator.total_pages = device_pages_;
+        cfg.host_allocator.total_pages = host_pages_;
+        cfg.disable_l2_cache = host_pages_ <= 1;
+        cfg.host_write_policy = write_policy_;
+        cfg.prefix_replay_tokens = replay_tokens_;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = device_pages_;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Rebuilds the scheduler with the flag as given and the suite's knobs.
+    void ResetWith(bool drop) {
+        drop_ = drop;
+        config_ = WithHostPackingFromDevice(MakeConfig());
+        scheduler_ = std::make_unique<Scheduler>(config_);
+    }
+
+    // Acknowledges the plan's Host loads; returns the rows they copy.
+    std::int32_t AckLoads(const ExecutionPlan& plan) {
+        std::int32_t rows = 0;
+        for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
+            const auto& load = std::get<LoadBackBatch>(operation);
+            for (std::size_t i = 0; i < load.op_ids.size(); ++i) {
+                rows += static_cast<std::int32_t>(load.src_pages[i].size());
+                SendLoadBackDone(load.op_ids[i]);
+            }
+        }
+        return rows;
+    }
+
+    // Prefills `id`, already submitted and bootstrapped, alone to its end,
+    // every copy acknowledged; returns where its first chunk resumed and adds
+    // the rows its Host loads copied to `load_rows`, when given.
+    std::int32_t Prefill(const std::string& id, std::int32_t prompt_tokens, std::int32_t* load_rows = nullptr) {
+        std::int32_t first_prefix = -1;
+        std::int32_t scheduled = 0;
+        for (int round = 0; scheduled < prompt_tokens && round < 32; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            const std::int32_t loaded = AckLoads(plan);
+            if (load_rows != nullptr) {
+                *load_rows += loaded;
+            }
+            AckWriteBacks(plan);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch == nullptr || batch->request_ids.empty()) {
+                continue;
+            }
+            EXPECT_EQ(batch->request_ids, std::vector<std::string>{id});
+            if (first_prefix < 0) {
+                first_prefix = batch->extend_prefix_lens.at(0);
+            }
+            scheduled = batch->extend_prefix_lens.at(0) + batch->input_lengths.at(0);
+            SendForwardDone(id,
+                            scheduled == prompt_tokens ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+        }
+        return first_prefix;
+    }
+
+    // The remote decode that hands `id` off, the PD ACK that finishes it, and
+    // the plan carrying the finish's stores.
+    void HandOff(const std::string& id) {
+        const ExecutionPlan handoff = PlanOnce();
+        EXPECT_TRUE(handoff.remote_decode.has_value());
+        AckWriteBacks(handoff);
+        SendPdSucceeded(id);
+        AckWriteBacks(PlanOnce());
+    }
+
+    // One whole P-role turn; returns where its first chunk resumed (and adds
+    // its Host load rows to `load_rows`, as Prefill does).
+    std::int32_t Turn(const std::string& id, const std::vector<std::int32_t>& tokens,
+                      std::int32_t* load_rows = nullptr) {
+        Submit(RequestWithTokens(id, tokens));
+        SendBootstrapped(id);
+        const std::int32_t resumed = Prefill(id, static_cast<std::int32_t>(tokens.size()), load_rows);
+        HandOff(id);
+        return resumed;
+    }
+
+    // `tokens` followed by `n` tokens from `first` on.
+    static std::vector<std::int32_t> Extend(std::vector<std::int32_t> tokens, std::int32_t first, std::int32_t n) {
+        for (std::int32_t i = 0; i < n; ++i) {
+            tokens.push_back(first + i);
+        }
+        return tokens;
+    }
+
+    bool drop_{false};
+    std::int32_t device_pages_{257};
+    std::int32_t host_pages_{257};
+    SchedulerConfig::HostWritePolicy write_policy_{SchedulerConfig::HostWritePolicy::kWriteThrough};
+    std::int32_t replay_tokens_{0};
+};
+
+// A 6-token prompt ends inside its second page. Without the flag its finish
+// publishes the tail [4, 6) and its state, and streams both to Host; with it
+// only the first page, so a longer prompt repeating the 6 tokens starts over.
+TEST_F(DropShortPromptEndsSuite, AShortPromptEndIsNotPublished) {
+    for (const bool drop : {false, true}) {
+        SCOPED_TRACE(drop);
+        ResetWith(drop);
+        EXPECT_EQ(Turn("short", MakeTokens(6)), 0);
+        EXPECT_EQ(scheduler_->TailEntries(), drop ? 0u : 1u);
+        EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), drop ? 1 : 1 + 1 + 3)
+            << "the page; or the page, the tail's KV block and three states";
+        EXPECT_EQ(Probe("longer", Extend(MakeTokens(6), 70, 4)).prefix_tokens, drop ? 0 : 6);
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks())
+            << "every block is cache-only or free";
+    }
+}
+
+// Nothing before the PD ACK depends on the drop: with the flag or without
+// it, the admission reserves no copy-in block for the prompt end, which no
+// first decode publishes on this role, and the remote decode that hands the
+// prompt off publishes no tail. Only the ACK's publication differs.
+TEST_F(DropShortPromptEndsSuite, OnlyThePdAckDecidesAShortPromptEnd) {
+    for (const bool drop : {false, true}) {
+        SCOPED_TRACE(drop);
+        ResetWith(drop);
+        Submit(RequestWithTokens("short", MakeTokens(6)));
+        SendBootstrapped("short");
+        const ExecutionPlan prefill = PlanOnce();
+        ASSERT_NE(FindForwardBatch(prefill), nullptr);
+        EXPECT_EQ(HeldOutsideTables(), 0) << "no copy-in block";
+        AckWriteBacks(prefill);
+        SendForwardDone("short", {900});
+        const ExecutionPlan handoff = PlanOnce();
+        ASSERT_TRUE(handoff.remote_decode.has_value());
+        EXPECT_EQ(scheduler_->TailEntries(), 0u) << "the hand-off publishes no tail";
+        EXPECT_EQ(HeldOutsideTables(), 0);
+        AckWriteBacks(handoff);
+        SendPdSucceeded("short");
+        AckWriteBacks(PlanOnce());
+        EXPECT_EQ(scheduler_->TailEntries(), drop ? 0u : 1u);
+    }
+}
+
+// The same under write-back, where nothing reaches the Host at publication,
+// on a Device of nine blocks: the 8-token contender's admission needs nine
+// and evicts the short prompt's cache. Without the flag that is a checkpoint
+// boundary -- the tail at 6 with its states, over the first page -- written
+// back whole, so a longer prompt still resumes at 6, from the Host. With it
+// the lone page has no checkpoint at or under it: it leaves as a dead entry,
+// never written back.
+TEST_F(DropShortPromptEndsSuite, UnderWriteBackADroppedShortPromptEndWritesNothingBack) {
+    device_pages_ = 10;
+    write_policy_ = SchedulerConfig::HostWritePolicy::kWriteBack;
+    for (const bool drop : {false, true}) {
+        SCOPED_TRACE(drop);
+        ResetWith(drop);
+        Turn("short", MakeTokens(6));
+        EXPECT_EQ(scheduler_->TailEntries(), drop ? 0u : 1u);
+        EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "nothing is stored at publication";
+        Turn("contender", MakeTokens(8, 9000));
+        const HostCacheStats stats = scheduler_->GetHostCacheStats();
+        EXPECT_EQ(stats.eviction_stores.blocks.at(0), drop ? 0u : 2u) << "the page and the tail's KV block";
+        for (std::size_t group = 1; group < 4; ++group) {
+            EXPECT_EQ(stats.eviction_stores.blocks.at(group), drop ? 0u : 1u) << "the tail's state";
+        }
+        EXPECT_EQ(stats.dead_entries_not_written_back, drop ? 1u : 0u) << "the lone page";
+        const Resume longer = Probe("longer", Extend(MakeTokens(6), 70, 1));
+        EXPECT_EQ(longer.prefix_tokens, drop ? 0 : 6);
+        EXPECT_EQ(longer.load_rows, drop ? 0 : 5) << "the page, the tail's KV block and three states";
+    }
+}
+
+// A page-aligned short prompt end is a chain boundary a longer prompt resumes
+// from: the 8-token prompt keeps its state at 8.
+TEST_F(DropShortPromptEndsSuite, AnAlignedShortPromptEndKeepsItsState) {
+    ResetWith(/*drop=*/true);
+    Turn("aligned", MakeTokens(8));
+    EXPECT_EQ(Probe("longer", Extend(MakeTokens(8), 70, 4)).prefix_tokens, 8);
+}
+
+// A prompt long enough for a pre-tail checkpoint is the dead-checkpoint
+// rule's alone: the 22-token prompt's end is covered by its checkpoint 20
+// either way, and a longer prompt resumes there.
+TEST_F(DropShortPromptEndsSuite, ALongPromptIsUnchanged) {
+    for (const bool drop : {false, true}) {
+        SCOPED_TRACE(drop);
+        ResetWith(drop);
+        Turn("long", MakeTokens(22));
+        EXPECT_EQ(scheduler_->TailEntries(), 0u);
+        EXPECT_EQ(Probe("longer", Extend(MakeTokens(22), 70, 4)).prefix_tokens, 20);
+    }
+}
+
+// A model without State groups keeps its short prompt ends with the flag:
+// its tails are resume points of their own, so a longer prompt resumes at
+// the 6-token prompt's end.
+class DropShortPromptEndsFullOnlySuite : public DropShortPromptEndsSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DropShortPromptEndsSuite::MakeConfig();
+        std::erase_if(cfg.cache_groups,
+                      [](const CacheGroupConfig& group) { return group.attn_kind == AttnKind::kState; });
+        return cfg;
+    }
+};
+
+TEST_F(DropShortPromptEndsFullOnlySuite, AModelWithoutStateGroupsKeepsItsShortPromptEnds) {
+    ResetWith(/*drop=*/true);
+    Turn("short", MakeTokens(6));
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+    Submit(RequestWithTokens("longer", Extend(MakeTokens(6), 70, 4)));
+    SendBootstrapped("longer");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{6}) << "resumes at the prompt end's tail";
+}
+
+// The superseded-input mark stands for a long turn. Under a 2-token replay
+// tail the 25-token t1 ends past the page its checkpoint 20 starts, so
+// nothing covers its end and it publishes its tail at 25. t2, t1 and three
+// more tokens, resumes at that tail -- past its own checkpoint 24, so its
+// page-aligned end 28 is published as ever -- and its finish marks the tail
+// superseded, with the flag or without it, under either Host write policy.
+// The contender's first chunk needs the room of one tail: the marked one
+// leaves, as t2's reclaim, and a prompt continuing t2 resumes at 28.
+TEST_F(DropShortPromptEndsSuite, ALongTurnStillSupersedesTheTailItResumedFrom) {
+    replay_tokens_ = 2;
+    device_pages_ = 23;
+    for (const auto policy :
+         {SchedulerConfig::HostWritePolicy::kWriteThrough, SchedulerConfig::HostWritePolicy::kWriteBack}) {
+        for (const bool drop : {false, true}) {
+            SCOPED_TRACE(testing::Message() << "policy " << static_cast<int>(policy) << ", drop " << drop);
+            write_policy_ = policy;
+            ResetWith(drop);
+            const std::vector<std::int32_t> t1 = MakeTokens(25);
+            EXPECT_EQ(Turn("t1", t1), 0);
+            EXPECT_EQ(scheduler_->TailEntries(), 1u) << "the uncovered prompt end at 25";
+            const std::vector<std::int32_t> t2 = Extend(t1, 100, 3);
+            EXPECT_EQ(Turn("t2", t2), 25);
+            EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks, 0u);
+            Turn("contender", MakeTokens(8, 9000));
+            EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks, 4u)
+                << "the tail at 25: its KV block and three states";
+            EXPECT_EQ(Probe("t2-next", Extend(t2, 200, 3)).prefix_tokens, 28);
+        }
+    }
+}
+
+// With the flag a short prompt resumes from a tail checkpoint on the Device
+// only where a junction cut published one: at a KV tail cached with no state,
+// here one L3 brings in without its state objects (another engine stored the
+// tail; the state reads fail). s1 finds the KV to 6 and no state there, so
+// its first chunk is cut at that junction, and the next chunk's admission
+// publishes the states there under the tail's hash; a junction publishes only
+// its state, so the tail's KV stays the Host's. s2 resumes at that tail, the
+// Device's states over the Host's KV. Without the flag s2 publishes its end
+// at 7 and marks the tail superseded; with it s2 drops that end, leaving no
+// state past 6, and marks nothing: the tail is still the deepest checkpoint
+// the next such prompt can resume at. The contender's admission needs room
+// on a Device of twelve blocks: a marked tail leaves first, as s2's reclaim;
+// an unmarked one is an admission victim like any other entry.
+class DropShortPromptEndsL3Suite : public DropShortPromptEndsSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DropShortPromptEndsSuite::MakeConfig();
+        cfg.enable_l3_storage = true;
+        cfg.storage_config = StorageConfig{16,
+                                           32,
+                                           cfg.host_allocator.total_pages - 1,
+                                           64,
+                                           32,
+                                           2,
+                                           100,
+                                           100,
+                                           StoragePressure{16, 1048576, 1000},
+                                           StoragePressure{8, 524288, 500}};
+        return cfg;
+    }
+
+    void Tick(std::int64_t now_us, bool allow_forward, bool allow_storage) {
+        ExecutionEvent tick;
+        tick.With(cache::StorageTick{now_us, allow_forward, allow_storage, StoragePressure{0, 0, 0}});
+        scheduler_->Advance(std::move(tick));
+    }
+    void StorageDone(std::uint64_t op_id, std::vector<std::uint8_t> success) {
+        ExecutionEvent done;
+        const std::size_t num_keys = success.size();
+        done.With(cache::StorageDone{op_id, std::move(success), true, std::vector<std::uint8_t>(num_keys, 0)});
+        scheduler_->Advance(std::move(done));
+    }
+    static std::vector<StorageOperation> StorageOps(const ExecutionPlan& plan) {
+        std::vector<StorageOperation> ops;
+        for (const auto& operation : plan.Operations()) {
+            if (const auto* cache = std::get_if<CacheOperation>(&operation)) {
+                if (const auto* storage = std::get_if<StorageOperation>(cache)) {
+                    ops.push_back(*storage);
+                }
+            }
+        }
+        return ops;
+    }
+};
+
+TEST_F(DropShortPromptEndsL3Suite, ADroppedShortPromptEndSupersedesNoInput) {
+    device_pages_ = 13;
+    for (const bool drop : {false, true}) {
+        SCOPED_TRACE(drop);
+        ResetWith(drop);
+        Submit(RequestWithTokens("s1", Extend(MakeTokens(6), 70, 1)));
+        SendBootstrapped("s1");
+        Tick(1, /*allow_forward=*/false, /*allow_storage=*/true);
+        const std::vector<StorageOperation> queries = StorageOps(PlanOnce());
+        ASSERT_EQ(queries.size(), 1u);
+        const auto& query = std::get<StorageQueryOperation>(queries.front());
+        StorageDone(query.op_id, std::vector<std::uint8_t>(query.keys.size(), 1));
+        const std::vector<StorageOperation> gets = StorageOps(PlanOnce());
+        ASSERT_EQ(gets.size(), 1u);
+        const auto& get = std::get<StorageGetOperation>(gets.front());
+        ASSERT_EQ(get.keys.size(), 5u) << "the page, the tail's KV block and three states";
+        std::vector<std::uint8_t> read;
+        for (const CacheKey& key : get.keys) {
+            read.push_back(key.group_id == 0 ? 1 : 0);  // the state objects fail
+        }
+        StorageDone(get.op_id, read);
+        Tick(2, /*allow_forward=*/true, /*allow_storage=*/false);
+        const ExecutionPlan first = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(first);
+        ASSERT_NE(batch, nullptr);
+        ASSERT_EQ(batch->extend_prefix_lens.at(0), 0) << "no state to resume at";
+        ASSERT_EQ(batch->input_lengths.at(0), 6) << "cut at the KV junction";
+        AckLoads(first);
+        AckWriteBacks(first);
+        SendForwardDone("s1");
+        EXPECT_EQ(Prefill("s1", 7), 6);
+        HandOff("s1");
+        ASSERT_EQ(scheduler_->TailEntries(), drop ? 1u : 2u) << "the junction at 6; s1's own end at 7 without the flag";
+
+        std::int32_t s2_load_rows = 0;
+        ASSERT_EQ(Turn("s2", Extend(MakeTokens(6), 80, 1), &s2_load_rows), 6) << "the tail at 6";
+        EXPECT_EQ(s2_load_rows, 1) << "the tail's KV block, from the Host";
+        Turn("contender", MakeTokens(8, 9000));
+        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        EXPECT_EQ(evictions.request_reclaim.blocks, drop ? 0u : 3u) << "the tail at 6: its three states";
+        EXPECT_GT(evictions.admission.blocks, 0u);
     }
 }
 
