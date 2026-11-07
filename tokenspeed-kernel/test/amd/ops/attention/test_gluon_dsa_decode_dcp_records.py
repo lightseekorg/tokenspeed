@@ -381,11 +381,11 @@ def test_decode_records_compile_once_across_tokens():
 
     # The rank stride follows the token count as a runtime argument; the
     # layout (the heads per rank, a model constant) is compiled, so each
-    # layout has one binary for every decode size.
+    # layout has one binary for every decode size. The token-major decode's
+    # reduce compiles once per split bucket, which serving warms at startup.
     run(64)
     with assert_no_triton_compile(
         gfx950_attention._dsa_dense_mfma_kv_kernel,
-        gfx950_attention._dsa_dense_mfma_reduce_kernel,
         gfx950_attention._dsa_dense_mfma_records_reduce_kernel,
     ):
         for tokens in (4, 16, 20, 48):
