@@ -1400,9 +1400,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         same window tensors. Other source windows retain eager coverage validation.
         Full scans device-visible history; Reindex scans shape-bounded candidates.
         Replicated-cache decode scores the caller's complete query batch;
-        owner-local history retains per-request windows. Prefill bounds query
-        tiles and score scratch. TP gathers Q/weight tiles once, not scores per
-        history tile.
+        owner-local history retains per-request windows. Canonical replicated-cache
+        prefill batches request windows into one index_topk call within the
+        index_logit_rows budget. TP gathers Q/weight once per call.
         """
         from tokenspeed_kernel.ops.attention import dsv41
 
@@ -1583,24 +1583,31 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             device=self.device,
         )
         block_lens = torch.empty(n, dtype=torch.int32, device=self.device)
-        # Query tiling bounds both score scratch and replicated table rows. Do
-        # not index_select the table for the entire prefill (T * context pages).
+        # Canonical replicated-cache prefill batches request windows so one
+        # index_topk call covers the index_logit_rows budget. KVP windows stay
+        # per request; other prefill windows use 256-row tiles and decode
+        # scores its whole batch.
         canonical_prefill = window is not None
         query_tile = 1024 if canonical_prefill else 256
         if forward_mode.is_decode():
             query_tile = max(1, n)
-        windows = (
-            [
+        if kvp_decode:
+            windows = [
                 (span.offset, span.offset + span.count, span)
                 for span in spans
                 if span.count
             ]
-            if canonical_prefill or kvp_decode
-            else [
+        elif canonical_prefill:
+            windows = [
+                (span.offset, span.offset + span.count, span)
+                for span in spans
+                if span.count
+            ]
+        else:
+            windows = [
                 (start, min(start + query_tile, n), None)
                 for start in range(0, n, query_tile)
             ]
-        )
         if query_shard is not None:
             # Keep the complete request list: even empty query owners must join
             # the same KVP history gathers, using the original history bounds.
@@ -1618,6 +1625,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 (*partition.local_bounds(start, stop), span)
                 for start, stop, span in windows
             ]
+        if canonical_prefill and self.kvp_size == 1:
+            windows = self._merge_index_windows(windows, ratio, reindex)
+        elif canonical_prefill and not reindex:
+            # KVP gathers one request's history per window; only a request whose
+            # own logits exceed one call is split.
+            windows = self._split_index_windows(windows, ratio)
         # Candidate-source Full passes still gather history for block maxima.
         # Ordinary Full and Reindex exchange only local row candidates.
         local_index_available = (
@@ -1630,9 +1643,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         )
         for start, stop, span in windows:
+            members = self._index_window_members(span)
+            window_history = (
+                max((item.prefix + item.count for item, _ in members), default=0)
+                if members
+                else (history_bound if span is None else span.prefix + span.count)
+            )
             selection_kind = self._index_selection_kind(
                 layer_id,
-                span.prefix + span.count if canonical_prefill else history_bound,
+                window_history if canonical_prefill else history_bound,
             )
             local_index = local_index_available and selection_kind != "all"
             scoring_cache = index_cache
@@ -1678,8 +1697,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     )[None, :]
                 tile_table = row.expand(stop - start, -1)
                 if kvp_decode:
-                    # Broadcast tables select dense scoring; decode/verify needs
-                    # paged Full and candidate-only sparse Reindex scoring.
+                    # Decode/verify needs paged Full and candidate-only sparse
+                    # Reindex scoring; prefill scores the request's history densely.
                     tile_table = tile_table.contiguous()
                 geometry = V41IndexGeometry(
                     scoring_positions,
@@ -1691,6 +1710,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                         tile_table,
                         visible,
                         scoring_requests[start:stop].to(torch.int32).contiguous(),
+                        history_rows=None if kvp_decode else (stop - start,),
                     ),
                 )
             else:
@@ -1752,7 +1772,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self.spec.index_topk,
                 candidate_capacity if produce_candidates else 0,
                 self.spec.candidate_block_size,
-                query_tile,
+                max(1, stop - start),
                 256,
                 index_process_group,
                 outputs,
@@ -2011,6 +2031,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._decode_schedule_keepalive.append(schedule)
         return schedule
 
+    @property
+    def supports_fused_attention(self) -> bool:
+        # FP8 output must follow the complete softmax, not a DCP partial.
+        return self.kvp_size == 1
+
     def forward_v41(
         self,
         q,
@@ -2028,13 +2053,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        fused_decode_groups: int | None,
         out_rope_cache=None,
         key_rows: QueryShardGather | None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Joint SWA/global attention; returns BF16 [T,Hlocal,512].
 
         The output is BEFORE inverse RoPE unless out_rope_cache (the inverse
         FP32 [positions,64] table) is given; then it is rotated with it.
+
+        With fused_decode_groups, q instead uses the prepared weight's unrotated
+        layout. Local decode returns grouped FP8 codes/scales after inverse RoPE,
+        for the matching prepared output projection. SWA uses the same RoPE table.
 
         q and swa_kv are [T,Hlocal,512] / [T,512]. q is post-RoPE; SWA can
         defer RMSNorm and RoPE using swa_norm_weight/eps and swa_rope_cache.
@@ -2052,6 +2082,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         are evaluated. Global selections and Reindex candidates remain query-local.
         """
         from tokenspeed_kernel.ops.attention import dsv41
+
+        if fused_decode_groups is not None and (
+            q.shape[1] not in (64, 128) or q.shape[1] != 8 * fused_decode_groups
+        ):
+            raise ValueError("Fused V4.1 output requires 8 heads per group")
+        if fused_decode_groups is not None and (
+            not forward_mode.is_decode()
+            or not self.supports_fused_attention
+            or swa_rope_cache is None
+            or out_rope_cache is not None
+        ):
+            raise ValueError(
+                "Fused V4.1 attention requires local decode with its RoPE table"
+            )
 
         source_positions, source_requests = positions, request_indices
         source_window = None
@@ -2148,11 +2192,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     swa_rope_cache=swa_rope_cache,
                     swa_norm_weight=swa_norm_weight,
                     swa_norm_eps=swa_norm_eps,
+                    fused_decode_groups=None,
                     out_rope_cache=out_rope_cache,
                     key_rows=None,
                 )
             return out
         if n == 0 and key_rows is None:
+            if fused_decode_groups is not None:
+                groups = fused_decode_groups
+                width = q.shape[1] * q.shape[2] // groups
+                return (
+                    q.new_empty((0, groups, width), dtype=torch.float8_e4m3fn),
+                    q.new_empty((0, groups, width // 128), dtype=torch.int32),
+                )
             return torch.empty_like(q)
         prepared = self._prepared_selections.pop(
             (layer_id, forward_mode, id(positions), id(request_indices)), None
@@ -2216,6 +2268,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 if canonical
                 else self.window_slots(V41_SWA_GROUP_ID, positions, request_indices)
             )
+            if fused_decode_groups is not None:
+                return dsv41.selected_attention_fp8(
+                    q,
+                    cache,
+                    swa_slots,
+                    swa_lens,
+                    global_cache,
+                    global_slots,
+                    global_lens,
+                    attn_sink,
+                    softmax_scale,
+                    positions,
+                    swa_rope_cache,
+                    fused_decode_groups,
+                    None,
+                    None,
+                )
             if self.kvp_size > 1 and owner >= 0:
                 # Indexer selections remain global; only KV reads are owner-local.
                 local_slots, local_counts, local_swa_lens = (
@@ -2534,6 +2603,98 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if not self._in_model_forward:
             self._index_geometry.clear()
 
+    @staticmethod
+    def _index_columns(span, ratio):
+        """Logits columns of a request's index call: its page-table width in rows."""
+        return max(1, ((span.prefix + span.count) // ratio + 63) // 64) * 64
+
+    def _split_index_windows(self, windows, ratio):
+        """Split a request window whose own logits exceed one index_topk call.
+
+        index_topk scores each window in one call, so every piece keeps
+        rows * columns BF16 logits within index_logit_rows. Empty and spanless
+        windows pass through unchanged.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        pieces = []
+        for start, stop, span in windows:
+            if span is None or start >= stop:
+                pieces.append((start, stop, span))
+                continue
+            limit = dsv41.index_logit_rows(self._index_columns(span, ratio))
+            pieces.extend(
+                (cursor, min(cursor + limit, stop), span)
+                for cursor in range(start, stop, limit)
+            )
+        return pieces
+
+    def _merge_index_windows(self, windows, ratio, reindex):
+        """Merge request windows, splitting a request whose own Q×K exceeds one call."""
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        active = [
+            (start, stop, span)
+            for start, stop, span in windows
+            if span is not None and start < stop
+        ]
+        if not active:
+            return windows
+        if reindex:
+            return [
+                (
+                    active[0][0],
+                    active[-1][1],
+                    tuple((item[2], item[1] - item[0]) for item in active),
+                )
+            ]
+        pieces = [
+            (start, stop, span, self._index_columns(span, ratio))
+            for start, stop, span in self._split_index_windows(active, ratio)
+        ]
+        merged = []
+        batch = []
+        rows = 0
+        max_k = 0
+
+        def flush():
+            nonlocal batch, rows, max_k
+            if not batch:
+                return
+            start = batch[0][0]
+            stop = batch[-1][1]
+            members = tuple((item[2], item[1] - item[0]) for item in batch)
+            merged.append((start, stop, members))
+            batch = []
+            rows = 0
+            max_k = 0
+
+        for start, stop, span, columns in pieces:
+            next_rows = rows + (stop - start)
+            next_k = max(max_k, columns)
+            if batch and next_rows > dsv41.index_logit_rows(next_k):
+                flush()
+                next_rows = stop - start
+                next_k = columns
+            batch.append((start, stop, span))
+            rows = next_rows
+            max_k = next_k
+        flush()
+        return merged
+
+    def _index_window_members(self, span):
+        """Normalize a window payload to ((request span, local rows), ...)."""
+        if span is None or isinstance(span, V41PrefillSpan):
+            return ()
+        if not isinstance(span, tuple) or not span:
+            return ()
+        first = span[0]
+        if isinstance(first, tuple) and len(first) == 2:
+            return span
+        if isinstance(first, V41PrefillSpan):
+            return tuple((item, item.count) for item in span)
+        return ()
+
     def _selection_geometry(
         self, positions, requests, source_table, table, ratio, start, stop, span, mode
     ):
@@ -2552,7 +2713,36 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         geometry = self._index_geometry.get(key)
         if geometry is None:
-            if span is not None:
+            # Prefill windows know which rows share a request history; the
+            # kernel scores those densely. Other windows (decode, arbitrary
+            # rows) carry None and score through the paged table.
+            history_rows = None
+            members = self._index_window_members(span)
+            if members:
+                visible = (
+                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
+                )
+                width = max(
+                    1,
+                    max((item.prefix + item.count) // ratio + 63 for item, _ in members)
+                    // 64,
+                )
+                parts = []
+                for item, local in members:
+                    row = table[item.request : item.request + 1, :width]
+                    row = row.masked_fill(row <= 0, -1)
+                    if local:
+                        parts.append((row, local))
+                history_rows = tuple(local for _, local in parts) or None
+                if not parts:
+                    tile_table = table[:0, :width]
+                elif len(parts) == 1:
+                    tile_table = parts[0][0].expand(parts[0][1], -1)
+                else:
+                    tile_table = torch.cat(
+                        [row.expand(local, -1) for row, local in parts], dim=0
+                    )
+            elif span is not None:
                 visible = (
                     ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
                 )
@@ -2560,6 +2750,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 row = table[span.request : span.request + 1, :width]
                 row = row.masked_fill(row <= 0, -1)
                 tile_table = row.expand(stop - start, -1)
+                history_rows = (stop - start,) if stop > start else None
             else:
                 tile_table, visible = dsv41.selection_table(
                     positions[start:stop], requests[start:stop], table, ratio
@@ -2590,6 +2781,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                             if ordered
                             else None
                         ),
+                        history_rows=history_rows,
                     )
                     if cacheable
                     else None

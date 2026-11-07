@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
+from tokenspeed_kernel.ops.attention.dsv41 import _metadata as dsv41_metadata
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -751,6 +752,7 @@ def _decode_compute(backend, inputs, bs):
                 swa_rope_cache=None,
                 swa_norm_weight=None,
                 swa_norm_eps=0.0,
+                fused_decode_groups=None,
                 key_rows=None,
             )
         )
@@ -1055,7 +1057,8 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         + queries * (512 * 2 + (128 + 512) * 4)
         + queries * 32 * (128 * 2 + 68)
         + queries * 24 * (512 + 128) * 12
-        + 576 * 68
+        # One packed index history per request in a batched prefill call.
+        + config.max_bs * 576 * 68
     )
     with pytest.raises(NotImplementedError, match="target attention"):
         DeepseekV41Config.generate(args, model, True)
@@ -1663,6 +1666,7 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        fused_decode_groups=None,
         key_rows=None,
     )
     record = backend.sparse_topk.prefill
@@ -1839,6 +1843,7 @@ def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None,
         )
 
@@ -1874,6 +1879,7 @@ def test_deferred_swa_norm_without_rope_cache_is_refused():
             swa_rope_cache=None,
             swa_norm_weight=torch.ones(512, dtype=torch.bfloat16),
             swa_norm_eps=1e-6,
+            fused_decode_groups=None,
             key_rows=None,
         )
 
@@ -1902,6 +1908,7 @@ def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        fused_decode_groups=None,
         key_rows=None,
     )
     backend.cache_pool.arena.buffer.zero_()
@@ -1926,6 +1933,7 @@ def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
                 swa_rope_cache=None,
                 swa_norm_weight=None,
                 swa_norm_eps=0.0,
+                fused_decode_groups=None,
                 key_rows=None,
             )
         )
@@ -1960,6 +1968,7 @@ def test_gpu_mixed_swa_matches_separate_extend_and_decode():
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None,
         )
 
@@ -2043,6 +2052,7 @@ def test_gpu_replayed_rows_attend_from_the_window_start_only():
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None,
         )
 
@@ -2169,6 +2179,7 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        fused_decode_groups=None,
         key_rows=None,
     )
     slots, lengths = captured[0][2:4]
@@ -2776,6 +2787,122 @@ def test_prefill_selection_skips_only_redundant_work(length):
     assert slots is record.physical_slots and lengths is record.lengths
 
 
+def test_canonical_prefill_batches_full_requests_into_one_index_topk():
+    backend = _backend("cpu", 4)
+    meta = _extend(backend, _tables("cpu"), [8, 8], [16, 16], [0, 0], [24, 24])
+    q = torch.zeros(16, 2, 128, dtype=torch.bfloat16)
+    weights = torch.ones(16, 2, dtype=torch.bfloat16)
+
+    def scored(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        candidates,
+        topk,
+        candidate_topk,
+        block_size,
+        query_chunk,
+        score_chunk,
+        group,
+        out,
+        solution,
+        index_metadata,
+    ):
+        for ids, counts, stride in ((out[0], out[1], 1), (out[2], out[3], 8)):
+            values = torch.arange(ids.shape[1]).expand_as(ids)
+            ids.copy_(values.masked_fill(values * stride >= visible[:, None], -1))
+            counts.copy_((ids >= 0).sum(dim=1))
+        return out
+
+    with patch.object(dsv41, "index_topk", side_effect=scored) as topk:
+        backend.select_global(
+            2,
+            q,
+            weights,
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.EXTEND,
+            None,
+            query_shard=None,
+        )
+    assert topk.call_count == 1
+    args, kwargs = topk.call_args
+    assert args[0].shape[0] == 16
+    query_chunk = kwargs.get("query_chunk_size", args[9] if len(args) > 9 else None)
+    assert query_chunk == 16
+
+
+def test_one_request_full_window_splits_when_logits_exceed_budget():
+    backend = _backend("cpu", 1)
+    # 12000 rows over ~1M history columns is ~24GB of BF16 logits.
+    span = V41PrefillSpan(0, 0, 2_000_000, 12_000, 0)
+    limit = dsv41.index_logit_rows(backend._index_columns(span, 2))
+    windows = backend._merge_index_windows([(0, 12_000, span)], ratio=2, reindex=False)
+    assert [w[1] - w[0] for w in windows] == [limit, limit, 12_000 - 2 * limit]
+    assert [w[0] for w in windows] == [0, limit, 2 * limit]
+    assert all(w[2] == ((span, w[1] - w[0]),) for w in windows)
+
+
+def test_split_index_windows_uses_page_table_columns(monkeypatch):
+    backend = _backend("cpu", 1)
+    # 1,000 history rows score against a 1,024-column page table: 300 rows
+    # fit this budget, while the unrounded history would admit 307.
+    monkeypatch.setattr(dsv41_metadata, "INDEX_LOGIT_BYTES", 300 * 1024 * 2)
+    span = V41PrefillSpan(0, 0, 0, 1000, 0)
+    empty = V41PrefillSpan(1, 1000, 0, 0, 0)
+    windows = [(0, 1000, span), (1000, 1000, empty), (1000, 1003, None)]
+    assert backend._split_index_windows(windows, 1) == [
+        (0, 300, span),
+        (300, 600, span),
+        (600, 900, span),
+        (900, 1000, span),
+        (1000, 1000, empty),
+        (1000, 1003, None),
+    ]
+
+
+def _index_scratch_recipe(**changes):
+    recipe = _recipe("cpu")
+    spec = recipe.attn_config.component(DeepseekV41Config)
+    recipe.attn_config = replace(
+        recipe.attn_config, components=(replace(spec, **changes),)
+    )
+    return recipe
+
+
+def test_index_scratch_charges_only_the_scorers_a_role_runs():
+    # 65,536 prefill rows over 512 columns: dense BF16 logits outgrow the
+    # portable TopK scratch, and only a role that prefills charges them with
+    # one packed history per request.
+    recipe = _index_scratch_recipe(max_query_tokens=65536)
+    workspace = {}
+    for role in ("null", "prefill", "decode"):
+        recipe.server_args.disaggregation_mode = role
+        workspace[role] = recipe.workspace_bytes()
+    dense = 65536 * 512 * 2
+    portable = 256 * 24 * (512 + 64) * 12
+    packed_histories = 2 * 512 * 68
+    assert workspace["prefill"] == workspace["null"]
+    assert workspace["null"] - workspace["decode"] == (
+        dense - portable + packed_histories
+    )
+
+
+def test_index_scratch_charges_candidate_scoring_only_with_reindex_layers():
+    # 2**20 candidate blocks make candidate-only scoring outgrow the portable
+    # scratch; a model whose index sources are its KV owners has no Reindex.
+    reindex = _index_scratch_recipe(candidate_topk=1 << 20)
+    owners = reindex.attn_config.component(DeepseekV41Config).kv_owners
+    no_reindex = _index_scratch_recipe(candidate_topk=1 << 20, index_sources=owners)
+    sparse = 514 * (1 << 20) * (8 * 2 + 2 * 4)
+    portable = 256 * 24 * (512 + 64) * 12
+    assert reindex.workspace_bytes() - no_reindex.workspace_bytes() == (
+        sparse - portable
+    )
+
+
 def test_free_query_window_does_not_inherit_canonical_prefill_length():
     backend = _backend("cpu", 2)
     tables = _tables("cpu")
@@ -3378,6 +3505,7 @@ def test_gpu_sharded_swa_preserves_output_and_cache(monkeypatch, case, fused_rop
             swa_rope_cache=rope,
             swa_norm_weight=norm,
             swa_norm_eps=1e-6 if fused_rope else 0.0,
+            fused_decode_groups=None,
             key_rows=key_rows,
         )
 
@@ -3538,6 +3666,7 @@ def test_gpu_model_qcp_preserves_global_selections(
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None if plan is None else QueryShardGather(plan, (0, 1, 2, 3)),
         )
 

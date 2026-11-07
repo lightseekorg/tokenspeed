@@ -336,6 +336,7 @@ class _Backend:
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        fused_decode_groups,
         out_rope_cache,
         key_rows=None,
     ):
