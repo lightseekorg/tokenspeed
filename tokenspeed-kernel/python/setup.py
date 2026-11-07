@@ -153,7 +153,7 @@ def _git_branch() -> str:
 
 
 def _nightly_version_suffix() -> str:
-    """The version suffix of a manual nightly build, or "".
+    """Return the version suffix of a manual nightly build, or an empty string.
 
     TOKENSPEED_KERNEL_VERSION_SUFFIX is free text that turns a manual nightly
     into a development release of that date's nightly, so it neither collides
