@@ -575,10 +575,14 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             // The peer's retained window lands as a sparse suffix behind the
             // hit: the first landed block is the one after the hit's last
             // block (a partial tail block is already the hitter's own fresh
-            // page), or the window's first block when that is later.
+            // page), or the window's first block when that is later. A
+            // full-history group's blocks up to the prompt end land whole
+            // and are not zeroed (GroupDemand::landed_tokens).
             for (std::size_t i = 0; i < demands.size(); ++i) {
                 const CacheGroupConfig& group = config_.cache_groups[i];
-                if (group.attn_kind == AttnKind::kSlidingWindow) {
+                if (group.attn_kind == AttnKind::kFull) {
+                    demands[i].landed_tokens = request->PrefillSize();
+                } else if (group.attn_kind == AttnKind::kSlidingWindow) {
                     const std::int32_t block_granularity =
                         coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
                     const std::int32_t hit_blocks = (hit_tokens + block_granularity - 1) / block_granularity;

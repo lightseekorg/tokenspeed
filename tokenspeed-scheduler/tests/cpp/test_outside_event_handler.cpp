@@ -1029,9 +1029,12 @@ TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivat
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(6)), 1) << "the landing's own block";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(4)), 0) << "a copy destination is never zeroed";
     const auto full = destination->BlockTables().at("full").at(0);
-    ASSERT_GE(full.size(), 3u);  // the prompt, the decode slot and the D's admission headroom
+    ASSERT_GE(full.size(), 4u);  // the prompt, the decode slot and the D's admission headroom
     EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "the full group's only tail block is the partial one";
-    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(2)), 1);
+    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(2)), 0)
+        << "the block containing token 11 ends inside the prompt: the peer fills it whole";
+    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(3)), 1)
+        << "the block holding the prompt end is partial";
     SendRemotePrefillDone("r2", /*bootstrap_token=*/79);
     const ExecutionPlan decode_plan = PlanOnce();
     const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
@@ -1177,9 +1180,11 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     ASSERT_EQ(state.size(), 2u);
     EXPECT_EQ(state[0], 0);
     EXPECT_GT(state[1], 0);
+    // The peer fills the four prompt pages and the state's slot 1 whole:
+    // only the decode reserve page is zeroed.
     ASSERT_EQ(plan.pages_to_zero.size(), 2u);
-    EXPECT_EQ(plan.pages_to_zero.at("full"), full);
-    EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[1]}));
+    EXPECT_EQ(plan.pages_to_zero.at("full"), (std::vector<std::int32_t>{full.at(4)}));
+    EXPECT_TRUE(plan.pages_to_zero.at("state").empty());
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
     EXPECT_TRUE(scheduler_->PdTransferPinned("r0"));
 
@@ -1273,8 +1278,10 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     EXPECT_TRUE(plan2.pages_to_copy.at("full").empty()) << "the hit's only tail block is the partial one";
     const auto full2 = destination2->BlockTables().at("full").at(0);
     ASSERT_EQ(full2.size(), 6u);  // five prompt pages and the decode reserve
-    EXPECT_EQ(std::ranges::count(plan2.pages_to_zero.at("full"), full2.at(4)), 1)
-        << "the block containing token 9 is a fresh page";
+    EXPECT_EQ(std::ranges::count(plan2.pages_to_zero.at("full"), full2.at(4)), 0)
+        << "the block containing token 9 is a fresh page the peer fills whole";
+    EXPECT_EQ(plan2.pages_to_zero.at("full"), (std::vector<std::int32_t>{full2.at(5)}))
+        << "only the decode reserve page is zeroed";
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, ExactStateHitCanFinishWithoutADecodeForward) {
