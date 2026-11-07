@@ -402,10 +402,22 @@ masked state writer (`store_state_rows`) drops its result, and the padded
 output rows are zeroed by a device-side bound the capture cannot freeze. The
 live tokens keep the packing of the unpadded forward, so a capture of any
 request count matches eager bit for bit; nothing about padding reaches the
-cache or the scheduler. A forward that writes an in-forward State checkpoint
-keeps its live metadata instead (`prepare_prefill_metadata` returns False):
-the capacity layout carries no checkpoint, so the layer runs at its eager
-break of the ordinary prefill graph.
+cache or the scheduler. On a server that writes in-forward State checkpoints
+(`ServerArgs.writes_state_checkpoints_in_forward`, which `GdnAttnBackend`
+takes at construction), the GDN layers of a forward that writes one stay
+captured too. Their capacity metadata keeps one fixed checkpoint slot per
+request slot, and the captured scan stores a state at every multiple of the
+bound pool's prefix granularity, which divides every checkpoint offset, into
+a float32 scratch that all captured shapes share (`CapacityCheckpointLayout`).
+Before each use the refresh rewrites in place each sequence's state count and
+each live checkpoint's scratch row, token index and block; an unused slot
+keeps an in-range token index and block `-1`, which the masked writers of the
+conv window and the recurrent state skip. The checkpoint block thus receives
+the state the scan computes at its boundary, as in an eager forward. A
+capacity layout without these slots keeps such a forward on its live metadata
+(`prepare_prefill_metadata` returns False), so the layer runs at its eager
+break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
+checkpoint windows at its eager break, over live metadata.
 
 PD moves exactly one block per state group: `latest_snapshot` is slot 1 of
 the prefill's final state, landing in the decode's slot 1 (its slot 0 stays
