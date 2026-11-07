@@ -144,7 +144,8 @@ class QueryShardHistoryGroup:
             returns rows in that numbering.
         rows: History rows of the group.
         local_query: This rank's query rows that belong to the group, as a
-            slice of the rank's shard rows.
+            slice of the rank's shard rows (a rank's rows are in request
+            order, so a request range is one run of them).
         gather: How the group's rows split over the page owners.
     """
 
@@ -1155,7 +1156,7 @@ class DSABackend(PagedAttentionBackend):
         )
         cap = self._history_workspace.rows
         groups: list[QueryShardHistoryGroup] = []
-        query_start = 0
+        local_start = 0
         row_base = 0
         first = 0
         while first < num_extends:
@@ -1170,11 +1171,7 @@ class DSABackend(PagedAttentionBackend):
                 last += 1
                 rows += history_lens[last]
             requests = slice(first, last + 1)
-            query_rows = sum(extend_lens[requests])
-            local_lo = min(max(query_start, plan.local_start), plan.local_end)
-            local_hi = min(
-                max(query_start + query_rows, plan.local_start), plan.local_end
-            )
+            local_rows = sum(plan.local_rows_per_request[requests])
             virtual_slots = build_prefill_kv_workspace_slots(
                 page_table=page_table[requests],
                 seq_lens=seq_lens[requests],
@@ -1193,13 +1190,11 @@ class DSABackend(PagedAttentionBackend):
                     requests=requests,
                     row_base=row_base,
                     rows=rows,
-                    local_query=slice(
-                        local_lo - plan.local_start, local_hi - plan.local_start
-                    ),
+                    local_query=slice(local_start, local_start + local_rows),
                     gather=gather,
                 )
             )
-            query_start += query_rows
+            local_start += local_rows
             row_base += rows
             first = last + 1
         return DSAQueryShardMetadata(plan=plan, groups=tuple(groups))
