@@ -42,8 +42,9 @@ class ModelProfile:
     A registered model class exposes ``model_profile(hf_config)`` as a
     classmethod returning one of these. ``ModelConfig`` resolves it once, and
     every resolver that would otherwise match the architecture name against a
-    table reads the profile instead. Every field is explicit: a profile that
-    omits a fact is a construction error, never a silent fallback.
+    table reads the profile instead. Required facts are explicit. Optional
+    history lookback defaults to the complete history, preserving readers
+    that declare no bound.
 
     Attributes:
         configure_attention: Writes the attention geometry onto the
@@ -61,6 +62,11 @@ class ModelProfile:
             names none, or None to keep the architecture default.
         request_token_history: Whether the model reads each request's
             committed token history (``ForwardContext.request_token_history``).
+        request_token_history_lookback: Committed tokens behind the write
+            frontier the model reads (an n-gram hash reads its order minus
+            one), so a resuming extend seeds only that tail of its prefix.
+            Omitting it (None) preserves the complete history. Zero means the
+            model reads no committed tokens behind the frontier.
         is_multimodal: Whether this checkpoint has an active-capable media encoder.
         tokenizer_kwargs: Extra keyword arguments for the model's tokenizer.
         attention_instances_per_layer: Attention modules per decoder layer:
@@ -95,6 +101,7 @@ class ModelProfile:
     create_attention_config: (
         Callable[[ServerArgs, ModelConfig, bool], AttnConfig] | None
     )
+    request_token_history_lookback: int | None = None
 
     def __post_init__(self) -> None:
         if self.create_attention_config is not None and not callable(
@@ -102,6 +109,15 @@ class ModelProfile:
         ):
             raise TypeError(
                 "ModelProfile.create_attention_config must be callable or None"
+            )
+        if self.request_token_history_lookback is not None and (
+            not self.request_token_history
+            or type(self.request_token_history_lookback) is not int
+            or self.request_token_history_lookback < 0
+        ):
+            raise ValueError(
+                "ModelProfile.request_token_history_lookback needs a model that "
+                "reads request token history and a non-negative integer count"
             )
         if not self.cache_family:
             raise ValueError("ModelProfile.cache_family must name a cache family")
@@ -127,4 +143,22 @@ class ModelProfile:
         )
 
 
-__all__ = ["ModelProfile"]
+def resolve_history_seed_lookback(*profiles: ModelProfile | None) -> int | None:
+    """Bound seeds for all history readers, including the draft model.
+
+    Unprofiled models and profiles that read no history add no requirement.
+    Any reader without a declared bound requires the complete prefix;
+    otherwise the largest lookback covers every reader. No readers returns
+    None, with history allocation and seeding still disabled by the caller.
+    """
+    lookbacks = [
+        profile.request_token_history_lookback
+        for profile in profiles
+        if profile is not None and profile.request_token_history
+    ]
+    if not lookbacks or any(value is None for value in lookbacks):
+        return None
+    return max(value for value in lookbacks if value is not None)
+
+
+__all__ = ["ModelProfile", "resolve_history_seed_lookback"]
