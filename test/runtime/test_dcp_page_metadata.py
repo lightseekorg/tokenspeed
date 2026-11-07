@@ -532,6 +532,42 @@ def test_write_slots_resolve_once_per_forward_and_slots(monkeypatch):
     assert unsharded[0] is loc and unsharded[1] is None
 
 
+def test_write_slots_reuse_only_within_one_capture_state(monkeypatch):
+    """A graph capture resolves the forward's slots itself rather than reusing
+    an eager resolution, and an eager write never reuses the capture's."""
+    from types import SimpleNamespace
+
+    import tokenspeed.runtime.layers.attention.dcp.placement as placement_mod
+
+    resolved = []
+
+    def counting(loc, placement):
+        resolved.append(loc.clone())
+        return resolve_cache_slots(loc, placement)
+
+    capturing = [False]
+    monkeypatch.setattr(placement_mod, "resolve_cache_slots", counting)
+    monkeypatch.setattr(
+        placement_mod, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    monkeypatch.setattr(
+        placement_mod.torch.cuda, "is_current_stream_capturing", lambda: capturing[0]
+    )
+    placement = CachePlacement(128, 9, (0, 1, 2, 3), 2)
+    share = SimpleNamespace(write_slots=[])
+    loc = torch.arange(200, 264, dtype=torch.int64) * 7
+
+    eager = placement_mod.resolve_write_slots(loc, placement, share)
+    capturing[0] = True
+    captured = placement_mod.resolve_write_slots(loc, placement, share)
+    assert len(resolved) == 2 and captured[0] is not eager[0]
+    again = placement_mod.resolve_write_slots(loc, placement, share)
+    assert again[0] is captured[0] and len(resolved) == 2
+    capturing[0] = False
+    after = placement_mod.resolve_write_slots(loc, placement, share)
+    assert after[0] is eager[0] and len(resolved) == 2
+
+
 def test_write_slots_resolve_at_every_write_off_amd(monkeypatch):
     """Off AMD every layer's write resolves its own slots."""
     from types import SimpleNamespace
