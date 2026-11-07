@@ -397,7 +397,11 @@ library compiles once per batch shape with no key to bucket -- FlashInfer's
 joint BF16 GEMM and the ll_bf16 router's dot-product kernel compile once per
 exact row count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
-compiles instead of compiling on the forward thread.
+compiles instead of compiling on the forward thread. The pinned FlashInfer
+TGV tiles for BF16 decode GEMMs on small weights run only before it too,
+though they compile once per tile, not per shape: their route was measured
+only inside captured graphs, so eager calls after the mark keep cuBLASLt
+(`tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/README.md`).
 
 A full garbage collection is a stall of the same kind, for every Python
 thread of the process at once. Startup leaves millions of long-lived Python
