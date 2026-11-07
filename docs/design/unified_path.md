@@ -445,7 +445,7 @@ chain: the target's rows at step 0, one row per request after; multi-depth
 MTP: the target's rows at every depth; block drafters: one forward). The
 executor never derives a drafter's step count or shape itself.
 
-Padding rows still route through the MoE layers, and under attention DP every
+Padding rows still pass through the MoE layers, and under attention DP every
 rank's filler is interleaved with the real rows in the all-gathered MoE
 input. The expert load counters (`--expert-distribution-recorder-mode stat`)
 therefore read a device-side live-row mask (`ExpertLoadRowMask`, one
@@ -454,6 +454,27 @@ owners mark from the host's padded/live counts before a padded replay — the
 decode graph in `ForwardStepRunner`, the bucket in `PrefillGraph.replay` —
 and clear right after it, on the same stream. Eager forwards are unpadded
 and read the all-True mask; the router counts a route if and only if its row is marked.
+
+DeepGEMM MegaMoE also routes no experts for the filler rows of a padded
+decode replay. `ForwardStepRunner` writes the replay's live and padded
+request counts into one int32 device pair (`mega_moe_live_requests`) that
+every MegaMoE input staging reads, and writes (1, 1) back right after the
+replay, on the same stream, also when the replay raises. Staging gives each
+row at or past `num_tokens * live // padded` expert id -1 and weight 0, which
+MegaMoE skips in dispatch and combine; a filler row's MoE output is then
+zero, or the fused shared expert's alone. Eager forwards and prefill-graph
+buckets see (1, 1) and route every row.
+
+The pair counts requests, not rows, so one pair serves the replay's forwards
+of different rows per request, such as the DeepSeek V4.1 target's rows and
+its DSpark drafter's block rows, where a row mask would need one per row
+count. The share is right only when each rank's MegaMoE input is its
+attention-DP group's whole padded batch: request-major, the same number of
+rows per request, the filler requests last. Attention TP 1 and rows
+replicated over attention TP (attention TP == MoE TPxEP), the only layouts
+DeepSeek V4.1 admits with MegaMoE, give that. A reduce-scatter shard
+(`moe_input_row_segments`) holds its group's live rows unevenly, so a model
+that runs DeepGEMM MegaMoE in a decode graph must stage whole batches.
 
 ### Pointer-stable per-bs views from one builder
 
@@ -1328,8 +1349,10 @@ Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the
 DFLASH sentinel req-pool rows, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
-`graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify,
-output-buffer re-slicing, the `ctx.bs` save/restore, and the replay itself
+`graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify, the
+filler-row marks around a padded replay (the expert load row mask and
+MegaMoE's live-request counts), output-buffer re-slicing, the `ctx.bs`
+save/restore, and the replay itself
 through the drafter (`replay_decode_graph`: EAGLE-Harness replays it on its
 round stream and launches its device-chained round behind it).
 
