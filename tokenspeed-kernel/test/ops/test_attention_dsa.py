@@ -286,16 +286,19 @@ def test_dsa_plan_returns_none_without_kernel(device: str) -> None:
     assert dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64, solution="missing") is None
 
 
-def test_dsa_workspace_topk_to_global_slots(device: str) -> None:
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+def test_dsa_workspace_topk_to_global_slots(
+    device: str, slot_dtype: torch.dtype
+) -> None:
     workspace_indices = torch.tensor(
         [[2, -1, 0], [1, 3, -1]],
         device=device,
         dtype=torch.int32,
     )
     kv_workspace_slots = torch.tensor(
-        [10, 20, 30, 40],
+        [10, 20, 2**31 - 2, 40],
         device=device,
-        dtype=torch.int64,
+        dtype=slot_dtype,
     )
     out = torch.empty_like(workspace_indices)
 
@@ -306,7 +309,7 @@ def test_dsa_workspace_topk_to_global_slots(device: str) -> None:
     )
 
     expected = torch.tensor(
-        [[30, -1, 10], [20, 40, -1]],
+        [[2**31 - 2, -1, 10], [20, 40, -1]],
         device=device,
         dtype=torch.int32,
     )

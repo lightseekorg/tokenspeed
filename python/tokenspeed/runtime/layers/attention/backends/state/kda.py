@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
+from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
 from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
@@ -717,7 +718,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
             The gate, or None when the model supplied neither form.
         """
         if g_raw is None and f_a_out is not None:
-            return torch.nn.functional.linear(f_a_out, f_b_weight)
+            gate = _try_gluon_largem_gfx1250(f_a_out, f_b_weight)
+            if gate is None:
+                gate = torch.nn.functional.linear(f_a_out, f_b_weight)
+            return gate
         else:
             return g_raw
 

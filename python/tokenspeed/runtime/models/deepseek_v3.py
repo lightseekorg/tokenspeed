@@ -40,7 +40,12 @@ from tokenspeed_kernel.ops.attention.mla import (
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
-from tokenspeed_kernel.ops.gemm import bmm, mm, plan_dense_gemm
+from tokenspeed_kernel.ops.gemm import (
+    _try_gluon_largem_gfx1250,
+    bmm,
+    mm,
+    plan_dense_gemm,
+)
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.platform import current_platform
@@ -349,7 +354,9 @@ class MoEGate(nn.Module):
                 out_dtype=torch.float32,
             )
         elif _platform.is_amd:
-            logits = mm(hidden_states, self.weight)
+            logits = _try_gluon_largem_gfx1250(hidden_states, self.weight)
+            if logits is None:
+                logits = mm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
         return logits

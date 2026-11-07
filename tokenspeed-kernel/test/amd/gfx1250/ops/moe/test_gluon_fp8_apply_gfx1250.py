@@ -186,6 +186,50 @@ def test_gluon_fp8_moe_gfx1250_matches_torch(
     torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.01)
 
 
+def test_gluon_fp8_moe_gfx1250_sorted_rows_match_torch(monkeypatch) -> None:
+    from tokenspeed_kernel.ops.moe import gluon
+
+    # Enough experts that gate/up keeps its regime tiles instead of the
+    # few-programs ones, and over 64 routes per expert for 128-row tiles.
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_experts = 4 * num_sms // (_INTERMEDIATE // 16) + 1
+    top_k = 8
+    num_tokens = 65 * num_experts // top_k + 1
+    generator = torch.Generator(device="cuda").manual_seed(64)
+    x = torch.randn(
+        num_tokens, _HIDDEN, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    weights, w13_dequant, w2_dequant = _experts(num_experts, generator)
+    topk_ids = _topk_ids(num_tokens, num_experts, top_k, generator)
+    topk_ids[0, 1] = -1
+    topk_weights = torch.rand(
+        num_tokens, top_k, device="cuda", dtype=torch.float32, generator=generator
+    )
+    sorted_rows = []
+    launch_experts = gluon.launch_gluon_fp8_block_experts_gfx1250
+
+    def launch(*args, **kwargs):
+        sorted_rows.append(launch_experts(*args, **kwargs))
+        return sorted_rows[-1]
+
+    plan = _plan("silu", None)
+    moe_process_weights(plan, weights)
+    with monkeypatch.context() as patch:
+        patch.setattr(gluon, "launch_gluon_fp8_block_experts_gfx1250", launch)
+        actual = moe_apply(
+            plan,
+            x,
+            weights,
+            torch.empty((num_tokens, num_experts), device="cuda"),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+
+    assert sorted_rows == [True]
+    expected = _reference(x, w13_dequant, w2_dequant, topk_ids, topk_weights, None)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.01)
+
+
 def test_gluon_fp8_moe_gfx1250_ep_filters_nonlocal_routes() -> None:
     from tokenspeed_kernel.ops.moe.gluon import (
         gluon_fp8_block_precomputed_moe_apply_gfx1250,
@@ -262,7 +306,12 @@ def test_gluon_fp8_moe_gfx1250_token_count() -> None:
         routes = tokens * top_k
         counts = (tokens, routes)
         # Routing and combine still key on the token and route counts.
-        return (*map(int_specialization_class, counts), tile(tokens), routes <= 128)
+        return (
+            *map(int_specialization_class, counts),
+            tile(tokens),
+            routes <= 128,
+            routes <= 1024,
+        )
 
     # Tokens are independent: a shorter batch is a prefix of the longest one
     # that uses the same tiles.

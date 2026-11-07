@@ -2495,8 +2495,10 @@ def _try_gluon_largem_gfx1250(
 ) -> torch.Tensor | None:
     """Run the CDNA5 large-M kernel, or return None when the call is ineligible.
 
-    Named K3 APIs and BF16 ``UnquantizedLinearMethod`` layers use this instead
-    of registering the kernel on generic ``mm()``.
+    Named K3 APIs, BF16 ``UnquantizedLinearMethod`` layers, and BF16 prefill
+    projections that call ``F.linear`` directly use this instead of
+    registering the kernel on generic ``mm()``. The activation may be a column
+    slice of a wider tensor whose rows start on 16-byte boundaries.
     """
 
     if (
@@ -2508,7 +2510,11 @@ def _try_gluon_largem_gfx1250(
         or not activation.is_cuda
         or not weight.is_cuda
         or weight.device != activation.device
-        or not activation.is_contiguous()
+        or activation.stride(1) != 1
+        or (
+            not activation.is_contiguous()
+            and (activation.stride(0) % 8 or activation.data_ptr() % 16)
+        )
         or not weight.is_contiguous()
         or (
             out is not None
@@ -2684,7 +2690,7 @@ def kimi3_latent_projection(
         ):
             raise ValueError(
                 "Kimi K3 gfx1250 Gluon projection requires a contiguous BF16 "
-                "K3 shape with M >= 512"
+                "shape and row count selected for it"
             )
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
             gluon_mm_a16w16_largem_gfx1250,
@@ -2712,7 +2718,7 @@ def kimi3_mla_qkv_gate_projection(
     """Project K3 MLA QKV-a and gate rows with an architecture-selected schedule.
 
     ``packed`` is populated when communication should retain the fused row
-    layout. The split CDNA4 prefill schedule returns independent QKV and gate
+    layout. The split prefill schedule returns independent QKV and gate
     tensors so callers can communicate only the QKV rows.
     """
 
@@ -2750,29 +2756,10 @@ def kimi3_mla_qkv_gate_projection(
             and hidden_states.is_contiguous()
             and weight.is_contiguous()
         )
-        gfx1250_largem = (
-            Platform.get().is_cdna5
-            and hidden_states.is_cuda
-            and weight.is_cuda
-            and hidden_states.dtype == torch.bfloat16
-            and weight.dtype == torch.bfloat16
-            and hidden_states.is_contiguous()
-            and weight.is_contiguous()
-            and use_gluon_largem_gfx1250(m, hidden_states.shape[1], qkv_width)
-            and use_gluon_largem_gfx1250(
-                m,
-                hidden_states.shape[1],
-                output_width - qkv_width,
-            )
-        )
         solution = (
             "gluon_wmma_gfx1250"
             if gfx1250_tdm
-            else (
-                "gluon_largem_gfx1250"
-                if gfx1250_largem
-                else ("fused" if m <= 32 or _use_mv(hidden_states, weight) else "split")
-            )
+            else ("fused" if m <= 32 or _use_mv(hidden_states, weight) else "split")
         )
 
     if solution == "gluon_wmma_gfx1250":
@@ -2823,7 +2810,7 @@ def kimi3_mla_qkv_gate_projection(
         ):
             raise ValueError(
                 "Kimi K3 gfx1250 MLA Gluon projection requires contiguous "
-                "BF16 K3 QKV/gate shapes with M >= 512"
+                "BF16 QKV/gate shapes and a row count selected for both"
             )
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
             gluon_mm_a16w16_largem_gfx1250,
@@ -2839,15 +2826,21 @@ def kimi3_mla_qkv_gate_projection(
         )
         return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=None)
 
-    qkv_weight = weight[:qkv_width]
-    gate_weight = weight[qkv_width:]
-    qkv = _try_gluon_largem_gfx950(hidden_states, qkv_weight) if routed else None
-    if qkv is None:
-        qkv = torch.nn.functional.linear(hidden_states, qkv_weight)
-    gate = _try_gluon_largem_gfx950(hidden_states, gate_weight) if routed else None
-    if gate is None:
-        gate = torch.nn.functional.linear(hidden_states, gate_weight)
-    return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=None)
+    def project(part: torch.Tensor) -> torch.Tensor:
+        output = None
+        if routed:
+            output = _try_gluon_largem_gfx950(hidden_states, part)
+            if output is None:
+                output = _try_gluon_largem_gfx1250(hidden_states, part)
+        if output is None:
+            output = torch.nn.functional.linear(hidden_states, part)
+        return output
+
+    return Kimi3MLAQKVGateProjection(
+        qkv=project(weight[:qkv_width]),
+        gate=project(weight[qkv_width:]),
+        packed=None,
+    )
 
 
 def kimi3_mla_gate_projection(
@@ -3442,7 +3435,7 @@ def kimi3_shared_down_projection(
         ):
             raise ValueError(
                 "Kimi K3 gfx1250 shared down projection requires a contiguous "
-                "BF16 K3 shape with M >= 512"
+                "BF16 shape and row count selected for it"
             )
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
             gluon_mm_a16w16_largem_gfx1250,
@@ -3664,7 +3657,7 @@ def kimi3_qkvfab_projection(
         ):
             raise ValueError(
                 "Kimi K3 gfx1250 QKVFAB Gluon projection requires contiguous "
-                "BF16 [M,7168] input and [6288,7168] weight with M >= 512"
+                "BF16 [M,7168] input and [6288,7168] weight with a selected M"
             )
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
             gluon_mm_a16w16_largem_gfx1250,

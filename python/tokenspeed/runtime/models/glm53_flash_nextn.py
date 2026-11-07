@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
 from torch import nn
 
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
@@ -107,15 +108,15 @@ class Glm53FlashModelNextN(nn.Module):
                     "GLM-5.3-Flash MTP requires captured target hidden states"
                 )
             captured_hidden_states = hidden_states
-        hidden_states = self.eh_proj(
-            torch.cat(
-                (
-                    self.enorm(hidden_states),
-                    self.hnorm(captured_hidden_states),
-                ),
-                dim=-1,
-            )
+        hidden_states = torch.cat(
+            (
+                self.enorm(hidden_states),
+                self.hnorm(captured_hidden_states),
+            ),
+            dim=-1,
         )
+        projected = _try_gluon_largem_gfx1250(hidden_states, self.eh_proj.weight)
+        hidden_states = self.eh_proj(hidden_states) if projected is None else projected
         hidden_states, residual = self.decoder(
             positions,
             hidden_states,

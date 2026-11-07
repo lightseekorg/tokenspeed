@@ -25,7 +25,6 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
-_LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
 _LARGEM_WIDE_N = 3072
 # From this many rows the 256 x 256 warp pipeline tile fills the device.
@@ -57,25 +56,106 @@ _WARP_BASES_M8 = ((1, 0), (2, 0), (4, 0))
 _WARP_BASES_4 = ((0, 1), (1, 0))
 _WARP_BASES_8 = ((0, 1), (1, 0), (2, 0))
 _WARP_BASES_N8 = ((0, 1), (0, 2), (0, 4))
-_LARGEM_SHAPES = {
-    (512, 3072),
-    (768, 7168),
-    (1536, 7168),
-    (1536, 2304),
-    (3584, 7168),
-    (4224, 7168),
-    (7168, 1536),
-    (7168, 2112),
-    (7168, 3584),
-    (7168, 6288),
-    (7168, 8448),
+# Inclusive row ranges per (K, N) where these kernels beat hipBLASLt; None
+# leaves a range open. Re-check when the pinned hipBLASLt changes.
+_LARGEM_ROWS = {
+    # Kimi K3 projections.
+    (512, 3072): ((512, None),),
+    (768, 7168): ((512, None),),
+    (1536, 7168): ((512, None),),
+    (1536, 2304): ((512, None),),
+    (3584, 7168): ((512, None),),
+    (4224, 7168): ((512, None),),
+    (7168, 1536): ((512, None),),
+    (7168, 2112): ((512, None),),
+    (7168, 3584): ((512, None),),
+    (7168, 6288): ((512, None),),
+    (7168, 8448): ((512, None),),
+    # Other BF16 serving weights.
+    (128, 1536): ((512, None),),
+    (128, 2048): ((512, None),),
+    (512, 128): ((512, None),),
+    (1024, 7168): ((4096, None),),
+    (1536, 1536): ((1536, 2560), (4864, None)),
+    (1536, 4096): ((4096, None),),
+    (2048, 4096): ((4096, None),),
+    (2304, 7168): ((4096, None),),
+    (4096, 32): ((512, None),),
+    (4096, 128): ((512, 8192),),
+    (4096, 288): ((512, 8192),),
+    (4096, 6416): ((848, None),),
+    (5120, 32): ((848, None),),
+    (5120, 512): ((512, 8192),),
+    (7168, 4608): ((512, 1536), (5632, 7168), (12288, None)),
+    (8192, 4096): ((848, 1792), (7424, None)),
+    (14336, 2112): ((1024, 3584), (6144, 7168), (24576, None)),
 }
+# A column tail past the last whole cluster column that would cost the warp
+# pipeline grid one more CU round runs on 128 x 64 large-M tiles instead,
+# unless the grid already keeps this share of its rounds busy.
+_LARGEM_PEEL_MAX_CU_UTILIZATION = 0.9
+# Up to this width one wave of dense WMMA tiles beats the large-M tiles.
+_NARROW_MAX_N = 512
+# Ascending tile area: of the tiles that divide N, the one with the most CTAs
+# within one wave of the CUs wins, the smaller tile on a tie.
+_NARROW_TILES = (
+    (64, 32, _WARP_BASES_4),
+    (64, 64, _WARP_BASES_4),
+    (128, 32, _WARP_BASES_4),
+    (128, 64, _WARP_BASES_8),
+)
+
+
+def _narrow_dense_tile(
+    m: int, n: int
+) -> tuple[int, int, tuple[tuple[int, int], ...]] | None:
+    """Return the dense ``(block_m, block_n, warp_bases)`` for a narrow output,
+    or None when no tile dividing N fits one wave of the CUs."""
+    best = None
+    best_ctas = 0
+    for block_m, block_n, warp_bases in _NARROW_TILES:
+        if n % block_n:
+            continue
+        ctas = triton.cdiv(m, block_m) * (n // block_n)
+        if best_ctas < ctas <= _NUM_CUS:
+            best, best_ctas = (block_m, block_n, warp_bases), ctas
+    return best
+
+
+def _warp_pipeline_rounds(m: int, n: int) -> tuple[float, int]:
+    """Return the busy share of the warp pipeline grid's CU rounds and their
+    count; CTAs of a cluster past the M or N edge still occupy a CU."""
+    cta_m, cta_n = _LARGEM_WARP_PIPELINE_CLUSTER
+    ctas = triton.cdiv(m, 256 * cta_m) * cta_m * triton.cdiv(n, 256 * cta_n) * cta_n
+    rounds = triton.cdiv(ctas, _NUM_CUS)
+    tiles = triton.cdiv(m, 256) * triton.cdiv(n, 256)
+    return tiles / (rounds * _NUM_CUS), rounds
+
+
+def _warp_pipeline_columns(m: int, n: int) -> int:
+    """Return how many leading columns the warp pipeline grid covers; the
+    rest run on 128 x 64 large-M tiles."""
+    cluster_n = 256 * _LARGEM_WARP_PIPELINE_CLUSTER[1]
+    split = n // cluster_n * cluster_n
+    if split == n or split < _LARGEM_WARP_PIPELINE_MIN_N:
+        return n
+    utilization, rounds = _warp_pipeline_rounds(m, n)
+    if (
+        utilization >= _LARGEM_PEEL_MAX_CU_UTILIZATION
+        or _warp_pipeline_rounds(m, split)[1] >= rounds
+    ):
+        return n
+    return split
 
 
 def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
-    """Return whether CDNA5 large-M WMMA accepts this K3 projection shape."""
+    """Return whether the CDNA5 large-M projection is selected: ``_LARGEM_ROWS``
+    lists ``(K, N)`` with a row range holding M."""
 
-    return m >= _LARGEM_MIN_M and (k, n) in _LARGEM_SHAPES
+    return any(
+        low <= m and (high is None or m <= high)
+        for low, high in _LARGEM_ROWS.get((k, n), ())
+    )
 
 
 def _wmma_tdm_dense_launch_metadata(grid, kernel, args):
@@ -1708,12 +1788,15 @@ def gluon_mm_a16w16_largem_gfx1250(
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run K3 BF16 projections on one CDNA5 WMMA kernel launch.
+    """Run BF16 prefill projections on CDNA5 WMMA kernels.
 
     From ``_LARGEM_WIDE_M`` rows this is the eight-wave warp pipeline kernel with
-    256 x 256 tiles; fewer rows use the four-warp 128 x 128 kernel. Either
-    covers the whole output, including ragged M and N edges, rather than
-    having the caller peel them off into vendor calls.
+    256 x 256 tiles, followed by a 128 x 64 launch over a column tail that
+    would have cost it another CU round; fewer rows use the four-warp
+    128 x 128 kernel. Outputs of at most ``_NARROW_MAX_N`` columns use one
+    wave of dense WMMA tiles when a tile divides N. Together they cover the
+    whole output, including ragged M and N edges, rather than having the
+    caller peel them off into vendor calls.
     """
 
     if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[1]:
@@ -1722,19 +1805,25 @@ def gluon_mm_a16w16_largem_gfx1250(
     n = int(B.shape[0])
     if not use_gluon_largem_gfx1250(m, k, n):
         raise ValueError(
-            f"gfx1250 large-M projection requires M >= {_LARGEM_MIN_M} "
-            f"and a K3 shape, got M={m} N={n} K={k}"
+            "gfx1250 large-M projection requires a selected shape and row "
+            f"count, got M={m} N={n} K={k}"
         )
     if (
         A.dtype != torch.bfloat16
         or B.dtype != torch.bfloat16
         or not A.is_cuda
         or A.device != B.device
-        or not A.is_contiguous()
+        or A.stride(1) != 1
         or not B.is_contiguous()
     ):
         raise ValueError(
-            "gfx1250 large-M projection requires contiguous GPU BF16 inputs"
+            "gfx1250 large-M projection requires GPU BF16 A with unit column "
+            "stride and contiguous B"
+        )
+    if not A.is_contiguous() and (A.stride(0) % 8 or A.data_ptr() % 16):
+        raise ValueError(
+            "gfx1250 large-M projection requires a strided A's rows to start "
+            "on 16-byte boundaries"
         )
     if k % 128 != 0:
         raise ValueError(
@@ -1753,7 +1842,22 @@ def gluon_mm_a16w16_largem_gfx1250(
             "gfx1250 large-M output must be contiguous BF16 with shape "
             f"{(m, n)} on {A.device}"
         )
-    _launch_largem(A, B, out)
+    narrow = _narrow_dense_tile(m, n) if n <= _NARROW_MAX_N else None
+    if narrow is None:
+        _launch_largem(A, B, out)
+        return out
+    block_m, block_n, warp_bases = narrow
+    _launch_wmma_tdm_dense_tiles(
+        A,
+        B,
+        out,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=128,
+        split_k=1,
+        num_buffers=4,
+        warp_bases=warp_bases,
+    )
     return out
 
 
@@ -1764,8 +1868,9 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
     # The warp pipeline kernel writes its tile with one TDM store, so it needs a
     # contiguous output; narrower outputs leave its 256-wide grid underfilled.
     if m >= _LARGEM_WIDE_M and n >= _LARGEM_WARP_PIPELINE_MIN_N and out.is_contiguous():
+        split = _warp_pipeline_columns(m, n)
         cta_m, cta_n = _LARGEM_WARP_PIPELINE_CLUSTER
-        grid = triton.cdiv(m, 256 * cta_m) * triton.cdiv(n, 256 * cta_n)
+        grid = triton.cdiv(m, 256 * cta_m) * triton.cdiv(split, 256 * cta_n)
         _wmma_tdm_dense_largem_warp_pipeline_kernel[(grid,)](
             A,
             B,
@@ -1774,7 +1879,7 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
             B.stride(0),
             out.stride(0),
             m,
-            n,
+            split,
             k,
             CTA_M=cta_m,
             CTA_N=cta_n,
@@ -1785,6 +1890,10 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
             waves_per_eu=2,
             num_ctas=cta_m * cta_n,
         )
+        if split < n:
+            _launch_largem_tiles(
+                A, B[split:], out[:, split:], 128, 64, _WARP_BASES_4, 4, 8
+            )
         return
 
     if m >= _LARGEM_WIDE_M and n >= _LARGEM_WIDE_N:
@@ -1802,6 +1911,22 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
         block_n = block_m if n % block_m == 0 else 128
         warp_bases, num_warps = _WARP_BASES_4, 4
         group_m = 8
+    _launch_largem_tiles(A, B, out, block_m, block_n, warp_bases, num_warps, group_m)
+
+
+def _launch_largem_tiles(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    block_m: int,
+    block_n: int,
+    warp_bases: tuple[tuple[int, int], ...],
+    num_warps: int,
+    group_m: int,
+) -> None:
+    """Store ``A @ B.T`` with one ``_wmma_tdm_dense_largem_kernel`` grid."""
+    m, k = A.shape
+    n = B.shape[0]
     grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
     _wmma_tdm_dense_largem_kernel[(grid,)](
         A,
