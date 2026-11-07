@@ -26,6 +26,10 @@ readme = "README.md"
 [workspace.dependencies]
 bytes = "1"
 thiserror = "2"
+# The ZMQ implementation of every socket in the workspace (the frontend wire,
+# the encode intake, the PD control sockets, the metrics relay): one version
+# and one feature set, so every crate links the same transport.
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

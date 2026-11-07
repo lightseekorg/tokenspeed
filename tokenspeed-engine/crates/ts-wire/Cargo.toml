@@ -1,7 +1,7 @@
 [package]
 name = "tokenspeed-wire"
 description = "TokenSpeed engine IPC schema and msgpack codec"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
