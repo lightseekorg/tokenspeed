@@ -599,7 +599,8 @@ def packed_block_tables_from_forward_op(
         device: Destination device for the packed tensor.
         host_tables: Also return the tables in host memory (``tables_cpu``).
         num_reqs: Optional expected row count for every group.
-        expected_group_ids: Optional contract order and exact key set.
+        expected_group_ids: Optional pack order and exact key set; the
+            packed buffer and the returned views follow it.
         max_page_id: Optional common inclusive upper bound for page IDs.
         max_page_ids: Optional per-group inclusive upper bounds.
 

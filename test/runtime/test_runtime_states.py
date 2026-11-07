@@ -22,12 +22,21 @@ import os
 import sys
 
 import pytest
+import tokenspeed_scheduler as ts
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
+from tokenspeed.runtime.engine.scheduler_utils import make_config
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+    CacheBatchMetadata,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    CacheRuntimeContract,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -190,3 +199,122 @@ def test_reset_states_graph_replay_uses_current_inputs():
         assert states.spec_candidates_ready.tolist() == [
             i not in selected for i in range(5)
         ]
+
+
+# A history group between two state groups: the bridge packs the state groups last.
+_GROUP_KINDS = (("conv_a", "state"), ("history", "full_history"), ("conv_b", "state"))
+_STATE_GROUPS = ("conv_a", "conv_b")
+_PAGES = 17
+
+
+def _scheduled_batch():
+    """Two prompts' first forward, as the scheduler plans it."""
+    kinds = {"state": ts.AttnKind.State, "full_history": ts.AttnKind.Full}
+    config = make_config(
+        num_device_pages=_PAGES,
+        max_scheduled_tokens=64,
+        max_batch_size=2,
+        prefix_granularity=4,
+        num_host_pages=0,
+        disable_l2_cache=True,
+        enable_l3_storage=False,
+        role="fused",
+        num_snapshot_pages=1,
+        host_group_packing=(),
+        max_retracted_requests=0,
+        host_write_policy="write_through",
+        storage_config=None,
+        enable_kv_cache_events=False,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+        disable_prefix_cache=True,
+        cache_groups=[
+            ts.CacheGroupConfig(
+                group_id=group_id,
+                block_granularity=0 if kind == "state" else 4,
+                total_pages=_PAGES,
+                attn_kind=kinds[kind],
+            )
+            for group_id, kind in _GROUP_KINDS
+        ],
+        enable_mixed_prefill_decode=False,
+        prefix_replay_tokens=0,
+    )
+    scheduler = ts.Scheduler(config)
+    for i in range(2):
+        request = ts.RequestSpec()
+        request.request_id = f"r{i}"
+        request.tokens = list(range(6 + i))
+        request.max_new_tokens = 2
+        scheduler.submit_requests([request])
+    (batch,) = scheduler.next_execution_plan().forward
+    assert len(batch.request_ids) == 2
+    return batch
+
+
+def _contract() -> CacheRuntimeContract:
+    specs = tuple(
+        CacheGroupSpec(
+            group_id=group_id,
+            attn_kind=kind,
+            rows_per_page=None if kind == "state" else 4,
+            entry_stride_tokens=None if kind == "state" else 1,
+            replayable=False,
+        )
+        for group_id, kind in _GROUP_KINDS
+    )
+    return CacheRuntimeContract(
+        prefix_granularity=4,
+        num_lcm_blocks=_PAGES - 1,
+        token_capacity=(_PAGES - 1) * 4,
+        group_specs=specs,
+        group_page_counts={spec.group_id: _PAGES for spec in specs},
+        group_packing={spec.group_id: 1 for spec in specs},
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("layout", ["bridge", "separate"])
+def test_masked_state_tables_pads_only_the_stopped_rows_of_state_groups(device, layout):
+    """A stopped request's rows read -1 in every state group; live rows and
+    the history group keep their blocks, whether the tables are the bridge's
+    one upload or tensors of their own."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    batch = _scheduled_batch()
+    expected = {
+        group_id: torch.from_numpy(array.copy())
+        for group_id, array in batch.block_tables_arrays().items()
+    }
+    metadata = CacheBatchMetadata.from_forward_op(
+        batch,
+        device=device,
+        contract=_contract(),
+        num_requests=2,
+        validate_page_ids=True,
+        host_tables=False,
+    )
+    tables = dict(metadata.tables(active_forward_op=batch))
+    assert tuple(tables) == tuple(group_id for group_id, _ in _GROUP_KINDS)
+    if layout == "separate":
+        tables = {group_id: table.clone() for group_id, table in tables.items()}
+    else:
+        # The one-launch padding needs the bridge to pack the state groups end to end.
+        conv_a, conv_b = (tables[group_id] for group_id in _STATE_GROUPS)
+        assert (
+            conv_b.untyped_storage().data_ptr() == conv_a.untyped_storage().data_ptr()
+        )
+        assert conv_b.storage_offset() == conv_a.storage_offset() + conv_a.numel()
+    for group_id, table in tables.items():
+        assert torch.equal(table.cpu(), expected[group_id])
+
+    states = RuntimeStates(8, 32, 32, 1, device)
+    slots = torch.tensor(batch.request_pool_indices, dtype=torch.int64, device=device)
+    states.stopped[slots[1]] = True
+    masked = states.masked_state_tables(tables, slots, _STATE_GROUPS)
+
+    for group_id in _STATE_GROUPS:
+        assert masked[group_id] is tables[group_id]
+        assert torch.equal(masked[group_id][0].cpu(), expected[group_id][0])
+        assert (masked[group_id][1] == -1).all()
+    assert torch.equal(masked["history"].cpu(), expected["history"])
