@@ -104,14 +104,24 @@ class CacheBatchMetadata:
             device,
             host_tables=host_tables,
             num_reqs=num_requests,
-            expected_group_ids=group_ids,
+            # State groups pack last and end to end, so their rows pad in one launch.
+            expected_group_ids=tuple(
+                spec.group_id
+                for spec in sorted(
+                    contract.group_specs, key=lambda spec: spec.attn_kind == "state"
+                )
+            ),
             # The packer scans every page ID against bounds it is given.
             max_page_ids=max_page_ids if validate_page_ids else None,
         )
         return cls._from_validated_tables(
             group_ids=group_ids,
-            group_tables=tables.tables,
-            group_tables_cpu=tables.tables_cpu if host_tables else None,
+            group_tables={group_id: tables.tables[group_id] for group_id in group_ids},
+            group_tables_cpu=(
+                {group_id: tables.tables_cpu[group_id] for group_id in group_ids}
+                if host_tables
+                else None
+            ),
             num_requests=num_requests,
             forward_op=forward_op,
         )
@@ -189,8 +199,9 @@ class CacheBatchMetadata:
 
     def tables(self, *, active_forward_op: Any) -> Mapping[str, torch.Tensor]:
         """Return every group's table view, in a read-only mapping, after
-        freshness validation. The views are this step's own upload: the
-        executor pads stopped requests' state rows in them in place."""
+        freshness validation. The views are this step's own upload, with the
+        state groups' tables end to end at its tail: the executor pads
+        stopped requests' state rows in them in place."""
         self._validate_active_forward_op(active_forward_op)
         return self._group_tables
 

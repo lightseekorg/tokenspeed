@@ -82,7 +82,7 @@ def _quantize_asm():
         "rcp.approx.ftz.f32 ginv, $6;",
         "mul.rn.f32 r, s, ginv;",
         "rcp.approx.ftz.f32 r, r;",
-        "setp.eq.f32 zero, a, 0f00000000;",
+        "setp.eq.f32 zero, s, 0f00000000;",
         "selp.f32 r, 0f00000000, r, zero;",
     ]
     for i in range(8):

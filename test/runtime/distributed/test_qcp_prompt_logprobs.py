@@ -43,9 +43,9 @@ import torch.multiprocessing as mp
 WORLD = 4
 HIDDEN = 8
 # Vocabulary per order: a small one for torch's log-softmax, two trainer
-# blocks for the megatron fold (which needs a block multiple). Sharded over
+# blocks for the blockwise fold (which needs a block multiple). Sharded over
 # the four ranks' heads either way.
-VOCABS = {"torch": 64, "megatron": 2 * 32768}
+VOCABS = {"torch": 64, "blockwise": 2 * 32768}
 
 
 def _get_open_port() -> int:
@@ -99,7 +99,7 @@ def _forward(
 
     total = sum(lengths)
     shard = QueryShardPlan.from_forward(
-        total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank
+        total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank, device="cpu"
     )
     gather_ids = torch.cumsum(torch.tensor(lengths), 0) - 1
     vocab = weight.shape[0]
@@ -115,7 +115,7 @@ def _forward(
     )
     out = processor(
         input_ids=None,
-        hidden_states=hidden[shard.local_slice].clone(),
+        hidden_states=hidden[shard.local_row_ids].clone(),
         lm_head=SimpleNamespace(weight=local),
         logits_metadata=metadata,
     )
@@ -250,7 +250,7 @@ def _run(rank: int, port: int, logprob_order: str) -> None:
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("logprob_order", ["torch", "megatron"])
+@pytest.mark.parametrize("logprob_order", ["torch", "blockwise"])
 def test_sharded_prompt_logprobs_equal_the_unsharded_forward(logprob_order):
     port = _get_open_port()
     errors = mp.Manager().dict()

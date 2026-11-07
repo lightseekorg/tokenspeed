@@ -1297,7 +1297,8 @@ def _rmsnorm_nvfp4_quant_kernel(
     sf_e4m3 = sf_value.to(tl.float8e4nv)
     sf_f32 = sf_e4m3.to(tl.float32)
     out_scale = _rcp_approx(sf_f32 * _rcp_approx(global_scale))
-    out_scale = tl.where(amax != 0.0, out_scale, 0.0)
+    # A block whose E4M3 scale rounds to zero encodes zero values.
+    out_scale = tl.where(sf_f32 != 0.0, out_scale, 0.0)
     scaled = tl.reshape(blocks * out_scale[:, None], [BLOCK // 2, 2])
     low, high = tl.split(scaled)
     packed = tl.inline_asm_elementwise(
