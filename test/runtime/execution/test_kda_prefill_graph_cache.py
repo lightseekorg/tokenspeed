@@ -105,10 +105,13 @@ def test_capacity_refresh_pads_unused_request_slots_with_one_scan_row(live):
     no work at all."""
     lengths = [129, 130, 131][:live]
     retained = prepare_capacity_prefill_metadata(
-        _live_metadata([100] * 4, "cuda"), 512, None
+        _live_metadata([100] * 4, "cuda"), 512, None, checkpoints=None
     )
     source = _live_metadata(lengths, "cuda")
-    assert prepare_capacity_prefill_metadata(source, 512, retained) is retained
+    assert (
+        prepare_capacity_prefill_metadata(source, 512, retained, checkpoints=None)
+        is retained
+    )
     total = sum(lengths)
     padding = 4 - live
     host = source.cu_extend_seq_lens_cpu.tolist()
@@ -123,7 +126,9 @@ def test_capacity_refresh_pads_unused_request_slots_with_one_scan_row(live):
     )
     assert retained.prefill_token_extent == 512
     with pytest.raises(ValueError, match="exceed the captured capacity"):
-        prepare_capacity_prefill_metadata(_live_metadata([510], "cuda"), 512, retained)
+        prepare_capacity_prefill_metadata(
+            _live_metadata([510], "cuda"), 512, retained, checkpoints=None
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -131,14 +136,91 @@ def test_capacity_scrub_zeroes_rows_past_the_live_total():
     """The padded rows are zeroed by a device-side bound, never a Python int
     the capture would freeze."""
     retained = prepare_capacity_prefill_metadata(
-        _live_metadata([2, 2, 2], "cuda"), 8, None
+        _live_metadata([2, 2, 2], "cuda"), 8, None, checkpoints=None
     )
-    prepare_capacity_prefill_metadata(_live_metadata([3, 2], "cuda"), 8, retained)
+    prepare_capacity_prefill_metadata(
+        _live_metadata([3, 2], "cuda"), 8, retained, checkpoints=None
+    )
     rows = torch.ones(8, 4, device="cuda")
     extra = torch.ones(8, device="cuda")
     retained.scrub_padding(rows, None, extra)
     assert rows[:5].eq(1).all() and rows[5:].eq(0).all()
     assert extra[:5].eq(1).all() and extra[5:].eq(0).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_capacity_scrub_writes_only_the_padding_rows_of_strided_inputs():
+    """A projection column view loses only its padding rows' own columns; a
+    view whose rows are not contiguous is scrubbed too."""
+    retained = prepare_capacity_prefill_metadata(
+        _live_metadata([3, 2], "cuda"), 8, None, checkpoints=None
+    )
+    projection = torch.ones(8, 3000, device="cuda", dtype=torch.bfloat16)
+    transposed = torch.ones(24, 8, device="cuda", dtype=torch.bfloat16).T
+    retained.scrub_padding(projection[:, 16:2600], transposed)
+    assert projection[:5].eq(1).all() and projection[5:, 16:2600].eq(0).all()
+    assert projection[5:, :16].eq(1).all() and projection[5:, 2600:].eq(1).all()
+    assert transposed[:5].eq(1).all() and transposed[5:].eq(0).all()
+
+
+def _kernel_test_utils():
+    """tokenspeed-kernel's test helpers, for ``assert_no_triton_compile``."""
+    import importlib.util
+
+    path = os.path.join(_TEST_DIR, "..", "tokenspeed-kernel", "test", "utils.py")
+    spec = importlib.util.spec_from_file_location("capacity_kernel_test_utils", path)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    return helper
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_capacity_scrub_compiles_nothing_new_across_forwards():
+    """The live total, the token capacity and the request count (which moves
+    the bound's address) vary per forward; none compiles a new scrub kernel."""
+    from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
+        _zero_rows_from_kernel,
+    )
+
+    def scrub(lengths, bucket):
+        metadata = prepare_capacity_prefill_metadata(
+            _live_metadata(lengths, "cuda"), bucket, None, checkpoints=None
+        )
+        rows = torch.ones(bucket, 96, device="cuda", dtype=torch.bfloat16)
+        metadata.scrub_padding(rows)
+        live = sum(lengths)
+        assert rows[:live].eq(1).all() and rows[live:].eq(0).all()
+
+    scrub([3], 8)
+    with _kernel_test_utils().assert_no_triton_compile(_zero_rows_from_kernel):
+        for lengths, bucket in (
+            ([8], 8),
+            ([1, 2], 8),
+            ([5, 6, 7], 32),
+            ([100] * 4, 512),
+            ([1] * 7, 2048),
+            ([300] * 8, 4096),
+        ):
+            scrub(lengths, bucket)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_capacity_scrub_reaches_rows_past_int32_offsets():
+    """A padding row starting past 2**31 elements is zeroed in place; the
+    stride fits int32, so only an int64 row offset reaches it. Only the far
+    end of the 2 GiB view is touched."""
+    from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
+        _zero_rows_from,
+    )
+
+    row_stride, rows = 1 << 16, (1 << 15) + 2
+    storage = torch.empty(row_stride * rows, device="cuda", dtype=torch.uint8)
+    view = torch.as_strided(storage, (rows, 64), (row_stride, 1))
+    view[-2:].fill_(1)
+    storage[-row_stride + 64 :].fill_(7)
+    _zero_rows_from(view, torch.tensor([rows - 1], dtype=torch.int32, device="cuda"))
+    assert view[-2].eq(1).all() and view[-1].eq(0).all()
+    assert storage[-row_stride + 64 :].eq(7).all()
 
 
 def test_hybrid_initializes_prefill_graph_state_on_both_children():
@@ -517,7 +599,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         # Uncaptured shapes use the same builder with transient storage. Check
         # its eager output/state too, not just eager on a retained graph buffer.
         backend.forward_metadata = prepare_capacity_prefill_metadata(
-            source, bucket, None
+            source, bucket, None, checkpoints=None
         )
         reset()
         fresh_eager = forward(compact=False)[: sum(lengths)].clone()
