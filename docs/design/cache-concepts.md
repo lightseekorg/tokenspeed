@@ -101,7 +101,11 @@ to the global empty-parent FIFO rather than any group.
 Packing is a property of each pool. Device packing satisfies attention-kernel
 strides; compact Host storage uses a parent large enough for the largest single
 group payload, then fits as many complete children of each group as that parent
-holds. Host L2 and the request-private snapshot pool use this compact geometry.
+holds. When the largest payload is a State checkpoint, or a replayable window
+block that Host L2 never stores, the parent rounds up to whole blocks of the
+cached history group with the most Host bytes per token if that lowers the Host
+bytes per cached token at an assumed State checkpoint density
+(`runtime/cache/host_storage.py`), so those KV pages pack without a gap. Host L2 and the request-private snapshot pool use this compact geometry.
 The scheduler receives their virtual packing explicitly, including each group's
 shard count. Enabling either Host pool requires `host_group_packing` with one
 value per group, in `cache_groups` order; Device packing is never a fallback.
