@@ -1064,7 +1064,7 @@ class TestDeepseekV4Config:
                     "chunked_prefill_size": 16,
                     "prefill_graph_max_tokens": 32,
                     "max_cudagraph_capture_size": 64,
-                    "max_num_seqs": 128,
+                    "request_state_seqs": 128,
                     "cuda_graph_max_bs": 4096,
                     "cuda_graph_max_tokens": 4096,
                     "max_running_requests": 4096,

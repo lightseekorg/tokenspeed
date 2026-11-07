@@ -578,6 +578,29 @@ def _muse_collective_policy_worker(rank, world_size, device):
         )
 
 
+def _muse_pull_warmup_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_pull_twoshot_allreduce,
+    )
+    from utils import assert_no_triton_compile
+
+    # Past the push and Lamport two-shot windows, below the owned-row path:
+    # the producer pull reduces these rows.
+    rows = 179
+    state = _muse_state(rank, device, 192, True)
+    state.warmup_reduce_outputs()
+    with assert_no_triton_compile(iris_pull_twoshot_allreduce):
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        branch.fill_(rank + 1)
+        output = state.reduce_outputs((branch,))[0]
+    torch.testing.assert_close(
+        output,
+        torch.full_like(output, world_size * (world_size + 1) // 2),
+        rtol=0,
+        atol=0,
+    )
+
+
 def _muse_owned_packet_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
         iris_pack_moe_inputs,
@@ -977,7 +1000,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
+def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=(), options=None):
     """Compile a Gluon kernel for gfx950 without launching it.
 
     Arguments named in unspecialized get no 16-byte divisibility, as when a
@@ -1005,7 +1028,7 @@ def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
     return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": num_warps},
+        options={"num_warps": num_warps, **(options or {})},
     )
 
 
@@ -1184,12 +1207,8 @@ def test_route_sum_gather_lamport_polling_codegen():
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
-def test_attntail_lamport_polling_codegen():
-    """Each subgroup of the 16-subgroup poller retries on its own.
-
-    A workgroup-wide readiness reduction would put shared-memory traffic and
-    barriers into every retry; the subgroup ballot keeps them out.
-    """
+def _attntail_lamport_assembly() -> str:
+    """gfx950 assembly of the 16-subgroup Lamport attention tail at TP8."""
     rank = 5
     from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
@@ -1233,7 +1252,16 @@ def test_attntail_lamport_polling_codegen():
         },
         num_warps=16,
     )
-    assembly = kernel.asm["amdgcn"]
+    return kernel.asm["amdgcn"]
+
+
+def test_attntail_lamport_polling_codegen():
+    """Each subgroup of the 16-subgroup poller retries on its own.
+
+    A workgroup-wide readiness reduction would put shared-memory traffic and
+    barriers into every retry; the subgroup ballot keeps them out.
+    """
+    assembly = _attntail_lamport_assembly()
     polls = [
         cycle for cycle in polling_cycles(assembly) if _batched_peer_reads(cycle, 7)
     ]
@@ -1242,6 +1270,26 @@ def test_attntail_lamport_polling_codegen():
         votes_with_subgroup_mask(cycle) for cycle in polls
     ), "a retry must branch on one subgroup lane mask"
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+def test_attntail_stage_store_follows_a_barrier():
+    """Every wave loads its workgroup's stage; one lane stores the next.
+
+    A wave that loaded after that store would use the next stage's mailbox
+    slot, so a workgroup barrier must precede the store on every path: it
+    sits in the block that ends in the store.
+    """
+    lines = _attntail_lamport_assembly().splitlines()
+    stores = [i for i, line in enumerate(lines) if "global_store_dword " in line]
+    assert len(stores) == 1, "expected one global store (the stage)"
+    index = stores[0]
+    # Walk back through fall-through-only blocks ("; %bb.N:") to a block
+    # that branches may enter (".LBB").
+    while index > 0 and not lines[index].startswith(".LBB"):
+        if "s_barrier" in lines[index]:
+            break
+        index -= 1
+    assert "s_barrier" in lines[index], "the stage store does not follow a barrier"
 
 
 def test_gather_lamport_polling_codegen():
@@ -3616,6 +3664,7 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
             partial(_muse_boundary_worker, sharded=True), "nccl", id="boundary_scatter"
         ),
         pytest.param(_muse_collective_policy_worker, "nccl", id="collective_policy"),
+        pytest.param(_muse_pull_warmup_worker, "nccl", id="pull_warmup"),
         pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),

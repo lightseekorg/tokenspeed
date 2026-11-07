@@ -245,6 +245,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             overlap_schedule_depth=0,
             decode_input_tokens=16,
             max_batch_size=16,
+            request_slots=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     # Once, before tuning and capture, only where the checkpoint declares the contract.
