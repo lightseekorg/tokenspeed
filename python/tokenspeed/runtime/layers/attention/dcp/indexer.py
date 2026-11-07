@@ -508,6 +508,10 @@ def _tile_pages(
     end: int,
     page_size: int,
 ) -> DSAIndexCandidatePages | None:
+    """Candidate pages for query rows ``[start, end)``: the forward's planned
+    pages sliced to them, None when tiles are not planned at an owned width,
+    else this tile's pages planned ``metadata.columns`` wide. Raises when the
+    candidate leaf cannot score planned pages."""
     if metadata.pages is not None:
         return metadata.pages.rows(start, end)
     if metadata.columns is None:
