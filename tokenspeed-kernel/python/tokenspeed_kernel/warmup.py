@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from itertools import product
 from typing import Any, TypeAlias
 
@@ -59,6 +59,34 @@ def register_triton_warmup(
     if kernel in _warmup_variants:
         raise ValueError(f"Warmup already registered for {kernel}")
     _warmup_variants[kernel] = variants
+
+
+def warmup_registrations() -> dict[Any, _Variants]:
+    """A copy of every kernel's registered variants, for :func:`restore_warmup_registrations`."""
+    return dict(_warmup_variants)
+
+
+def restore_warmup_registrations(registrations: dict[Any, _Variants]) -> None:
+    """Return to the variants ``registrations`` copied."""
+    _warmup_variants.clear()
+    _warmup_variants.update(registrations)
+
+
+def rekey_warmup_registrations(replacements: Mapping[int, Any]) -> set[int]:
+    """Move each variant set registered for a kernel whose ``id`` keys ``replacements`` onto its value; returns the ids of the kernels moved onto."""
+    moved = set()
+    for kernel in list(_warmup_variants):
+        replacement = replacements.get(id(kernel))
+        if replacement is not None:
+            _warmup_variants[replacement] = _warmup_variants.pop(kernel)
+            moved.add(id(replacement))
+    return moved
+
+
+def remove_warmup_registrations(kernels: Iterable[Any]) -> None:
+    """Forget the variants registered for ``kernels``."""
+    for kernel in kernels:
+        _warmup_variants.pop(kernel, None)
 
 
 def kernel_launcher(kernel: Any, grid: Any) -> Callable[..., Any]:

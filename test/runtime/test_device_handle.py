@@ -144,7 +144,8 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             if self.generation and warmup_fails:
                 raise WarmupFailure("rebound initialization failed")
 
-        def autotune(self):
+        def autotune(self, *, keep_loaded_tactics):
+            assert not keep_loaded_tactics
             if has_draft and not prefill_only:
                 self.warmup_decode_path(batch_sizes=(1,), graph_phase=False)
 

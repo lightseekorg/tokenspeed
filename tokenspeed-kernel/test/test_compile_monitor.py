@@ -387,3 +387,24 @@ def test_launch_options_are_plain_values():
                     and kw.value.id in constexprs
                 ]
     assert not offenders, offenders
+
+
+def test_forgetting_a_reloaded_kernel_resets_its_repeat_count(caplog):
+    kept, forgotten = CompileMonitor("warn", 1), CompileMonitor("warn", 1)
+    for monitor in (kept, forgotten):
+        _record(monitor, 64)
+        monitor.serving = True
+    forgotten.forget(["ops.example"])
+    with caplog.at_level(logging.WARNING, logger=compile_monitor.__name__):
+        for _ in range(2):
+            _record(forgotten, 64)
+        assert not _warnings(caplog)
+        for _ in range(2):
+            _record(kept, 64)
+    assert any("already had" in warning for warning in _warnings(caplog))
+
+
+def test_reopening_startup_reopens_the_compile_switch():
+    compile_monitor.mark_serving()
+    compile_monitor.reopen_startup([])
+    assert not compile_monitor.is_serving()

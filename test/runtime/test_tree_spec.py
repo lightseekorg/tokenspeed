@@ -92,6 +92,42 @@ def test_fresh_spec_is_the_chain(nodes):
     assert torch.equal(window, torch.arange(3 * nodes, device="cuda"))
 
 
+def test_reset_to_chain_undoes_a_loaded_tree():
+    """After serving trees, reset_to_chain makes graph warmup's compact a no-op again."""
+    nodes, bs = 8, 3
+    spec = TreeSpec(
+        TreeSpecConfig(topk=4, num_steps=3, num_nodes=nodes), bs, torch.device("cuda")
+    )
+    fresh = TreeSpec(
+        TreeSpecConfig(topk=4, num_steps=3, num_nodes=nodes), bs, torch.device("cuda")
+    )
+    tree = torch.tensor([-1, 0, 0, 0, 1, 1, 2, 4], dtype=torch.int32, device="cuda")
+    spec.load_step(
+        bs,
+        torch.arange(bs, device="cuda"),
+        tree.repeat(bs, 1),
+        torch.arange(bs * nodes, device="cuda"),
+    )
+    hidden = torch.randn(bs * nodes, 64, device="cuda").bfloat16()
+    root_only = torch.full((bs, nodes), -1, dtype=torch.int32, device="cuda")
+    root_only[:, 0] = 0
+    positions = torch.arange(bs * nodes, dtype=torch.int64, device="cuda") + 100
+    spec.compact_rows(root_only, hidden, positions)
+    assert not torch.equal(positions, torch.arange(bs * nodes, device="cuda") + 100)
+    buffers = (spec.parent_buf, spec.depth_buf, spec.mask_buf)
+    addresses = [b.data_ptr() for b in buffers]
+    spec.reset_to_chain()
+    assert [b.data_ptr() for b in buffers] == addresses
+    for got, want in zip(
+        (spec.parent_buf, spec.draft_parent_buf, spec.depth_buf, spec.mask_buf),
+        (fresh.parent_buf, fresh.draft_parent_buf, fresh.depth_buf, fresh.mask_buf),
+    ):
+        assert torch.equal(got, want)
+    before = positions.clone()
+    spec.compact_rows(root_only, hidden, positions)
+    assert torch.equal(positions, before)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_router_compacts_mla_latent_rows_once(dtype):
     """An MLA pool hands out its latent key rows and, as the value, a narrower

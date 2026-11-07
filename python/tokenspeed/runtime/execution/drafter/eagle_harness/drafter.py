@@ -934,18 +934,17 @@ class EagleHarness(Eagle4):
                 policy.decide(depth, state["work_deltas"][(depth - 1) % 2])
                 if chain:
                     self._chain.end_depth(bs, depth, policy.go, state["sampled"])
-        tree_lanes.active = True
         self.attn_backend.publish_draft_step_locations(
             cache_start=state["slot_starts"][:bs], num_tokens=k
         )
-        logits_output = self.draft_model_runner.forward(
-            ctx=lanes,
-            input_ids=state["tokens"][:bs].view(-1),
-            positions=state["positions"][: bs * k],
-            captured_hidden_states=state["hidden"][:bs].view(bs * k, -1),
-            spec_step_idx=depth,
-        )
-        tree_lanes.active = False
+        with tree_lanes.lane_forward():
+            logits_output = self.draft_model_runner.forward(
+                ctx=lanes,
+                input_ids=state["tokens"][:bs].view(-1),
+                positions=state["positions"][: bs * k],
+                captured_hidden_states=state["hidden"][:bs].view(bs * k, -1),
+                spec_step_idx=depth,
+            )
         if decide and depth == 1:
             # Depth 1's counts come from the round's start.
             stream.wait_stream(decide_stream)

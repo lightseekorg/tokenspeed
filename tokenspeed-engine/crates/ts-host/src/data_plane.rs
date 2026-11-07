@@ -117,6 +117,11 @@ enum Op {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
     },
+    /// A forward reload, as its msgpack control struct.
+    ReloadForward {
+        payload: Bytes,
+        reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
     ReleaseMemory {
         tags: Vec<String>,
         reply: mpsc::SyncSender<Result<(), String>>,
@@ -463,6 +468,11 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::Profile { payload, reply })
     }
 
+    fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
+        let payload = control_payload(op)?;
+        self.ask(|reply| Op::ReloadForward { payload, reply })
+    }
+
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         let tags = tags.to_vec();
         self.ask(|reply| Op::ReleaseMemory { tags, reply })
@@ -599,7 +609,8 @@ fn forward_loop(
                 }
                 Op::CheckWeightUpdate { reply, .. }
                 | Op::UpdateWeights { reply, .. }
-                | Op::Profile { reply, .. } => {
+                | Op::Profile { reply, .. }
+                | Op::ReloadForward { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
                 Op::SnapshotExpertLoad { reply } => {
@@ -772,6 +783,13 @@ fn run(
         Op::Profile { payload, reply } => {
             let done = plane
                 .call_method1("profile", (PyBytes::new(py, &payload),))
+                .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
+        Op::ReloadForward { payload, reply } => {
+            let done = plane
+                .call_method1("reload_forward", (PyBytes::new(py, &payload),))
                 .and_then(|result| result.extract())
                 .map_err(python);
             answer(reply, done)?;

@@ -56,6 +56,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -76,6 +77,7 @@ __all__ = [
     "install_compile_monitor",
     "is_serving",
     "mark_serving",
+    "reopen_startup",
     "uninstall_compile_monitor",
 ]
 
@@ -172,6 +174,16 @@ class CompileMonitor:
         self._startup_seconds = 0.0
         self._serving_compiles = 0
         self._serving_seconds = 0.0
+
+    def forget(self, modules: Iterable[str]) -> None:
+        """Drop the history of kernels defined in ``modules``, whose code was reloaded."""
+        prefixes = tuple(f"{module}." for module in modules)
+        with self._lock:
+            for kernel in [name for name in self._kernels if name.startswith(prefixes)]:
+                del self._kernels[kernel]
+            self._direct_calls = {
+                call for call in self._direct_calls if not call[0].startswith(prefixes)
+            }
 
     def stats(self) -> CompileStats:
         with self._lock:
@@ -496,6 +508,15 @@ def mark_serving() -> None:
     _serving = True
     if _hooks is not None:
         _hooks.monitor.serving = True
+
+
+def reopen_startup(reloaded_modules: Iterable[str]) -> None:
+    """Reopen the startup compile window for a recapture after ``reloaded_modules`` changed; :func:`mark_serving` closes it."""
+    global _serving
+    _serving = False
+    if _hooks is not None:
+        _hooks.monitor.serving = False
+        _hooks.monitor.forget(reloaded_modules)
 
 
 def is_serving() -> bool:

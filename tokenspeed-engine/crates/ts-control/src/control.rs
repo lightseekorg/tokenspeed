@@ -31,16 +31,19 @@
 //! everything and answers at once. A memory release drains like `wait`,
 //! then frees its regions and freezes until they are resumed; it is refused
 //! under a `keep` pause, as a pause is under a release.
+//! A forward reload (`--allow-reload-forward`) drains, flushes and runs at the gate, then resumes unless a pause preceded it.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use ts_wire::{
     control::{
         DestroyWeightsUpdateGroupReqOutput, InitWeightsUpdateGroupReqOutput,
         IsSchedulerPausedReqOutput, IsSleepingReqOutput, PauseSchedulerReqOutput,
-        RebalanceExpertsReqOutput, ReleaseMemoryOccupationReqOutput,
-        ResumeMemoryOccupationReqOutput, ResumeSchedulerReqOutput, UpdateWeightFromDiskReqOutput,
-        UpdateWeightsFromDistributedReqOutput, UpdateWeightsFromMooncakeReqOutput,
+        RebalanceExpertsReqOutput, ReleaseMemoryOccupationReqOutput, ReloadForwardReqInput,
+        ReloadForwardReqOutput, ResumeMemoryOccupationReqOutput, ResumeSchedulerReqOutput,
+        UpdateWeightFromDiskReqOutput, UpdateWeightsFromDistributedReqOutput,
+        UpdateWeightsFromMooncakeReqOutput,
     },
     ControlOutput, ControlRequest,
 };
@@ -63,12 +66,14 @@ pub enum PauseState {
 }
 
 /// What a drain finishes with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Drain {
     /// An `abort` or `wait` pause: reply.
     Pause,
     /// A memory release: free these regions, freeze and reply.
     Release(Vec<String>),
+    /// A forward reload, queued on the gate since it arrived: mark it ready.
+    Reload,
 }
 
 /// Settings of the control operations.
@@ -82,6 +87,8 @@ pub struct ControlConfig {
     /// With the L3 storage tier, the checkpoint identity its pages publish
     /// under (`--weight-version`); `None` without the tier.
     pub l3_weight_version: Option<String>,
+    /// `--allow-reload-forward`: `reload_forward` is served; refused on arrival otherwise.
+    pub allow_reload_forward: bool,
 }
 
 /// `L3_FLUSH_REQUIRES_WEIGHT_VERSION`.
@@ -121,6 +128,8 @@ pub fn wants_flush(op: &ControlRequest) -> bool {
         ControlRequest::UpdateWeightsFromDistributed(op) => op.flush_cache,
         ControlRequest::UpdateWeightsFromMooncake(op) => op.flush_cache,
         ControlRequest::UpdateWeightFromDisk(op) => op.flush_cache,
+        // Capture writes dummy KV, and cached KV was computed by the old code.
+        ControlRequest::ReloadForward(_) => true,
         _ => false,
     }
 }
@@ -135,8 +144,21 @@ pub fn gate_code(op: &ControlRequest) -> Option<i64> {
         ControlRequest::UpdateWeightsFromMooncake(_) => 4,
         ControlRequest::RebalanceExperts(_) => 5,
         ControlRequest::UpdateWeightFromDisk(_) => 6,
+        ControlRequest::ReloadForward(_) => 7,
         _ => return None,
     })
+}
+
+/// A reload's identity on the gate: the caller's id, or the request's content without one.
+pub fn reload_key(op: &ReloadForwardReqInput) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match &op.id {
+        Some(id) => id.hash(&mut hasher),
+        None => (&op.mode, &op.modules).hash(&mut hasher),
+    }
+    // Non-negative, so the gate's MAX of key and -key compares it across ranks.
+    (hasher.finish() >> 2) as i64
 }
 
 /// A gated operation's reply.
@@ -191,6 +213,7 @@ pub fn gated_reply(op: &ControlRequest, success: bool, message: String) -> Contr
                 num_paused_requests: Some(0),
             })
         }
+        ControlRequest::ReloadForward(_) => reload_reply(success, &message),
         other => unreachable!("{} is not gated", other.tag()),
     }
 }
@@ -222,6 +245,15 @@ fn release_reply(success: bool, message: &str) -> ControlOutput {
     })
 }
 
+fn reload_reply(success: bool, message: &str) -> ControlOutput {
+    ControlOutput::ReloadForward(ReloadForwardReqOutput {
+        rid: None,
+        http_worker_ipc: None,
+        success,
+        message: message.to_owned(),
+    })
+}
+
 fn resume_memory_reply(success: bool, message: &str) -> ControlOutput {
     ControlOutput::ResumeMemoryOccupation(ResumeMemoryOccupationReqOutput {
         rid: None,
@@ -241,6 +273,14 @@ pub struct Controls {
     released: Vec<String>,
     /// A release was accepted and has not freed its regions or failed.
     release_pending: bool,
+    /// A forward reload was accepted and has not been answered.
+    reload_pending: bool,
+    /// The pending reload found the scheduler unpaused, so it resumes it.
+    resume_after_reload: bool,
+    /// The pending reload drained: the gate may run it once every rank's is.
+    reload_ready: bool,
+    /// When the pending reload gives up waiting, if it has a timeout.
+    reload_deadline: Option<Instant>,
     /// An `abort` pause still has to abort what runs.
     abort_all: bool,
     /// An `abort` or `wait` pause, or a release, still has to cancel the
@@ -286,6 +326,10 @@ impl Controls {
             drain: None,
             released: Vec::new(),
             release_pending: false,
+            reload_pending: false,
+            resume_after_reload: false,
+            reload_ready: false,
+            reload_deadline: None,
             abort_all: false,
             cancel_unscheduled: false,
             weight_ops: VecDeque::new(),
@@ -447,6 +491,50 @@ impl Controls {
         self.drain.take()
     }
 
+    /// The pending reload drained here; the gate runs it once every attention-DP rank's has.
+    pub fn mark_reload_ready(&mut self) {
+        self.reload_ready = true;
+    }
+
+    /// Whether a reload was accepted and not answered; the same on every replica member.
+    pub fn reload_pending(&self) -> bool {
+        self.reload_pending
+    }
+
+    /// Whether the pending reload drained here.
+    pub fn reload_ready(&self) -> bool {
+        self.reload_ready
+    }
+
+    /// Whether a pending reload's timeout passed by `now`; the replica agrees before it expires.
+    pub fn reload_timed_out(&self, now: Instant) -> bool {
+        self.reload_pending && self.reload_deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Give up the pending reload whose timeout passed on some replica member, and resume if it paused.
+    pub fn expire_reload(&mut self) {
+        if !self.reload_pending {
+            return;
+        }
+        let resume =
+            self.cancel_reload("timed out before it drained and every attention-DP engine held it");
+        if resume {
+            self.state = PauseState::Unpaused;
+            self.abort_all = false;
+            self.cancel_unscheduled = false;
+        }
+    }
+
+    /// The reload was answered: schedule again unless a pause preceded it.
+    pub fn finish_reload(&mut self) {
+        self.reload_pending = false;
+        self.reload_ready = false;
+        self.reload_deadline = None;
+        if std::mem::take(&mut self.resume_after_reload) {
+            self.state = PauseState::Unpaused;
+        }
+    }
+
     /// The pause reply of a finished `abort`/`wait` drain.
     pub fn finish_pause_drain(&mut self) {
         self.reply(pause_reply(true, ""));
@@ -595,6 +683,7 @@ impl Controls {
                 ));
             }
             ControlRequest::Profile(_) => return Effect::Profile,
+            ControlRequest::ReloadForward(op) => self.reload(op),
             op @ (ControlRequest::InitWeightsUpdateGroup(_)
             | ControlRequest::DestroyWeightsUpdateGroup(_)
             | ControlRequest::RebalanceExperts(_)) => self.weight_ops.push_back(op),
@@ -632,6 +721,10 @@ impl Controls {
             self.reply(pause_reply(false, "a pause is already in progress"));
             return;
         }
+        if self.reload_pending {
+            self.reply(pause_reply(false, "a forward reload is in progress"));
+            return;
+        }
         if mode == "keep" {
             self.state = PauseState::PausedAll;
             self.reply(pause_reply(true, ""));
@@ -641,6 +734,10 @@ impl Controls {
     }
 
     fn resume(&mut self) {
+        if self.reload_pending {
+            // The way out of a reload some attention-DP rank never received: it has not run yet.
+            self.cancel_reload("cancelled by continue_generation before it ran");
+        }
         if !self.released.is_empty() {
             self.reply(resume_reply(
                 false,
@@ -657,12 +754,27 @@ impl Controls {
                 self.release_pending = false;
                 self.reply(release_reply(false, "resumed before release drained"));
             }
+            Some(Drain::Reload) => unreachable!("cancel_reload took it"),
             None => {}
         }
         self.state = PauseState::Unpaused;
         self.abort_all = false;
         self.cancel_unscheduled = false;
         self.reply(resume_reply(true, ""));
+    }
+
+    /// Withdraw a reload that is still draining or waiting at the gate and answer it as failed; returns whether it would have resumed.
+    fn cancel_reload(&mut self, why: &str) -> bool {
+        if matches!(self.drain, Some(Drain::Reload)) {
+            self.drain = None;
+        }
+        self.weight_ops
+            .retain(|op| !matches!(op, ControlRequest::ReloadForward(_)));
+        self.reload_pending = false;
+        self.reload_ready = false;
+        self.reload_deadline = None;
+        self.reply(reload_reply(false, why));
+        std::mem::take(&mut self.resume_after_reload)
     }
 
     fn release(&mut self, tags: Option<&[String]>, refusal: Option<String>) {
@@ -689,8 +801,11 @@ impl Controls {
             let message = format!("tags already released: {already:?}");
             return fail(self, message);
         }
-        if self.drain.is_some() {
-            return fail(self, "a pause or release is already in progress".to_owned());
+        if self.drain.is_some() || self.reload_pending {
+            return fail(
+                self,
+                "a pause, release or reload is already in progress".to_owned(),
+            );
         }
         if self.state == PauseState::PausedAll && self.released.is_empty() {
             // Its drain would let the frozen requests run, and the wake
@@ -706,6 +821,50 @@ impl Controls {
         }
         self.release_pending = true;
         self.request_drain(false, Drain::Release(tags));
+    }
+
+    fn reload(&mut self, op: ReloadForwardReqInput) {
+        let refusal = if !self.config.allow_reload_forward {
+            Some(
+                "forward reload is off: it is a development operation; start the server with \
+                 --allow-reload-forward"
+                    .to_owned(),
+            )
+        } else if op.id.is_none() {
+            Some("reload_forward needs an id, the same on every engine it is sent to".to_owned())
+        } else if op
+            .timeout_s
+            .is_some_and(|timeout| !timeout.is_finite() || timeout < 0.0)
+        {
+            Some("reload_forward timeout_s must be a finite, non-negative number".to_owned())
+        } else if !matches!(op.mode.as_str(), "wait" | "abort") {
+            Some(format!(
+                "invalid reload mode: {:?}; use wait or abort",
+                op.mode
+            ))
+        } else if !self.released.is_empty() {
+            Some("memory is released; resume_memory_occupation before reloading".to_owned())
+        } else if self.drain.is_some() || self.reload_pending {
+            Some("a pause, release or reload is already in progress".to_owned())
+        } else if self.state == PauseState::PausedAll {
+            Some("a keep pause froze the scheduler; resume_scheduler before reloading".to_owned())
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            self.reply(reload_reply(false, &message));
+            return;
+        }
+        self.resume_after_reload = self.state == PauseState::Unpaused;
+        self.reload_pending = true;
+        self.reload_ready = false;
+        self.reload_deadline = op
+            .timeout_s
+            .map(|timeout| Instant::now() + Duration::from_secs_f64(timeout));
+        let abort = op.mode == "abort";
+        // Queued on arrival, so it keeps the frontend's order with the weight operations on every rank.
+        self.weight_ops.push_back(ControlRequest::ReloadForward(op));
+        self.request_drain(abort, Drain::Reload);
     }
 
     fn resume_memory(&mut self, tags: Option<&[String]>) -> Effect {
@@ -745,7 +904,8 @@ impl Controls {
 #[cfg(test)]
 mod tests {
     use ts_wire::control::{
-        PauseSchedulerReqInput, ReleaseMemoryOccupationReqInput, ResumeSchedulerReqInput,
+        PauseSchedulerReqInput, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        ResumeSchedulerReqInput,
     };
 
     use super::*;
@@ -773,6 +933,67 @@ mod tests {
         })
     }
 
+    fn rebalance() -> ControlRequest {
+        ControlRequest::RebalanceExperts(ts_wire::control::RebalanceExpertsReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })
+    }
+
+    fn reload(mode: &str) -> ControlRequest {
+        ControlRequest::ReloadForward(ReloadForwardReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            mode: mode.to_owned(),
+            modules: None,
+            id: Some("test".to_owned()),
+            timeout_s: None,
+        })
+    }
+
+    #[test]
+    fn a_reload_without_an_id_is_refused_and_one_past_its_timeout_expires() {
+        let mut controls = controls(false);
+        let ControlRequest::ReloadForward(mut op) = reload("wait") else {
+            unreachable!();
+        };
+        op.id = None;
+        controls.handle(ControlRequest::ReloadForward(op.clone()), None);
+        assert!(!controls.admit_blocked());
+        op.id = Some("late".to_owned());
+        op.timeout_s = Some(0.0);
+        controls.handle(ControlRequest::ReloadForward(op), None);
+        assert!(controls.admit_blocked());
+        assert!(controls.reload_timed_out(Instant::now()));
+        controls.expire_reload();
+        assert!(!controls.admit_blocked() && controls.weight_head().is_none());
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [
+                ("ReloadForwardReqOutput", false),
+                ("ReloadForwardReqOutput", false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reload_key_names_the_callers_id_or_else_the_request() {
+        let keyed = |id: Option<&str>, mode: &str| {
+            reload_key(&ReloadForwardReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                mode: mode.to_owned(),
+                modules: None,
+                id: id.map(str::to_owned),
+                timeout_s: None,
+            })
+        };
+        assert_eq!(keyed(Some("a"), "wait"), keyed(Some("a"), "abort"));
+        assert_ne!(keyed(Some("a"), "wait"), keyed(Some("b"), "wait"));
+        assert_ne!(keyed(None, "wait"), keyed(None, "abort"));
+        assert!(keyed(Some("a"), "wait") >= 0);
+    }
+
     fn successes(replies: &[ControlOutput]) -> Vec<(&'static str, bool)> {
         replies
             .iter()
@@ -784,6 +1005,8 @@ mod tests {
                     ControlOutput::ResumeMemoryOccupation(r) => r.success,
                     ControlOutput::UpdateWeightFromDisk(r) => r.success,
                     ControlOutput::UpdateWeightsFromMooncake(r) => r.success,
+                    ControlOutput::ReloadForward(r) => r.success,
+                    ControlOutput::RebalanceExperts(r) => r.success,
                     _ => true,
                 };
                 (reply.tag(), success)
@@ -796,6 +1019,7 @@ mod tests {
             memory_saver,
             memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
             l3_weight_version: None,
+            allow_reload_forward: true,
         })
     }
 
@@ -835,6 +1059,126 @@ mod tests {
         );
     }
 
+    /// Run the gate's part of a drained reload as the loop does, answering `success`.
+    fn complete_reload(controls: &mut Controls, success: bool) {
+        assert_eq!(controls.take_drain(), Some(Drain::Reload));
+        controls.mark_reload_ready();
+        let head = controls.weight_head().expect("the reload is queued");
+        assert_eq!(gate_code(head), Some(7));
+        assert!(wants_flush(head));
+        let op = controls.pop_weight_op().unwrap();
+        controls.reply(gated_reply(&op, success, String::new()));
+        controls.finish_reload();
+    }
+
+    #[test]
+    fn a_forward_reload_drains_waits_at_the_gate_and_resumes() {
+        let mut controls = controls(false);
+        controls.handle(reload("abort"), None);
+        assert!(controls.admit_blocked() && !controls.forward_blocked());
+        assert!(controls.take_abort_all() && controls.take_cancel_unscheduled());
+        assert!(controls.take_replies().is_empty());
+        // Nothing pauses, releases or reloads again while it is pending.
+        controls.handle(pause("wait"), None);
+        controls.handle(release(None), None);
+        controls.handle(reload("wait"), None);
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [
+                ("PauseSchedulerReqOutput", false),
+                ("ReleaseMemoryOccupationReqOutput", false),
+                ("ReloadForwardReqOutput", false)
+            ]
+        );
+        // A gated operation queues behind it, in arrival order on every rank.
+        controls.handle(rebalance(), None);
+        assert!(controls.take_replies().is_empty());
+        assert!(controls.admit_blocked() && !controls.reload_ready());
+        complete_reload(&mut controls, false);
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [("ReloadForwardReqOutput", false)]
+        );
+        // A failed reload still resumes: the old code serves on.
+        assert!(!controls.admit_blocked());
+        assert!(matches!(
+            controls.weight_head(),
+            Some(ControlRequest::RebalanceExperts(_))
+        ));
+    }
+
+    #[test]
+    fn a_resume_cancels_a_reload_still_draining_or_waiting_at_the_gate() {
+        let mut controls = controls(false);
+        controls.handle(reload("wait"), None);
+        controls.handle(resume(), None);
+        assert!(!controls.admit_blocked() && controls.drain().is_none());
+        controls.handle(reload("wait"), None);
+        assert_eq!(controls.take_drain(), Some(Drain::Reload));
+        controls.mark_reload_ready();
+        controls.handle(resume(), None);
+        assert!(!controls.admit_blocked() && controls.weight_head().is_none());
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [
+                ("ReloadForwardReqOutput", false),
+                ("ResumeSchedulerReqOutput", true),
+                ("ReloadForwardReqOutput", false),
+                ("ResumeSchedulerReqOutput", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_forward_reload_after_a_pause_leaves_the_scheduler_paused() {
+        let mut controls = controls(false);
+        controls.handle(pause("wait"), None);
+        assert_eq!(controls.take_drain(), Some(Drain::Pause));
+        controls.finish_pause_drain();
+        controls.handle(reload("wait"), None);
+        complete_reload(&mut controls, true);
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [
+                ("PauseSchedulerReqOutput", true),
+                ("ReloadForwardReqOutput", true)
+            ]
+        );
+        assert!(controls.admit_blocked());
+        controls.handle(resume(), None);
+        assert!(!controls.admit_blocked());
+    }
+
+    #[test]
+    fn a_forward_reload_is_refused_on_arrival_without_its_flag_or_under_a_freeze() {
+        let mut off = Controls::new(ControlConfig {
+            memory_saver: false,
+            memory_regions: Vec::new(),
+            l3_weight_version: None,
+            allow_reload_forward: false,
+        });
+        off.handle(reload("wait"), None);
+        // Refused before any drain: admission never stops.
+        assert!(!off.admit_blocked() && off.drain().is_none());
+        let mut on = controls(false);
+        on.handle(reload("now"), None);
+        on.handle(pause("keep"), None);
+        on.handle(reload("wait"), None);
+        assert!(on.drain().is_none());
+        assert_eq!(
+            successes(&off.take_replies())
+                .into_iter()
+                .chain(successes(&on.take_replies()))
+                .collect::<Vec<_>>(),
+            [
+                ("ReloadForwardReqOutput", false),
+                ("ReloadForwardReqOutput", false),
+                ("PauseSchedulerReqOutput", true),
+                ("ReloadForwardReqOutput", false)
+            ]
+        );
+    }
+
     fn mooncake_load(flush_cache: bool, weight_version: Option<&str>) -> ControlRequest {
         ControlRequest::UpdateWeightsFromMooncake(
             ts_wire::control::UpdateWeightsFromMooncakeReqInput {
@@ -854,6 +1198,7 @@ mod tests {
             memory_saver: false,
             memory_regions: Vec::new(),
             l3_weight_version: Some("v1".to_owned()),
+            allow_reload_forward: false,
         });
         // A flushed load without a version publishes the committed one's.
         assert_eq!(
