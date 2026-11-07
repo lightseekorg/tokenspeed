@@ -49,6 +49,7 @@ from test.runtime.cache_pool_test_utils import (  # noqa: E402
     specs_for_layers,
 )
 
+import tokenspeed.runtime.engine.rank_setup as rank_setup  # noqa: E402
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
@@ -353,6 +354,43 @@ def test_a_decode_server_demotes_no_checkpoint():
     cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
     assert not cfg.state_checkpoint_in_forward
     assert not cfg.demote_superseded_state_checkpoints
+
+
+def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatch):
+    # tokenspeed-scheduler 0.1.49 has neither field, so setting them would
+    # raise AttributeError: a prefill server with in-forward checkpoints on
+    # starts without the demotion and the short prompt-end drop instead.
+    class OldSchedulerConfig:
+        state_checkpoint_in_forward = False
+
+    warnings = []
+    monkeypatch.setattr(rank_setup, "SchedulerConfig", OldSchedulerConfig)
+    monkeypatch.setattr(
+        rank_setup, "logger", SimpleNamespace(warning=lambda *a: warnings.append(a))
+    )
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-transfer-backend",
+            "mooncake",
+            "--enable-state-checkpoint-in-forward",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    )
+    assert cfg.state_checkpoint_in_forward
+    # Read as such a wheel would hold them: absent, or left at their default.
+    assert not getattr(cfg, "demote_superseded_state_checkpoints", False)
+    assert not getattr(cfg, "drop_short_prompt_end_checkpoints", False)
+    assert len(warnings) == 2
+    assert "SchedulerConfig.demote_superseded_state_checkpoints" in warnings[0][0]
+    assert "SchedulerConfig.drop_short_prompt_end_checkpoints" in warnings[1][0]
 
 
 @pytest.mark.parametrize(
