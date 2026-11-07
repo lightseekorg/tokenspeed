@@ -193,7 +193,9 @@ public:
     std::size_t RunningSize() const;
     // P role, independent admission: computed prompts waiting for their
     // Decode destination (PrefillAwaitingDestination, a subset of
-    // PrefillSize(), not running), and the Device parents they pin.
+    // PrefillSize(), not running), and the Device parents in their block
+    // tables, counted as ActiveLcmBlocks() counts them; blocks held outside the
+    // tables (e.g. a pending in-forward State checkpoint) are not included.
     std::size_t AwaitingDestinationSize() const;
     std::int32_t AwaitingDestinationLcmBlocks() const;
     // Device pool parents that are empty or hold only unpinned cache entries.

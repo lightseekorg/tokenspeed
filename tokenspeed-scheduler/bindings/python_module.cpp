@@ -177,6 +177,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
+        // P role, required there and None elsewhere: Early admits a prompt
+        // once its Decode destination is allocated, Independent without
+        // waiting for it, holding only its KV transfer for the destination.
         .def_rw("decode_allocation_policy", &tokenspeed::SchedulerConfig::decode_allocation_policy)
         .def_prop_rw(
             "num_device_pages", [](const tokenspeed::SchedulerConfig& c) { return c.device_allocator.total_pages; },
@@ -742,6 +745,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Count RemotePrefilling requests; these are also included in prefilling_size().")
         .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
              "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
+        .def("awaiting_destination_size", &tokenspeed::Scheduler::AwaitingDestinationSize,
+             "P role, independent admission: count computed prompts waiting for their Decode destination "
+             "(PrefillAwaitingDestination); these are also included in prefilling_size() and pd_transfer_size().")
+        .def("awaiting_destination_lcm_blocks", &tokenspeed::Scheduler::AwaitingDestinationLcmBlocks,
+             "Device LCM blocks in the block tables of the prompts awaiting_destination_size() counts, counted "
+             "as active_lcm_blocks() counts them; blocks held outside the tables (e.g. a pending in-forward "
+             "State checkpoint) are not included.")
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)

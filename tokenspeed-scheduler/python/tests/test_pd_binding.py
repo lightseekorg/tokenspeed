@@ -179,6 +179,54 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(
     assert scheduler.available_lcm_blocks() == cfg.num_device_pages - 1
 
 
+def test_independent_prefill_counts_prompts_waiting_for_their_destination():
+    """Under independent decode allocation computed prompts wait for their
+    decode destination with their pages; the scheduler counts them and the
+    pages in their block tables."""
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Independent
+    cfg.prefix_granularity = 2
+    cfg.max_scheduled_tokens = 8
+    cfg.max_batch_size = 3
+    cfg.num_device_pages = 64
+    cfg.num_snapshot_pages = 1
+    cfg.disable_l2_cache = True
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=2,
+            total_pages=64,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    rids = ["oldest", "older", "newest"]
+    scheduler.submit_requests(
+        [make_spec(rid, [10 * i + 1, 10 * i + 2]) for i, rid in enumerate(rids)]
+    )
+    admitted = ExecutionEvent()
+    for rid in rids:
+        admitted.add_event(PD.BootstrappedEvent(rid))
+    scheduler.advance(admitted)
+    assert scheduler.next_execution_plan().forward[0].request_ids == rids
+    for rid in rids:
+        result = ForwardEvent.ExtendResult()
+        result.request_id, result.tokens = rid, [5]
+        scheduler.advance(ExecutionEvent().add_event(result))
+    assert scheduler.awaiting_destination_size() == 3
+    assert scheduler.awaiting_destination_lcm_blocks() == scheduler.active_lcm_blocks()
+
+    scheduler.advance(ExecutionEvent().add_event(PD.DestinationReadyEvent("older")))
+    handoff = scheduler.next_execution_plan().remote_decode
+    assert handoff is not None and list(handoff.request_ids) == ["older"]
+    assert scheduler.awaiting_destination_size() == 2
+    assert (
+        0 < scheduler.awaiting_destination_lcm_blocks() < scheduler.active_lcm_blocks()
+    )
+
+
 def test_execution_event_accepts_pd_events():
     """ExecutionEvent.add_event accepts PD events and returns self for chaining."""
     execution_event = ExecutionEvent()

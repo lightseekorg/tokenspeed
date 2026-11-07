@@ -153,7 +153,10 @@ const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
 /// for seconds -- and whenever the loop runs no request, so an engine that
 /// went idle reports none active at once. A count taken while idle is not kept:
 /// the first round after requests arrive takes a new one, so an engine that
-/// just took a burst does not report none active for the next 100 ms.
+/// just took a burst does not report none active for the next 100 ms. The
+/// prefill role's gauge of the pages its computed prompts hold while they
+/// wait for their decode destination walks those prompts' block tables, so
+/// it is throttled the same way, idle while no prompt waits.
 #[derive(Debug, Default)]
 struct ActivePages {
     /// The last count taken while requests ran, and when.
@@ -578,6 +581,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// prefill work to schedule, and whether it would decode this round.
     dp_wants_prefill: Vec<bool>,
     dp_has_decode_work: Vec<bool>,
+    /// P role: the pages of the computed prompts waiting for their decode
+    /// destination, reused across rounds as `active_pages` is.
+    awaiting_destination_pages: ActivePages,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -642,6 +648,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             rounds_since_prefill: 0,
             dp_wants_prefill: Vec::new(),
             dp_has_decode_work: Vec::new(),
+            awaiting_destination_pages: ActivePages::default(),
         }
     }
 
@@ -940,11 +947,27 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.config.kv_token_capacity,
             );
             match self.outputs.role() {
-                crate::output::Role::Prefill => metrics.record_prefill_queues(
-                    sizes.bootstrapping as i64,
-                    sizes.pd_transfer as i64,
-                    sizes.retracted as i64,
-                ),
+                crate::output::Role::Prefill => {
+                    // A walk of the waiting prompts' block tables, throttled
+                    // as the active count's is; none while no prompt waits.
+                    let none_waiting = sizes.awaiting_destination == 0;
+                    let awaiting_destination_pages =
+                        self.awaiting_destination_pages
+                            .read(Instant::now(), none_waiting, || {
+                                if none_waiting {
+                                    0
+                                } else {
+                                    scheduler.awaiting_destination_lcm_blocks()
+                                }
+                            });
+                    metrics.record_prefill_queues(
+                        sizes.bootstrapping as i64,
+                        sizes.pd_transfer as i64,
+                        sizes.retracted as i64,
+                        sizes.awaiting_destination as i64,
+                        i64::from(awaiting_destination_pages),
+                    );
+                }
                 crate::output::Role::Decode => metrics.record_decode_queues(
                     sizes.bootstrapping as i64,     // prealloc: waiting for the peer
                     sizes.remote_prefilling as i64, // kv_wait: waiting for its KV

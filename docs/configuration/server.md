@@ -1061,7 +1061,12 @@ on the prefill role, waiting for the decode side to allocate their KV pages —
 which the `#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned)`
 suffix also lists on its own. The Prometheus waiting gauge and the router
 load snapshot report the scheduler's narrower waiting count, without the
-bootstrapping share.
+bootstrapping share. Under
+`--disaggregation-decode-allocation-policy independent` a prefill request
+bootstraps only until the prefill server admits it, which does not wait for
+the decode allocation; a computed prompt then stays in the `prefill` share
+until its destination is allocated and its transfer starts
+([P/D admission](#pd-admission)).
 
 `tokenspeed:request_queue_time_seconds` is the Prometheus per-request
 queue-wait histogram (`--enable-metrics`): the wall time from a request's
@@ -1314,6 +1319,21 @@ carry the `model_name` and `app_key` labels:
 | `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode, except an interval with nothing for that peer; buckets span 1 ms to 60 s). |
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
+
+A prefill server under `--disaggregation-decode-allocation-policy
+independent` ([P/D admission](#pd-admission)) also reports its admission
+with the scheduler's metrics, which carry the `dp_rank` label too:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `tokenspeed:num_prefill_awaiting_destination_reqs` | Gauge | Prompts computed and waiting for their decode destination, with their pages and request slot. `tokenspeed:num_prefill_inflight_queue_reqs`, the prefill requests whose pages a transfer pins, counts them too. |
+| `tokenspeed:num_prefill_awaiting_destination_pages` | Gauge | KV pages in those prompts' block tables, counted as `tokenspeed:num_free_tokens` counts pages; blocks held outside the tables (such as a pending in-forward State checkpoint) are not included. |
+
+Under `independent`, `tokenspeed:num_prefill_prealloc_queue_reqs` counts the
+requests the prefill server has not admitted yet, and an admitted request not
+yet computed counts in `tokenspeed:num_requests_waiting`. A computed prompt
+waiting for its destination takes no batch row: `tokenspeed:num_requests_inflight`
+counts it, `tokenspeed:num_requests_running` does not.
 
 ## TokenSpeed-specific runtime knobs
 

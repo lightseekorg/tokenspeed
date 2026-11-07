@@ -212,6 +212,29 @@ class EngineMetrics:
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
+        self.num_prefill_awaiting_destination_reqs = factory.gauge(
+            name="tokenspeed:num_prefill_awaiting_destination_reqs",
+            documentation=(
+                "Prefill requests computed and waiting for their decode "
+                "destination (--disaggregation-decode-allocation-policy "
+                "independent); tokenspeed:num_prefill_inflight_queue_reqs "
+                "counts them too."
+            ),
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+        )
+        self.num_prefill_awaiting_destination_pages = factory.gauge(
+            name="tokenspeed:num_prefill_awaiting_destination_pages",
+            documentation=(
+                "KV pages in the block tables of the prefill requests waiting "
+                "for their decode destination, counted as "
+                "tokenspeed:num_free_tokens counts pages; blocks held outside "
+                "the tables (such as a pending in-forward State checkpoint) "
+                "are not included."
+            ),
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+        )
         self.num_decode_prealloc_queue_reqs = factory.gauge(
             name="tokenspeed:num_decode_prealloc_queue_reqs",
             documentation="Decode requests waiting for their prefill peer to connect.",
@@ -530,13 +553,25 @@ class EngineMetrics:
         )
 
     def record_prefill_queues(
-        self, *, prealloc: int, inflight: int, retracted: int
+        self,
+        *,
+        prealloc: int,
+        inflight: int,
+        retracted: int,
+        awaiting_destination: int,
+        awaiting_destination_pages: int,
     ) -> None:
         if not self.enabled:
             return
         self.num_prefill_prealloc_queue_reqs.labels(**self.labels).set(max(prealloc, 0))
         self.num_prefill_inflight_queue_reqs.labels(**self.labels).set(max(inflight, 0))
         self.num_retracted_queue_reqs.labels(**self.labels).set(max(retracted, 0))
+        self.num_prefill_awaiting_destination_reqs.labels(**self.labels).set(
+            max(awaiting_destination, 0)
+        )
+        self.num_prefill_awaiting_destination_pages.labels(**self.labels).set(
+            max(awaiting_destination_pages, 0)
+        )
 
     def record_decode_queues(
         self, *, prealloc: int, kv_wait: int, transfer: int, retracted: int
