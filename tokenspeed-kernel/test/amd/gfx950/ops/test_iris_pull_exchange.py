@@ -404,6 +404,57 @@ def test_pull_combine_matches_nccl_all_to_all_then_combine():
     mp.spawn(_combine_worker, args=(port,), nprocs=8, join=True)
 
 
+def _heap_room_worker(rank: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=180),
+    )
+    group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+    from tokenspeed_kernel.ops.communication._iris import (
+        MIN_HEAP_BYTES,
+        get_or_create_context,
+    )
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+        prepare_k3_communication,
+    )
+
+    prepare_k3_communication(
+        group=group,
+        rank_in_group=rank,
+        staged_max_numel=1024,
+        producer_direct_max_numel=1024,
+        attnres_max_numel=0,
+        attnres_max_rows=0,
+        enable_lamport=False,
+        sharded_max_rows=0,
+        dtype=torch.bfloat16,
+        device=device,
+        all_reduce=None,
+        pull_exchange_max_bytes=200 << 20,
+    )
+    # Collectives created later (a drafter's fused all-reduce) allocate from
+    # the room the base heap leaves, which the exchange must not take.
+    get_or_create_context(heap_size=0).zeros((MIN_HEAP_BYTES // 2,), dtype=torch.uint8)
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4 or torch.cuda.device_count() < 2,
+    reason="requires two CDNA4 GPUs",
+)
+def test_a_pull_exchange_leaves_the_heap_room_for_other_collectives():
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_heap_room_worker, args=(port,), nprocs=2, join=True)
+
+
 @pytest.mark.skipif(not current_platform().is_cdna4, reason="requires CDNA4")
 @pytest.mark.parametrize("world, largest", [(2, 2**31 - 16), (8, 2**30 - 16)])
 def test_pull_exchange_refuses_buffers_past_its_32bit_offsets(world, largest):

@@ -1052,17 +1052,21 @@ def prepare_k3_communication(
             total_bytes += ProducerLamport.heap_bytes(lamport_numel)
             if world_size == 8:
                 total_bytes += _k3_two_shot_heap_bytes(producer_direct_max_numel)
-    if pull_exchange_max_bytes:
-        total_bytes += IrisPullExchange.heap_bytes(pull_exchange_max_bytes, world_size)
     sharded_bytes = (
         IrisAllReduceShardedState.heap_bytes(sharded_max_rows, world_size, dtype)
         if sharded_max_rows
         else 0
     )
+    pull_exchange_bytes = (
+        IrisPullExchange.heap_bytes(pull_exchange_max_bytes, world_size)
+        if pull_exchange_max_bytes
+        else 0
+    )
     # Preserve the base heap's headroom for other collective operations.
     ctx = get_or_create_context(
         heap_size=max(MIN_HEAP_BYTES, total_bytes + HEAP_HEADROOM_BYTES)
-        + sharded_bytes,
+        + sharded_bytes
+        + pull_exchange_bytes,
     )
     if all_reduce is None:
         all_reduce = IrisAllReduce(
