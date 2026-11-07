@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -47,6 +48,8 @@ public:
     TokenContainer& operator=(const TokenContainer&) = delete;
 
     void Extend(const std::vector<std::int32_t>& new_tokens);
+    // Back to the prompt: every token after it is dropped.
+    void DropGeneratedTokens() { tokens_.resize(static_cast<std::size_t>(num_prefill_tokens_)); }
 
     std::vector<std::span<const std::int32_t>> FullPrefixPages(std::int32_t prefix_granularity, bool except_last) const;
     // Full prefix pages [first_page, past_end_page), all of them complete.

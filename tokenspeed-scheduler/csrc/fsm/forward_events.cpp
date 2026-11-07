@@ -189,6 +189,23 @@ Finished AbortEvent::operator()(Restoring&& state) {
 }
 
 template <typename State>
+Submitted RequeueEvent::requeue(State&& state) {
+    _assert(coordinator_ != nullptr, "RequeueEvent requires a cache coordinator");
+    _assert(state.resources.results_in_flight == 0, "a requeued prompt has no forward in flight");
+    FreeRequest(*coordinator_, state.resources.block_tables);
+    state.resources.token_container->DropGeneratedTokens();
+    return Submitted{state.resources.token_container, state.resources.prefix_granularity};
+}
+
+Submitted RequeueEvent::operator()(Prefilling&& state) {
+    return requeue(std::move(state));
+}
+
+Submitted RequeueEvent::operator()(PrefillAwaitingDestination&& state) {
+    return requeue(std::move(state));
+}
+
+template <typename State>
 Retracted SnapshotRetractEvent::retract(State&& state, ResumeShape shape) {
     _assert(coordinator_ != nullptr, "SnapshotRetractEvent requires a cache coordinator");
     _assert(state.resources.results_in_flight == 0, "a retraction victim must be quiescent");

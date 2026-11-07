@@ -108,6 +108,8 @@ const MAX_SCHEDULED_TOKENS: usize = 256;
 enum Tiers {
     /// None: no op ever needs an acknowledgment.
     DeviceOnly,
+    /// `DeviceOnly` on 64 usable Full blocks.
+    SmallDevice,
     /// A retraction snapshot pool, with a retraction forced every few plans.
     ForcedRetraction,
     /// A Host L2 tier that published prefixes are written back to.
@@ -125,7 +127,7 @@ enum Tiers {
 
 /// The scheduler over `tiers` for `role`, its KV cache split over
 /// `kv_shard_count` shards: an LCM block then packs one Full block per
-/// shard, so the Device keeps 512 usable Full blocks (64 on
+/// shard, so the Device keeps 512 usable Full blocks (64 on `SmallDevice` and
 /// `HostL2WriteBackForcedRetraction`) and a tier with Host pages 1024, the
 /// counts the tests' numbers rely on.
 fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize, independent: bool) -> Scheduler {
@@ -138,6 +140,7 @@ fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize, independent: b
     };
     let tiers = match tiers {
         Tiers::DeviceOnly => "",
+        Tiers::SmallDevice => "cfg.num_device_pages = 64 // cfg.cache_groups[0].shard_count + 1",
         Tiers::ForcedRetraction => {
             "cfg.num_snapshot_pages = 65\n\
              cfg.max_retracted_requests = 8\n\
@@ -317,6 +320,9 @@ struct FakeDevice {
     device_ops: Arc<Mutex<Vec<String>>>,
     /// Results published after the control plane's all-rank agreement.
     weight_commits: Arc<Mutex<Vec<bool>>>,
+    /// Per request, the weights its first computation and its latest ran under:
+    /// the weight updates committed before each.
+    forward_weights: HashMap<String, (usize, usize)>,
     /// Inject a local loading failure while other ranks succeed.
     fail_weight_update: bool,
     /// The rank's load prerequisites refuse (weights released, KV still
@@ -400,8 +406,13 @@ struct WireRoom {
     decode_registered: bool,
     /// The decode engine admitted the pages, in this slot.
     preallocated: Option<i32>,
+    /// The decode engine admits the pages once this other room's KV was sent.
+    preallocated_once_sent: Option<u64>,
     /// The prefill engine sent the KV and this first token.
     sent: Option<i32>,
+    /// The weights the prefill engine sampled the first token under and
+    /// computed the KV sent under, as `FakeDevice::forward_weights` counts.
+    sent_weights: Option<(usize, usize)>,
     /// The prefill ranks that sent their part of the KV.
     sent_by: Vec<usize>,
     /// The transfer breaks.
@@ -459,7 +470,19 @@ impl TransferPeer for FakePeer {
             self.tracked
                 .iter()
                 .map(|(_, room, bootstrapped, _)| {
+                    let after = wire
+                        .rooms
+                        .get(room)
+                        .and_then(|room| room.preallocated_once_sent);
+                    let admits = after.is_some_and(|other| {
+                        wire.rooms
+                            .get(&other)
+                            .is_some_and(|other| other.sent.is_some())
+                    });
                     let room = wire.rooms.entry(*room).or_default();
+                    if admits {
+                        room.preallocated.get_or_insert(1);
+                    }
                     let poll = if room.fails
                         || room.cancel_pending
                         || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
@@ -721,12 +744,16 @@ impl DataPlane for FakeDevice {
                     self.generated.insert(rid.clone(), 1);
                 }
             }
-            if let Some(prompts) = plan.remote_decode() {
-                for rid in &prompts.request_ids {
-                    let first = 1000 + self.generated[rid] - 1;
+            // As the transfer peer does, the first token is the one the
+            // remote decode carries.
+            if let Some(prompts) = plan.remote_decode_transfer() {
+                for (rid, &first) in prompts.request_ids.iter().zip(&prompts.decode_input_ids) {
                     let room = wire.rooms.entry(self.rooms[rid]).or_default();
                     room.sent = Some(first);
                     room.sent_by.push(self.rank);
+                    // A requeued prompt's first token is its first
+                    // computation's.
+                    room.sent_weights = self.forward_weights.get(rid).copied();
                 }
             }
         }
@@ -735,7 +762,18 @@ impl DataPlane for FakeDevice {
         };
         thread::sleep(FORWARD_TIME);
         let mut result = ForwardResult::default();
+        let weights = self
+            .weight_commits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&committed| committed)
+            .count();
         for (i, rid) in batch.request_ids.iter().enumerate() {
+            self.forward_weights
+                .entry(rid.clone())
+                .or_insert((weights, weights))
+                .1 = weights;
             let mid_chunk = i < batch.num_extends
                 && batch.extend_prefix_lens[i] + batch.input_lengths[i] < batch.prefill_lengths[i];
             let token = if self.placeholder_stage {
@@ -3561,6 +3599,80 @@ fn an_independent_prefill_keeps_its_kv_until_the_destination_is_allocated() {
             wire.rooms[&9].preallocated.is_none() && wire.rooms[&9].sent.is_none(),
             "depth {depth}"
         );
+    }
+}
+
+#[test]
+fn a_requeued_independent_prefill_sends_the_token_it_sampled_first() {
+    // "waiting" is computed and waits for its destination, which comes only
+    // once "granted"'s KV went out; "granted", allocated at once, does not
+    // fit beside it in 64 blocks. So "waiting" is requeued, "granted" is
+    // computed and sent, and "waiting" is computed again: its new sample is
+    // dropped, and its KV goes out with the token it sampled first. A trainer
+    // retries a flushing weight load every round from "granted"'s arrival
+    // on: none lands before "waiting"'s KV went out, so that token and that
+    // KV come from the same weights.
+    for depth in [0, 1] {
+        let wire = Arc::new(Mutex::new(Wire {
+            prefill_ranks: 1,
+            ..Wire::default()
+        }));
+        {
+            let mut wire = wire.lock().unwrap();
+            wire.rooms.entry(12).or_default().preallocated = Some(1);
+            wire.rooms.entry(11).or_default().preallocated_once_sent = Some(12);
+        }
+        let mut script = vec![Vec::new(); 80];
+        script[0].push(EngineRequest::Add(Box::new(disaggregated(
+            "waiting", 11, 800, 4,
+        ))));
+        script[10].push(EngineRequest::Add(Box::new(TokenizedGenerateReqInput {
+            input_ids: Some((5001..=5400).collect()),
+            ..disaggregated("granted", 12, 400, 4)
+        })));
+        for round in script.iter_mut().skip(10) {
+            round.push(EngineRequest::Control(Box::new(disk_load())));
+        }
+        let rank = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::SmallDevice,
+            Setup {
+                pd: Some(Pd {
+                    role: Role::Prefill,
+                    wire: wire.clone(),
+                }),
+                independent_admission: true,
+                ..Setup::default()
+            },
+            vec![script],
+            no_reaction,
+        )
+        .remove(0);
+        assert_eq!(rank.outcome, Ok(()), "depth {depth}");
+        assert!(
+            rank.replies.iter().any(
+                |reply| matches!(reply, ControlOutput::UpdateWeightFromDisk(out) if out.success)
+            ),
+            "depth {depth}"
+        );
+        let wire = wire.lock().unwrap();
+        assert_eq!(wire.rooms[&12].sent, Some(1000), "depth {depth}");
+        assert_eq!(wire.rooms[&11].sent, Some(1000), "depth {depth}");
+        for room in [11, 12] {
+            assert_eq!(
+                wire.rooms[&room].sent_weights,
+                Some((0, 0)),
+                "depth {depth}"
+            );
+        }
+        let waiting: Vec<i32> = rank
+            .outputs
+            .iter()
+            .filter(|output| output.rid == "waiting")
+            .flat_map(|output| output.output_ids.clone())
+            .collect();
+        assert_eq!(waiting, [1000], "depth {depth}");
     }
 }
 

@@ -90,6 +90,14 @@ public:
     bool DestinationReady() const { return destination_ready_; }
     void MarkDestinationReady() { destination_ready_ = true; }
 
+    // P role: requeued (fsm::RequeueEvent) after its final chunk sampled the
+    // first token, which the runtime keeps and sends with the KV of the next
+    // computation; true until that computation's token lands or the request
+    // ends. A flush -- a weight update -- in between would pair a token of the
+    // old weights with KV of the new, so every flush refuses meanwhile
+    // (Scheduler::CanClearCache), though the prompt holds no pages.
+    bool RequeuedAfterSampling() const { return requeued_after_sampling_; }
+
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
     // thrash -- its readmission must take back exactly what the retraction
@@ -139,9 +147,16 @@ public:
                       std::same_as<std::remove_cvref_t<Event>, fsm::ScheduleRestoreEvent>) {
             generated_tokens_at_admission_ = GeneratedTokens();
         }
+        // A requeue drops the sampled token, so it is read first.
+        if constexpr (std::same_as<std::remove_cvref_t<Event>, fsm::RequeueEvent>) {
+            requeued_after_sampling_ = requeued_after_sampling_ || HasGeneratedOutput();
+        }
         state_ = std::visit(
             [&event](auto&& state) -> fsm::State { return fsm::ToState(std::forward<Event>(event)(std::move(state))); },
             std::move(state_));
+        if (HasGeneratedOutput() || Is<fsm::Finished>()) {
+            requeued_after_sampling_ = false;
+        }
     }
 
     template <typename State>
@@ -371,6 +386,7 @@ private:
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
     bool destination_ready_{false};
+    bool requeued_after_sampling_{false};
     std::int32_t prefix_granularity_{};
     std::optional<std::vector<std::string>> prompt_prefix_hashes_{};
     std::vector<std::uint64_t> kv_event_block_hashes_;

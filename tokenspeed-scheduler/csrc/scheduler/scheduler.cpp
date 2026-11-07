@@ -230,7 +230,9 @@ bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
-    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
+    const bool has_sampled_requeues = std::ranges::any_of(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->RequeuedAfterSampling(); });
+    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0 || has_sampled_requeues) {
         return false;
     }
     return coordinator_.CacheIsClearable(include_host);
@@ -246,14 +248,21 @@ bool Scheduler::clearCache(bool include_host) {
     // continues from those bytes once restored, so a flush (a weight update)
     // under it would resume old-weight KV under new weights. Its L2 leg is
     // pinned and would refuse the Host clear by itself; its snapshot-pool leg
-    // is not indexed anywhere, so the suspended set is checked directly.
+    // is not indexed anywhere, so the suspended set is checked directly. A P
+    // prompt requeued after sampling its first token holds no pages either,
+    // but the runtime sends that token with the KV of its next computation
+    // (Request::RequeuedAfterSampling).
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
     const std::size_t suspended = RetractedSize();
-    if (has_pd_transfers || has_tier_transfers || suspended > 0) {
-        spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
-                     include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
+    const bool has_sampled_requeues = std::ranges::any_of(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->RequeuedAfterSampling(); });
+    if (has_pd_transfers || has_tier_transfers || suspended > 0 || has_sampled_requeues) {
+        spdlog::info(
+            "[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={} "
+            "sampled_requeues={}",
+            include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended, has_sampled_requeues);
         return false;
     }
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
