@@ -709,9 +709,10 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
             assert lent.dtype == q.dtype
             assert torch.equal(lent.view(torch.uint8), token_major)
             wide = q.to(torch.bfloat16)
+            wide_rank_major = gather_query_heads_rank_major(wide, group)
             assert torch.equal(
-                gather_query_heads_lent(wide, group).view(torch.uint8),
-                gather_query_heads(wide, group).view(torch.uint8),
+                gather_query_heads_lent(wide, group),
+                wide_rank_major.permute(1, 0, 2, 3).reshape(wide.shape[0], -1, 576),
             )
             # 48 heads x 2 ranks = 96, like K3.1's 12 x KVP8; trtllm-gen runs 96 as 128.
             wide_heads = 48

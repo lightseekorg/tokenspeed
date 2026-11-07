@@ -932,6 +932,11 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     monkeypatch.setattr(dsa, "dsa_decode", decode)
     monkeypatch.setattr(dsa, "combine_attention_partials", combine)
     monkeypatch.setattr(dsa, "dsa_decode_dcp_records_supported", supported)
+    monkeypatch.setattr(
+        dsa,
+        "dsa_decode_dcp_records_workspace_bytes",
+        lambda **_: 4 * query_width * 2 * 65 * 4,
+    )
     monkeypatch.setattr(dsa, "gather_query_heads_rank_major", gather_rank_major)
     monkeypatch.setattr(dsa, "dsa_decode_dcp_records", records_core)
     monkeypatch.setattr(dsa, "combine_attention_records", combine_records)
