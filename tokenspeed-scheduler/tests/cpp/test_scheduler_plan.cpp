@@ -1622,6 +1622,41 @@ TEST_F(MixedPrefillDecodeIntervalSuite, ADeferredPromptJoinsNoDecodeRound) {
     EXPECT_EQ(Round(), "P:ba");  // the mixed round: prefill rows first
 }
 
+// Ten pages: few enough that a running decode runs out of pages while a
+// prompt waits.
+class MixedPrefillDecodeIntervalCapacitySuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        cfg.prefill_decode_interval = 4;
+        cfg.max_scheduled_tokens = 8;
+        cfg.device_allocator.total_pages = 10;
+        cfg.cache_groups.front().total_pages = 10;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantAdmittedPromptIsNotHeldBackThatRound) {
+    Submit({MakeRequestSpec("c", 1, /*start=*/300), MakeRequestSpec("e", 1, /*start=*/500), MakeRequestSpec("a", 2)});
+    EXPECT_EQ(Round(), "P:cea");
+    Submit(MakeRequestSpec("b", 4, /*start=*/100));
+    EXPECT_EQ(Round(), "D:cea");
+    EXPECT_EQ(Round(), "D:cea");
+    // The interval still owes this round, but a's next page does not fit:
+    // the scheduler retracts a and grants its pages to b, whose first chunk
+    // runs beside the decodes and starts a new interval.
+    EXPECT_EQ(Round({"b"}), "P:bce");
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    SendFinish("e");  // frees the pages b's next chunk needs
+    // b has been held back two rounds, not three: the new interval holds its
+    // next chunk for two more.
+    EXPECT_EQ(Round(), "D:c");
+    EXPECT_EQ(Round(), "D:c");
+    EXPECT_EQ(Round(), "P:bc");
+}
+
 TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole) {
     const auto config = [](Role role, std::int32_t interval) {
         SchedulerConfig cfg{};
