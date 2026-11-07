@@ -33,6 +33,7 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    BLOCKWISE_LOGPROB_ORDERS,
     DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
     LOGPROB_ORDERS,
@@ -2188,7 +2189,7 @@ class ServerArgs:
         # The trainer's router is softmax + topk(scores + bias) in torch.
         self.router_topk = "torch"
         # The trainer's logprobs come from its vocab-parallel cross-entropy.
-        if self.logprob_order not in ("blockwise", "blockwise-direct"):
+        if self.logprob_order not in BLOCKWISE_LOGPROB_ORDERS:
             self.logprob_order = "blockwise"
         # The trainer's grouped MLP applies the router weight inside the
         # activation and folds a token's slots in fp32 slot order.
@@ -4555,11 +4556,13 @@ class ServerArgs:
             "sum(exp) over fixed 32768-wide vocab blocks folded in block "
             "order), returning -(log(sum_exp) - target). 'blockwise-direct': "
             "the same reduction, returning target - log(sum_exp). "
+            "Suffix either with -16384 to select 16384-wide blocks, "
+            "independently of serving TP. "
             "Requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
             "logprobs only, never the sampled tokens. Folded to blockwise by "
             "--numerics rl-bitwise, overriding an explicit torch; an explicit "
-            "blockwise-direct is preserved.",
+            "blockwise form and block width are preserved.",
         )
         parser.add_argument(
             "--moe-combine-order",

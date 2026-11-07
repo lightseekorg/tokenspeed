@@ -2789,24 +2789,99 @@ def clean_logits(values, lengths, table, pages, capacity, page_size):
 
 
 @triton.jit(
-    do_not_specialize=["L0", "N", "CAP"],
+    do_not_specialize=["X0", "L0", "T0", "S0", "TC", "NP"],
 )
-def _dense_ranges(L, START, END, L0, N, CAP, B: tl.constexpr):
+def _mask_invalid_pages(
+    X, L, T, S, X0, L0, T0, S0, TC, NP, P: tl.constexpr, B: tl.constexpr
+):
+    # One program per query row, looping only over its live pages.
+    row = tl.program_id(0).to(tl.int64)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), TC * P)
+    # The row's history starts at packed key column S[row], i.e. page S[row] / P
+    # of the flattened history page list.
+    base = tl.load(S + row * S0).to(tl.int64) // P
+    for first in range(0, tl.cdiv(end, P), B):
+        page_index = first + tl.arange(0, B)
+        live = page_index * P < end
+        page = tl.load(T + (base + page_index) * T0, live, other=0).to(tl.int64)
+        invalid = live & ((page < 0) | (page >= NP))
+        # Normally every live page is valid and nothing is written.
+        if tl.max(invalid.to(tl.int32), axis=0) > 0:
+            column = page_index[:, None] * P + tl.arange(0, P)[None, :]
+            value = tl.full((B, P), float("-inf"), X.dtype.element_ty)
+            tl.store(X + row * X0 + column, value, invalid[:, None] & (column < end))
+
+
+def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size):
+    """Set logits of invalid pages in [0, length) to -inf in place.
+
+    values is [rows, >= width * page_size] with unit column stride, where
+    history_pages is the flattened [histories * width] page list of the packed
+    dense keys and starts holds each row's packed key start (history * width *
+    page_size). Rows of one history share its page row, so the table is read
+    per history, not per row. Columns at or beyond length are left untouched:
+    consumers read [0, length). Unlike clean_logits, nothing is copied.
+    Returns values.
+    """
+    if (
+        values.ndim != 2
+        or values.stride(1) != 1
+        or values.shape[0] != lengths.numel()
+        or starts.numel() != lengths.numel()
+        or history_pages.ndim != 1
+    ):
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
+    width = values.shape[1] // page_size
+    if values.shape[0] and width:
+        _mask_invalid_pages[(values.shape[0],)](
+            values,
+            lengths,
+            history_pages,
+            starts,
+            values.stride(0),
+            lengths.stride(0),
+            history_pages.stride(0),
+            starts.stride(0),
+            width,
+            pages,
+            page_size,
+            256,
+            num_warps=4,
+        )
+    return values
+
+
+@triton.jit(
+    do_not_specialize=["L0", "O0", "N", "CAP"],
+)
+def _dense_ranges(L, OFFSET, START, END, L0, O0, N, CAP, B: tl.constexpr):
     row = tl.program_id(0) * B + tl.arange(0, B)
     length = tl.load(L + row * L0, row < N, other=0)
-    tl.store(START + row, 0, row < N)
-    tl.store(END + row, tl.minimum(tl.maximum(length, 0), CAP).to(tl.int32), row < N)
+    origin = tl.load(OFFSET + row * O0, row < N, other=0)
+    begin = tl.maximum(origin, 0).to(tl.int32)
+    span = tl.minimum(tl.maximum(length, 0), CAP).to(tl.int32)
+    tl.store(START + row, begin, row < N)
+    tl.store(END + row, begin + span, row < N)
 
 
-def dense_ranges(lengths, capacity):
+def dense_ranges(lengths, capacity, offsets=None):
+    """Exclusive [start, end) into packed keys; offsets default to 0 (one history)."""
     starts = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
     ends = torch.empty_like(starts)
     if lengths.numel():
+        packed = offsets
+        packed_stride = 0
+        if packed is None:
+            packed = torch.zeros(1, dtype=torch.int32, device=lengths.device)
+        else:
+            packed_stride = packed.stride(0)
         _dense_ranges[(triton.cdiv(lengths.numel(), 256),)](
             lengths,
+            packed,
             starts,
             ends,
             lengths.stride(0),
+            packed_stride,
             lengths.numel(),
             capacity,
             256,
@@ -3536,6 +3611,96 @@ def global_slots(rows, positions, requests, table, ratio, pages):
             ratio,
             pages,
             BLOCK=256,
+        )
+    return out
+
+
+@triton.jit(
+    do_not_specialize=["Q", "ROW0", "SS0", "LS0", "GS0"],
+    do_not_specialize_on_alignment=["Rows", "Logical", "Slots"],
+)
+def _prefill_indices_kernel(
+    Swa,
+    Logical,
+    Slots,
+    Rows,
+    Base,
+    Out,
+    Q,
+    ROW0,
+    SS0,
+    LS0,
+    GS0,
+    W: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_ROWS: tl.constexpr,
+):
+    q = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    live = q < Q
+    # Row and query offsets grow with the step's token count: compute in int64.
+    q64 = q.to(tl.int64)
+    if HAS_ROWS:
+        row = tl.load(Rows + q64, live, other=0).to(tl.int64)
+    else:
+        row = q64 + ROW0
+    out_row = Out + q64[:, None] * (W + K)
+
+    w = tl.arange(0, BLOCK_W)
+    w_mask = live[:, None] & (w[None, :] < W)
+    swa = tl.load(Swa + q64[:, None] * SS0 + w[None, :], w_mask, other=-1)
+    tl.store(out_row + w[None, :], swa.to(tl.int32), w_mask)
+
+    k = tl.arange(0, BLOCK_K)
+    k_mask = live[:, None] & (k[None, :] < K)
+    selected = tl.load(Logical + row[:, None] * LS0 + k[None, :], k_mask, other=-1)
+    slots = tl.load(Slots + row[:, None] * GS0 + k[None, :], k_mask, other=-1)
+    base = tl.load(Base + q64, live, other=0).to(tl.int64)
+    rows = tl.where(
+        (selected >= 0) & (slots >= 0), selected.to(tl.int64) + base[:, None], -1
+    )
+    tl.store(out_row + W + k[None, :], rows.to(tl.int32), k_mask)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_prefill_indices",
+    name="triton_dsv41_prefill_indices",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def prefill_indices(swa_indices, logical_rows, global_slots, rows, history_base):
+    """Join SWA and selected-history workspace rows into int32 attention indices."""
+    queries, window = swa_indices.shape
+    width = logical_rows.shape[1]
+    out = torch.empty(
+        (queries, window + width), dtype=torch.int32, device=swa_indices.device
+    )
+    if queries:
+        has_rows = not isinstance(rows, slice)
+        kernel_launcher(_prefill_indices_kernel, (triton.cdiv(queries, 8),))(
+            swa_indices,
+            logical_rows,
+            global_slots,
+            rows if has_rows else history_base,
+            history_base,
+            out,
+            queries,
+            0 if has_rows else rows.start,
+            swa_indices.stride(0),
+            logical_rows.stride(0),
+            global_slots.stride(0),
+            W=window,
+            K=width,
+            BLOCK_W=triton.next_power_of_2(window),
+            BLOCK_K=triton.next_power_of_2(width),
+            BLOCK_M=8,
+            HAS_ROWS=has_rows,
+            num_warps=4,
         )
     return out
 
@@ -4641,6 +4806,8 @@ register_triton_warmup(
 register_triton_warmup(
     _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
 )
+# Canonical windows pass a row slice, reordered subsets an index tensor.
+register_triton_warmup(_prefill_indices_kernel, variants=({"HAS_ROWS": (False, True)},))
 register_triton_warmup(
     _selection_table_kernel,
     variants=lambda args: ({"RATIO": tuple(sorted({1, args["RATIO"]}))},),

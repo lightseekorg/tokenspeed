@@ -66,6 +66,98 @@ def test_pd_event_fields_are_bound():
     assert event.request_id == "req-0"
 
 
+@pytest.mark.parametrize(
+    "terminal", ["success", "failure", "cancel_success", "cancel_failure"]
+)
+@pytest.mark.parametrize("pool_pages", [8, 12])
+def test_prefill_duplicate_sources_survive_until_pd_terminal(terminal, pool_pages):
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefix_granularity = 2
+    cfg.max_scheduled_tokens = 8
+    cfg.max_batch_size = 4
+    cfg.num_device_pages = pool_pages
+    cfg.num_snapshot_pages = 1
+    cfg.disable_l2_cache = True
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=2,
+            total_pages=pool_pages,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    scheduler.submit_requests([make_spec(rid, [1, 2, 3, 4]) for rid in ("a", "b")])
+    scheduler.advance(
+        ExecutionEvent()
+        .add_event(PD.BootstrappedEvent("a"))
+        .add_event(PD.BootstrappedEvent("b"))
+    )
+    first = scheduler.next_execution_plan().forward[0]
+    sources = {
+        rid: [int(p) for p in row if p > 0]
+        for rid, row in zip(first.request_ids, dict(first.block_tables)["history"])
+    }
+    assert set(sources["a"]).isdisjoint(sources["b"])
+    for rid in ("a", "b"):
+        result = ForwardEvent.ExtendResult()
+        result.request_id, result.tokens = rid, [5]
+        scheduler.advance(ExecutionEvent().add_event(result))
+    handoff = scheduler.next_execution_plan().remote_decode
+    actual = {
+        rid: [int(p) for p in row if p > 0]
+        for rid, row in zip(handoff.request_ids, dict(handoff.block_tables)["history"])
+    }
+    assert (
+        actual == sources
+    ), "prefix publication must not replace transfer source pages"
+    if terminal.startswith("cancel"):
+        abort = ForwardEvent.Abort()
+        abort.request_id = "b"
+        scheduler.advance(ExecutionEvent().add_event(abort))
+        assert scheduler.pd_transfer_size() == 2
+    scheduler.submit_requests([make_spec("c", [10, 11])])
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("c")))
+    later = scheduler.next_execution_plan().forward[0]
+    if pool_pages == 8:
+        assert (
+            not later.request_ids
+        ), "capacity pressure must wait instead of recycling a PD source"
+    else:
+        allocated = {
+            int(p) for row in dict(later.block_tables)["history"] for p in row if p > 0
+        }
+        assert allocated.isdisjoint(set(sources["a"] + sources["b"]))
+    for rid in ("a", "b"):
+        event = (
+            PD.SucceededEvent(rid)
+            if terminal.endswith("success")
+            else PD.FailedEvent(rid)
+        )
+        scheduler.advance(ExecutionEvent().add_event(event))
+    if pool_pages == 8:
+        later = scheduler.next_execution_plan().forward[0]
+        assert list(later.request_ids) == ["c"], "terminal ACK must unblock allocation"
+    scheduler.advance(ExecutionEvent().add_event(PD.FailedEvent("c")))
+    assert scheduler.active_lcm_blocks() > 0, "the local forward has not landed yet"
+    # Repeated cancellation after the terminal transfer event must not make
+    # retirement wait for another transfer event that will never arrive.
+    abort = ForwardEvent.Abort()
+    abort.request_id = "c"
+    scheduler.advance(ExecutionEvent().add_event(abort))
+    scheduler.advance(ExecutionEvent().add_event(abort))
+    result = ForwardEvent.ExtendResult()
+    result.request_id, result.tokens = "c", [12]
+    scheduler.advance(ExecutionEvent().add_event(result))
+    scheduler.next_execution_plan()
+    assert (
+        scheduler.active_lcm_blocks() == 0
+    ), "terminal requests must release every pin"
+    assert scheduler.available_lcm_blocks() == cfg.num_device_pages - 1
+
+
 def test_execution_event_accepts_pd_events():
     """ExecutionEvent.add_event accepts PD events and returns self for chaining."""
     execution_event = ExecutionEvent()
