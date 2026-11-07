@@ -406,6 +406,11 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     coordinator.Free(tables);
     // The owner is gone, but the ticket still holds the Device source: it is
     // neither evictable nor clearable until the runtime acknowledges the copy.
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication));
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish));
+    EXPECT_TRUE(transfers.HasPinnedStoresInFlight());
+    EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kFinish).ops, 1u);
+    EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kPublication).ops, 0u);
     EXPECT_FALSE(coordinator.ClearDeviceCache());
     std::vector<BlockTable> newcomer(1);
     std::vector<GroupDemand> newcomer_demands{{.table = &newcomer[0], .extent = DenseGrowth{2}}};
