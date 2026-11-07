@@ -890,12 +890,17 @@ def _kda_linear_attn_backend(
 def _gdn_linear_attn_backend(
     server_args: ServerArgs, config: AttnConfig
 ) -> AttentionBackend:
-    del server_args
     from tokenspeed.runtime.layers.attention.backends.state.gdn import (
         GdnAttnBackend,
     )
 
-    return GdnAttnBackend(config, config.component(SoftmaxAttnConfig))
+    return GdnAttnBackend(
+        config,
+        config.component(SoftmaxAttnConfig),
+        writes_state_checkpoints_in_forward=(
+            server_args.writes_state_checkpoints_in_forward
+        ),
+    )
 
 
 def _mamba2_linear_attn_backend(

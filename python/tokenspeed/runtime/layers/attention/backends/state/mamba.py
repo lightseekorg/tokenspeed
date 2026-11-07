@@ -210,7 +210,8 @@ class MambaForwardMetadata:
     # chunked scan's plan for them (its interval, buffer and the buffer row of
     # each checkpoint); None when the forward writes none. A MIXED forward
     # that runs its decode rows apart writes them through its extend rows'
-    # metadata alone (_prepare_mixed_verify_metadata).
+    # metadata alone (_prepare_mixed_verify_metadata). Capacity metadata may
+    # instead keep fixed slots here (``CapacityPrefillMetadata``).
     state_checkpoints: InForwardStateCheckpoints | None = None
     scan_state_checkpoints: GdnStateCheckpoints | None = None
     scan_checkpoint_rows: torch.Tensor | None = None
@@ -2063,14 +2064,18 @@ class MambaAttnBackend(AttentionBackend):
             checkpoints = self.forward_metadata.state_checkpoints
             if checkpoints is not None:
                 # The conv state at a checkpoint is the window of the
-                # conv's inputs just before it (oldest first).
+                # conv's inputs just before it (oldest first). The masked
+                # writer skips the -1 blocks of capacity metadata's unused
+                # checkpoint slots.
                 window = conv_states.shape[-1]
                 rows = checkpoints.token_index.unsqueeze(1) + torch.arange(
                     -window, 0, device=checkpoints.token_index.device
                 )
-                conv_states[
-                    checkpoints.blocks_by_group[self._state_group_for(layer_id)].long()
-                ] = (mixed_qkv[rows].transpose(1, 2).to(conv_states.dtype))
+                store_state_rows(
+                    mixed_qkv[rows].transpose(1, 2).unsqueeze(1),
+                    conv_states.unsqueeze(1),
+                    checkpoints.blocks_by_group[self._state_group_for(layer_id)],
+                )
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             if _prefill_conv_writes_qkv(
@@ -2232,7 +2237,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             # The final state goes to the live slot. Capacity metadata pads the
             # request dimension with -1 blocks whose dummy scan result the
-            # masked writer drops.
+            # masked writer drops; it skips unused checkpoint slots alike.
             store_state_rows(last_recurrent_state, ssm_states, state_out_blocks)
             if metadata.state_checkpoints is not None:
                 store_state_rows(

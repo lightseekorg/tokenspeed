@@ -21,11 +21,13 @@
 #include "integration_test_helper.h"
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 namespace tokenspeed::test {
 
@@ -735,6 +737,117 @@ TEST_F(SkewedGroupPrefillKvCacheEventTestSuite, RepublishedRunEmitsStoredParentF
         }
     }
     EXPECT_EQ(stored_order, chain_hashes);
+}
+
+// A full and a sliding group whose window (six tokens over four-token pages)
+// reaches one page back behind a page boundary, without a Host pool: a
+// retracted request's image rides the snapshot pool whole, and its restore
+// copies every slot back as a private copy. The knob retracts at plan 5.
+class SlidingWindowRestoreKvCacheEventTestSuite : public SchedulerKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
+        cfg.prefix_granularity = 4;
+        cfg.max_scheduled_tokens = 8;
+        // Twelve usable: r's six cache-only blocks beside o's six fill them.
+        // The startup bound charges r's 14-token limit a tail handover and
+        // the copy-in block beside it in each group.
+        cfg.device_allocator.total_pages = 13;
+        cfg.debug_force_retraction_interval = 5;
+        CacheGroupConfig& full = cfg.cache_groups.front();
+        full.block_granularity = cfg.prefix_granularity;
+        full.total_pages = cfg.device_allocator.total_pages;
+        CacheGroupConfig sliding = full;
+        sliding.group_id = "sliding";
+        sliding.attn_kind = AttnKind::kSlidingWindow;
+        sliding.sliding_window_tokens = cfg.prefix_granularity + 2;
+        cfg.cache_groups.push_back(std::move(sliding));
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Applies a drain to the boundaries the feed reports stored: a removal
+    // names one stored before, and none is stored twice.
+    void Drain() {
+        for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+            if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+                for (const std::uint64_t hash : removed->block_hashes) {
+                    EXPECT_EQ(stored_.erase(hash), 1u) << "a removal names a boundary never stored";
+                }
+                continue;
+            }
+            const auto& stored = std::get<KvBlockStoredEvent>(event);
+            EXPECT_TRUE(stored_.emplace(stored.block_hashes.front(), stored.token_ids).second)
+                << "a boundary is stored twice";
+        }
+    }
+    ExecutionPlan PlanAndDrain() {
+        ExecutionPlan plan = PlanOnce();
+        Drain();
+        return plan;
+    }
+    bool Stored(const std::vector<std::int32_t>& tokens) const {
+        return std::ranges::any_of(stored_, [&tokens](const auto& entry) { return entry.second == tokens; });
+    }
+
+    std::map<std::uint64_t, std::vector<std::int32_t>> stored_;
+};
+
+// r = [1..8] is retracted at frontier 11 (plan 5), leaving its published
+// blocks cached: both prompt pages and the tail [101 102 103], in both
+// groups. o = [200..207], admitted while r's image is in flight, takes the
+// six free blocks, so the restore (plan 7) funds its private copies by
+// evicting every one of those entries, and the drain drops their descriptors.
+// r's page completion at 12 (plan 9) publishes the window behind it, rows 7 to
+// 11: its private copy of page 1 goes into the index under page 1's hash,
+// whose descriptor that publication registers again.
+TEST_F(SlidingWindowRestoreKvCacheEventTestSuite,
+       APageCompletionAfterAPoolRestoreRegistersThePageItsWindowReachesBackInto) {
+    Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(8), .max_new_tokens = 6});
+    PlanAndDrain();  // plan 1: r's prefill
+    SendForwardDone("r", {101});
+    PlanAndDrain();  // plan 2: the first decode publishes both prompt pages
+    EXPECT_TRUE(Stored({1, 2, 3, 4}));
+    EXPECT_TRUE(Stored({5, 6, 7, 8}));
+    SendForwardDone("r", {102});
+    PlanAndDrain();
+    SendForwardDone("r", {103});
+    PlanAndDrain();
+    SendForwardDone("r", {104});
+    const ExecutionPlan retraction = PlanAndDrain();  // plan 5
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_TRUE(Stored({101, 102, 103}));
+
+    Submit(RequestSpec{.request_id = "o", .tokens = MakeTokens(8, 200), .max_new_tokens = 2});
+    ASSERT_EQ(FindForwardBatch(PlanAndDrain())->request_ids, std::vector<std::string>{"o"});  // plan 6
+    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 0);
+    ASSERT_TRUE(Stored({5, 6, 7, 8})) << "o's admission evicted nothing";
+    AckImageStores(retraction);
+    SendForwardDone("o", {300});
+    const ExecutionPlan readmit = PlanAndDrain();  // plan 7: the restore, beside o's first decode
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"r"});
+    for (const std::string& hash : restore->content_hashes.at(0)) {
+        EXPECT_TRUE(hash.empty()) << "every row is a private copy";
+    }
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0) << "no cache-only entry of r's is left";
+    EXPECT_FALSE(Stored({1, 2, 3, 4}));
+    EXPECT_FALSE(Stored({5, 6, 7, 8}));
+    EXPECT_FALSE(Stored({101, 102, 103}));
+    AckRestores(readmit);
+    Drain();
+    SendForwardDone("o", {301});
+    SendFinish("o");
+
+    ASSERT_EQ(FindForwardBatch(PlanAndDrain())->request_ids, std::vector<std::string>{"r"});  // plan 8
+    SendForwardDone("r", {105});
+    PlanAndDrain();  // plan 9
+    EXPECT_TRUE(Stored({101, 102, 103, 104}));
+    SendForwardDone("r", {106});
+    SendFinish("r");
+    PlanAndDrain();
+    EXPECT_EQ(scheduler_->RequestTokenSize("r"), -1);
 }
 
 TEST_F(SchedulerTestSuite, SubmitRequestsRejectsEmptyTokens) {
