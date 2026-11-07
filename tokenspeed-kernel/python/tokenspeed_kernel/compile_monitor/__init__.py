@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel._triton import _IS_NPU, triton
 
 if TYPE_CHECKING:
@@ -464,7 +465,7 @@ def install_compile_monitor(on_violation: OnViolation) -> None:
     _hooks = _Hooks(CompileMonitor(on_violation, UNBOUNDED_VALUE_LIMIT))
     triton.knobs.runtime.jit_cache_hook = _hooks.cache_hook
     triton.knobs.runtime.jit_post_compile_hook = _hooks.post_compile_hook
-    if importlib.util.find_spec("cutlass") is None:
+    if not has_optional_package("cutlass"):
         return
     try:
         # Imported here: it imports this package, and cutlass, which only

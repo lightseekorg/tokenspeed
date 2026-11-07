@@ -33,10 +33,10 @@ and validated on every call.
 
 from __future__ import annotations
 
-import importlib.util
 import math
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.kda._triton.prefill_scan_inputs import (
     prepare_capacity_scan,
@@ -65,7 +65,7 @@ def cutedsl_kda_supported() -> bool:
     return (
         platform.is_nvidia
         and platform.arch_version in _SUPPORTED_ARCHES
-        and importlib.util.find_spec("tokenspeed_cutedsl_kda") is not None
+        and has_optional_package("tokenspeed_cutedsl_kda")
     )
 
 
