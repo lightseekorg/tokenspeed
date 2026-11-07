@@ -37,12 +37,15 @@ namespace fsm {
 struct Bootstrapping;
 struct RemotePrefilling;
 struct Prefetching;
+struct PrefillAwaitingDestination;
 
 struct BootstrappedEvent : InvalidTransitionHandler<BootstrappedEvent> {
     using InvalidTransitionHandler<BootstrappedEvent>::operator();
 
     Submitted operator()(Bootstrapping&& state);
     Prefetching operator()(Prefetching&& state);
+    // P role: a computed prompt that waited for its destination sends its KV.
+    PrefillDone operator()(PrefillAwaitingDestination&& state);
 };
 
 struct SucceededEvent : InvalidTransitionHandler<SucceededEvent> {

@@ -99,6 +99,8 @@ def _config(
     cfg.overlap_schedule_depth = 1
     cfg.enable_mixed_prefill_decode = mixed
     cfg.role = role
+    if cfg.role == ts.SchedulerConfig.Role.P:
+        cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early
     groups = [
         ts.CacheGroupConfig(
             group_id=HISTORY,

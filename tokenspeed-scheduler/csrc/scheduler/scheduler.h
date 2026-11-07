@@ -130,6 +130,11 @@ public:
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
+    // P role, independent admission: computed prompts waiting for their
+    // Decode destination (PrefillAwaitingDestination, a subset of
+    // PrefillSize()), and the Device parents they pin.
+    std::size_t AwaitingDestinationSize() const;
+    std::int32_t AwaitingDestinationLcmBlocks() const;
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.

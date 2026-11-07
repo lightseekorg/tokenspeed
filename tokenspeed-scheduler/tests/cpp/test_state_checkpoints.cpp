@@ -983,6 +983,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateCheckpointInForwardSuite::MakeConfig();
         cfg.role = Role::kP;
+        cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot
                                                                         : CacheTransferPolicy::FullSuffix;
@@ -3503,6 +3504,8 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateCheckpointInForwardPrefillRoleSuite::MakeConfig();
         cfg.role = role_;
+        cfg.decode_allocation_policy =
+            role_ == Role::kP ? std::optional{SchedulerConfig::DecodeAllocationPolicy::kEarly} : std::nullopt;
         cfg.state_checkpoint_in_forward = in_forward_;
         cfg.device_allocator.total_pages = device_pages_;
         cfg.host_allocator.total_pages = host_pages_;

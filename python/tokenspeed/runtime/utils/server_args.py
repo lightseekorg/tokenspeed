@@ -802,6 +802,8 @@ class ServerArgs:
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     enable_external_encoder: bool = False
     disaggregation_mode: str = "null"
+    # Prefill role only; None resolves to "early" there (resolve_disaggregation).
+    disaggregation_decode_allocation_policy: str | None = None
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
@@ -2302,6 +2304,47 @@ class ServerArgs:
             raise ValueError(
                 "--enable-external-encoder requires aggregated or prefill serving"
             )
+        # Only the prefill role has a decode allocation policy. Omitted, it is
+        # early: a prompt waits for its Decode destination before it is
+        # admitted, as every prefill server did before the flag existed.
+        if self.disaggregation_mode == "prefill":
+            if self.disaggregation_decode_allocation_policy is None:
+                self.disaggregation_decode_allocation_policy = "early"
+            _require_choice(
+                "--disaggregation-decode-allocation-policy",
+                self.disaggregation_decode_allocation_policy,
+                ("early", "independent"),
+            )
+        elif self.disaggregation_decode_allocation_policy is not None:
+            raise ValueError(
+                "--disaggregation-decode-allocation-policy requires "
+                "--disaggregation-mode prefill"
+            )
+        if self.disaggregation_decode_allocation_policy == "independent":
+            # Experimental: one attention rank per prompt, no external
+            # encoder, and the KV sent from the computed prompt rather than
+            # streamed during its forward. Refused, never rewritten; a
+            # multimodal model is refused by the rank, which reads the model
+            # (HostBootstrap).
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("attention TP > 1", self.mapping.attn.tp_size > 1),
+                    ("--kv-parallel-size > 1", self.mapping.attn.kvp_size > 1),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                    ("--enable-external-encoder", self.enable_external_encoder),
+                    (
+                        "--disaggregation-layerwise-interval other than 0",
+                        self.disaggregation_layerwise_interval != 0,
+                    ),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    "--disaggregation-decode-allocation-policy independent does "
+                    f"not support {', '.join(unsupported)}"
+                )
         # PD disaggregation. The prefill role keeps the ordinary graph flags:
         # it never runs a decode step, so the decode graph has nothing to
         # capture (ModelExecutorConfig.prefill_only), while its extend
@@ -4727,6 +4770,22 @@ class ServerArgs:
             default="null",
             choices=["null", "prefill", "decode", "encode"],
             help='Used for PD/EPD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "encode" for a vision-tower-only server that ships image embeddings to a prefill server. If not specified, it is not disaggregated',
+        )
+        parser.add_argument(
+            "--disaggregation-decode-allocation-policy",
+            type=str,
+            choices=["early", "independent"],
+            default=ServerArgs.disaggregation_decode_allocation_policy,
+            help="Prefill servers only: what a request's Decode allocation "
+            "gates. 'early' (the default) starts the prefill once every Decode "
+            "rank has allocated the destination; 'independent' (experimental) "
+            "starts it at once and holds only its KV transfer until the "
+            "destination is allocated. independent requires attention TP 1, "
+            "--kv-parallel-size 1, --pipeline-parallel-size 1, no "
+            "--enable-external-encoder, --disaggregation-layerwise-interval 0 "
+            "and a model without multimodal input (or --language-model-only). "
+            "Refused with any other --disaggregation-mode; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--comm-fusion-max-num-tokens",

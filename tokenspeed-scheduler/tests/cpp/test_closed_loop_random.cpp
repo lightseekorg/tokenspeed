@@ -270,6 +270,8 @@ struct ClosedLoop {
         const std::int32_t packing = std::max(4, kv_shards);
         SchedulerConfig cfg{};
         cfg.role = role;
+        cfg.decode_allocation_policy =
+            role == Role::kP ? std::optional{SchedulerConfig::DecodeAllocationPolicy::kEarly} : std::nullopt;
         cfg.prefix_granularity = kP;
         cfg.device_allocator.total_pages = device_pages;
         cfg.host_allocator.total_pages = host_pages;
