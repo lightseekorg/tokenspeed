@@ -37,7 +37,7 @@ from tokenspeed_scheduler import StorageKind
 from transformers import Qwen3Config
 
 from tokenspeed.runtime.cache.host_storage import HostCacheResources, HostCacheStorage
-from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.cache.l3.factory import _kv_producer_options, l3_settings
 from tokenspeed.runtime.cache.transfer.layout import (
     CacheField,
     CacheGroupLayout,
@@ -231,6 +231,20 @@ def test_settings_include_the_draft_checkpoint_identity(construction, tmp_path):
     with_draft = l3_settings(args, model, draft, **factory_kwargs)
     assert not target_only.has_draft and with_draft.has_draft
     assert target_only.deployment_id != with_draft.deployment_id
+
+
+def test_settings_separate_the_qsa_bf16_prefill_scratch(construction):
+    args, model, _, factory_kwargs = construction
+    # Off, the producer facts are those of a build without the option, so
+    # existing deployments keep their identity.
+    assert "enable_qsa_prefill_bf16_scratch" not in _kv_producer_options(
+        args, draft_dtype=""
+    )
+    without = l3_settings(args, model, None, **factory_kwargs)
+    args.enable_qsa_prefill_bf16_scratch = True
+    with_scratch = l3_settings(args, model, None, **factory_kwargs)
+    # Large prefill calls attend through another kernel.
+    assert with_scratch.deployment_id != without.deployment_id
 
 
 def test_settings_refuse_head_partitioned_payload_on_cyclic_owners(construction):
