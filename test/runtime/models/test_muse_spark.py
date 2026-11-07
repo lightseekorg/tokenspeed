@@ -302,7 +302,10 @@ class _AddLayer(torch.nn.Module):
         super().__init__()
         self.value = value
         self.input_layernorm = f"norm{value}"
-        self.comm_manager = SimpleNamespace(gather_residual=lambda rows, ctx: rows)
+        self.comm_manager = SimpleNamespace(
+            gather_residual=lambda rows, ctx: rows,
+            needs_pre_attn_all_gather=lambda: False,
+        )
 
     def forward(
         self,
@@ -353,7 +356,7 @@ class _CaptureSink:
         self.captures.append((capture_idx, hidden))
 
 
-def _tapping_model(taps: list[int]):
+def _tapping_model(taps: list[int], with_sink: bool = True):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
@@ -366,26 +369,37 @@ def _tapping_model(taps: list[int]):
     sink = _CaptureSink()
     ctx = SimpleNamespace(
         forward_mode=SimpleNamespace(is_idle=lambda: False),
-        target_capture_sink=sink,
+        target_capture_sink=sink if with_sink else None,
     )
     return model, sink, ctx
 
 
-def test_forward_taps_the_residual_stream_after_each_draft_target_layer() -> None:
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_forward_taps_the_residual_stream_after_each_draft_target_layer(
+    with_sink,
+) -> None:
     # A draft names layer outputs; the last layer's output is the final stream.
-    model, sink, ctx = _tapping_model([2, 0])
-    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    model, sink, ctx = _tapping_model([2, 0], with_sink)
+    hidden = (torch.arange(6, dtype=torch.float32).reshape(2, 3) + 1 / 3) * 100
 
     out, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
 
-    after_layer_0 = (hidden + 1.0).to(torch.bfloat16)
-    final_stream = (hidden + 1.0 + 2.0 + 3.0).to(torch.bfloat16)
+    after_layer_0 = hidden + 1.0
+    final_stream = hidden + 1.0 + 2.0 + 3.0
+    if not with_sink:
+        # The collected taps are rounded to the model dtype.
+        after_layer_0 = after_layer_0.to(torch.bfloat16)
+        final_stream = final_stream.to(torch.bfloat16)
     assert len(aux) == 2
     torch.testing.assert_close(aux[0], after_layer_0, rtol=0, atol=0)
     # The final capture is the stream before the output norm.
     torch.testing.assert_close(aux[1], final_stream, rtol=0, atol=0)
-    torch.testing.assert_close(out, -final_stream)
-    # The sink receives each capture in draft order as soon as it is produced.
+    torch.testing.assert_close(out, -final_stream.to(torch.bfloat16))
+    if not with_sink:
+        assert sink.captures == []
+        return
+    # The sink receives each FP32 capture in draft order as soon as it is
+    # produced, and rounds what it keeps itself.
     assert [index for index, _ in sink.captures] == [0, 1]
     assert sink.captures[0][1] is aux[0] and sink.captures[1][1] is aux[1]
 
