@@ -201,9 +201,11 @@ capacity model (§1.4) states the same split.
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
 `holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
-prefill that is still incomplete. Nothing behind it is scheduled that round.
-A resident chunk that fails admission ends the prefill phases too: admitting
-anything behind it would strand it.
+prefill that is still incomplete. Nothing behind it is scheduled that round
+(on the P role, `prefill_chunk_yield_tokens` lets whole prompts complete
+beside it; see the end of this section). A resident chunk that fails
+admission ends the prefill phases too: admitting anything behind it would
+strand it.
 
 The reason is that per-chunk admission gives an in-progress prefill **no claim
 on the capacity it still needs**. Let a newcomer take pages while a prompt is
@@ -222,11 +224,14 @@ by whether the window reaches `PrefillSize()`), so a prompt scheduled in full
 never holds the line. A round can therefore carry **several prefills that
 complete this round plus at most one truncated one — and the truncated one is
 necessarily last**, because `holdsHeadOfLine` seals the phase the moment it
-appears. With 6K of budget left and prompts of 2K / 1K / 10K waiting, the
-round schedules the 2K and the 1K in full and the first 3K chunk of the 10K
-prompt, then stops. The same rule makes the finishing round of a chunked
-prefill cheap: its final chunk releases the line *within* the round, so the
-prompts queued behind it start in that round, not the next.
+appears; a chunk that gives way (below) is admitted before the whole prompts
+it carries, but its row moves behind theirs. The runtime relies on this order
+(`unified_path.md`, "Prefill requests without generated outputs"). With 6K of
+budget left and prompts of 2K / 1K / 10K waiting, the round schedules the 2K
+and the 1K in full and the first 3K chunk of the 10K prompt, then stops. The
+same rule makes the finishing round of a chunked prefill cheap: its final
+chunk releases the line *within* the round, so the prompts queued behind it
+start in that round, not the next.
 
 **Decodes are not part of the line.** In mixed mode the decode batch is built
 before the prefill phases and takes its token budget first (§3.3), so a round
@@ -235,6 +240,43 @@ Outside mixed mode, prefill and decode never share a round at all — decodes
 get the round only when no prefill scheduled, or ahead of the prefills while
 a prefill/decode interval is owed (§3.3) — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
+
+**A chunk that cannot finish may give way (P role, opt-in).** With
+`prefill_chunk_yield_tokens` N (`--prefill-chunk-yield-tokens`), a chunk that
+cannot finish its prompt this round — a resident's, or a new prompt's first —
+shares its forward with waiting bootstrapped prompts that fit whole. Once per
+round, `wholePromptsAfter` probes up to eight `Submitted` candidates (for a
+new prompt's chunk, only those behind it) the way admission would. A
+candidate qualifies when its first chunk could complete it: no eviction store
+pending on its prefix, no junction cut, no in-forward checkpoint spanned from
+inside a page, and — beside a resident chunk on a model with State groups —
+no page shared with what that chunk's admission is about to publish (its
+probe would be stale). What it takes is counted past its hit, replay
+included: a 100k-token prompt with 1k uncached tokens takes 1k.
+`carriedPrompts` keeps them in FIFO order while they fit N, the batch, the
+free request slots and, with `max_kv_page_num`, the page budget. The chunk
+then ends on the last page (with aligned State checkpoints, segment boundary)
+at least their total before the end of its budget (`YieldingChunkBudget`).
+Once it is admitted and keeps the head of line, `carryWholePrompts` admits
+each carried prompt only if its first chunk completes it on the budget left;
+the first capacity failure ends the fill. None of them holds the head of
+line, so the round is still *completing prefills + at most one truncated
+prefill*, and the truncated one still runs last: `carryWholePrompts` then
+moves its row behind the carried prompts', so the completing prefills form a
+prefix of the batch.
+
+The chunk gives way only while such prompts wait, and only what they take:
+fewer than N plus one page. N is at most half of `max_scheduled_tokens` (B),
+so with R = B - N - page + 1 the long prompt advances by at least
+`max(R, page)` tokens in every round it starts with the whole budget (a
+resident always does; a first chunk may find part of it spent by prompts
+admitted ahead of it), less a hit's replay window, and finishes U uncached
+tokens within `1 + ceil((U - B) / R)` such rounds. A final chunk never gives
+way. A resident chunk whose admission fails still blocks everything behind
+it, and the chunk that gave way is admitted first again next round. Off (the
+default), the plans are the ones built without the option. The fused role
+does not offer it: there, retraction picks the largest incomplete prefill
+first, and a carried prompt could make the yielding request that victim.
 
 ### 1.2 State groups: two slots, natural checkpoints
 
@@ -1117,7 +1159,11 @@ outcomes but never compose the batch.
 **Phases:** completed prompts out on `plan.remote_decode` (their pages stay
 pinned until the transfer finishes, so releasing them outranks feeding more
 prompt work), then the shared local-prefill phases
-(`scheduleLocalPrefillWork`): resident chunks, then new prompts.
+(`scheduleLocalPrefillWork`): resident chunks, then new prompts. With
+`prefill_chunk_yield_tokens`, a chunk that cannot finish gives way to the
+whole prompts waiting behind it, which complete in its forward, ahead of its
+row (§1.1). Each carried prompt's pages are then pinned until its own
+transfer is acknowledged, like any completed prompt's.
 
 **Reserve: the decode slot, nothing else.** The completing chunk reserves
 `decode_input_tokens` like every role, because the drafter writes the first
@@ -1597,7 +1643,11 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   helper asserts it found none set.
 - An incomplete local prefill is not overtaken (1.1). Decodes are never hostage
   to it: they consume no fresh capacity within their reserve, so they keep
-  running beside a stalled prefill.
+  running beside a stalled prefill. With `prefill_chunk_yield_tokens` on the P
+  role, whole prompts may complete in its forward, ahead of its row, within
+  the tokens its chunk gave up. The incomplete prefill is still admitted
+  first, and a resident chunk that fails admission still stops everything
+  behind it.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
   no PD transfer against its pages (§3.1) — and, in both tiers, is chosen only
