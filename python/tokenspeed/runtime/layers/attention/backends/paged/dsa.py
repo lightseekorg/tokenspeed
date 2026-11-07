@@ -922,7 +922,7 @@ class DSABackend(PagedAttentionBackend):
 
     def dcp_decode_query_rider(self, layer, q: torch.Tensor) -> torch.Tensor | None:
         """This rank's decode query heads as the bytes an owned top-k's
-        score gather can carry (``select_owned_dsa_topk_with_rider``), when
+        score gather can carry (``select_owned_dsa_topk``), when
         the sparse decode of ``q`` over that top-k takes the DCP records
         core: ``forward_sparse_decode`` then reads every rank's heads where
         that gather lands them (``gathered_query``) instead of gathering
@@ -1364,18 +1364,10 @@ class DSABackend(PagedAttentionBackend):
     # KVP prefill over gathered histories (dsa_kvp_history_prefill)
     # ------------------------------------------------------------------
 
-    def takes_history_prefill_topk(self) -> bool:
-        """Whether this forward's indexer selects over gathered history pages
-        (:meth:`gather_history_index_k_pages`) with the plan's slot map: a
-        pure KVP extend over gathered histories."""
-        return self.history_prefill is not None
-
-    def require_history_prefill(self) -> HistoryPrefillPlan:
-        """This forward's prefill over gathered histories."""
-        if self.history_prefill is None:
-            raise RuntimeError(
-                "this forward is not a KVP prefill over gathered histories"
-            )
+    def history_prefill_plan(self) -> HistoryPrefillPlan | None:
+        """This forward's prefill over gathered histories, whose indexer
+        selects over gathered history pages with the plan's slot map; None
+        when the forward is not one."""
         return self.history_prefill
 
     def _plan_history_prefill(
@@ -2086,51 +2078,78 @@ class DSABackend(PagedAttentionBackend):
     ) -> torch.Tensor:
         """Per request group, gather the latent history pages and attend the
         group's rows against them with the query's heads."""
-        if kv_seq_lens is not None:
-            kv_seq_lens = kv_seq_lens.to(
-                device=q_view.device, dtype=torch.int32
-            ).contiguous()
-
-        def attend(rows: slice, kv: torch.Tensor) -> torch.Tensor:
-            # This call mirrors the unsharded arm's: every kernel facade
-            # option the unsharded call passes (the slot-order selection
-            # included) must be passed here too.
-            return dsa_prefill(
-                q=q_view[rows],
-                kv_cache=kv,
-                sparse_kv_cache=None,
-                topk_slots=topk_slots[rows],
-                topk_lens=topk_lens[rows],
-                kv_seq_lens=None if kv_seq_lens is None else kv_seq_lens[rows],
-                max_seqlen_k=max_seq_len,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                kv_lora_rank=self.kv_lora_rank,
-                qk_rope_head_dim=self.qk_rope_head_dim,
-                softmax_scale=layer.scaling,
-                page_size=self.kernel_page_size,
-                logit_cap=layer.logit_cap,
-                k_scale=1.0,
-                return_lse=False,
-                solution=self.kernel_solution,
-                kernel_plan=self.prefill_kernel_plan,
-                slot_order=self.slot_order,
-            )
-
+        kv_seq_lens = self._int32_lens(kv_seq_lens, q_view.device)
         if len(groups) == 1 and groups[0].query == slice(0, q_view.shape[0]):
-            return attend(
-                groups[0].query,
-                self.gather_history_kv_pages(layer, token_to_kv_pool, groups[0]),
+            kv = self.gather_history_kv_pages(layer, token_to_kv_pool, groups[0])
+            return self._prefill_rows(
+                layer, q_view, kv, topk_slots, topk_lens, kv_seq_lens, max_seq_len
             )
-        out = q_view.new_empty(
+        out = self._prefill_output(q_view, layer)
+        for group in groups:
+            rows = group.query
+            kv = self.gather_history_kv_pages(layer, token_to_kv_pool, group)
+            out[rows] = self._prefill_rows(
+                layer,
+                q_view[rows],
+                kv,
+                topk_slots[rows],
+                topk_lens[rows],
+                None if kv_seq_lens is None else kv_seq_lens[rows],
+                max_seq_len,
+            )
+        return out
+
+    @staticmethod
+    def _int32_lens(
+        lens: torch.Tensor | None, device: torch.device
+    ) -> torch.Tensor | None:
+        if lens is None:
+            return None
+        return lens.to(device=device, dtype=torch.int32).contiguous()
+
+    @staticmethod
+    def _prefill_output(q_view: torch.Tensor, layer) -> torch.Tensor:
+        return q_view.new_empty(
             (q_view.shape[0], q_view.shape[1], layer.v_head_dim),
             dtype=(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             ),
         )
-        for group in groups:
-            kv = self.gather_history_kv_pages(layer, token_to_kv_pool, group)
-            out[group.query] = attend(group.query, kv)
-        return out
+
+    def _prefill_rows(
+        self,
+        layer,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor,
+        kv_seq_lens: torch.Tensor | None,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """``dsa_prefill`` of rows against a gathered buffer ``kv``."""
+        # This call mirrors the unsharded arm's: every kernel facade option
+        # the unsharded call passes (the slot-order selection included) must
+        # be passed here too.
+        return dsa_prefill(
+            q=q,
+            kv_cache=kv,
+            sparse_kv_cache=None,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            kv_seq_lens=kv_seq_lens,
+            max_seqlen_k=max_seq_len,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            softmax_scale=layer.scaling,
+            page_size=self.kernel_page_size,
+            logit_cap=layer.logit_cap,
+            k_scale=1.0,
+            return_lse=False,
+            solution=self.kernel_solution,
+            kernel_plan=self.prefill_kernel_plan,
+            slot_order=self.slot_order,
+        )
 
     def _forward_dcp_records_prefill(
         self,
@@ -2191,17 +2210,9 @@ class DSABackend(PagedAttentionBackend):
                 f"query shard rank {meta.plan.rank} attends {meta.plan.local_rows} "
                 f"rows, got {q_view.shape[0]}"
             )
-        out = q_view.new_empty(
-            (q_view.shape[0], q_view.shape[1], layer.v_head_dim),
-            dtype=(
-                torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
-            ),
-        )
-        topk_lens = topk_lens.to(device=q_view.device, dtype=torch.int32).contiguous()
-        if kv_seq_lens is not None:
-            kv_seq_lens = kv_seq_lens.to(
-                device=q_view.device, dtype=torch.int32
-            ).contiguous()
+        out = self._prefill_output(q_view, layer)
+        topk_lens = self._int32_lens(topk_lens, q_view.device)
+        kv_seq_lens = self._int32_lens(kv_seq_lens, q_view.device)
         for group in meta.groups:
             # Every rank joins every group's gather; the collective does not
             # know which ranks have query rows in the group.
@@ -2218,28 +2229,14 @@ class DSABackend(PagedAttentionBackend):
             valid = (slots >= 0) & (columns < topk_lens[rows, None])
             positions = torch.where(valid, slots - group.row_base, 0).to(torch.int64)
             slots = torch.where(valid, kv_rows[positions], -1)
-            # This call mirrors the unsharded arm's: every kernel facade
-            # option the unsharded call passes (the slot-order selection
-            # included) must be passed here too.
-            out[rows] = dsa_prefill(
-                q=q_view[rows],
-                kv_cache=kv_group,
-                sparse_kv_cache=None,
-                topk_slots=slots,
-                topk_lens=topk_lens[rows],
-                kv_seq_lens=None if kv_seq_lens is None else kv_seq_lens[rows],
-                max_seqlen_k=max_seq_len,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                kv_lora_rank=self.kv_lora_rank,
-                qk_rope_head_dim=self.qk_rope_head_dim,
-                softmax_scale=layer.scaling,
-                page_size=self.kernel_page_size,
-                logit_cap=layer.logit_cap,
-                k_scale=1.0,
-                return_lse=False,
-                solution=self.kernel_solution,
-                kernel_plan=self.prefill_kernel_plan,
-                slot_order=self.slot_order,
+            out[rows] = self._prefill_rows(
+                layer,
+                q_view[rows],
+                kv_group,
+                slots,
+                topk_lens[rows],
+                None if kv_seq_lens is None else kv_seq_lens[rows],
+                max_seq_len,
             )
         return out
 
@@ -2470,14 +2467,12 @@ class DSABackend(PagedAttentionBackend):
         topk_slots: torch.Tensor,
         topk_lens: torch.Tensor,
         q_len_per_req: int,
-        gathered_query: torch.Tensor | None = None,
+        gathered_query: torch.Tensor | None,
     ) -> torch.Tensor:
         """The head-sharded KVP decode as :meth:`_forward_dcp_records_prefill`
-        runs the prefill: the same core and exchange as ``dsa_decode`` plus
-        ``combine_attention_partials``, bit for bit, without the relayout of
-        the gathered heads or the repack of the partials. A
-        ``gathered_query`` (``forward_sparse_decode``) stands in for the
-        query gather."""
+        runs the prefill, bit for bit as ``dsa_decode`` plus
+        ``combine_attention_partials``. A ``gathered_query`` stands in for
+        the query gather."""
         if gathered_query is None:
             q = gather_query_heads_rank_major(q_view, self.kvp_group)
         else:
