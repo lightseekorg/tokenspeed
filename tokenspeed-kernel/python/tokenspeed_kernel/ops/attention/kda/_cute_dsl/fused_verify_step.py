@@ -565,7 +565,29 @@ def fused_verify_step_supported(
     head_dim: int,
     lower_bound: float | None,
 ) -> bool:
-    """Whether this kernel can address these inputs: shapes, dtypes and alignment."""
+    """Whether this kernel can address these inputs.
+
+    Args:
+        mixed_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16 q|k|v rows
+            before the convolution.
+        conv_weights: ``[3 * num_heads * head_dim, 4]`` BF16 convolution taps.
+        conv_states: ``[pages, channels, 3]`` BF16 convolution history.
+        f_a_out: ``[tokens, rank]`` BF16 gate projection input.
+        f_b_weight: ``[num_heads * head_dim, rank]`` BF16 gate projection.
+        beta_logits: ``[tokens, num_heads]`` beta logits.
+        A_log: ``[num_heads]`` gate decay logarithms.
+        dt_bias: ``[num_heads * head_dim]`` gate bias.
+        checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32
+            checkpoint in value-major layout.
+        num_heads: Per-rank head count.
+        head_dim: Head width.
+        lower_bound: Bounded-gate lower bound, or None for the softplus gate.
+
+    Returns:
+        True when the shapes, dtypes, strides and base alignments fit the
+        kernel: head width and gate rank 128, BF16 activations, an FP32
+        checkpoint, 16-byte aligned rows and a non-positive lower bound.
+    """
     width = num_heads * head_dim
     rank = f_a_out.shape[-1]
     return (
@@ -625,7 +647,47 @@ def fused_verify_step(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run the fused one-token verify; ``out`` is ``[tokens, heads * head_dim]``."""
+    """Run one-token record verify with the gate and convolution producers fused.
+
+    Args:
+        mixed_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16 q|k|v rows
+            before the convolution, one token per request.
+        conv_weights: ``[3 * num_heads * head_dim, 4]`` BF16 convolution taps.
+        conv_states: ``[pages, channels, 3]`` BF16 committed convolution
+            history; read only.
+        f_a_out: ``[tokens, 128]`` BF16 gate projection input.
+        f_b_weight: ``[num_heads * head_dim, 128]`` BF16 gate projection.
+        beta_logits: ``[tokens, num_heads]`` beta logits.
+        A_log: ``[num_heads]`` gate decay logarithms.
+        dt_bias: ``[num_heads * head_dim]`` gate bias.
+        lower_bound: Bounded-gate lower bound, or None for the softplus gate.
+        checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32
+            committed checkpoint in value-major layout; read only.
+        correction_cache: ``[slots, num_heads, capacity, head_dim]`` FP32
+            correction records; written.
+        kg_cache: ``[slots, num_heads, capacity, 2 * head_dim]`` BF16 key and
+            raw-gate records; written.
+        original_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16; receives
+            the pre-convolution rows for commit.
+        query_start_loc: ``[batch + 1]`` token offset of each request.
+        state_indices: ``[batch]`` checkpoint and convolution page of each
+            request. Pages at or below 0 are padding: zero outputs and no
+            records, though their pre-convolution rows are still retained.
+        num_heads: Per-rank head count.
+        head_dim: Head width; 128.
+        out: ``[tokens, num_heads * head_dim]`` BF16 verify output; written.
+        record_metadata: ``[batch, 3]`` int64 record slot, generation and
+            start position per request, or None to record request r at slot
+            r, position 0.
+        record_stamps: ``[slots, capacity, 2]`` int64 start and generation of
+            each record position, written with ``record_metadata``; else None.
+
+    Returns:
+        ``out``.
+
+    Raises:
+        ValueError: If ``fused_verify_step_supported`` rejects the inputs.
+    """
     if mixed_qkv.shape[0] == 0:
         return out
     if not fused_verify_step_supported(

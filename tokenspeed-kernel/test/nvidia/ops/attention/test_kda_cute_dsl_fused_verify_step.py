@@ -185,7 +185,7 @@ def _fused(x):
     return _verify(x, records), buffers
 
 
-def _assert_matches(x, expected, actual):
+def _assert_matches(expected, actual):
     out_ref, (corr_ref, kg_ref, stamps_ref, kept_ref) = expected
     out, (corr, kg, stamps, kept) = actual
     assert torch.equal(kept, kept_ref)
@@ -215,14 +215,17 @@ def _assert_matches(x, expected, actual):
 def test_fused_step_matches_split_producers(batch, lower_bound):
     x = _inputs(batch, seed=batch, lower_bound=lower_bound)
     state, history = x["state_pool"].clone(), x["conv_states"].clone()
-    _assert_matches(x, _split(x), _fused(x))
+    _assert_matches(_split(x), _fused(x))
     assert torch.equal(x["state_pool"], state)
     assert torch.equal(x["conv_states"], history)
 
 
 def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
-    """The last pages of a pool whose page offsets pass 2**31 elements verify
-    exactly like the same contents at the start of a small pool."""
+    """Page offsets past 2**31 elements verify exactly like near pages.
+
+    The last pages of the large pool hold the same contents as the first pages
+    of a small pool, so outputs and records must be equal.
+    """
     x = _inputs(2, seed=70)
     near = _fused(x)
     pages = 2**31 // (HEADS * DIM * DIM) + 2
@@ -250,7 +253,7 @@ def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
 
 def test_fused_step_without_metadata_records_by_request():
     x = _inputs(4, seed=40, metadata=False)
-    _assert_matches(x, _split(x), _fused(x))
+    _assert_matches(_split(x), _fused(x))
 
 
 @pytest.mark.parametrize("unaligned", ["f_a rows", "conv weights"])
