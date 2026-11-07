@@ -87,29 +87,29 @@ rounding relative to the original GEMM.
 On SM100 and SM103, `mm` runs a BF16 GEMM on one pinned FlashInfer TGV tile
 instead of cuBLASLt when all of these hold:
 
-- no bias, BF16 output, and no plan, `solution`, override, scales or `alpha`;
+- No bias, BF16 output, and no plan, `solution`, override, scales, or `alpha`
 - `TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows
   (`BF16_GEMM_MAX_M` on SM100 and SM103), `mm` takes FlashInfer's joint BF16
   GEMM (`flashinfer_bf16_gemm`) instead, in which FlashInfer's tuner chooses
-  among its TGV and CuTe DSL tactics;
-- `TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K` (2048 <= K <= 3072; below);
-- this rank's weight takes at most `TGV_DECODE_MAX_WEIGHT_BYTES` (16 MiB);
-- one of the pinned tiles covers the GEMM in one wave (below);
+  among its TGV and CuTe DSL tactics.
+- `TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K` (2048 <= K <= 3072; below)
+- This rank's weight takes at most `TGV_DECODE_MAX_WEIGHT_BYTES` (16 MiB).
+- One of the pinned tiles covers the GEMM in one wave (below).
 - PDL is enabled (`pdl_enabled()`, which the server's `--disable-pdl` turns
-  off);
-- the operands meet the joint BF16 contract (`flashinfer_joint_bf16_supported`):
-  contiguous, 32-byte aligned, K a multiple of 8;
-- serving has not started (`is_serving()`).
+  off).
+- The operands meet the joint BF16 contract (`flashinfer_joint_bf16_supported`):
+  contiguous, 32-byte aligned, K a multiple of 8.
+- Serving has not started (`is_serving()`).
 
 Under PDL, TGV loads weight tiles while the producer kernel still runs and
 waits only before loading activations; cuBLASLt starts loading after the
 producer finishes. FlashInfer's tactic profiling times each GEMM alone and
 cannot see that overlap, so `select_tgv_decode_tile` chooses the tile itself:
-of the 2-CTA tiles of 128 weight rows by 16, 32 or 64 activation rows, each
+of the 2-CTA tiles of 128 weight rows by 16, 32, or 64 activation rows, each
 with the most stages that fit in shared memory, the first whose grid has at
 most one CTA per SM. A GEMM for which none fits keeps cuBLASLt, and so does
 every GEMM without PDL, which has no overlap to gain. The choice depends only
-on M, N, K, the weight size, the SM count and the PDL setting.
+on M, N, K, the weight size, the SM count, and the PDL setting.
 
 The K window is measured, not derived: on GB300, in a captured PDL chain of an
 RMSNorm and this GEMM on a weight cold in L2, TGV beat cuBLASLt on most shapes
@@ -137,7 +137,7 @@ pipeline parallelism without CUDA graphs.
 A TGV tactic id is a position in FlashInfer's tactic table, so
 `resolve_tgv_tactics` finds the tiles by shape. If the installed FlashInfer
 lacks one of them or its TGV launcher, a warning is logged once and these
-GEMMs keep cuBLASLt. TGV compiles once per tile, PDL setting and operand
+GEMMs keep cuBLASLt. TGV compiles once per tile, PDL setting, and operand
 layout, never per shape. `kernel_warmup` compiles the three tiles at startup.
 Pipeline parallelism skips kernel warmup; there, the eager passes before each
 graph capture compile the tiles that graph uses. Either way, no tile compiles
