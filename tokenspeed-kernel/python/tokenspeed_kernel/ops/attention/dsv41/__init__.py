@@ -63,6 +63,7 @@ __all__ = [
     "decode_rows",
     "decode_window",
     "global_slots",
+    "prefill_indices",
     "compact_slots",
     "selection_table",
     "cache_pack",
@@ -1360,6 +1361,55 @@ def global_slots(rows, positions, requests, table, ratio, pages):
         ).to(torch.int32)
     return _kernel("global_slots", positions)(
         rows, positions, requests, table, ratio, pages
+    )
+
+
+def prefill_indices(swa_indices, logical_rows, global_slots, rows, history_base):
+    """Build int32 sparse prefill attention indices into a packed KV workspace.
+
+    Each query's indices are its SWA workspace rows followed by its selected
+    compressed-history rows, shifted to where its request's history starts in
+    the workspace. A selected row that is negative, or whose physical slot is
+    negative, becomes -1.
+
+    Args:
+        swa_indices: Integer [Q, W] SWA workspace rows per query, -1 for none.
+        logical_rows: Integer [T, K] request-local selected history rows.
+        global_slots: Integer [T, K] physical slots of logical_rows; negative
+            marks a row absent from the cache.
+        rows: The Q query rows of logical_rows and global_slots, as a slice
+            with step 1 or an integer [Q] tensor.
+        history_base: Integer [Q] first workspace row of each query's history.
+
+    Returns:
+        Contiguous int32 [Q, W + K] indices.
+    """
+    if logical_rows.shape != global_slots.shape or logical_rows.ndim != 2:
+        raise ValueError("logical_rows and global_slots must share shape [T, K]")
+    if swa_indices.ndim != 2 or history_base.shape != swa_indices.shape[:1]:
+        raise ValueError("swa_indices must be [Q, W] and history_base [Q]")
+    if isinstance(rows, slice):
+        if rows.step not in (None, 1) or rows.start is None:
+            raise ValueError("rows must be a slice with an explicit start and step 1")
+        if len(range(*rows.indices(logical_rows.shape[0]))) != swa_indices.shape[0]:
+            raise ValueError("rows must select one logical row per query")
+    elif rows.shape != history_base.shape:
+        raise ValueError("rows must select one logical row per query")
+    # The kernel reads every row's columns contiguously.
+    swa_indices, logical_rows, global_slots = (
+        x if x.stride(-1) == 1 else x.contiguous()
+        for x in (swa_indices, logical_rows, global_slots)
+    )
+    if not swa_indices.is_cuda:
+        selected, slots = logical_rows[rows], global_slots[rows]
+        history = torch.where(
+            (selected >= 0) & (slots >= 0),
+            selected.to(torch.int64) + history_base[:, None].to(torch.int64),
+            -1,
+        )
+        return torch.cat((swa_indices.to(torch.int64), history), dim=-1).to(torch.int32)
+    return _kernel("prefill_indices", logical_rows)(
+        swa_indices, logical_rows, global_slots, rows, history_base
     )
 
 
