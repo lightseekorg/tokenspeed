@@ -3323,8 +3323,10 @@ class ServerArgs:
                 f"{self.inkling2_loop_num_passes}"
             )
         if self.device == "npu":
-            if not self.disable_prefill_graph:
-                raise ValueError("NPU execution requires --disable-prefill-graph")
+            # Experimental: prefill graph (BreakableCapture piecewise capture)
+            # unlocked on NPU. Previously hard-required --disable-prefill-graph
+            # (c006baf2, first NPU support). PDL stays disabled (independent
+            # programmatic-dependent-launch feature, not tested on NPU).
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
 

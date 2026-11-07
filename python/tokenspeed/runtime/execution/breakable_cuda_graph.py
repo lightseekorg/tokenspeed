@@ -66,6 +66,15 @@ import torch
 from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_weak_ref
 from tokenspeed_kernel.workspace import capture_session
 
+
+def _graph_class(device: str) -> type:
+    """The graph class for ``device`` (NPU records via torch_npu.NPUGraph)."""
+    return (
+        torch.get_device_module(device).NPUGraph
+        if device == "npu"
+        else torch.get_device_module(device).CUDAGraph
+    )
+
 __all__ = [
     "BreakableCapture",
     "HandoffSlot",
@@ -207,6 +216,10 @@ class BreakableCapture:
             2478MB -> 564MB for buckets [8192,4096,2048,1024] on the repro). This
             mirrors ``torch.cuda.graph``'s shared ``default_capture_stream`` and
             its documented "pass the same stream for effective memory sharing".
+        device: Execution device name (``"cuda"`` or ``"npu"``). ``"npu"``
+            records segments via ``torch.npu.NPUGraph``, the NPU analogue of
+            ``CUDAGraph`` (piecewise capture of graphable ops with eager breaks
+            for attention / KV-cache work).
         handoff_storage: An optional handoff storage map shared with captures that
             never replay while this one's handoffs are live; see ``_handoff_view``.
         run_segments_while_capturing: Whether each segment runs once as soon
@@ -221,17 +234,20 @@ class BreakableCapture:
     """
 
     _active: BreakableCapture | None = None
-    _default_capture_stream: torch.cuda.Stream | None = None
+    _default_capture_stream: Any | None = None
 
     def __init__(
         self,
         pool: Any | None = None,
-        stream: torch.cuda.Stream | None = None,
+        stream: Any | None = None,
+        device: str = "cuda",
         handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
         *,
         run_segments_while_capturing: bool = False,
     ) -> None:
         self.pool = pool
+        self.device = device
+        self._dm = torch.get_device_module(device)
         self._run_segments_while_capturing = run_segments_while_capturing
         self.segments: list[Callable[[], Any]] = []
         # Per entry of ``segments``, the (wait, layer) calls a replay makes
@@ -240,11 +256,11 @@ class BreakableCapture:
         # asks each wait for (see wait_before_segment); breaks wait themselves.
         self.segment_waits: list[tuple[tuple[Callable[[int], None], int], ...]] = []
         self._current_waits: dict[Callable[[int], None], int] = {}
-        self._current_graph: torch.cuda.CUDAGraph | None = None
+        self._current_graph: Any | None = None
         self._capturing = False
         if stream is None:
             if BreakableCapture._default_capture_stream is None:
-                BreakableCapture._default_capture_stream = torch.cuda.Stream()
+                BreakableCapture._default_capture_stream = self._dm.Stream()
             stream = BreakableCapture._default_capture_stream
         self._stream = stream
         self._stream_ctx: Any | None = None
@@ -258,7 +274,7 @@ class BreakableCapture:
         )
 
     @property
-    def stream(self) -> torch.cuda.Stream:
+    def stream(self) -> Any:
         """The stream used for warmup and capture."""
         return self._stream
 
@@ -279,8 +295,8 @@ class BreakableCapture:
         self._gc_was_enabled = gc.isenabled()
         gc.disable()
         # The capture stream must observe prior entry-stream work (warmup, buffers).
-        self._stream.wait_stream(torch.cuda.current_stream())
-        self._stream_ctx = torch.cuda.stream(self._stream)
+        self._stream.wait_stream(self._dm.current_stream())
+        self._stream_ctx = self._dm.stream(self._stream)
         self._stream_ctx.__enter__()
         BreakableCapture._active = self
         self._capture_session = capture_session(self)
@@ -300,14 +316,14 @@ class BreakableCapture:
                 self._stream_ctx.__exit__(*exc)
                 self._stream_ctx = None
             # Eager breaks ran on the side stream; entry stream must observe them.
-            torch.cuda.current_stream().wait_stream(self._stream)
+            self._dm.current_stream().wait_stream(self._stream)
             if self._gc_was_enabled:
                 gc.enable()
         return False
 
     def _begin_segment(self) -> None:
         assert not self._capturing
-        graph = torch.cuda.CUDAGraph()
+        graph = _graph_class(self.device)()
         if self.pool is not None:
             graph.capture_begin(pool=self.pool)
         else:

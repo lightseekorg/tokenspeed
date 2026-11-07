@@ -914,7 +914,10 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+            pool=self._pool,
+            stream=stream,
+            device=self.config.device,
+            handoff_storage=self._handoff_storage,
         )
         cap.stream.wait_stream(
             torch.get_device_module(self.config.device).current_stream()
@@ -943,6 +946,7 @@ class PrefillGraph:
         cap = BreakableCapture(
             pool=self._pool,
             stream=stream,
+            device=self.config.device,
             handoff_storage=self._encoder_handoff_storage,
         )
         cap.stream.wait_stream(
@@ -975,7 +979,10 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+            pool=self._pool,
+            stream=stream,
+            device=self.config.device,
+            handoff_storage=self._handoff_storage,
         )
         cap.stream.wait_stream(
             torch.get_device_module(self.config.device).current_stream()
