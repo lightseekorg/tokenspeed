@@ -6,6 +6,12 @@ routes. Rebuild the Python runtime, native host and kernel package together;
 the memory-saving startup handshake rejects native hosts without the
 replica-wide update-commit protocol (version 2: load admission and commit).
 
+Weight-update validity is checked even when memory saving is disabled. Local
+loading success stays pending until the replica-wide commit succeeds. A failed
+load or commit blocks subsequent forwards, including idle forwards, because
+parameters may contain a mix of old and new weights. Restart the deployment
+after such a failure.
+
 ## Policy and model contract
 
 `cpu_backup` copies weight-region allocations to host memory and restores their
