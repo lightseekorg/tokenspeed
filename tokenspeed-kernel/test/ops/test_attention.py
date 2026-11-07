@@ -741,3 +741,105 @@ def test_attn_merge_state(
     assert lse.shape == lse_a.shape
     torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)
+
+
+def _paged_cache(
+    lens: list[int], page_size: int, num_kv_heads: int, head_dim: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shuffled pages for requests of ``lens`` keys: k/v caches and the table."""
+    pages = [max(1, -(-n // page_size)) for n in lens]
+    order = torch.randperm(sum(pages)).tolist()
+    table = torch.zeros(len(lens), max(pages), dtype=torch.int32)
+    start = 0
+    for i, n in enumerate(pages):
+        table[i, :n] = torch.tensor(order[start : start + n], dtype=torch.int32)
+        start += n
+    shape = (sum(pages), page_size, num_kv_heads, head_dim)
+    k = torch.randn(shape, dtype=torch.bfloat16)
+    v = torch.randn(shape, dtype=torch.bfloat16)
+    return k.to(device), v.to(device), table.to(device)
+
+
+def _decode_reference(q, k_cache, v_cache, table, lens, window_left, scale):
+    """FP32 decode of one query per request over its last keys, with the LSE."""
+    page_size, num_kv_heads, head_dim = k_cache.shape[1:]
+    group = q.shape[1] // num_kv_heads
+    outs, lses = [], []
+    for i, n in enumerate(lens):
+        start = max(0, n - window_left - 1) if window_left >= 0 else 0
+        rows = table[i].long()
+        k = k_cache[rows].reshape(-1, num_kv_heads, head_dim)[start:n].float()
+        v = v_cache[rows].reshape(-1, num_kv_heads, head_dim)[start:n].float()
+        k = k.repeat_interleave(group, dim=1)
+        v = v.repeat_interleave(group, dim=1)
+        logits = torch.einsum("hd,khd->hk", q[i].float(), k) * scale
+        if n == start:
+            outs.append(torch.zeros_like(q[i], dtype=torch.float32))
+            lses.append(torch.full((q.shape[1],), -math.inf, device=q.device))
+            continue
+        lses.append(torch.logsumexp(logits, dim=1))
+        outs.append(torch.einsum("hk,khd->hd", logits.softmax(dim=1), v))
+    return torch.stack(outs), torch.stack(lses)
+
+
+@pytest.mark.parametrize("num_q_heads", [4, 16], ids=["mha", "gqa"])
+@pytest.mark.parametrize("window_left", [-1, 300], ids=["full", "window"])
+def test_triton_mha_decode_returns_lse_at_every_batch_size(
+    device: str, num_q_heads: int, window_left: int, require
+) -> None:
+    """The Triton decode's output and natural-log LSE match an FP32 reference
+    whether a small batch splits each request's keys across programs or a large
+    one keeps them whole, an empty cache yields a zero output and an LSE of
+    -inf, and a new batch size or key split reuses the compiled kernels."""
+    from tokenspeed_kernel.ops.attention.mha._triton import decode
+    from utils import assert_no_triton_compile
+
+    require("attention", "mha_decode_with_kvcache", "triton", torch.bfloat16, "q")
+    num_kv_heads, head_dim, page_size = 4, 128, 64
+    scale = head_dim**-0.5
+    # The per-head kernel multiplies q and k in bf16 before summing (logits off
+    # by up to about 1e-2), as tolerated for the output; the grouped kernel
+    # takes them from an FP32 dot.
+    lse_tol = 2e-2 if num_q_heads == num_kv_heads else 1e-4
+
+    def check(lens: list[int]) -> None:
+        k_cache, v_cache, table = _paged_cache(
+            lens, page_size, num_kv_heads, head_dim, device
+        )
+        q = torch.randn(
+            len(lens), num_q_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        out, lse = mha_decode_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=table,
+            cache_seqlens=torch.tensor(lens, dtype=torch.int32, device=device),
+            max_seqlen_k=max(lens),
+            max_seqlen_q=1,
+            window_left=window_left,
+            return_lse=True,
+            softmax_scale=scale,
+            solution="triton",
+        )
+        out_ref, lse_ref = _decode_reference(
+            q, k_cache, v_cache, table, lens, window_left, scale
+        )
+        torch.testing.assert_close(out.float(), out_ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(lse, lse_ref, rtol=lse_tol, atol=lse_tol)
+
+    # Warm both alignment classes of the page-table stride (16 and 2 pages).
+    check([1000, 1])
+    check([100])
+    kernels = (
+        decode._fwd_kernel_stage1,
+        decode._fwd_grouped_kernel_stage1,
+        decode._fwd_kernel_stage2,
+    )
+    with assert_no_triton_compile(*kernels):
+        # One request: its keys split across programs.
+        check([2049])
+        # Long and short requests, and an empty cache.
+        check([777, 0, 64, 1500, 3])
+        # Enough requests to fill the GPU without splitting.
+        check([int(n) for n in torch.randint(1, 900, (512,))])
