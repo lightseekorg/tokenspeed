@@ -1617,7 +1617,9 @@ def build_device_side(
         host_tail_packing = {
             group.group_id: packing * shards[group.group_id]
             for group, packing in zip(
-                layout.groups, compute_host_group_packing(layout), strict=True
+                layout.groups,
+                compute_host_group_packing(layout, group_specs=contract.group_specs),
+                strict=True,
             )
         }
     snapshot_pool = _retraction_pool_request(
