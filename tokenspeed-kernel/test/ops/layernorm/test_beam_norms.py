@@ -119,7 +119,8 @@ def _qk(tokens=8, heads=(6, 1), head_dim=128, eps=EPS, change=None):
 QK_CASES = {
     "beam_tp1": (_qk(heads=(48, 8)), True),
     "beam_tp8": (_qk(heads=(6, 1)), True),
-    "beam_tp4": (_qk(heads=(12, 2)), False),
+    "beam_tp2": (_qk(heads=(24, 4)), True),
+    "beam_tp4": (_qk(heads=(12, 2)), True),
     "beam_tp16": (_qk(heads=(3, 1)), False),
     "int32_positions": (_qk(change="int32_positions"), True),
     "tokens_0": (_qk(tokens=0), False),
