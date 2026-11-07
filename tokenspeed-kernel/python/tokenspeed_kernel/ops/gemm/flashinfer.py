@@ -1199,8 +1199,8 @@ def flashinfer_tgv_decode_gemm(
         raise ValueError("Unsupported input to the pinned FlashInfer TGV GEMM")
     if out is None:
         out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    # TGV compiles once per tactic, PDL setting and operand layout, never per
-    # shape. Canonical strides keep every call on one layout.
+    # TGV compiles once per tactic, PDL setting, and operand layout, never
+    # per shape. Canonical strides keep every call on one layout.
     tgv.run(
         a=_canonical_bf16_view(x.detach()),
         b=weight.detach().t(),
@@ -1215,7 +1215,7 @@ def flashinfer_tgv_decode_gemm(
 def warm_tgv_decode_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
     """Compile every pinned TGV tactic during startup kernel warmup.
 
-    TGV compiles per tactic, PDL setting and operand layout, not per shape,
+    TGV compiles per tactic, PDL setting, and operand layout, not per shape,
     so warming the pinned tactics on any weight the policy routes, at the
     process's PDL setting, keeps compilation out of CUDA graph capture.
     Does nothing outside :func:`~tokenspeed_kernel.ops.tuning.kernel_warmup`,

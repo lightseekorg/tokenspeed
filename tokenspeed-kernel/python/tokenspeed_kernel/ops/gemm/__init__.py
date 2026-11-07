@@ -709,8 +709,8 @@ def mm(
         # under PDL (README "Decode GEMMs on small weights"). Like the joint
         # path, only before serving: CUDA graphs captured at startup keep the
         # tile, and eager calls while serving keep cuBLASLt. Registering the
-        # tile kernel instead (m bounds, a K-window, weight-size and one-wave
-        # mnk_problem_filter, plus serving, bias and 32-byte alignment traits
+        # tile kernel instead (m bounds, a K-window, weight-size, and one-wave
+        # mnk_problem_filter, plus serving, bias, and 32-byte alignment traits
         # that mm() does not pass today) was considered; it stays a shortcut
         # like the joint path so both serving-gated FlashInfer routes sit
         # here. So override= and solution= skip it, it cannot be benchmarked
