@@ -532,6 +532,8 @@ class ServerArgs:
 
     # Dense GEMM selection is independent of routed-expert kernels.
     dense_gemm_backend: str = "auto"
+    # Online W8A8 for Qwen3.5/Qwen4-Exp attention projections only.
+    enable_fp8_attn_proj: bool = False
 
     # MoE backend
     moe_backend: str = "auto"
@@ -2760,8 +2762,7 @@ class ServerArgs:
             nargs="?",
             metavar="model",
             default=None,
-            help="The model name or path (positional argument). "
-            "Equivalent to --model.",
+            help="The model name or path (positional argument). Equivalent to --model.",
         )
         parser.add_argument(
             "--model",
@@ -3480,6 +3481,14 @@ class ServerArgs:
             "Fewer layers per chunk bound the per-round stall.",
         )
         parser.add_argument(
+            "--enable-fp8-attn-proj",
+            action="store_true",
+            default=ServerArgs.enable_fp8_attn_proj,
+            help="Use online block-FP8 full-attention QKV/O and GDN QKVZ/output "
+            "projections for Qwen3.5/Qwen4-Exp, keeping GDN BA in floating precision. "
+            "Requires floating attention weights; MoE quantization is unchanged.",
+        )
+        parser.add_argument(
             "--dense-gemm-backend",
             type=str,
             default=ServerArgs.dense_gemm_backend,
@@ -3488,7 +3497,8 @@ class ServerArgs:
             "auto prefers compatible CuTe-DSL on Blackwell at M > 16 GEMM rows. "
             "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
             "weights and FP32 scales without requantization. "
-            "deepgemm requires Hopper and preserves FP32 scales. "
+            "deepgemm preserves FP32 scales on Hopper; SM100/SM103 use "
+            "UE8M0 weight requantization and packed activation scales. "
             "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(

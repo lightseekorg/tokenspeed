@@ -27,8 +27,10 @@ import torch
 from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_mxfp8_weight_scales,
+    prepare_deepgemm_fp8_weight,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import pdl_enabled
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -183,6 +185,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
                 )
                 layer.input_scale = None
+            if global_server_args_dict["dense_gemm_backend"] == "deepgemm" and tuple(
+                self.quant_config.weight_block_size
+            ) == (128, 128):
+                weight, scales = prepare_deepgemm_fp8_weight(
+                    layer.weight.data, layer.weight_scale_inv.data
+                )
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale_inv = Parameter(scales, requires_grad=False)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -304,13 +314,20 @@ class Fp8LinearMethod(LinearMethodBase):
             return out if out is not None else output.view(*output_shape)
         if block_scale is None:
             scale_encoding = (
-                "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
+                "packed_ue8m0"
+                if layer.weight_scale_inv.dtype == torch.int32
+                else (
+                    "ue8m0"
+                    if layer.weight_scale_inv.dtype == torch.uint8
+                    else "float32"
+                )
             )
             input_2d, block_scale = quantize_fp8(
                 input_2d,
                 granularity="token_group",
                 group_size=self.quant_config.weight_block_size[1],
                 scale_encoding=scale_encoding,
+                enable_pdl=pdl_enabled(),
             )
         solution = None
         if global_server_args_dict["dense_gemm_backend"] in (
