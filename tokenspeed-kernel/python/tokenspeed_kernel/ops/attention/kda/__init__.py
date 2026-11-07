@@ -20,11 +20,11 @@
 
 from __future__ import annotations
 
-import importlib.util
 import math
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
@@ -759,7 +759,7 @@ def kda_replay_commit_supported(
 import tokenspeed_kernel.ops.attention.kda.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.vllm_recoverssm  # noqa: E402,F401
 
-if importlib.util.find_spec("flash_kda") is not None:
+if has_optional_package("flash_kda"):
     import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cudnn  # noqa: E402,F401

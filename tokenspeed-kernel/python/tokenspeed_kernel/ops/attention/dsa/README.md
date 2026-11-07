@@ -34,15 +34,12 @@ optional LSE is FP32 in natural-log units. Empty selections produce zero
 output and negative-infinite LSE. Negative slots inside a visible prefix are
 masked. Omitting lengths inspects the full selected-slot width.
 
-Install a FlashInfer build containing PR #7984 (tested source revision
-`335e25d0b8d95bf42709d6851c569dddc26577d6`) and compatible CUTLASS DSL
-libraries. Select `solution="flashinfer_prims"` in the kernel API, or set
+The pinned FlashInfer 0.7.3 provides the Prims-TS sparse MLA wrapper. Select
+`solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
 and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`
 for serving. TRTLLM keeps its higher default priority, and also returns the
-LSE that decode context parallelism merges. The solution registers only when
-the installed FlashInfer provides the Prims-TS sparse MLA wrapper; otherwise
-such calls fall back to Triton. The indexer is unchanged.
+LSE that decode context parallelism merges. The indexer is unchanged.
 
 The upstream plan owns PDL scheduling. This adapter requires PDL enabled and
 rejects an explicit disable request. The caller prepares Q and the selected

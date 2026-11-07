@@ -20,8 +20,6 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.warmup import kernel_launcher
 
-_FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
-
 
 @triton.jit
 def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
@@ -1173,11 +1171,10 @@ def _store_nvfp4(
     # fp4_quantize's E4M3-scale recipe, bit for bit: block amax / 6 scaled into E4M3, values into E2M1.
     blocks = tl.reshape(normed, [BLOCK // 16, 16])
     vec_max = tl.max(tl.abs(blocks), axis=1).to(tl.float32)
-    # Its zero test flushes too: a subnormal block amax counts as zero.
-    vec_max = tl.where(vec_max < _FP32_MIN_NORMAL, 0.0, vec_max)
     sf = _mul_ftz(sf_scale, _mul_ftz(vec_max, rcp6)).to(tl.float8e4nv)
+    # A block whose E4M3 scale rounds to zero encodes zero values.
     out_scale = tl.where(
-        vec_max != 0,
+        sf.to(tl.float32) != 0,
         _rcp_approx_ftz(_mul_ftz(sf.to(tl.float32), rcp_sf_scale)),
         0.0,
     )

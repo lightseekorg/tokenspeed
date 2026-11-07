@@ -19,9 +19,8 @@
 # SOFTWARE.
 from __future__ import annotations
 
-import importlib.util
-
 import torch
+from tokenspeed_kernel._optional import has_trtllm_kernel
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -31,11 +30,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
-_HAS_TRTLLM_KERNEL = (
-    platform.is_nvidia
-    and importlib.util.find_spec("trtllm_kernel") is not None
-    and importlib.util.find_spec("deep_ep") is not None
-)
+_HAS_TRTLLM_KERNEL = platform.is_nvidia and has_trtllm_kernel()
 __all__ = []
 
 

@@ -83,7 +83,7 @@ def test_incompatible_package_falls_back_and_explicit_adapter_rejects(
     if change == "changed":
         path.write_text(original + "\n# unreviewed upstream modification\n")
     elif change == "version":
-        path.write_text(original.replace('"0.7.2.post1"', '"0.7.2"'))
+        path.write_text(original.replace('"0.7.3"', '"0.7.2.post1"'))
     env = dict(
         os.environ,
         PYTHONPATH=f"{tmp_path}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
