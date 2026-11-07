@@ -297,9 +297,17 @@ def test_gluon_owned_page_prefill_rows_score_and_select_like_one_row_groups(
     launch = index_candidates.launch_gluon_dsa_index_candidates_gfx950
     args = (q, q_scales, weights, cache, pages.pages, lengths)
 
-    one_row = launch(*args, page_size=PAGE_SIZE, softmax_scale=0.1)
+    one_row = launch(
+        *args,
+        query_group_size=1,
+        query_requests=None,
+        request_count=None,
+        page_size=PAGE_SIZE,
+        softmax_scale=0.1,
+    )
     blocks = launch(
         *args,
+        query_group_size=1,
         query_requests=requests,
         request_count=table.shape[0],
         page_size=PAGE_SIZE,
