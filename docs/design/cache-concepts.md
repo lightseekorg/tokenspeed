@@ -2331,6 +2331,13 @@ linear-attention geometry still fails during recipe construction.
    second one is a bug.
 4. New attention backends declare which view of `CacheBlock` they need
    (paged KV view or state view); they do not invent new table concepts.
+5. A table entry is only right if the block holds what the row needs.
+   `tokenspeed-scheduler/python/tests/test_cache_content.py` replays every
+   plan of randomized closed loops on a model of the device and fails on the
+   first forward that reads anything but its own prefix, or on a write to a
+   page a PD transfer still uses. Changes to publication, eviction, rotation,
+   Host copies, retraction, or PD page lifetime keep it green; a known bug it
+   catches is a strict `xfail` until the fix lands.
 
 ## Current state vs. principles (audit 2026-08-16)
 
