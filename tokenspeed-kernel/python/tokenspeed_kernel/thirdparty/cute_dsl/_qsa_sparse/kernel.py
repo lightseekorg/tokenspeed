@@ -50,6 +50,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl._qsa_sparse.common import (
     _prefetch_private_kv_payload,
     _ScratchArena,
     copy_gmem_to_smem_u128,
+    copy_gmem_to_smem_u128_zfill,
     cpy_dice,
     exp2,
     fadd2,
@@ -689,6 +690,26 @@ class MixedInputFusedMultiHeadAttentionDecode:
         return raw_slot
 
     @cute.jit
+    def _gather_bf16_u128(
+        self,
+        destination: cute.Pointer,
+        source: cute.Pointer,
+        raw_slot: cutlass.Int32,
+    ):
+        """Copy 16 bytes of one gathered BF16 K/V row; padding is zero-filled.
+
+        The softmax masks padded entries (``raw_slot <= 0``) by their ids, so
+        their operands only have to be finite: zeros written without a global
+        read replace slot 1, a line every CTA would otherwise read. ``source``
+        addresses slot 1 for them, so the address stays valid.
+        """
+        copy_gmem_to_smem_u128_zfill(
+            destination,
+            source,
+            cutlass.Int32(16) if raw_slot > 0 else cutlass.Int32(0),
+        )
+
+    @cute.jit
     def _issue_sparse_tile_bf16_loaded(
         self,
         cache_iter: cute.Pointer,
@@ -700,7 +721,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         lane_idx: cutlass.Int32,
         kv_smem_dtype: Type[cutlass.Numeric],
     ):
-        lane_slot = raw_slot if raw_slot > 0 else cutlass.Int32(_PADDING_READ_SLOT)
+        # Lanes exchange raw ids, so every copy can tell padding apart.
         base_row = warpgroup_tidx // 16
         col = (warpgroup_tidx - base_row * 16) * 8
         column_source = cache_iter + dim_offset + col
@@ -718,7 +739,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
             for iteration in cutlass.range(
                 16, unroll=2 if self.head_tile in (72, 96) else 4
             ):
-                slot = cute.arch.shuffle_sync(lane_slot, iteration * 2 + lane_idx // 16)
+                raw = cute.arch.shuffle_sync(raw_slot, iteration * 2 + lane_idx // 16)
+                slot = raw if raw > 0 else cutlass.Int32(_PADDING_READ_SLOT)
                 source = (
                     column_source
                     + cutlass.Int64(slot) * self.problem_shape[2] * _HEAD_DIM
@@ -729,13 +751,14 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     cute.AddressSpace.smem,
                     assumed_align=16,
                 )
-                copy_gmem_to_smem_u128(destination, source)
+                self._gather_bf16_u128(destination, source, raw)
         else:
             if cutlass.const_expr(self.original_heads_per_kv == 12):
                 for iteration in cutlass.range(16, unroll=2):
-                    slot = cute.arch.shuffle_sync(
-                        lane_slot, iteration * 2 + lane_idx // 16
+                    raw = cute.arch.shuffle_sync(
+                        raw_slot, iteration * 2 + lane_idx // 16
                     )
+                    slot = raw if raw > 0 else cutlass.Int32(_PADDING_READ_SLOT)
                     source = (
                         column_source
                         + cutlass.Int64(slot) * self.problem_shape[2] * _HEAD_DIM
@@ -746,12 +769,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         cute.AddressSpace.smem,
                         assumed_align=16,
                     )
-                    copy_gmem_to_smem_u128(destination, source)
+                    self._gather_bf16_u128(destination, source, raw)
             else:
                 for iteration in cutlass.range(16, unroll=4):
-                    slot = cute.arch.shuffle_sync(
-                        lane_slot, iteration * 2 + lane_idx // 16
+                    raw = cute.arch.shuffle_sync(
+                        raw_slot, iteration * 2 + lane_idx // 16
                     )
+                    slot = raw if raw > 0 else cutlass.Int32(_PADDING_READ_SLOT)
                     source = (
                         column_source
                         + cutlass.Int64(slot) * self.problem_shape[2] * _HEAD_DIM
@@ -762,7 +786,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         cute.AddressSpace.smem,
                         assumed_align=16,
                     )
-                    copy_gmem_to_smem_u128(destination, source)
+                    self._gather_bf16_u128(destination, source, raw)
         cute.arch.cp_async_commit_group()
 
     @cute.jit
@@ -815,12 +839,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
             self.original_heads_per_kv == 12 and self.problem_shape[2] == 2
         ):
             """Copy both D128 halves using one cached slot and source address."""
-            lane_slot = raw_slot if raw_slot > 0 else cutlass.Int32(_PADDING_READ_SLOT)
+            # Lanes exchange raw ids, so every copy can tell padding apart.
             for iteration in cutlass.range(16, unroll=2):
                 vector = warpgroup_tidx + iteration * warpgroup_threads
                 row = vector // 16
                 col = (vector - row * 16) * 8
-                slot = cute.arch.shuffle_sync(lane_slot, iteration * 2 + lane_idx // 16)
+                raw = cute.arch.shuffle_sync(raw_slot, iteration * 2 + lane_idx // 16)
+                slot = raw if raw > 0 else cutlass.Int32(_PADDING_READ_SLOT)
                 source = (
                     cache_iter
                     + cutlass.Int64(slot) * self.problem_shape[2] * _HEAD_DIM
@@ -839,7 +864,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     cute.AddressSpace.smem,
                     assumed_align=16,
                 )
-                copy_gmem_to_smem_u128(destination, source)
+                self._gather_bf16_u128(destination, source, raw)
                 second_address = (
                     logical_address + (second_smem_stage - smem_stage) * 32768
                 )
@@ -849,14 +874,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     cute.AddressSpace.smem,
                     assumed_align=16,
                 )
-                copy_gmem_to_smem_u128(second_destination, source + 128)
+                self._gather_bf16_u128(second_destination, source + 128, raw)
             cute.arch.cp_async_commit_group()
         else:
             if cutlass.const_expr(self.original_heads_per_kv == 12):
                 """Copy both D128 halves using one cached slot and source address."""
-                lane_slot = (
-                    raw_slot if raw_slot > 0 else cutlass.Int32(_PADDING_READ_SLOT)
-                )
+                # Lanes exchange raw ids, so every copy can tell padding apart.
                 base_row = warpgroup_tidx // 16
                 col = (warpgroup_tidx - base_row * 16) * 8
                 column_source = cache_iter + col
@@ -870,9 +893,10 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 swizzled_base = logical_base ^ ((logical_base >> 3) & 0x70)
                 second_delta = (second_smem_stage - smem_stage) * 32768
                 for iteration in cutlass.range(16, unroll=2):
-                    slot = cute.arch.shuffle_sync(
-                        lane_slot, iteration * 2 + lane_idx // 16
+                    raw = cute.arch.shuffle_sync(
+                        raw_slot, iteration * 2 + lane_idx // 16
                     )
+                    slot = raw if raw > 0 else cutlass.Int32(_PADDING_READ_SLOT)
                     source = (
                         column_source
                         + cutlass.Int64(slot) * self.problem_shape[2] * _HEAD_DIM
@@ -885,14 +909,14 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         cute.AddressSpace.smem,
                         assumed_align=16,
                     )
-                    copy_gmem_to_smem_u128(destination, source)
+                    self._gather_bf16_u128(destination, source, raw)
                     second_destination = cute.make_ptr(
                         kv_smem_dtype,
                         swizzled_base + iteration * 1024 + second_delta,
                         cute.AddressSpace.smem,
                         assumed_align=16,
                     )
-                    copy_gmem_to_smem_u128(second_destination, source + 128)
+                    self._gather_bf16_u128(second_destination, source + 128, raw)
                 cute.arch.cp_async_commit_group()
 
     @cute.jit

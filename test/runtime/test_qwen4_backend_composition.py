@@ -197,6 +197,7 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
+        qsa_bf16_scratch=None,
     )
     target_verify = width > 1 and not is_draft
     expected_bytes = (3 * has_gdn + 5 * has_ple + 7 * has_qsa) if target_verify else 0

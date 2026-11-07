@@ -93,6 +93,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
         CacheMemoryPlan,
     )
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
+    )
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -1152,12 +1155,14 @@ def _prepare_fixed_workspaces(
     draft_backend,
     uses_paged_state_verify: bool,
     is_inkling: bool,
+    qsa_bf16_scratch: QSABf16ScratchPlan | None,
     expected_bytes: int,
 ) -> None:
     """Allocate the fixed workspaces the recipe reserved from the cache budget
     (``CacheRecipe.workspace_bytes``) and check the bytes agree.
 
-    The verify workspaces of the paged-state families and the
+    The verify workspaces of the paged-state families, Qwen4-Exp's QSA BF16
+    prefill scratch (``qsa_bf16_scratch``, the target's) and the
     query-context-parallel history gather workspace of GPU DSA: the target
     tree allocates the latter once and the draft tree gathers into the same
     buffers (the draft's extend step follows the target's forward on the
@@ -1165,6 +1170,7 @@ def _prepare_fixed_workspaces(
     """
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
+        qwen4_exp_backend,
     )
 
     width = int(server_args.speculative_num_draft_tokens or 1)
@@ -1179,6 +1185,11 @@ def _prepare_fixed_workspaces(
         actual_bytes += backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
+        allocated = True
+    if qsa_bf16_scratch is not None:
+        actual_bytes += qwen4_exp_backend(backend).preallocate_qsa_bf16_scratch(
+            qsa_bf16_scratch
+        )
         allocated = True
     # V4.1 allocates its gathered projections and per-request packed history
     # per forward; it has no DSA history gather workspace to reserve.
@@ -1393,6 +1404,9 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
         probe_batch_rows=probe_batch_rows,
     )
+    # Reserved from the budget by the recipe, allocated below; a family
+    # without QSA layers refuses --enable-qsa-prefill-bf16-scratch here.
+    qsa_bf16_scratch = recipe.qsa_bf16_scratch_plan
     num_draft_cache_layers = recipe.num_draft_layers
     num_target_cache_layers = len(recipe.layer_types) - num_draft_cache_layers
     from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows
@@ -1544,6 +1558,7 @@ def create_attn_components(
         draft_backend=draft_attn_backend,
         uses_paged_state_verify=cache_setup.uses_paged_state_verify,
         is_inkling=cache_family == "inkling",
+        qsa_bf16_scratch=qsa_bf16_scratch,
         expected_bytes=fixed_workspace_bytes,
     )
 
