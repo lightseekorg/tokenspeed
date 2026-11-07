@@ -211,8 +211,11 @@ def _fused_outputs(
     topk: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The caller's slot rows and counts, or new ones: int32 ``[tokens, topk]``
-    with unit column stride and int32 ``[tokens]``."""
+    """The caller's slot rows and counts, or new ones.
+
+    The slot rows are int32 ``[tokens, topk]`` with unit column stride and the
+    counts int32 ``[tokens]``.
+    """
     if out is None:
         out = torch.empty((tokens, topk), dtype=torch.int32, device=device)
     elif (
@@ -325,6 +328,13 @@ if _fused_indexer is not None:
                 )
                 for weights_dtype in (torch.float32, torch.bfloat16)
             }
+            | {
+                # Queries quantized ahead: unit scales, folded into the weights.
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e4m3fn),
+                    weights=dense_tensor_format(torch.float32),
+                )
+            }
         ),
         traits={
             "q_len": frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
@@ -357,21 +367,28 @@ if _fused_indexer is not None:
         lens_out: torch.Tensor | None = None,
         batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fused DSA decode top-k: FP32 logits bit-identical to DeepGEMM's paged
-        MQA logits, NaN and +inf scored -inf, and the exact top-k of each row's
-        causal window in ascending position order (ties at the threshold to the
-        lowest positions), as global slots with a ``-1`` tail.
+        """Fused DSA decode top-k: the paged logits and each row's exact top-k.
+
+        The FP32 logits are bit-identical to DeepGEMM's paged MQA logits, with
+        NaN and +inf scored -inf. The exact top-k of each row's causal window
+        comes in ascending position order (ties at the threshold to the lowest
+        positions), as global slots with a ``-1`` tail.
 
         Args:
-            q: ``[tokens, 32, 128]`` BF16 index queries, unit last stride.
-            weights: ``[tokens, 32]`` FP32 or BF16 head weights, unit last stride.
+            q: ``[tokens, 32, 128]`` BF16 index queries, unit last stride, or
+                contiguous E4M3 ones with unit scales
+                (``index_k_layernorm_fp8_scatter_and_quantize_query``).
+            weights: ``[tokens, 32]`` FP32 or BF16 head weights, unit last
+                stride; with E4M3 queries contiguous FP32 weights carrying
+                each query's scale and the score scale.
             seq_lens: int32 ``[requests]`` request lengths; verify row ``j``
                 sees ``seq_lens[req] - (q_len_per_req - 1) + j`` keys.
             block_table: int32 ``[requests, pages]`` page table of the index-K
                 plane and the latent cache, unit column stride.
             page_size: Keys per page (64).
             topk: Keys selected per row (2048).
-            softmax_scale: Score scale folded into the head weights.
+            softmax_scale: Score scale folded into the head weights; 1 with
+                E4M3 queries, whose weights carry it.
             q_len_per_req: Query rows per request (1-8).
             slot_order: ``"selection"`` or ``"sorted"``; both emit ascending
                 positions, which is this leaf's selection order.
@@ -442,12 +459,28 @@ if _fused_indexer is not None:
             raise ValueError(
                 "block_table must be int32 [requests, pages] with unit column stride"
             )
+        prequantized = q.dtype == torch.float8_e4m3fn
+        if prequantized and (
+            softmax_scale != 1.0
+            or weights.dtype != torch.float32
+            or weights.shape != (tokens, _FUSED_HEADS)
+            or not (q.is_contiguous() and weights.is_contiguous())
+        ):
+            raise ValueError(
+                "E4M3 queries take unit scales: contiguous FP32 [tokens, 32] "
+                "weights carrying the query scales and the score scale, and "
+                f"softmax_scale 1, got softmax_scale={softmax_scale} and "
+                f"{weights.dtype} weights {tuple(weights.shape)}"
+            )
         out, lens_out = _fused_outputs(
             out, lens_out, tokens=tokens, topk=int(topk), device=q.device
         )
         if tokens == 0:
             return out, lens_out
-        q_fp8, folded = quantize_index_query_weights(q, weights, softmax_scale)
+        if prequantized:
+            q_fp8, folded = q, weights
+        else:
+            q_fp8, folded = quantize_index_query_weights(q, weights, softmax_scale)
         fused_decode_topk_scores(
             q_fp8,
             folded,

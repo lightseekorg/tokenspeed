@@ -314,10 +314,22 @@ non-finite scrub, radix top-k and slot mapping, and ignores the `dsa_plan`.
   compile per `q_len_per_req`. At most 4096 requests per call.
 - The select never releases its dependents early: trtllm-gen sparse attention
   reads the counts before its PDL wait.
+- It also takes queries quantized ahead: contiguous E4M3 queries with unit
+  scales (`q_scales=None`) and the FP32 weights that carry their scales and
+  the score scale (`softmax_scale=1`), which it scores without its own
+  quantization launch.
 
 The leaf registers below every other `dsa_decode_topk` leaf, so only
 `solution="cute_dsl"` selects it. Kimi-K3.1 pins it where it is registered;
 other models with the same indexer geometry keep their leaf.
+
+A Kimi-K3.1 decode round quantizes those queries in the launch that writes
+its index keys: `index_k_layernorm_fp8_scatter_and_quantize_query`
+(`_triton/topk.py`) runs, per row, the row functions of
+`index_k_layernorm_fp8_scatter` (one warp, so the key's LayerNorm sums in the
+same order) and of `quantize_index_query_weights`, so the plane's bytes and
+the query and weights are bit-identical to the two separate launches. Mixed
+rounds, prefill, and KV-parallel decode keep the separate write.
 
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)
 

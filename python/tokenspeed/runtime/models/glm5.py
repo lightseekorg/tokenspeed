@@ -141,6 +141,8 @@ class GlmDsaIndexerOutput:
     key_norm: LayerNorm | None = None
     # When set, query holds input rows and ranks project only their top-k share.
     query_proj: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # When set, the decode rows' E4M3 query and FP32 weights folding its scales and the score scale.
+    quantized_query: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def query_rows(self, start: int, end: int) -> torch.Tensor:
         rows = self.query[start:end]
@@ -356,10 +358,16 @@ class GlmDsaSparseAttentionMixin:
     ``decode_topk_solution`` (default None: normal selection) pins the
     tensor-parallel decode top-k to one ``dsa_decode_topk`` solution; a host
     sets it only to a solution it validated and that selects on the platform.
+
+    ``index_k_write_quantizes_query`` (default off) quantizes a decode round's
+    index query in the launch of its index-K write (an ``fp8_scaled`` plane,
+    keys with ``key_norm``) and hands the decode top-k E4M3 queries with unit
+    scales; a host sets it only where its ``decode_topk_solution`` takes them.
     """
 
     index_query_fp8: bool = False
     decode_topk_solution: str | None = None
+    index_k_write_quantizes_query: bool = False
 
     def _scorer_index_query(
         self, q: torch.Tensor, index_k_cache: torch.Tensor
@@ -611,10 +619,22 @@ class GlmDsaSparseAttentionMixin:
         num_decode_tokens: int,
         topk: int,
     ) -> GlmDsaDecodeTopK:
-        q = indexer_output.query_rows(decode_start, decode_start + num_decode_tokens)
-        weights = indexer_output.weights[
-            decode_start : decode_start + num_decode_tokens
-        ]
+        quantized = indexer_output.quantized_query
+        if quantized is None:
+            q = indexer_output.query_rows(
+                decode_start, decode_start + num_decode_tokens
+            )
+            weights = indexer_output.weights[
+                decode_start : decode_start + num_decode_tokens
+            ]
+        elif decode_start != 0 or quantized[0].shape[0] != num_decode_tokens:
+            raise RuntimeError(
+                "the index-K write quantized rows [0, "
+                f"{quantized[0].shape[0]}), not the decode window [{decode_start}, "
+                f"{decode_start + num_decode_tokens})"
+            )
+        else:
+            q, weights = quantized
         index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
         if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
@@ -647,6 +667,8 @@ class GlmDsaSparseAttentionMixin:
         dcp_index = None
         capturing = False
         if placement is not None:
+            if quantized is not None:
+                raise RuntimeError("the KV-parallel decode top-k scores BF16 queries")
             page_size = ctx.token_to_kv_pool.index_k_page_size
             capturing = is_current_stream_capturing(q.device)
             dcp_index = self._reusable_dcp_index(
@@ -705,7 +727,12 @@ class GlmDsaSparseAttentionMixin:
                 lens_out=topk_lens_slice,
             )
         else:
-            q, q_scales = self._scorer_index_query(q, index_k_cache)
+            softmax_scale = self.indexer.weights_softmax_scale
+            if quantized is None:
+                q, q_scales = self._scorer_index_query(q, index_k_cache)
+            else:
+                # Unit query scales: the weights carry them and the score scale.
+                q_scales, softmax_scale = None, 1.0
             dsa_decode_topk(
                 q,
                 weights,
@@ -713,7 +740,7 @@ class GlmDsaSparseAttentionMixin:
                 page_table,
                 page_size=ctx.token_to_kv_pool.index_k_page_size,
                 topk=topk,
-                softmax_scale=self.indexer.weights_softmax_scale,
+                softmax_scale=softmax_scale,
                 batch_invariant=False,
                 q_len_per_req=q_len_per_req,
                 index_k_cache=index_k_cache,
@@ -1265,16 +1292,33 @@ class GlmDsaSparseAttentionMixin:
                 indexer_output = replace(
                     indexer_output, query=index_query, query_proj=None
                 )
-            index_slots, index_mask = resolve_cache_slots(
-                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
-            )
-            ctx.token_to_kv_pool.set_index_k_buffer(
-                self.attn_mqa.layer_id,
-                index_slots,
-                indexer_output.key,
-                write_mask=index_mask,
-                key_norm=indexer_output.key_norm,
-            )
+            placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+            index_slots, index_mask = resolve_cache_slots(out_cache_loc, placement)
+            # Decode rounds only (every row decodes); the KV-parallel top-k scores BF16 queries.
+            if (
+                self.index_k_write_quantizes_query
+                and num_prefill_tokens == 0
+                and placement is None
+            ):
+                quantized = ctx.token_to_kv_pool.set_index_k_buffer_and_quantize_query(
+                    self.attn_mqa.layer_id,
+                    index_slots,
+                    indexer_output.key,
+                    write_mask=index_mask,
+                    key_norm=indexer_output.key_norm,
+                    query=indexer_output.query_rows(0, num_attn_tokens),
+                    query_weights=indexer_output.weights,
+                    softmax_scale=self.indexer.weights_softmax_scale,
+                )
+                indexer_output = replace(indexer_output, quantized_query=quantized)
+            else:
+                ctx.token_to_kv_pool.set_index_k_buffer(
+                    self.attn_mqa.layer_id,
+                    index_slots,
+                    indexer_output.key,
+                    write_mask=index_mask,
+                    key_norm=indexer_output.key_norm,
+                )
             if ctx.num_extends > 0:
                 shared_topk.prefill = self._compute_prefill_topk_indices(
                     indexer_output,
