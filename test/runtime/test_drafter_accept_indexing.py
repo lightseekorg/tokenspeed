@@ -169,7 +169,9 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
         req_pool_indices_buf=torch.zeros(4, dtype=torch.int64)
     )
     executor.runtime_states = SimpleNamespace(
-        valid_cache_lengths=torch.zeros(4, dtype=torch.int32), vocab_size=32
+        valid_cache_lengths=torch.zeros(4, dtype=torch.int32),
+        input_vocab_size=32,
+        vocab_size=32,
     )
     executor.attn_backend = SimpleNamespace()
     executor.token_to_kv_pool = SimpleNamespace()
@@ -402,6 +404,7 @@ class TestDrafterAcceptIndexing:
         backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
         backend.spec_num_tokens = k
         backend.kernel_page_size = 64
+        backend.is_draft = True
         metadata = TRTLLMMLADecodeMetadata(
             seq_lens_k=torch.zeros(bs, dtype=torch.int32)
         )
@@ -439,6 +442,52 @@ class TestDrafterAcceptIndexing:
         for p in plans:
             assert (p["seq_lens_2d"]) is (rows)
             assert (p["page_size"]) == (64)
+        # Drafts never read the decode core's published KV rows.
+        assert (metadata._dsa_kv_seq_lens) is None
+
+    def test_dsa_target_refresh_publishes_the_causal_kv_rows_in_place(self):
+        # KV lengths are the leaf's clamped seq_lens_k, rewritten in place for replay.
+        from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+            TRTLLMMLADecodeMetadata,
+        )
+
+        k, bs = 4, 3
+        backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.spec_num_tokens = k
+        backend.kernel_page_size = 64
+        backend.is_draft = False
+        metadata = TRTLLMMLADecodeMetadata(
+            seq_lens_k=torch.zeros(bs, dtype=torch.int32)
+        )
+
+        def leaf_refresh(bs, actual_bs, seq_lens, page_table, **kwargs):
+            metadata.seq_lens_k[:bs].copy_(seq_lens[:bs].clamp_min(k))
+
+        backend._dense_backend = SimpleNamespace(
+            forward_decode_metadata=metadata, refresh_decode_metadata=leaf_refresh
+        )
+        page_table = torch.zeros((bs, 1), dtype=torch.int32)
+        with mock.patch.object(dsa_mod, "dsa_plan", side_effect=lambda **kw: object()):
+            # The third request is a padded graph row.
+            backend.refresh_decode_metadata(
+                bs, 2, torch.tensor([9, 5, 0, 99], dtype=torch.int32), page_table
+            )
+            rows = metadata._dsa_kv_seq_lens
+            assert (rows.tolist()) == ([6, 7, 8, 9, 2, 3, 4, 5, 1, 2, 3, 4])
+            backend.refresh_decode_metadata(
+                bs, 3, torch.tensor([10, 6, 4, 99], dtype=torch.int32), page_table
+            )
+
+        assert (metadata._dsa_kv_seq_lens) is (rows)
+        assert (rows.tolist()) == ([7, 8, 9, 10, 3, 4, 5, 6, 1, 2, 3, 4])
+        # The decode rows after one extend request, at the verify width only.
+        assert (backend._published_kv_seq_lens(metadata, 1, k, 2 * k).tolist()) == (
+            [3, 4, 5, 6, 1, 2, 3, 4]
+        )
+        assert (backend._published_kv_seq_lens(metadata, 0, 1, bs)) is None
+        backend.is_draft = True
+        assert (backend._published_kv_seq_lens(metadata, 0, k, bs * k)) is None
 
     def test_substitute_mm_pad_rewrites_media_ids_in_place(self):
         image = MultimodalDataItem(modality=Modality.IMAGE, hash=123)
@@ -712,7 +761,7 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
-    states = RuntimeStates(POOL, VOCAB, N, "cpu")
+    states = RuntimeStates(POOL, VOCAB, VOCAB, N, "cpu")
     states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
     buffers = _draft_buffers()
     pools = SpeculativeSamplingPools(
@@ -1035,7 +1084,7 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
     assert Eagle.supports_speculative_sampling and Mtp.supports_speculative_sampling
     assert not DFlash.supports_speculative_sampling
 
-    states = RuntimeStates(POOL, VOCAB, N, "cpu")
+    states = RuntimeStates(POOL, VOCAB, VOCAB, N, "cpu")
     states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
     buffers = _draft_buffers()
     pools = SpeculativeSamplingPools(

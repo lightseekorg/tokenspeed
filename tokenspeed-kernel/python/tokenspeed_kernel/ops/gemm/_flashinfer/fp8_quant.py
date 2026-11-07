@@ -34,8 +34,12 @@ _trtllm_per_token_group_quant_fp8 = error_fn
 
 if platform.is_nvidia:
     from tokenspeed_kernel.ops.quantization.trtllm import (
-        _per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
+        _HAS_TRTLLM_KERNEL,
+        _per_token_group_quant_8bit,
     )
+
+    if _HAS_TRTLLM_KERNEL:
+        _trtllm_per_token_group_quant_fp8 = _per_token_group_quant_8bit
 
 
 @triton.jit

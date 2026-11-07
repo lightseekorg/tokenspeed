@@ -15,7 +15,7 @@ its own cache groups.
 through `select_kernel` like any other kernel family, and a helper built on the
 first:
 
-* `gqa_prologue(q, k, v, *, norm, rotary, cache, return_kv,
+* `gqa_prologue(q, k, v, *, norm, rotary, cache, query_dtype, return_kv,
   solution, override)` for multi-head and grouped-query attention;
 * `mla_prologue(query, q_pe, latent_cache, *, expanded, rotary,
   cache, solution, override)` for multi-head latent attention; `cache=None`
@@ -38,7 +38,8 @@ rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
 When a projection or collective has already applied the same head-step numerics,
 `PagedAttention.store_prepared` uses `gqa_prologue` with no norm or rotary step.
 The prologue still owns slot selection and KV conversion/writes; the returned
-query/key rows need no additional copy in the Triton solution.
+query/key rows need no additional copy in the Triton solution unless the
+backend asks for an FP8 query.
 Flows that dispatch core attention themselves call `PagedAttention.prologue`
 (GQA) or `PagedAttention.latent_prologue` (MLA). Passing `k = v = None` means
 that `prologue`/`latent_prologue` call has prepared the inputs and written
@@ -237,9 +238,15 @@ given, which the decode half relies on. The gluon backend's absorbed cached
 extend rebuilds its query in the break from those untouched inputs and skips
 the store. Its captured expanded pass is spent. The backends' own breaks nest
 inside these and pass through, and remain for callers that reach a backend
-directly. Prefill graphs capture the target model only and replay a round
-with draft narrowing eagerly, so draft layers need no break. A narrowed draft
-step writes every row itself and skips the pre-break prologue.
+directly. Prefill graphs capture the target model and replay a round with
+draft narrowing eagerly, so draft layers need no break. A narrowed draft
+step writes every row itself and skips the pre-break prologue. The drafter
+prefill graph (`--enable-drafter-prefill-graph`, see
+[unified_path.md](unified_path.md#drafter-prefill-graphs)) records a draft's
+extend step only when the draft model declares
+`supports_breakable_draft_extend`: Qwen4-Exp's MTP head runs the GQA prologue
+in the captured segment and attends at `PagedAttention.attend`, like the
+target.
 
 ## Formats and scales
 
@@ -263,6 +270,13 @@ scales. MLA caches run at unit scale.
 An MLA layer reads its query in the activation dtype, except that an FP8
 latent cache gets an FP8 query, and FP8 expanded keys and values, whichever MLA
 backend serves the layer. A per-token-head cache keeps the activation dtype.
+A GQA layer's query dtype is the reader's choice, since readers of one FP8
+cache differ: the backend's `query_dtype` names it per layer and forward
+mode, and the prologue returns the query in it (the Triton solution rounds
+once from fp32, the composite converts its result), so no separate cast runs
+before attention. The MHA backend asks for unscaled FP8 in decode over an FP8
+cache; a fresh prefill attends the activation-dtype key and value rows the
+prologue returns, so extend keeps the activation dtype.
 
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.

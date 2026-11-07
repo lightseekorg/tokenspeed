@@ -201,7 +201,7 @@ class Qwen3DecoderLayer(nn.Module):
         self.mlp = GatedMLP.tensor_parallel(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation=gated_activation(config.hidden_act),
+            activation=gated_activation(config.hidden_act, swiglu_limit=None),
             tp_rank=self.mapping.dense.tp_rank,
             tp_size=self.mapping.dense.tp_size,
             tp_group=self.mapping.dense.tp_group,

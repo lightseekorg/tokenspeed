@@ -730,6 +730,7 @@ def test_standard_decode_replay_workspace_matches_recipe(draft_tokens):
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
+        qsa_bf16_scratch=None,
         expected_bytes=planned_bytes,
     )
 
@@ -763,6 +764,7 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
+        qsa_bf16_scratch=None,
         expected_bytes=planned_bytes,
     )
 
@@ -777,6 +779,7 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
             draft_backend=None,
             uses_paged_state_verify=True,
             is_inkling=False,
+            qsa_bf16_scratch=None,
             expected_bytes=planned_bytes + 1,
         )
 
@@ -1331,6 +1334,7 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
+        qsa_bf16_scratch=None,
         expected_bytes=planned_bytes,
     )
 

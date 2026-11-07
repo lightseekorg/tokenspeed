@@ -56,12 +56,14 @@ public:
     std::size_t NumNegativeKeys() const { return negative_.size(); }
     std::size_t NumBackupCandidates() const { return backup_candidates_.size(); }
     bool IsNegative(const CacheKey& key) const { return negative_.contains(key); }
-    // An empty lease when nothing was started.
-    StorageLease StartQuery(std::vector<CacheKey> keys);
+    // Returns an empty lease when nothing was started.
+    StorageLease StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens);
     bool Completed(std::uint64_t id) const;
     bool IsQuery(std::uint64_t id) const;
-    std::vector<CacheKey> QueryHits(std::uint64_t id) const;
-    // An empty lease when nothing was started.
+    // Successful query hits, and the cumulative tokens they cover. Each hit counts once per operation.
+    std::vector<CacheKey> QueryHits(std::uint64_t id);
+    std::uint64_t QueryHitTokens() const { return query_hit_tokens_; }
+    // Returns an empty lease when nothing was started.
     StorageLease StartRead(const CacheCoordinator::PromptPrefix& prompt, std::span<const CacheKey> hits);
     void Complete(const cache::StorageDone& event);
     void QueueBackups(std::span<const CacheKey> keys);
@@ -76,6 +78,8 @@ private:
     struct Ticket {
         StorageKind kind;
         std::vector<CacheKey> keys;
+        // Query tickets: tokens each key covers, parallel to `keys`.
+        std::vector<std::int32_t> key_tokens;
         std::vector<CacheBlockRef> blocks;
         std::vector<std::uint8_t> success;
         ContentHash tail_prior;
@@ -103,5 +107,7 @@ private:
     std::uint64_t unavailable_dropped_backup_keys_{0};
     std::uint64_t disabled_dropped_backup_keys_{0};
     std::uint64_t cleanup_dropped_backup_keys_{0};
+    // Cumulative tokens of keys storage queries found (L3 hits).
+    std::uint64_t query_hit_tokens_{0};
 };
 }  // namespace tokenspeed

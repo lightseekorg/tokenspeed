@@ -353,6 +353,43 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     };
 }
 
+std::int32_t TierTransferManager::DemoteInFlightEvictions(std::span<const CacheKey> keys) {
+    if (in_flight_segments_.empty() || keys.empty()) {
+        return 0;
+    }
+    const std::unordered_set<CacheKey, CacheKeyHash> demoted_keys(keys.begin(), keys.end());
+    std::int32_t demoted = 0;
+    // Per key, the members holding its Host entry to publish into: the Host
+    // held it when the Device entry was evicted, or an earlier store
+    // published it since.
+    std::unordered_map<CacheKey, std::uint32_t, CacheKeyHash> host_entry_holds;
+    for (InFlightSegment& in_flight : in_flight_segments_) {
+        for (CacheCoordinator::EvictedBlock& member : in_flight.segment.members) {
+            if (!demoted_keys.contains(member.key)) {
+                continue;
+            }
+            const bool holds_host_entry =
+                member.host_block && member.host_block == coordinator_.FindHostCachedBlock(member.key);
+            if (holds_host_entry) {
+                ++host_entry_holds[member.key];
+            }
+            if (!member.metadata.demoted) {
+                member.metadata.last_access_epoch = CacheCoordinator::kDemotedAccessEpoch;
+                member.metadata.was_acquired = false;
+                member.metadata.demoted = true;
+                // One publishing into a Host entry counts with that entry.
+                demoted += holds_host_entry ? 0 : 1;
+            }
+        }
+    }
+    // The settlement keeps the newer of a member's date and its Host entry's,
+    // so the Host entry is dated back here.
+    for (const auto& [key, holds] : host_entry_holds) {
+        demoted += coordinator_.DemoteHostEntryHeldByWriteBack(key, holds) ? 1 : 0;
+    }
+    return demoted;
+}
+
 void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
     // Both ends were pinned for the copy; the destinations were published
     // when the admission claimed the Host hit, so the ACK only lets go.
