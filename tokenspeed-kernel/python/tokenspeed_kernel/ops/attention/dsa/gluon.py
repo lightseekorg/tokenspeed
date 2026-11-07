@@ -799,7 +799,7 @@ if current_platform().is_amd:
         )
 
         if not 0 < topk <= 2048:
-            raise ValueError("gfx950 owned-page top-k supports at most2048 candidates")
+            raise ValueError("gfx950 owned-page top-k supports at most 2048 candidates")
         if q_scales is None:
             raise ValueError("gfx950 owned-page scorer requires FP8 query scales")
         if pages is None:
@@ -890,15 +890,9 @@ if current_platform().is_amd:
         """``dsa_select_owned_candidates`` in one launch over the gathered
         scores, for sizes ``dsa_select_owned_candidates_supported`` admits."""
         from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
-            gathered_owned_selection_fits,
             gluon_dsa_select_owned_from_gathered_gfx950,
         )
 
-        if not gathered_owned_selection_fits(scores, topk):
-            raise ValueError(
-                "gfx950 owned selection takes a power-of-two rank count, a "
-                "full top-k of candidates per rank and contiguous rows"
-            )
         return gluon_dsa_select_owned_from_gathered_gfx950(
             scores,
             positions,
