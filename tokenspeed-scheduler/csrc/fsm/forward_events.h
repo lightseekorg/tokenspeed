@@ -204,12 +204,13 @@ struct SnapshotRetractEvent : InvalidTransitionHandler<SnapshotRetractEvent> {
     using InvalidTransitionHandler<SnapshotRetractEvent>::operator();
 
     SnapshotRetractEvent(CacheCoordinator* coordinator, std::int64_t epoch, bool resumes_generation,
-                         RetractionImage image, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-                         std::vector<StoreWait> image_stores)
+                         RetractionImage image, std::vector<std::int32_t> kv_event_tails,
+                         std::shared_ptr<SnapshotSlotIndex> blob_slot, std::vector<StoreWait> image_stores)
         : coordinator_{coordinator},
           epoch_{epoch},
           resumes_generation_{resumes_generation},
           image_{std::move(image)},
+          kv_event_tails_{std::move(kv_event_tails)},
           blob_slot_{std::move(blob_slot)},
           image_stores_{std::move(image_stores)} {}
 
@@ -225,6 +226,7 @@ private:
     std::int64_t epoch_{0};
     bool resumes_generation_{false};
     RetractionImage image_;
+    std::vector<std::int32_t> kv_event_tails_;
     std::shared_ptr<SnapshotSlotIndex> blob_slot_;
     std::vector<StoreWait> image_stores_;
 };

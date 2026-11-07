@@ -186,7 +186,11 @@ def make_case(*, tokens, head_dim, value_head_dim, vheads, state_dtype, replay, 
         num_v_heads=vheads,
         head_v_dim=value_head_dim,
     )
-    backend = GdnAttnBackend(replace(config, components=(spec, linear)), spec)
+    backend = GdnAttnBackend(
+        replace(config, components=(spec, linear)),
+        spec,
+        writes_state_checkpoints_in_forward=False,
+    )
     backend.set_kv_pool(pool)
     backend.init_cuda_graph_state(_BATCH)
     backend.preallocate_verify_workspace(_BATCH, tokens)

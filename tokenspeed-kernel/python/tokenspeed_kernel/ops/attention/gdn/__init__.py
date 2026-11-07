@@ -176,12 +176,15 @@ def gdn_chunk_prefill_capturable(
     num_q_heads: int,
     num_v_heads: int,
     qk_l2norm: bool,
+    state_checkpoints: bool,
 ) -> bool:
     """Whether a CUDA graph can capture ``gdn_chunk_prefill`` at a fixed sequence count.
 
     The kernel selected for this geometry must size its launch from the number
     of sequences alone and read ``cu_seqlens`` on device, so a graph replayed
-    with rewritten bounds of the same sequence count stays valid.
+    with rewritten bounds of the same sequence count stays valid. With
+    ``state_checkpoints`` it must also read ``GdnStateCheckpoints.cu_starts``
+    on device; the interval and buffer stay those of the capture.
 
     Args:
         dtype: Q/K/V dtype.
@@ -190,6 +193,7 @@ def gdn_chunk_prefill_capturable(
         num_q_heads: Query (and key) head count.
         num_v_heads: Value head count.
         qk_l2norm: Whether the scan L2-normalizes Q/K.
+        state_checkpoints: Whether the captured scan stores state checkpoints.
 
     Returns:
         ``True`` when the selected kernel can be captured that way.
@@ -207,7 +211,7 @@ def gdn_chunk_prefill_capturable(
                 num_v_heads,
                 False,
                 qk_l2norm,
-                False,
+                state_checkpoints,
             ),
         )
     except NoKernelFoundError:

@@ -265,6 +265,10 @@ storage the cache layer allocated. The scheduler owns allocation, so its output 
 Consumers outside the cache layer treat the ids as opaque.
 Export preserves every logical slot, including holes in a released prefix.
 Export and active-parent accounting skip reading those released references.
+On PD decode admission, a partial leading history block is a landing slot
+for the prefill peer. Installing its private writable block also rewinds
+the released-prefix frontier to include that slot: the outgoing destination
+table must carry the real block ID, even at logical slot zero.
 
 A table resolves a block's id once, when the block enters a slot, and keeps
 it beside the reference (`BlockTable::PageIds`): a forward batch exports
@@ -402,10 +406,22 @@ masked state writer (`store_state_rows`) drops its result, and the padded
 output rows are zeroed by a device-side bound the capture cannot freeze. The
 live tokens keep the packing of the unpadded forward, so a capture of any
 request count matches eager bit for bit; nothing about padding reaches the
-cache or the scheduler. A forward that writes an in-forward State checkpoint
-keeps its live metadata instead (`prepare_prefill_metadata` returns False):
-the capacity layout carries no checkpoint, so the layer runs at its eager
-break of the ordinary prefill graph.
+cache or the scheduler. On a server that writes in-forward State checkpoints
+(`ServerArgs.writes_state_checkpoints_in_forward`, which `GdnAttnBackend`
+takes at construction), the GDN layers of a forward that writes one stay
+captured too. Their capacity metadata keeps one fixed checkpoint slot per
+request slot, and the captured scan stores a state at every multiple of the
+bound pool's prefix granularity, which divides every checkpoint offset, into
+a float32 scratch that all captured shapes share (`CapacityCheckpointLayout`).
+Before each use the refresh rewrites in place each sequence's state count and
+each live checkpoint's scratch row, token index and block; an unused slot
+keeps an in-range token index and block `-1`, which the masked writers of the
+conv window and the recurrent state skip. The checkpoint block thus receives
+the state the scan computes at its boundary, as in an eager forward. A
+capacity layout without these slots keeps such a forward on its live metadata
+(`prepare_prefill_metadata` returns False), so the layer runs at its eager
+break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
+checkpoint windows at its eager break, over live metadata.
 
 PD moves exactly one block per state group: `latest_snapshot` is slot 1 of
 the prefill's final state, landing in the decode's slot 1 (its slot 0 stays
@@ -496,6 +512,14 @@ page a tail hit loads) and the State checkpoint an inline KDA layer reads there
 would race the load. `PrefillGraph.replay` therefore waits for the plan's whole
 Host load before the first segment; a replayed forward overlaps only its
 embedding with that load.
+
+A write needs the fence as much as a read: a Host tail hit
+loads its partially filled last block whole, and the forward appends its new
+tokens to the rest of that block, so a row written before the copy lands is
+overwritten by it. A pool's setters must therefore wait as its getters do. A
+draft view has its own tracker, and its layers land after all of the target's
+on either copy path, so no per-layer wait of the target forward covers a draft
+layer: the context rows a draft writes before its forward must wait themselves.
 
 A batched post-verification commit is the one side-cache writer that issues no
 fence of its own. It moves every bound layer's fields in a single launch, so it
@@ -1953,8 +1977,8 @@ MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
 Before allocating the arena, the hybrid KVP check validates these declared group shard
 counts rather than the recipe name or its inheritance. Plugin recipes follow
 the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
-require the full-attention backend to declare `supports_mla_dcp`; FlashMLA and
-TokenSpeed MLA (CuTe MLA) both declare this capability.
+require the full-attention backend to declare `supports_mla_dcp`; FlashMLA,
+TokenSpeed MLA (CuTe MLA) and DSA declare this capability.
 Decode (DCP) gathers query heads, computes attention over owned history, and
 merges partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reads its bounded prefix chunks through the backend
@@ -1973,8 +1997,14 @@ amplifying FP8 attention rounding when changing the softmax partitioning.
 The gathers run on a named
 copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
-before its layer instead of queueing with those collectives. GPU DSA sparse
-prefill instead combines local sparse-attention partials.
+before its layer instead of queueing with those collectives. On SM100 and SM103
+a KVP group may gather the same raw rows with a fused paged-row all-gather on a
+stream of its own instead (`ops/communication/README.md` in
+`tokenspeed-kernel`), still one window ahead: each owner reads its rows in
+place and stores them into every rank's receive slot. A receive slot holds the
+history-expansion capacity from every owner, so any one loop fits however its
+pages are owned, and a window packs loops while each owner's rows still fit.
+GPU DSA sparse prefill instead combines local sparse-attention partials.
 Ascend's generic MLA prefill gathers each layer's complete cache plane into
 an owner-major temporary view. That view is not published as persistent cache;
 its allocation and communication scale with layer capacity, including unused
@@ -2037,8 +2067,11 @@ because every path keeps three invariants:
    a peer's cache.
 2. Off the execution stream, a read of a page the plan grants again forks
    from it after the forward's prologue, which waits on the default stream
-   and with it on the plan's store fence and zeroing; the history gather's
-   all-gather, for one, reads rows the execution stream copied out. Only the
+   and with it on the plan's store fence and zeroing. The history gather's
+   NCCL all-gather, for one, reads rows the execution stream copied out; its
+   fused all-gather reads the owner's pages in place, from a kernel forked
+   through an event the execution stream records after the prologue and the
+   layer's Host-load wait, and writes only the ranks' receive slots. Only the
    eviction copies, which the fence orders, read such a page earlier: on the
    write stream, behind the forward that wrote it.
 3. A kernel that would read a peer's KV in place (one-sided or
@@ -2258,6 +2291,15 @@ allocation follows actual referenced pages and current rows, not cache capacity.
 The null page and receive alignment are physical overhead.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
+
+Kimi-K3.1 keeps the `kimi_k3` family: a DSA target config adds one index-K
+field per MLA layer to the full-attention group, in a plane of its own (the
+latent plane's page stride must stay its payload) that KDA state never
+shares, so the K3 packing is unchanged. Its pool
+(`HybridKDADSATokenToKVPool`) writes, gathers and scores those planes in the
+DSA leaf's kernel pages (`index_k_page_size`), which subdivide the 128-token
+cache blocks exactly as the router's page tables do; the ordinary DSA family
+runs its kernel page at the arena page.
 
 Qwen4-Exp selects its cache recipe by model family, including targets with
 only full-attention layers. PLE and QSA fields and their verify budget do
