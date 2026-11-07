@@ -115,11 +115,10 @@ def _select_head_tile(
     if (
         not bf16_kv
         and heads_per_kv == 12
-        and rows * kv_heads >= sm_count
-        and _is_sm107(device)
+        and (not _is_sm107(device) or rows * kv_heads >= sm_count)
     ):
-        # Cover twelve heads with one gather/conversion stream once the
-        # unsplit grid has at least one tile per SM. Smaller grids keep tile8.
+        # Cover twelve heads with one gather/conversion stream. SM107 keeps
+        # tile8 until the unsplit grid has at least one tile per SM.
         return 16
     return _head_tile_for_geometry(heads_per_kv * query_group, bf16_kv, query_group)
 
@@ -149,6 +148,8 @@ def _configuration(rows, q_heads, kv_heads, max_seqlen_q, bf16_kv, sm_count, dev
             if rows * head_tiles_per_row <= _SMALL_MAX_CLUSTERS
             else 0
         ),
+        # The FP8 wave cost model was fitted on SM103; SM107 keeps its split rule.
+        fp8_wave_sizing=not _is_sm107(device),
     )
     return (
         head_tile,
