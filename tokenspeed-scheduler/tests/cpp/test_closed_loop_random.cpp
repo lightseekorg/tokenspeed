@@ -44,9 +44,13 @@
 // after every plan no retraction image was refused once planned; and under
 // write-back, after every plan, the blocks evicted for the cache (by
 // admission, stranded suffix or restore) equal the sum of the drain's
-// outcomes, the dead and demoted entries it dropped included. Once
-// everything is acknowledged, no Host entry is pinned and nothing is in
-// flight.
+// outcomes, the dead and demoted entries it dropped included. On the P role
+// a plan leaves at most one prefill incomplete, and it runs last, after any
+// whole prompts its chunk gave way to (prefill_chunk_yield_tokens): the
+// completing prefills form a prefix of the batch. With KV cache events on,
+// every plan's drain removes only blocks the feed stored and stores none
+// twice, alike on mirrored ranks. Once everything is acknowledged, no Host
+// entry is pinned and nothing is in flight.
 //
 // The demotion runs turn superseded checkpoint demotion on, with the
 // in-forward checkpoints it requires (so the dead prompt ends and finishes
@@ -72,6 +76,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -97,10 +102,13 @@ struct LoopKnobs {
     std::optional<bool> write_back;
     std::optional<bool> in_forward;
     // A prompt draw below repeat_below repeats a live prompt; then one below
-    // continue_below continues a finished one; any other draw is a system
-    // prompt with new user tokens.
+    // continue_below continues a finished prompt, with new user tokens always
+    // under extend_always, otherwise half the time (or as the next turn of a
+    // conversation, below). Any other draw is a system prompt with new user
+    // tokens.
     double repeat_below{0.15};
     double continue_below{0.45};
+    bool extend_always{false};
     // A continued prompt is the next turn of a conversation: the finished
     // prompt (without what it generated) with its last one to four tokens
     // rendered anew, then new user tokens; no later prompt continues the same
@@ -108,6 +116,19 @@ struct LoopKnobs {
     bool conversations{false};
     // Multiplies the drawn Device size.
     std::int32_t device_pages_factor{1};
+    // A chunk budget in place of 48 tokens (0: none).
+    std::int32_t chunk_budget{0};
+    // SchedulerConfig::prefill_chunk_yield_tokens (0: off; the P role only).
+    std::int32_t yield_tokens{0};
+    // Leave out the State groups and the sliding window: no junction cut and
+    // no final-window rule then shapes a chunk.
+    bool full_attention_only{false};
+    // SchedulerConfig::enable_kv_cache_events, the feed drained and checked
+    // after every plan.
+    bool kv_events{false};
+    // Restricted State groups of this checkpoint grain (0: unrestricted),
+    // with in-forward checkpoints and no sliding window.
+    std::int32_t state_grain{0};
     // P role only: SchedulerConfig::drop_short_prompt_end_checkpoints, with
     // the in-forward checkpoints on whatever in_forward says.
     bool drop_short_prompt_ends{false};
@@ -164,9 +185,64 @@ struct ClosedLoop {
     // eviction write-back ops so far.
     std::uint64_t decode_only_write_backs{0};
     std::uint64_t eviction_ops{0};
+    // The P role's plans with an incomplete prefill that whole prompts ran
+    // beside (prefill_chunk_yield_tokens), how many of those chunks ended on
+    // a page (with restricted State groups, a segment), and the prompts they
+    // carried.
+    std::uint64_t yielding_chunks{0};
+    std::uint64_t yielding_chunks_on_page{0};
+    std::uint64_t carried_prompts{0};
+    // The P role's requests a plan left incomplete: each later chunk of
+    // theirs is a resident's.
+    std::set<std::string> prefilling;
+    // With KV cache events: per rank, the blocks the feed reports stored,
+    // and how many stored events the first rank's feed carried.
+    std::vector<std::set<std::uint64_t>> kv_stored_blocks;
+    std::uint64_t kv_stored_events{0};
 
     int Rand(int lo, int hi_exclusive) { return std::uniform_int_distribution<int>(lo, hi_exclusive - 1)(rng); }
     double Uniform() { return std::uniform_real_distribution<double>(0.0, 1.0)(rng); }
+    // A request's place in submission order: ids are "r" and a counter.
+    static int Serial(const std::string& id) { return std::stoi(id.substr(1)); }
+
+    // Drains every rank's KV event feed after a plan: a removal names a block
+    // the feed stored, no block is stored twice without a removal between,
+    // and mirrored ranks report the same events.
+    void DrainKvEvents() {
+        if (!knobs.kv_events) {
+            return;
+        }
+        kv_stored_blocks.resize(schedulers.size());
+        std::vector<std::pair<bool, std::uint64_t>> first_feed;
+        for (std::size_t rank = 0; rank < schedulers.size(); ++rank) {
+            std::vector<std::pair<bool, std::uint64_t>> feed;
+            for (const KvCacheEvent& event : schedulers[rank]->DrainKvEvents()) {
+                if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+                    for (const std::uint64_t hash : removed->block_hashes) {
+                        if (kv_stored_blocks[rank].erase(hash) == 0) {
+                            throw std::logic_error("round " + std::to_string(round) +
+                                                   ": a KV event removes a block never stored");
+                        }
+                        feed.emplace_back(false, hash);
+                    }
+                    continue;
+                }
+                const auto& stored = std::get<KvBlockStoredEvent>(event);
+                for (const std::uint64_t hash : stored.block_hashes) {
+                    if (!kv_stored_blocks[rank].insert(hash).second) {
+                        throw std::logic_error("round " + std::to_string(round) + ": a KV event stores a block twice");
+                    }
+                    feed.emplace_back(true, hash);
+                }
+                kv_stored_events += rank == 0 ? 1 : 0;
+            }
+            if (rank == 0) {
+                first_feed = std::move(feed);
+            } else if (feed != first_feed) {
+                throw std::logic_error("round " + std::to_string(round) + ": mirrored ranks' KV event feeds differ");
+            }
+        }
+    }
 
     ClosedLoop(unsigned seed, Role loop_role, bool mirrored_ranks, LoopKnobs loop_knobs)
         : rng(seed), role(loop_role), mirrored(mirrored_ranks), knobs(loop_knobs) {
@@ -182,7 +258,8 @@ struct ClosedLoop {
             overlap_depth = Rand(0, 2);
         }
         const std::int32_t history_block = Rand(0, 2) == 0 ? kP : kP / 2;
-        const bool in_forward = knobs.in_forward.value_or(Rand(0, 2) == 0);
+        // Restricted State groups require in-forward checkpoints.
+        const bool in_forward = knobs.in_forward.value_or(Rand(0, 2) == 0) || knobs.state_grain > 1;
         const std::int32_t host_pages = std::vector<std::int32_t>{9, 17, 33}[Rand(0, 3)];
         kv_shards = std::vector<std::int32_t>{1, 2, 4, 8}[Rand(0, 4)];
         const std::int32_t device_pages = std::vector<std::int32_t>{24, 40, 64}[Rand(0, 3)] * knobs.device_pages_factor;
@@ -196,14 +273,16 @@ struct ClosedLoop {
         cfg.disable_l2_cache = false;
         cfg.host_write_policy =
             write_back ? SchedulerConfig::HostWritePolicy::kWriteBack : SchedulerConfig::HostWritePolicy::kWriteThrough;
-        cfg.max_scheduled_tokens = 48;
+        cfg.max_scheduled_tokens = knobs.chunk_budget > 0 ? knobs.chunk_budget : 48;
         cfg.max_batch_size = 6;
+        cfg.enable_kv_cache_events = knobs.kv_events;
         cfg.decode_input_tokens = 1;
         cfg.overlap_schedule_depth = overlap_depth;
         cfg.enable_mixed_prefill_decode = mixed;
         cfg.state_checkpoint_in_forward = in_forward || knobs.drop_short_prompt_ends;
         cfg.drop_short_prompt_end_checkpoints = knobs.drop_short_prompt_ends;
         cfg.demote_superseded_state_checkpoints = knobs.demote;
+        cfg.prefill_chunk_yield_tokens = knobs.yield_tokens;
         cfg.cache_groups.push_back(CacheGroupConfig{.group_id = "full_attention",
                                                     .block_granularity = history_block,
                                                     .total_pages = (device_pages - 1) * packing + 1,
@@ -212,15 +291,19 @@ struct ClosedLoop {
                                                     .transfer_policy = CacheTransferPolicy::FullSuffix,
                                                     .shard_count = kv_shards});
         for (const std::string group_id : {"linear_attention_0", "linear_attention_1"}) {
+            if (knobs.full_attention_only) {
+                break;
+            }
             cfg.cache_groups.push_back(CacheGroupConfig{.group_id = group_id,
                                                         .block_granularity = 0,
                                                         .total_pages = device_pages,
                                                         .attn_kind = AttnKind::kState,
-                                                        .transfer_policy = CacheTransferPolicy::LatestSnapshot});
+                                                        .transfer_policy = CacheTransferPolicy::LatestSnapshot,
+                                                        .checkpoint_granularity = std::max(1, knobs.state_grain)});
         }
         // Keep the existing random stream while covering ordinary and
         // replayable windows under both policies and mirrored rank plans.
-        if (seed % 3 == 0) {
+        if (seed % 3 == 0 && !knobs.full_attention_only && knobs.state_grain <= 1) {
             cfg.cache_groups.push_back(CacheGroupConfig{.group_id = "sliding",
                                                         .block_granularity = history_block,
                                                         .total_pages = (device_pages - 1) * 2 + 1,
@@ -283,7 +366,7 @@ struct ClosedLoop {
                     done.erase(done.begin() + static_cast<std::ptrdiff_t>(continued));
                     tokens.resize(tokens.size() - std::min(tokens.size(), static_cast<std::size_t>(Rand(1, 5))));
                     tokens.insert(tokens.end(), user.begin(), user.end());
-                } else if (Uniform() < 0.5) {
+                } else if (knobs.extend_always || Uniform() < 0.5) {
                     tokens.insert(tokens.end(), user.begin(), user.end());
                 }
             } else {
@@ -390,6 +473,7 @@ struct ClosedLoop {
                 throw std::logic_error("the mirrored schedulers planned apart at round " + std::to_string(round));
             }
         }
+        DrainKvEvents();
         std::vector<std::pair<std::uint32_t, Kind>> ops;
         bool restores = false;
         for (const Operation& operation : plan.Operations()) {
@@ -427,6 +511,58 @@ struct ClosedLoop {
         }
         const ForwardBatch* batch = FindForwardBatch(plan);
         const bool runs_forward = batch != nullptr && !batch->request_ids.empty();
+        if (role == Role::kP && runs_forward) {
+            // At most one prefill is left incomplete, the head of line, and
+            // it runs last: the completing prefills form a prefix of the
+            // batch, whole prompts its chunk gave way to included.
+            std::optional<std::size_t> incomplete;
+            for (std::size_t i = 0; i < batch->NumExtends(); ++i) {
+                if (batch->extend_prefix_lens[i] + batch->input_lengths[i] < batch->prefill_lengths[i]) {
+                    if (incomplete) {
+                        throw std::logic_error("round " + std::to_string(round) +
+                                               ": two prefills were left incomplete");
+                    }
+                    incomplete = i;
+                }
+            }
+            if (!CompletingPrefillsFormAPrefix(*batch)) {
+                throw std::logic_error("round " + std::to_string(round) +
+                                       ": a completing prefill runs after the incomplete one");
+            }
+            if (incomplete) {
+                // The prompts its chunk carried: first chunks admitted after
+                // it -- beside a resident's chunk, which otherwise admits
+                // nothing behind it, every one; beside a new prompt's, those
+                // submitted after it.
+                const std::string& holder = batch->request_ids[*incomplete];
+                const bool resident = prefilling.contains(holder);
+                std::uint64_t carried = 0;
+                for (std::size_t i = 0; i < *incomplete; ++i) {
+                    const std::string& id = batch->request_ids[i];
+                    carried += !prefilling.contains(id) && (resident || Serial(id) > Serial(holder)) ? 1 : 0;
+                }
+                if (carried > 0) {
+                    if (knobs.yield_tokens == 0) {
+                        throw std::logic_error("round " + std::to_string(round) +
+                                               ": a prompt was admitted behind an incomplete prefill");
+                    }
+                    ++yielding_chunks;
+                    carried_prompts += carried;
+                    // A page, or a restricted State group's whole segment.
+                    const std::int32_t end = batch->extend_prefix_lens[*incomplete] + batch->input_lengths[*incomplete];
+                    if (end % std::max(kP, knobs.state_grain) == 0) {
+                        ++yielding_chunks_on_page;
+                    }
+                }
+            }
+            for (std::size_t i = 0; i < batch->NumExtends(); ++i) {
+                if (incomplete && i == *incomplete) {
+                    prefilling.insert(batch->request_ids[i]);
+                } else {
+                    prefilling.erase(batch->request_ids[i]);
+                }
+            }
+        }
         // An op of a plan that only restores lands two to five plans late:
         // no forward fences it.
         const int earliest = restores && !runs_forward ? 2 : 0;
@@ -844,6 +980,75 @@ TEST(ClosedLoopRandomTest, DemotionChainsNeverRaiseAndDrain) {
             } else {
                 EXPECT_EQ(dropped, 0u);
             }
+        }
+    }
+}
+
+// prefill_chunk_yield_tokens on the P role, at half the chunk budget: 16
+// seeds per variant -- drawn configurations; in-forward checkpoints; with a
+// 24-token budget and prompts that mostly continue finished ones, State
+// groups as drawn (also with the KV event feed checked after every plan) and
+// full attention alone; drawn configurations with the KV event feed; and
+// restricted State groups of a two-page grain -- every fourth with mirrored
+// ranks. Besides draining with nothing pinned, no plan leaves two prefills
+// incomplete or runs a completing prefill after the incomplete one
+// (NextPlan), so every prompt carried beside a chunk that gave way completes
+// in its round, ahead of that chunk. Such a chunk ends on a page unless a
+// junction or the final-window rule cuts it; with full attention alone
+// neither does, and restricted State groups end it on a whole segment.
+TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
+    const LoopKnobs short_budget{.continue_below = 0.7, .extend_always = true, .chunk_budget = 24, .yield_tokens = 12};
+    LoopKnobs short_budget_kv_events = short_budget;
+    short_budget_kv_events.kv_events = true;
+    LoopKnobs full_attention = short_budget;
+    full_attention.full_attention_only = true;
+    const struct {
+        const char* name;
+        LoopKnobs knobs;
+    } variants[] = {
+        {"drawn", LoopKnobs{.yield_tokens = 24}},
+        {"in-forward", LoopKnobs{.in_forward = true, .yield_tokens = 24}},
+        {"24-token budget", short_budget},
+        {"24-token budget, KV events", short_budget_kv_events},
+        {"full attention", full_attention},
+        {"drawn, KV events", LoopKnobs{.yield_tokens = 24, .kv_events = true}},
+        {"restricted State groups", LoopKnobs{.yield_tokens = 24, .state_grain = 2 * kP}},
+    };
+    for (const auto& variant : variants) {
+        std::uint64_t yielding_chunks = 0;
+        std::uint64_t on_page = 0;
+        std::uint64_t carried = 0;
+        std::uint64_t kv_stored_events = 0;
+        for (unsigned seed = 0; seed < 16; ++seed) {
+            ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/seed % 4 == 3, variant.knobs);
+            SCOPED_TRACE(::testing::Message()
+                         << variant.name << " seed " << seed << (loop.write_back ? " write-back" : " write-through")
+                         << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
+            try {
+                loop.Run();
+            } catch (const std::exception& error) {
+                ADD_FAILURE() << "raised: " << error.what();
+                continue;
+            }
+            for (const std::unique_ptr<Scheduler>& scheduler : loop.schedulers) {
+                EXPECT_EQ(scheduler->HostPoolPinnedBlocks(), 0);
+                EXPECT_TRUE(scheduler->CanClearCache());
+            }
+            yielding_chunks += loop.yielding_chunks;
+            on_page += loop.yielding_chunks_on_page;
+            carried += loop.carried_prompts;
+            kv_stored_events += loop.kv_stored_events;
+        }
+        SCOPED_TRACE(variant.name);
+        EXPECT_GT(yielding_chunks, 0u) << "chunks gave way";
+        EXPECT_GE(carried, yielding_chunks);
+        if (variant.knobs.full_attention_only || variant.knobs.state_grain > 1) {
+            EXPECT_EQ(on_page, yielding_chunks) << "every chunk that gave way ended on a page or segment";
+        } else {
+            EXPECT_GT(on_page, 0u);
+        }
+        if (variant.knobs.kv_events) {
+            EXPECT_GT(kv_stored_events, 0u) << "the feed reported stored blocks";
         }
     }
 }
