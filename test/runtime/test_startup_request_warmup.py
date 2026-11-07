@@ -26,7 +26,10 @@ import pytest
 import torch
 from tokenspeed_scheduler import AttnKind, CacheGroupConfig, Scheduler, SchedulerConfig
 
-from tokenspeed.runtime.execution.startup_warmup import warmup_request_path
+from tokenspeed.runtime.execution.startup_warmup import (
+    request_path_phases,
+    warmup_request_path,
+)
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
@@ -167,3 +170,39 @@ def test_startup_reaches_sixteen_requests_after_chunked_admission():
         decode_steps=2,
     )
     assert device.batches.count((16, 0)) == 2
+
+
+def test_startup_shortens_the_full_batch_to_what_the_cache_holds():
+    # 32768 tokens hold 16 requests of about 2K, not of a 4096-token chunk.
+    config = _config(4)
+    config.max_batch_size = 16
+    config.max_scheduled_tokens = 4096
+    config.num_device_pages = 2048
+    config.cache_groups = [
+        CacheGroupConfig(
+            group_id="full",
+            block_granularity=16,
+            total_pages=2048,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    config.enable_mixed_prefill_decode = False
+    config.overlap_schedule_depth = 1
+    shape = dict(
+        chunk_tokens=4096,
+        context_len=65536,
+        prefix_granularity=16,
+        max_batch_size=16,
+        decode_width=4,
+        attn_tp_size=8,
+    )
+    device = _Device(4, fail_decode=False)
+    warmup_request_path(
+        device,
+        config,
+        phases=request_path_phases(token_capacity=2048 * 16, **shape),
+        decode_width=4,
+        decode_steps=2,
+    )
+    assert device.batches.count((16, 0)) == 2
+    assert request_path_phases(token_capacity=16 * 52, **shape) == ()

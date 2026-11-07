@@ -37,6 +37,38 @@ from tokenspeed.runtime.execution.types import PlannedForward, StopCriteria
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
+def request_path_phases(
+    *,
+    chunk_tokens: int,
+    context_len: int,
+    token_capacity: int,
+    prefix_granularity: int,
+    max_batch_size: int,
+    decode_width: int,
+    attn_tp_size: int,
+) -> tuple[tuple[int, int], ...]:
+    """The (batch size, prompt length) startup cases: one short and one
+    medium request, then the full batch. The full batch's prompts span a
+    chunk and a short tail (128 rows per rank at TP8 and 16 requests,
+    reaching the medium-M MoE path as well as full chunks), shortened so the
+    whole batch and its decode budget fit the cache at once; none where
+    even that does not fit."""
+    tail = max(1, 128 * attn_tp_size // max_batch_size)
+    budget = 5 * decode_width
+    long_prompt = min(
+        chunk_tokens + tail,
+        context_len - budget,
+        token_capacity // max_batch_size - budget - 2 * prefix_granularity,
+    )
+    if long_prompt < 1:
+        return ()
+    return (
+        (1, min(5, long_prompt)),
+        (1, min(1024, long_prompt)),
+        (max_batch_size, long_prompt),
+    )
+
+
 def warmup_request_path(
     device,
     scheduler_config,
@@ -66,8 +98,6 @@ def warmup_request_path(
     """
     from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 
-    if decode_width < 1 or decode_steps < 1:
-        raise ValueError("startup decode width and steps must be positive")
     # The bounded output budget assumes no decoding during another request's
     # admission. Mixed rounds could exhaust an early request before the full
     # batch is resident, bypassing the intended full-batch preparation.
@@ -82,8 +112,6 @@ def warmup_request_path(
         autotune(tune_mode=False, tuning_buckets=None, round_up=None),
     ):
         for phase, (batch_size, prompt_length) in enumerate(phases):
-            if batch_size < 1 or prompt_length < 1:
-                raise ValueError("startup batches and prompt lengths must be positive")
             scheduler = Scheduler(scheduler_config)
             requests = []
             criteria = {}
