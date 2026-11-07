@@ -20,10 +20,10 @@
 
 """Bounded packed CSA2 scoring and DeepSelect through existing TS integrations."""
 
-import importlib.util
 from functools import lru_cache
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import (
     _mxfp4_cache_view,
     warmup_mqa_logits,
@@ -77,13 +77,13 @@ from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
 
 platform = current_platform()
 
-if platform.is_blackwell and importlib.util.find_spec("deep_gemm") is not None:
+if platform.is_blackwell and has_optional_package("deep_gemm"):
     prepare_cuda_toolkit_env()
     import deep_gemm
 
 if platform.is_hopper:
     prepare_cuda_toolkit_env()
-    if importlib.util.find_spec("deep_gemm") is not None:
+    if has_optional_package("deep_gemm"):
         import deep_gemm
 
     # The selector compiles with nvidia-cutlass-dsl, a CUDA-only dependency.
@@ -93,7 +93,7 @@ if platform.is_hopper:
 @lru_cache(maxsize=1)
 def is_native_indexer_available() -> bool:
     """Whether the current platform supports packed DeepGEMM MQA scoring."""
-    return platform.is_blackwell and importlib.util.find_spec("deep_gemm") is not None
+    return platform.is_blackwell and has_optional_package("deep_gemm")
 
 
 @lru_cache(maxsize=32)
@@ -435,7 +435,7 @@ _INDEX_VALUE_BYTES = _LAYOUTS["index_v4"][2]
 @lru_cache(maxsize=1)
 def is_hopper_indexer_available() -> bool:
     """Whether this platform scores FP8 index rows with DeepGEMM."""
-    return platform.is_hopper and importlib.util.find_spec("deep_gemm") is not None
+    return platform.is_hopper and has_optional_package("deep_gemm")
 
 
 @lru_cache(maxsize=8)
