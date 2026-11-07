@@ -1280,6 +1280,69 @@ def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
         assert torch.count_nonzero(output[live_rows:]) == 0
 
 
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qsa_sparse_attention_blackwell_writes_a_caller_output(
+    device: str, cache_dtype: torch.dtype
+) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or platform.arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+    ):
+        pytest.skip("CuTe DSL QSA requires SM100 or SM103")
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        cute_dsl_blackwell_qsa_sparse_attention,
+    )
+
+    torch.manual_seed(127)
+    rows = 3
+    q = torch.randn(rows, 6, 256, device=device, dtype=torch.bfloat16)
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    k_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    v_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    selected = torch.full((rows, 2051), -1, device=device, dtype=torch.int32)
+    selected[:, :19] = torch.arange(64, 83, device=device)
+    selected[:, -3] = 128
+    unit = 1.0 if cache_dtype is torch.float8_e4m3fn else None
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=1,
+        metadata_capacity_rows=None,
+        k_scale=unit,
+        v_scale=unit,
+    )
+
+    out = torch.full_like(q, float("nan"))
+    result = cute_dsl_blackwell_qsa_sparse_attention(
+        q, k_cache, v_cache, selected, **kwargs, out=out
+    )
+    assert result is out
+    torch.testing.assert_close(
+        out, _reference(q, k_cache, v_cache, selected, 1 / 16), atol=1e-3, rtol=1e-2
+    )
+    for wrong in (
+        q.new_empty((rows + 1, 6, 256)),
+        torch.empty_like(q, dtype=torch.float16),
+        q.new_empty((rows, 6, 512))[..., ::2],
+        torch.empty_like(q, device="cpu"),
+    ):
+        with pytest.raises(ValueError, match="contiguous tensor like the query"):
+            cute_dsl_blackwell_qsa_sparse_attention(
+                q, k_cache, v_cache, selected, **kwargs, out=wrong
+            )
+    empty = q.new_empty((0, 6, 256))
+    assert (
+        cute_dsl_blackwell_qsa_sparse_attention(
+            q[:0], k_cache, v_cache, selected[:0], **kwargs, out=empty
+        )
+        is empty
+    )
+
+
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("rows", [1, 4, 9])
 @pytest.mark.parametrize(
@@ -1395,6 +1458,214 @@ def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
         rtol=3.5e-2,
         atol=3.5e-2,
     )
+
+
+@pytest.mark.parametrize("logit_gain", [1.0, 4.0])
+@pytest.mark.parametrize("rows", [24, 39, 64, 115, 129])
+@pytest.mark.parametrize(("q_heads", "kv_heads"), [(24, 2), (12, 1)])
+def test_qsa_sparse_attention_blackwell_fp8_decode_grids_match_reference(
+    device: str, rows: int, q_heads: int, kv_heads: int, logit_gain: float
+) -> None:
+    """FP8 decode grids large enough to pick their rows/CTA and KV splits by
+    wave count match the reference over full selections with holes and a
+    padded request."""
+    platform = current_platform()
+    if platform.arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip(
+            "cluster QSA sparse attention is specialized for NVIDIA SM100 or SM103"
+        )
+
+    torch.manual_seed(131 + rows)
+    cache_slots, head_dim, width = 8192, 256, 2051
+    # A larger query gain peaks the softmax, where one KV split merges the
+    # whole prefix in a single online-softmax pass.
+    q = (
+        torch.randn(rows, q_heads, head_dim, device=device, dtype=torch.bfloat16)
+        * logit_gain
+    )
+    k_cache = (
+        torch.randn(
+            cache_slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    v_cache = (
+        torch.randn(
+            cache_slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    slots = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    slots[:, :2049] = torch.randint(
+        1, cache_slots, (rows, 2049), dtype=torch.int32, device=device
+    )
+    slots[:, 5::11] = -1
+    slots[:, 9::17] = 0
+    slots[-1].fill_(-1)
+
+    scale, k_scale, v_scale = head_dim**-0.5, 0.5, 0.25
+    actual = qsa_sparse_attention(
+        q,
+        k_cache,
+        v_cache,
+        slots,
+        scale=scale,
+        # MTP verify rows where they divide; the odd grids stay single-query.
+        max_seqlen_q=4 if rows % 4 == 0 else 1,
+        metadata_capacity_rows=None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        override=None,
+        solution=None,
+        sparse_metadata=None,
+    )
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[-1]) == 0
+    torch.testing.assert_close(
+        actual.float(),
+        _reference(
+            q, k_cache, v_cache, slots, scale, k_scale=k_scale, v_scale=v_scale
+        ).float(),
+        rtol=3.5e-2,
+        atol=3.5e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("q_heads", "kv_heads", "launch", "copies"),
+    [
+        # Decode grids: each FP8 rows/CTA x KV-split choice of the wave
+        # policy, and the eight splits of a small grid.
+        (24, 2, (1, 1), 1),
+        (24, 2, (2, 1), 1),
+        (24, 2, (1, 2), 1),
+        (24, 2, (1, 4), 1),
+        (24, 2, (1, 8), 1),
+        (12, 1, (1, 1), 1),
+        # A prefill-sized grid under the production launch policy.
+        (24, 2, None, 16),
+    ],
+)
+def test_qsa_sparse_attention_blackwell_fp8_prefix_ends_at_last_valid_tile(
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+    q_heads: int,
+    kv_heads: int,
+    launch: tuple[int, int] | None,
+    copies: int,
+) -> None:
+    """FP8 rows end their prefix loop after the last tile with a positive id.
+
+    Rows ending in tile 0, mid-row or on a 128-entry tile edge, with padding
+    interleaved before the last valid id, match the reference and, bitwise, a
+    twin row whose extra candidates in tiles 8-15 force the full loop in every
+    KV split. Those candidates score so low that their softmax weight is
+    exactly zero, so the twin computes the full loop's result. Twins alternate
+    between the second and first row of their pair, so CTAs holding two rows
+    see both loop-length orders. All-padding prefixes run one tile and keep
+    their tail-only or zero output.
+    """
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
+    import tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse as sparse_module
+
+    if launch is not None:
+
+        def select_config(
+            num_rows: int,
+            head_tiles_per_row: int,
+            bf16_kv: bool,
+            sm_count: int,
+            wide_cluster_capacity: int,
+            *,
+            fp8_wave_sizing: bool,
+        ) -> tuple[int, int, int, bool]:
+            del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+            del fp8_wave_sizing
+            return launch[0], launch[1], 1, False
+
+        monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
+
+    torch.manual_seed(229)
+    cache_slots, width, far_slot = 4096, 2051, 4095
+    # Valid prefix positions. The rows end at tile 0's first entry, tile 0's
+    # last entry, tile 1's first entry, mid-row, tile 7's last entry after
+    # seven all-padding tiles, after a dense prefix with holes, and at the end.
+    patterns = (
+        [0],
+        [5, 127],
+        [64, 128],
+        [1, 300, 640, 1000],
+        [1023],
+        [p for p in range(700) if p % 11 != 5 and p % 17 != 9],
+        [1024, 2047],
+    )
+    paired = 2 * len(patterns)
+    # Each pattern fills one row of a pair, which ends early. Its twin repeats
+    # it, query included, plus one far candidate per tile 8-15, which ends
+    # every split's loop in its last tile. The twin comes second in even pairs
+    # and first in odd ones, so a two-row CTA runs a short row before a full one
+    # and the reverse. The last two rows have all-padding prefixes, and only
+    # the first of them has tail candidates.
+    slots = torch.full(
+        (copies, paired + 2, width), -1, dtype=torch.int32, device=device
+    )
+    slots[..., 0:2048:3] = 0  # Both padding encodings, before and after ids.
+    slots[..., 2048:] = torch.randint(
+        64, far_slot, (copies, paired + 2, 3), dtype=torch.int32, device=device
+    )
+    for index, positions in enumerate(patterns):
+        row, twin = 2 * index + index % 2, 2 * index + 1 - index % 2
+        columns = torch.tensor(positions, device=device)
+        slots[:, row, columns] = torch.randint(
+            64, far_slot, (copies, columns.numel()), dtype=torch.int32, device=device
+        )
+        slots[:, twin] = slots[:, row]
+        slots[:, twin, 8 * 128 + 120 : 2048 : 128] = far_slot
+    slots[:, -1, 2048:] = -1
+    q = torch.randn(
+        copies, paired + 2, q_heads, 256, device=device, dtype=torch.bfloat16
+    )
+    q[:, 1:paired:2] = q[:, 0:paired:2]
+    q[..., 0] = 4.0
+    k_cache = (
+        torch.randn(cache_slots, kv_heads, 256, device=device, dtype=torch.bfloat16)
+        * 0.25
+    )
+    # Raw score -1792 for every query: after the 1/16 * 1.75 scale it is ~196
+    # below the row maximum, so its softmax weight underflows to zero.
+    k_cache[far_slot] = 0
+    k_cache[far_slot, :, 0] = -448
+    k_cache = k_cache.to(torch.float8_e4m3fn)
+    v_cache = (
+        torch.randn(cache_slots, kv_heads, 256, device=device, dtype=torch.bfloat16)
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+
+    q, slots = q.flatten(0, 1), slots.flatten(0, 1)
+
+    output = qsa_sparse_attention(
+        q,
+        k_cache,
+        v_cache,
+        slots,
+        scale=1 / 16,
+        max_seqlen_q=1 if launch is None else 4,
+        metadata_capacity_rows=None,
+        k_scale=1.75,
+        v_scale=0.25,
+        override="cute_dsl_blackwell_qsa_sparse_attention",
+        solution=None,
+        sparse_metadata=None,
+    )
+
+    assert torch.isfinite(output).all()
+    expected = _reference(q, k_cache, v_cache, slots, 1 / 16, 1.75, 0.25)
+    torch.testing.assert_close(output, expected, rtol=0.02, atol=0.002)
+    output = output.view(copies, paired + 2, q_heads, 256)
+    assert torch.equal(output[:, 0:paired:2], output[:, 1:paired:2])
+    assert torch.count_nonzero(output[:, -1]) == 0
 
 
 @pytest.mark.parametrize(("q_heads", "kv_heads"), [(1, 1), (8, 1), (16, 2), (24, 8)])
@@ -1680,6 +1951,9 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
         (torch.float8_e4m3fn, 4, 1, 1, False),
         (torch.float8_e4m3fn, 8, 1, 1, False),
         (torch.float8_e4m3fn, 16, 1, 3, False),
+        (torch.float8_e4m3fn, 1, 1, 1, False),
+        (torch.float8_e4m3fn, 1, 2, 1, False),
+        (torch.float8_e4m3fn, 2, 1, 1, False),
         (torch.bfloat16, 1, 2, 3, True),
         (torch.bfloat16, 1, 4, 3, True),
         (torch.bfloat16, 2, 1, 3, True),
@@ -1712,8 +1986,11 @@ def test_qsa_sparse_attention_blackwell_changed_kv_replay(
         bf16_kv: bool,
         sm_count: int,
         wide_cluster_capacity: int,
+        *,
+        fp8_wave_sizing: bool,
     ) -> tuple[int, int, int, bool]:
         del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+        del fp8_wave_sizing
         return query_rows_per_cta, splits, bf16_smem_slots, bf16_async_ready
 
     monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
@@ -1812,8 +2089,11 @@ def test_qsa_sparse_attention_blackwell_large_kv_offsets(
         bf16_kv: bool,
         sm_count: int,
         wide_cluster_capacity: int,
+        *,
+        fp8_wave_sizing: bool,
     ) -> tuple[int, int, int, bool]:
         del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+        del fp8_wave_sizing
         # Two BF16 buffers keep lookahead prefetch active at the large addresses.
         slots = 2 if cache_dtype is torch.bfloat16 else 3
         return 1, splits, slots, cache_dtype is torch.bfloat16
@@ -1887,7 +2167,16 @@ def test_qsa_sparse_attention_blackwell_large_kv_offsets(
         (128, 4, True, 152, (1, 1, 3, True)),
         (416, 4, True, 152, (1, 1, 3, True)),
         (512, 1, True, 80, (1, 1, 3, True)),
-        (512, 1, False, 152, (1, 4, 1, False)),
+        # FP8 sizes rows/CTA and splits by wave-quantized per-CTA tile work.
+        (512, 1, False, 152, (1, 1, 1, False)),
+        (8, 1, False, 152, (1, 8, 1, False)),
+        (16, 2, False, 152, (1, 4, 1, False)),
+        (48, 1, False, 152, (1, 2, 1, False)),
+        (72, 2, False, 152, (1, 1, 1, False)),
+        (80, 2, False, 152, (1, 2, 1, False)),
+        (224, 2, False, 152, (1, 1, 1, False)),
+        (288, 2, False, 152, (1, 1, 1, False)),
+        (352, 2, False, 152, (1, 1, 1, False)),
     ],
 )
 def test_qsa_sparse_attention_blackwell_output_tiling(
@@ -1901,7 +2190,46 @@ def test_qsa_sparse_attention_blackwell_output_tiling(
         pytest.skip("CTA tiling requires NVIDIA SM100 or SM103")
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import _select_launch_config
 
-    assert _select_launch_config(rows, head_tiles, bf16, sm_count, 7) == expected
+    assert (
+        _select_launch_config(rows, head_tiles, bf16, sm_count, 7, fp8_wave_sizing=True)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("sm107", "sm_count", "rows", "expected"),
+    [
+        # SM107 keeps tile8 below one tile per SM, and four KV splits.
+        (True, 212, 105, (8, 4, 1)),
+        (True, 212, 106, (16, 4, 1)),
+        # SM100/SM103 use tile16 at every size and size large grids by waves.
+        (False, 152, 8, (16, 4, 1)),
+        (False, 152, 72, (16, 1, 1)),
+        (False, 152, 288, (16, 1, 1)),
+    ],
+)
+def test_qsa_sparse_attention_blackwell_fp8_tile_and_grid_by_arch(
+    monkeypatch: pytest.MonkeyPatch,
+    sm107: bool,
+    sm_count: int,
+    rows: int,
+    expected: tuple[int, int, int],
+) -> None:
+    """24q/2kv FP8 decode picks its head tile, KV splits and rows/CTA per arch."""
+    if current_platform().arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+        ArchVersion(10, 7),
+    ):
+        pytest.skip("CTA tiling requires NVIDIA SM100, SM103 or SM107")
+    import tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse as sparse_module
+
+    # Stand in for the other architecture; the real selectors run unchanged.
+    monkeypatch.setattr(sparse_module, "_is_sm107", lambda device: sm107)
+    head_tile, _, kv_splits, query_rows_per_cta = sparse_module._configuration(
+        rows, 24, 2, 1, False, sm_count, torch.cuda.current_device()
+    )[:4]
+    assert (head_tile, kv_splits, query_rows_per_cta) == expected
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])

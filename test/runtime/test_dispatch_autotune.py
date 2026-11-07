@@ -465,12 +465,14 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
 
 def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     """The dummy extend carries the engine's shard plan (make_dummy_batch),
-    and the target forward sees this rank's slice of the span -- ids,
+    and the target forward sees this rank's rows of the span -- ids,
     positions and the per-row model inputs -- as a real sharded extend does."""
     plan = QueryShardPlan.from_forward(
-        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2
+        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2, device="cpu"
     )
-    assert plan.local_slice == slice(8, 12)
+    # Every request is four rows, one per zigzag segment of the first four:
+    # rank 2 computes the third row of each.
+    assert plan.local_row_ids.tolist() == [2, 6, 10, 14]
     seen = {}
     events = []
     group = object()  # Stands in for the gloo CPU group.
@@ -523,9 +525,9 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     )
     _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
     ModelExecutor.autotune(executor)
-    assert seen["input_ids"].tolist() == [8, 9, 10, 11]
-    assert seen["positions"].tolist() == [80, 90, 100, 110]
-    assert seen["rows"] == slice(8, 12) and seen["span"] == 16
+    assert seen["input_ids"].tolist() == [2, 6, 10, 14]
+    assert seen["positions"].tolist() == [20, 60, 100, 140]
+    assert seen["rows"].tolist() == [2, 6, 10, 14] and seen["span"] == 16
     assert pg_manager.requests == [("gloo", (0, 1, 2, 3))]
     assert events == [
         ("load", None, group, 0),
@@ -695,6 +697,9 @@ class _DecodeCaptureDouble:
 
 
 class _PrefillCaptureDouble:
+    capture_buckets = [16]
+    num_warmup = 1
+
     def __init__(self, *, disable, on_capture):
         self.disable = disable
         self._on_capture = on_capture
@@ -702,13 +707,35 @@ class _PrefillCaptureDouble:
     def capture(self, runner, *, entries, observer):
         self._on_capture(runner)
 
+    def captured_hidden_spec(self):
+        return 8, torch.float32
+
 
 class _DrafterCaptureDouble:
-    def __init__(self, on_capture):
+    """A drafter with a prefill graph of its own (``captures_prefill_graph``)
+    or with extend graphs (``extend_graph_plan``)."""
+
+    def __init__(self, *, extend_graphs, on_capture):
+        self.captures_prefill_graph = not extend_graphs
+        self._extend_graphs = extend_graphs
         self._on_capture = on_capture
 
     def capture_prefill_graph(self, stream, observer):
         self._on_capture(stream)
+
+    def extend_graph_plan(self, token_buckets, request_counts):
+        if not self._extend_graphs:
+            return {}
+        return {
+            "prefill:drafter-step0": [
+                (bucket, bs)
+                for bucket in token_buckets
+                for bs in request_counts(bucket)
+            ]
+        }
+
+    def capture_extend_graphs(self, capture, *, observer):
+        self._on_capture(capture.stream)
 
 
 class _ObserverDouble:
@@ -716,24 +743,40 @@ class _ObserverDouble:
         return nullcontext()
 
 
+@dataclass
+class _CaptureConfig:
+    """The ModelExecutorConfig fields capture_graphs() reads."""
+
+    enable_drafter_prefill_graph: bool = True
+    prefill_graph_capture_batch_sizes: list[int] | None = None
+    context_len: int = 4096
+    max_num_seqs: int = 4
+    data_parallel_size: int = 1
+
+
 class _CaptureExecutor:
     """The ModelExecutor state capture_graphs() reads, without the GPU boot."""
 
-    def __init__(
-        self, *, captures_drafter_prefill_graph, forward_step, prefill_graph, drafter
-    ):
-        self.captures_drafter_prefill_graph = captures_drafter_prefill_graph
+    # Which drafter graphs a boot records is the executor's own logic.
+    captures_drafter_prefill_graph = ModelExecutor.captures_drafter_prefill_graph
+    _drafter_extend_plan = ModelExecutor._drafter_extend_plan
+    drafter_extend_ladders = ModelExecutor.drafter_extend_ladders
+    _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
+
+    def __init__(self, *, forward_step, prefill_graph, drafter):
+        self.config = _CaptureConfig()
         self.device = "cpu"
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph
         self.drafter = drafter
+        self.draft_attn_backend = None
 
 
 @pytest.mark.parametrize("decode_disabled", [False, True])
 @pytest.mark.parametrize("prefill_disabled", [False, True])
-@pytest.mark.parametrize("has_drafter", [False, True])
+@pytest.mark.parametrize("drafter_graphs", [None, "own", "extend"])
 def test_capture_lifecycle_preserves_main_order(
-    decode_disabled, prefill_disabled, has_drafter
+    decode_disabled, prefill_disabled, drafter_graphs
 ):
     events = []
     reset_workspace_pools()
@@ -759,13 +802,16 @@ def test_capture_lifecycle_preserves_main_order(
         events.append("draft")
 
     executor = _CaptureExecutor(
-        captures_drafter_prefill_graph=not prefill_disabled and has_drafter,
         forward_step=step,
         prefill_graph=_PrefillCaptureDouble(
             disable=prefill_disabled, on_capture=capture_prefill
         ),
         drafter=(
-            _DrafterCaptureDouble(on_capture=capture_draft) if has_drafter else None
+            None
+            if drafter_graphs is None
+            else _DrafterCaptureDouble(
+                extend_graphs=drafter_graphs == "extend", on_capture=capture_draft
+            )
         ),
     )
     ModelExecutor.capture_graphs(
@@ -777,7 +823,7 @@ def test_capture_lifecycle_preserves_main_order(
     assert events == [
         *([] if decode_disabled else ["decode"]),
         *([] if prefill_disabled else ["prefill"]),
-        *(["draft"] if not prefill_disabled and has_drafter else []),
+        *(["draft"] if not prefill_disabled and drafter_graphs is not None else []),
     ]
     reset_workspace_pools()
 
@@ -1828,6 +1874,50 @@ def test_mm_runs_the_joint_bf16_gemm_only_before_serving(monkeypatch, serving):
     torch.testing.assert_close(out, x @ w.T)
     assert len(joint_calls) == int(not serving)
     assert len(generic_calls) == int(serving)
+
+
+@pytest.mark.parametrize("tactic", [None, 21])
+@pytest.mark.parametrize("serving", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("override", [None, "forced"])
+def test_mm_runs_the_pinned_tgv_tile_only_before_serving(
+    monkeypatch, tactic, serving, bias, override
+):
+    """Decode rows above the joint bound run the TGV tactic the adapter picks,
+    only before serving and only without bias or a forced kernel. When it
+    picks none, or is not asked, selection runs as before."""
+    decisions, tgv_calls, generic_calls = [], [], []
+    monkeypatch.setattr(gemm_module, "autotune_bf16_gemm", lambda *args: None)
+    monkeypatch.setattr(
+        gemm_module,
+        "flashinfer_tgv_decode_tactic",
+        lambda a, b, out: decisions.append((a, b, out)) or tactic,
+    )
+    monkeypatch.setattr(
+        gemm_module,
+        "flashinfer_tgv_decode_gemm",
+        lambda a, b, out, chosen: tgv_calls.append(chosen) or torch.mm(a, b.T, out=out),
+    )
+    monkeypatch.setattr(gemm_module, "is_serving", lambda: serving)
+    monkeypatch.setattr(gemm_module, "pdl_enabled", lambda: False)
+    monkeypatch.setattr(
+        gemm_module, "select_kernel", _SelectKernelDouble(_generic_mm(generic_calls))
+    )
+    x = torch.randn(48, 4, dtype=torch.bfloat16)
+    w = torch.randn(8, 4, dtype=torch.bfloat16)
+    out = torch.empty(48, 8, dtype=torch.bfloat16)
+    b = torch.ones(8, dtype=torch.bfloat16) if bias else None
+    assert gemm_module.mm(x, w, bias=b, out=out, override=override) is out
+    torch.testing.assert_close(out, x @ w.T + (b if b is not None else 0))
+    asked = not serving and not bias and override is None
+    if asked:
+        ((a, weight, destination),) = decisions
+        assert a is x and weight is w and destination is out
+    else:
+        assert decisions == []
+    routed = asked and tactic is not None
+    assert tgv_calls == ([tactic] if routed else [])
+    assert len(generic_calls) == int(not routed)
 
 
 # ---------------------------------------------------------------------------

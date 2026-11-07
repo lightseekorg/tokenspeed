@@ -203,6 +203,8 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     seen = []
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
+    # A drafter's own prefill graph does not wait for the extend-graph switch.
+    executor.config = SimpleNamespace(enable_drafter_prefill_graph=False)
     executor.forward_step = SimpleNamespace(
         disable=False,
         stream="stream",
@@ -246,6 +248,7 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
     )
     executor.drafter = SimpleNamespace(
         release_prefill_graph=lambda: order.append("drafter"),
+        release_extend_graphs=lambda: order.append("drafter extend"),
         release_round_graphs=lambda: order.append("drafter rounds"),
     )
     monkeypatch.setattr(
@@ -263,6 +266,7 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
         "decode",
         "prefill",
         "drafter",
+        "drafter extend",
         "drafter rounds",
         ("unfreeze", "cuda"),
         "collect",

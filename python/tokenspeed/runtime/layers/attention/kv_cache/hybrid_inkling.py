@@ -42,12 +42,14 @@ class HybridInklingTokenToKVPool(HybridMHATokenToKVPool):
             self.arena.field(f"layer.{field_layer}.kvconv_v"),
         )
 
-    def hiddenconv_checkpoint_buffer(
+    def hiddenconv_checkpoint(
         self, layer_id: int, component: str
-    ) -> torch.Tensor:
+    ) -> tuple[str, torch.Tensor]:
+        """The hiddenconv group holding this stream's checkpoint, and its view."""
         if component not in ("attnconv", "mlpconv"):
             raise ValueError(f"unknown Inkling hidden-conv component {component!r}")
-        return self.arena.field(f"layer.{self._field_layer_id(layer_id)}.{component}")
+        field_id = f"layer.{self._field_layer_id(layer_id)}.{component}"
+        return self.arena.plan.field(field_id).group_id, self.arena.field(field_id)
 
 
 class HybridInklingTokenToKVPoolMXFP8(

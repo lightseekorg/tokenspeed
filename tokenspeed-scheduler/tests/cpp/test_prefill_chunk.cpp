@@ -20,8 +20,8 @@
 
 // How a local prefill chunk is cut (scheduler/operations/prefill_chunk.h):
 // the junction cut, the bounded-replay budget debit and final-window rule,
-// and the mixed-mode reserve, all as pure arithmetic on the coordinator's
-// facts.
+// the mixed-mode reserve and the budget a chunk gives way with, all as pure
+// arithmetic on the coordinator's facts.
 
 #include <gtest/gtest.h>
 
@@ -149,6 +149,60 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
                                                     /*checkpoint_retention_requests=*/0);
     EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 100, 7, 0), 7);
     EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0), 5);
+}
+
+// A chunk that cannot finish gives way to whole prompts behind it
+// (SchedulerConfig::prefill_chunk_yield_tokens): it ends on the last page at
+// least the yielded tokens before its budget's end.
+TEST(YieldingChunkBudgetTest, AChunkThatCannotFinishEndsOnAPageBeforeTheYield) {
+    BlockPool plain_pool(16, {1});
+    const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr,
+                                                   /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
+    // (first_pos, resumes_hit, unscheduled, budget, yield)
+    EXPECT_EQ(YieldingChunkBudget(plain, 16, false, 100, 40, 0), 40) << "nothing to yield";
+    EXPECT_EQ(YieldingChunkBudget(plain, 16, false, 40, 40, 12), 40) << "the chunk finishes within the budget";
+    EXPECT_EQ(YieldingChunkBudget(plain, 16, false, 100, 40, 10), 28) << "16 + 40 - 10 = 46, down to the page at 44";
+    EXPECT_EQ(YieldingChunkBudget(plain, 16, false, 100, 40, 8), 32) << "a whole page yields exactly";
+    EXPECT_EQ(YieldingChunkBudget(plain, 17, false, 100, 40, 10), 27) << "from inside a page, still ending at 44";
+    EXPECT_EQ(YieldingChunkBudget(plain, 0, true, 100, 40, 10), 28) << "a hit's first chunk without replay";
+    // A cut leaving less than a page of new tokens takes the whole budget.
+    EXPECT_EQ(YieldingChunkBudget(plain, 16, false, 100, 8, 4), 4);
+    EXPECT_EQ(YieldingChunkBudget(plain, 17, false, 100, 8, 4), 8) << "17 + 8 - 4 = 21: the page at 20 leaves 3";
+    EXPECT_EQ(YieldingChunkBudget(plain, 16, false, 100, 8, 8), 8);
+    // Every end such a budget allows is a page for PrefillChunkTokens too.
+    EXPECT_EQ(PrefillChunkTokens(plain, 17, false, 100, YieldingChunkBudget(plain, 17, false, 100, 40, 10), 0), 27);
+
+    // A hit's replay window comes out of the budget first: it counts towards
+    // whether the chunk finishes, and the window rides on top of the new
+    // tokens that end on a page.
+    BlockPool pool(64, {1, 1, 1});
+    const CacheCoordinator replay = MakeCoordinator(ReplayableSpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr,
+                                                    /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false,
+                                                    /*checkpoint_retention_requests=*/0);
+    EXPECT_EQ(YieldingChunkBudget(replay, 16, true, 36, 40, 10), 28) << "36 + 8 replayed > 40: 16 + 40 - 8 - 10 = 38";
+    EXPECT_EQ(PrefillChunkTokens(replay, 16, true, 36, 28, 0), 20) << "ends on the page at 36";
+    EXPECT_EQ(YieldingChunkBudget(replay, 16, true, 32, 40, 10), 40) << "32 + 8 replayed fit";
+    EXPECT_EQ(YieldingChunkBudget(replay, 16, false, 100, 40, 10), 28) << "a later chunk replays nothing";
+    // The least a chunk computes here is MinPrefillChunkTokens = 16.
+    EXPECT_EQ(YieldingChunkBudget(replay, 16, true, 100, 36, 10), 24) << "16 new tokens, 32 - 16";
+    EXPECT_EQ(YieldingChunkBudget(replay, 16, true, 100, 36, 14), 36) << "12 new tokens would be too few";
+
+    // Restricted State groups: a chunk holds whole checkpoint segments.
+    std::vector<CacheGroupSpec> restricted = FullOnlySpecs();
+    restricted.push_back(CacheGroupSpec{.attn_kind = AttnKind::kState,
+                                        .cache_blocks_per_lcm_block = 1,
+                                        .block_granularity = 0,
+                                        .checkpoint_granularity = 8});
+    BlockPool restricted_pool(16, {1, 1});
+    const CacheCoordinator aligned = MakeCoordinator(restricted, 4, restricted_pool, /*enable_l3_storage=*/false,
+                                                     nullptr, /*snapshot_pool=*/nullptr, false,
+                                                     /*write_back_evictions=*/false,
+                                                     /*checkpoint_retention_requests=*/0);
+    EXPECT_EQ(YieldingChunkBudget(aligned, 8, false, 100, 40, 10), 24) << "8 + 40 - 10 = 38, down to the segment at 32";
+    EXPECT_EQ(PrefillChunkTokens(aligned, 8, false, 100, 24, 0), 24);
+    EXPECT_EQ(YieldingChunkBudget(aligned, 8, false, 100, 16, 8), 8) << "one segment";
+    EXPECT_EQ(YieldingChunkBudget(aligned, 8, false, 100, 16, 9), 16) << "less than a segment: the whole budget";
 }
 
 TEST(PrefillStateCheckpointTest, LongPromptsLeaveAReusablePageBeforeTheirReplayTail) {

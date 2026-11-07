@@ -127,41 +127,43 @@ def test_executor_flags_an_out_of_vocab_target_instead_of_scoring_it(monkeypatch
 
 def test_executor_stages_a_shards_rows_of_the_plan(monkeypatch):
     """Under a query shard each rank keeps as its rows the plan's rows inside
-    its shard, re-based to it, with the per-rank split of the activation
-    gather; the targets and slots stay the whole plan's (every rank scores
+    its shard, as indices into it, with the per-rank split of the activation
+    gather and the index that restores plan order after it; the targets and slots stay the whole plan's (every rank scores
     every row once the activations are gathered) and the target audit runs
     over the whole plan on every rank, so the NaN flags agree across the
-    group. A rank without any planned row stages none and still carries the
-    split."""
+    group."""
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
-    # Two requests of 4 and 6 rows over four shards of [3, 3, 2, 2] rows; the
-    # plan wants rows 1..3 of the first and rows 4..7 of the second (slot 1's
-    # first two rows 4, 5 are on rank 1, rows 6, 7 on rank 2; rank 3 none).
+    # Two requests of 4 and 6 rows over four ranks, one row per zigzag
+    # segment: rank 0 holds rows 0, 4, rank 1 rows 1, 5, rank 2 rows 2, 6, 9,
+    # rank 3 rows 3, 7, 8. The plan wants rows 1..3 of the first request and
+    # rows 4..7 of the second.
     shifted = list(range(100, 110))
     shifted[6] = 999  # out of vocab: flags slot 1 on every rank
     plans = {}
     for rank in range(4):
         executor = _staging_executor(monkeypatch, shifted_ids=shifted, vocab_size=200)
         shard = QueryShardPlan.from_forward(
-            total_tokens=10, input_lengths=[4, 6], size=4, rank=rank
+            total_tokens=10, input_lengths=[4, 6], size=4, rank=rank, device="cpu"
         )
         plan = InputLogprobPlan(
             row_starts=(1, 4), counts=(3, 4), position_starts=(1, 0)
         )
         staged = executor._input_logprob_rows(plan, 2, 10, shard)
         plans[rank] = staged
-        assert staged.rows_per_rank == (2, 3, 2, 0)
+        assert staged.rows_per_rank == (1, 2, 2, 2)
+        # The gather returns rows 4, 1, 5, 2, 6, 3, 7 (rank by rank).
+        assert staged.gathered_to_rows.tolist() == [1, 3, 5, 0, 2, 4, 6]
         assert staged.num_input_rows == shard.local_rows
         assert staged.num_result_rows == 7
         assert staged.slots.tolist() == [0, 0, 0, 1, 1, 1, 1]
         # The flagged row's target is clamped; every rank holds every target.
         assert staged.targets.tolist() == [101, 102, 103, 104, 105, 199, 107]
         assert executor.nan_guard.flags.tolist() == [0, 1, 0, 0]
-    assert plans[0].rows.tolist() == [1, 2]
-    assert plans[1].rows.tolist() == [0, 1, 2]  # rows 3, 4, 5 re-based to shard 1
-    assert plans[2].rows.tolist() == [0, 1]  # rows 6, 7 re-based to shard 2
-    assert plans[3].rows.tolist() == []
+    assert plans[0].rows.tolist() == [1]  # row 4, rank 0's second row
+    assert plans[1].rows.tolist() == [0, 1]  # rows 1, 5
+    assert plans[2].rows.tolist() == [0, 1]  # rows 2, 6
+    assert plans[3].rows.tolist() == [0, 1]  # rows 3, 7
 
 
 def test_nan_guard_flags_the_slot_of_a_non_finite_prompt_logprob():
@@ -230,6 +232,7 @@ def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
                 num_input_rows=5,
                 chunk_tokens=chunk_tokens,
                 rows_per_rank=None,
+                gathered_to_rows=None,
                 top_k=top_k,
             ),
         )
@@ -293,6 +296,7 @@ def test_prompt_rows_and_sampled_rows_take_the_same_top_k_of_the_same_logits():
                 num_input_rows=num_rows,
                 chunk_tokens=2,
                 rows_per_rank=None,
+                gathered_to_rows=None,
                 top_k=k,
             ),
         ),

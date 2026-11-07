@@ -231,7 +231,9 @@ class HostCacheExecutor:
             draft_layout,
             group_ids=scheduler_group_ids or None,
         )
-        host_lcm_block_bytes = compute_host_lcm_block_bytes(self.layout)
+        host_lcm_block_bytes = compute_host_lcm_block_bytes(
+            self.layout, group_specs=contract.group_specs
+        )
         shard_by_id = {
             spec.group_id: int(spec.shard_count) for spec in contract.group_specs
         }
@@ -239,7 +241,9 @@ class HostCacheExecutor:
             packing * shard_by_id[group.group_id]
             for group, packing in zip(
                 self.layout.groups,
-                compute_host_group_packing(self.layout),
+                compute_host_group_packing(
+                    self.layout, group_specs=contract.group_specs
+                ),
                 strict=True,
             )
         )
@@ -354,7 +358,9 @@ class HostCacheExecutor:
         self._transfer_geometry = None
         if l2_tier:
             self.host_storage = HostCacheStorage(
-                self.layout, num_host_lcm_blocks=host_lcm_blocks
+                self.layout,
+                group_specs=contract.group_specs,
+                num_host_lcm_blocks=host_lcm_blocks,
             )
             # Scheduler block ids on both ends of every L2 copy to this rank's
             # local ids.
@@ -376,7 +382,9 @@ class HostCacheExecutor:
         self.blob_arena: torch.Tensor | None = None
         if snapshot_lcm_blocks:
             self.snapshot_storage = HostCacheStorage(
-                self.layout, num_host_lcm_blocks=snapshot_lcm_blocks
+                self.layout,
+                group_specs=contract.group_specs,
+                num_host_lcm_blocks=snapshot_lcm_blocks,
             )
             self.snapshot_block_owners = BlockOwnerTranslation.for_host_pool(
                 self.layout,
