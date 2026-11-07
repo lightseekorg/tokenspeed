@@ -133,6 +133,14 @@ the device (no batch, no cache op, no remote stream: `plan.needs_device()`)
 queues nothing: a loop waiting on a transfer would otherwise hand the forward
 thread an empty plan per round, each costing a turn of the GIL.
 
+The wait for a launch (`take_launched`) parks on the shared state's condvar,
+and every change to that state goes through `StateGuard` (`data_plane.rs`):
+any `&mut` borrow through the guard marks it, and the guard's drop (or wait)
+notifies — a launch, a take or restore, a failure, the teardown drain alike.
+The notification is a property of the lock, not a step each mutation site
+must remember: a state change that leaves a waiter asleep is
+unrepresentable, not a bug somebody merely forgot to write.
+
 The control thread's Python calls run under a thread-local dispatch guard
 (`maybe_control_plane_guard` in `device.py`, on by default), entered while
 it serves: any CUDA tensor op from it raises. Event waits — the inbound

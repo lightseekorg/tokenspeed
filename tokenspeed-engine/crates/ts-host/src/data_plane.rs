@@ -155,7 +155,9 @@ struct AdmitRow {
 #[derive(Default)]
 struct Shared {
     state: Mutex<State>,
-    /// Signalled when a forward was launched or the data plane failed.
+    /// Signalled when the shared state changed: a launch, a removal or a
+    /// restore, or a failure — always through [`StateGuard`]'s drop or
+    /// wait, never a mutation site's separate call.
     changed: Condvar,
 }
 
@@ -168,42 +170,114 @@ struct State {
 }
 
 impl Shared {
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// The only handle on [`State`]: any `&mut` borrow through the guard
+    /// marks it dirty and dropping it (or waiting on it) notifies, so a
+    /// state change can never leave a waiter asleep — waking the waiters
+    /// is not the mutation site's separate, forgettable responsibility.
+    fn lock_state(&self) -> StateGuard<'_> {
+        StateGuard {
+            state: Some(
+                self.state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
+            changed: &self.changed,
+            dirty: false,
+        }
     }
 
     fn failure(&self) -> Option<String> {
-        self.state().failure.clone()
+        self.lock_state().failure.clone()
     }
 
     /// Record a failure, unless an earlier one is recorded, and wake the
-    /// control thread if it waits for a launch.
+    /// control thread if it waits for a launch. Dirties — and so notifies —
+    /// even when an earlier failure already stands: one redundant wakeup
+    /// beats a conditional path somebody could get wrong.
     fn fail(&self, failure: String) {
-        self.state().failure.get_or_insert(failure);
-        self.changed.notify_all();
+        self.lock_state().failure.get_or_insert(failure);
     }
 
     fn launch(&self, forward: ForwardId, launched: Py<PyAny>) {
-        self.state().launched.insert(forward, launched);
-        self.changed.notify_all();
+        self.lock_state().launched.insert(forward, launched);
     }
 
     /// The launched forward `forward`, once the forward thread launched it.
+    /// The checks read through `Deref` only, so a wait that finds nothing
+    /// stays clean: with `DerefMut` marking dirty unconditionally, a failed
+    /// take that dirtied would have every waiter announce a phantom change
+    /// before sleeping, and parked waiters would wake each other forever.
     fn take_launched(&self, forward: ForwardId) -> Result<Py<PyAny>, String> {
-        let mut state = self.state();
+        let mut state = self.lock_state();
         loop {
             if let Some(failure) = &state.failure {
                 return Err(failure.clone());
             }
-            if let Some(launched) = state.launched.remove(&forward) {
-                return Ok(launched);
+            if state.launched.contains_key(&forward) {
+                return Ok(state
+                    .launched
+                    .remove(&forward)
+                    .expect("the entry was just present"));
             }
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = state.wait();
+        }
+    }
+}
+
+/// A locked [`State`] that notifies `changed` on the way out when this
+/// holder changed it. Readers leave the guard clean and notify nothing;
+/// every `&mut` borrow marks it dirty, so there is no mutation path that
+/// forgets the notification.
+struct StateGuard<'a> {
+    /// `None` only inside [`StateGuard::wait`] and after the guard's own
+    /// `drop`, which release the lock; a live guard always holds it.
+    state: Option<MutexGuard<'a, State>>,
+    changed: &'a Condvar,
+    dirty: bool,
+}
+
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        self.state.as_ref().expect("the guard holds the lock")
+    }
+}
+
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.dirty = true;
+        self.state.as_mut().expect("the guard holds the lock")
+    }
+}
+
+impl<'a> StateGuard<'a> {
+    /// Waits for a change, flushing this holder's own change first: falling
+    /// asleep holding a change nobody was told about is the deadlock this
+    /// guard exists to make unrepresentable. The flush notifies while the
+    /// lock is still held — the alternative, sleeping on an unannounced
+    /// change, is the bug — and the condvar's wait releases it right after.
+    fn wait(mut self) -> Self {
+        if self.dirty {
+            self.changed.notify_all();
+            self.dirty = false;
+        }
+        let state = self
+            .changed
+            .wait(self.state.take().expect("the guard holds the lock"))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.state = Some(state);
+        self
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        // Release the lock before notifying, so the woken do not pile up on
+        // the mutex the notifier still holds.
+        drop(self.state.take());
+        if self.dirty {
+            self.changed.notify_all();
         }
     }
 }
@@ -524,7 +598,12 @@ impl Drop for PythonDataPlane {
             }
         }
         let guard = self.guard.take();
-        let launched = std::mem::take(&mut self.shared.state().launched);
+        // The drain's own notification only makes a waiter recheck once;
+        // what ends any remaining wait is the failure `ExitNotice` recorded
+        // when the forward thread left.
+        let mut state = self.shared.lock_state();
+        let launched = std::mem::take(&mut state.launched);
+        drop(state);
         Python::attach(|py| {
             if let Some(guard) = guard {
                 if let Err(error) =
@@ -1207,5 +1286,57 @@ result = (Plane(), ts.Scheduler(cfg))
         // Every later call reports the failure, on either thread's side.
         assert!(data_plane.poll_cache_events().is_err());
         assert!(data_plane.release(&["r".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn a_change_outside_launch_and_fail_wakes_the_waiter() {
+        // Every state change must announce itself, not only the launch and
+        // failure paths: a waiter parked on a forward wakes when its entry
+        // appears through any change — a take-then-restore included, the
+        // shape that once parked a control thread forever (a closed
+        // experiment added restore paths without notifying).
+        // This test stands alone: it never goes through `plane()`, so it
+        // starts the interpreter itself rather than relying on whichever
+        // test initialized it first.
+        interpreter();
+        let shared = Arc::new(Shared::default());
+        // Two distinct objects: `py.None()` is a singleton, and identity
+        // against it would pass regardless of which entry came back.
+        let (marker, spare) = Python::attach(|py| {
+            (
+                PyBytes::new(py, b"waited for").into_any().unbind(),
+                PyBytes::new(py, b"restored").into_any().unbind(),
+            )
+        });
+        let (taken, got) = mpsc::channel::<Result<Py<PyAny>, String>>();
+        let waiter = {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                let _ = taken.send(shared.take_launched(7));
+            })
+        };
+        // The waiter must already be parked when the change lands, or the
+        // test degrades to "an insert can be taken": after the settle time,
+        // it holds neither the lock (parking released it) nor a result.
+        thread::sleep(Duration::from_millis(200));
+        assert!(shared.state.try_lock().is_ok());
+        assert!(matches!(got.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        // Clone before locking: the shared lock is a leaf, nothing takes
+        // the GIL while holding it.
+        let restored = Python::attach(|py| spare.clone_ref(py));
+        {
+            let mut state = shared.lock_state();
+            // The restore shape: a take that finds nothing, then the entry
+            // back in — neither is `launch` or `fail`.
+            assert!(state.launched.remove(&7).is_none());
+            state.launched.insert(7, restored);
+        }
+        let launched = got
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the waiter was never woken");
+        let launched = launched.expect("the waiter saw a failure");
+        assert!(launched.is(&spare));
+        assert!(!launched.is(&marker));
+        waiter.join().unwrap();
     }
 }
