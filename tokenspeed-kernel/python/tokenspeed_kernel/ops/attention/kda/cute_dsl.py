@@ -301,14 +301,7 @@ def cutedsl_kda_chunk_prefill(
     return out.view(batch, tokens, num_value_heads, value_dim), final_state
 
 
-def _cute_dsl_importable() -> bool:
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("quack") is not None
-    )
-
-
-if current_platform().is_nvidia and _cute_dsl_importable():
+if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
 
     @register_kernel(
         "attention",
