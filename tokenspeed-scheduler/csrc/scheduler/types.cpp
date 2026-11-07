@@ -81,6 +81,13 @@ void SchedulerConfig::Validate() const {
     if (state_checkpoint_in_forward && disable_prefix_cache && role != Role::kD) {
         throw std::invalid_argument("Scheduler: state_checkpoint_in_forward requires prefix caching");
     }
+    if (drop_short_prompt_end_checkpoints && role != Role::kP) {
+        throw std::invalid_argument("Scheduler: drop_short_prompt_end_checkpoints applies to the P role only");
+    }
+    if (drop_short_prompt_end_checkpoints && !state_checkpoint_in_forward) {
+        throw std::invalid_argument(
+            "Scheduler: drop_short_prompt_end_checkpoints requires state_checkpoint_in_forward");
+    }
     // Only in-forward checkpoints are ever demoted.
     if (demote_superseded_state_checkpoints && !state_checkpoint_in_forward && role != Role::kD) {
         throw std::invalid_argument(

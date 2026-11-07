@@ -183,6 +183,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
+        .def_rw("drop_short_prompt_end_checkpoints", &tokenspeed::SchedulerConfig::drop_short_prompt_end_checkpoints)
         .def_rw("demote_superseded_state_checkpoints",
                 &tokenspeed::SchedulerConfig::demote_superseded_state_checkpoints)
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
