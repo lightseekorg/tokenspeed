@@ -18,9 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``BaseCausalLM.load_weights`` fuses stacked projections, hands this rank's
-experts to the model's expert loader, skips other ranks' experts, and returns
-the parameters that received data."""
+"""``BaseCausalLM.load_weights`` stacks projections and loads local experts.
+
+It skips other ranks' experts and returns the parameters that received data.
+"""
 
 from __future__ import annotations
 
@@ -45,23 +46,29 @@ from tokenspeed.runtime.layers.moe import (  # noqa: E402
 )
 from tokenspeed.runtime.models.base import BaseCausalLM  # noqa: E402
 
-H = 4
+HIDDEN = 4
 NUM_EXPERTS, EP_SIZE, EP_RANK = 4, 2, 1
 
 
 def _shard_loader(param, loaded_weight, shard_id):
     rows = {"q": 0, "k": 1, "v": 2, 0: 0, 1: 1}[shard_id]
-    param.data[rows * H : (rows + 1) * H] = loaded_weight
+    param.data[rows * HIDDEN : (rows + 1) * HIDDEN] = loaded_weight
 
 
 def _expert_loader(param, loaded_weight, *, shard_id, local_expert_id):
-    rows = {"w1": slice(0, H), "w3": slice(H, 2 * H), "w2": slice(0, H)}[shard_id]
+    rows = {
+        "w1": slice(0, HIDDEN),
+        "w3": slice(HIDDEN, 2 * HIDDEN),
+        "w2": slice(0, HIDDEN),
+    }[shard_id]
     param.data[local_expert_id, rows] = loaded_weight
 
 
 def _stacked(rows: int) -> nn.Module:
     module = nn.Module()
-    module.weight = nn.Parameter(torch.zeros(rows * H, H), requires_grad=False)
+    module.weight = nn.Parameter(
+        torch.zeros(rows * HIDDEN, HIDDEN), requires_grad=False
+    )
     module.weight.weight_loader = _shard_loader
     return module
 
@@ -72,15 +79,17 @@ class _Layer(nn.Module):
         self.self_attn = nn.Module()
         self.self_attn.qkv_proj = _stacked(3)
         self.input_layernorm = nn.Module()
-        self.input_layernorm.weight = nn.Parameter(torch.zeros(H), requires_grad=False)
+        self.input_layernorm.weight = nn.Parameter(
+            torch.zeros(HIDDEN), requires_grad=False
+        )
         self.mlp = nn.Module()
         self.mlp.experts = nn.Module()
         num_local = NUM_EXPERTS // EP_SIZE
         self.mlp.experts.w13_weight = nn.Parameter(
-            torch.zeros(num_local, 2 * H, H), requires_grad=False
+            torch.zeros(num_local, 2 * HIDDEN, HIDDEN), requires_grad=False
         )
         self.mlp.experts.w2_weight = nn.Parameter(
-            torch.zeros(num_local, H, H), requires_grad=False
+            torch.zeros(num_local, HIDDEN, HIDDEN), requires_grad=False
         )
         self.mlp.experts.w13_weight.weight_loader = _expert_loader
         self.mlp.experts.w2_weight.weight_loader = _expert_loader
@@ -120,7 +129,7 @@ class _TinyMoeLM(BaseCausalLM):
 
 
 def _value(seed: int) -> torch.Tensor:
-    return torch.full((H, H), float(seed))
+    return torch.full((HIDDEN, HIDDEN), float(seed))
 
 
 def test_projections_stack_and_only_this_ranks_experts_load():
@@ -130,8 +139,8 @@ def test_projections_stack_and_only_this_ranks_experts_load():
         (f"{prefix}.self_attn.q_proj.weight", _value(1)),
         (f"{prefix}.self_attn.k_proj.weight", _value(2)),
         (f"{prefix}.self_attn.v_proj.weight", _value(3)),
-        (f"{prefix}.self_attn.rotary_emb.inv_freq", torch.ones(H)),
-        (f"{prefix}.input_layernorm.weight", torch.full((H,), 4.0)),
+        (f"{prefix}.self_attn.rotary_emb.inv_freq", torch.ones(HIDDEN)),
+        (f"{prefix}.input_layernorm.weight", torch.full((HIDDEN,), 4.0)),
     ]
     for expert in range(NUM_EXPERTS):
         for proj, offset in (("gate_proj", 10), ("up_proj", 20), ("down_proj", 30)):
@@ -147,13 +156,13 @@ def test_projections_stack_and_only_this_ranks_experts_load():
     layer = model.model.layers[0]
     qkv = layer.self_attn.qkv_proj.weight
     for rows, seed in enumerate((1, 2, 3)):
-        assert torch.equal(qkv[rows * H : (rows + 1) * H], _value(seed))
-    assert torch.equal(layer.input_layernorm.weight, torch.full((H,), 4.0))
+        assert torch.equal(qkv[rows * HIDDEN : (rows + 1) * HIDDEN], _value(seed))
+    assert torch.equal(layer.input_layernorm.weight, torch.full((HIDDEN,), 4.0))
     # Rank 1 of 2 owns experts 2 and 3, in its local slots 0 and 1.
     w13, w2 = layer.mlp.experts.w13_weight, layer.mlp.experts.w2_weight
     for local, expert in enumerate((2, 3)):
-        assert torch.equal(w13[local, :H], _value(10 + expert))
-        assert torch.equal(w13[local, H:], _value(20 + expert))
+        assert torch.equal(w13[local, :HIDDEN], _value(10 + expert))
+        assert torch.equal(w13[local, HIDDEN:], _value(20 + expert))
         assert torch.equal(w2[local], _value(30 + expert))
     assert loaded == {
         f"{prefix}.self_attn.qkv_proj.weight",
