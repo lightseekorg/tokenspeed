@@ -244,6 +244,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
         _assert(cache_progress.state_checkpoint_tokens % prefix_granularity == 0,
                 "an in-forward State checkpoint sits at a page boundary");
         state_checkpoint_pages = cache_progress.state_checkpoint_tokens / prefix_granularity;
+        cache_progress.published_state_checkpoint_tokens = cache_progress.state_checkpoint_tokens;
         cache_progress.published_state_checkpoint_blocks = std::move(cache_progress.state_checkpoint_blocks);
         cache_progress.state_checkpoint_blocks.clear();
         cache_progress.state_checkpoint_tokens = 0;
@@ -680,6 +681,14 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .resumed_tail_hash = std::move(admission->resumed_tail_hash),
         .resume_tokens = hit_tokens,
     };
+    // Checkpoint demotion counts the first admissions that resume at each
+    // page boundary: one more than a conversation's own makes it shared
+    // (demoteSupersededCheckpoint).
+    const std::int32_t resumed_pages = cache_progress.resume_tokens / prefix_granularity;
+    if (checkpoint_lineage_ && resumed_pages > 0 && cache_progress.resume_tokens % prefix_granularity == 0 &&
+        resumed_pages <= static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
+        checkpoint_lineage_->NoteResume(cache_progress.prefix_hashes[static_cast<std::size_t>(resumed_pages) - 1]);
+    }
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
         cache_progress.state_checkpoint_blocks = std::move(admission->state_checkpoint_blocks);
@@ -735,6 +744,9 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     StagedCacheProgress staged{cache_progress};
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;
+    }
+    if (ends_at_state_checkpoint) {
+        cache_progress.published_state_checkpoint_tokens = state_checkpoint;
     }
     const RequestProgress progress = AdvanceRequestProgress(
         *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),

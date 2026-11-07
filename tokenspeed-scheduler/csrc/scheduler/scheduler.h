@@ -39,6 +39,7 @@
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
 #include "resource/allocator/req_pool_allocator.h"
+#include "scheduler/checkpoint_lineage.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
@@ -82,6 +83,10 @@ struct HostCacheStats {
     // once, no probe being able to resume from it on the Host (dead entries,
     // never written back).
     std::uint64_t dead_entries_not_written_back{0};
+    // What they evicted under write-back and dropped as demoted entries
+    // (SchedulerConfig::demote_superseded_state_checkpoints), never written
+    // back; counted under the eviction's cause.
+    std::uint64_t demoted_entries_not_written_back{0};
     CacheCoordinator::DeviceEvictionStats device_evictions;
     // CacheCoordinator::CheckpointResumeGaps, the gaps an admission resumed
     // a State checkpoint after, on either tier.
@@ -171,6 +176,11 @@ public:
     // per-prior cap has dropped since start.
     std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
     std::int64_t TailCapEvictions() const { return coordinator_.TailCapEvictions(); }
+    // The entries superseded checkpoint demotion demoted since start
+    // (demoteSupersededCheckpoint), on either tier or on an eviction
+    // write-back's way to the Host; always 0 without
+    // SchedulerConfig::demote_superseded_state_checkpoints. Accounting only.
+    std::uint64_t DemotedCheckpointEntries() const { return demoted_checkpoint_entries_; }
     // Empty parents of the request-private snapshot pool: every block of it
     // belongs to some retracted request's image, so a request that finished
     // or aborted while retracted must have returned its share (leak check).
@@ -330,6 +340,23 @@ private:
     bool firstDecodePublishesPromptEnd(const Request& request, std::int32_t resume_tokens) const;
     std::optional<CacheCoordinator::CopyInPoint> promptEndCopyInPoint(const Request& request,
                                                                       std::int32_t resume_tokens) const;
+    // Superseded checkpoint demotion, at a finish that published an in-forward
+    // State checkpoint C past the page boundary R it resumed from, before C
+    // is recorded: when R is itself a recorded in-forward checkpoint, demotes
+    // the one R's publisher resumed from -- two turns back on this
+    // conversation -- with the window blocks behind it that neither R nor C
+    // resumes with. R stays, so a next prompt that diverges inside the last
+    // turn resumes there. A shared checkpoint stays too: one another first
+    // admission resumed at, or one an access dated after R's publisher
+    // acquired it. A boundary no in-forward checkpoint was recorded at (a
+    // junction or prompt end alone) is never demoted, though it can need a
+    // window block it shares with the demoted one. The scheduler sees no
+    // conversations, so another conversation's boundary only this one
+    // resumed from so far is demoted like its own.
+    void demoteSupersededCheckpoint(const fsm::CacheProgress& progress);
+    // Records, at a finish, the in-forward State checkpoint the request
+    // published past the point it resumed from.
+    void recordCheckpointPublication(const fsm::CacheProgress& progress);
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
@@ -589,6 +616,14 @@ private:
     // order the coordinator touches pages (evictions run suffix-first), so
     // this order carries no meaning; DrainKvEvents sorts the batch.
     std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
+
+    // SchedulerConfig::demote_superseded_state_checkpoints where it takes
+    // effect (a model with State groups, outside the D role): what finishes
+    // and first admissions record for demoteSupersededCheckpoint. Empty
+    // otherwise.
+    std::optional<CheckpointLineage> checkpoint_lineage_;
+    // DemotedCheckpointEntries.
+    std::uint64_t demoted_checkpoint_entries_{0};
 };
 
 }  // namespace tokenspeed
