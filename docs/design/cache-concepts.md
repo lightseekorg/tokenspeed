@@ -424,6 +424,11 @@ capacity layout without these slots keeps such a forward on its live metadata
 break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
 checkpoint windows at its eager break, over live metadata.
 
+On PD decode admission, a partial leading history block is a landing slot for
+the prefill peer. Installing its private writable block also rewinds the
+reclaimed-prefix frontier to include that slot: the outgoing destination
+table must carry the real block ID, even at logical slot zero.
+
 PD moves exactly one block per state group: `latest_snapshot` is slot 1 of
 the prefill's final state, landing in the decode's slot 1 (its slot 0 stays
 null, so the first decode reads the landed state). When the decode role's

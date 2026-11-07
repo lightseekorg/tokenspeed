@@ -783,8 +783,12 @@ class DeepseekV41Compressor(nn.Module):
                 else F.linear(x.float(), self.wkv_wgate.weight.float())
             )
         if key_rows is not None:
-            projected = token_all_gather_rows(
-                projected.contiguous(), key_rows.group, list(key_rows.plan.row_counts)
+            projected = key_rows.plan.to_span_order(
+                token_all_gather_rows(
+                    projected.contiguous(),
+                    key_rows.group,
+                    list(key_rows.plan.row_counts),
+                )
             )
         if self.ratio == 2:
             content, scores = projected.chunk(2, dim=-1)
@@ -1308,8 +1312,8 @@ class DeepseekV41Attention(nn.Module):
         # Backend positions carry -1 for padding; request indices are batch rows.
         positions, requests = source_positions, source_requests
         if rows.source_shard is not None:
-            positions = positions[rows.source_shard.local_slice]
-            requests = requests[rows.source_shard.local_slice]
+            positions = positions[rows.source_shard.local_row_ids]
+            requests = requests[rows.source_shard.local_row_ids]
         if (
             rows.keep_rows is not None
             and rows.keep_rows.numel() == 0
@@ -1428,7 +1432,7 @@ class DeepseekV41Attention(nn.Module):
                     else:
                         index_q_input, index_q_scale = qr, None
                     query_slice = (
-                        rows.query_shard.local_slice
+                        rows.query_shard.local_row_ids
                         if rows.query_shard is not None
                         else slice(None)
                     )
@@ -2710,7 +2714,7 @@ class DeepseekV41Model(nn.Module):
                     self.mapping.attn.qcp_group,
                     list(plan.row_counts),
                 )
-                captured = list(packed.split(widths, dim=-1))
+                captured = list(plan.to_span_order(packed).split(widths, dim=-1))
             if plan.sampled_rows_total != ctx.output_layout.num_output_tokens:
                 raise RuntimeError(
                     "V4.1 QCP output ownership disagrees with output layout"
@@ -2719,7 +2723,6 @@ class DeepseekV41Model(nn.Module):
                 hidden = gather_sampled_rows(
                     hidden,
                     plan,
-                    local.sampled_rows,
                     group=self.mapping.attn.qcp_group,
                 )
             else:

@@ -231,6 +231,56 @@ fn a_refused_preallocation_fails_both_sides() {
 }
 
 #[test]
+fn failure_retires_queued_layerwise_reads_before_releasing_the_room() {
+    let Some(library) = library() else {
+        eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
+        return;
+    };
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let steps = Box::new(std::sync::atomic::AtomicI64::new(0));
+    let mut pair = pair_with(
+        library,
+        &source,
+        &destination,
+        Duration::from_secs(60),
+        Some(steps.as_ptr() as usize),
+    );
+    let (mut mesh, group) = single_rank();
+    let rid = "cancel-queued";
+    pair.prefill.register(rid, &pair.bootstrap).unwrap();
+    pair.decode.register(rid, &pair.bootstrap).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.to_owned())
+    );
+    pair.admit(rid);
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.to_owned())
+    );
+    for _ in 0..64 {
+        pair.prefill_outbox
+            .arm_layerwise(&prompt_forward(rid))
+            .unwrap();
+    }
+    // The first job waits for its producer; the rest are still queued.
+    pair.prefill.abort_room(rid, pair.bootstrap.room);
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
+    );
+    assert!(!pair.prefill.has_in_flight());
+    steps.store(1000, std::sync::atomic::Ordering::Release);
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        destination.iter().all(|&byte| byte == 0),
+        "retired work must never resume reads after the producer advances"
+    );
+    assert!(pair.prefill.poll(&mut mesh, &group).unwrap().is_empty());
+}
+
+#[test]
 fn a_room_no_decode_rank_reaches_times_out() {
     let Some(library) = library() else {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");

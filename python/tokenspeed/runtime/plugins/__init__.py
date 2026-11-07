@@ -52,7 +52,7 @@ logger = get_colorful_logger(__name__)
 ENTRY_POINT_GROUP = "tokenspeed.plugins"
 DISABLE_ENV_VAR = "TOKENSPEED_DISABLE_PLUGINS"
 # Bumped whenever a class or protocol on the plugin contract changes.
-PLUGIN_API_VERSION = 3
+PLUGIN_API_VERSION = 4
 
 __all__ = [
     "DISABLE_ENV_VAR",

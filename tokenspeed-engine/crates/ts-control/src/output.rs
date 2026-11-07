@@ -185,25 +185,40 @@ pub struct HistorySeeds {
     pub slots: Vec<i32>,
     /// Each slot's committed prefix length.
     pub prefix_lengths: Vec<i64>,
-    /// Each slot's committed prefix.
+    /// Each slot's committed prefix, or only its last tokens when the model
+    /// reads a bounded lookback: they end at the prefix length.
     pub tokens: Vec<Vec<i32>>,
 }
 
 /// Which request's committed tokens each history row holds.
 ///
 /// Every forward appends its inputs to its slot's row at the committed
-/// frontier, so a row holds a request's tokens from position 0 once it
-/// started there at position 0 or was seeded there, until another request
-/// runs in the slot. A forward seeds its committed prefix otherwise: after
-/// a prefix-cache hit, a slot handoff, a retracted request's restore into
+/// frontier, so a row holds the request's readable committed tokens until
+/// another request runs in the slot. With a bounded lookback, positions
+/// before the seeded tail remain unspecified. A forward seeds its committed
+/// prefix after a prefix-cache hit, a slot handoff, a retracted request's restore into
 /// another slot, or a PD decode landing. Ownership is per admission, not
 /// per request id, which clients may reuse.
+///
+/// A model that reads at most `lookback` committed tokens behind the
+/// frontier (an n-gram hash, say) needs only those seeded: a 200K-token
+/// prefix-cache hit then ships a few tokens to the device, not the prefix.
 #[derive(Debug, Default)]
 pub struct HistoryRows {
     owners: HashMap<i32, u64>,
+    lookback: Option<usize>,
 }
 
 impl HistoryRows {
+    /// Rows whose seeds carry the last `lookback` committed tokens, or the
+    /// whole prefix with None.
+    pub fn new(lookback: Option<usize>) -> Self {
+        Self {
+            owners: HashMap::new(),
+            lookback,
+        }
+    }
+
     /// Record `batch`'s slot ownership and the prefixes it must seed, or
     /// `None` when no row needs one. Called once per dispatched forward, in
     /// dispatch order.
@@ -231,13 +246,15 @@ impl HistoryRows {
             if boundary > total {
                 return Err(CommitError::History(rid.clone()));
             }
+            let start = self.lookback.map_or(0, |n| boundary.saturating_sub(n));
             let prompt = &state.prompt_ids;
             let prefix: Vec<i32> = if boundary <= prompt.len() {
-                prompt[..boundary].to_vec()
+                prompt[start..boundary].to_vec()
             } else {
                 prompt
                     .iter()
                     .chain(&state.output_ids[..boundary - prompt.len()])
+                    .skip(start)
                     .copied()
                     .collect()
             };
@@ -1889,6 +1906,75 @@ mod tests {
                 tokens: vec![vec![50, 51, 52]],
             })
         );
+    }
+
+    #[test]
+    fn a_bounded_lookback_seeds_only_the_prefix_tail() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+        register_history(&mut p, "b", &[30, 31], &[]);
+        let seeds = HistoryRows::new(Some(3))
+            .seeds(&history_batch(&[("a", 1, 5), ("b", 2, 2)], 2), &p)
+            .unwrap();
+        // The tail ends at the prefix length and may span prompt and
+        // output; a prefix shorter than the lookback ships whole.
+        assert_eq!(
+            seeds,
+            Some(HistorySeeds {
+                slots: vec![1, 2],
+                prefix_lengths: vec![5, 2],
+                tokens: vec![vec![12, 13, 20], vec![30, 31]],
+            })
+        );
+        let in_prompt = HistoryRows::new(Some(2))
+            .seeds(&history_batch(&[("a", 1, 3)], 1), &p)
+            .unwrap();
+        assert_eq!(in_prompt.unwrap().tokens, [vec![11, 12]]);
+    }
+
+    #[test]
+    fn bounded_seeds_preserve_landing_reuse_and_recovery() {
+        for lookback in [0, 1, 3, 100] {
+            let mut p = processor(None);
+            register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+            register_history(&mut p, "b", &[30, 31], &[]);
+            let mut rows = HistoryRows::new(Some(lookback));
+            // A PD landing excludes the last output: it is the decode input.
+            let landing = history_batch(&[("a", 1, 0)], 0);
+            let seed = rows.seeds(&landing, &p).unwrap().unwrap();
+            let prefix = [10, 11, 12, 13, 20];
+            assert_eq!(seed.prefix_lengths, [5]);
+            assert_eq!(seed.tokens[0], prefix[5_usize.saturating_sub(lookback)..]);
+            assert_eq!(rows.seeds(&landing, &p).unwrap(), None);
+            // A prefix hit takes over the slot, then the original request recovers.
+            let handoff = rows
+                .seeds(&history_batch(&[("b", 1, 2)], 1), &p)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                handoff.tokens[0],
+                [30, 31][2_usize.saturating_sub(lookback)..]
+            );
+            let recovery = rows
+                .seeds(&history_batch(&[("a", 1, 4)], 1), &p)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recovery.tokens[0],
+                prefix[4_usize.saturating_sub(lookback)..4]
+            );
+            // Finishing and reusing the client id must still create a new owner.
+            p.states.remove("a");
+            register_history(&mut p, "a", &[50, 51, 52, 53], &[]);
+            let reused = rows
+                .seeds(&history_batch(&[("a", 1, 3)], 1), &p)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reused.tokens[0],
+                [50, 51, 52][3_usize.saturating_sub(lookback)..]
+            );
+        }
     }
 
     #[test]

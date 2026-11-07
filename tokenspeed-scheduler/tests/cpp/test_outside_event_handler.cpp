@@ -1139,6 +1139,9 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AClaimedPromptEndStateIsSupersededOnlyB
         EXPECT_EQ(evictions.admission.blocks, 2u);
         EXPECT_EQ(evictions.request_reclaim.blocks, r1_decodes ? 2u : 0u);
         SendAbortEvent("big");
+        ExecutionEvent retired;
+        retired.With(pd::FailedEvent{"big"});
+        scheduler_->Advance(retired);
         PlanOnce();
 
         for (const bool ends_at_10 : {false, true}) {
@@ -1154,6 +1157,9 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AClaimedPromptEndStateIsSupersededOnlyB
             ASSERT_NE(landing, nullptr) << again.request_id;
             EXPECT_EQ(landing->state_prefix_cached, std::vector<bool>{ends_at_10 == r1_decodes}) << again.request_id;
             SendAbortEvent(again.request_id);
+            ExecutionEvent retired_probe;
+            retired_probe.With(pd::FailedEvent{again.request_id});
+            scheduler_->Advance(retired_probe);
             PlanOnce();
         }
     }

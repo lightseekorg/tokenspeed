@@ -132,8 +132,15 @@ ROUTER_TOPKS = ("fused", "torch")
 # ``--logprob-order``: the selected-token log-softmax behind every returned
 # logprob — ``torch.log_softmax``, or fixed-width blockwise reduction
 # over ``BLOCKWISE_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
-LOGPROB_ORDERS = ("torch", "blockwise", "blockwise-direct")
 BLOCKWISE_VOCAB_BLOCK = 32768
+# Block width describes the trainer's reduction, independently of serving TP.
+BLOCKWISE_LOGPROB_ORDERS = {
+    "blockwise": (BLOCKWISE_VOCAB_BLOCK, "negative-cross-entropy"),
+    "blockwise-direct": (BLOCKWISE_VOCAB_BLOCK, "direct"),
+    "blockwise-16384": (16384, "negative-cross-entropy"),
+    "blockwise-direct-16384": (16384, "direct"),
+}
+LOGPROB_ORDERS = ("torch", *BLOCKWISE_LOGPROB_ORDERS)
 
 # ``--moe-combine-order``: how a token's routed-expert contributions meet
 # across the MoE TP-EP group — ``rank``: per-rank partials summed by the
@@ -212,6 +219,7 @@ __all__ = [
     "LAYER_BOUNDARY_NORMS",
     "LOGPROB_ORDERS",
     "BLOCKWISE_VOCAB_BLOCK",
+    "BLOCKWISE_LOGPROB_ORDERS",
     "MLA_LORA_SCALES",
     "MOE_COMBINE_ORDERS",
     "NUMERICS_ENVELOPES",

@@ -3616,6 +3616,96 @@ def global_slots(rows, positions, requests, table, ratio, pages):
 
 
 @triton.jit(
+    do_not_specialize=["Q", "ROW0", "SS0", "LS0", "GS0"],
+    do_not_specialize_on_alignment=["Rows", "Logical", "Slots"],
+)
+def _prefill_indices_kernel(
+    Swa,
+    Logical,
+    Slots,
+    Rows,
+    Base,
+    Out,
+    Q,
+    ROW0,
+    SS0,
+    LS0,
+    GS0,
+    W: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_ROWS: tl.constexpr,
+):
+    q = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    live = q < Q
+    # Row and query offsets grow with the step's token count: compute in int64.
+    q64 = q.to(tl.int64)
+    if HAS_ROWS:
+        row = tl.load(Rows + q64, live, other=0).to(tl.int64)
+    else:
+        row = q64 + ROW0
+    out_row = Out + q64[:, None] * (W + K)
+
+    w = tl.arange(0, BLOCK_W)
+    w_mask = live[:, None] & (w[None, :] < W)
+    swa = tl.load(Swa + q64[:, None] * SS0 + w[None, :], w_mask, other=-1)
+    tl.store(out_row + w[None, :], swa.to(tl.int32), w_mask)
+
+    k = tl.arange(0, BLOCK_K)
+    k_mask = live[:, None] & (k[None, :] < K)
+    selected = tl.load(Logical + row[:, None] * LS0 + k[None, :], k_mask, other=-1)
+    slots = tl.load(Slots + row[:, None] * GS0 + k[None, :], k_mask, other=-1)
+    base = tl.load(Base + q64, live, other=0).to(tl.int64)
+    rows = tl.where(
+        (selected >= 0) & (slots >= 0), selected.to(tl.int64) + base[:, None], -1
+    )
+    tl.store(out_row + W + k[None, :], rows.to(tl.int32), k_mask)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_prefill_indices",
+    name="triton_dsv41_prefill_indices",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def prefill_indices(swa_indices, logical_rows, global_slots, rows, history_base):
+    """Join SWA and selected-history workspace rows into int32 attention indices."""
+    queries, window = swa_indices.shape
+    width = logical_rows.shape[1]
+    out = torch.empty(
+        (queries, window + width), dtype=torch.int32, device=swa_indices.device
+    )
+    if queries:
+        has_rows = not isinstance(rows, slice)
+        kernel_launcher(_prefill_indices_kernel, (triton.cdiv(queries, 8),))(
+            swa_indices,
+            logical_rows,
+            global_slots,
+            rows if has_rows else history_base,
+            history_base,
+            out,
+            queries,
+            0 if has_rows else rows.start,
+            swa_indices.stride(0),
+            logical_rows.stride(0),
+            global_slots.stride(0),
+            W=window,
+            K=width,
+            BLOCK_W=triton.next_power_of_2(window),
+            BLOCK_K=triton.next_power_of_2(width),
+            BLOCK_M=8,
+            HAS_ROWS=has_rows,
+            num_warps=4,
+        )
+    return out
+
+
+@triton.jit(
     do_not_specialize=["N", "TC", "TR", "TS0", "TS1"],
     do_not_specialize_on_alignment=["Table", "P", "Req"],
 )
@@ -4716,6 +4806,8 @@ register_triton_warmup(
 register_triton_warmup(
     _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
 )
+# Canonical windows pass a row slice, reordered subsets an index tensor.
+register_triton_warmup(_prefill_indices_kernel, variants=({"HAS_ROWS": (False, True)},))
 register_triton_warmup(
     _selection_table_kernel,
     variants=lambda args: ({"RATIO": tuple(sorted({1, args["RATIO"]}))},),

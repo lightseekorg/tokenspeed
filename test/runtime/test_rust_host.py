@@ -463,7 +463,12 @@ def executor():
     return _CpuExecutor(output_token_cumulative_probs=None)
 
 
-def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
+@pytest.mark.parametrize(
+    "history_prefix,history_tokens", [(2, [7, 8]), (9, [7, 8]), (9, [])]
+)
+def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
+    executor, history_prefix, history_tokens
+):
     plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1", temperature=0.0, max_new_tokens=8, stop_token_ids={9})
     plane.admit([("r1", msgspec.msgpack.encode(params), [2, 9], 11, None)])
@@ -480,7 +485,7 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
         None,
         None,
         (None, 0),
-        ([1], [2], [[7, 8]]),
+        ([1], [history_prefix], [history_tokens]),
     )
 
     assert pending is not None
@@ -500,7 +505,11 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
     assert sampling_params == [params]
     assert stop_criteria == (StopCriteria(stop_token_ids=(2, 9), token_limit=11),)
     assert executor.history_seeds == [
-        RequestHistorySeeds(slots=(1,), prefix_lengths=(2,), tokens=((7, 8),))
+        RequestHistorySeeds(
+            slots=(1,),
+            prefix_lengths=(history_prefix,),
+            tokens=(tuple(history_tokens),),
+        )
     ]
 
 

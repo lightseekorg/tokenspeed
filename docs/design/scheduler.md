@@ -1207,7 +1207,22 @@ of what the Device holds.
 are pinned until the peer acknowledges, then released wholesale. Retracting a
 prompt whose KV is mid-transfer would strand the decode side.
 
-The PD pin is not recorded anywhere; it is a function of the FSM
+While P holds a request, prefix publication uses a copy of its block table.
+Deduplication may redirect that copy to canonical cache blocks, but the real
+request keeps the physical source blocks named by queued layerwise transfers.
+A client abort waits for the transfer terminal event; a failed transfer also
+waits for outstanding local forward results before freeing its tables. Failed
+requests waiting for those results receive no further forward work. Successful
+and failed terminal paths both release the source references, without an extra
+long-lived copy of the tables.
+
+P-role prefix publication keeps the physical source table unchanged while a
+transfer can still read it, even when the prefix index already holds a
+canonical duplicate. Publication uses copied references. Copy-in capacity
+follows the ordinary pre-reserved-block contract; it does not revive the old
+best-effort owner-tail capacity calculation or canonical-tail protection.
+
+The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
 pinned — the peer's decode reads the pages from the first scheduled chunk until
 the PD ACK finishes or aborts the request. On the D role the pin is exactly
@@ -1751,3 +1766,9 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   remainder (4). Only the empty-round retraction (2), in a round that builds
   nothing and waits for no finished request, retracts or aborts an exempt
   request.
+
+Deferred PD cancellation belongs to the request: it first waits for transfer
+retirement, then for any outstanding local forward. Repeated cancellation
+cannot restart a transfer wait after its terminal event has arrived. Destroying
+the request destroys this state, so reusing a client request ID cannot inherit
+an old abort.
