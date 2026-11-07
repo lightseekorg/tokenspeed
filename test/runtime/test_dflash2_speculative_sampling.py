@@ -355,6 +355,7 @@ def _executor_config(spec_algo: str) -> ModelExecutorConfig:
         prefill_only=False,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,
+        enable_drafter_prefill_graph=False,
         input_logprob_chunk_tokens=N,
         enable_speculative_sampling=True,
         query_shard_size=1,
