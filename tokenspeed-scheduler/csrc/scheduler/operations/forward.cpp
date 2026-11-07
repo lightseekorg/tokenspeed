@@ -1057,10 +1057,11 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
                                /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
                                    (config_.role != Role::kD && num_computed_tokens <= victim.PrefillSize()));
     if (progress.completed_pages) {
-        // A publication is a KV-event mutation: the newly hashed pages (decode
-        // pages no admission has registered yet) and the tail need their token
-        // descriptors first, exactly as publishCompletedPages registers before
-        // it caches.
+        // A publication is a KV-event mutation: its pages from
+        // CacheCoordinator::FirstPublishedPage (the newly hashed decode pages
+        // no admission has registered yet, and any page below them it
+        // publishes under) and the tail need their token descriptors first,
+        // exactly as publishCompletedPages registers before it caches.
         registerKvEventPublication(victim, cache_progress.prefix_hashes, *progress.completed_pages);
         coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
     }
@@ -1154,8 +1155,9 @@ std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuil
         write_back_operations.push_back(std::move(*stores->host_store));
     }
     build.snapshot_stores.push_back(std::move(stores->snapshot_store));
+    std::vector<std::int32_t> kv_event_tails = kvEventTailsOf(stores->image);
     victim.Apply(fsm::SnapshotRetractEvent{&coordinator_, next_retraction_epoch_++, victim.HasGeneratedOutput(),
-                                           std::move(stores->image), std::move(blob_slot),
+                                           std::move(stores->image), std::move(kv_event_tails), std::move(blob_slot),
                                            std::move(stores->image_stores)});
     spdlog::info("[Scheduler] retract: suspended request {} ({} tokens) with its image", victim.Id(),
                  victim.TokenSize());

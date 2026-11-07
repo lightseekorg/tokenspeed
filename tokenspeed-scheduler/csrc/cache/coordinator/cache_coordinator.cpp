@@ -2561,6 +2561,28 @@ void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_inde
     cacheCompletedBlocksForGroup<CacheTier::kDevice>(group_index, table, completed, access_epoch);
 }
 
+std::int32_t CacheCoordinator::FirstPublishedPage(const CompletedPages& completed) const {
+    const auto hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
+    std::int32_t first_page = completed.first_new_prefix_page;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        for (const PublishedRange& range : completedBlockRanges(i, completed)) {
+            // A State group's one key is the point itself: the deepest page
+            // unless a tail is published. A history group's run starts at
+            // slot first_cache_block.
+            const std::int32_t page = GroupIsState(i)
+                                          ? hashed_prefix_pages - (completed.tail ? 0 : 1)
+                                          : range.first_cache_block / BlocksPerBoundary(static_cast<std::int32_t>(i));
+            first_page = std::min(first_page, page);
+        }
+    }
+    // The block an in-forward State checkpoint publishes under its page adds
+    // no page: the chunk that wrote it started on a page boundary at least
+    // one page below it (writesInForwardCheckpoint), so that page is never
+    // below the first new one. A sliding window behind it is one of the
+    // ranges read above.
+    return first_page;
+}
+
 void CacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {

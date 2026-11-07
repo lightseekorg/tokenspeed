@@ -285,11 +285,24 @@ private:
         bool evict_blocks_past_segments);
     void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
-    // The descriptors a publication mutates: its newly hashed full pages and,
-    // at a tail, the partial page under its tail hash (token_ids = the rows
-    // below T, parent = the last full page).
+    // The descriptors a publication mutates: its full pages from the first it
+    // registers an entry under (CacheCoordinator::FirstPublishedPage) and, at
+    // a tail, the partial page under its tail hash (token_ids = the rows below
+    // T, parent = the last full page).
     void registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                     const CompletedPages& completed);
+    // The boundaries (in tokens) of the tails an image's published slots sit
+    // at, read off their descriptors at the retraction (none with the feed
+    // off): the restore republishes such a slot after a drain may have
+    // dropped its descriptor.
+    std::vector<std::int32_t> kvEventTailsOf(const RetractionImage& image) const;
+    // The descriptors a restore's ACK mutates when it republishes the image's
+    // L2 slots: the whole prefix chain and the image's tails (kvEventTailsOf).
+    // A drain dropped them when the victim's pages left the Device.
+    void registerKvEventRestore(Request& request, std::span<const std::string> prefix_hashes,
+                                std::span<const std::int32_t> tails);
+    // The descriptor of `tail` past the full pages `prefix_hashes`.
+    void registerKvEventTail(Request& request, std::span<const std::string> prefix_hashes, const TailPublication& tail);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);
     // Finished requests whose forwards have all landed: publish the frontier
     // (state and KV tail) and release the pages. Runs after every batch of

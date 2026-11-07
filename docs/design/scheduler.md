@@ -1350,13 +1350,24 @@ end and its finish (unless they are dead, §1.2), its junction cuts and the
 in-forward checkpoint's page boundary, never for another interior chunk
 end's chain hash; a tail's
 descriptor carries the rows below `T` and the residency check counts a
-tail's blocks from it. Retraction publishes twice
-without an admission: `retractVictim` registers the newly hashed pages before
-`CacheCompletedBlocks` (as the finish-time publication does), and the
-`RestoreDone` handler registers the restored request's whole prefix chain
-before `CompleteSnapshotRestore` republishes its L2-tier destinations — the
-victim's pages left the Device when they were granted away, so their
-descriptors are typically gone by the time the restore lands.
+tail's blocks from it. A publication registers its newly hashed pages and its
+tail, and every page below them it registers an entry under
+(`CacheCoordinator::FirstPublishedPage`: the deepest page, where a State
+checkpoint lands when no page is new, and the pages a sliding window behind
+one of its boundaries reaches back into). Those pages keep their descriptors
+while the request's own published blocks hold them on the Device, but not
+once a restore has brought the request back on unpublished copies of them
+(snapshot-pool rows) and a drain has dropped them. Retraction publishes twice
+without an admission: `retractVictim` registers before `CacheCompletedBlocks`
+(as the finish-time publication does), and the `RestoreDone` handler
+registers the restored request's whole prefix chain, and the tails the
+image's published slots sit at, before `CompleteSnapshotRestore` republishes
+its L2-tier destinations — the victim's pages left the Device when they were
+granted away, so their descriptors are typically gone by the time the restore
+lands. No page hash names such a tail (slot 0 of a State group holding the
+checkpoint of a prompt end inside a page), so the retraction reads its
+boundary off the descriptor while the victim still holds it and keeps it with
+the image (`Retracted::kv_event_tails`).
 
 **A readmission that does not fit waits.** Its failed restore never
 triggers retraction (it is never recorded as the capacity blocker): when the
