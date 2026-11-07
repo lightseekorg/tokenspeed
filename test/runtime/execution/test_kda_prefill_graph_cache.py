@@ -807,7 +807,12 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
     # The Host load has its own stream; record the forward stream's waits in order.
     stream = SimpleNamespace(wait_event=lambda event: events.append(names[id(event)]))
     with (
-        patch("torch.cuda.current_stream", return_value=stream),
+        # LayerwiseLoadTracker.wait_for_all_layers waits on its module's
+        # device_module stream (torch.cpu on a host without a GPU).
+        patch(
+            "tokenspeed.runtime.cache.l2.layerwise_load.device_module.current_stream",
+            return_value=stream,
+        ),
         patch(
             "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata."
             "from_forward_context",

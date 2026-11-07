@@ -56,7 +56,12 @@ from tokenspeed.runtime.execution.accept_simulation import (
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
+from tokenspeed.runtime.execution.cudagraph_memory import (
+    CapturedLadder,
+    ladder_from_plan,
+)
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
+from tokenspeed.runtime.execution.drafter.base import DrafterExtendCapture
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     EagleHarnessConfig,
 )
@@ -75,6 +80,7 @@ from tokenspeed.runtime.execution.prefill_graph import (
     PrefillGraph,
     dummy_batch_size,
     narrowing_prefill_model,
+    resolve_prefill_capture_batch_sizes,
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
@@ -421,6 +427,10 @@ class ModelExecutorConfig:
     decode_only_attention: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
+    # The drafter's extend-round work replays from graphs beside the target's
+    # prefill graph (--enable-drafter-prefill-graph): it selects whether that
+    # work runs eager or from graphs, so it is explicit.
+    enable_drafter_prefill_graph: bool
     # Prompt-logprob gather: how many prompt rows go through the LM head at
     # once (``--input-logprob-chunk-tokens``). Bounds the transient
     # ``[rows, vocab]`` logits; log-softmax is row-local so the value never
@@ -549,6 +559,7 @@ class ModelExecutorConfig:
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+            enable_drafter_prefill_graph=server_args.enable_drafter_prefill_graph,
             state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
@@ -796,6 +807,7 @@ class ModelExecutor:
             if self._draft_model_runner is not None:
                 prepare_logits_communication(self._draft_model_runner.model)
         self._build_graph_owners()
+        self._validate_drafter_extend_graphs()
 
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
@@ -925,6 +937,7 @@ class ModelExecutor:
         self.prefill_graph.release_graphs()
         if self.drafter is not None:
             self.drafter.release_prefill_graph()
+            self.drafter.release_extend_graphs()
             self.drafter.release_round_graphs()
         workspace_pool(self.device).unfreeze()
         gc.collect()
@@ -1044,6 +1057,22 @@ class ModelExecutor:
                 self.drafter.capture_prefill_graph(
                     self.forward_step.stream, observer.measure("prefill:drafter")
                 )
+            # The drafter's extend graphs: the entries the projection prices.
+            plan = self._drafter_extend_plan()
+            if plan:
+                width, dtype = self.prefill_graph.captured_hidden_spec()
+                self.drafter.capture_extend_graphs(
+                    DrafterExtendCapture(
+                        plan=plan,
+                        ladders=self.drafter_extend_ladders(entries),
+                        stream=self.forward_step.stream,
+                        num_warmup=self.prefill_graph.num_warmup,
+                        target_hidden_width=width,
+                        target_hidden_dtype=dtype,
+                        prepare_batch=self._prepare_drafter_capture_batch,
+                    ),
+                    observer=observer,
+                )
 
     @property
     def captures_drafter_prefill_graph(self) -> bool:
@@ -1058,6 +1087,81 @@ class ModelExecutor:
             not self.prefill_graph.disable
             and self.drafter is not None
             and self.drafter.captures_prefill_graph
+        )
+
+    def _drafter_extend_plan(self) -> dict[str, list[tuple[int, int]]]:
+        """The drafter's extend graphs this boot records, per series.
+
+        Only with ``--enable-drafter-prefill-graph``, the target's prefill
+        graph on, and a drafter that can capture them in this configuration;
+        they share the target's token buckets and capture each at the
+        bucket's exact request counts (``--prefill-graph-capture-batch-sizes``,
+        unset: the fewest requests that fit the bucket in the context length).
+        The capture and the projection read this one plan, so they reach the
+        same verdict.
+        """
+        if (
+            not self.config.enable_drafter_prefill_graph
+            or self.prefill_graph.disable
+            or self.drafter is None
+        ):
+            return {}
+        plan = self.drafter.extend_graph_plan(
+            self.prefill_graph.capture_buckets,
+            partial(resolve_prefill_capture_batch_sizes, self.config),
+        )
+        return {series: entries for series, entries in plan.items() if entries}
+
+    @property
+    def captures_drafter_extend_graphs(self) -> bool:
+        """Whether this boot records drafter extend graphs beside the ladders."""
+        return bool(self._drafter_extend_plan())
+
+    def _validate_drafter_extend_graphs(self) -> None:
+        """Refuse ``--enable-drafter-prefill-graph`` when this boot would
+        record no drafter graph.
+
+        ``ServerArgs.validate_drafter_prefill_graph`` refuses the launches the
+        arguments decide; whether the prefill graph is on and whether the
+        drafter supports its loaded draft model are known only here.
+
+        Raises:
+            ValueError: The switch is on and the plan is empty.
+        """
+        if (
+            not self.config.enable_drafter_prefill_graph
+            or self.captures_drafter_extend_graphs
+        ):
+            return
+        if self.prefill_graph.disable:
+            reason = "the prefill CUDA graph is off in this configuration"
+        elif self.drafter is None:
+            reason = "this engine has no drafter"
+        else:
+            reason = (
+                f"the {type(self.drafter).__name__} drafter records none for this "
+                "draft model; it needs a chain EAGLE-style drafter over a draft "
+                "model that declares supports_breakable_draft_extend (Qwen4-Exp "
+                "MTP), without draft token history or a shared MTP top-k "
+                "(index_share_for_mtp_iteration)"
+            )
+        raise ValueError(
+            f"--enable-drafter-prefill-graph cannot record the drafter's prefill "
+            f"work: {reason}"
+        )
+
+    def drafter_extend_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
+        """The drafter's extend-graph ladders and the positions ``entries`` samples."""
+        return {
+            series: ladder_from_plan(graphs, entries)
+            for series, graphs in self._drafter_extend_plan().items()
+        }
+
+    def _prepare_drafter_capture_batch(self, num_tokens: int, bs: int) -> None:
+        """A dummy pure extend for the drafter's capture, its target and draft
+        metadata prepared as for a live extend."""
+        self.prefill_graph.make_dummy_draft_batch(
+            num_tokens, bs, self.draft_attn_backend
         )
 
     def autotune(self) -> None:
