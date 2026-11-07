@@ -77,6 +77,10 @@ mod ffi {
         UpdateReserveNumTokens,
         /// PD: the request's peers are connected (`pd::BootstrappedEvent`).
         PdBootstrapped,
+        /// PD, P role under independent decode allocation: every decode rank
+        /// allocated the request's destination
+        /// (`pd::DestinationReadyEvent`).
+        PdDestinationReady,
         /// PD: the request's transfer failed; it may still be stopping
         /// (`pd::FailedEvent`).
         PdFailed,

@@ -112,6 +112,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
             case ForwardEventKind::PdBootstrapped:
                 execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
                 break;
+            case ForwardEventKind::PdDestinationReady:
+                execution_event.With(tokenspeed::pd::DestinationReadyEvent(std::move(request_id)));
+                break;
             case ForwardEventKind::PdFailed:
                 execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
                 break;

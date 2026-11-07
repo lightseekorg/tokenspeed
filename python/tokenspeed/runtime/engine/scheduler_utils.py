@@ -63,6 +63,12 @@ _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
     "write_back": SchedulerConfig.HostWritePolicy.WriteBack,
 }
+# make_config's decode_allocation_policy names; ServerArgs validates the flag
+# and SchedulerConfig::Validate the role it is given on.
+_DECODE_ALLOCATION_POLICIES = {
+    "early": SchedulerConfig.DecodeAllocationPolicy.Early,
+    "independent": SchedulerConfig.DecodeAllocationPolicy.Independent,
+}
 
 
 def engram_context_len(text_config) -> int:
@@ -118,6 +124,7 @@ def make_config(
     storage_config: StorageConfig | None,
     host_write_policy: str,
     prefill_decode_interval: int,
+    decode_allocation_policy: str | None,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -175,6 +182,12 @@ def make_config(
             owed to the running decodes after each round that schedules a
             prefill chunk, unless no decode can run, and the most rounds it
             holds any one prompt back in total; 0 is off. Fused role only.
+        decode_allocation_policy:
+            ``--disaggregation-decode-allocation-policy``, required on the
+            prefill role and None on every other: ``"early"`` admits a prompt
+            once its Decode destination is allocated; ``"independent"``
+            admits it without waiting for the destination and holds only its
+            KV transfer for it.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -270,6 +283,10 @@ def make_config(
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     cfg.role = scheduler_role(role)
+    if decode_allocation_policy is not None:
+        cfg.decode_allocation_policy = _DECODE_ALLOCATION_POLICIES[
+            decode_allocation_policy
+        ]
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache

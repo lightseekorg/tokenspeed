@@ -49,6 +49,19 @@ void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     }
 }
 
+void Scheduler::handleEvent(const pd::DestinationReadyEvent& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr) {
+        return;
+    }
+    // Whatever the prompt's state, its final result no longer parks it; one
+    // already parked sends its KV.
+    request->MarkDestinationReady();
+    if (request->Is<fsm::PrefillAwaitingDestination>()) {
+        request->Apply(fsm::DestinationReadyEvent{});
+    }
+}
+
 void Scheduler::handleEvent(const pd::FailedEvent& event) {
     Request* request = findRequest(event.request_id);
     if (request == nullptr || request->Is<fsm::Finished>()) {
@@ -395,7 +408,13 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
             profile_span.emplace("Scheduler::handlePrefillResult");
         }
         request->NoteResultLanded();
-        request->Apply(fsm::ExtendResultEvent{event.tokens});
+        // Under early decode allocation an admitted prompt has its
+        // destination; under independent it has one once
+        // pd::DestinationReadyEvent arrived.
+        const bool await_destination =
+            config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kIndependent &&
+            !request->DestinationReady();
+        request->Apply(fsm::ExtendResultEvent{event.tokens, await_destination});
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }

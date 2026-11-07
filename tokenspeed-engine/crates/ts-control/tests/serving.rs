@@ -191,6 +191,8 @@ cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granula
                                         cache_blocks_per_lcm_block={kv_shard_count},
                                         shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
+if cfg.role == ts.SchedulerConfig.Role.P:
+    cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early
 if cfg.role != ts.SchedulerConfig.Role.Fused:
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
 {tiers}

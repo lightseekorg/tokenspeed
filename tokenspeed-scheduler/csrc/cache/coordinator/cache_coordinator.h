@@ -569,7 +569,8 @@ public:
     // own ParentRefs as they change, so reading it walks nothing.
     std::int32_t NumActiveLcmBlocks() const noexcept { return active_parents_.Count(); }
     // The same count taken by walking the given per-request table sets:
-    // the reference debug builds check NumActiveLcmBlocks against.
+    // the reference debug builds check NumActiveLcmBlocks against, and the
+    // count for a subset of the requests.
     std::int32_t CountActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
     // Free pages (group page units) this group could still place, counting its
     // partially filled parents and every empty parent.

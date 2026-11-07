@@ -631,6 +631,7 @@ TEST_F(LoneRequestCompactionSuite, AbortsALoneFirstAdmissionItsDeviceTailBindsTo
 TEST_F(LoneRequestCompactionSuite, PRoleNeverAbortsALoneStuckFirstAdmission) {
     config_ = MakeConfig();
     config_.role = Role::kP;
+    config_.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
     config_.device_allocator.total_pages = 4;
     config_.max_scheduled_tokens = 16;
     config_.cache_groups.resize(1);
@@ -1000,6 +1001,7 @@ TEST_F(LoneRequestCompactionSuite, NeverRetractsTheRequestWhoseBlocksItsCompacti
 // them. The same layout completes without a compaction.
 TEST_F(LoneRequestCompactionSuite, PRoleChunkAdmissionsNeverCompact) {
     config_.role = Role::kP;
+    config_.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
     scheduler_ = std::make_unique<Scheduler>(config_);
     std::vector<RequestSpec> prompts;
     ExecutionEvent bootstrapped;

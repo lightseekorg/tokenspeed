@@ -1072,6 +1072,22 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // reserves none.
     if (!admitWithKvEventTracking(plan, feedback, *request, staged, demands, progress, /*copy_in_point=*/std::nullopt,
                                   /*evict_blocks_past_segments=*/true)) {
+        // Independent decode allocation rests on a prompt's remote decode
+        // taking no block: the Decode node allocated because the prompt
+        // holds every page it needs. The prompt stays as it is and is tried
+        // again; its Decode node's waiting timeout ends it.
+        if (auto* done = request->GetIf<fsm::PrefillDone>();
+            done != nullptr &&
+            config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kIndependent &&
+            !std::exchange(done->remote_decode_failure_logged, true)) {
+            spdlog::error(
+                "[Scheduler] independent decode allocation: the remote decode of request {} ({} prompt tokens) was "
+                "not admitted: it asked for {} more tokens{}{} with {} of {} Device LCM blocks empty; the prompt "
+                "keeps its pages until its decode node gives up",
+                request->Id(), request->PrefillSize(), reserve_tokens,
+                completed_page ? ", a completed page's publication" : "",
+                completed_checkpoint ? ", a State checkpoint" : "", EmptyLcmBlocks(), TotalLcmBlocks());
+        }
         return std::nullopt;
     }
     staged.Commit();
@@ -2067,7 +2083,9 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 // becoming the capacity blocker (retracting a victim for it is pure thrash
 // -- the two simply do not fit together), but it does seal new-prompt
 // admission (new_prompts_sealed): a newcomer taking the pages it is waiting
-// for would starve it. A lone-request compaction ends the plan's prefill
+// for would starve it. With blocked_prompt_seals (buildPrefillWorkerPlan), a
+// new prompt that fails for capacity stops the new prompts behind it too. A
+// lone-request compaction ends the plan's prefill
 // phases: a block it moved that nothing holds -- the probe's tail block once
 // the retry copied it, a hit page of a retry that failed -- gets its bytes
 // from the plan's copies, which the runtime runs after the plan's stores
@@ -2088,7 +2106,7 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 // they would be later admissions in the compaction's plan.
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
-                                         std::int32_t decode_reserve) {
+                                         bool blocked_prompt_seals, std::int32_t decode_reserve) {
     ProfileSpan profile_span{"Scheduler::scheduleLocalPrefillWork"};
     std::optional<std::vector<WholePrompt>> whole_prompts;
     for (const bool resident : {true, false}) {
@@ -2190,7 +2208,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             } else if (feedback.admission_failed) {
                 spdlog::debug("[Scheduler] prefill {} blocked on capacity", request->Id());
                 feedback.NoteCapacityBlocked(request);
-                if (resident) {
+                if (resident || blocked_prompt_seals) {
                     return;
                 }
             }
@@ -2253,7 +2271,17 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
+    // Independent decode allocation: a computed prompt waiting for its
+    // destination holds pages that only the Decode node's allocation, or the
+    // transfer peer's timeout, gives back. While one waits, a new prompt that
+    // fails for capacity stops the new prompts behind it: smaller prompts
+    // that kept fitting would take every page the waiting ones return, and
+    // the larger prompt would wait for all of them to drain.
+    const bool prompt_awaits_destination =
+        config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kIndependent &&
+        AwaitingDestinationSize() > 0;
+    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false,
+                             /*blocked_prompt_seals=*/prompt_awaits_destination, config_.decode_input_tokens);
 }
 
 // D role: decode worker. One restore rides beside the decode batch, then at
@@ -2363,7 +2391,8 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // the prefills into rounds is meant to avoid. The next open round
         // resumes it; a prompt's chunks therefore cluster instead of
         // scattering across rounds.
-        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, /*blocked_prompt_seals=*/false,
+                                 config_.decode_input_tokens);
     }
 
     if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {

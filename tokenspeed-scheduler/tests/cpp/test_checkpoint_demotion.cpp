@@ -748,6 +748,9 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
         cfg.role = role_;
+        if (role_ == Role::kP) {
+            cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
+        }
         cfg.prefix_granularity = kP;
         cfg.device_allocator.total_pages = device_pages_;
         cfg.host_allocator.total_pages = host_pages_;
