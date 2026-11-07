@@ -142,6 +142,63 @@ TEST_P(StorageQueryHighestTest, RestoresTheHighestCheckpointWithinTheActualKeyBu
 
 INSTANTIATE_TEST_SUITE_P(KeyBudgets, StorageQueryHighestTest, ::testing::Values(40u, 256u));
 
+TEST(StorageQueryTest, ReservationRetriesClearKeysTailAndWarmReferences) {
+    QueryCache cache(4, FullAndStates(4, 4, 1), 64);
+    QueryPrompt prompt(14, 4);
+    const auto prefix = prompt.Prefix(14, true);
+    const CacheKey warm{.group_id = 0, .content_hash = prompt.hashes[0]};
+    cache.Warm(std::span{&warm, 1});
+    const auto query = cache.coordinator.MissingStorageKeys(prefix, 100);
+    ASSERT_EQ(query.max_tokens, 14);
+
+    // The tail at 14 costs five references and the page at 12 costs four.
+    // Three credits must select 8: one warm Full block, one new Full block,
+    // and one State checkpoint. Rejected keys, tail metadata and pins must
+    // not leak from either longer candidate into that reservation.
+    auto reservation = cache.coordinator.ReserveStoragePrefix(prefix, query.keys, 3);
+    const std::vector<CacheKey> expected{
+        {.group_id = 0, .content_hash = prompt.hashes[1]},
+        {.group_id = 1, .content_hash = prompt.hashes[1]},
+    };
+    EXPECT_EQ(reservation.keys, expected);
+    EXPECT_EQ(reservation.blocks.size(), expected.size());
+    EXPECT_FALSE(reservation.tail);
+    EXPECT_EQ(reservation.tail_prior, ContentHash{});
+    EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
+}
+
+TEST(StorageQueryTest, ReservationBudgetIncludesWarmReferencesAndPreservesWarmNoOp) {
+    QueryCache cache(4, FullAndStates(4, 4, 2), 64);
+    QueryPrompt prompt(8, 4);
+    const auto prefix = prompt.Prefix(8, false);
+    const std::vector<CacheKey> warm{
+        {.group_id = 0, .content_hash = prompt.hashes[0]},
+        {.group_id = 0, .content_hash = prompt.hashes[1]},
+        {.group_id = 1, .content_hash = prompt.hashes[1]},
+    };
+    cache.Warm(warm);
+    const std::vector<CacheKey> remote{{.group_id = 2, .content_hash = prompt.hashes[1]}};
+    EXPECT_TRUE(cache.coordinator.ReserveStoragePrefix(prefix, remote, 3).keys.empty());
+    EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
+    {
+        auto reservation = cache.coordinator.ReserveStoragePrefix(prefix, remote, 4);
+        EXPECT_EQ(reservation.keys, remote);
+        EXPECT_EQ(reservation.blocks.size(), 1u);
+        EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
+    }
+    EXPECT_TRUE(cache.coordinator.ReserveStoragePrefix(prefix, remote, 0).keys.empty());
+    EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
+    cache.Warm(remote);
+    const std::vector<CacheKey> shorter_remote{
+        {.group_id = 1, .content_hash = prompt.hashes[0]},
+        {.group_id = 2, .content_hash = prompt.hashes[0]},
+    };
+    // A wholly warm longer hit needs no read, even when its reference count
+    // exceeds the quota. Do not turn it into an unnecessary shorter read.
+    EXPECT_TRUE(cache.coordinator.ReserveStoragePrefix(prefix, shorter_remote, 3).keys.empty());
+    EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
+}
+
 TEST(StorageQueryTest, MissingHighestStateFallsBackToTheNextCompleteCheckpoint) {
     QueryCache cache(4, FullAndStates(4, 4, 1), 64);
     QueryPrompt prompt(11, 4);
