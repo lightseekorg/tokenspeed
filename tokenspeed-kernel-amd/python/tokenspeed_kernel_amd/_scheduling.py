@@ -144,6 +144,23 @@ def release_drain(_semantic):
 
 
 @tl.core.extern
+def arithmetic_fence(value, _semantic):
+    """Return the FP32 ``value`` as one LLVM must treat as new
+    (``llvm.arithmetic.fence``; no instruction): arithmetic on the result is
+    neither merged with the same arithmetic on ``value`` nor reassociated
+    across this point. Launch with :func:`sched_compile_options`.
+    """
+    return tl.core.extern_elementwise(
+        _SCHED_LIBRARY_NAME,
+        _SCHED_LIBRARY_PATH,
+        [value],
+        {(tl.float32,): ("__tokenspeed_sched_arithmetic_fence_f32", tl.float32)},
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
 def wave_all_equal(a, b, _semantic):
     """1 where ``a == b`` (FP32, ordered) holds in every active lane of the
     wave, else 0, as an int32 tensor whose value is the same across the
