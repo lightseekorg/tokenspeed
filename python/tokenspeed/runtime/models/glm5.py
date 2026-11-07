@@ -352,9 +352,14 @@ class GlmDsaSparseAttentionMixin:
     ``fp8_scaled`` plane take FP8 E4M3 index queries with per-(token, head)
     scales (:meth:`_scorer_index_query`); a host sets it only where the
     platform registers such scorers.
+
+    ``decode_topk_solution`` (default None: normal selection) pins the
+    tensor-parallel decode top-k to one ``dsa_decode_topk`` solution; a host
+    sets it only to a solution it validated and that selects on the platform.
     """
 
     index_query_fp8: bool = False
+    decode_topk_solution: str | None = None
 
     def _scorer_index_query(
         self, q: torch.Tensor, index_k_cache: torch.Tensor
@@ -718,6 +723,7 @@ class GlmDsaSparseAttentionMixin:
                 out=topk_slice,
                 lens_out=topk_lens_slice,
                 slot_order=global_server_args_dict["dsa_slot_order"],
+                solution=self.decode_topk_solution,
             )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,

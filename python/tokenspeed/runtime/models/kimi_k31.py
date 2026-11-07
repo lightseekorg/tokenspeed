@@ -210,6 +210,37 @@ def _scorers_take_fp8_index_queries(indexer: KimiK31Indexer) -> bool:
     return True
 
 
+def _fused_decode_topk_solution(indexer: KimiK31Indexer) -> str | None:
+    """``"cute_dsl"`` where the fused decode top-k serves this indexer (BF16
+    queries over a packed ``fp8_scaled`` plane, 1-8 rows per request), else
+    None. It scores bit-identically to the DeepGEMM leaf and gives exact ties
+    at the threshold the lowest positions."""
+    signature = format_signature(
+        q=dense_tensor_format(torch.bfloat16),
+        weights=dense_tensor_format(torch.bfloat16),
+    )
+    traits = {
+        "q_len": frozenset(range(1, 9)),
+        "index_heads": indexer.index_n_heads,
+        "head_dim": indexer.index_head_dim,
+        "page_size": 64,
+        "topk": indexer.index_topk,
+        "index_k_format": "fp8_scaled",
+        "index_k_layout": "packed",
+    }
+    try:
+        select_kernel(
+            "attention",
+            "dsa_decode_topk",
+            signature,
+            traits=traits,
+            solution="cute_dsl",
+        )
+    except NoKernelFoundError:
+        return None
+    return "cute_dsl"
+
+
 class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttention):
     """K3's gated NoPE MLA attending its own indexer's top-k (DSA).
 
@@ -279,6 +310,10 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self.indexer = KimiK31Indexer(config, prefix=add_prefix("indexer", prefix))
         # FP8 index queries where the platform registers fp8_scaled scorers.
         self.index_query_fp8 = _scorers_take_fp8_index_queries(self.indexer)
+        # The fused decode top-k scores BF16 queries.
+        self.decode_topk_solution = (
+            None if self.index_query_fp8 else _fused_decode_topk_solution(self.indexer)
+        )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []

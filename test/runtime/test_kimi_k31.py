@@ -1415,6 +1415,9 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
     good[bad] = False
     assert int(selected.topk_lens[0]) == 2048
     assert sorted(selected.topk_indices[0].tolist()) == sorted(slots[good].tolist())
+    if attention.decode_topk_solution is not None:
+        # The pinned fused top-k emits the selection in ascending position.
+        assert torch.equal(selected.topk_indices[0], slots[good].to(torch.int32))
 
 
 @requires_gpu
