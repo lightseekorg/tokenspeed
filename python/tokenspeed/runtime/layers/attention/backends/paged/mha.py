@@ -522,7 +522,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         """Draft-tree attention (verify nodes or drafting lanes): a causal
-        ``rows``-token extend over the committed prefix with its log-sum-exp,
+        ``rows``-token pass over the committed prefix with its log-sum-exp,
         then the tree window and the prefix tail merged into it
         (``tree_window_attention``); the trtllm leaf's cascade with a portable
         prefix half.
@@ -542,31 +542,50 @@ class MHAAttnBackend(PagedAttentionBackend):
         q_len = tree.rows if causal_prefix else 1
         num_reqs = q.shape[0] // q_len
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        # Pinned to Triton, bypassing selection: its causal mask keeps row r at
-        # key P - R + r even when the prefix P is shorter than the R rows (the
-        # partial then covers fewer keys, or none), which the window kernel's
-        # merge assumes.
-        prefix_out, prefix_lse = mha_extend_with_kvcache(
-            q=q,
-            cu_seqlens_q=torch.arange(
-                0, (num_reqs + 1) * q_len, q_len, dtype=torch.int32, device=q.device
-            ),
-            # Unread by the Triton extend: it takes the keys from cache_seqlens.
-            cu_seqlens_kv=None,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=tree.page_table if causal_prefix else tree.row_page_table,
-            cache_seqlens=tree.prefix_lens if causal_prefix else tree.row_prefix_lens,
-            max_seqlen_q=q_len,
-            max_seqlen_k=self.max_context_len,
-            is_causal=True,
-            window_left=layer.sliding_window_size,
-            logit_cap=0.0,
-            sinks=None,
-            return_lse=True,
-            softmax_scale=layer.scaling,
-            solution="triton",
-        )
+        if causal_prefix:
+            # Pinned to Triton, bypassing selection: its causal mask keeps row r
+            # at key P - R + r even when the prefix P is shorter than the R rows
+            # (the partial then covers fewer keys, or none), which the window
+            # kernel's merge assumes. Its decode folds a request's rows into one
+            # pass over the prefix, which every row shares.
+            prefix_out, prefix_lse = mha_decode_with_kvcache(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                page_table=tree.page_table,
+                cache_seqlens=tree.prefix_lens,
+                max_seqlen_k=self.max_context_len,
+                max_seqlen_q=q_len,
+                window_left=-1,
+                logit_cap=0.0,
+                sinks=None,
+                return_lse=True,
+                softmax_scale=layer.scaling,
+                solution="triton",
+            )
+        else:
+            # Pinned to Triton like the causal prefix above.
+            prefix_out, prefix_lse = mha_extend_with_kvcache(
+                q=q,
+                cu_seqlens_q=torch.arange(
+                    0, num_reqs + 1, dtype=torch.int32, device=q.device
+                ),
+                # Unread by the Triton extend: it takes the keys from cache_seqlens.
+                cu_seqlens_kv=None,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                page_table=tree.row_page_table,
+                cache_seqlens=tree.row_prefix_lens,
+                max_seqlen_q=1,
+                max_seqlen_k=self.max_context_len,
+                is_causal=True,
+                window_left=layer.sliding_window_size,
+                logit_cap=0.0,
+                sinks=None,
+                return_lse=True,
+                softmax_scale=layer.scaling,
+                solution="triton",
+            )
         dim = layer.qk_head_dim
         out = tree_window_attention(
             q,
