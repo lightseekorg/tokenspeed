@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
 
@@ -181,6 +182,35 @@ class DFlash(BaseDrafter):
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
         self._init_incremental_proj()
+
+    @override
+    def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
+        """Refuse --enable-speculative-sampling for greedy DFLASH, else bind.
+
+        Base DFLASH proposes the argmax of every block row and records no
+        draft distribution, so the base ``draft_probs`` gate never fires for
+        it; the verifier's config says whether the flag is on. DFlash2 samples
+        its walk (sparse q, see its override) and DSpark its Markov steps
+        (dense q through the base sampler).
+
+        Args:
+            sampling_backend: The executor's verifier.
+
+        Raises:
+            ValueError: The flag is on and this drafter proposes greedily.
+        """
+        if (
+            sampling_backend.config.enable_speculative_sampling
+            and not self.supports_speculative_sampling
+        ):
+            raise ValueError(
+                "--enable-speculative-sampling with DFLASH needs a DFlash2 draft "
+                "(candidate selector weights) whose walk samples each step from "
+                f"its own distribution; {type(self).__name__} proposes a whole "
+                "block greedily"
+            )
+        # A no-op unless the executor allocated draft_probs (DSpark).
+        super().bind_sampling_backend(sampling_backend)
 
     @override
     def idle_forward_global_num_tokens(
@@ -993,10 +1023,16 @@ class DFlash(BaseDrafter):
         with the target: the target hands each captured tap to
         :meth:`on_target_capture` as it is produced, so the draft's KV is
         written under the target's remaining layers and ``run`` finds it done.
-        Everything the sink needs is fixed here, for this forward only.
+        Everything the sink needs is fixed here, for this forward only. An
+        idle forward is not armed: it may skip the final-norm tap, and without
+        the last tap the KV write never completes and ``_run_overlap`` raises.
         """
         self._incremental_kv_write_done = False
-        if not (self._incremental_proj_enabled and self._overlap_allowed(ctx)):
+        if not (
+            self._incremental_proj_enabled
+            and self._overlap_allowed(ctx)
+            and not ctx.forward_mode.is_idle()
+        ):
             return
         num_tokens = ctx.input_num_tokens
         self._incr_num_tokens = num_tokens

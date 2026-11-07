@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -39,7 +41,9 @@ from tokenspeed.runtime.execution.slot_state import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.cudagraph_memory import CapturedLadder
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -47,6 +51,29 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+
+@dataclass(frozen=True)
+class DrafterExtendCapture:
+    """What a drafter's extend-graph capture borrows from the executor."""
+
+    # The drafter's own extend_graph_plan for this boot.
+    plan: Mapping[str, Sequence[tuple[int, int]]]
+    # Per series, the plan positions this capture records (a memory probe
+    # samples a few, a serving capture takes all).
+    ladders: Mapping[str, CapturedLadder]
+    # The capture stream the target's graphs used.
+    stream: torch.cuda.Stream
+    # Eager runs before each capture.
+    num_warmup: int
+    # Per-row width and dtype of the target's FULL hidden capture, the rows
+    # the draft's extend step reads.
+    target_hidden_width: int
+    target_hidden_dtype: torch.dtype
+    # Lays out a dummy pure extend of (tokens, requests) in the input buffers
+    # and prepares the target's and the draft's metadata for it, as a live
+    # extend's metadata prep does.
+    prepare_batch: Callable[[int, int], None]
 
 
 class BaseDrafter:
@@ -72,10 +99,11 @@ class BaseDrafter:
     # forwarding without it.
     supports_request_token_history = False
 
-    # Whether this drafter proposes one token per step from its own logits
-    # and can therefore sample it from the recorded distribution q
-    # (--enable-speculative-sampling). Block drafters propose a whole block
-    # greedily and leave this False.
+    # Whether this drafter can sample its proposals from a distribution q it
+    # records for verify (--enable-speculative-sampling): the step drafters
+    # sample one token per step from their own logits (dense q), DFlash2
+    # samples its candidate walk (sparse q over the selector's candidates).
+    # Other block drafters propose a whole block greedily and leave this False.
     supports_speculative_sampling = False
 
     def __init__(
@@ -275,6 +303,40 @@ class BaseDrafter:
         """Capture draft prefill work after target capture, when prefill graphs
         are enabled. Drafters without a separate prefill graph need no action.
         """
+
+    def extend_graph_plan(
+        self,
+        token_buckets: Sequence[int],
+        request_counts: Callable[[int], Sequence[int]],
+    ) -> dict[str, list[tuple[int, int]]]:
+        """Every entry ``capture_extend_graphs`` measures, per memory-projection
+        series (``--enable-drafter-prefill-graph``).
+
+        The one channel between that capture and the CUDA-graph memory
+        projection, which prices exactly these entries: a series lists its
+        entries widest first as ``(width, requests)``.
+
+        Args:
+            token_buckets: The target's prefill token buckets.
+            request_counts: The exact request counts to capture at a bucket.
+
+        Returns:
+            Series name -> entries; empty for a drafter without extend graphs
+            or in a configuration they cannot bake.
+        """
+        del token_buckets, request_counts
+        return {}
+
+    def release_extend_graphs(self) -> None:
+        """Drop captured extend graphs. Drafters without them need no action."""
+
+    def capture_extend_graphs(
+        self, capture: DrafterExtendCapture, *, observer: MemoryDeltaObserver
+    ) -> None:
+        """Capture the drafter's work inside an extend forward as graphs, after
+        the target's prefill graphs: the entries of ``capture.plan`` at
+        ``capture.ladders``' sampled positions, each measured by ``observer``
+        under its series. Drafters without extend graphs need no action."""
 
     def bind_tree(self, tree_spec: TreeSpec) -> None:
         """Draft trees (--speculative-eagle-topk > 1); only EAGLE-style drafters expand lanes."""
