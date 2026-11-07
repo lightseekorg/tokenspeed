@@ -1792,6 +1792,13 @@ make one of the engine's pipeline stages hold more bytes: a stage allocates
 every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
 
+Inkling's ShortConv checkpoints share the attention planes the same way: a
+kvconv group and one hiddenconv group per attention group put each layer's
+rows on that layer's K and V planes, so a parent is exactly its KV pages. A
+row wider than its plane takes a plane of its own. Which group holds a row
+never depends on TP: P/D peers of different TP widths must declare the same
+groups with the same fields.
+
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 
