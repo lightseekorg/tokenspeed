@@ -310,7 +310,7 @@ admission states what the pair does through the group's `StateStep`
   is (the landed or restored slot 1 is the state the decode continues from).
 - `kLand` — the D role's remote landing: slot 0 is the claimed prompt-end
   checkpoint or null (nothing on this node reads a zero state), slot 1 a
-  fresh block the peer's transfer fills.
+  fresh block the peer's transfer fills whole, so it is not zeroed.
 
 **Natural checkpoints.** A state is published only at a point where its owner
 stops writing it — a `PublicationPoint` other than an ordinary chunk end
@@ -1302,7 +1302,11 @@ ordinary probe: `extend_prefix_lens` is the hit `T`, page-aligned or a
 published tail, and the block containing an unaligned `T` is left a hole for
 the peer to fill whole; the tail's full blocks below it, when a group's
 blocks are smaller than a page, are the hitter's own copies like on every
-role (`pages_to_copy`). For the State groups only one checkpoint counts: the one at
+role (`pages_to_copy`). The peer fills whole every full-history block up to
+the prompt end, so the landing lists none of them in `pages_to_zero`
+(`GroupDemand::landed_tokens`), as a copy destination is never listed: it
+zeroes the block holding an unaligned prompt end and the reserve pages
+beyond it, and no State slot. For the State groups only one checkpoint counts: the one at
 **exactly the prompt end** (`PrefixProbe::state_at_prompt_end`). When every
 State group holds it, the admission claims it as slot 0 and reports
 `state_prefix_cached` on the `PrefillOperation` (per extend row on the

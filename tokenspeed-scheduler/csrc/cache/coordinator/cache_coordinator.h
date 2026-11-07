@@ -305,9 +305,10 @@ public:
         // Restore only: snapshot pool -> Device copies of the private slots.
         std::vector<BlockTransfer> snapshot_pairs;
         // Fresh device child pages appended by ordinary Acquire, aligned by
-        // group_id, for the plan to zero. Cache hits and copy destinations
-        // (Host hits, a restore's rebuilt slots, the pairs below) are
-        // excluded: the copy fills them whole.
+        // group_id, for the plan to zero. Cache hits, copy destinations
+        // (Host hits, a restore's rebuilt slots, the pairs below) and the
+        // blocks a remote landing fills whole (GroupDemand::landed_tokens,
+        // StateStep::kLand's slot 1) are excluded: the copy fills them whole.
         std::vector<std::vector<std::int32_t>> new_page_ids;
         // Device -> Device whole-block copies, aligned by group_id, as
         // (source, destination) virtual block ids: a hitter's private copy of

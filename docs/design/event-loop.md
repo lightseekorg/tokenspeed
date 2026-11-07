@@ -951,7 +951,9 @@ For orientation, one `EventLoop::round`:
    as another group's copy destination, which the arena writes only after
    every pair reading those byte ranges; a destination is never zeroed;
    no op id, no ACK), then
-   page zeroing (the new owner's sanitization), then the Device-bound copies
+   page zeroing (the new owner's sanitization of the fresh pages nothing
+   fills whole: a copy destination and a block a remote landing fills are
+   left out), then the Device-bound copies
    -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
    lands on zeroed pages and the forward reads it layer by layer behind the
    layerwise fences (a prefill graph replay waits for the whole load before

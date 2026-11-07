@@ -1248,9 +1248,17 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         }
         groups_[i].Allocator().ShapeStateTable(*demands[i].table, std::move(input));
     }
+    // A remote landing fills whole every block that ends at or below the
+    // prompt end (slot b holds tokens [b*g, (b+1)*g)): a copy destination,
+    // not a page to zero.
+    const auto landed_whole = [&](std::size_t i, std::int32_t slot) {
+        const std::int32_t landed_tokens = demands[i].landed_tokens;
+        return landed_tokens > 0 &&
+               static_cast<std::int64_t>(slot + 1) * geometry_[i].BlockGranularity() <= landed_tokens;
+    };
     // Gives a hitter's table a private block in `slot`: a copy of the shared
-    // block there (copy-on-write), or a fresh zeroed one where the slot was a
-    // hole.
+    // block there (copy-on-write), or a fresh one where the slot was a hole,
+    // zeroed unless the peer's landing fills it.
     const auto privatize_slot = [&](std::size_t i, BlockTable& table, std::int32_t slot,
                                     std::int32_t available_tokens) {
         GroupAllocator& allocator = groups_[i].Allocator();
@@ -1258,7 +1266,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         const std::int32_t destination = allocator.ResolveCacheBlockId(*table.Blocks()[static_cast<std::size_t>(slot)]);
         if (replaced) {
             result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*replaced), destination);
-        } else {
+        } else if (!landed_whole(i, slot)) {
             result.new_page_ids[i].push_back(destination);
         }
     };
@@ -1420,7 +1428,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                     // can finish the request before any decode writes live.
                     _assert(static_cast<bool>(table.Blocks()[0]), "an exact state hit must have an input checkpoint");
                     result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*table.Blocks()[0]), live);
-                } else {
+                } else if (step.kind != StateStep::Kind::kLand) {
+                    // A landing's live slot is filled whole by the peer's
+                    // transfer, like a copy destination: nothing to zero.
                     result.new_page_ids[i].push_back(live);
                 }
             }
@@ -1457,9 +1467,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             groups_[i].Allocator().Acquire(pool_, *demand.table, geometry_[i].PlanAcquire(*demand.table, demand),
                                            paired.first_slot, std::move(paired.blocks));
         FatalCheck(acquired, "admission plan no longer fits the block pool");
+        // Only a dense table's slots are block-aligned to the prompt the way
+        // landed_whole assumes.
+        _assert(demand.landed_tokens == 0 || std::holds_alternative<DenseGrowth>(demand.extent),
+                "a remote landing's extent is a dense growth");
         const std::span<const CacheBlockRef> blocks = demand.table->Blocks();
         for (std::int32_t block = first_new_block; block < demand.table->NumBlocks(); ++block) {
-            if (!blocks[static_cast<std::size_t>(block)]) {
+            if (!blocks[static_cast<std::size_t>(block)] || landed_whole(i, block)) {
                 continue;
             }
             result.new_page_ids[i].push_back(
