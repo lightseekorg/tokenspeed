@@ -26,12 +26,17 @@ the kernel for, and rejects other layouts."""
 
 import pytest
 import torch
-from moe_stream_helpers import DIVISIBLE, PHYS, make_experts
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
+
+from moe_stream_helpers import DIVISIBLE, PHYS, make_experts  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     _extract_gluon_raw_s,
     _extract_gluon_raw_w,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_stream import moe_stream_weights
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_stream import (  # noqa: E402
+    moe_stream_weights,
+)
 
 EXPERTS = 4
 

@@ -34,10 +34,13 @@ and a group tag stored only after a wait that covers its wave's mids stores.
 import re
 
 import pytest
-from moe_stream_helpers import DIVISIBLE, PHYS
-from tokenspeed_kernel_amd._triton import gluon, triton
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_stream
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._stream_sync import (
+
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
+
+from moe_stream_helpers import DIVISIBLE, PHYS  # noqa: E402
+from tokenspeed_kernel_amd._triton import gluon, triton  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_stream  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4._stream_sync import (  # noqa: E402
     stream_sync_compile_options,
 )
 
