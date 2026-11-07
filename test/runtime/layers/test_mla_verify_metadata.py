@@ -301,6 +301,7 @@ def _run_cutedsl_decode(
     block_size: int = 8,
     sliding_window_size: int = -1,
     num_extends: int = 0,
+    split_kvs: torch.Tensor | None = None,
 ) -> dict:
     """The CuteDSL leaf's decode call, with the kernel replaced by a probe."""
     from tokenspeed.runtime.layers.attention.backends.paged import (
@@ -340,6 +341,8 @@ def _run_cutedsl_decode(
     backend._logged_block_layouts = set()
     backend.tree_verify = None
     backend.tree_draft = None
+    backend.min_kv_split = 8
+    backend._decode_split_kvs_buf = split_kvs
 
     layer = SimpleNamespace(
         tp_q_head_num=1,
@@ -418,6 +421,7 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
     backend._decode_views_by_bs = {}
     backend._block_page_table_buf = None
     backend._block_seq_lens_buf = None
+    backend._decode_split_kvs_buf = None
     backend.page_table_buf = torch.zeros(bs * spec, pages, dtype=torch.int32)
     backend.seq_lens_buf = torch.zeros(bs * spec, dtype=torch.int32)
 
@@ -428,6 +432,81 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
 
     torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
     torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens_k[0::spec])
+
+
+def test_the_cutedsl_verify_passes_the_rows_of_its_split_counts(monkeypatch):
+    splits = torch.tensor([7, 3], dtype=torch.int32)
+    captured = _run_cutedsl_decode(
+        monkeypatch, q_len_per_req=2, draft_block_decode=False, split_kvs=splits
+    )
+
+    assert captured["block_split_kvs"].data_ptr() == splits.data_ptr()
+    assert captured["block_split_kvs"].tolist() == [7, 3]
+
+
+@pytest.mark.parametrize("draft_block_decode,window", [(True, -1), (False, 4095)])
+def test_block_drafts_and_windows_keep_the_uniform_split(
+    monkeypatch, draft_block_decode, window
+):
+    captured = _run_cutedsl_decode(
+        monkeypatch,
+        q_len_per_req=8 if draft_block_decode else 2,
+        draft_block_decode=draft_block_decode,
+        sliding_window_size=window,
+        split_kvs=torch.ones(16, dtype=torch.int32),
+    )
+
+    assert captured["block_split_kvs"] is None
+
+
+@pytest.mark.parametrize("num_extends", [0, 1])
+def test_the_cutedsl_refresh_writes_split_counts_from_the_clamped_lengths(
+    monkeypatch, num_extends
+):
+    """The verify window's floor applies before the split counts are derived,
+    and every row gets a count: draft steps after an extend round decode all
+    rows."""
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        tokenspeed_mla as cutedsl_backend,
+    )
+
+    recorded = {}
+
+    def record_split_kvs(seq_lens, out, **kwargs):
+        recorded.update(kwargs, seq_lens=seq_lens.tolist())
+        out.copy_(seq_lens // 8)
+        return out
+
+    monkeypatch.setattr(
+        cutedsl_backend, "tokenspeed_mla_decode_split_kvs", record_split_kvs
+    )
+    bs, pages = 2, 3
+    backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    backend._dcp = None
+    backend.spec_num_tokens = 4
+    backend.is_draft = False
+    backend.max_context_len = 256
+    backend.draft_block_decode = False
+    backend.tree_verify = None
+    backend.min_kv_split = 8
+    backend._num_heads_per_tp = 96
+    backend._decode_views_by_bs = {}
+    backend._block_page_table_buf = None
+    backend._block_seq_lens_buf = None
+    backend._decode_split_kvs_buf = torch.zeros(bs, dtype=torch.int32)
+    backend.page_table_buf = torch.zeros(bs, pages, dtype=torch.int32)
+    backend.seq_lens_buf = torch.zeros(bs, dtype=torch.int32)
+
+    page_table = torch.zeros(bs, pages, dtype=torch.int32)
+    seq_lens = torch.tensor([2, 128], dtype=torch.int32)
+    backend.refresh_decode_metadata(
+        bs, bs, seq_lens, page_table, num_extends=num_extends
+    )
+
+    assert recorded == dict(
+        seq_lens=[4, 128], num_heads=96, q_len=4, max_seq_len=256, min_split_kv=8
+    )
+    assert backend._decode_split_kvs_buf.tolist() == [0, 16]
 
 
 if __name__ == "__main__":

@@ -108,6 +108,15 @@ The FP16/BF16 implementation retains its existing split-KV heuristic, reducer
 capacity and PDL waits. The selected layout is part of the compile cache key.
 The wrapper keeps tiling, workspace sizing, and kernel selection consistent.
 
+A uniform split cuts every request of the batch into `split_kv` chunks, so in
+a batch of very different lengths the longest request sets the kernel time.
+FP8 decode can instead take per-request split counts (`block_split_kvs`):
+`tokenspeed_mla_decode_split_kvs` keeps the uniform split's chunk total for
+the batch and gives each request chunks of about the same length. The grid is
+then `max(32, min_split_kv)` splits wide (`PER_REQUEST_SPLIT_KV_CAPACITY`) and
+the workspace is sized for that width. The counts live in a device tensor, so
+a CUDA graph replays with counts refreshed in place and no recompilation.
+
 Sliding-window and DCP masking remain supported; window boundaries use the
 packed row's original query-token position.
 

@@ -36,8 +36,10 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
+    PER_REQUEST_SPLIT_KV_CAPACITY,
     get_num_sm,
     tokenspeed_mla_decode,
+    tokenspeed_mla_decode_split_kvs,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
@@ -243,6 +245,18 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         if not 1 <= self.min_kv_split <= 256:
             raise ValueError("min_kv_split must be in [1, 256]")
         self._decode_row_capacity = config.max_bs * self.block_decode_expansion
+        # FP8 decode gives each request its own KV split count, refreshed once
+        # per forward, so the longest request of a mixed batch no longer sets
+        # the kernel time. Block drafts keep the uniform split.
+        self._per_request_split_kv = (
+            self.data_type == torch.float8_e4m3fn and not self.draft_block_decode
+        )
+        self._decode_split_capacity = (
+            max(PER_REQUEST_SPLIT_KV_CAPACITY, self.min_kv_split)
+            if self._per_request_split_kv
+            else self.min_kv_split
+        )
+        self._decode_split_kvs_buf: torch.Tensor | None = None
 
         # Decode scratch comes from the shared WorkspacePool: the kernel's own
         # get_workspace_size formula is B*H*q_len*split_kv*(D+1)*acc_bytes with
@@ -290,6 +304,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.chunked_prefill_metadata = None
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        self._decode_split_kvs_buf = None
         self._dcp = None
 
     def configure_runtime(
@@ -326,7 +341,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             * (self.kv_lora_rank + 1)
             * 4
         )
-        if self.min_kv_split > 1:
+        if self._decode_split_capacity > 1:
             head_rows = self._num_heads_per_tp * len(self.kvp_group) * q_len_capacity
             # Packed FP8 queries pad the combined query/head axis to 128 rows.
             head_rows = ((head_rows + 127) // 128) * 128
@@ -334,7 +349,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 required,
                 self._decode_row_capacity
                 * head_rows
-                * self.min_kv_split
+                * self._decode_split_capacity
                 * (self.kv_lora_rank + 1)
                 * 4,
             )
@@ -483,6 +498,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # capture's allocation pool. Reinitialization must replace them too.
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        self._decode_split_kvs_buf = (
+            torch.ones_like(self.seq_lens_buf) if self._per_request_split_kv else None
+        )
         if self._dcp is None:
             return
         if self.block_decode_active:
@@ -647,6 +665,16 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
         self._refresh_tree_prefix(bs, self.seq_lens_buf)
+        if self._decode_split_kvs_buf is not None and metadata.dcp is None:
+            # Every row: draft steps after an extend round decode all of them.
+            tokenspeed_mla_decode_split_kvs(
+                self.seq_lens_buf[:bs],
+                self._decode_split_kvs_buf[:bs],
+                num_heads=self._num_heads_per_tp,
+                q_len=metadata.q_len_per_req,
+                max_seq_len=metadata.max_seq_len_k,
+                min_split_kv=self.min_kv_split,
+            )
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel
         # bounds access by seq_lens). Padded (and idle) requests are already
@@ -726,6 +754,14 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
             page_table = metadata.page_table[num_extends:]
             cache_seqlens = metadata.seq_lens_k[num_extends:]
+        block_split_kvs = (
+            self._decode_split_kvs_buf[num_extends : num_extends + bs]
+            if self._decode_split_kvs_buf is not None
+            and not self.block_decode_active
+            and metadata.dcp is None
+            and window_left < 0
+            else None
+        )
 
         softmax_scale = layer.scaling
         if self.data_type == torch.float8_e4m3fn:
@@ -778,6 +814,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             local_visible_lens=local_visible_lens,
             return_lse=metadata.dcp is not None,
             min_split_kv=self.min_kv_split,
+            block_split_kvs=block_split_kvs,
         )
         if metadata.dcp is not None:
             partial, lse_log2 = raw_out
