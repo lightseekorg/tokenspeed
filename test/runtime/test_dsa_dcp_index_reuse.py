@@ -332,7 +332,7 @@ def _prefill_ctx(columns):
         cache_placement=lambda layer: _PLACEMENT,
         sparse_topk=SimpleNamespace(prefill=None, decode=None),
         prefill_index_columns=lambda: columns,
-        takes_history_prefill_topk=lambda: False,
+        history_prefill_plan=lambda: None,
     )
     pool = SimpleNamespace(
         get_index_k_buffer=lambda layer_id: torch.zeros(128, 132, dtype=torch.uint8),
@@ -589,8 +589,7 @@ def test_a_history_prefill_selects_each_group_over_its_gathered_pages(monkeypatc
         cache_placement=lambda layer: _PLACEMENT,
         sparse_topk=SimpleNamespace(prefill=None, decode=None),
         prefill_index_columns=refuse,
-        takes_history_prefill_topk=lambda: True,
-        require_history_prefill=lambda: plan,
+        history_prefill_plan=lambda: plan,
         gather_history_index_k_pages=gather_pages,
     )
     pool = SimpleNamespace(

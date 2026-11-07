@@ -248,9 +248,9 @@ class MLAAttnBackend(PagedAttentionBackend):
     def configure_runtime(
         self,
         *,
-        block_granularity: int | None = None,
-        virtual_block_count: int | None = None,
-        shard_count: int = 1,
+        block_granularity: int,
+        virtual_block_count: int,
+        shard_count: int,
         **kwargs,
     ) -> None:
         super().configure_runtime(**kwargs)

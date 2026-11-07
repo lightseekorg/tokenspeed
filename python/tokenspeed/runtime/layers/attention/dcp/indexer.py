@@ -563,17 +563,11 @@ def _score_rows(
         solution=None,
         pages=_tile_pages(q, weights, index_k_cache, metadata, start, end, page_size),
         scores_out=scores_out,
-        **(
-            {
-                "q_scales": q_scales[start:end],
-                "query_group_size": (
-                    query_group_size
-                    if start % query_group_size == 0 and end % query_group_size == 0
-                    else 1
-                ),
-            }
-            if q_scales is not None
-            else {}
+        q_scales=None if q_scales is None else q_scales[start:end],
+        query_group_size=(
+            query_group_size
+            if start % query_group_size == 0 and end % query_group_size == 0
+            else 1
         ),
     )
 
@@ -584,16 +578,11 @@ def owned_dsa_topk_fits(
     *,
     page_size: int,
     topk: int,
-    max_logits_bytes: int | None,
-    rider_bytes: int = 0,
+    rider_bytes: int,
 ) -> bool:
-    """Whether :func:`select_owned_dsa_topk` (``rider_bytes`` per rank
-    riding its gather) serves ``metadata``'s rows: it scores them in one
-    tile and exchanges them once, as :func:`select_dsa_topk` does without a
-    logits budget, and a ``dsa_select_owned_candidates`` leaf takes the
-    gathered scores. Host values only, the same on every rank."""
-    if max_logits_bytes is not None and max_logits_bytes > 0:
-        return False
+    """Whether :func:`select_owned_dsa_topk`, gathering ``rider_bytes`` per
+    rank with the scores, serves ``metadata``'s rows in one tile. Host values
+    only, the same on every rank."""
     columns = metadata.columns or metadata.local_page_table.shape[1]
     if _tile_rows(rows, columns, page_size, None) < rows:
         return False
@@ -616,77 +605,32 @@ def select_owned_dsa_topk(
     softmax_scale: float,
     initial_tokens: int,
     local_tokens: int,
-    q_scales: torch.Tensor | None = None,
-    query_group_size: int = 1,
-    out: torch.Tensor | None = None,
-    lens_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    rider: torch.Tensor | None,
+    q_scales: torch.Tensor | None,
+    query_group_size: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """This rank's share of :func:`select_dsa_topk`'s selection over
     ``metadata``'s rows, as local cache slots, for rows that
     :func:`owned_dsa_topk_fits`.
 
-    Every rank scores its local candidates as :func:`select_dsa_topk` does,
-    but only their scores are gathered: each rank derives the same k-th
-    score from all of them and keeps its own candidates through it
-    (``dsa_select_owned_candidates``), so positions never leave their rank
-    and no rank translates or compacts the whole selection.
-
-    Returns:
-        Int32 ``[rows, topk]`` local slots (``out`` when given), this rank's
-        selected candidates first and ``-1`` after, and int32 ``[rows]``
-        counts (``lens_out`` when given): bit for bit what compacting
-        :func:`select_dsa_topk`'s selection, as scheduler slots, to this
-        rank's owned slots gives.
-    """
-    out, lens_out, _ = select_owned_dsa_topk_with_rider(
-        q,
-        weights,
-        index_k_cache,
-        metadata=metadata,
-        page_size=page_size,
-        topk=topk,
-        softmax_scale=softmax_scale,
-        initial_tokens=initial_tokens,
-        local_tokens=local_tokens,
-        rider=None,
-        q_scales=q_scales,
-        query_group_size=query_group_size,
-        out=out,
-        lens_out=lens_out,
-    )
-    return out, lens_out
-
-
-def select_owned_dsa_topk_with_rider(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    *,
-    metadata: DCPIndexMetadata,
-    page_size: int,
-    topk: int,
-    softmax_scale: float,
-    initial_tokens: int,
-    local_tokens: int,
-    rider: torch.Tensor | None,
-    q_scales: torch.Tensor | None = None,
-    query_group_size: int = 1,
-    out: torch.Tensor | None = None,
-    lens_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """:func:`select_owned_dsa_topk`, with ``rider`` bytes of every row
-    gathered in the scores' all-gather: one collective where a later
-    gather of the same rows (the attention query's heads) would be a
-    second.
+    Only the candidates' scores are gathered: every rank derives the same
+    k-th score from all of them and keeps its own candidates through it, so
+    positions never leave their rank. ``rider`` bytes of every row ride the
+    same all-gather, saving a later gather of the same rows.
 
     Args:
         rider: Contiguous uint8 ``[rows, width]`` of this rank, ``width`` a
             multiple of 4, or None.
 
     Returns:
-        :func:`select_owned_dsa_topk`'s slots and counts, and every rank's
-        rider rows ``[ranks, rows, width]`` (a view of the gathered buffer,
-        rank ``r``'s at ``[r]``; None without a rider).
+        ``out``: int32 ``[rows, topk]`` local slots, this rank's selected
+        candidates first and ``-1`` after; ``lens_out``: int32 ``[rows]``
+        counts, bit for bit what compacting :func:`select_dsa_topk`'s
+        selection to this rank's owned slots gives; and every rank's rider
+        rows ``[ranks, rows, width]`` (a view of the gathered buffer; None
+        without a rider).
     """
     rows = q.shape[0]
     if metadata.query_requests.shape != (rows,):
@@ -702,15 +646,7 @@ def select_owned_dsa_topk_with_rider(
             "a rider is a contiguous uint8 [rows, width] matrix, width a "
             "multiple of 4"
         )
-    if out is None:
-        out = torch.empty((rows, topk), device=q.device, dtype=torch.int32)
-    if lens_out is None:
-        lens_out = torch.empty((rows,), device=q.device, dtype=torch.int32)
     group = metadata.placement.group
-    if rows == 0:
-        if rider is None:
-            return out, lens_out, None
-        return out, lens_out, rider.new_empty((len(group), 0, rider.shape[1]))
     score_bytes = rows * topk * 4
     if len(group) > 1:
         # Every rank's chunk is its scores, then its rider rows, written

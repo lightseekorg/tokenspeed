@@ -410,9 +410,8 @@ def _history_rows(requests: slice) -> torch.Tensor:
 def test_the_history_prefill_plans_every_extend_row_local():
     backend = _history_backend(11)  # 6 pages: 3 + 3 fit, 3 + 3 + 3 do not
     _init_history(backend)
-    plan = backend.require_history_prefill()
+    plan = backend.history_prefill_plan()
     assert backend.query_shard_metadata is None
-    assert backend.takes_history_prefill_topk()
     assert [g.requests for g in plan.groups] == [slice(0, 2), slice(2, 3)]
     # Every extend row is attended here: rows 0-4 are the first group's
     # chunks, 5-9 the second's.
@@ -427,9 +426,7 @@ def test_the_history_prefill_plans_every_extend_row_local():
     # An unsharded extend clears the plan.
     backend._history_prefill = False
     _init_history(backend)
-    assert backend.history_prefill is None
-    with pytest.raises(RuntimeError, match="not a KVP prefill"):
-        backend.require_history_prefill()
+    assert backend.history_prefill_plan() is None
 
 
 def test_the_history_prefill_keeps_the_slot_arm_where_it_cannot_plan():
@@ -438,13 +435,12 @@ def test_the_history_prefill_keeps_the_slot_arm_where_it_cannot_plan():
     next forward with both replans."""
     backend = _backend(0, workspace_rows=11, qcp=False, index_k_format="fp8_scaled")
     _init_history(backend)
-    assert backend.history_prefill is None
-    assert not backend.takes_history_prefill_topk()
+    assert backend.history_prefill_plan() is None
     backend = _history_backend(11)
     _init_history(backend, host_table=False)
-    assert not backend.takes_history_prefill_topk()
+    assert backend.history_prefill_plan() is None
     _init_history(backend)
-    assert backend.takes_history_prefill_topk()
+    assert backend.history_prefill_plan() is not None
     with pytest.raises(RuntimeError, match="workspace"):
         _init_history(_history_backend(0))
 
@@ -452,7 +448,7 @@ def test_the_history_prefill_keeps_the_slot_arm_where_it_cannot_plan():
 def test_the_history_arm_attends_gathered_groups_with_the_querys_heads(monkeypatch):
     backend = _history_backend(11)
     _init_history(backend)
-    plan = backend.require_history_prefill()
+    plan = backend.history_prefill_plan()
     groups = plan.groups
     plane = torch.arange(40, dtype=torch.float32).unsqueeze(1).expand(40, KV_DIM)
     plane = plane.to(torch.bfloat16).unsqueeze(1).contiguous()
@@ -523,7 +519,7 @@ def test_the_history_arm_attends_gathered_groups_with_the_querys_heads(monkeypat
     # A lone group spanning the rows hands back the core's output as is.
     single = _history_backend(18)
     _init_history(single)
-    assert len(single.require_history_prefill().groups) == 1
+    assert len(single.history_prefill_plan().groups) == 1
     calls.clear()
     out = single.forward_sparse_prefill(
         q=q,
@@ -739,7 +735,7 @@ def test_the_history_index_k_pages_read_like_the_pools_plane(
     alone exceed it (3 pages against a 2-page workspace)."""
     backend = _history_backend(workspace_rows, index_k_format=index_k_format)
     _init_history(backend)
-    plan = backend.require_history_prefill()
+    plan = backend.history_prefill_plan()
     _gather_one_owner(monkeypatch)
     pool, _ = _written_index_k_pool(index_k_format, PAGE, 10)
     workspace = backend._history_workspace.index_k
@@ -1070,7 +1066,7 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
     )
     assert target.history_gather_workspace().nbytes == planned
     _init_history(target)
-    assert target.takes_history_prefill_topk()
+    assert target.history_prefill_plan() is not None
 
     # Kimi-K3.1: the hybrid wrapper hands the workspace to its DSA child,
     # beside the KDA verify staging of its linear child.

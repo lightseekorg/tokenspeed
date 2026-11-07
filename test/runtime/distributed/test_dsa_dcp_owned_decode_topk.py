@@ -32,8 +32,7 @@ local slots, for a BF16 index query and, where a candidate scorer takes
 one, an FP8 query with its scales. Rows compare as sets: a scorer's
 candidate order is unspecified, and the gfx950 one's follows its atomics.
 The ranks' counts must add up to the selection's. Rider bytes riding the
-score gather (:func:`select_owned_dsa_topk_with_rider`, as a records
-decode's query rides it) must leave the selection as it was and land as an
+score gather (as a records decode's query rides it) must leave the selection as it was and land as an
 all-gather of every rank's rider lands. A forward's captured metadata build
 and owned selection with its rider, replayed after the lengths, the table
 and the rider change in place, must select what the eager merge selects
@@ -209,7 +208,6 @@ def _worker(rank, degree, rendezvous, pull_exchange):
         owned_dsa_topk_fits,
         select_dsa_topk,
         select_owned_dsa_topk,
-        select_owned_dsa_topk_with_rider,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import (
         CachePlacement,
@@ -343,23 +341,16 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                     metadata,
                     page_size=_PAGE,
                     topk=_TOPK,
-                    max_logits_bytes=None,
                     rider_bytes=rows * _RIDER,
-                )
-                assert not owned_dsa_topk_fits(
-                    rows,
-                    metadata,
-                    page_size=_PAGE,
-                    topk=_TOPK,
-                    max_logits_bytes=64 << 20,
                 )
                 out = torch.full((rows, _TOPK), 7, dtype=torch.int32, device=device)
                 lens_out = torch.full((rows,), 7, dtype=torch.int32, device=device)
-                owned, counts = select_owned_dsa_topk(
+                owned, counts, _ = select_owned_dsa_topk(
                     query,
                     weights,
                     plane,
                     metadata=metadata,
+                    rider=None,
                     q_scales=scales,
                     out=out,
                     lens_out=lens_out,
@@ -381,13 +372,15 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                 # Bytes riding the score gather land as an all-gather would
                 # land them, and leave the selection as it was.
                 rider = rider_of(rows)
-                ridden, ridden_counts, gathered = select_owned_dsa_topk_with_rider(
+                ridden, ridden_counts, gathered = select_owned_dsa_topk(
                     query,
                     weights,
                     plane,
                     metadata=metadata,
                     q_scales=scales,
                     rider=rider,
+                    out=torch.empty_like(out),
+                    lens_out=torch.empty_like(lens_out),
                     **kwargs,
                 )
                 _assert_same_rows(ridden, expected)
@@ -400,13 +393,15 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                 torch.zeros((_RIDER, rows), dtype=torch.uint8, device=device).t(),
             ):
                 with pytest.raises(ValueError, match="a rider is a contiguous"):
-                    select_owned_dsa_topk_with_rider(
+                    select_owned_dsa_topk(
                         query,
                         weights,
                         plane,
                         metadata=metadata,
                         q_scales=scales,
                         rider=bad,
+                        out=out,
+                        lens_out=lens_out,
                         **kwargs,
                     )
             print(
@@ -424,7 +419,7 @@ def _worker(rank, degree, rendezvous, pull_exchange):
         rider = rider_of(rows)
 
         def step():
-            return select_owned_dsa_topk_with_rider(
+            return select_owned_dsa_topk(
                 query,
                 weights,
                 plane,
