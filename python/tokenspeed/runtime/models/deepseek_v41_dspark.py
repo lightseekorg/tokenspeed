@@ -130,6 +130,12 @@ class _WindowAttention:
     def supports_fused_attention(self) -> bool:
         return True
 
+    @property
+    def supports_fused_prefill(self) -> bool:
+        # The drafter's window attention has no query group to exchange heads
+        # across, so prefill carries the same support as decode.
+        return True
+
     def _workspace(self, swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps):
         """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
 

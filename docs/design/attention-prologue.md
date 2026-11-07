@@ -386,7 +386,13 @@ DSpark decode uses the same contract over its BF16 window workspace.
 
 The native epilogue requires eight query heads per output group. Unsupported
 head or projection geometry and distributed partial attention retain the regular
-path. Main-model prefill always uses the canonical weights. Prepared copies are
+path. Pure prefill uses the same prepared weights and the same fused call, one
+per workspace batch; a mixed batch keeps the regular path, since its extend and
+decode halves must agree on the output format, and so does prefill under the
+operator's query context parallelism, whose head exchange cannot merge grouped
+FP8 rows. Prefill under a model query shard also keeps the regular path: the
+backend receives the shard's query rows while the caller rotates Q from its own
+source rows, so the fused Q RoPE would use other positions. Prepared copies are
 nonpersistent buffers, refreshed in place from the canonical checkpoint after
 weight updates so captured graphs retain their addresses. Cache ownership,
 selection and write ordering are unchanged.
