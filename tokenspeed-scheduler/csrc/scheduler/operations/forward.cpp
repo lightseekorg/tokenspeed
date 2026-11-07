@@ -1771,31 +1771,32 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
-    const bool defer_prefill = prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates);
+    const bool interval_owes_decodes = prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates);
     if (config_.enable_mixed_prefill_decode) {
         // A deferred prefill joins no decode, so the decodes keep its reserve.
-        const bool has_local_prefill = !defer_prefill && std::ranges::any_of(candidates, [](const Request* request) {
-            return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
-        });
+        const bool has_local_prefill =
+            !interval_owes_decodes && std::ranges::any_of(candidates, [](const Request* request) {
+                return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
+            });
         build.pending_prefill_reserve = has_local_prefill ? MinPrefillChunkTokens(coordinator_) : 0;
         scheduleDecodeBatch(feedback, build, candidates);
-    } else if (defer_prefill) {
+    } else if (interval_owes_decodes) {
         scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    const bool prefill_deferred = defer_prefill && build.pushed_decode;
-    if (!prefill_deferred) {
+    const bool prefill_phases_skipped = interval_owes_decodes && build.pushed_decode;
+    if (!prefill_phases_skipped) {
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
     }
 
-    if (!config_.enable_mixed_prefill_decode && !defer_prefill && !build.pushed_prefill) {
+    if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {
         scheduleDecodeBatch(feedback, build, candidates);
     }
 
     // The prompts this round held back, taken before a retraction can make
     // one of them its victim: that one sat the round out all the same.
     std::vector<Request*> held_back;
-    if (prefill_deferred) {
+    if (prefill_phases_skipped) {
         std::ranges::copy_if(candidates, std::back_inserter(held_back), [](const Request* request) {
             return request->IsAnyOf<fsm::Submitted, fsm::Prefilling>();
         });
