@@ -175,6 +175,77 @@ TEST(CacheCoordinatorPreparedKeysTest, ProbeOwnsKeysAfterRequestIsReleased) {
     EXPECT_EQ(tables[0].NumBlocks(), 4);
 }
 
+// A replayable group is never matched, so it expands no prepared keys, and an
+// admission acquires nothing for it on either tier -- also when the Host
+// suffix starts above page 0, where the group's key range would begin.
+TEST(CacheCoordinatorPreparedKeysTest, ReplayableGroupsExpandNoKeysAndHoldNoHits) {
+    BlockPool device_pool(32, {1, 1});
+    BlockPool host_pool(32, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 2,
+                       .replayable = true,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 1},
+    };
+    auto coordinator = MakeCoordinator(specs, 4, device_pool, false, &host_pool, nullptr, false, true,
+                                       /*checkpoint_retention_requests=*/0);
+    const std::vector<std::string> hashes{"p0", "p1", "p2", "p3"};
+    const PreparedPrefixKeys keys = coordinator.PreparePrefixKeys(hashes);
+    ASSERT_EQ(keys->size(), 2u);
+    EXPECT_TRUE((*keys)[1].empty()) << "the 1-token window group would expand four keys per page";
+    std::vector<CacheKey> full_keys = coordinator.ExpandPrefixKeys(hashes);
+    std::erase_if(full_keys, [](const CacheKey& key) { return key.group_id != 0; });
+    EXPECT_EQ((*keys)[0], full_keys);
+
+    // The Device holds the Full group's first two pages, the Host the last two.
+    for (std::size_t page = 0; page < hashes.size(); ++page) {
+        for (std::int32_t offset = 0; offset < 2; ++offset) {
+            const CacheKey key = Key(hashes[page], 0, offset);
+            if (page < 2) {
+                CacheBlockRef block = device_pool.AcquireBlock(0);
+                ASSERT_TRUE(block);
+                coordinator.GroupPrefixIndex(0).Register(device_pool, block, key, NextTestAccessEpoch(),
+                                                         static_cast<std::int32_t>(page) * 2 + offset,
+                                                         CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
+                                                         /*session=*/nullptr);
+            } else {
+                CacheBlockRef block = coordinator.AcquireHostBlock(0, 0);
+                ASSERT_TRUE(block);
+                coordinator.CacheHostBlock(block, key, std::nullopt);
+            }
+        }
+    }
+    auto probe = coordinator.ProbePromptPrefix(
+        {.prefix_hashes = hashes, .tokens = {}, .max_tokens = 16, .tail = std::nullopt, .prepared_keys = keys});
+    EXPECT_EQ(probe.device.full_page_tokens, 8);
+    EXPECT_EQ(probe.host.num_common_tokens, 16);
+    std::vector<BlockTable> tables(2);
+    const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}},
+                             GroupDemand{.table = &tables[1], .extent = DenseGrowth{4}}};
+    auto admitted = coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*copy_in_blocks=*/{},
+                                      /*copy_in_point=*/std::nullopt, std::nullopt, false, /*session_id=*/{},
+                                      /*cache_group_id=*/{});
+    ASSERT_TRUE(admitted);
+    EXPECT_EQ(admitted->device_prefix_tokens, 8);
+    EXPECT_EQ(admitted->host_prefix_tokens, 16);
+    ASSERT_EQ(admitted->load_pairs.size(), 4u);
+    for (const BlockTransfer& transfer : admitted->load_pairs) {
+        EXPECT_EQ(transfer.group_id, 0u);
+    }
+    // The Full group holds the eight hit blocks and two fresh ones; the
+    // replayable group only the fresh replay window [14, 16) and growth.
+    EXPECT_EQ(tables[0].NumBlocks(), 10);
+    EXPECT_EQ(tables[1].NumBlocks(), 20);
+    const auto replay_slots = tables[1].Blocks();
+    EXPECT_TRUE(
+        std::all_of(replay_slots.begin(), replay_slots.begin() + 14, [](const CacheBlockRef& b) { return !b; }));
+    EXPECT_TRUE(std::all_of(replay_slots.begin() + 14, replay_slots.end(), [](const CacheBlockRef& b) { return b; }));
+    EXPECT_EQ(admitted->new_page_ids[1].size(), 6u);
+    coordinator.Free(tables);
+}
+
 CacheBlockLocation CacheBoundaryForGroup(CacheCoordinator& coordinator, BlockPool& pool,
                                          const std::string& content_hash, std::uint32_t group_id,
                                          std::uint64_t access_epoch, std::int32_t logical_block_index,
