@@ -53,6 +53,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import Pipe
@@ -123,7 +124,9 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     ReasoningGrammar,
     reasoning_grammar,
 )
-from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.metrics.config import metrics_enabled, raw_metrics_enabled
+from tokenspeed.runtime.metrics.events import MetricEvent, MetricEventSink
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
@@ -132,6 +135,10 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
+from tokenspeed.runtime.plugins.registry import (
+    TraceProvider,
+    get_trace_provider,
+)
 from tokenspeed.runtime.sampling.registry import get_sampling_backend_class
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
@@ -442,6 +449,11 @@ class HostConfig:
         kv_events_publisher: Where this rank publishes them (the ZMQ
             publisher's fields), on the attention-TP group's first rank; else
             None.
+        otlp_traces_endpoint: ``--otlp-traces-endpoint``, the OTLP/HTTP
+            receiver finished requests trace to.
+        trace_provider: Optional registered provider of custom span context.
+        trace_sample_ratio: ``--trace-sample-ratio``, the share of requests
+            it keeps.
         l3: With the L3 storage tier, what the host starts its executor
             from; else None.
         l3_metrics: This rank reports the L3 tier's metrics: with the tier
@@ -475,6 +487,7 @@ class HostConfig:
     request_token_history: bool
     physical_context_len: int
     kv_total_pages: int
+    kv_token_capacity: int
     rank: int
     replica_ranks: tuple[int, ...]
     pp_ranks: tuple[int, ...] | None
@@ -499,6 +512,9 @@ class HostConfig:
     log_request_stats: bool
     kv_events: bool
     kv_events_publisher: KVEventsConfig | None
+    otlp_traces_endpoint: str | None
+    trace_sample_ratio: float
+    trace_provider: TraceProvider | None
     l3: L3Settings | None
     l3_metrics: bool
     attn_tp_rank: int
@@ -1007,6 +1023,81 @@ class HostDataPlane:
         )
 
 
+# Torch's allocator counters only exist in this rank's process; the Rust host
+# sees page counts, not bytes. Sample them here and report through the same
+# output plugin the engine's own metrics use.
+_MEMORY_METRIC_INTERVAL_SECONDS = 10.0
+
+
+class MemoryMetricSampler(threading.Thread):
+    """Emit allocator and driver memory gauges for one rank."""
+
+    def __init__(
+        self,
+        *,
+        sink: MetricEventSink,
+        model_name: str,
+        app_key: str,
+        dp_rank: int,
+        gpu_id: int,
+        device: str,
+    ) -> None:
+        super().__init__(name="ts-memory-metrics", daemon=True)
+        self._sink = sink
+        self._labels = {
+            "model_name": model_name,
+            "app_key": app_key,
+            "dp_rank": str(dp_rank),
+        }
+        self._gpu_id = gpu_id
+        self._device = device
+        self._stopping = threading.Event()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self.join(timeout=1.0)
+
+    def run(self) -> None:
+        try:
+            device_module = torch.get_device_module(torch.device(self._device).type)
+        except Exception as exc:
+            logger.warning(
+                f"Cannot initialize memory metrics for {self._device}: {exc}"
+            )
+            return
+        warned = False
+        while not self._stopping.wait(_MEMORY_METRIC_INTERVAL_SECONDS):
+            try:
+                free_bytes, total_bytes = device_module.mem_get_info(self._gpu_id)
+                allocated = device_module.memory_allocated(self._gpu_id)
+                reserved = device_module.memory_reserved(self._gpu_id)
+            except Exception as exc:
+                if not warned:
+                    logger.warning(
+                        f"Cannot sample memory on {self._device} GPU {self._gpu_id}: {exc}"
+                    )
+                    warned = True
+                continue
+            mib = 1024**2
+            used = total_bytes - free_bytes
+            values = {
+                "tokenspeed:mem_alloc_mb": allocated / mib,
+                "tokenspeed:mem_reserved_mb": reserved / mib,
+                "tokenspeed:mem_phys_used_mb": used / mib,
+                "tokenspeed:mem_non_torch_mb": max(0.0, used - reserved) / mib,
+            }
+            for metric, value in values.items():
+                self._sink.emit(
+                    MetricEvent(
+                        timestamp_ns=time.time_ns(),
+                        metric=metric,
+                        operation="set",
+                        value=float(value),
+                        labels=dict(self._labels),
+                    )
+                )
+
+
 class HostBootstrap:
     """One rank, built: the scheduler and config for the control thread, and
     the data plane the forward and control threads call."""
@@ -1027,6 +1118,9 @@ class HostBootstrap:
         self._connection = connection
         mapping = server_args.mapping
         gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+        self._gpu_id = gpu_id
+        self._port_args = port_args
+        self._memory_sampler: MemoryMetricSampler | None = None
         attn_tp_rank = mapping.attn.tp_rank
         dp_rank = mapping.attn.dp_rank
         global_rank = mapping.rank
@@ -1248,6 +1342,7 @@ class HostBootstrap:
                     model_config.context_len + server_args.spec_context_pad
                 ),
                 kv_total_pages=geometry.num_usable_pages,
+                kv_token_capacity=geometry.token_capacity,
                 rank=global_rank,
                 # Every stage runs the same plan, so with a pipeline the replica
                 # is the world (ServerArgs refuses attention DP with one). Under
@@ -1295,6 +1390,13 @@ class HostBootstrap:
                     if kv_events
                     and attn_tp_rank == 0
                     and kv_events_config.publisher in (None, "zmq")
+                    else None
+                ),
+                otlp_traces_endpoint=server_args.otlp_traces_endpoint,
+                trace_sample_ratio=server_args.trace_sample_ratio,
+                trace_provider=(
+                    get_trace_provider(server_args.trace_provider)
+                    if server_args.trace_provider is not None
                     else None
                 ),
                 epd_receive_enabled=(
@@ -1418,16 +1520,53 @@ class HostBootstrap:
             }
         )
 
+    def _start_memory_metrics(self) -> None:
+        """Sample this rank's accelerator memory, if an output plugin is on.
+
+        Only the rank that owns EngineMetrics reports, and only when a raw
+        reporter (not just Prometheus) selected this process's sink.
+        """
+        if self._memory_sampler is not None:
+            return
+        if not raw_metrics_enabled(self._server_args):
+            return
+        if self._server_args.mapping.attn.tp_rank != 0:
+            return
+        configs = self._port_args.metrics_producer_configs
+        if not configs:
+            return
+        try:
+            metrics_service.connect(configs)
+            sink = metrics_service.get_event_sink()
+        except Exception:
+            logger.warning("memory metrics are unavailable", exc_info=True)
+            return
+        if sink is None:
+            return
+        self._memory_sampler = MemoryMetricSampler(
+            sink=sink,
+            model_name=self._server_args.served_model_name or "",
+            app_key=self._server_args.app_key or "",
+            dp_rank=self._server_args.mapping.attn.dp_rank or 0,
+            gpu_id=self._gpu_id,
+            device=self._server_args.device,
+        )
+        self._memory_sampler.start()
+
     def enter_serving(self) -> None:
         """End startup: from here on a host synchronization or a kernel
         compilation on the data plane is a stall."""
         arm_data_plane_sync_debug(self._server_args.device)
         mark_jit_compile_serving()
         freeze_startup_heap()
+        self._start_memory_metrics()
 
     def close(self) -> None:
         """Release the device side's caches, once the forward thread and the
         L3 executor have stopped."""
+        if self._memory_sampler is not None:
+            self._memory_sampler.stop()
+            self._memory_sampler = None
         self._device.shutdown_cache()
 
 

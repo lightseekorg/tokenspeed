@@ -41,6 +41,9 @@ from tokenspeed.runtime.execution.drafter.dspark import DSpark  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
+    drafter_accept_lengths,
+)
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
     TargetCaptureConfigurator,
@@ -977,6 +980,25 @@ def test_dflash_leaves_the_context_alone_when_it_will_not_overlap(
     assert torch.equal(drafter._incr_acc_buf, torch.ones(16, 3))
 
 
+@pytest.mark.parametrize("idle", [False, True])
+def test_dflash_attaches_its_sink_to_a_decode_forward_but_not_an_idle_one(idle):
+    """A decode forward (captured or eager alike) arms the sink, which takes
+    every tap. An idle forward is not armed: it may skip the final-norm tap
+    that completes the KV write."""
+    drafter = _incremental_dflash(enabled=True)
+    ctx = _target_ctx(num_extends=0, num_tokens=0 if idle else 4)
+    if idle:
+        ctx.forward_mode = ForwardMode.IDLE
+
+    drafter.prepare_target_forward(ctx)
+
+    assert drafter._incremental_kv_write_done is False
+    if idle:
+        assert ctx.target_capture_sink is None
+    else:
+        assert ctx.target_capture_sink is drafter
+
+
 def test_dflash_rejects_a_capture_of_the_wrong_width():
     drafter = _incremental_dflash(enabled=True)
     drafter.prepare_target_forward(_target_ctx(num_extends=0, num_tokens=4))
@@ -1334,6 +1356,17 @@ def test_unsupported_stream_fails_before_installing_capture(dflash_model):
     with pytest.raises(ValueError, match="only supply 'prefix'"):
         dflash_model.configure_target(target, None)
     setter.assert_not_called()
+
+
+def test_the_drafter_continues_each_decode_request_from_at_least_one_token():
+    """A stopped decode request (0 accepted) still hands the drafter its last
+    position; prefill rows and the reported lengths are left alone."""
+    accept_lengths = torch.tensor([0, 3, 0, 2], dtype=torch.int32)
+
+    lengths = drafter_accept_lengths(accept_lengths, slice(1, 4))
+
+    assert lengths.tolist() == [0, 3, 1, 2]
+    assert accept_lengths.tolist() == [0, 3, 0, 2]
 
 
 if __name__ == "__main__":

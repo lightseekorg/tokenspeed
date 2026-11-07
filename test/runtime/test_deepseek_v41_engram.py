@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gc
 import importlib.util
 import json
 import os
@@ -605,6 +606,67 @@ def test_cuda_quantized_projection_forward():
     assert empty.shape == (0, 4, 32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_host_table_feeds_wkv_its_mxfp8_rows():
+    """A shared host table hands wkv quantized rows; the output is the GPU
+    table's BF16 round trip bit for bit, eagerly and replayed."""
+    quant = Mxfp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [32, 32],
+            "scale_fmt": "ue8m0",
+        }
+    )
+    torch.manual_seed(7)
+    codes, scales = _weights(72, 32)
+    weight = (torch.randn(160, 192) * 4).to(torch.float8_e4m3fn)
+    models = []
+    for host_table in (False, True):
+        model = DeepseekV41Engram(
+            _config(),
+            1,
+            _mapping(0, 1, 1),
+            v41_mxfp8_config(quant),
+            "model.layers.1.engram",
+            "cuda:0",
+            host_table,
+            "shared" if host_table else "gpu",
+        )
+        model.embed.weight_loader(model.embed.weight, codes)
+        model.embed.weight_loader(model.embed.scale, scales)
+        model.wkv.weight.weight_loader(
+            model.wkv.weight, weight, shard_id=None, begin_size=None
+        )
+        model.wkv.weight_scale_inv.weight_loader(
+            model.wkv.weight_scale_inv, torch.full((5, 6), 121, dtype=torch.uint8)
+        )
+        model.wkv.quant_method.process_weights_after_loading(model.wkv)
+        models.append(model)
+    gpu, host = models
+    assert host.embed.serves_mxfp8_rows and not gpu.embed.serves_mxfp8_rows
+    hashes = torch.randint(0, 72, (5, 2, 6), device="cuda:0")
+    hashes[1, 0, 2], hashes[3, 0, 5] = -1, 72
+    ids = hashes[:, 0]
+    hidden = torch.randn(5, 4, 32, dtype=torch.bfloat16, device="cuda:0")
+    mask = torch.tensor([True, True, False, True, True], device="cuda:0")
+    torch.testing.assert_close(
+        host(hidden, ids, mask, query_shard=None),
+        gpu(hidden, ids, mask, query_shard=None),
+        rtol=0,
+        atol=0,
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = host(hidden, ids, mask, query_shard=None)
+    hashes.copy_(torch.randint(0, 72, (5, 2, 6), device="cuda:0"))
+    graph.replay()
+    torch.testing.assert_close(
+        captured, gpu(hidden, ids, mask, query_shard=None), rtol=0, atol=0
+    )
+
+
 def test_distributed_four_way_lookup(monkeypatch):
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -1020,6 +1082,13 @@ def test_cuda_host_table_gather_matches_device_shard():
         AssertionError("host gather must not register")
     )
     host_embed(ids, query_shard=None)
+    torch.cuda.synchronize()
+    weight = host_embed.weight.detach()
+    scale = host_embed.scale.detach()
+    del host_embed
+    gc.collect()
+    assert not weight.is_pinned()
+    assert not scale.is_pinned()
 
 
 @pytest.mark.parametrize("counts", [(2, 1, 1, 1), (1, 1, 0, 0)])

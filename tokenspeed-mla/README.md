@@ -11,6 +11,7 @@ Speed-of-light TokenSpeed MLA kernels for `SM100/SM103/SM107` with:
   - Split-KV + workspace path with runtime auto-sizing and compile caching
 - `MLA K/V pack + FP8 quantize`:
   - Fused Triton kernel replacing `cat + cast + cast` in chunked prefill
+  - Groups adjacent token/head rows, preserving FP32 scaling and FP8 rounding
   - Supports strided views and optional pre-allocated output buffers
 
 This package includes performance-oriented optimizations for latency-sensitive
@@ -99,7 +100,10 @@ per-row causal positions and predicates partial output/LSE rows.
 For packed queries, auto split-KV uses `ceil(H * q_len / 128)` query tiles,
 and workspace needs `B * 128 * ceil(H * q_len / 128) * split_kv * 513 * 4`
 bytes for D512/FP32 partials, or zero when split-KV is one. Callers must
-provide sufficient workspace for the selected layout. Output shape, output dtype
+provide sufficient workspace for the selected layout. Device offsets multiply
+element counts by bytes per element; forming an intermediate bit count can
+overflow Int32 for partial-output buffers of 256 MiB or larger.
+Output shape, output dtype
 (BF16 for FP8; input dtype for FP16/BF16), and base-2 LSE semantics are unchanged.
 The FP16/BF16 implementation retains its existing split-KV heuristic, reducer
 capacity and PDL waits. The selected layout is part of the compile cache key.

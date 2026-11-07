@@ -193,11 +193,15 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 8192
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
     """Largest prefill-graph bucket: explicit value, or min(8192, chunk, kv budget).
 
-    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
-    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
-    receive counts come back to the host, and a host sync cannot be captured.
+    Returns 0 on a disaggregated Decode worker, which never executes Prefill,
+    or when the MoE all-to-all backend is DeepEP: an extend-shaped forward
+    takes DeepEP's normal dispatch, whose per-expert receive counts come back
+    to the host, and a host sync cannot be captured.
     """
-    if server_args.all2all_backend == "deepep":
+    if (
+        server_args.disaggregation_mode == "decode"
+        or server_args.all2all_backend == "deepep"
+    ):
         return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
@@ -350,6 +354,27 @@ def warn_past_rope_table(
         )
 
 
+def drafter_accept_lengths(
+    accept_lengths: torch.Tensor, decode_requests: slice
+) -> torch.Tensor:
+    """The accepted lengths the drafter continues from.
+
+    A stopped request keeps no token and its drafts are discarded, but the
+    drafter still indexes the last accepted position, so each decode
+    request's length is at least 1. ``accept_lengths`` is left unchanged.
+
+    Args:
+        accept_lengths: ``[bs]`` accepted tokens per request.
+        decode_requests: The decode requests' rows.
+
+    Returns:
+        A new ``[bs]`` tensor.
+    """
+    lengths = accept_lengths.clone()
+    lengths[decode_requests].clamp_(min=1)
+    return lengths
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -368,6 +393,7 @@ class ModelExecutorConfig:
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
+    input_vocab_size: int
     # Logical context limit (user semantics: input validation, max_new_tokens
     # folding, stop checks all key off this).
     context_len: int
@@ -390,9 +416,8 @@ class ModelExecutorConfig:
     # it never runs a decode/verify step of its own, so the decode graph is
     # never captured there while the prefill graph keeps its ordinary gating.
     prefill_only: bool
-    # The mirror image: an attention layout that serves decode rows only
-    # (head TP under attention DP), so startup never runs an extend-shaped
-    # dummy forward and tunes on a decode-shaped one instead.
+    # The mirror image: a disaggregated Decode worker, including ordinary
+    # TP and attention DP, never executes Prefill. Startup warms Decode.
     decode_only_attention: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
@@ -506,6 +531,7 @@ class ModelExecutorConfig:
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
+            input_vocab_size=model_config.input_vocab_size,
             context_len=model_config.context_len,
             physical_context_len=(
                 model_config.context_len + server_args.spec_context_pad
@@ -527,7 +553,7 @@ class ModelExecutorConfig:
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
-            decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
+            decode_only_attention=server_args.disaggregation_mode == "decode",
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             enable_memory_saver=server_args.enable_memory_saver,
@@ -629,10 +655,11 @@ class ModelExecutor:
         self.input_buffers.init_ngram_buffers(
             ngram_context,
             model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
-            config.vocab_size,
+            config.input_vocab_size,
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
+            input_vocab_size=config.input_vocab_size,
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
@@ -643,17 +670,7 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
-        # Trees keep their draft q per tree instead (bind_tree).
-        if config.enable_speculative_sampling and not config.spec_draft_tree:
-            if config.spec_algo is None:
-                raise ValueError(
-                    "enable_speculative_sampling needs a speculative drafter to "
-                    "record proposal distributions for"
-                )
-            self.runtime_states.init_draft_probs(
-                spec_num_tokens=spec_num_tokens,
-                reject_threshold=config.spec_reject_draft_prob_threshold,
-            )
+        self._init_draft_probs(config, spec_num_tokens)
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -1056,8 +1073,8 @@ class ModelExecutor:
         ib = self.input_buffers
         # The one traversal that discovers each operator is shaped like the
         # forwards this engine runs: an extend over the prefill budget, or,
-        # for an attention layout that serves decode rows only (head TP), a
-        # decode step at the largest batch -- the shape capture records later.
+        # on a disaggregated Decode worker, a decode step at the largest batch
+        # -- the shape capture records later.
         decode_only = self.config.decode_only_attention
         if decode_only:
             num_tokens = (
@@ -1117,7 +1134,7 @@ class ModelExecutor:
                     batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
                 )
                 if decode_only:
-                    # No extend forward exists on this layout; the decode step
+                    # This role never runs an extend forward; the decode step
                     # reaches the target and, through the speculative forward,
                     # the draft.
                     if self.drafter is not None:
@@ -1804,13 +1821,8 @@ class ModelExecutor:
         if self.drafter is not None:
             draft_accept_lengths = accept_lengths
             if ctx.output_layout.num_decodes:
-                # A stopped request keeps no token; its drafts are discarded,
-                # but the drafter indexes the last accepted position.
-                draft_accept_lengths = accept_lengths.clone()
-                draft_accept_lengths[ctx.output_layout.decode_request_slice] = (
-                    draft_accept_lengths[ctx.output_layout.decode_request_slice].clamp(
-                        min=1
-                    )
+                draft_accept_lengths = drafter_accept_lengths(
+                    accept_lengths, ctx.output_layout.decode_request_slice
                 )
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,
@@ -1907,6 +1919,30 @@ class ModelExecutor:
             ib.state_write_padding_pool_index,
         )
 
+    def _init_draft_probs(
+        self, config: ModelExecutorConfig, spec_num_tokens: int
+    ) -> None:
+        """Allocate the dense per-vocab draft q under --enable-speculative-sampling.
+
+        Trees keep their draft q per tree instead (bind_tree), and DFLASH
+        (DFlash2) records a sparse q over its selector's candidates
+        (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
+        The step drafters and DSpark sample from full-vocab logits and need
+        the dense rows.
+        """
+        if not config.enable_speculative_sampling or config.spec_draft_tree:
+            return
+        if config.spec_algo is None:
+            raise ValueError(
+                "enable_speculative_sampling needs a speculative drafter to "
+                "record proposal distributions for"
+            )
+        if config.spec_algo != "DFLASH":
+            self.runtime_states.init_draft_probs(
+                spec_num_tokens=spec_num_tokens,
+                reject_threshold=config.spec_reject_draft_prob_threshold,
+            )
+
     def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
@@ -1917,6 +1953,7 @@ class ModelExecutor:
                 else None
             ),
             draft_probs=self.runtime_states.draft_probs,
+            draft_q=self.runtime_states.future_draft_q,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
@@ -2320,11 +2357,14 @@ class ModelExecutor:
                     contract=self._cache_runtime_contract,
                     num_requests=bs,
                     validate_page_ids=self._validate_page_ids,
+                    # Only an extend plans from host tables.
+                    host_tables=num_extends > 0,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
-                block_tables_cpu = dict(
-                    cache_metadata.tables_cpu(active_forward_op=forward_op)
-                )
+                if num_extends > 0:
+                    block_tables_cpu = dict(
+                        cache_metadata.tables_cpu(active_forward_op=forward_op)
+                    )
             # What the batch fixes on its own is staged while a pending round still drafts.
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,

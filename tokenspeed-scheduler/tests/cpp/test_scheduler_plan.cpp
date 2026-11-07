@@ -36,6 +36,7 @@ protected:
         cfg.device_allocator.total_pages = 9;
         cfg.cache_groups[0].total_pages = 9;
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        cfg.enable_kv_cache_events = true;
         return cfg;
     }
 };
@@ -44,6 +45,7 @@ TEST_F(AdmissionPromptHashSuite, AQueuedAdmissionSeesCachePublishedSinceItsPrevi
     Submit({MakeRequestSpec("owner", 3), MakeRequestSpec("queued", 5)});
     const auto first = PlanOnce();
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
     for (const auto& operation : first.Operations()) {
         if (const auto* batch = std::get_if<ForwardBatch>(&operation)) {
             EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"owner"}));
@@ -52,6 +54,11 @@ TEST_F(AdmissionPromptHashSuite, AQueuedAdmissionSeesCachePublishedSinceItsPrevi
 
     SendForwardDone("owner", {42});
     SendFinish("owner");
+    const auto stored = scheduler_->DrainKvEvents();
+    ASSERT_EQ(stored.size(), 3u);
+    for (const auto& event : stored) {
+        EXPECT_TRUE(std::holds_alternative<KvBlockStoredEvent>(event));
+    }
     const auto retry = PlanOnce();
     bool admitted = false;
     for (const auto& operation : retry.Operations()) {
@@ -63,6 +70,7 @@ TEST_F(AdmissionPromptHashSuite, AQueuedAdmissionSeesCachePublishedSinceItsPrevi
     }
     EXPECT_TRUE(admitted);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
 class LoadBackViaCacheTestSuite : public SchedulerTestSuite {

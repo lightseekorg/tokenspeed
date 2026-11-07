@@ -21,11 +21,12 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.platform import current_platform, prepare_cuda_toolkit_env
 
 _IS_HOPPER_PLUS = current_platform().is_hopper_plus
 
-if _IS_HOPPER_PLUS:
+if _IS_HOPPER_PLUS and has_optional_package("deep_gemm"):
     prepare_cuda_toolkit_env()
     import deep_gemm
 
@@ -59,6 +60,7 @@ def _warmup_fp8_fp4_mqa_logits(
     index_head_dim: int,
     device: torch.device,
     max_kv_len: int,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Pre-compile the ragged prefill sparse-indexer kernel."""
     head_dim_bytes = index_head_dim // 2
@@ -83,7 +85,7 @@ def _warmup_fp8_fp4_mqa_logits(
             cu_seq_len_k_end=cu_end,
             clean_logits=False,
             max_seqlen_k=max_kv_len,
-            logits_dtype=torch.float32,
+            logits_dtype=logits_dtype,
         )
 
 
@@ -94,6 +96,7 @@ def _warmup_fp8_fp4_paged_mqa_logits(
     cache_block_size: int,
     max_decode_tokens: int,
     device: torch.device,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Pre-compile paged decode indexer and schedule-metadata kernels."""
     head_dim_bytes = index_head_dim // 2
@@ -119,23 +122,36 @@ def _warmup_fp8_fp4_paged_mqa_logits(
         context_lens = torch.full(
             (num_tokens, 1), cache_block_size, dtype=torch.int32, device=device
         )
-        block_table = torch.arange(num_tokens, dtype=torch.int32, device=device).view(
-            num_tokens, 1
-        )
-        schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens, cache_block_size, num_sms
-        )
-        deep_gemm.fp8_fp4_paged_mqa_logits(
-            q=(q_values.view(torch.int8).unsqueeze(1), q_scales.unsqueeze(1)),
-            kv_cache=kv_cache,
-            weights=weights,
-            context_lens=context_lens,
-            block_table=block_table,
-            schedule_meta=schedule_meta,
-            max_context_len=cache_block_size,
-            clean_logits=False,
-            logits_dtype=torch.float32,
-        )
+        rows = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        # Compile both independent rows and request-grouped verify rows before
+        # capture. Queries in a group share one physical history table. The
+        # group density is only a sample: DeepGEMM's optional ``indices``
+        # argument enters the host metadata builder, so a grouped call proves
+        # the installed build supports it and fails at startup instead of on
+        # the first decode step.
+        for indices in (None, rows // 4):
+            block_table = (rows if indices is None else indices).view(num_tokens, 1)
+            try:
+                schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens, cache_block_size, num_sms, indices=indices
+                )
+                deep_gemm.fp8_fp4_paged_mqa_logits(
+                    q=(q_values.view(torch.int8).unsqueeze(1), q_scales.unsqueeze(1)),
+                    kv_cache=kv_cache,
+                    weights=weights,
+                    context_lens=context_lens,
+                    block_table=block_table,
+                    schedule_meta=schedule_meta,
+                    max_context_len=cache_block_size,
+                    clean_logits=False,
+                    logits_dtype=logits_dtype,
+                    indices=indices,
+                )
+            except TypeError as error:
+                raise RuntimeError(
+                    "this DeepGEMM build has no grouped paged MQA logits "
+                    "(indices=...); the DSV4.1 paged indexer requires it"
+                ) from error
     torch.cuda.synchronize()
 
 
@@ -146,6 +162,7 @@ def warmup_mqa_logits(
     cache_block_size: int,
     max_decode_tokens: int,
     device: torch.device,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Compile packed MQA scoring and paged metadata kernels before capture."""
     _warmup_fp8_fp4_mqa_logits(
@@ -153,6 +170,7 @@ def warmup_mqa_logits(
         index_head_dim=index_head_dim,
         device=device,
         max_kv_len=4096,
+        logits_dtype=logits_dtype,
     )
     _warmup_fp8_fp4_paged_mqa_logits(
         num_heads=num_heads,
@@ -160,4 +178,5 @@ def warmup_mqa_logits(
         cache_block_size=cache_block_size,
         max_decode_tokens=max_decode_tokens,
         device=device,
+        logits_dtype=logits_dtype,
     )
