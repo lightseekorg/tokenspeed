@@ -911,26 +911,36 @@ public address used by EPD.
 ### P/D admission
 
 `--disaggregation-decode-allocation-policy` sets what a request's Decode
-allocation gates on a prefill server; the other roles refuse the flag.
-`early`, the default, admits the prefill once every Decode rank of the
-request has allocated its destination, so the KV can stream layer by layer
-during the forward. `independent` (experimental) admits the prefill at once
-and holds only its KV transfer: a computed prompt keeps its pages until the
-destination is allocated, and a destination allocated before the prompt
-finishes is remembered. `independent` requires attention TP 1,
-`--kv-parallel-size 1`, `--pipeline-parallel-size 1`, no
-`--enable-external-encoder`, an explicit
-`--disaggregation-layerwise-interval 0` and a model without multimodal
-input (or `--language-model-only`); anything else is refused at
-startup.
+allocation gates on a prefill server; the other roles refuse the flag. Under
+either policy the Decode server allocates a request's destination once the
+request reaches it and its pages allow. `early`, the default, admits the
+prefill once every Decode rank of the request has allocated its destination,
+so the KV can stream layer by layer during the forward. `independent`
+(experimental) admits the prefill at once and holds only its KV transfer: a
+computed prompt keeps its pages until the destination is allocated, and a
+destination allocated before the prompt finishes is remembered.
+`independent` requires attention TP 1, `--kv-parallel-size 1`,
+`--pipeline-parallel-size 1`, no `--enable-external-encoder`, an explicit
+`--disaggregation-layerwise-interval 0` and a model without multimodal input
+(or `--language-model-only`); anything else is refused at startup.
 
 Under `independent`, computed prompts waiting for their destination hold
-prefill pages, so a Decode server short of pages also delays the prefill
-server's other prompts, including those bound for other Decode servers. A
+prefill pages and request slots. Prompts whose destination is allocated go
+first: when one of them does not fit in the pages left, waits behind a partly
+computed prompt without a destination whose next chunk does not fit, or finds
+no free request slot, the prompts behind it wait, and the prefill server
+requeues prompts without a destination, which release their pages and slot,
+stay registered with their Decode server, and are computed again later from
+what the prefix cache kept
+([PD KV transfer metrics](#pd-kv-transfer-metrics) counts them). A Decode
+server short of pages therefore costs the prefill server recomputation. A
 prompt whose destination is not allocated within
 `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s by default) of its
-arrival fails, which also ends a wait in which Prefill and Decode each hold
-pages the other needs.
+arrival fails, and its client gets an abort, computed or not. With
+speculative decoding, a requeued prompt sends the first token and draft
+candidates of its first computation beside the draft KV of its second; where
+the two sampled differently, the Decode server's first drafts are accepted
+less. Outputs do not change.
 
 ## Observability
 

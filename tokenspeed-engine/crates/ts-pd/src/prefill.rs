@@ -61,7 +61,9 @@ use crate::{
     Copy, PeerConfig, StartError, Transport,
 };
 
-/// A request still bootstrapping this long after registration is reported.
+/// A request whose decode destination is still not allocated this long after
+/// registration is reported, whether the scheduler holds it bootstrapping or
+/// (independent decode allocation) computes it meanwhile.
 const BOOTSTRAP_STALL: Duration = Duration::from_secs(10);
 
 /// How often an idle control-socket thread checks for shutdown.
@@ -1598,7 +1600,10 @@ impl PrefillPeer {
             .collect();
         if !stalled.is_empty() {
             self.stall_logged_at = Some(now);
-            tracing::warn!(?stalled, "requests still bootstrapping");
+            tracing::warn!(
+                ?stalled,
+                "requests still waiting for their decode allocation"
+            );
         }
     }
 
