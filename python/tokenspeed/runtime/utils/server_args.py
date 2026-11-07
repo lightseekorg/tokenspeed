@@ -579,6 +579,9 @@ class ServerArgs:
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
     # (default) is exact dense attention; see --skip-softmax-threshold help.
     skip_softmax_threshold: float = 0.0
+    # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
+    # of their pages, reserved from the KV cache budget; see the flag's help.
+    enable_qsa_prefill_bf16_scratch: bool = False
     sampling_backend: str | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
@@ -3512,6 +3515,26 @@ class ServerArgs:
             "threshold. Backends that do reach kernel selection raise an "
             "error there if they lack gluon skip-softmax support, rather "
             "than silently ignoring it.",
+        )
+        parser.add_argument(
+            "--enable-qsa-prefill-bf16-scratch",
+            action="store_true",
+            dest="enable_qsa_prefill_bf16_scratch",
+            default=ServerArgs.enable_qsa_prefill_bf16_scratch,
+            help="QSA sparse-attention models (Qwen4-Exp) with --kv-cache-dtype "
+            "fp8_e4m3 on SM100 to SM107: a target prefill call of at least "
+            "2048 rows copies the FP8 KV pages it can read into a BF16 scratch "
+            "and attends there with the CuTe kernel's BF16 path instead of the "
+            "FP8 prefill kernel. Smaller and mixed calls, calls whose context "
+            "exceeds the scratch or 128 cache tokens per row, decode, verify "
+            "and drafts keep the FP8 path; the cache stays FP8. The scratch "
+            "holds one maximum-length context plus one --chunked-prefill-size "
+            "chunk, with that chunk's remapped slots and attention output, and "
+            "is reserved from the KV cache budget before the pool is sized. "
+            "Startup fails for a model without QSA layers, another KV cache "
+            "dtype (mxfp8 included), chunked prefill below 2048 tokens or "
+            "disabled, or a GPU without the CuTe QSA kernel. The decode role, "
+            "which runs no prefill, reserves no scratch.",
         )
         parser.add_argument(
             "--sampling-backend",
