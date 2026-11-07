@@ -310,12 +310,7 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         core's key splits, which lead with the records. Zero where gfx950's
         records core does not run."""
         degree = self.mapping.attn.kvp_size
-        if (
-            degree == 1
-            or not self.owned_decode_topk
-            or max_rows <= 0
-            or not current_platform().is_cdna4
-        ):
+        if max_rows <= 0 or not current_platform().is_cdna4:
             return 0
         head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         gather = max_rows * (self.index_topk * 4 + self.num_local_heads * head_dim * 2)

@@ -681,8 +681,8 @@ class GlmDsaSparseAttentionMixin:
         capturing = False
         owned_placement = None
         gathered_query = None
+        q, q_scales = self._scorer_index_query(q, index_k_cache)
         if placement is not None:
-            q, q_scales = self._scorer_index_query(q, index_k_cache)
             softmax_scale = self.indexer.weights_softmax_scale
             page_size = ctx.token_to_kv_pool.index_k_page_size
             capturing = is_current_stream_capturing(q.device)
@@ -773,7 +773,6 @@ class GlmDsaSparseAttentionMixin:
                     lens_out=topk_lens_slice,
                 )
         else:
-            q, q_scales = self._scorer_index_query(q, index_k_cache)
             dsa_decode_topk(
                 q,
                 weights,
@@ -1502,33 +1501,28 @@ class GlmDsaSparseAttentionMixin:
                     else None
                 ),
             )
-            decode_gate = (
-                None if output_gate is None else output_gate[decode_start:decode_end]
-            )
             if decode_query is None:
-                self.forward_absorb(
-                    positions[decode_start:decode_end],
+                decode_query = self.forward_absorb_qkv_proj(
                     q[decode_start:decode_end],
                     latent_cache[decode_start:decode_end],
+                    positions[decode_start:decode_end],
                     decode_ctx,
                     decode_locs,
-                    attn_output[decode_start:decode_end],
-                    topk_indices=topk_indices,
-                    topk_lens=topk_lens,
-                    output_gate=decode_gate,
-                    topk_owned=topk_owned,
                 )
-            else:
-                self.forward_absorb_attn_v_proj(
-                    decode_query,
-                    decode_ctx,
-                    attn_output[decode_start:decode_end],
-                    topk_indices=topk_indices,
-                    topk_lens=topk_lens,
-                    output_gate=decode_gate,
-                    topk_owned=topk_owned,
-                    gathered_query=gathered_query,
-                )
+            self.forward_absorb_attn_v_proj(
+                decode_query,
+                decode_ctx,
+                attn_output[decode_start:decode_end],
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                output_gate=(
+                    None
+                    if output_gate is None
+                    else output_gate[decode_start:decode_end]
+                ),
+                topk_owned=topk_owned,
+                gathered_query=gathered_query,
+            )
 
         return attn_output
 
@@ -1578,7 +1572,6 @@ class GlmDsaSparseAttentionMixin:
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
         output_gate: torch.Tensor | None = None,
-        topk_owned: bool = False,
     ) -> torch.Tensor:
         Q = self.forward_absorb_qkv_proj(
             q,
@@ -1594,7 +1587,6 @@ class GlmDsaSparseAttentionMixin:
             topk_indices=topk_indices,
             topk_lens=topk_lens,
             output_gate=output_gate,
-            topk_owned=topk_owned,
         )
 
     def forward_absorb_attn_v_proj(
