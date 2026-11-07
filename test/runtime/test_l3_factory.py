@@ -55,6 +55,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheMemoryPlan,
     CachePlaneLayout,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -117,6 +118,15 @@ def construction(tmp_path):
             groups=groups,
             buffers=(torch.zeros(68, dtype=torch.uint8),),
             consumers=(("layer.0.k",),),
+        ),
+        group_specs=(
+            CacheGroupSpec(
+                "full",
+                "full_history",
+                rows_per_page=1,
+                entry_stride_tokens=2,
+                replayable=False,
+            ),
         ),
         num_host_lcm_blocks=16,
     )
