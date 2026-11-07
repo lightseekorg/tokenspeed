@@ -2374,7 +2374,8 @@ def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows)
         for module in attn.modules():
             if isinstance(module, LinearBase):
                 module.quant_method.process_weights_after_loading(module)
-        assert v41._reads_swizzled_scales(attn.wq_b)
+        # Prepared for at least one layout its GEMM reads without a repack.
+        assert v41._scale_layouts(attn.wq_b) != frozenset({"canonical"})
         positions = torch.arange(6, device="cuda:0")
         requests = torch.zeros(6, dtype=torch.int64, device="cuda:0")
         x = torch.randn(6, 128, dtype=torch.bfloat16, device="cuda:0")
@@ -2382,7 +2383,7 @@ def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows)
         quantize = v41.rmsnorm_quantize_fp8_group32
 
         def recording(*args, **kwargs):
-            layouts.append(kwargs["swizzled_scales"])
+            layouts.append(kwargs["scale_layout"])
             return quantize(*args, **kwargs)
 
         monkeypatch.setattr(v41, "rmsnorm_quantize_fp8_group32", recording)
@@ -2405,9 +2406,13 @@ def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows)
             return out, [*backend.calls[-1][1:5], *sum(selections, ())]
 
         actual, actual_inputs = run()
-        monkeypatch.setattr(v41, "_reads_swizzled_scales", lambda layer: False)
+        monkeypatch.setattr(
+            v41, "_scale_layouts", lambda layer: frozenset({"canonical"})
+        )
         expected, expected_inputs = run()
-        assert layouts == [rows != "narrowed", False]
+        # Narrowing selects rows of the scales, which only canonical allows.
+        assert (layouts[0] == "canonical") == (rows == "narrowed")
+        assert layouts[1] == "canonical"
         if rows == "partitioned" and attn.indexer is not None:
             assert len(actual_inputs) == 6
         assert torch.equal(actual, expected)

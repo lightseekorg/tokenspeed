@@ -1799,6 +1799,7 @@ def test_batched_prefill_attention_matches_per_request_batches(monkeypatch):
                     swa_rope_cache=None,
                     swa_norm_weight=None,
                     swa_norm_eps=0.0,
+                    fused_decode_groups=None,
                     key_rows=None,
                 )
             )
@@ -1865,6 +1866,7 @@ def test_batched_prefill_reuses_owner_history_until_global_write():
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None,
         )
 

@@ -130,6 +130,13 @@ class _WindowAttention:
     def supports_fused_attention(self) -> bool:
         return True
 
+    @property
+    def supports_fused_prefill(self) -> bool:
+        # The drafter runs its window attention as decode rows only, and
+        # forward_v41 below serves the fused path for decode alone. Declaring
+        # prefill support here would raise instead of falling back.
+        return False
+
     def _workspace(self, swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps):
         """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
 
