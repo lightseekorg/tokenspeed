@@ -21,7 +21,7 @@ ts-collective = { package = "tokenspeed-collective", version = "0.1.0", path = "
 ts-metrics = { package = "tokenspeed-metrics", version = "0.1.0", path = "../ts-metrics" }
 ts-mooncake = { package = "tokenspeed-mooncake", version = "0.1.0", path = "../ts-mooncake" }
 ureq = { version = "2", default-features = false, features = ["json"] }
-zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+zeromq.workspace = true
 
 [lints]
 workspace = true
