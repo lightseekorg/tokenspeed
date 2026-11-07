@@ -49,7 +49,14 @@ def test_cuda_host_uint8_row_gather_matches_index():
 
 
 def _mxfp8_table(rows: int, dim: int, generator: torch.Generator) -> torch.Tensor:
-    """Packed [codes | scales] rows; scales span blocks under the 1e-4 amax floor."""
+    """Packed [codes | scales] rows; scales span blocks under the 1e-4 amax floor.
+
+    Row 0 has zero codes. With three or more rows, row 1 puts exponent byte 0
+    (2^-127) under nonzero codes of both signs, and row 2 has exponent byte 1
+    in its first block. These values, at most 448 * 2^-126, sit far below the
+    1e-4 amax floor, so the gather and the BF16 path must both turn them into
+    the same signed zero codes and the floor exponent.
+    """
     codes = torch.randint(0, 256, (rows, dim), dtype=torch.uint8, generator=generator)
     # 0x7F/0xFF are E4M3 NaN.
     codes[(codes & 0x7F) == 0x7F] = 0
@@ -57,20 +64,31 @@ def _mxfp8_table(rows: int, dim: int, generator: torch.Generator) -> torch.Tenso
         95, 135, (rows, dim // 32), dtype=torch.uint8, generator=generator
     )
     codes[0] = 0
+    if rows > 2:
+        # 1, -1, the smallest subnormals and +-448, then random nonzero codes.
+        codes[1, :6] = torch.tensor([0x38, 0xB8, 0x01, 0x81, 0x7E, 0xFE])
+        codes[1][codes[1] == 0] = 0x40
+        scales[1] = 0
+        scales[2, 0] = 1
     return torch.cat([codes, scales], dim=1)
 
 
 def _quantized_rows(table: torch.Tensor, indices: torch.Tensor):
-    """Reference: dequantize the rows to BF16, then quantize them 1x32 UE8M0."""
+    """Reference: the BF16 path the MXFP8 rows replace.
+
+    Dequantize as the Engram embedding does (torch's E8M0, so byte 0 is
+    2^-127), round to BF16, then quantize as the 1x32 UE8M0 activation
+    quantizer does (1e-4 amax floor, ceil exponent of amax * (1 / 448)).
+    """
     dim = table.shape[1] // 33 * 32
     ids = indices.cpu().long()
     valid = (ids >= 0) & (ids < table.shape[0])
     rows = table[ids.clamp(0, table.shape[0] - 1)].masked_fill(~valid[..., None], 0)
     codes = rows[..., :dim].view(torch.float8_e4m3fn).float()
-    scales = (rows[..., dim:].int() << 23).view(torch.float32)
+    scales = rows[..., dim:].view(torch.float8_e8m0fnu).float()
     values = (codes.unflatten(-1, (-1, 32)) * scales[..., None]).bfloat16().float()
     amax = values.abs().amax(-1).clamp_min(1e-4)
-    bits = (amax / 448.0).view(torch.int32)
+    bits = (amax * (1.0 / 448.0)).view(torch.int32)
     exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).int()
     quantized = (values / (exponent << 23).view(torch.float32)[..., None]).to(
         torch.float8_e4m3fn
