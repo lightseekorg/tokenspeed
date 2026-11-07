@@ -475,6 +475,54 @@ that publishes no end state (above) marks the input all the same: the prompt
 end, or the pre-tail checkpoint the next turn resumes at instead, was
 published or found cached earlier.
 
+**Superseded checkpoints.** With in-forward checkpoints, each turn
+of a conversation that re-renders the end of the last prompt resumes at the
+checkpoint the turn before wrote and writes its own, and the prompt ends and
+finishes that such a turn cannot resume at are skipped (dead checkpoints,
+above). A long conversation therefore leaves a chain of in-forward
+checkpoints, and only the newest two serve its next turn (one that diverges
+inside the last turn resumes at the older). With
+`demote_superseded_state_checkpoints` (on with
+`--enable-state-checkpoint-in-forward`; it requires in-forward checkpoints and
+has no effect on the D role or without State groups) a finish that publishes an in-forward checkpoint
+`C(n)` past the page boundary it resumed from, itself an in-forward checkpoint
+`C(n-1)` whose request resumed from an earlier one `C(n-2)`, demotes `C(n-2)`:
+its State entries and the sliding-window blocks behind it, less any block
+`C(n-1)` or `C(n)` resumes with, are dated back to access epoch 0 on both tiers
+and marked demoted (`CacheCoordinator::DemoteEntries`). The Device and a
+write-through Host evict them first, ahead of every dated entry and of the aged
+checkpoints checkpoint retention ranks at its cutoff, which keeps the live
+conversations' prefixes cached longer. A write-back Host segment plan takes a
+Host-only checkpoint boundary whose checkpoints are all demoted after dead
+entries, Host boundaries the Device covers or supersedes, and the Host copies
+of KV a request holds on the Device, but before the Host copies of unheld
+Device KV ([Cache concepts](cache-concepts.md)). The scheduler records which
+in-forward checkpoint each finish published and where its request resumed
+(`CheckpointLineage`, bounded). A shared `C(n-2)` stays: one another first
+admission also resumed at, or one an acquisition or publication touched after
+`C(n-1)`'s request resumed there
+(`BoundaryTree::Node::latest_state_access_epoch`) -- a fork, or a system prompt
+every new conversation resumes at. The scheduler sees no conversations, so a
+boundary only this conversation has resumed from so far is demoted even when
+another request published it before, until the next hit there. A boundary no
+in-forward checkpoint was recorded at (a junction or a prompt end alone) is
+never demoted. That holds for its State entries, not for the window blocks it
+shares with `C(n-2)`: another checkpoint whose own window reaches into
+`C(n-2)`'s, such as the prompt end of the turn that wrote `C(n-2)` when that
+one is not dead, or a junction just before it, can still need a demoted
+block. No entry a request or a transfer holds is demoted either; a hit, touch
+or republication dates an entry forward again and ends its demotion. No new store
+or eviction write-back copies a demoted entry to the Host: a finish's store
+skips it, and an eviction under the write-back policy drops it whatever evicted
+it (counted under that cause and in
+`HostCacheStats::demoted_entries_not_written_back`). A Host copy made before
+the demotion stays there, demoted too, and one an eviction write-back is still
+carrying lands demoted (`TierTransferManager::DemoteInFlightEvictions`). Only
+a demotion marks an entry demoted
+(`PrefixCacheIndex::CachedBlockMetadata::demoted`): a demoted session's entries
+(`DemoteSessions`) and superseded inputs sit at epoch 0 too, but keep their own
+rules with the flag on or off.
+
 **Aligned state checkpoints.** A State group can declare
 `checkpoint_granularity`, a multiple of the prefix-hash grain. Its published
 and matched states must end on that boundary. Intermediate prefill forwards

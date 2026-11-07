@@ -1505,11 +1505,17 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> co
         return;
     }
     for (const CacheGroup& group : groups_) {
+        const PrefixCacheIndex& index = group.Index();
         // A tail hash holds fewer blocks than a page; Contains filters.
         for (CacheKey& key : keysForGroup(content_hashes, group.Id())) {
-            if (group.Index().Contains(pool_, key)) {
-                pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
+            if (!index.Contains(pool_, key)) {
+                continue;
             }
+            // Read only with demotion on: off, this stays one lookup.
+            if (demotes_checkpoints_ && isDemotedEntry(index.Inspect(pool_, key)->metadata)) {
+                continue;
+            }
+            pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
         }
     }
 }
@@ -1878,19 +1884,37 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
     PrefixCacheIndex& index = groups_[group_id].Index();
     // Read while the entry is still there: the Host entry inherits it.
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata = index.MetadataFor(pool_, location);
+    // A demoted entry never rides an eviction write-back, whatever evicts it
+    // -- an admission's or a restore's victim, a request's own released slot
+    // or a stranded suffix: it is dropped, counted under what evicted it. A
+    // demoted session's entry or a superseded input shares its epoch without
+    // being demoted: the rule below takes it.
+    const bool demoted = metadata && isDemotedEntry(*metadata);
+    const bool drops_demoted = demoted && write_back_segment != nullptr;
     // A superseded input an admission, rotation or restore evicts leaves as the
     // reclaim of the request that superseded it, under either write policy,
     // and is never written back. It is never a stranded suffix: a tail at
     // epoch 0 is a candidate of its own before any page above it.
-    if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch &&
-        (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
-         reason == &DeviceEvictionStats::request_reclaim)) {
+    if (demoted) {
+        write_back_segment = nullptr;
+    } else if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch &&
+               (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
+                reason == &DeviceEvictionStats::request_reclaim)) {
         reason = &DeviceEvictionStats::request_reclaim;
         write_back_segment = nullptr;
     }
     const std::optional<CacheKey> key = index.UnpinnedKeyAt(pool_, location);
     if (!key) {
         return key;  // pinned or gone: nothing to record
+    }
+    if (drops_demoted) {
+        ++demoted_entries_not_written_back_;
+        // A request's own released slot the drain would have considered is
+        // dropped like a dead one, and counted with them, so the drain's
+        // outcomes still add up to the evictions it considered.
+        if (reason == &DeviceEvictionStats::request_reclaim) {
+            ++device_evictions_.request_reclaim_for_write_back;
+        }
     }
     if (write_back_segment != nullptr) {
         if (reason == &DeviceEvictionStats::request_reclaim) {
@@ -2303,6 +2327,68 @@ void CacheCoordinator::MarkSupersededStateInput(const ContentHash& resumed_tail_
                                                            /*newly_cached=*/nullptr, SessionForAccess(access_epoch));
                            }
                        });
+}
+
+static_assert(CacheCoordinator::kDemotedAccessEpoch == 0, "a demoted entry carries an epoch no access issues");
+
+std::vector<CacheKey> CacheCoordinator::BoundaryCheckpointKeys(std::span<const std::string> prefix_hashes,
+                                                               std::span<const std::int32_t> kept_boundaries) const {
+    std::vector<CacheKey> keys;
+    if (prefix_hashes.empty()) {
+        return keys;
+    }
+    // What a natural checkpoint at the boundary publishes in the groups that
+    // are not prefix-closed; the KV pages below it stay the path to the
+    // deeper boundaries.
+    const CompletedPages boundary{
+        .prefix_hashes = prefix_hashes,
+        .first_new_prefix_page = static_cast<std::int32_t>(prefix_hashes.size()) - 1,
+        .publish_state = true,
+    };
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (groups_[i].Matcher().IsPrefixClosed()) {
+            continue;
+        }
+        const bool sliding = groups_[i].Spec().attn_kind == AttnKind::kSlidingWindow;
+        for (PublishedRange& range : completedBlockRanges(i, boundary)) {
+            for (std::size_t j = 0; j < range.keys.size(); ++j) {
+                // A window block is keyed by its place on the chain, so a kept
+                // boundary whose window covers it resumes with this very entry.
+                const std::int32_t block = range.first_cache_block + static_cast<std::int32_t>(j);
+                const auto behind = [&](std::int32_t kept_tokens) {
+                    const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), kept_tokens);
+                    return block >= window.first && block < window.past_end;
+                };
+                if (sliding && std::ranges::any_of(kept_boundaries, behind)) {
+                    continue;
+                }
+                keys.push_back(std::move(range.keys[j]));
+            }
+        }
+    }
+    return keys;
+}
+
+std::int32_t CacheCoordinator::DemoteEntries(std::span<const CacheKey> keys) {
+    std::int32_t demoted = 0;
+    for (const CacheKey& key : keys) {
+        PrefixCacheIndex& index = groups_[key.group_id].Index();
+        demoted += index.Demote(pool_, key, kDemotedAccessEpoch, /*write_back_holds=*/0) ? 1 : 0;
+        if (host_pool_ != nullptr) {
+            demoted += index.Demote(*host_pool_, key, kDemotedAccessEpoch, /*write_back_holds=*/0) ? 1 : 0;
+        }
+    }
+    return demoted;
+}
+
+bool CacheCoordinator::DemoteHostEntryHeldByWriteBack(const CacheKey& key, std::uint32_t write_back_holds) {
+    return host_pool_ != nullptr &&
+           groups_[key.group_id].Index().Demote(*host_pool_, key, kDemotedAccessEpoch, write_back_holds);
+}
+
+std::uint64_t CacheCoordinator::LatestStateAccessEpoch(const ContentHash& hash) const {
+    const BoundaryTree::Node* node = boundary_tree_.Find(hash);
+    return node == nullptr ? 0 : node->latest_state_access_epoch;
 }
 
 void CacheCoordinator::recordCheckpoints(const CompletedPages& completed, std::uint64_t access_epoch) {
@@ -2928,6 +3014,11 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
     // past page 0, links it).
     index.Register(*host_pool_, block_ref, key, metadata.last_access_epoch, metadata.logical_block_index,
                    metadata.boundary_kind, /*newly_cached=*/nullptr, metadata.session);
+    // A copy a demotion reached on its way (TierTransferManager::
+    // DemoteInFlightEvictions) lands demoted, unless the entry is newer.
+    if (metadata.demoted) {
+        index.MarkDemoted(*host_pool_, key, kDemotedAccessEpoch);
+    }
     if (GroupIsState(key.group_id)) {
         BoundaryTree::Node* node = boundary_tree_.Find(key.content_hash);
         _assert(node != nullptr, "an indexed checkpoint has a tree node");

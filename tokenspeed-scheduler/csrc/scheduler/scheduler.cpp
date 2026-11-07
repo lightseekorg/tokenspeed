@@ -119,6 +119,18 @@ Scheduler::Scheduler(SchedulerConfig config)
         });
     }
 
+    // Validate requires in-forward checkpoints, and with them prefix caching,
+    // outside the D role, which computes no prompt; without a State group
+    // there is no checkpoint to demote.
+    bool has_state_group = false;
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        has_state_group = has_state_group || coordinator_.GroupIsState(static_cast<std::size_t>(i));
+    }
+    if (config_.demote_superseded_state_checkpoints && config_.role != Role::kD && has_state_group) {
+        checkpoint_lineage_.emplace();
+    }
+    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value());
+
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
     }
@@ -484,6 +496,7 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .host_evictions = coordinator_.HostEvictions(),
         .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
+        .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };

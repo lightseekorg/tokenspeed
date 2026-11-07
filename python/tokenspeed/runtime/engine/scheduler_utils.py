@@ -127,6 +127,7 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
+    demote_superseded_state_checkpoints: bool = False,
     max_kv_page_num: int = 0,
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
@@ -187,6 +188,12 @@ def make_config(
             State checkpoint is published at a prompt end that checkpoint
             covers (prefill and fused roles) or at a fused finish past the
             prompt end. Requires prefix caching.
+        demote_superseded_state_checkpoints:
+            On with ``--enable-state-checkpoint-in-forward``: a finish that
+            publishes an in-forward State checkpoint demotes the one its
+            conversation published two turns back, unless another request
+            shares it. Requires ``state_checkpoint_in_forward`` outside the
+            decode role.
         max_kv_page_num: Per-local-prefill-batch budget for the sum of
             ``ceil((cached prefix + current chunk) / prefix_granularity)``
             across requests. 0 leaves the budget unbounded. Derived from
@@ -248,6 +255,9 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if demote_superseded_state_checkpoints:
+        # Set only when on, as above.
+        cfg.demote_superseded_state_checkpoints = True
     if checkpoint_retention_requests is not None:
         # Set only when given, as above: an older scheduler wheel keeps its
         # plain LRU by default and refuses an explicit value.

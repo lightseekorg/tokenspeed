@@ -422,7 +422,9 @@ class ServerArgs:
     # no chunk is cut for it. The prompt end that checkpoint covers and a
     # fused finish past the prompt end then publish no state and no KV tail:
     # a next turn that re-renders the end of the prompt and its reply cannot
-    # resume there (docs/design/scheduler.md section 1.2).
+    # resume there. A finish also demotes the in-forward checkpoint its
+    # conversation published two turns back, which both cache tiers then evict
+    # early (docs/design/scheduler.md section 1.2).
     enable_state_checkpoint_in_forward: bool = False
     # Hybrid models: a State checkpoint a later request's checkpoint extends
     # ranks, under cache pressure, as if last used this many new requests ago. None
@@ -1512,7 +1514,8 @@ class ServerArgs:
 
         This is the flag, except on a decode server, whose prompts arrive by
         transfer. Its scheduler then also skips the dead prompt-end and finish
-        checkpoints; a decode server publishes them as ever.
+        checkpoints and demotes superseded in-forward checkpoints; a decode
+        server publishes the former as ever.
         """
         return (
             self.enable_state_checkpoint_in_forward
@@ -2977,8 +2980,15 @@ class ServerArgs:
             "finish, as on a prefill server, is kept if the state at the "
             "boundary has left the cache); a next turn that repeats the "
             "previous reply verbatim resumes at an earlier checkpoint instead "
-            "and recomputes the reply. Requires prefix caching; a decode server "
-            "ignores it. See docs/design/scheduler.md section 1.2.",
+            "and recomputes the reply. When a request publishes an in-forward "
+            "checkpoint past the one it resumed from, which its own predecessor "
+            "wrote past an earlier one, that earlier checkpoint -- two turns "
+            "back on the conversation -- is evicted early from the device and "
+            "host caches, and no new store or eviction write-back copies it to "
+            "host, unless another request also resumed from it, or acquired or "
+            "republished it after the conversation's previous turn resumed "
+            "there. Requires prefix caching; a decode server ignores it. See "
+            "docs/design/scheduler.md section 1.2.",
         )
         parser.add_argument(
             "--checkpoint-retention-requests",
