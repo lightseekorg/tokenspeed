@@ -264,10 +264,11 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 input_embeds=hidden_states,
             )
 
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, logits_metadata
-        )
+            # Keep the narrowed draft row counts active through the head exchange.
+            logits_metadata = LogitsMetadata.from_forward_context(ctx)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, logits_metadata
+            )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         """Shard preselection for ``load_weights`` (see DefaultModelLoader).
