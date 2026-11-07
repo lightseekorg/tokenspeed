@@ -1404,7 +1404,7 @@ def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
 
 @pytest.mark.parametrize(
     ("batch", "heads"),
-    [(1, 12), (4, 12), (16, 12), (1, 8), (4, 8), (1, 16), (4, 16)],
+    [(1, 12), (4, 12), (8, 12), (16, 12), (1, 8), (4, 8), (1, 16), (4, 16)],
 )
 def test_kda_fused_verify_and_replay_match_sequential_reference(
     batch: int, heads: int
@@ -1615,6 +1615,99 @@ def test_kda_fused_verify_and_replay_match_sequential_reference(
     )
     torch.testing.assert_close(conv_pool, expected_conv, atol=0, rtol=0)
     torch.testing.assert_close(state_pool, expected_state, atol=5e-4, rtol=5e-4)
+
+
+def test_kda_fused_verify_short_windows_match_single_request_runs() -> None:
+    """Windows shorter than the draft bound verify like each request alone."""
+    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA verify test")
+
+    torch.manual_seed(41)
+    heads, head_dim, draft = 12, 128, 4
+    width = heads * head_dim
+    counts = (4, 3, 2)
+    starts = [sum(counts[:index]) for index in range(len(counts) + 1)]
+    rows = starts[-1]
+    mixed_qkv = torch.randn(rows, 3 * width, device="cuda", dtype=torch.bfloat16)
+    f_a_out = torch.randn(rows, head_dim, device="cuda", dtype=torch.bfloat16)
+    beta_logits = torch.randn(rows, heads, device="cuda", dtype=torch.bfloat16)
+    conv_weights = 0.1 * torch.randn(3 * width, 4, device="cuda", dtype=torch.bfloat16)
+    conv_pool = 0.1 * torch.randn(
+        len(counts) + 1, 3 * width, 3, device="cuda", dtype=torch.bfloat16
+    )
+    f_b_weight = 0.1 * torch.randn(width, head_dim, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(width, device="cuda", dtype=torch.float32)
+    state_pool = 0.01 * torch.randn(
+        len(counts) + 1, heads, head_dim, head_dim, device="cuda", dtype=torch.float32
+    )
+
+    def verify(requests):
+        batch = len(requests)
+        window = [
+            row
+            for request in requests
+            for row in range(starts[request], starts[request + 1])
+        ]
+        boundaries = [0]
+        for request in requests:
+            boundaries.append(boundaries[-1] + counts[request])
+        correction = torch.zeros(
+            len(counts), draft, heads, head_dim, device="cuda", dtype=torch.float32
+        )
+        key_gate = torch.zeros(
+            len(counts), draft, heads, 2 * head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        metadata = torch.zeros(batch, 3, device="cuda", dtype=torch.int64)
+        metadata[:, 0] = torch.tensor(requests, device="cuda")
+        metadata[:, 1] = 1
+        indices = torch.tensor(requests, device="cuda", dtype=torch.int32) + 1
+        records = KdaReplayRecords(
+            original_qkv=None,
+            correction=correction.transpose(1, 2),
+            key_gate=key_gate.transpose(1, 2),
+            metadata=metadata,
+            stamps=torch.full(
+                (len(counts), draft, 2), -1, device="cuda", dtype=torch.int64
+            ),
+            query_start_loc=torch.tensor(boundaries, device="cuda", dtype=torch.int32),
+        )
+        output = try_kda_fused_paged_verify(
+            mixed_qkv[window],
+            conv_weights,
+            conv_pool,
+            conv_pool,
+            f_a_out[window],
+            f_b_weight,
+            beta_logits[window],
+            a_log,
+            dt_bias,
+            state_pool=state_pool,
+            state_scratch=None,
+            read_indices=indices,
+            write_indices=indices,
+            num_heads=heads,
+            head_dim=head_dim,
+            draft_token_num=draft,
+            lower_bound=LOWER_BOUND,
+            recurrent_layout="v_major",
+            store_states=False,
+            replay_records=records,
+        )
+        assert output is not None
+        return output[0], correction, key_gate
+
+    output, correction, key_gate = verify(list(range(len(counts))))
+    for request in range(len(counts)):
+        alone, alone_correction, alone_key_gate = verify([request])
+        rows_of_request = slice(starts[request], starts[request + 1])
+        torch.testing.assert_close(output[rows_of_request], alone, atol=0, rtol=0)
+        torch.testing.assert_close(
+            correction[request], alone_correction[request], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            key_gate[request], alone_key_gate[request], atol=0, rtol=0
+        )
 
 
 def test_kda_paged_decode_does_not_select_nvidia_kernel_on_amd() -> None:
