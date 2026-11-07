@@ -829,7 +829,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         cache_accesses.append(("fields", indexer.layer_id))
         return None, torch.empty(0), None
 
-    indexer._fields = fields
+    indexer.cache_fields = fields
     stacks = router.stacks
     metadata = backend.indexer_backend.metadata_for(ForwardMode.EXTEND)
     qsa_table = metadata.qsa_block_table
@@ -927,7 +927,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
     indexer.recent_page_size = 64
     indexer.compress_ratio = 4
     pool = SimpleNamespace(layerwise_load_tracker=None)
-    indexer._fields = lambda pool: (None, torch.empty(0), None)
+    indexer.cache_fields = lambda pool: (None, torch.empty(0), None)
     indexer._project_qk_raw = lambda hidden: (hidden, hidden[:, None, :])
     selection_widths = []
 
@@ -938,7 +938,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
 
     indexer._select = select
     draft_scratch = tuple(torch.empty(2) for _ in range(3))
-    indexer._draft_scratch_buffers = lambda *args: draft_scratch
+    indexer.draft_scratch = lambda *args: draft_scratch
     prepared = SimpleNamespace(
         logical_positions=torch.arange(8),
         request_indices=torch.zeros(8, dtype=torch.int64),
@@ -1103,7 +1103,7 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
         mrope_section=None,
         mrope_interleaved=False,
     )
-    indexer._fields = lambda pool: (
+    indexer.cache_fields = lambda pool: (
         torch.empty((2, 4, 1, 8)),
         torch.empty((2, 64, 1, 8)),
         torch.empty((2, 3), dtype=torch.int64),
@@ -1266,7 +1266,7 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     raw = torch.zeros((3, 4, 1, 2), dtype=torch.float32, device=device)
     compressed = torch.zeros((3, 64, 1, 2), dtype=torch.float32, device=device)
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
-    indexer._fields = lambda pool: (raw, compressed, rope_positions)
+    indexer.cache_fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 
@@ -1369,12 +1369,7 @@ def test_qwen4_exp_qsa_draft_scratch_spans_compression_boundaries() -> None:
         stage_draft=False,
     )
     raw[1, 3, 0] = -99
-    seed_position = torch.tensor([3], dtype=torch.long, device=device)
-    scratch = indexer._draft_scratch_buffers(
-        committed_keys[:1],
-        indexer._position_values(seed_position),
-        1,
-    )
+    scratch = indexer.draft_scratch(1, committed_keys.dtype, committed_keys.device)
 
     for value in range(3, 8):
         logical = torch.tensor([value], dtype=torch.long, device=device)
@@ -2238,6 +2233,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         speculative_num_draft_tokens=0,
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
+        enable_qsa_prefill_bf16_scratch=False,
     )
 
     setup = prepare_cache_setup(
@@ -2404,6 +2400,7 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
         mapping=Mapping(rank=0, world_size=1),
+        enable_qsa_prefill_bf16_scratch=False,
     )
     return prepare_cache_setup(
         family="qwen4_exp",

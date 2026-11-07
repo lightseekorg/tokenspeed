@@ -843,6 +843,7 @@ mod tests {
                 version: 7,
                 flush_cache,
                 weight_version: weight_version.map(str::to_owned),
+                snapshot: None,
             },
         )
     }

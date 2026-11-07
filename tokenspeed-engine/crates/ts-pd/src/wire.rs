@@ -18,9 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The P/D control messages. The frames are those the Python peers sent
-//! before this crate replaced them, byte for byte, so nodes of either
-//! version interoperate.
+//! The P/D control messages. Cache registrations carry an incarnation
+//! separate from the transport address: every P/D peer must support this
+//! nine-frame protocol before serving together.
 
 use bytes::Bytes;
 
@@ -49,12 +49,13 @@ fn text(frame: &[u8], name: &str) -> Result<String, WireError> {
 }
 
 /// A Decode rank's registration with a Prefill rank: where to reach it,
-/// its transfer session, and its cache.
+/// its transfer session, and the identity of its current cache.
 #[allow(clippy::too_many_arguments)]
 pub fn registration_frames(
     host: &str,
     port: u16,
     session_id: &str,
+    cache_id: &str,
     arena_base: u64,
     layout: &[u8],
     tp_size: i64,
@@ -70,6 +71,7 @@ pub fn registration_frames(
         Bytes::copy_from_slice(layout),
         ascii(tp_size),
         ascii(tp_rank),
+        ascii(cache_id),
     ]
 }
 
@@ -81,47 +83,103 @@ pub fn is_registration(frames: &[Bytes]) -> bool {
 }
 
 /// A registration's reply route, readable even when its layout is rejected
-/// (`KVArgsRegisterInfo.route_header_from_zmq`): endpoint, port, session.
+/// (`KVArgsRegisterInfo.route_header_from_zmq`): endpoint, port, cache identity.
 pub fn registration_route(frames: &[Bytes]) -> Result<(String, u16, String), WireError> {
-    if frames.len() != 8 || !is_registration(frames) {
-        return Err(error("CachePD slab registration requires exactly 8 frames"));
+    if frames.len() != 9 || !is_registration(frames) {
+        return Err(error("CachePD slab registration requires exactly 9 frames"));
     }
     let endpoint = text(&frames[1], "CachePD registration endpoint")?;
-    let session_id = text(&frames[3], "CachePD registration session")?;
+    let cache_id = text(&frames[8], "CachePD registration cache identity")?;
     if endpoint.is_empty() || endpoint.len() > 255 {
         return Err(error("CachePD registration endpoint is invalid"));
     }
-    if session_id.is_empty() || session_id.len() > 512 {
-        return Err(error("CachePD registration session is invalid"));
+    if cache_id.is_empty() || cache_id.len() > 512 {
+        return Err(error("CachePD registration cache identity is invalid"));
     }
     let port = parse_uint(&frames[2], 65535)
         .filter(|&port| port >= 1)
         .ok_or_else(|| error("CachePD registration port is invalid"))?;
-    Ok((endpoint, port as u16, session_id))
+    Ok((endpoint, port as u16, cache_id))
 }
 
 /// A Decode rank's pre-allocation of one request: its destination block
 /// manifest, empty for a rank that only joins the status agreement.
-pub fn preallocation_frames(room: u64, session_id: &str, manifest: Option<&[u8]>) -> Vec<Bytes> {
+pub fn preallocation_frames(room: u64, cache_id: &str, manifest: Option<&[u8]>) -> Vec<Bytes> {
     vec![
         ascii(room),
-        ascii(session_id),
+        ascii(cache_id),
         manifest.map_or_else(Bytes::new, Bytes::copy_from_slice),
     ]
 }
 
-/// A pre-allocation's room and session (`TransferInfo.route_header_from_zmq`).
+/// A pre-allocation's room and cache identity (`TransferInfo.route_header_from_zmq`).
 pub fn preallocation_route(frames: &[Bytes]) -> Result<(u64, String), WireError> {
     if frames.len() != 3 {
         return Err(error("CachePD pre-allocation requires exactly 3 frames"));
     }
     let room = parse_uint(&frames[0], MAX_ROOM)
         .ok_or_else(|| error("CachePD room must be canonical unsigned ASCII"))?;
-    let session_id = text(&frames[1], "CachePD session")?;
-    if session_id.is_empty() || session_id.len() > 512 {
-        return Err(error("CachePD request requires a Decode session"));
+    let cache_id = text(&frames[1], "CachePD cache identity")?;
+    if cache_id.is_empty() || cache_id.len() > 512 {
+        return Err(error("CachePD request requires a Decode cache identity"));
     }
-    Ok((room, session_id))
+    Ok((room, cache_id))
+}
+
+/// Explicit cancellation is distinct from a failure report: only its ACK
+/// proves that this Prefill rank can no longer write the room's pages.
+pub fn cancellation_frames(room: u64, cache_id: &str) -> Vec<Bytes> {
+    vec![Bytes::from_static(b"Cancel"), ascii(room), ascii(cache_id)]
+}
+
+pub fn is_cancellation(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|frame| frame.as_ref() == b"Cancel")
+}
+
+pub fn cancellation_route(frames: &[Bytes]) -> Result<(u64, String), WireError> {
+    if frames.len() != 3 || !is_cancellation(frames) {
+        return Err(error("CachePD cancellation requires exactly 3 frames"));
+    }
+    let room = parse_uint(&frames[1], MAX_ROOM)
+        .ok_or_else(|| error("CachePD room must be canonical unsigned ASCII"))?;
+    let cache_id = text(&frames[2], "CachePD cache identity")?;
+    if cache_id.is_empty() || cache_id.len() > 512 {
+        return Err(error(
+            "CachePD cancellation requires a Decode cache identity",
+        ));
+    }
+    Ok((room, cache_id))
+}
+
+pub fn cancellation_ack_frames(room: u64, cache_id: &str, rank: i64) -> Vec<Bytes> {
+    vec![
+        Bytes::from_static(b"CancelAck"),
+        ascii(room),
+        ascii(cache_id),
+        ascii(rank),
+    ]
+}
+
+pub fn is_cancellation_ack(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|frame| frame.as_ref() == b"CancelAck")
+}
+
+pub fn cancellation_ack(frames: &[Bytes]) -> Result<(u64, String, i64), WireError> {
+    if frames.len() != 4 || !is_cancellation_ack(frames) {
+        return Err(error(
+            "CachePD cancellation acknowledgment requires exactly 4 frames",
+        ));
+    }
+    let mut request = frames[..3].to_vec();
+    request[0] = Bytes::from_static(b"Cancel");
+    let (room, cache_id) = cancellation_route(&request)?;
+    let rank = parse_uint(&frames[3], i64::MAX as u64)
+        .ok_or_else(|| error("CachePD cancellation rank is invalid"))?;
+    Ok((room, cache_id, rank as i64))
 }
 
 /// A Prefill rank's report on one room.
@@ -253,6 +311,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancellation_and_its_retirement_ack_have_distinct_strict_formats() {
+        let request = cancellation_frames(7, "cache-a");
+        assert_eq!(
+            cancellation_route(&request).unwrap(),
+            (7, "cache-a".to_owned())
+        );
+        let ack = cancellation_ack_frames(7, "cache-a", 2);
+        assert_eq!(
+            cancellation_ack(&ack).unwrap(),
+            (7, "cache-a".to_owned(), 2)
+        );
+        assert!(cancellation_route(&ack).is_err());
+        assert!(cancellation_ack(&request).is_err());
+        assert!(cancellation_route(&cancellation_frames(7, "")).is_err());
+        assert!(cancellation_ack(&cancellation_ack_frames(7, "cache-a", -1)).is_err());
+        let mut invalid = request.clone();
+        invalid[1] = Bytes::from_static(b"07");
+        assert!(cancellation_route(&invalid).is_err());
+    }
+
+    #[test]
     fn a_status_message_round_trips() {
         let message = StatusMessage {
             room: 77,
@@ -278,22 +357,90 @@ mod tests {
 
     #[test]
     fn routes_parse_from_well_formed_frames_only() {
-        let frames = registration_frames("10.0.0.1", 4000, "10.0.0.1:5000", 0x1000, b"L", 4, 2);
+        let frames = registration_frames(
+            "10.0.0.1",
+            4000,
+            "10.0.0.1:5000",
+            "cache-a",
+            0x1000,
+            b"L",
+            4,
+            2,
+        );
         assert_eq!(
             registration_route(&frames),
-            Ok(("10.0.0.1".to_owned(), 4000, "10.0.0.1:5000".to_owned()))
+            Ok(("10.0.0.1".to_owned(), 4000, "cache-a".to_owned()))
         );
         assert_eq!(frames[4].as_ref(), 0x1000u64.to_ne_bytes());
-        assert!(registration_route(&frames[..7]).is_err());
+        assert!(registration_route(&frames[..8]).is_err());
 
-        let frames = preallocation_frames(42, "10.0.0.1:5000", None);
-        assert_eq!(
-            preallocation_route(&frames),
-            Ok((42, "10.0.0.1:5000".to_owned()))
-        );
+        let frames = preallocation_frames(42, "cache-a", None);
+        assert_eq!(preallocation_route(&frames), Ok((42, "cache-a".to_owned())));
         assert!(frames[2].is_empty());
         let bad = [ascii("042"), ascii("s"), Bytes::new()];
         assert!(preallocation_route(&bad).is_err());
         assert_eq!(session_port("[::1]:5000"), Some(5000));
+    }
+
+    #[test]
+    fn a_registration_routes_by_cache_identity_even_when_its_transport_is_invalid() {
+        let mut frames = registration_frames(
+            "10.0.0.1",
+            4000,
+            "10.0.0.1:5000",
+            "cache-b",
+            0x1000,
+            b"L",
+            1,
+            0,
+        );
+        frames[3] = Bytes::from_static(b"\xff");
+        assert_eq!(
+            registration_route(&frames),
+            Ok(("10.0.0.1".to_owned(), 4000, "cache-b".to_owned()))
+        );
+        for identity in [
+            Bytes::new(),
+            Bytes::from_static(b"\xff"),
+            ascii("x".repeat(513)),
+        ] {
+            frames[8] = identity.clone();
+            assert!(registration_route(&frames).is_err());
+            assert!(preallocation_route(&[ascii(1), identity, Bytes::new()]).is_err());
+        }
+    }
+
+    #[test]
+    fn a_registration_keeps_its_cache_identity_separate_from_its_transport() {
+        use crate::layout::registration::{Preallocation, RegistrationInfo};
+
+        let layout = crate::layout::contract::tests::wire();
+        let mut frames = registration_frames(
+            "10.0.0.1",
+            4000,
+            "10.0.0.1:5000",
+            "cache-c",
+            0x1000,
+            layout.as_bytes(),
+            1,
+            0,
+        );
+        let registration = RegistrationInfo::from_frames(&frames).unwrap();
+        assert_eq!(registration.session_id, "10.0.0.1:5000");
+        assert_eq!(registration.cache_id, "cache-c");
+        let allocation =
+            Preallocation::from_frames(&preallocation_frames(42, "cache-c", None)).unwrap();
+        assert_eq!(allocation.cache_id, registration.cache_id);
+        for session in [
+            Bytes::new(),
+            Bytes::from_static(b"\xff"),
+            ascii("x".repeat(513)),
+        ] {
+            frames[3] = session;
+            assert_eq!(
+                RegistrationInfo::from_frames(&frames).unwrap_err().0,
+                "CachePD registration session is invalid"
+            );
+        }
     }
 }

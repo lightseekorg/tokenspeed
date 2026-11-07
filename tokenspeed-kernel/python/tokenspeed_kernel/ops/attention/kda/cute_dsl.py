@@ -29,14 +29,17 @@ Exact-length execution retains the public wrapper's preparation.
 Sigmoid(beta), the safe gate, and QK L2 normalization run in-kernel, like the
 FLA and FlashKDA paths. The safe-gate lower bound is baked into the CUBIN
 and validated on every call.
+
+It also registers the in-tree CuTe DSL RecoverSSM verify, which replaces the
+Triton verify on Blackwell for BF16 windows of up to 16 tokens.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import math
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.kda._triton.prefill_scan_inputs import (
     prepare_capacity_scan,
@@ -45,12 +48,16 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
     _DENSE_HALF_SIGNATURES,
     _nvidia_kda_prefill,
 )
+from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+    vllm_triton_kda_recoverssm_verify,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.cutedsl_kda import (
     cutedsl_kda_forward_with_prepared_plan,
     cutedsl_kda_supports_prepared_plan,
@@ -65,7 +72,7 @@ def cutedsl_kda_supported() -> bool:
     return (
         platform.is_nvidia
         and platform.arch_version in _SUPPORTED_ARCHES
-        and importlib.util.find_spec("tokenspeed_cutedsl_kda") is not None
+        and has_optional_package("tokenspeed_cutedsl_kda")
     )
 
 
@@ -292,3 +299,129 @@ def cutedsl_kda_chunk_prefill(
         cu_seqlens_cpu=cu_seqlens_cpu,
     )
     return out.view(batch, tokens, num_value_heads, value_dim), final_state
+
+
+if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
+
+    @register_kernel(
+        "attention",
+        "kda_recoverssm_verify",
+        name="cute_dsl_kda_recoverssm_verify",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim_align": frozenset({32}),
+            "head_dim_max": frozenset({128}),
+            "spec_query_len_max": frozenset({16}),
+            "paged_state": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
+            "state_dtype": frozenset({torch.float32}),
+        },
+    )
+    def cute_dsl_kda_recoverssm_verify(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        raw_g: torch.Tensor,
+        raw_beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        *,
+        checkpoint_state: torch.Tensor,
+        correction_cache: torch.Tensor,
+        kg_cache: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        spec_query_len: int,
+        lower_bound: float | None,
+        out: torch.Tensor,
+        record_metadata: torch.Tensor | None,
+        record_stamps: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Verify candidates and save current-window recovery records.
+
+        Same contract as ``vllm_triton_kda_recoverssm_verify``: q/k/v and raw_g
+        pack tokens as [1, tokens, heads, dim] with dense heads, raw_beta omits
+        the final dim, and A_log and dt_bias parameterize the gate. lower_bound
+        selects the bounded gate, or None the softplus gate. checkpoint_state
+        uses [page, head, value, key]; state_indices selects request pages,
+        with pages <= 0 marking padding, and query_start_loc gives packed-token
+        offsets for windows of at most spec_query_len tokens. correction_cache
+        is FP32 [slot, head, position, channel] and kg_cache holds unnormalized
+        K and raw gate. record_metadata is INT64 [batch, 3] (slot, generation,
+        absolute start) and record_stamps INT64 [slots, capacity, 2]; both may
+        be None only for unstamped diagnostics.
+
+        Inputs the CuTe DSL kernel cannot address run the Triton verify
+        instead: token rows or state not 16-byte aligned, state tiles that are
+        not dense, strided indices or record channels, a strided one-element
+        A_log, and positive lower bounds.
+
+        Returns out after writing verify results; the checkpoint is unchanged.
+        """
+        from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
+            recoverssm_verify,
+            recoverssm_verify_supported,
+        )
+
+        if not recoverssm_verify_supported(
+            q,
+            k,
+            v,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            checkpoint_state,
+            correction_cache,
+            kg_cache,
+            query_start_loc,
+            state_indices,
+            spec_query_len,
+            lower_bound,
+            out,
+        ):
+            return vllm_triton_kda_recoverssm_verify(
+                q,
+                k,
+                v,
+                raw_g,
+                raw_beta,
+                A_log,
+                dt_bias,
+                checkpoint_state=checkpoint_state,
+                correction_cache=correction_cache,
+                kg_cache=kg_cache,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                spec_query_len=spec_query_len,
+                lower_bound=lower_bound,
+                out=out,
+                record_metadata=record_metadata,
+                record_stamps=record_stamps,
+            )
+        return recoverssm_verify(
+            q,
+            k,
+            v,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            lower_bound=lower_bound,
+            checkpoint_state=checkpoint_state,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            spec_query_len=spec_query_len,
+            out=out,
+            record_metadata=record_metadata,
+            record_stamps=record_stamps,
+        )

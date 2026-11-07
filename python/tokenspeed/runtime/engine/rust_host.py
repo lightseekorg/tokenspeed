@@ -67,6 +67,7 @@ from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -93,6 +94,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_ops_from_plan,
     engram_context_len,
     resolve_dspark_prefix_replay_tokens,
+    resolve_in_flight_depth,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.encode_host import EncodeBootstrap
@@ -405,6 +407,9 @@ class HostConfig:
             model without Engram.
         request_token_history: The model reads each request's committed
             token history (``ModelConfig.requires_request_token_history``).
+        request_token_history_lookback: Committed tokens the model reads
+            behind the frontier, which bounds the history seeds; None seeds
+            the whole prefix.
         physical_context_len: Tokens a request's buffers hold.
         kv_total_pages: Usable cache pages, reported with the load.
         rank: This rank.
@@ -485,6 +490,7 @@ class HostConfig:
     spec_num_tokens: int | None
     ngram_context_len: int
     request_token_history: bool
+    request_token_history_lookback: int | None
     physical_context_len: int
     kv_total_pages: int
     kv_token_capacity: int
@@ -523,6 +529,16 @@ class HostConfig:
     epd_receive_enabled: bool
     grammar: GrammarSettings | None
     eager_grammar: bool
+
+
+def host_in_flight_depth(server_args: ServerArgs) -> int:
+    """``HostConfig.in_flight_depth`` of a rank launched with
+    ``server_args`` (``resolve_in_flight_depth``)."""
+    return resolve_in_flight_depth(
+        disable_overlap_schedule=server_args.disable_overlap_schedule,
+        disaggregation_mode=server_args.disaggregation_mode,
+        pp_size=server_args.mapping.pp_size,
+    )
 
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
@@ -1152,7 +1168,8 @@ class HostBootstrap:
             else:
                 draft_model_config = None
             ngram_context_len = engram_context_len(model_config.hf_text_config)
-            if ngram_context_len and mapping.has_pp:
+            in_flight_depth = host_in_flight_depth(server_args)
+            if ngram_context_len and in_flight_depth > 1:
                 raise NotImplementedError(
                     "Engram input history requires PP=1 and in-flight depth <= 1"
                 )
@@ -1315,10 +1332,7 @@ class HostBootstrap:
                 handshake_address=server_args.zmq_handshake_endpoint(),
                 engine_index=server_args.zmq_engine_index + dp_rank,
                 ready_response=zmq_wire.encode(ready_response),
-                # The chunk pipeline keeps one forward per stage in flight.
-                in_flight_depth=(
-                    mapping.pp_size if mapping.has_pp else overlap_schedule_depth
-                ),
+                in_flight_depth=in_flight_depth,
                 vocab_size=model_config.vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
                 top_k_exclusive_max=get_sampling_backend_class(
@@ -1338,6 +1352,16 @@ class HostBootstrap:
                 ),
                 ngram_context_len=ngram_context_len,
                 request_token_history=model_config.requires_request_token_history,
+                request_token_history_lookback=(
+                    resolve_history_seed_lookback(
+                        model_config.model_profile,
+                        (
+                            draft_model_config.model_profile
+                            if draft_model_config is not None
+                            else None
+                        ),
+                    )
+                ),
                 physical_context_len=(
                     model_config.context_len + server_args.spec_context_pad
                 ),

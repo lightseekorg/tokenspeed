@@ -31,6 +31,8 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    fs::File,
+    io::Read,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex, MutexGuard,
@@ -62,6 +64,13 @@ const SOCKET_POLL: Duration = Duration::from_millis(100);
 /// How long a bootstrap-server lookup may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A fresh cache must never inherit the identity of a reused transport address.
+fn new_cache_id() -> std::io::Result<String> {
+    let mut random = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    Ok(format!("{:032x}", u128::from_be_bytes(random)))
+}
+
 /// A Decode rank's settings.
 #[derive(Debug, Clone)]
 pub struct DecodeConfig {
@@ -89,6 +98,7 @@ pub struct DecodeConfig {
 /// A Prefill rank a route reaches.
 #[derive(Debug, Clone)]
 struct Target {
+    rank: i64,
     host: String,
     port: u16,
     is_dummy: bool,
@@ -107,7 +117,15 @@ struct Landed {
 type ConnectionKey = (String, u64, Vec<i64>);
 
 #[derive(Default)]
+struct Cancellation {
+    acknowledged: BTreeSet<i64>,
+    sent: Option<Instant>,
+}
+
+#[derive(Default)]
 struct State {
+    /// Changes whenever the cache is restored, even if its address is reused.
+    cache_id: String,
     rooms: RoomTable,
     /// The rooms of the requests the scheduling loop tracks. Only these
     /// keep state: a late report, connection or admission of a room the
@@ -123,6 +141,7 @@ struct State {
     targets: HashMap<u64, Arc<Vec<Target>>>,
     admissions: HashMap<u64, i32>,
     waiting_since: HashMap<u64, Instant>,
+    cancellations: HashMap<u64, Cancellation>,
     /// Bootstrap address -> the rooms reading from it.
     addr_rooms: HashMap<String, HashSet<u64>>,
     /// Bootstrap address -> its route; the addresses the heartbeat watches.
@@ -143,7 +162,7 @@ impl State {
     /// Apply one Prefill rank's report.
     fn apply(&mut self, message: StatusMessage) {
         let room = message.room;
-        if !self.tracked.contains(&room) {
+        if !self.tracked.contains(&room) || self.cancellations.contains_key(&room) {
             return;
         }
         match message.status {
@@ -238,7 +257,7 @@ impl State {
         route: &PrefillRoute,
         targets: Arc<Vec<Target>>,
     ) -> bool {
-        if !self.tracked.contains(&room) {
+        if !self.tracked.contains(&room) || self.cancellations.contains_key(&room) {
             return false;
         }
         self.expected
@@ -250,6 +269,34 @@ impl State {
             .insert(room);
         self.rooms.update(room, TransferPoll::Bootstrapped);
         true
+    }
+
+    fn acknowledge_cancellation(&mut self, room: u64, cache_id: &str, rank: i64) {
+        if cache_id != self.cache_id
+            || !self
+                .targets
+                .get(&room)
+                .is_some_and(|targets| targets.iter().any(|target| target.rank == rank))
+        {
+            return;
+        }
+        if let Some(cancellation) = self.cancellations.get_mut(&room) {
+            cancellation.acknowledged.insert(rank);
+        }
+    }
+
+    fn cancellation_retired(&self, room: u64) -> bool {
+        let Some(cancellation) = self.cancellations.get(&room) else {
+            return false;
+        };
+        // No manifest ever named these pages. The state lock excludes a
+        // concurrent admission, which also checks the cancellation marker.
+        !self.admissions.contains_key(&room)
+            || self.targets.get(&room).is_some_and(|targets| {
+                targets
+                    .iter()
+                    .all(|target| cancellation.acknowledged.contains(&target.rank))
+            })
     }
 
     /// The Prefill node at bootstrap address `addr` is lost: forget its
@@ -289,6 +336,7 @@ impl State {
         self.targets.remove(&room);
         self.admissions.remove(&room);
         self.waiting_since.remove(&room);
+        self.cancellations.remove(&room);
         if let Some(rooms) = self.addr_rooms.get_mut(addr) {
             rooms.remove(&room);
         }
@@ -312,6 +360,42 @@ struct Shared {
 impl Shared {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("the PD state lock is poisoned")
+    }
+
+    /// Queue cancellation on the same sockets as registration and manifests.
+    /// Retrying an unacknowledged request is safe and does not block the loop.
+    fn cancel(&self, room: u64) {
+        let mut state = self.state();
+        if !state.tracked.contains(&room) {
+            return;
+        }
+        if !state.rooms.has_failure(room) {
+            state.fail(
+                room,
+                "KV receive cancelled; waiting for remote writes to retire",
+            );
+        } else {
+            state.rooms.update(room, TransferPoll::Failed);
+        }
+        let cancellation = state.cancellations.entry(room).or_default();
+        if cancellation
+            .sent
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        cancellation.sent = Some(Instant::now());
+        if state.admissions.contains_key(&room) {
+            if let Some(targets) = state.targets.get(&room) {
+                for target in targets.iter() {
+                    self.transport.sockets.send(
+                        &target.host,
+                        target.port,
+                        wire::cancellation_frames(room, &state.cache_id),
+                    );
+                }
+            }
+        }
     }
 
     /// The route for `addr`, fetched and planned once.
@@ -338,6 +422,13 @@ impl Shared {
     /// look up the route, register with its ranks the first time the route
     /// is used, and mark the room bootstrapped.
     fn connect(&self, room: u64, addr: &str) -> Result<(), String> {
+        let cache_id = {
+            let state = self.state();
+            if !state.tracked.contains(&room) || state.cancellations.contains_key(&room) {
+                return Ok(());
+            }
+            state.cache_id.clone()
+        };
         let route = self.route(addr)?;
         let dp_group = room % route.prefill_dp_size.max(1) as u64;
         let key: ConnectionKey = (addr.to_owned(), dp_group, route.target_tp_ranks.clone());
@@ -372,35 +463,47 @@ impl Shared {
                         .and_then(|port| u16::try_from(port).ok())
                         .ok_or_else(lookup_failed)?;
                     targets.push(Target {
+                        rank,
                         host: host.to_owned(),
                         port,
                         is_dummy: route.dummy_tp_ranks.contains(&rank),
                     });
                 }
-                let targets = Arc::new(targets);
-                self.state().connections.insert(key, targets.clone());
-                // Registered once per route; a room's pre-allocation follows
-                // on the same socket, so it arrives after the registration.
-                let session_id = self.transport.session_id();
-                for target in targets.iter() {
-                    self.transport.sockets.send(
-                        &target.host,
-                        target.port,
-                        wire::registration_frames(
-                            &self.local_ip,
-                            self.transport.sockets.port(),
-                            &session_id,
-                            self.arena_base,
-                            &self.layout_wire,
-                            self.tp_size,
-                            self.tp_rank,
-                        ),
-                    );
-                }
-                targets
+                Arc::new(targets)
             }
         };
-        if self.state().attach(room, addr, &route, targets) {
+        let mut state = self.state();
+        // The HTTP lookup may outlive a cancelled request or a cache release.
+        // Do not repopulate the new cache's connections with that old work.
+        if !state.tracked.contains(&room)
+            || state.cancellations.contains_key(&room)
+            || state.cache_id != cache_id
+        {
+            return Ok(());
+        }
+        if !state.connections.contains_key(&key) {
+            // Enqueue registration while holding the incarnation lock. A
+            // room's pre-allocation follows on this same socket.
+            let session_id = self.transport.session_id();
+            for target in targets.iter() {
+                self.transport.sockets.send(
+                    &target.host,
+                    target.port,
+                    wire::registration_frames(
+                        &self.local_ip,
+                        self.transport.sockets.port(),
+                        &session_id,
+                        &state.cache_id,
+                        self.arena_base,
+                        &self.layout_wire,
+                        self.tp_size,
+                        self.tp_rank,
+                    ),
+                );
+            }
+            state.connections.insert(key, targets.clone());
+        }
+        if state.attach(room, addr, &route, targets) {
             tracing::debug!(room, "connected");
         }
         Ok(())
@@ -482,13 +585,17 @@ impl DecodeOutbox {
         self.shared.transport.release_regions()
     }
 
-    /// A wake re-mapped the cache: register it under a fresh transfer
-    /// session, as the Prefill ranks write into this memory with the keys of
-    /// its registration, and forget the registrations made under the old
-    /// one, so the next request registers the new session again.
+    /// A wake re-mapped the cache: replace both its transfer engine and its
+    /// identity. The next request registers this incarnation even when the
+    /// engine reuses an earlier transport address.
     pub fn restore_registration(&self) -> Result<(), String> {
+        let cache_id = new_cache_id()
+            .map_err(StartError::CacheIdentity)
+            .map_err(|error| error.to_string())?;
+        let mut state = self.shared.state();
         self.shared.transport.restore_regions(true)?;
-        self.shared.state().connections.clear();
+        state.cache_id = cache_id;
+        state.connections.clear();
         Ok(())
     }
 
@@ -540,20 +647,18 @@ impl DecodeOutbox {
     /// A request's pages are admitted: send its manifest to its Prefill
     /// ranks; its KV lands at `request_pool_index`.
     fn receive(&self, rid: &str, room: u64, request_pool_index: i32, manifest: &[u8]) {
-        let targets = {
-            let mut state = self.shared.state();
-            if !state.tracked.contains(&room) {
-                // The loop ended the request (its transfer failed) after it
-                // planned this admission: its pages go back, so no Prefill
-                // rank may write them.
-                tracing::debug!(rid, room, "not pre-allocating an ended request");
-                return;
-            }
-            state.admissions.insert(room, request_pool_index);
-            state.waiting_since.insert(room, Instant::now());
-            state.rooms.update(room, TransferPoll::WaitingForInput);
-            state.targets.get(&room).cloned()
-        };
+        let mut state = self.shared.state();
+        if !state.tracked.contains(&room) || state.cancellations.contains_key(&room) {
+            // The loop ended the request (its transfer failed) after it
+            // planned this admission: its pages go back, so no Prefill
+            // rank may write them.
+            tracing::debug!(rid, room, "not pre-allocating an ended request");
+            return;
+        }
+        state.admissions.insert(room, request_pool_index);
+        state.waiting_since.insert(room, Instant::now());
+        state.rooms.update(room, TransferPoll::WaitingForInput);
+        let targets = state.targets.get(&room).cloned();
         let Some(targets) = targets else {
             tracing::warn!(
                 rid,
@@ -562,14 +667,13 @@ impl DecodeOutbox {
             );
             return;
         };
-        let session_id = self.shared.transport.session_id();
         for target in targets.iter() {
             self.shared.transport.sockets.send(
                 &target.host,
                 target.port,
                 wire::preallocation_frames(
                     room,
-                    &session_id,
+                    &state.cache_id,
                     (!target.is_dummy).then_some(manifest),
                 ),
             );
@@ -605,11 +709,15 @@ impl DecodePeer {
     /// socket and start the threads.
     pub fn start(config: DecodeConfig) -> Result<(Self, DecodeOutbox), StartError> {
         let layout = Contract::from_wire(&config.layout)?;
+        let cache_id = new_cache_id().map_err(StartError::CacheIdentity)?;
         let (incoming, messages) = mpsc::channel::<Vec<bytes::Bytes>>();
         let transport = Transport::start(&config.peer, incoming)?;
         let shared = Arc::new(Shared {
             transport,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                cache_id,
+                ..State::default()
+            }),
             local_ip: config.peer.local_ip.clone(),
             engine_rank: config.peer.engine_rank,
             arena_base: config.arena_base,
@@ -627,6 +735,12 @@ impl DecodePeer {
                 .name("ts-pd-status".to_owned())
                 .spawn(move || loop {
                     match messages.recv_timeout(SOCKET_POLL) {
+                        Ok(frames) if wire::is_cancellation_ack(&frames) => {
+                            match wire::cancellation_ack(&frames) {
+                                Ok((room, cache_id, rank)) => shared.state().acknowledge_cancellation(room, &cache_id, rank),
+                                Err(error) => tracing::error!(%error, "rejecting a malformed cancellation acknowledgment"),
+                            }
+                        }
                         Ok(frames) => match StatusMessage::from_frames(&frames) {
                             Ok(message) => {
                                 tracing::debug!(room = message.room, status = ?message.status, "status");
@@ -694,6 +808,11 @@ impl DecodePeer {
     /// The transfer engine's session id.
     pub fn session_id(&self) -> String {
         self.shared.transport.session_id()
+    }
+
+    /// The current cache incarnation, independent of its transfer address.
+    pub fn cache_id(&self) -> String {
+        self.shared.state().cache_id.clone()
     }
 
     fn forget(&mut self, rid: &str) {
@@ -819,15 +938,38 @@ impl TransferPeer for DecodePeer {
             polls
         };
 
+        // A failure report, timeout or client abort is not a remote-write
+        // fence. Every replica member must cancel every target before the
+        // scheduler may recycle any rank's destination pages.
+        let mut retired = Vec::with_capacity(self.order.len());
+        let mut has_failure = false;
+        for (rid, &poll) in self.order.iter().zip(&agreed) {
+            let receiver = self.receivers.get_mut(rid).expect("tracked");
+            let failed = poll == TransferPoll::Failed as i64;
+            if failed {
+                has_failure = true;
+                receiver.concluded = Some(TransferPoll::Failed);
+                self.shared.cancel(receiver.room);
+            }
+            retired.push(i64::from(
+                !failed || self.shared.state().cancellation_retired(receiver.room),
+            ));
+        }
+        let retired = if replica.size() > 1 && has_failure {
+            mesh.all_reduce(replica, &retired, Reduce::Min)?
+        } else {
+            retired
+        };
+
         let mut events = Vec::new();
         let mut ended = Vec::new();
-        for (rid, &poll) in self.order.iter().zip(&agreed) {
+        for ((rid, &poll), &retired) in self.order.iter().zip(&agreed).zip(&retired) {
             let receiver = self.receivers.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
             if receiver.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 receiver.local = TransferPoll::Bootstrapped;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
-            } else if poll == TransferPoll::Failed {
+            } else if poll == TransferPoll::Failed && retired != 0 {
                 let reason = self
                     .shared
                     .state()
@@ -872,6 +1014,13 @@ impl TransferPeer for DecodePeer {
 
     fn has_in_flight(&self) -> bool {
         !self.order.is_empty()
+    }
+
+    fn cancel(&mut self, rid: &str) {
+        if let Some(receiver) = self.receivers.get_mut(rid) {
+            receiver.concluded = Some(TransferPoll::Failed);
+            self.shared.cancel(receiver.room);
+        }
     }
 
     /// The decode node has no encoder to wait on.
@@ -947,6 +1096,57 @@ mod tests {
         assert!(state.expected.is_empty());
         assert!(state.targets.is_empty());
         assert!(state.pending.is_empty() && state.landed.is_empty());
+    }
+
+    #[test]
+    fn cancellation_needs_every_target_including_dummy_and_the_current_cache() {
+        let mut state = State {
+            cache_id: "current".to_owned(),
+            ..State::default()
+        };
+        connected(&mut state, 1, "prefill:80");
+        state.targets.insert(
+            1,
+            Arc::new(vec![
+                Target {
+                    rank: 0,
+                    host: "p0".to_owned(),
+                    port: 1,
+                    is_dummy: false,
+                },
+                Target {
+                    rank: 1,
+                    host: "p1".to_owned(),
+                    port: 2,
+                    is_dummy: true,
+                },
+            ]),
+        );
+        state.admissions.insert(1, 7);
+        state.cancellations.insert(1, Cancellation::default());
+        state.acknowledge_cancellation(1, "old", 0);
+        state.acknowledge_cancellation(1, "current", 9);
+        assert!(!state.cancellation_retired(1));
+        state.acknowledge_cancellation(1, "current", 0);
+        state.acknowledge_cancellation(1, "current", 0);
+        state.apply(success(1, 1, 7));
+        assert!(!state.cancellation_retired(1));
+        assert_ne!(state.rooms.get(1), Some(TransferPoll::Success));
+        state.acknowledge_cancellation(1, "current", 1);
+        assert!(state.cancellation_retired(1));
+        state.clear(1, "prefill:80");
+        state.acknowledge_cancellation(1, "current", 0);
+        assert!(state.cancellations.is_empty());
+    }
+
+    #[test]
+    fn cancelling_before_admission_blocks_a_late_connection_without_waiting_for_ack() {
+        let mut state = State::default();
+        state.tracked.insert(1);
+        state.cancellations.insert(1, Cancellation::default());
+        assert!(state.cancellation_retired(1));
+        assert!(!state.attach(1, "prefill:80", &route(), Arc::new(Vec::new())));
+        assert!(state.targets.is_empty());
     }
 
     #[test]

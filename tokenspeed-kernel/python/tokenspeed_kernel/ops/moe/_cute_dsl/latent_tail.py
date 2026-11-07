@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.fabric import multicast_reachable
 from tokenspeed_kernel.platform import current_platform
 
 if TYPE_CHECKING:
@@ -39,45 +40,6 @@ K3_SHARED_RS_MAX_TOKENS = 32
 _MAX_NUM_TOKENS = 64
 _SKINNY_MAX_NUM_TOKENS = 5
 _COLLECTIVE_TOKEN_CTAS = 8
-
-
-def multicast_reachable(group: dist.ProcessGroup) -> bool:
-    """Whether NVLS multicast can actually map across ``group``'s ranks.
-
-    ``symm_mem`` importing is not enough: a cross-host group without fabric or
-    IMEX still reports multicast support locally and then hangs inside the
-    rendezvous instead of letting the caller fall back. The host-span test is
-    at group granularity: a node-local subgroup of a multi-host job never
-    needs fabric, and probing one would decline a group that works over plain
-    NVLink on a machine with no fabric at all.
-
-    Size alone does not establish node-locality, and neither does alignment to
-    the group's own width: at eight devices a host, ``[6, 7, 8]`` is contiguous
-    and starts on a multiple of three while still living on two hosts. What
-    decides it is which host each rank sits on, which the world map records
-    beside the fabric verdict. Nothing is divided out of the visible device
-    count here: a job running fewer workers than a host has GPUs puts two hosts
-    inside one such window, and the group would skip the fabric test entirely.
-
-    Both terms come from the map gathered at distributed initialization, so
-    every rank makes the same local decision, and a map never gathered declines
-    rather than guessing at placement.
-    """
-    import torch.distributed as dist
-    from tokenspeed_kernel.ops.communication.fabric import (
-        group_has_fabric,
-        group_host_span,
-    )
-
-    if not dist.is_initialized():
-        return False
-    ranks = dist.get_process_group_ranks(group)
-    span = group_host_span(ranks)
-    if span is None:
-        return False
-    if span <= 1:
-        return True
-    return group_has_fabric(ranks)
 
 
 def multicast_backend_unavailable_reason(

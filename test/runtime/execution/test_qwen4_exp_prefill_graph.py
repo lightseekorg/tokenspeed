@@ -196,7 +196,7 @@ def test_qsa_break_replays_live_rows_positions_and_cache_writes(monkeypatch) -> 
     indexer.recent_page_size = 64
     indexer.compress_ratio = 4
     indexer._project_qk_raw = lambda hidden: (hidden[:, :1], hidden[:, :1])
-    indexer._fields = lambda pool: (None, pool.compressed, None)
+    indexer.cache_fields = lambda pool: (None, pool.compressed, None)
 
     def write_and_compress(
         token_k, positions, logical, requests, qsa_locs, recent_locs, pool, **kwargs

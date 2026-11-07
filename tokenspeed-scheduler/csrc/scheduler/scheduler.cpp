@@ -119,6 +119,18 @@ Scheduler::Scheduler(SchedulerConfig config)
         });
     }
 
+    // Validate requires in-forward checkpoints, and with them prefix caching,
+    // outside the D role, which computes no prompt; without a State group
+    // there is no checkpoint to demote.
+    bool has_state_group = false;
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        has_state_group = has_state_group || coordinator_.GroupIsState(static_cast<std::size_t>(i));
+    }
+    if (config_.demote_superseded_state_checkpoints && config_.role != Role::kD && has_state_group) {
+        checkpoint_lineage_.emplace();
+    }
+    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value());
+
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
     }
@@ -287,8 +299,60 @@ void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std
 
 void Scheduler::registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                            const CompletedPages& completed) {
-    registerKvEventPrefixPages(request, prefix_hashes, completed.first_new_prefix_page);
-    if (!config_.enable_kv_cache_events || !completed.tail) {
+    if (!config_.enable_kv_cache_events) {
+        return;
+    }
+    // Pages below the new ones keep their descriptors while the request's own
+    // published blocks hold them on the Device -- not after a restore brought
+    // the request back on unpublished copies -- so the range starts at the
+    // first page the publication registers an entry under.
+    registerKvEventPrefixPages(request, prefix_hashes, coordinator_.FirstPublishedPage(completed));
+    if (completed.tail) {
+        registerKvEventTail(request, prefix_hashes, *completed.tail);
+    }
+}
+
+std::vector<std::int32_t> Scheduler::kvEventTailsOf(const RetractionImage& image) const {
+    std::vector<std::int32_t> tails;
+    if (!config_.enable_kv_cache_events) {
+        return tails;
+    }
+    for (const ImageTable& table : image.tables) {
+        for (const ImageSlot& slot : table.slots) {
+            if (!slot.InHostCache()) {
+                continue;
+            }
+            // A published slot's boundary is on the Device, so it has its
+            // descriptor; one with fewer tokens than a page is a tail's.
+            const auto it = kv_event_boundaries_.find(eventKey(slot.key));
+            FatalCheck(it != kv_event_boundaries_.end(), "an imaged published slot has no KV event descriptor");
+            const auto tail_tokens = static_cast<std::int32_t>(it->second.stored.token_ids.size());
+            const std::int32_t boundary = it->second.depth * config_.prefix_granularity + tail_tokens;
+            if (tail_tokens < config_.prefix_granularity && std::ranges::find(tails, boundary) == tails.end()) {
+                tails.push_back(boundary);
+            }
+        }
+    }
+    return tails;
+}
+
+void Scheduler::registerKvEventRestore(Request& request, std::span<const std::string> prefix_hashes,
+                                       std::span<const std::int32_t> tails) {
+    registerKvEventPrefixPages(request, prefix_hashes, 0);
+    for (const std::int32_t boundary : tails) {
+        const auto full_pages = static_cast<std::size_t>(boundary / config_.prefix_granularity);
+        _assert(full_pages <= prefix_hashes.size(), "an imaged tail lies inside the request's computed pages");
+        const std::span<const std::string> pages = prefix_hashes.first(full_pages);
+        const std::optional<TailPublication> tail =
+            request.TailPublicationAt(boundary, pages.empty() ? std::string{} : pages.back());
+        _assert(tail.has_value(), "an imaged tail lies strictly inside a page");
+        registerKvEventTail(request, pages, *tail);
+    }
+}
+
+void Scheduler::registerKvEventTail(Request& request, std::span<const std::string> prefix_hashes,
+                                    const TailPublication& tail) {
+    if (!config_.enable_kv_cache_events) {
         return;
     }
     const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
@@ -296,8 +360,8 @@ void Scheduler::registerKvEventPublication(Request& request, std::span<const std
     const std::optional<std::uint64_t> parent_hash =
         full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[full_pages - 1]};
     const std::span<const std::int32_t> tail_tokens =
-        request.TokenSlice(full_pages * config_.prefix_granularity, completed.tail->tail_tokens);
-    const CacheKey key{.content_hash = completed.tail->hash};
+        request.TokenSlice(full_pages * config_.prefix_granularity, tail.tail_tokens);
+    const CacheKey key{.content_hash = tail.hash};
     KvBlockStoredEvent event{
         .block_hashes = {HashKvBlock(tail_tokens, parent_hash)},
         .parent_block_hash = parent_hash,
@@ -432,6 +496,7 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .host_evictions = coordinator_.HostEvictions(),
         .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
+        .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };
@@ -498,6 +563,9 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
+        if (request->PdFailureRetired()) {
+            continue;  // local forward results still own the failed request's pages
+        }
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
                              fsm::Retracted>()) {
             candidates.push_back(request.get());

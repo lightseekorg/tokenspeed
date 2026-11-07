@@ -26,7 +26,7 @@ from __future__ import annotations
 # below for registration and would rebind the bare name ``torch`` in this
 # package namespace, hence the alias.
 import torch as _torch
-from tokenspeed_kernel.ops.sampling.logprob import vocab_parallel_logprobs
+from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -37,7 +37,7 @@ __all__ = [
     "eagle4_candidate_supports",
     "eagle4_candidate_tail",
     "eagle4_shard_topk",
-    "vocab_parallel_logprobs",
+    "blockwise_logprobs",
     "prepare_sampling_offsets",
 ]
 

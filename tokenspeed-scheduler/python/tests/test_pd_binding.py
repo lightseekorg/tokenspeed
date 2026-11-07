@@ -66,6 +66,98 @@ def test_pd_event_fields_are_bound():
     assert event.request_id == "req-0"
 
 
+@pytest.mark.parametrize(
+    "terminal", ["success", "failure", "cancel_success", "cancel_failure"]
+)
+@pytest.mark.parametrize("pool_pages", [8, 12])
+def test_prefill_duplicate_sources_survive_until_pd_terminal(terminal, pool_pages):
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefix_granularity = 2
+    cfg.max_scheduled_tokens = 8
+    cfg.max_batch_size = 4
+    cfg.num_device_pages = pool_pages
+    cfg.num_snapshot_pages = 1
+    cfg.disable_l2_cache = True
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=2,
+            total_pages=pool_pages,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    scheduler.submit_requests([make_spec(rid, [1, 2, 3, 4]) for rid in ("a", "b")])
+    scheduler.advance(
+        ExecutionEvent()
+        .add_event(PD.BootstrappedEvent("a"))
+        .add_event(PD.BootstrappedEvent("b"))
+    )
+    first = scheduler.next_execution_plan().forward[0]
+    sources = {
+        rid: [int(p) for p in row if p > 0]
+        for rid, row in zip(first.request_ids, dict(first.block_tables)["history"])
+    }
+    assert set(sources["a"]).isdisjoint(sources["b"])
+    for rid in ("a", "b"):
+        result = ForwardEvent.ExtendResult()
+        result.request_id, result.tokens = rid, [5]
+        scheduler.advance(ExecutionEvent().add_event(result))
+    handoff = scheduler.next_execution_plan().remote_decode
+    actual = {
+        rid: [int(p) for p in row if p > 0]
+        for rid, row in zip(handoff.request_ids, dict(handoff.block_tables)["history"])
+    }
+    assert (
+        actual == sources
+    ), "prefix publication must not replace transfer source pages"
+    if terminal.startswith("cancel"):
+        abort = ForwardEvent.Abort()
+        abort.request_id = "b"
+        scheduler.advance(ExecutionEvent().add_event(abort))
+        assert scheduler.pd_transfer_size() == 2
+    scheduler.submit_requests([make_spec("c", [10, 11])])
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("c")))
+    later = scheduler.next_execution_plan().forward[0]
+    if pool_pages == 8:
+        assert (
+            not later.request_ids
+        ), "capacity pressure must wait instead of recycling a PD source"
+    else:
+        allocated = {
+            int(p) for row in dict(later.block_tables)["history"] for p in row if p > 0
+        }
+        assert allocated.isdisjoint(set(sources["a"] + sources["b"]))
+    for rid in ("a", "b"):
+        event = (
+            PD.SucceededEvent(rid)
+            if terminal.endswith("success")
+            else PD.FailedEvent(rid)
+        )
+        scheduler.advance(ExecutionEvent().add_event(event))
+    if pool_pages == 8:
+        later = scheduler.next_execution_plan().forward[0]
+        assert list(later.request_ids) == ["c"], "terminal ACK must unblock allocation"
+    scheduler.advance(ExecutionEvent().add_event(PD.FailedEvent("c")))
+    assert scheduler.active_lcm_blocks() > 0, "the local forward has not landed yet"
+    # Repeated cancellation after the terminal transfer event must not make
+    # retirement wait for another transfer event that will never arrive.
+    abort = ForwardEvent.Abort()
+    abort.request_id = "c"
+    scheduler.advance(ExecutionEvent().add_event(abort))
+    scheduler.advance(ExecutionEvent().add_event(abort))
+    result = ForwardEvent.ExtendResult()
+    result.request_id, result.tokens = "c", [12]
+    scheduler.advance(ExecutionEvent().add_event(result))
+    scheduler.next_execution_plan()
+    assert (
+        scheduler.active_lcm_blocks() == 0
+    ), "terminal requests must release every pin"
+    assert scheduler.available_lcm_blocks() == cfg.num_device_pages - 1
+
+
 def test_execution_event_accepts_pd_events():
     """ExecutionEvent.add_event accepts PD events and returns self for chaining."""
     execution_event = ExecutionEvent()
@@ -291,3 +383,127 @@ def test_remote_admission_lands_the_state_in_slot_one_and_decodes_in_place(
         if step > 0:
             complete_decode("next", 200 + step)
     complete_decode("next", 210)
+
+
+def make_prefill_state_config(
+    drop_short_prompt_end_checkpoints: bool,
+) -> SchedulerConfig:
+    """A prefill server for a hybrid model (one History and one State group,
+    2-token pages) with the in-forward State checkpoint under an 8-token chunk
+    budget, so a prompt of 8 tokens or fewer has none."""
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefix_granularity = 2
+    cfg.max_scheduled_tokens = 8
+    cfg.max_batch_size = 1
+    cfg.num_device_pages = 65
+    cfg.num_snapshot_pages = 1  # the P role never retracts
+    cfg.disable_l2_cache = True
+    cfg.state_checkpoint_in_forward = True
+    cfg.drop_short_prompt_end_checkpoints = drop_short_prompt_end_checkpoints
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=2,
+            total_pages=65,
+            attn_kind=AttnKind.Full,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+        ),
+        CacheGroupConfig(
+            group_id="state",
+            block_granularity=0,
+            total_pages=65,
+            attn_kind=AttnKind.State,
+            transfer_policy=CacheTransferPolicy.LatestSnapshot,
+        ),
+    ]
+    return cfg
+
+
+def prefill_and_hand_off(
+    scheduler: Scheduler, request_id: str, tokens: list[int]
+) -> int:
+    """A prefill-server turn: the prompt's forwards, the hand-off to the decode
+    peer and the peer's ACK, which finishes the request. Returns where the
+    first forward resumed."""
+    scheduler.submit_requests([make_spec(request_id, tokens)])
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent(request_id)))
+    first_prefix = None
+    scheduled = 0
+    while scheduled < len(tokens):
+        [batch] = [
+            op for op in scheduler.next_execution_plan().forward if op.request_ids
+        ]
+        prefix = list(batch.extend_prefix_lens)[0]
+        first_prefix = prefix if first_prefix is None else first_prefix
+        scheduled = prefix + list(batch.input_lengths)[0]
+        result = ForwardEvent.ExtendResult()
+        result.request_id = request_id
+        result.tokens = [100] if scheduled == len(tokens) else []
+        scheduler.advance(ExecutionEvent().add_event(result))
+    handoff = scheduler.next_execution_plan().remote_decode
+    assert handoff is not None and list(handoff.request_ids) == [request_id]
+    scheduler.advance(ExecutionEvent().add_event(PD.SucceededEvent(request_id)))
+    return first_prefix
+
+
+@pytest.mark.parametrize("drop", [False, True])
+def test_a_prefill_server_can_drop_a_short_prompt_end(drop):
+    """``drop_short_prompt_end_checkpoints``: the 5-token prompt ends inside
+    its third page. Without the flag its finish publishes that end, where a
+    longer prompt resumes; with it only the full pages, which hold no state,
+    so the longer prompt starts over."""
+    scheduler = Scheduler(make_prefill_state_config(drop))
+    assert prefill_and_hand_off(scheduler, "short", [1, 2, 3, 4, 5]) == 0
+    resumed = prefill_and_hand_off(scheduler, "longer", [1, 2, 3, 4, 5, 6, 7])
+    assert resumed == (0 if drop else 5)
+
+
+def test_a_page_aligned_short_prompt_end_keeps_its_state():
+    scheduler = Scheduler(make_prefill_state_config(True))
+    prefill_and_hand_off(scheduler, "aligned", [1, 2, 3, 4])
+    assert prefill_and_hand_off(scheduler, "longer", [1, 2, 3, 4, 5, 6]) == 4
+
+
+def test_dropping_short_prompt_ends_takes_the_prefill_role_and_the_in_forward_checkpoint():
+    cfg = make_prefill_state_config(True)
+    cfg.state_checkpoint_in_forward = False
+    with pytest.raises(ValueError, match="requires state_checkpoint_in_forward"):
+        Scheduler(cfg)
+    cfg.state_checkpoint_in_forward = True
+    cfg.role = SchedulerConfig.Role.Fused
+    with pytest.raises(ValueError, match="P role only"):
+        Scheduler(cfg)
+
+
+def test_prefill_chunk_yield_round_trips_and_is_validated():
+    """The P-role knob is off by default, reaches the scheduler, and a value
+    above half the chunk budget is refused at construction."""
+    cfg = SchedulerConfig()
+    assert cfg.prefill_chunk_yield_tokens == 0
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefix_granularity = 16
+    cfg.max_scheduled_tokens = 32
+    cfg.max_batch_size = 4
+    cfg.num_device_pages = 64
+    cfg.num_snapshot_pages = 1  # the P role never retracts
+    cfg.disable_l2_cache = True
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=16,
+            total_pages=64,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    cfg.prefill_chunk_yield_tokens = 16
+    assert cfg.prefill_chunk_yield_tokens == 16
+    Scheduler(cfg)
+    cfg.prefill_chunk_yield_tokens = 17
+    with pytest.raises(ValueError, match="at most half of max_scheduled_tokens"):
+        Scheduler(cfg)
+    cfg.prefill_chunk_yield_tokens = 16
+    cfg.role = SchedulerConfig.Role.D
+    with pytest.raises(ValueError, match="P role only"):
+        Scheduler(cfg)

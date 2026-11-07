@@ -70,16 +70,25 @@ struct CacheProgress {
     // index keeps them cached. A retraction drops them once its publication
     // is applied (a Retracted request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
+    // The boundary of the in-forward State checkpoint the request published
+    // -- from its block, or from the live slot of a chunk that ended there --
+    // zero without one. Kept after the blocks are let go: the finish reads it
+    // (SchedulerConfig::demote_superseded_state_checkpoints).
+    std::int32_t published_state_checkpoint_tokens{0};
     // One aligned input checkpoint and its non-replayable sliding windows.
     // Kept while the request runs: restricted State cannot publish a decode
     // frontier to replace it. Admission may release this optional hold for
     // capacity, and retraction drops it before imaging the request.
     std::vector<CacheBlockRef> retained_input_checkpoint;
     // The boundary the first admission resumed from (its prefix hit; zero for
-    // none). The pre-tail State checkpoint makes the prompt end dead
+    // none). Never changes after the first admission. The pre-tail State
+    // checkpoint makes the prompt end dead
     // (SchedulerConfig::state_checkpoint_in_forward) only for a request that
     // resumed at or below it, which every admission of the prompt and its
-    // first decode read alike (Scheduler::promptEndCheckpoint).
+    // first decode read alike (Scheduler::promptEndCheckpoint). Superseded
+    // checkpoint demotion counts it at the first admission and reads it at
+    // the finish (Scheduler::demoteSupersededCheckpoint). Neither reads it on
+    // the D role, the only one whose first admission is a remote landing.
     std::int32_t resume_tokens{0};
 };
 
@@ -284,6 +293,10 @@ struct Retracted {
     std::int32_t prefix_granularity{};
     CacheProgress cache_progress;
     RetractionImage image;
+    // The tails (boundaries in tokens) the image's published slots sit at,
+    // from their KV-event descriptors (Scheduler::kvEventTailsOf): the
+    // restore registers them again before its ACK republishes the slots.
+    std::vector<std::int32_t> kv_event_tails;
     // The slot-state blob's slot in the runtime's arena. Shared with the
     // store that exports into it and, later, the restore that imports from
     // it: whichever of the state and the in-flight op lives longer keeps the
@@ -328,6 +341,7 @@ struct Retracted {
 struct Restoring {
     ForwardResources resources;
     RetractionImage image;
+    std::vector<std::int32_t> kv_event_tails;  // Retracted::kv_event_tails
     std::shared_ptr<SnapshotSlotIndex> blob_slot;
     ResumeShape shape;
     std::uint32_t restore_op{0};

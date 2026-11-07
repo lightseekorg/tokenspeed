@@ -95,6 +95,11 @@ pub trait TransferPeer {
     /// A transfer is still tracked: it may yet read or write the cache.
     fn has_in_flight(&self) -> bool;
 
+    /// Cancel a registered request without blocking. Its pages remain owned
+    /// until `poll` reports failure after every transfer has retired. Unknown
+    /// or already cancelled requests are harmless.
+    fn cancel(&mut self, rid: &str);
+
     /// EPD, P role: tell the decode node waiting on room `room` that the
     /// request failed before it could register (its embeddings never
     /// arrived), so its receiver fails instead of waiting. Best effort.

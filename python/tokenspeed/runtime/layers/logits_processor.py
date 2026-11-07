@@ -46,7 +46,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
-    MEGATRON_VOCAB_BLOCK,
+    BLOCKWISE_LOGPROB_ORDERS,
 )
 from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import (
@@ -236,7 +236,13 @@ class LogitsMetadata:
     def from_forward_context(cls, ctx: ForwardContext):
         return cls(
             forward_mode=ctx.forward_mode,
-            capture_hidden_mode=ctx.capture_hidden_mode,
+            # A drafter whose sink took every tap as the target produced it
+            # reads no hidden capture, so none is concatenated or stored.
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL
+                if ctx.target_capture_sink is not None
+                else ctx.capture_hidden_mode
+            ),
             gather_ids=ctx.gather_ids,
             logits_rows_selected=ctx.logits_rows_selected,
             input_logprob_rows=ctx.input_logprob_rows,
@@ -342,16 +348,14 @@ class LogitsProcessor(nn.Module):
 
         # --logprob-order: the log-softmax behind input (prompt) logprobs.
         self.logprob_order: str = global_server_args_dict["logprob_order"]
-        if (
-            self.logprob_order == "megatron"
-            and config.vocab_size % MEGATRON_VOCAB_BLOCK != 0
-        ):
+        blockwise_order = BLOCKWISE_LOGPROB_ORDERS.get(self.logprob_order)
+        if blockwise_order is not None and config.vocab_size % blockwise_order[0] != 0:
             # The logits every logprob reads are sliced to config.vocab_size
             # (_get_logits), and the trainer's sum(exp) folds fixed-width
             # blocks of them; refuse at construction, not on the forward thread.
             raise ValueError(
-                "--logprob-order megatron folds sum(exp) over fixed "
-                f"{MEGATRON_VOCAB_BLOCK}-wide vocabulary blocks and needs a "
+                f"--logprob-order {self.logprob_order} folds sum(exp) over fixed "
+                f"{blockwise_order[0]}-wide vocabulary blocks and needs a "
                 f"vocab_size that is a multiple of it; got {config.vocab_size}"
             )
 
@@ -782,11 +786,11 @@ class LogitsProcessor(nn.Module):
                     aux_pruned_states = list(aux_hidden_states)
             elif shard is not None:
                 pruned_states = gather_sampled_rows(
-                    hidden_states, shard, gather_ids, group=self.tp_group
+                    hidden_states, shard, group=self.tp_group
                 )
                 if select_aux:
                     aux_pruned_states = [
-                        gather_sampled_rows(h, shard, gather_ids, group=self.tp_group)
+                        gather_sampled_rows(h, shard, group=self.tp_group)
                         for h in aux_hidden_states
                     ]
             else:
@@ -909,7 +913,7 @@ class LogitsProcessor(nn.Module):
         is vocab-sharded over the same group, so a row's full-vocabulary
         logits need every rank's slice *of that row*: the planned rows'
         activations are all-gathered first (one collective with the
-        per-rank counts, rank order being row order) and the chunk loop then
+        per-rank counts, then put back in row order) and the chunk loop then
         runs over the whole plan on every rank, exactly as without a shard.
         Every rank ends with the same fp32 vector -- the unsharded forward's
         bit for bit, since each row meets the same operands -- so no result
@@ -967,7 +971,9 @@ class LogitsProcessor(nn.Module):
             )
         if plan.chunk_tokens <= 0:
             raise ValueError("input_logprob_chunk_tokens must be positive")
-        if (plan.rows_per_rank is None) != (shard is None):
+        if (plan.rows_per_rank is None) != (shard is None) or (
+            plan.gathered_to_rows is None
+        ) != (shard is None):
             raise ValueError(
                 "input logprob rows were staged for "
                 f"{'a sharded' if plan.rows_per_rank is not None else 'an unsharded'} "
@@ -986,7 +992,7 @@ class LogitsProcessor(nn.Module):
                 )
             source = token_all_gather_rows(
                 hidden_states[plan.rows], self.tp_group, list(plan.rows_per_rank)
-            )
+            ).index_select(0, plan.gathered_to_rows)
             index = None
             staged_rows = source.shape[0]
         num_rows = plan.num_result_rows
@@ -1024,7 +1030,9 @@ class LogitsProcessor(nn.Module):
                 require_full_vocab=True,
             )
             out[begin:end] = gather_token_logprobs(
-                logits, plan.targets[begin:end], logprob_order=self.logprob_order
+                logits,
+                plan.targets[begin:end],
+                logprob_order=self.logprob_order,
             )
             if top is not None:
                 top[0][begin:end], top[1][begin:end] = top_token_logprobs(logits, top_k)
@@ -1153,7 +1161,9 @@ class LogitsProcessor(nn.Module):
             # GGUF models
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
 
-        if self.logit_scale is not None:
+        # With a softcap, the softcap kernel applies the scale after the
+        # gathers below: they only move rows, so the result is the same.
+        if self.logit_scale is not None and not self.final_logit_softcapping:
             logits.mul_(self.logit_scale)
 
         if lm_head_tp_row_counts is not None:
@@ -1243,7 +1253,11 @@ class LogitsProcessor(nn.Module):
         logits = logits[:, : self.config.vocab_size].contiguous()
 
         if self.final_logit_softcapping:
-            fused_softcap_generic(logits, self.final_logit_softcapping)
+            fused_softcap_generic(
+                logits,
+                self.final_logit_softcapping,
+                1.0 if self.logit_scale is None else self.logit_scale,
+            )
 
         return logits
 
@@ -1265,6 +1279,7 @@ class LogitsProcessor(nn.Module):
 @triton.jit
 def fused_softcap_kernel(
     full_logits_ptr,
+    logit_scale,
     softcapping_value,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
@@ -1276,6 +1291,10 @@ def fused_softcap_kernel(
 
     # Load values
     x = tl.load(full_logits_ptr + offsets, mask=mask).to(tl.float32)
+
+    # Scale and round to the logits' dtype first, exactly as an in-place
+    # multiply of the stored logits would.
+    x = (x * logit_scale).to(full_logits_ptr.dtype.element_ty).to(tl.float32)
 
     # Perform operations in-place
     x = x / softcapping_value
@@ -1289,13 +1308,25 @@ def fused_softcap_kernel(
     tl.store(full_logits_ptr + offsets, x, mask=mask)
 
 
-def fused_softcap(full_logits, final_logit_softcapping):
+def fused_softcap(full_logits, final_logit_softcapping, logit_scale):
+    """Scale, then softcap ``full_logits`` in place.
+
+    Args:
+        full_logits: Logits to update in place.
+        final_logit_softcapping: The softcap ``c`` in ``c * tanh(x / c)``.
+        logit_scale: Multiplier applied to each logit (rounded to the logits'
+            dtype) before the softcap; 1.0 for none.
+
+    Returns:
+        ``full_logits``.
+    """
     n_elements = full_logits.numel()
     BLOCK_SIZE = 1024
     grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE, 1, 1)
 
     fused_softcap_kernel[grid](
         full_logits_ptr=full_logits,
+        logit_scale=logit_scale,
         softcapping_value=final_logit_softcapping,
         n_elements=n_elements,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -1303,5 +1334,5 @@ def fused_softcap(full_logits, final_logit_softcapping):
     return full_logits
 
 
-def fused_softcap_generic(full_logits, final_logit_softcapping):
-    return fused_softcap(full_logits, final_logit_softcapping)
+def fused_softcap_generic(full_logits, final_logit_softcapping, logit_scale):
+    return fused_softcap(full_logits, final_logit_softcapping, logit_scale)

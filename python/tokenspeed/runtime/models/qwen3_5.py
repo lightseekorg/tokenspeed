@@ -1022,6 +1022,15 @@ class Qwen3_5ForCausalLM(nn.Module):
     ATTENTION_LAYER_CLS: type = Qwen3_5AttentionDecoderLayer
     LINEAR_LAYER_CLS: type = Qwen3_5LinearDecoderLayer
 
+    def decoder_layer_cls(self, layer_type: str) -> type:
+        """The decoder layer class that ``make_layers`` builds for a layer of
+        ``layer_type`` (an entry of ``config.layers_block_type``). A model
+        overrides it to build another implementation of the layer."""
+        return {
+            "attention": self.ATTENTION_LAYER_CLS,
+            "linear_attention": self.LINEAR_LAYER_CLS,
+        }[layer_type]
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1051,14 +1060,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             tp_group=self.mapping.attn.tp_group,
         )
 
-        layer_cls_by_type = {
-            "attention": self.ATTENTION_LAYER_CLS,
-            "linear_attention": self.LINEAR_LAYER_CLS,
-        }
-
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
-            layer_class = layer_cls_by_type[layer_type]
+            layer_class = self.decoder_layer_cls(layer_type)
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
             else:

@@ -28,6 +28,7 @@ from threading import Lock
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._scheduling import release_drain, sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
@@ -480,6 +481,11 @@ def _dsa_persistent_radix_topk_kernel(
             sem="relaxed",
             scope="gpu",
         )
+        # Every wave added to the row histogram, but one thread arrives for
+        # the whole program, and s_barrier does not wait for memory. So each
+        # wave first waits until its no-return atomics reach L2 (vmcnt counts
+        # them like stores).
+        release_drain()
         gl.barrier()
 
         row_pass_arrival = pass_arrivals + row * _PERSISTENT_COUNTER_STRIDE
@@ -3036,6 +3042,7 @@ def _dsa_persistent_radix_topk(
         TOPK=topk,
         BLOCK_N=block_n,
         num_warps=_PERSISTENT_NUM_WARPS,
+        **sched_compile_options(),
     )
     return out, lens_out
 

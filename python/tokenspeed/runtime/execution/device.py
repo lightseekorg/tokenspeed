@@ -1002,6 +1002,7 @@ class DeviceHandle:
                     req.version,
                     self._mooncake_update_models(),
                     require_complete=require_complete,
+                    snapshot=req.snapshot,
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
@@ -1368,6 +1369,9 @@ def build_device_side(
         narrowing_prefill_model,
     )
     from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        prepare_prefix_history_transport,
+    )
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1399,6 +1403,12 @@ def build_device_side(
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
+        prepare_prefix_history_transport(
+            server_args,
+            model_config,
+            [runner.model for runner in (target, draft) if runner is not None],
+            torch.device(server_args.device, gpu_id),
+        )
     if communication_first:
         prepare_multimodal()
 
@@ -1600,7 +1610,9 @@ def build_device_side(
         host_tail_packing = {
             group.group_id: packing * shards[group.group_id]
             for group, packing in zip(
-                layout.groups, compute_host_group_packing(layout), strict=True
+                layout.groups,
+                compute_host_group_packing(layout, group_specs=contract.group_specs),
+                strict=True,
             )
         }
     snapshot_pool = _retraction_pool_request(

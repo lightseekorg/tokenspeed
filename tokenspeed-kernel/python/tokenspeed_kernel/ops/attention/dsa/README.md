@@ -34,15 +34,12 @@ optional LSE is FP32 in natural-log units. Empty selections produce zero
 output and negative-infinite LSE. Negative slots inside a visible prefix are
 masked. Omitting lengths inspects the full selected-slot width.
 
-Install a FlashInfer build containing PR #7984 (tested source revision
-`335e25d0b8d95bf42709d6851c569dddc26577d6`) and compatible CUTLASS DSL
-libraries. Select `solution="flashinfer_prims"` in the kernel API, or set
+The pinned FlashInfer 0.7.3 provides the Prims-TS sparse MLA wrapper. Select
+`solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
 and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`
 for serving. TRTLLM keeps its higher default priority, and also returns the
-LSE that decode context parallelism merges. The solution registers only when
-the installed FlashInfer provides the Prims-TS sparse MLA wrapper; otherwise
-such calls fall back to Triton. The indexer is unchanged.
+LSE that decode context parallelism merges. The indexer is unchanged.
 
 The upstream plan owns PDL scheduling. This adapter requires PDL enabled and
 rejects an explicit disable request. The caller prepares Q and the selected
@@ -263,6 +260,23 @@ launches from it declares the feature alongside the keyword, and the facade
 reads the registration rather than probing call signatures, so a
 `*args, **kwargs` wrapper never receives a keyword its launcher cannot take.
 
+`row_starts_cpu` optionally supplies an int32 or int64 CPU mirror of each query's
+inclusive workspace-row start, shape `[tokens]`. A strided mirror is valid.
+Together with `candidate_lens_cpu`, it lets a leaf plan groups of queries
+sharing a history without reading metadata back from the device. The caller
+must provide the current invocation's values in the same workspace coordinates
+as `row_starts`, including any slice or group rebase. The facade checks shape,
+device, and dtype; it does not compare values against device metadata.
+A stale mirror violates the contract and can produce incorrect selection.
+
+`None` supplies no mirror and preserves existing selection. A supplied mirror
+requires `ROW_STARTS_CPU_FEATURE` (`"row_starts_cpu"`) and reaches the selected
+leaf unchanged. Ordinary selection, explicit overrides, and saved plans reject
+leaves without the feature instead of dropping the argument. A declaring leaf
+must accept the keyword and support its omission. No in-tree production leaf
+currently declares this feature; it is an extension contract for registered
+providers, not a standalone scoring optimization.
+
 ## Slot order of the sparse cores
 
 `dsa_decode` and `dsa_prefill` take a required `slot_order` in
@@ -326,6 +340,14 @@ DeepGEMM index scoring registers for 16, 32, or 64 index heads. The
 16-head case pads queries and weights to its native 32-head ABI with zeros;
 caller-provided scoring scales and forced initial/local candidate policies
 remain unchanged. Kernel traits exclude other head counts.
+
+DeepGEMM's FP8 logits kernels take no query scale, so
+`quantize_index_query_weights` quantizes each (token, head) query to E4M3
+with the 1x128 token-group quantizer's arithmetic and folds that scale and
+`softmax_scale` into the head weights in one launch, bit-exact with NVIDIA's
+`quantize_fp8` followed by `combine_topk_weights`. Before the decode top-k,
+`scrub_nonfinite_logits` reads the per-request lengths and derives each
+verify row's causal candidate count itself.
 
 FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
 also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`

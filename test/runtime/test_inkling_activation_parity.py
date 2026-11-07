@@ -159,8 +159,8 @@ class _ConvCheckpointPool:
     def kvconv_checkpoint_buffers(self, layer_id):
         return self._kvconv[layer_id]
 
-    def hiddenconv_checkpoint_buffer(self, layer_id, component):
-        return self._hidden[component][layer_id]
+    def hiddenconv_checkpoint(self, layer_id, component):
+        return "hiddenconv_0", self._hidden[component][layer_id]
 
     def __getattr__(self, name):
         return getattr(self._kv_pool, name)
@@ -282,7 +282,7 @@ class _Harness:
             device=device,
         )
         conv_columns = {
-            "groups": ("kvconv", "hiddenconv"),
+            "groups": ("kvconv", "hiddenconv_0"),
             "pd_endpoint_snapshots": False,
         }
         self.backend = InklingAttnBackend(inner, conv_pool)
@@ -298,7 +298,7 @@ class _Harness:
         )
         # Two-slot conv tables: the request starts cold and writes block 1.
         conv_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
-        self.conv_tables = {"kvconv": conv_table, "hiddenconv": conv_table}
+        self.conv_tables = {"kvconv": conv_table, "hiddenconv_0": conv_table}
         # Request slot REQ_SLOT owns pages [1, 2, ...] -> token locs 64+.
         max_pages = 1024 // PAGE_SIZE
         self.page_table = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
@@ -501,7 +501,7 @@ class TestInklingRebindTest:
             dtype=torch.float32,
             device="cpu",
         )
-        both = ("kvconv", "hiddenconv")
+        both = ("kvconv", "hiddenconv_0")
         backend.conv_columns = conv_columns_for_pool(pool(both, "latest_snapshot"))
         backend.set_cache_pool(pool(both, "latest_snapshot"))
         stream = dict(layer_id=0, channel_offset=0, dim=4, group_id="kvconv")

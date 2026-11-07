@@ -90,6 +90,11 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
 `--max-model-len 1048576` keeps the checkpoint's native context, which agentic
 workloads with long cached prefixes need; prefix caching is on by default.
 
+With MXFP4 experts at MoE TP8 and EP1, startup also builds a column-split copy
+of the expert down-projection weights for prefill. The copy holds one more set
+of those weights on each GPU, which leaves less memory for the KV cache. While
+the copy exists, TokenSpeed refuses live weight updates.
+
 The two HIP runtime settings are needed for speed; TokenSpeed does not set them
 itself. `DEBUG_HIP_FORCE_GRAPH_QUEUES=1` matters most for the two-stream
 speculative decode graph. The extra capture sizes (3, 5, 6, 12) cut padding at
@@ -642,9 +647,11 @@ Notes:
   and output projection TP subgroups at startup.
 - On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
   breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
-  and on the aggregated role when `--prefill-graph-capture-token-sizes` names
-  the buckets and `--enable-mixed-batch` is off; elsewhere prefill runs eager.
-  `--disable-prefill-graph` turns them off.
+  and on the aggregated role unless `--enable-mixed-batch` is on; elsewhere
+  prefill runs eager. `--disable-prefill-graph` turns them off. On the
+  aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
+  out of the KV cache, and adds about 7 minutes to startup;
+  `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes 7 tokens per step, so it takes
   `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends

@@ -70,8 +70,9 @@ class QueryShardGather:
 
     Under query context parallelism every rank rotates its own rows and the
     prologue all-gathers the rotated latent over ``group`` (per-rank counts
-    ``plan.row_counts``) to the whole extend span before the owner-masked
-    store, so page ownership stays independent of the query shard.
+    ``plan.row_counts``) and puts it in span order (``plan.to_span_order``)
+    before the owner-masked store of the whole extend span, so page ownership
+    stays independent of the query shard.
 
     Attributes:
         plan: The forward's shard plan (``ctx.query_shard``).
@@ -295,6 +296,7 @@ class PagedAttention(nn.Module):
             norm=norm,
             rotary=rotary,
             cache=self._write_target(q, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
             return_kv=not ctx.forward_mode.is_decode(),
             solution=None,
             override=None,
@@ -320,6 +322,7 @@ class PagedAttention(nn.Module):
             norm=None,
             rotary=None,
             cache=self._write_target(q, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
             return_kv=not ctx.forward_mode.is_decode(),
             solution=None,
             override=None,
@@ -468,8 +471,10 @@ class PagedAttention(nn.Module):
             out = MLAPrologueOutput(
                 query=query, key=None, value=None, latent=latent_cache
             )
-        gathered = token_all_gather(
-            out.latent.contiguous(), key_rows.group, list(plan.row_counts)
+        gathered = plan.to_span_order(
+            token_all_gather(
+                out.latent.contiguous(), key_rows.group, list(plan.row_counts)
+            )
         )
         latent_store(
             gathered,
@@ -549,7 +554,9 @@ class PagedAttention(nn.Module):
             )
         width = extra_rows.shape[1]
         payload = torch.cat((extra_rows, out.latent), dim=1).contiguous()
-        gathered = token_all_gather_rows(payload, key_rows.group, list(plan.row_counts))
+        gathered = plan.to_span_order(
+            token_all_gather_rows(payload, key_rows.group, list(plan.row_counts))
+        )
         latent_store(
             gathered[:, width:],
             kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],

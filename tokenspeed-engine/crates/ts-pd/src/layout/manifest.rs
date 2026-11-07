@@ -148,8 +148,10 @@ impl Manifest {
 
 /// The block-table slots one group transfers for a prompt (`_logical_slots`):
 /// a `full_suffix` group every retained block from the one holding
-/// `prefix_len` through the final partial block, a snapshot group its live
-/// slot unless the receiver holds the prompt-end checkpoint.
+/// `prefix_len` through the final partial block; a replayable group sends
+/// its whole retained window because the receiver caches none of it. A
+/// snapshot group sends its live slot unless the receiver holds the
+/// prompt-end checkpoint.
 pub fn logical_slots(
     spec: &GroupSpec,
     prefix_len: i64,
@@ -158,7 +160,11 @@ pub fn logical_slots(
 ) -> Result<Vec<i64>, LayoutError> {
     if spec.full_suffix() {
         let granularity = spec.block_granularity()?;
-        let mut begin = prefix_len.div_euclid(granularity);
+        let mut begin = if spec.replayable {
+            0
+        } else {
+            prefix_len.div_euclid(granularity)
+        };
         if spec.attn_kind == "sliding_window" {
             // The next decode token attends the preceding window - 1 tokens:
             // every block intersecting that retained tail goes.

@@ -183,8 +183,15 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
+        .def_rw("drop_short_prompt_end_checkpoints", &tokenspeed::SchedulerConfig::drop_short_prompt_end_checkpoints)
+        .def_rw("demote_superseded_state_checkpoints",
+                &tokenspeed::SchedulerConfig::demote_superseded_state_checkpoints)
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
-        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance);
+        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
+        // P role: the most tokens a prefill chunk that cannot finish gives up
+        // for whole prompts behind it; 0 is off, at most half of
+        // max_scheduled_tokens.
+        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -336,6 +343,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
         .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
+        .def_ro("demoted_entries_not_written_back", &tokenspeed::HostCacheStats::demoted_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
 

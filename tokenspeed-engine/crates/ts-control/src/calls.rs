@@ -247,6 +247,13 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
                 version,
                 flush_cache,
                 weight_version,
+                snapshot: body
+                    .get("snapshot")
+                    .map(|value| match value {
+                        Value::Map(_) => Ok(value.clone()),
+                        other => Err(body.wrong("snapshot", "a map", other)),
+                    })
+                    .transpose()?,
             })
         }
         "release_memory_occupation" => {
@@ -749,6 +756,38 @@ mod tests {
             ("weight_version", "step-7".into()),
         ]);
         assert_eq!(named.weight_version.as_deref(), Some("step-7"));
+    }
+
+    #[test]
+    fn a_mooncake_load_preserves_the_snapshot_directory() {
+        let snapshot = body(vec![
+            ("version", int(7)),
+            (
+                "publishers",
+                Value::Array(vec![body(vec![("key", "weights/7".into())])]),
+            ),
+        ]);
+        let request = rl(
+            "update_weights_from_mooncake",
+            vec![body(vec![
+                ("version", int(7)),
+                ("snapshot", snapshot.clone()),
+            ])],
+        )
+        .unwrap();
+        let ControlRequest::UpdateWeightsFromMooncake(load) = request else {
+            panic!("expected a Mooncake load");
+        };
+        assert_eq!(load.snapshot, Some(snapshot));
+        let error = rl(
+            "update_weights_from_mooncake",
+            vec![body(vec![
+                ("version", int(7)),
+                ("snapshot", Value::Array(vec![])),
+            ])],
+        )
+        .unwrap_err();
+        assert!(error.contains("snapshot takes a map"), "{error}");
     }
 
     /// A body the route would refuse is refused by name: a missing or

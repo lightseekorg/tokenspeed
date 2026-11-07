@@ -162,6 +162,7 @@ def test_verify_preparation_calls_root_with_existing_budget_gate(
         draft_backend=draft_backend,
         uses_paged_state_verify=uses_paged_state_verify,
         is_inkling=False,
+        qsa_bf16_scratch=None,
     )
     _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes)
     if uses_paged_state_verify and expected_bytes:
@@ -618,6 +619,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         enable_replay_ssm=False,
         disaggregation_mode=role,
         mamba_ssm_dtype="float32",
+        enable_qsa_prefill_bf16_scratch=False,
     )
     setup = prepare_cache_setup(
         family="qwen4_exp",
@@ -661,6 +663,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
             draft_backend=None,
             uses_paged_state_verify=True,
             is_inkling=False,
+            qsa_bf16_scratch=None,
             expected_bytes=setup.fixed_workspace_bytes,
         )
         return
@@ -749,6 +752,7 @@ def _qwen4_exp_fp8_kv_recipe(
             disaggregation_mode="null",
             mamba_ssm_dtype=mamba_ssm_dtype,
             mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
+            enable_qsa_prefill_bf16_scratch=False,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=text_config),
@@ -1993,7 +1997,13 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enforce_eager=False,
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
-        mapping=SimpleNamespace(world_size=1, world_group=None, is_first_pp_rank=True),
+        device="cuda",
+        mapping=SimpleNamespace(
+            world_size=1,
+            world_group=None,
+            is_first_pp_rank=True,
+            attn=SimpleNamespace(has_kvp=False),
+        ),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
