@@ -23,7 +23,10 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._scheduling import arithmetic_fence, sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
+
+async_copy = gl.amd.cdna4.async_copy
 
 _SUBGROUP_SIZE = 64
 
@@ -108,6 +111,227 @@ def supports_gluon_rowcta_bf16_gemv_gfx950(m: int, n: int, k: int) -> bool:
 
 
 @gluon.jit
+def _rows_x_step(
+    x_ptr,
+    rows,
+    x_columns,
+    M,
+    K: gl.constexpr,
+    start: gl.constexpr,
+):
+    """Load one K step of every activation row; rows past M read zero."""
+    # No ``other``: a masked lane's buffer load gets an out-of-range offset
+    # and reads zero (CDNA4 ISA 9.1.5.1), while ``other`` would add a
+    # v_cndmask per loaded register.
+    return gl.amd.cdna4.buffer_load(
+        x_ptr,
+        (rows[:, None] * K + start + x_columns[None, :]).to(gl.int32),
+        mask=(rows < M)[:, None],
+    )
+
+
+@gluon.constexpr_function
+def _rows_layout(
+    block_m: int,
+    block_k: int,
+    waves_per_output: int,
+    outputs_per_wave: int,
+    num_warps: int,
+):
+    return gl.BlockedLayout(
+        [block_m, outputs_per_wave, block_k // (64 * waves_per_output)],
+        [1, 1, 64],
+        [1, num_warps // waves_per_output, waves_per_output],
+        [2, 1, 0],
+    )
+
+
+@gluon.jit
+def gluon_rowcta_bf16_gemv_rows_weights_gfx950(
+    weight_ptr,
+    first,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    OUTPUTS_PER_WAVE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Issue every K step's weights of outputs ``first ..``; returns them (a
+    tuple, one tensor per step) for :func:`gluon_rowcta_bf16_gemv_rows_finish_gfx950`.
+
+    A lane holds only a few bytes of each K step, so one step in flight
+    leaves each wave with K / BLOCK_K serialized HBM round trips; issuing all
+    steps up front (``.cg``, streamed once) avoids that.
+    """
+    OUTPUTS: gl.constexpr = NUM_WARPS // WAVES_PER_OUTPUT * OUTPUTS_PER_WAVE
+    layout: gl.constexpr = _rows_layout(
+        BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE, NUM_WARPS
+    )
+    w_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    outputs = first + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(1, w_layout))
+    w_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, w_layout))
+    gl.static_assert(K % BLOCK_K == 0, "the K steps must tile K exactly")
+    STEPS: gl.constexpr = K // BLOCK_K
+    weights = ()
+    for step in gl.static_range(STEPS):
+        weights += (
+            gl.amd.cdna4.buffer_load(
+                weight_ptr,
+                (outputs[:, None] * K + step * BLOCK_K + w_columns[None, :]).to(
+                    gl.int32
+                ),
+                cache=".cg",
+            ),
+        )
+    return weights
+
+
+# Activation K steps kept in flight ahead of the step being computed.
+_X_AHEAD = gl.constexpr(1)
+
+
+@gluon.jit
+def gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950(
+    x_ptr,
+    M,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    OUTPUTS_PER_WAVE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Issue the first activation K steps of every row (rows past M read
+    zero); returns them for :func:`gluon_rowcta_bf16_gemv_rows_finish_gfx950`."""
+    layout: gl.constexpr = _rows_layout(
+        BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE, NUM_WARPS
+    )
+    x_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, x_layout))
+    x_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, x_layout))
+    xs = ()
+    for step in gl.static_range(min(_X_AHEAD, K // BLOCK_K)):
+        xs += (_rows_x_step(x_ptr, rows, x_columns, M, K, step * BLOCK_K),)
+    return xs
+
+
+@gluon.jit
+def gluon_rowcta_bf16_gemv_rows_finish_gfx950(
+    weights,
+    xs,
+    x_ptr,
+    M,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    OUTPUTS_PER_WAVE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Return ``[BLOCK_M, OUTPUTS]`` sums of the issued ``weights`` for every row.
+
+    ``xs`` holds the first activation K steps
+    (:func:`gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950`).
+    """
+    layout: gl.constexpr = _rows_layout(
+        BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE, NUM_WARPS
+    )
+    x_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    OUTPUTS: gl.constexpr = NUM_WARPS // WAVES_PER_OUTPUT * OUTPUTS_PER_WAVE
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, x_layout))
+    x_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, x_layout))
+    # The activation rows (L2 hits, but a register per row and step) stay
+    # X_AHEAD steps ahead. Vector loads retire in issue order, so step s's
+    # FMAs wait only for loads issued before its own. The FMA order, and so
+    # the result, is unchanged.
+    STEPS: gl.constexpr = K // BLOCK_K
+    X_AHEAD: gl.constexpr = _X_AHEAD
+    accumulator = gl.zeros((BLOCK_M, OUTPUTS, BLOCK_K), gl.float32, layout=layout)
+    for step in gl.static_range(STEPS):
+        if step + X_AHEAD < STEPS:
+            xs += (
+                _rows_x_step(x_ptr, rows, x_columns, M, K, (step + X_AHEAD) * BLOCK_K),
+            )
+        weight = weights[step].to(gl.float32)
+        x = xs[step].to(gl.float32)
+        accumulator += x[:, None, :] * weight[None, :, :]
+        # Pin this step's math here (a value LLVM treats as new). Otherwise
+        # LLVM vectorizes the math of all steps together after every load,
+        # keeping each step's activation registers live, which spills at the
+        # larger row buckets.
+        accumulator = arithmetic_fence(accumulator)
+        gl.amd.hint.sched_barrier()
+    return gl.sum(accumulator, axis=2)
+
+
+@gluon.jit
+def gluon_rowcta_bf16_gemv_rows_stage_x_gfx950(
+    x_ptr,
+    M,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Copy every activation row into LDS (rows past M read zero), 16 bytes
+    per lane per copy; returns the buffer for
+    :func:`gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950`.
+
+    A few wide copies replace the per-step loads of a few bytes per row,
+    and the rows no longer hold registers between steps.
+    """
+    # One flat copy: each wave writes 1 KB runs, which direct-to-LDS loads
+    # need; the reader views the buffer as [BLOCK_M, K].
+    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
+    flat = gl.allocate_shared_memory(
+        gl.bfloat16, [BLOCK_M * K], gl.SwizzledSharedLayout(1, 1, 1, [0])
+    )
+    elements = gl.arange(0, BLOCK_M * K, layout=layout)
+    # Masked lanes write zeros, which is what rows past M must read.
+    async_copy.buffer_load_to_shared(
+        flat,
+        x_ptr,
+        elements,
+        mask=elements // K < M,
+    )
+    async_copy.commit_group()
+    return flat.reinterpret(
+        gl.bfloat16, [BLOCK_M, K], gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    )
+
+
+@gluon.jit
+def gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950(
+    weights,
+    x_smem,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    OUTPUTS_PER_WAVE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """:func:`gluon_rowcta_bf16_gemv_rows_finish_gfx950` with the rows staged
+    in LDS (:func:`gluon_rowcta_bf16_gemv_rows_stage_x_gfx950`): the same
+    FMA order, so the same bits."""
+    layout: gl.constexpr = _rows_layout(
+        BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE, NUM_WARPS
+    )
+    x_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    OUTPUTS: gl.constexpr = NUM_WARPS // WAVES_PER_OUTPUT * OUTPUTS_PER_WAVE
+    STEPS: gl.constexpr = K // BLOCK_K
+    async_copy.wait_group(0)
+    accumulator = gl.zeros((BLOCK_M, OUTPUTS, BLOCK_K), gl.float32, layout=layout)
+    for step in gl.static_range(STEPS):
+        x = x_smem.slice(step * BLOCK_K, BLOCK_K, 1).load(x_layout).to(gl.float32)
+        weight = weights[step].to(gl.float32)
+        accumulator += x[:, None, :] * weight[None, :, :]
+        accumulator = arithmetic_fence(accumulator)
+        gl.amd.hint.sched_barrier()
+    return gl.sum(accumulator, axis=2)
+
+
+@gluon.jit
 def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     x_ptr,
     weight_ptr,
@@ -126,36 +350,22 @@ def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     ``(BLOCK_K, WAVES_PER_OUTPUT)``: per-lane FP32 chunks accumulated in K order,
     then one sum over the output's subgroups, so row ``m`` is bitwise the
     single-row GEMV of ``x[m]``. Rows sit in each lane's registers, so every
-    weight load serves all of them.
+    weight load serves all of them. Composes the ``x_ahead`` / ``weights`` /
+    ``finish`` parts.
     """
-    OUTPUTS: gl.constexpr = NUM_WARPS // WAVES_PER_OUTPUT * OUTPUTS_PER_WAVE
-    layout: gl.constexpr = gl.BlockedLayout(
-        [BLOCK_M, OUTPUTS_PER_WAVE, BLOCK_K // (64 * WAVES_PER_OUTPUT)],
-        [1, 1, 64],
-        [1, NUM_WARPS // WAVES_PER_OUTPUT, WAVES_PER_OUTPUT],
-        [2, 1, 0],
-    )
-    w_layout: gl.constexpr = gl.SliceLayout(0, layout)
-    x_layout: gl.constexpr = gl.SliceLayout(1, layout)
-    outputs = first + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(1, w_layout))
-    w_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, w_layout))
-    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, x_layout))
-    x_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, x_layout))
-    accumulator = gl.zeros((BLOCK_M, OUTPUTS, BLOCK_K), gl.float32, layout=layout)
-    for start in range(0, K, BLOCK_K):
-        weight = gl.amd.cdna4.buffer_load(
-            weight_ptr,
-            (outputs[:, None] * K + start + w_columns[None, :]).to(gl.int32),
-            cache=".cg",
-        ).to(gl.float32)
-        x = gl.amd.cdna4.buffer_load(
-            x_ptr,
-            (rows[:, None] * K + start + x_columns[None, :]).to(gl.int32),
-            mask=(rows < M)[:, None],
-            other=0.0,
-        ).to(gl.float32)
-        accumulator += x[:, None, :] * weight[None, :, :]
-    return gl.sum(accumulator, axis=2)
+    # The first activation step issues before the weights, so step 0's
+    # FMAs need not wait for every weight step to return.
+    xs = gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950(
+        x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE, NUM_WARPS
+    )  # fmt: skip
+    weights = gluon_rowcta_bf16_gemv_rows_weights_gfx950(
+        weight_ptr, first, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, OUTPUTS_PER_WAVE,
+        NUM_WARPS
+    )  # fmt: skip
+    return gluon_rowcta_bf16_gemv_rows_finish_gfx950(
+        weights, xs, x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT,
+        OUTPUTS_PER_WAVE, NUM_WARPS
+    )  # fmt: skip
 
 
 def _rows_launch_metadata(grid, kernel, args):
@@ -321,6 +531,7 @@ def gluon_rowcta_bf16_gemv_gfx950(
         OUTPUTS_PER_WAVE=outputs_per_wave,
         NUM_WARPS=num_warps,
         num_warps=num_warps,
+        **sched_compile_options(),
     )
     return out
 
@@ -568,7 +779,12 @@ __all__ = [
     "launch_gluon_gated_rowcta_bf16_gemv_gfx950",
     "gluon_rowcta_bf16_gemv_geometry_gfx950",
     "gluon_rowcta_bf16_gemv_gfx950",
+    "gluon_rowcta_bf16_gemv_rows_finish_gfx950",
+    "gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950",
+    "gluon_rowcta_bf16_gemv_rows_stage_x_gfx950",
     "gluon_rowcta_bf16_gemv_rows_sums_gfx950",
+    "gluon_rowcta_bf16_gemv_rows_weights_gfx950",
+    "gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950",
     "prefers_gluon_rowcta_bf16_gemv_gfx950",
     "supports_gluon_gated_rowcta_bf16_gemv_gfx950",
     "supports_gluon_rowcta_bf16_gemv_gfx950",

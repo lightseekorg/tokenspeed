@@ -26,7 +26,7 @@ import re
 
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, is_cdna4, vmcnt_zero_before_barrier
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -34,13 +34,17 @@ if not is_cdna4():
 from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     fp32_router_gemv_counters,
     fp32_router_gemv_execute,
+    fp32_router_gemv_execute_with_mm,
     fp32_router_gemv_plan,
     fp32_router_gemv_process_weight,
+    fp32_router_gemv_with_mm_supported,
+    mm,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (  # noqa: E402
     MAX_K,
     MAX_ROWS,
     gluon_fp32_router_gemv_gfx950,
+    gluon_fp32_router_gemv_mm_a16w16_gfx950,
     gluon_fp32_router_gemv_num_counters_gfx950,
     gluon_fp32_router_gemv_splitk_gfx950,
     launch_gluon_fp32_router_gemv_gfx950,
@@ -230,6 +234,7 @@ def _compile_splitk(**config):
     ``config`` overrides the 8192 x 256 router's 64-row bucket.
     """
     from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._scheduling import sched_compile_options
 
     fn = gluon_fp32_router_gemv_splitk_gfx950
     pointers = ("x_ptr", "weight_ptr", "out_ptr", "partial_ptr", "counter_ptr")
@@ -259,7 +264,7 @@ def _compile_splitk(**config):
             attrs=attrs,
         ),
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": 4},
+        options={"num_warps": 4, **sched_compile_options()},
     )
 
 
@@ -288,3 +293,90 @@ def test_splitk_partials_bypass_l2_and_weights_stream(config) -> None:
     assert set(loads) == {system, stream, default}, loads
     assert loads.count(system) % config["SPLIT_K"] == 0
     assert system in stores, stores
+
+
+def test_splitk_partials_reach_l2_before_arrival() -> None:
+    """Every wave's partial reaches L2 before the split arrives.
+
+    All waves write the split's partial, and one thread bumps the tile's
+    relaxed counter. Compile without launching and check that, on every
+    path, each wave runs s_waitcnt vmcnt(0) before the barrier preceding
+    the counter atomic.
+    """
+    arrivals = vmcnt_zero_before_barrier(
+        _compile_splitk().asm["amdgcn"],
+        "gluon_fp32_router_gemv_splitk_gfx950",
+        r"\bglobal_atomic_add\w*\b",
+    )
+    assert arrivals, "each split must arrive with an atomic add"
+    assert all(waited for _, waited, _ in arrivals), arrivals
+
+
+def _router_plan():
+    return fp32_router_gemv_plan(
+        hidden_size=8192,
+        output_size=256,
+        dtype=torch.float32,
+        solution=None,
+        batch_invariant=False,
+    )
+
+
+# 8 rows are below the split-K buckets, 16 rows inside the first one.
+@pytest.mark.parametrize("rows", [8, 16])
+def test_router_with_mm_matches_the_split_k_router_and_mm(rows: int) -> None:
+    """One launch writes mm's bits and the split-K router's logits."""
+    plan = _router_plan()
+    x, weight = _problem(16, 8192, 256, 20261103)
+    weight *= 0.02
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    mm_a = torch.randn(rows, 8192, device="cuda", generator=generator).bfloat16()
+    mm_b = (
+        torch.randn(512, 8192, device="cuda", generator=generator) * 0.02
+    ).bfloat16()
+    router_rows = x[:rows].contiguous()
+    assert fp32_router_gemv_with_mm_supported(plan, router_rows, mm_a, mm_b)
+    mm_out = torch.full((rows, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+    logits = fp32_router_gemv_execute_with_mm(
+        plan, router_rows, prepared, MULTIPLIER, mm_a, mm_b, mm_out
+    )
+    assert torch.equal(mm_out, mm(mm_a, mm_b))
+    # A row's split-K logits do not depend on the other rows of its tile, so
+    # the standalone 16-row split-K launch gives the same bits.
+    assert torch.equal(logits, _launch(x, prepared, MULTIPLIER)[:rows])
+
+
+# One row has no decode GEMM config, mm sends 2-4 rows of this shape to the
+# rowcta GEMV, and 17 rows exceed the shared router tile.
+@pytest.mark.parametrize("rows", [1, 2, 17])
+def test_router_with_mm_declines_outside_its_contract(rows: int) -> None:
+    plan = _router_plan()
+    x = torch.randn(rows, 8192, device="cuda")
+    mm_a = torch.randn(rows, 8192, device="cuda").bfloat16()
+    mm_b = torch.randn(512, 8192, device="cuda").bfloat16()
+    assert not fp32_router_gemv_with_mm_supported(plan, x, mm_a, mm_b)
+
+
+def test_router_with_mm_compiles_once_per_row_bucket() -> None:
+    """Row counts inside a warmed bucket reuse its binary: the row count is a
+    runtime argument, and only the GEMM's row bucket is compiled in."""
+    plan = _router_plan()
+    x, weight = _problem(16, 8192, 256, 20261104)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    mm_b = torch.randn(512, 8192, device="cuda").bfloat16()
+
+    def run(rows: int) -> None:
+        mm_a = torch.randn(rows, 8192, device="cuda").bfloat16()
+        mm_out = torch.empty((rows, 512), dtype=torch.bfloat16, device="cuda")
+        router_rows = x[:rows].contiguous()
+        assert fp32_router_gemv_with_mm_supported(plan, router_rows, mm_a, mm_b)
+        fp32_router_gemv_execute_with_mm(
+            plan, router_rows, prepared, MULTIPLIER, mm_a, mm_b, mm_out
+        )
+
+    for rows in (8, 16):
+        run(rows)
+    with assert_no_triton_compile(gluon_fp32_router_gemv_mm_a16w16_gfx950):
+        for rows in (5, 7, 9, 12, 15, 16, 8):
+            run(rows)

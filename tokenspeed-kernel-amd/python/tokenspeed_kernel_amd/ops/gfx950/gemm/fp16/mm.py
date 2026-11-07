@@ -1895,6 +1895,97 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     return C
 
 
+# Full-K 16x16 tiles over 512-deep K with three buffers. Every output runs its
+# 16x16x32 MFMAs over K in order whatever the tile shape, so a column shard of
+# a split-K-1 decode GEMM equals the replicated GEMM's columns bitwise. The
+# depth was the fastest of 256, 512 and 1024 at 8-16 rows x 1024 x 4096 in
+# graph replay on MI355X.
+_COLUMN_SHARD_BLOCK_K = 512
+_COLUMN_SHARD_BUFFERS = 3
+
+
+def supports_gluon_mm_a16w16_column_shard_gfx950(
+    M: int, N: int, shard_n: int, K: int
+) -> bool:
+    """Whether a shard_n-column shard of the [M, N, K] decode GEMM is bitwise its columns.
+
+    The full decode GEMM must have a measured split-K-1 config, so its per-output
+    reduction is the shard's.
+    """
+    config = _choose_decode_config(M, N, K)
+    return (
+        config is not None
+        and config[6] == 1
+        and shard_n % 16 == 0
+        and K % _COLUMN_SHARD_BLOCK_K == 0
+        and K // _COLUMN_SHARD_BLOCK_K >= _COLUMN_SHARD_BUFFERS
+    )
+
+
+def launch_gluon_mm_a16w16_column_shard_gfx950(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Compute ``A @ B.T`` for a column shard ``B`` of a replicated decode GEMM weight.
+
+    Args:
+        A: Contiguous BF16/FP16 activation ``[M, K]``.
+        B: Contiguous weight rows ``[shard_n, K]`` with ``A``'s dtype, such as
+            one rank's rows of the replicated ``[N, K]`` weight.
+        out: ``[M, shard_n]`` destination in ``A``'s dtype with unit inner stride.
+
+    Returns:
+        ``out``; each column equals the replicated decode GEMM's column bitwise
+        when ``supports_gluon_mm_a16w16_column_shard_gfx950`` holds.
+    """
+    M, K = A.shape
+    shard_n = B.shape[0]
+    if not A.is_contiguous() or not B.is_contiguous() or B.shape[1] != K:
+        raise ValueError(
+            f"column-shard GEMM needs contiguous A [M, K] and B [shard_n, K], got "
+            f"{tuple(A.shape)=} {tuple(B.shape)=}"
+        )
+    if out.shape != (M, shard_n) or out.dtype != A.dtype or out.stride(1) != 1:
+        raise ValueError(
+            f"column-shard GEMM needs a unit-stride [{M}, {shard_n}] {A.dtype} out, "
+            f"got {tuple(out.shape)} {out.dtype} stride {out.stride()}"
+        )
+    gluon_mm_a16w16_medium_gfx950[(triton.cdiv(M, 16) * triton.cdiv(shard_n, 16),)](
+        A,
+        B,
+        out,
+        out,
+        out,
+        out,
+        out,
+        M,
+        shard_n,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=16,
+        BLOCK_N=16,
+        BLOCK_K=_COLUMN_SHARD_BLOCK_K,
+        WARPS_M=2,
+        WARPS_N=2,
+        NUM_BUFFERS=_COLUMN_SHARD_BUFFERS,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=1,
+        NUM_XCDS=1,
+        num_warps=4,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return out
+
+
 _GROUPED_M_BUCKETS = (4, 8, 16, 32, 64, 128)
 # Grouped decode GEMMs keyed by (groups, N, K), then M bucket; same tuple
 # layout as _DECODE_CONFIGS. Swept under graph replay on MI350X.
