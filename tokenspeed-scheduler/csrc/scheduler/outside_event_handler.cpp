@@ -308,8 +308,10 @@ void Scheduler::handleEvent(const cache::RestoreDone& event) {
         // The ACK republishes the L2-tier destinations into the Device index,
         // a KV-event mutation of boundaries whose descriptors DrainKvEvents
         // dropped when the victim's pages left the Device: register them
-        // again first, as a first chunk does for the load-backs it issues.
-        registerKvEventPrefixPages(*request, restoring->resources.cache_progress.prefix_hashes, 0);
+        // again first -- the prefix chain and any tail a State checkpoint of
+        // the image sits at -- as a first chunk does for the load-backs it
+        // issues.
+        registerKvEventRestore(*request, restoring->resources.cache_progress.prefix_hashes, restoring->kv_event_tails);
     }
     ReqPoolIndex request_pool_index = tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
     if (resumes) {

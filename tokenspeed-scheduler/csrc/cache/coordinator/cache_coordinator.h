@@ -512,6 +512,12 @@ public:
     // completion. progress.completed_pages must be present.
     void CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
                               std::uint64_t access_epoch);
+    // The first page of completed.prefix_hashes publishing `completed`
+    // registers an entry under: the first new page, or a page below it --
+    // the deepest one, where a State checkpoint lands when no page is new,
+    // or the first a sliding window behind one of its boundaries reaches
+    // back into.
+    std::int32_t FirstPublishedPage(const CompletedPages& completed) const;
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -1133,8 +1139,8 @@ private:
     // page plus the tail's blocks of a prefix-closed group, the blocks holding
     // the window behind the newest boundary of a sliding group, slot 1 of a
     // State group at a non-chunk point, nothing for a replayable one.
-    // The one source for cacheCompletedBlocksForGroup and for
-    // PublishedDataSlotsAfter.
+    // The one source for cacheCompletedBlocksForGroup,
+    // PublishedDataSlotsAfter and FirstPublishedPage.
     std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
     // The key of table slot `block` of a History group at a publication point:
     // its page's chain hash below the full pages, the tail hash from there on.
