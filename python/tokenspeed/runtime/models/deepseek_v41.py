@@ -179,7 +179,9 @@ from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
+    EngramHostAlloc,
     is_engram_embed_checkpoint_name,
+    resolve_engram_host_alloc,
     resolve_engram_host_layout,
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
@@ -2009,6 +2011,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         hc_stream: torch.cuda.Stream | None,
         host_table: bool,
         host_layout: str,
+        host_alloc: EngramHostAlloc | None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2056,6 +2059,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 self.attn.wq_a_wkv.weight.device,
                 host_table,
                 host_layout,
+                host_alloc,
             )
             if layer_id in config.engram_layer_ids
             else None
@@ -2445,6 +2449,7 @@ class DeepseekV41Model(nn.Module):
         prefix: str,
         host_table: bool,
         host_layout: str,
+        host_alloc: EngramHostAlloc | None,
     ):
         super().__init__()
         if mapping.pp_size != 1:
@@ -2524,6 +2529,7 @@ class DeepseekV41Model(nn.Module):
                     self.hc_stream,
                     host_table,
                     host_layout,
+                    host_alloc,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -3116,13 +3122,15 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def resolve_model(self, config, mapping, quant_config, prefix):
         host_table = global_server_args_dict["engram_host_table"]
+        host_layout = resolve_engram_host_layout(host_table, mapping.attn.tp_size)
         return self.model_cls(
             config.text_config,
             mapping,
             quant_config,
             add_prefix("model", prefix),
             host_table,
-            resolve_engram_host_layout(host_table, mapping.attn.tp_size),
+            host_layout,
+            resolve_engram_host_alloc(host_layout),
         )
 
     def bind_checkpoint_dir(self, checkpoint_dir: str) -> None:
