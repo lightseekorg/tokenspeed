@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import importlib.util
 import math
-from importlib.util import find_spec
 
 import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
@@ -303,7 +302,10 @@ def cutedsl_kda_chunk_prefill(
 
 
 def _cute_dsl_importable() -> bool:
-    return find_spec("cutlass") is not None and find_spec("quack") is not None
+    return (
+        importlib.util.find_spec("cutlass") is not None
+        and importlib.util.find_spec("quack") is not None
+    )
 
 
 if current_platform().is_nvidia and _cute_dsl_importable():
