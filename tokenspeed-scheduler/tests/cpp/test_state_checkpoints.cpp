@@ -2016,6 +2016,163 @@ TEST_F(DropShortPromptEndsL3Suite, ADroppedShortPromptEndSupersedesNoInput) {
     }
 }
 
+// prefill_chunk_yield_tokens with in-forward checkpoints: a 3-token prompt
+// arriving beside the 22-token seed's first and third chunks makes them give
+// way, ending on the page before 8 - 3 -- [0, 4) and [12, 16) -- and the
+// chunk after them, [16, 22), still spans the boundary 20 from a page and
+// writes the checkpoint in its forward. The same prompt sent again resumes
+// there.
+class StateCheckpointInForwardYieldSuite : public StateCheckpointInForwardPrefillRoleSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointInForwardPrefillRoleSuite::MakeConfig();
+        cfg.max_batch_size = 4;
+        cfg.prefill_chunk_yield_tokens = 4;
+        return cfg;
+    }
+
+    // Plans one round with `id` in its batch, acknowledges the plan's
+    // write-backs and hand-offs, lands every row (a completed prompt with a
+    // sampled token) and returns `id`'s chunk and checkpoint length. Every
+    // other row must complete its prompt, and the completing rows come first.
+    std::pair<std::pair<std::int32_t, std::int32_t>, std::int32_t> PlanChunkOf(const std::string& id,
+                                                                               ExecutionPlan* plan_out) {
+        ExecutionPlan plan = PlanOnce();
+        AckWriteBacks(plan);
+        if (plan.remote_decode) {
+            for (const std::string& handed_off : plan.remote_decode->request_ids) {
+                SendPdSucceeded(handed_off);
+            }
+        }
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_TRUE_OR_RETURN(batch != nullptr && std::ranges::find(batch->request_ids, id) != batch->request_ids.end(),
+                              {});
+        EXPECT_TRUE(CompletingPrefillsFormAPrefix(*batch));
+        std::pair<std::pair<std::int32_t, std::int32_t>, std::int32_t> chunk;
+        for (std::size_t row = 0; row < batch->NumExtends(); ++row) {
+            const std::int32_t end = batch->extend_prefix_lens[row] + batch->input_lengths[row];
+            const bool complete = end == batch->prefill_lengths[row];
+            if (batch->request_ids[row] == id) {
+                chunk = {{batch->extend_prefix_lens[row], end}, batch->extend_state_checkpoint_lens[row]};
+            } else {
+                EXPECT_TRUE(complete) << batch->request_ids[row] << " is carried whole";
+            }
+            SendForwardDone(batch->request_ids[row],
+                            complete ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+        }
+        if (plan_out != nullptr) {
+            *plan_out = std::move(plan);
+        }
+        return chunk;
+    }
+};
+
+TEST_F(StateCheckpointInForwardYieldSuite, TheChunkAfterOneThatGaveWayStillWritesTheCheckpoint) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    const std::vector<std::int32_t> tokens = MakeTokens(22);
+    Submit(RequestWithTokens("seed", tokens));
+    SendBootstrapped("seed");
+    std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
+    std::vector<std::int32_t> checkpoint_lens;
+    std::int32_t checkpoint_block = 0;
+    for (int round = 0; round < 6 && (chunks.empty() || chunks.back().second < 22); ++round) {
+        if (round == 0 || round == 2) {
+            const std::string id = "short" + std::to_string(round);
+            Submit(RequestWithTokens(id, MakeTokens(3, 500 + 10 * round)));
+            SendBootstrapped(id);
+        }
+        ExecutionPlan plan;
+        const auto [chunk, checkpoint_len] = PlanChunkOf("seed", &plan);
+        chunks.push_back(chunk);
+        checkpoint_lens.push_back(checkpoint_len);
+        if (checkpoint_len > 0) {
+            checkpoint_block = StateRow(*FindForwardBatch(plan), "state0", "seed").at(2);
+        }
+    }
+    EXPECT_EQ(chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 4}, {4, 12}, {12, 16}, {16, 22}}));
+    EXPECT_EQ(checkpoint_lens, (std::vector<std::int32_t>{0, 0, 0, 4}));
+    ASSERT_GT(checkpoint_block, 0);
+    const ExecutionPlan handoff = PlanOnce();
+    ASSERT_TRUE(handoff.remote_decode.has_value());
+    AckWriteBacks(handoff);
+
+    Submit(RequestWithTokens("resent", tokens));
+    SendBootstrapped("resent");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"resent"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{20});
+    EXPECT_EQ(StateRow(*batch, "state0", "resent").at(0), checkpoint_block) << "resumes from the in-forward checkpoint";
+    AckWriteBacks(plan);
+}
+
+// The same at serving geometry -- 256-token pages, a 16384-token budget and
+// at most 4096 tokens yielded -- with a 1000-token prompt arriving every
+// round: the 40960-token prompt's chunks that cannot finish end on the page
+// before 16384 - 1000 past their start -- at 15360 and 30720 -- each carrying
+// that round's prompt whole in a row ahead of its own, and its last chunk
+// [30720, 40960) -- which runs first, that round's prompt admitted behind it
+// -- still writes the in-forward checkpoint at 40704, where the same prompt
+// sent again resumes.
+class StateCheckpointInForwardServingYieldSuite : public StateCheckpointInForwardYieldSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointInForwardYieldSuite::MakeConfig();
+        cfg.prefix_granularity = 256;
+        cfg.max_scheduled_tokens = 16384;
+        cfg.max_batch_size = 8;
+        cfg.prefill_chunk_yield_tokens = 4096;
+        cfg.device_allocator.total_pages = 1025;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+            if (group.attn_kind != AttnKind::kState) {
+                group.block_granularity = cfg.prefix_granularity;
+            }
+        }
+        return cfg;
+    }
+};
+
+TEST_F(StateCheckpointInForwardServingYieldSuite, ChunksThatGiveWayEndOnPagesBeforeTheCheckpoint) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    const std::vector<std::int32_t> tokens = MakeTokens(40960);
+    Submit(RequestWithTokens("first", tokens));
+    SendBootstrapped("first");
+    std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
+    std::vector<std::int32_t> checkpoint_lens;
+    std::vector<std::vector<std::string>> batches;
+    for (int round = 0; round < 8 && (chunks.empty() || chunks.back().second < 40960); ++round) {
+        const std::string id = "short" + std::to_string(round);
+        Submit(RequestWithTokens(id, MakeTokens(1000, 1000000 + 10000 * round)));
+        SendBootstrapped(id);
+        ExecutionPlan plan;
+        const auto [chunk, checkpoint_len] = PlanChunkOf("first", &plan);
+        chunks.push_back(chunk);
+        checkpoint_lens.push_back(checkpoint_len);
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        batches.push_back(batch->request_ids);
+    }
+    EXPECT_EQ(chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 15360}, {15360, 30720}, {30720, 40960}}));
+    EXPECT_EQ(checkpoint_lens, (std::vector<std::int32_t>{0, 0, 40704 - 30720}));
+    EXPECT_EQ(batches,
+              (std::vector<std::vector<std::string>>{{"short0", "first"}, {"short1", "first"}, {"first", "short2"}}))
+        << "every round's prompt runs in the same forward";
+    const ExecutionPlan handoff = PlanOnce();
+    ASSERT_TRUE(handoff.remote_decode.has_value());
+    AckWriteBacks(handoff);
+
+    Submit(RequestWithTokens("resent", tokens));
+    SendBootstrapped("resent");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"resent"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{40704}) << "resumes from the in-forward checkpoint";
+    AckWriteBacks(plan);
+}
+
 // Mixed batches beside one decoding request, which takes one token of every
 // round's 8 and leaves 7 for the prefill.
 class StateCheckpointInForwardMixedSuite : public StateCheckpointInForwardSuite {

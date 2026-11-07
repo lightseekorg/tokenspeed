@@ -164,6 +164,15 @@ struct SchedulerConfig {
         return checkpoint_retention_requests.value_or(
             std::min<std::int64_t>(std::int64_t{16} * max_batch_size, kMaxCheckpointRetentionRequests));
     }
+    // P role: the room, in tokens, a local prefill chunk that cannot finish
+    // its prompt this round makes for bootstrapped prompts waiting behind it
+    // that fit whole, so they run complete in the same forward: the chunk
+    // ends on an earlier page and gives up fewer than this plus one page
+    // (docs/design/scheduler.md §1.1). A chunk yields only while such prompts
+    // wait, and only what they take. 0 (the default) is off; at most half of
+    // max_scheduled_tokens, so a long prompt keeps about half of every round
+    // or more.
+    std::int32_t prefill_chunk_yield_tokens{0};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

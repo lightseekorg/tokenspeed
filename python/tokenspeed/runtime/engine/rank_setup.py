@@ -285,4 +285,5 @@ def scheduler_config_from_args(
         drop_short_prompt_end_checkpoints=server_args.drops_short_prompt_end_checkpoints,
         checkpoint_retention_requests=server_args.checkpoint_retention_requests,
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
+        prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
     )

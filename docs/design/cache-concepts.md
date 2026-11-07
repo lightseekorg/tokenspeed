@@ -387,8 +387,9 @@ even when the forward ends on a full page.
 Conversely, `--enable-state-checkpoint-in-forward` also skips the natural
 checkpoints that a next turn re-rendering the end of the previous prompt
 cannot resume at, with their KV tails: a prompt end inside the page whose start
-holds the pre-tail checkpoint, and a fused finish past the prompt end (same
-section).
+holds the pre-tail checkpoint, a fused finish past the prompt end, and on a
+prefill server the end of a prompt too short for a pre-tail checkpoint when it
+lies inside a page (same section).
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
