@@ -393,11 +393,11 @@ decode-produced state, which those groups keep private anyway. Their other
 unaligned prompt ends still publish a KV tail, although no hit resumes there
 either.
 
-**Short prompt ends (opt-in).** A prompt too short for a pre-tail checkpoint
+**Short prompt ends.** A prompt too short for a pre-tail checkpoint
 (`PrefillStateCheckpointTokens` is 0: by default a prompt within one chunk
 budget) has no `C` to make its end dead, so the rule above publishes it. With
-`drop_short_prompt_end_checkpoints` (`--drop-short-prompt-end-checkpoints`,
-P role only, requires the in-forward checkpoint) the P role's finish skips
+`drop_short_prompt_end_checkpoints` (on with
+`--enable-state-checkpoint-in-forward`, P role only) the P role's finish skips
 that end too when it lies inside a page: it publishes the full pages alone,
 like a chunk end (`shortPromptEndIsDropped`). A re-rendered next turn cannot
 resume at that end either; a longer prompt that repeats the whole prompt

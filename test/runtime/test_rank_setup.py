@@ -224,9 +224,11 @@ def test_checkpoint_retention_leaf_distance_is_passed_when_given(flags, leaf_dis
 
 @pytest.mark.parametrize(
     "flags, enabled",
-    [([], False), (["--drop-short-prompt-end-checkpoints"], True)],
+    [([], False), (["--enable-state-checkpoint-in-forward"], True)],
 )
-def test_a_prefill_server_drops_short_prompt_ends_only_with_the_flag(flags, enabled):
+def test_a_prefill_server_drops_short_prompt_ends_with_in_forward_checkpoints(
+    flags, enabled
+):
     args = prepare_server_args(
         [
             "--model",
@@ -237,45 +239,31 @@ def test_a_prefill_server_drops_short_prompt_ends_only_with_the_flag(flags, enab
             "prefill",
             "--disaggregation-transfer-backend",
             "mooncake",
-            "--enable-state-checkpoint-in-forward",
             *flags,
         ]
     )
     cfg = _config(
         args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
     )
-    assert cfg.state_checkpoint_in_forward
+    assert cfg.state_checkpoint_in_forward is enabled
     assert cfg.drop_short_prompt_end_checkpoints is enabled
 
 
-def test_dropping_short_prompt_ends_is_refused_without_the_in_forward_checkpoint():
-    # It extends the dead checkpoints that flag skips.
-    with pytest.raises(ValueError, match="requires that flag"):
-        ServerArgs(
-            model="x",
-            max_num_seqs=8,
-            disaggregation_mode="prefill",
-            disaggregation_transfer_backend="mooncake",
-            drop_short_prompt_end_checkpoints=True,
-        )
-
-
-def test_a_fused_server_refuses_to_drop_short_prompt_ends():
-    # The drop is a prefill-server policy; a fused server keeps short prompt
-    # ends, so the flag there is a mistake rather than a launcher's echo.
-    with pytest.raises(ValueError, match="prefill-server policy"):
-        ServerArgs(
-            model="x",
-            max_num_seqs=8,
-            enable_state_checkpoint_in_forward=True,
-            drop_short_prompt_end_checkpoints=True,
-        )
+def test_a_fused_server_keeps_short_prompt_ends():
+    # The drop is a prefill-server policy: fused serving keeps its short
+    # prompt ends with in-forward checkpoints on.
+    args = ServerArgs(
+        model="x", max_num_seqs=8, enable_state_checkpoint_in_forward=True
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.state_checkpoint_in_forward
+    assert not cfg.drop_short_prompt_end_checkpoints
 
 
 @pytest.mark.parametrize("role, pool", [("decode", (5, 8)), ("encode", (1, 0))])
-def test_decode_and_encode_servers_take_the_short_prompt_end_flag_as_a_no_op(
-    role, pool
-):
+def test_decode_and_encode_servers_drop_no_short_prompt_end(role, pool):
     # A PD launcher may pass the prefill flags to every role; the scheduler
     # refuses the drop outside the P role, so these servers never set it.
     args = ServerArgs(
@@ -284,7 +272,6 @@ def test_decode_and_encode_servers_take_the_short_prompt_end_flag_as_a_no_op(
         disaggregation_mode=role,
         disaggregation_transfer_backend="mooncake",
         enable_state_checkpoint_in_forward=True,
-        drop_short_prompt_end_checkpoints=True,
     )
     cfg = _config(
         args,
