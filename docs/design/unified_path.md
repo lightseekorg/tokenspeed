@@ -1458,7 +1458,9 @@ null page 0.
 The bridge's `{gid: view}` dict is the router's input; the router does not
 require the views to share one storage, only the one-launch fill does. The
 executor pads stopped requests' state rows in place
-(`RuntimeStates.masked_state_tables`), so the views stay in that storage.
+(`RuntimeStates.masked_state_tables`), so the views stay in that storage;
+the bridge packs the state groups last and end to end, so that padding is
+one launch for every state group.
 The slot math lives in
 `paged/write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
 invariant, so locations computed over the kernel-page stack equal
