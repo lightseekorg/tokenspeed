@@ -17,10 +17,10 @@
 
 """Architecture-selected FlashAttention kernels."""
 
-import importlib.util
 import math
 
 import torch
+from tokenspeed_kernel._optional import has_fa4_cute, has_optional_package
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -49,24 +49,13 @@ platform = current_platform()
 # ------------------------------------------------------------------------------
 
 
-if (
-    platform.is_blackwell_plus
-    and importlib.util.find_spec("flash_attn") is not None
-    and importlib.util.find_spec("quack") is not None
-    and importlib.util.find_spec("flash_attn.cute") is not None
-):
+if platform.is_blackwell_plus and has_fa4_cute():
     from flash_attn.cute import (
         flash_attn_func,
         flash_attn_varlen_func,
     )
 
-if (
-    platform.is_nvidia
-    and platform.is_blackwell
-    and importlib.util.find_spec("flash_attn") is not None
-    and importlib.util.find_spec("quack") is not None
-    and importlib.util.find_spec("flash_attn.cute") is not None
-):
+if platform.is_nvidia and platform.is_blackwell and has_fa4_cute():
     # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8,
     # but the 256-wide MHA path mishandles non-contiguous V split views, so we
     # restrict it to <256 for now until that is resolved.
@@ -530,7 +519,7 @@ if (
 elif (
     platform.is_nvidia
     and platform.is_hopper
-    and importlib.util.find_spec("flash_attn_interface") is not None
+    and has_optional_package("flash_attn_interface")
 ):
     from flash_attn_interface import (
         flash_attn_func,
