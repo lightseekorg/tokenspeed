@@ -98,6 +98,52 @@ def test_iris_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
 
+class _OrdinaryReduction:
+    """A prepared reduction that admits payloads up to max_numel elements."""
+
+    def __init__(self, max_numel: int):
+        self.max_numel = max_numel
+        self.reduced = []
+
+    def can_reduce_ordinary(self, tensor, *, rccl_fallback: bool) -> bool:
+        assert rccl_fallback
+        return tensor.numel() <= self.max_numel
+
+    def reduce_ordinary(self, tensor):
+        self.reduced.append(tensor)
+        return tensor
+
+
+def test_installed_reduction_serves_its_group_past_the_staged_limit(monkeypatch):
+    backend = IrisBackend(Mock(), producer_direct_max_bytes=1024 * 1024)
+    monkeypatch.setattr(
+        iris_module, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    group, other_group = tuple(range(8)), tuple(range(8, 16))
+    reduction = _OrdinaryReduction(max_numel=172 * 8192)
+    backend.install_ordinary_all_reduce(group, reduction)
+
+    def rows(count):
+        return torch.empty((count, 8192), dtype=torch.bfloat16, device="meta")
+
+    draft_rows = rows(172)
+    assert backend.can_run(draft_rows, group)
+    assert backend.all_reduce(draft_rows, group) is draft_rows
+    assert reduction.reduced == [draft_rows]
+
+    # Other groups, unsupported operations, and payloads the reduction
+    # declines reach the fallback.
+    max_op = torch.distributed.ReduceOp.MAX
+    larger = rows(173)
+    assert not backend.can_run(draft_rows, other_group)
+    assert not backend.can_run(draft_rows, group, op=max_op)
+    assert not backend.can_run(larger, group)
+    backend.all_reduce(draft_rows, other_group)
+    backend.all_reduce(draft_rows, group, op=max_op)
+    backend.all_reduce(larger, group)
+    assert reduction.reduced == [draft_rows]
+
+
 def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
     backend = IrisBackend(Mock(), producer_direct_max_bytes=256)
     group = (0, 1)

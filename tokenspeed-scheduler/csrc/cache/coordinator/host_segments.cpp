@@ -210,6 +210,7 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
                             .group_id = groups_[closed_groups[i]].Id(),
                             .location = device.peer.location,
                             .boundary_tokens = node->boundary_tokens,
+                            .device_in_use = pinned,
                         });
                     }
                     next[i] = next_entry(i, pinned);
@@ -319,6 +320,9 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         CacheBlockLocation location;
         bool in_use;
         std::uint64_t last_access_epoch;
+        // A checkpoint that counts as demoted (isDemotedEntry); read for State
+        // entries only.
+        bool demoted;
     };
     struct HostEntries {
         explicit HostEntries(std::pmr::memory_resource* resource) : states{resource}, all{resource} {}
@@ -357,7 +361,8 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                     states.push_back(HostEntry{.group_id = key.group_id,
                                                .location = entry.location,
                                                .in_use = entry.pinned,
-                                               .last_access_epoch = entry.metadata.last_access_epoch});
+                                               .last_access_epoch = entry.metadata.last_access_epoch,
+                                               .demoted = isDemotedEntry(entry.metadata)});
                 }
             });
     }
@@ -374,7 +379,8 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                         entries.all.push_back(HostEntry{.group_id = groups_[i].Id(),
                                                         .location = entry->location,
                                                         .in_use = entry->pinned,
-                                                        .last_access_epoch = entry->metadata.last_access_epoch});
+                                                        .last_access_epoch = entry->metadata.last_access_epoch,
+                                                        .demoted = false});
                     }
                 });
             entries.all_loaded = true;
@@ -472,8 +478,12 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // Device keeps that one longest -- then the shallower boundary, keeping
     // the longer frontier as Device eviction does, then the candidate
     // node's first Host entry. An aged Host-only checkpoint ranks as
-    // CheckpointAging says: the larger distance first, then the older.
-    enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kHostOnly };
+    // CheckpointAging says: the larger distance first, then the older. A
+    // Host-only checkpoint boundary whose every Host checkpoint is demoted
+    // (SetCheckpointDemotion) ranks in a class of its own, whatever its pages'
+    // dates: the placement below takes it after the Host copies of KV a
+    // request holds on the Device and before the copies of unheld Device KV.
+    enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kDemoted, kHostOnly };
     struct Candidate {
         const BoundaryTree::Node* candidate_node{nullptr};
         VictimClass victim_class{VictimClass::kDead};
@@ -509,11 +519,13 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         // A Host-only checkpoint's rank and first location come from State.
         // Read its history only when its class needs it or it becomes a victim.
         std::size_t num_checkpoint_entries = 0;
+        std::size_t num_demoted_checkpoint_entries = 0;
         std::uint64_t state_epoch = 0;
         std::optional<CacheBlockLocation> first_entry_location;
         for (const HostEntry& entry : entries_for(node).states) {
             if (!taken.contains(entry.location)) {
                 ++num_checkpoint_entries;
+                num_demoted_checkpoint_entries += entry.demoted ? 1 : 0;
                 state_epoch = std::max(state_epoch, entry.last_access_epoch);
                 if (!first_entry_location) {
                     first_entry_location = entry.location;
@@ -580,6 +592,9 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                         candidate.aged_epoch = state_epoch;
                     }
                 }
+                if (num_demoted_checkpoint_entries == num_checkpoint_entries) {
+                    candidate.victim_class = VictimClass::kDemoted;
+                }
             } else {
                 candidate.epoch_sort_key = *newest_epoch(*host_pool_, node, /*kv_only=*/false);
             }
@@ -616,6 +631,12 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // page by page would otherwise be walked once per page).
     std::pmr::unordered_set<const BoundaryTree::Node*> walked_by_taken_victims{&scratch};
     bool added_kv_duplicates = false;
+    // Demoted checkpoint boundaries (VictimClass::kDemoted) wait for the Host
+    // copies of KV a request holds on the Device, and the copies of unheld
+    // Device KV wait for them: the first duplicate pass stops at the first
+    // unheld copy, and a second one takes those once the Host-only cache is
+    // next, skipping the held copies the first one took.
+    bool unheld_duplicates_deferred = false;
     while (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
         // Descendants taken in this plan can bring an aged checkpoint within
         // the leaf distance, where it ranks by its own use.
@@ -629,8 +650,16 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         // Existing dead and Device-covered segments retain their priority.
         // Reclaim safe duplicates before the only copy of a checkpoint,
         // including when the Device KV is no longer held by a request.
-        if (!added_kv_duplicates && (candidates.empty() || candidates.top().victim_class == VictimClass::kHostOnly)) {
+        const bool host_only_next = candidates.empty() || candidates.top().victim_class == VictimClass::kHostOnly;
+        const bool demoted_next = !candidates.empty() && candidates.top().victim_class == VictimClass::kDemoted;
+        if ((!added_kv_duplicates && (host_only_next || demoted_next)) ||
+            (unheld_duplicates_deferred && host_only_next)) {
+            bool deferred = false;
             visitHostKvDuplicateCandidates([&](const HostKvDuplicateCandidate& duplicate) {
+                if (demoted_next && !duplicate.device_in_use) {
+                    deferred = true;
+                    return false;
+                }
                 if (taken.insert(duplicate.location).second) {
                     shadow.Remove(duplicate.group_id, duplicate.location);
                     Victim victim;
@@ -641,6 +670,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                 return !shadow.Fits(need_by_bucket, no_dense_need, no_pair_need);
             });
             added_kv_duplicates = true;
+            unheld_duplicates_deferred = deferred;
             continue;
         }
         if (candidates.empty()) {

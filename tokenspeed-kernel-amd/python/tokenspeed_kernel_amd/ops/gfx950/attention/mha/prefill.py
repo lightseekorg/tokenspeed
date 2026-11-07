@@ -32,7 +32,10 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2_VALUE,
     _LN2,
     InputStrides,
+    _mfma_unscaled_fp8,
     attention_layouts,
+    fp8_lse_shift,
+    fp8_probability_shift,
     max,
     maximum,
 )
@@ -103,7 +106,8 @@ class AttentionConfig:
         assert HEAD_DIM in (64, 128)
         assert NUM_WARPS == 4
 
-        # Prefill uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
+        # Prefill uses a 32x32 MFMA with NUM_WARPS warp tiling: depth 16 for
+        # BF16, depth 64 (F8F6F4, twice the rate) for FP8.
         (
             qk_layout,
             pv_layout,
@@ -121,7 +125,7 @@ class AttentionConfig:
             IS_FP8,
             KV_DTYPE,
             num_warps=NUM_WARPS,
-            instr_shape=[32, 32, 16],
+            instr_shape=[32, 32, 64] if IS_FP8 else [32, 32, 16],
         )
         self.N_HEADS = gl.constexpr(N_HEADS)
         self.N_KV_HEADS = gl.constexpr(N_KV_HEADS)
@@ -329,10 +333,14 @@ class AttentionProgram:
         qk = gl.zeros(
             [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
         )
+        if cfg.IS_FP8:
+            return _mfma_unscaled_fp8(q, k, qk)
         return cdna4.mfma(q, k, qk)
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
+        if self.cfg.IS_FP8:
+            return _mfma_unscaled_fp8(p, v, acc)
         return cdna4.mfma(p, v, acc)
 
     @gluon.jit
@@ -413,7 +421,8 @@ class AttentionProgram:
                 invalid = m_new == -float("inf")
                 m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
 
-            qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
+            p_shift = fp8_probability_shift(m_new_scaled, cfg.IS_FP8)
+            qk_shifted = qk * cfg.SM_SCALE - p_shift[:, None]
             p_f32 = gl.exp2(qk_shifted)
             m_diff = m_i * cfg.SM_SCALE - m_new_scaled
             if HAS_INVALID:
@@ -430,7 +439,7 @@ class AttentionProgram:
     def apply_sinks(self, l_i, m_i, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
-            l_i += gl.exp2(sink_log2 - m_i * cfg.SM_SCALE)
+            l_i += gl.exp2(sink_log2 - fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8))
         return l_i
 
     @gluon.jit
@@ -461,10 +470,11 @@ class AttentionProgram:
             )
             mask = offs_m < self.seq_len
             lse_l_i = gl.where(l_i > 0.0, l_i, 1.0)
-            # Softmax runs in base-2 (exp2 hardware fast path), so m_i*SM_SCALE +
-            # log2(l_i) is the LSE in base-2 units. Convert to natural log (the
-            # public op contract / torch.logsumexp convention) by scaling by ln2.
-            lse = (m_i * cfg.SM_SCALE + gl.log2(lse_l_i)) * _LN2
+            # Softmax runs in base 2, so `fp8_lse_shift(m_i) + log2(l_i)` is
+            # the base-2 LSE; scale by ln 2 for the natural-log contract.
+            lse = (
+                fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8) + gl.log2(lse_l_i)
+            ) * _LN2
             cdna4.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
 
@@ -767,61 +777,6 @@ class ProgramScheduler:
 
 
 @gluon.jit
-def process_single_attention_tile(program: AttentionProgram):
-    cfg = program.cfg
-    q = program.load_q(other=0.0)
-
-    k_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(1, cfg.k_layout))
-    k_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.k_layout))
-    k_offsets = cfg.k_strides.offsets(
-        program.seq_base + k_offs_n[None, :], program.kv_head, k_offs_d[:, None]
-    )
-    k_mask = k_offs_n[None, :] < program.seq_len
-    k = cdna4.buffer_load(program.k_ptr, k_offsets, mask=k_mask, other=0.0)
-
-    v_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout))
-    v_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.v_layout))
-    v_offsets = cfg.v_strides.offsets(
-        program.seq_base + v_offs_n[:, None], program.kv_head, v_offs_d[None, :]
-    )
-    v_mask = v_offs_n[:, None] < program.seq_len
-    v = cdna4.buffer_load(program.v_ptr, v_offsets, mask=v_mask, other=0.0)
-
-    qk = program.compute_qk(q, k)
-
-    mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
-    mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
-    valid = mask_offs_m[:, None] < program.seq_len
-    valid &= mask_offs_n[None, :] < program.seq_len
-    valid &= mask_offs_n[None, :] <= mask_offs_m[:, None]
-    if cfg.WINDOW_LEFT >= 0:
-        valid &= mask_offs_m[:, None] <= mask_offs_n[None, :] + cfg.WINDOW_LEFT
-
-    qk = gl.where(valid, qk, -1.0e20)
-    row_has_valid = gl.any(valid, axis=1)
-    row_max = max(qk, 1)
-    m_i = gl.where(row_has_valid, row_max, 0.0)
-    m_i_scaled = m_i * cfg.SM_SCALE
-    p = gl.where(valid, gl.exp2(qk * cfg.SM_SCALE - m_i_scaled[:, None]), 0.0)
-    l_i = gl.sum(p, axis=1)
-    if cfg.HAS_SINK:
-        sink_log2 = gl.load(program.sink_ptr + program.q_head).to(gl.float32) * _INV_LN2
-        l_i += gl.exp2(sink_log2 - m_i_scaled)
-
-    acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
-    p = p.to(program.q_ptr.dtype.element_ty)
-    p = gl.convert_layout(p, cfg.p_layout)
-    acc = program.compute_pv(p, v, acc)
-
-    program.store_lse(l_i, m_i)
-    denom = gl.where(l_i > 0.0, l_i, 1.0)
-    recip_denom = 1.0 / denom
-    output = acc * recip_denom[:, None]
-    output = gl.convert_layout(output, cfg.store_layout)
-    program.store_output(output)
-
-
-@gluon.jit
 def process_attention_tile(
     program: AttentionProgram,
     k_smem: gl.shared_memory_descriptor,
@@ -920,11 +875,50 @@ def process_attention_tile(
 
 
 @gluon.jit
-def process_sliding_attention_tile(
+def process_sliding_kv_tile(
     program: AttentionProgram,
     k_smem: gl.shared_memory_descriptor,
     v_smem: gl.shared_memory_descriptor,
+    q,
+    kv_start,
+    mask_n,
+    mask_diff,
+    m_i,
+    l_i,
+    acc,
 ):
+    cfg = program.cfg
+    k_offsets, offs_n = program.make_k_offsets(kv_start)
+    v_offsets = program.make_v_offsets(kv_start)
+    mask = offs_n[:, None] < program.seq_len
+    program.issue_load_k(k_offsets, k_smem, mask=mask)
+    program.issue_load_v(v_offsets, v_smem, mask=mask, other=0.0)
+
+    valid = mask_diff.to(gl.uint32) <= cfg.WINDOW_LEFT
+    if kv_start + cfg.BLOCK_N > program.seq_len:
+        valid &= mask_n[None, :] < program.seq_len
+
+    async_copy.wait_group(1)
+    k = program.shared_load_k(k_smem)
+    qk = program.compute_qk(q, k)
+    qk = gl.where(valid, qk, -float("inf"))
+    p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
+
+    async_copy.wait_group(0)
+    v = program.shared_load_v(v_smem)
+    if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
+        acc = program.compute_pv(p, v, acc)
+    return m_i, l_i, acc
+
+
+@gluon.jit
+def process_short_window_attention_tile(
+    program: AttentionProgram,
+    k_smem: gl.shared_memory_descriptor,
+    v_smem: gl.shared_memory_descriptor,
+    MAX_KV_TILES: gl.constexpr,
+):
+    # A short window is unrolled, so the compiler can overlap its tiles.
     # The launcher forces DEFER_V_LOAD off here: too few KV tiles for the
     # saved traffic to cover the cost of deferring.
     cfg = program.cfg
@@ -933,9 +927,6 @@ def process_sliding_attention_tile(
 
     kv_start = program.q_start - cfg.WINDOW_LEFT
     kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
-    num_kv_tiles: gl.constexpr = (
-        cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
-    ) // cfg.BLOCK_N
     offs_m = program.q_start + gl.arange(
         0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
     )
@@ -944,29 +935,56 @@ def process_sliding_attention_tile(
     )
     mask_diff = offs_m[:, None] - mask_n[None, :]
 
-    for _ in gl.static_range(num_kv_tiles):
-        k_offsets, offs_n = program.make_k_offsets(kv_start)
-        v_offsets = program.make_v_offsets(kv_start)
-        mask = offs_n[:, None] < program.seq_len
-        program.issue_load_k(k_offsets, k_smem, mask=mask)
-        program.issue_load_v(v_offsets, v_smem, mask=mask, other=0.0)
-
-        valid = mask_diff.to(gl.uint32) <= cfg.WINDOW_LEFT
-        if kv_start + cfg.BLOCK_N > program.seq_len:
-            valid &= mask_n[None, :] < program.seq_len
-
-        async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem)
-        qk = program.compute_qk(q, k)
-        qk = gl.where(valid, qk, -float("inf"))
-        p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
-
-        async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem)
-        if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
-            acc = program.compute_pv(p, v, acc)
+    for _ in gl.static_range(MAX_KV_TILES):
+        m_i, l_i, acc = process_sliding_kv_tile(
+            program, k_smem, v_smem, q, kv_start, mask_n, mask_diff, m_i, l_i, acc
+        )
         kv_start = kv_start + cfg.BLOCK_N
+        mask_n = mask_n + cfg.BLOCK_N
+        mask_diff = mask_diff - cfg.BLOCK_N
 
+    l_i = program.apply_sinks(l_i, m_i, sink_log2)
+    program.store_lse(l_i, m_i)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    recip_denom = 1.0 / denom
+    output = acc * recip_denom[:, None]
+    output = gl.convert_layout(output, cfg.store_layout)
+    program.store_output(output)
+
+
+@gluon.jit
+def process_long_window_attention_tile(
+    program: AttentionProgram,
+    k_smem: gl.shared_memory_descriptor,
+    v_smem: gl.shared_memory_descriptor,
+):
+    # A long window (such as 4096) loops over only the tiles that both the
+    # window and the request reach: unrolling it compiles slowly and makes
+    # a short request pay for the whole window.
+    # The launcher forces DEFER_V_LOAD off here: too few KV tiles for the
+    # saved traffic to cover the cost of deferring.
+    cfg = program.cfg
+    q = program.load_q()
+    m_i, l_i, acc, sink_log2 = program.init_attention_state()
+
+    kv_start = program.q_start - cfg.WINDOW_LEFT
+    kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
+    offs_m = program.q_start + gl.arange(
+        0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
+    )
+    mask_n = kv_start + gl.arange(
+        0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
+    )
+    mask_diff = offs_m[:, None] - mask_n[None, :]
+
+    kv_end = program.q_start + cfg.BLOCK_M
+    kv_end = gl.where(kv_end < program.seq_len, kv_end, program.seq_len)
+    num_kv_tiles = (kv_end - kv_start + cfg.BLOCK_N - 1) // cfg.BLOCK_N
+    for _ in range(0, num_kv_tiles):
+        m_i, l_i, acc = process_sliding_kv_tile(
+            program, k_smem, v_smem, q, kv_start, mask_n, mask_diff, m_i, l_i, acc
+        )
+        kv_start = kv_start + cfg.BLOCK_N
         mask_n = mask_n + cfg.BLOCK_N
         mask_diff = mask_diff - cfg.BLOCK_N
 
@@ -1080,14 +1098,14 @@ def gluon_mha_prefill_gfx950(
             cu_seqlens_ptr,
             log2_threshold,
         )
+        # Requests shorter than BLOCK_N take the same path as longer ones. A
+        # separate register-only path for them let the gfx950 compiler reuse
+        # the spill slot of a loop-invariant buffer descriptor, so the next
+        # tile on the same workgroup read K from the wrong tensor.
         if active:
-            if program.seq_len < cfg.BLOCK_N:
-                if program.q_start == 0:
-                    process_single_attention_tile(program)
-            else:
-                process_attention_tile(
-                    program, k_smem, v_smem, boundary_mask0, boundary_mask1
-                )
+            process_attention_tile(
+                program, k_smem, v_smem, boundary_mask0, boundary_mask1
+            )
         scheduler = scheduler.advance()
 
 
@@ -1161,6 +1179,10 @@ def gluon_mha_prefill_sliding_gfx950(
         cfg.v_smem_layout,
     )
 
+    # Number of KV tiles a BLOCK_M query tile can see through the window.
+    MAX_KV_TILES: gl.constexpr = (
+        cfg.BLOCK_M + cfg.WINDOW_LEFT + cfg.BLOCK_N - 1
+    ) // cfg.BLOCK_N
     scheduler = ProgramScheduler.create(
         cfg, batch_size, batch_slots, q_slots, max_seqlen_q, sched_counter_ptr, False
     )
@@ -1175,12 +1197,17 @@ def gluon_mha_prefill_sliding_gfx950(
             cu_seqlens_ptr,
             log2_threshold,
         )
+        # Requests shorter than BLOCK_N take the same path as longer ones. A
+        # separate register-only path for them let the gfx950 compiler reuse
+        # the spill slot of a loop-invariant buffer descriptor, so the next
+        # tile on the same workgroup read K from the wrong tensor.
         if active:
-            if program.seq_len < cfg.BLOCK_N:
-                if program.q_start == 0:
-                    process_single_attention_tile(program)
+            if MAX_KV_TILES <= 8:
+                process_short_window_attention_tile(
+                    program, k_smem, v_smem, MAX_KV_TILES
+                )
             else:
-                process_sliding_attention_tile(program, k_smem, v_smem)
+                process_long_window_attention_tile(program, k_smem, v_smem)
         scheduler = scheduler.advance()
 
 
@@ -1300,6 +1327,12 @@ def launch_gluon_mha_prefill_gfx950(
         ``(output, lse)`` when ``return_lse`` is set.
     """
     total_tokens, n_heads, _ = q.shape
+    # The strides are compiled into the kernels, which lets K and V share
+    # their load offsets when their rows have the same layout. A caller's
+    # rows may arrive as views or as compact copies (a packed QKV projection
+    # may yield views on some batches and copies on others), so compact the
+    # views here: one binary serves both, at the cost of copying the views.
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     config = get_config(
         q=q,
         k=k,

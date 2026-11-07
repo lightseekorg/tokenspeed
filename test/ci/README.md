@@ -87,6 +87,21 @@ The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
 GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
 unquantized.
 
+The Qwen3.8 Flash Next MXFP4 monokernel task serves the same checkpoint on
+one GPU with `--decode-monokernel` and three-step MTP. It uses the same 2-GPU
+MI35x runners, whose Hugging Face cache already holds the checkpoint. It sends the first
+128 GSM8K test questions one at a time
+(`test/single_request_benchmark/gsm8k_decode.py`). Every decode step then has
+one request, so the decode monokernel serves every step. The batched GSM8K
+eval runs more than four token rows per step, so it keeps the regular path.
+One server start gates two things. The benchmark exits with status 1 when
+accuracy is below 0.88. `perf_reference` gates the per-request decode rate,
+which leaves out time to first token. The reference is the median of three
+runs on that runner, rounded down. The task stays optional until later runs
+confirm it. The benchmark
+writes per-request records under
+`.ci-artifacts/published/gsm8k-single-request`.
+
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
 invalid TPOT fails collection instead of producing a zero-throughput report.
@@ -694,10 +709,10 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
-The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.2 by image digest.
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.3 by image digest.
 When upgrading, keep the FlashInfer Python requirement, release cubin checksum,
-and runner JIT-cache version aligned. FlashInfer 0.7.2 also requires
-cuDNN frontend 1.31.0 or newer and splits its JIT cache into provider packages.
+and runner JIT-cache version aligned. FlashInfer 0.7.3 also requires
+cuDNN frontend 1.32.0 or newer and splits its JIT cache into provider packages.
 GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
 index and checks their installed versions again after dependency installation.
 

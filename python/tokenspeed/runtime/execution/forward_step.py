@@ -149,6 +149,69 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
 global_graph_memory_pool = None
 
 
+def prepare_draft_extend_metadata(
+    draft_attn_backend: AttentionBackend,
+    drafter: BaseDrafter,
+    *,
+    padded_bs: int,
+    num_extends: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    forward_mode: ForwardMode,
+    **kwargs,
+) -> None:
+    """The draft backend's metadata for an extend or mixed forward.
+
+    One draft metadata contract for every backend family, the same two steps
+    as the pure-decode path: the prefill init reads the accepted-prefix
+    seq_lens view, then the unified refresh prepares the draft's step-1+
+    decode metadata. Drafters republish their in-loop seq_lens edits through
+    advance_draft_forward_metadata / update_draft_forward_metadata. Called by
+    the forward step for every extend and by the drafter prefill graph's
+    capture for its dummy extends, so both prepare the same state.
+
+    Args:
+        draft_attn_backend: The draft model's attention backend.
+        drafter: The drafter; its ``draft_seq_lens_buf`` is seeded for the
+            round (the DFLASH drafter reads it directly; Eagle advances it per
+            step), and it takes the round's ``block_tables``.
+        padded_bs: Requests in the forward.
+        num_extends: Leading extend requests.
+        req_pool_indices: ``[padded_bs]`` request-pool slots.
+        seq_lens: ``[>= padded_bs]`` cache lengths after this forward.
+        forward_mode: EXTEND or MIXED.
+        **kwargs: The target's extend metadata arguments, passed on unchanged
+            (the extend lengths, ``block_tables`` and the rest).
+    """
+    draft_seq_lens = drafter.draft_seq_lens_buf[:padded_bs]
+    draft_seq_lens.copy_(seq_lens[:padded_bs])
+    draft_attn_backend.init_forward_metadata(
+        bs=padded_bs,
+        num_extends=num_extends,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        forward_mode=forward_mode,
+        **kwargs,
+    )
+    # Step two: the draft's step-1+ decode metadata for this round, via the
+    # same refresh the pure-decode path uses. Plain 1-token rows --
+    # deliberately NOT the packed verify width: V4's packed-decode arm would
+    # clobber forward_prefill_metadata with a DECODE-mode object and break the
+    # draft's first-step prefill. Refresh writes decode-slot metadata only, so
+    # rounds that run no decode steps (vanilla MTP extend depths, DFLASH block
+    # decode) simply leave it unread or overwrite it per step.
+    draft_attn_backend.refresh_decode_metadata(
+        padded_bs,
+        padded_bs,
+        req_pool_indices,
+        draft_seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        num_extends=num_extends,
+        block_tables=kwargs.get("block_tables"),
+    )
+    drafter.round_block_tables = kwargs.get("block_tables")
+
+
 class DeepEPCudaGraphRunnerAdapter:
     """Manages DeepEP dispatch mode consistency across CUDA graph capture/replay.
 
@@ -630,6 +693,11 @@ class ForwardStepRunner:
                 if self.runtime_states is not None
                 else None
             ),
+            draft_q=(
+                self.runtime_states.future_draft_q
+                if self.runtime_states is not None
+                else None
+            ),
             vocab_size=self.vocab_size,
             device=self.device,
         )
@@ -810,6 +878,11 @@ class ForwardStepRunner:
                         if self.runtime_states is not None
                         else None
                     ),
+                    draft_q=(
+                        self.runtime_states.future_draft_q
+                        if self.runtime_states is not None
+                        else None
+                    ),
                     vocab_size=self.vocab_size,
                     device=self.device,
                 )
@@ -975,43 +1048,16 @@ class ForwardStepRunner:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
-            # One draft metadata contract for every backend family, the same
-            # two steps as the pure-decode path: the prefill init reads the
-            # accepted-prefix seq_lens view, then the unified refresh prepares
-            # the draft's step-1+ decode metadata. Drafters republish their
-            # in-loop seq_lens edits through advance_draft_forward_metadata /
-            # update_draft_forward_metadata. The copy below seeds the
-            # drafter-owned buffer for the round (the DFLASH drafter reads it
-            # directly; Eagle advances it per step).
-            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
-            draft_seq_lens.copy_(seq_lens[:padded_bs])
-            draft_extend_kwargs = dict(kwargs)
-            self.draft_attn_backend.init_forward_metadata(
-                bs=padded_bs,
+            prepare_draft_extend_metadata(
+                self.draft_attn_backend,
+                self.drafter,
+                padded_bs=padded_bs,
                 num_extends=num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
-                **draft_extend_kwargs,
+                **kwargs,
             )
-            # Step two: the draft's step-1+ decode metadata for this round,
-            # via the same refresh the pure-decode path uses. Plain 1-token
-            # rows — deliberately NOT the packed verify width: V4's
-            # packed-decode arm would clobber forward_prefill_metadata with a
-            # DECODE-mode object and break the draft's first-step prefill.
-            # Refresh writes decode-slot metadata only, so rounds that run no
-            # decode steps (vanilla MTP extend depths, DFLASH block decode)
-            # simply leave it unread or overwrite it per step.
-            self.draft_attn_backend.refresh_decode_metadata(
-                padded_bs,
-                padded_bs,
-                req_pool_indices,
-                draft_seq_lens,
-                forward_mode=ForwardMode.DECODE,
-                num_extends=num_extends,
-                block_tables=kwargs.get("block_tables"),
-            )
-            self.drafter.round_block_tables = kwargs.get("block_tables")
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:

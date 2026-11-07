@@ -295,11 +295,12 @@ def _sharded_tail_contribution(
     """
     n = lengths.shape[0]
     offs, rows = _tail_row_offsets(lengths, width)
-    owned = (offs >= 0) & (rows >= plan.local_start) & (rows < plan.local_end)
     out = shard.new_zeros((n, width) + shard.shape[1:])
     if plan.local_rows > 0:
-        local = (rows - plan.local_start).clamp(0, plan.local_rows - 1)
-        picked = shard[local.reshape(-1)].reshape(out.shape)
+        # A tail slot before a short request's first row names no row.
+        local = plan.local_index_of_row[rows.clamp(0, plan.total_rows - 1)]
+        owned = (offs >= 0) & (local >= 0)
+        picked = shard[local.clamp_min(0).reshape(-1)].reshape(out.shape)
         mask = owned.view((n, width) + (1,) * (shard.dim() - 1))
         out = torch.where(mask, picked, out)
     return out
@@ -606,7 +607,7 @@ class Mtp(BaseDrafter):
 
         Under a query shard every depth runs the target's shard of the span,
         exactly as Eagle's step 0: the ids and positions are the shard's
-        slice of the whole-span buffers (the per-depth shifts are computed
+        rows of the whole-span buffers (the per-depth shifts are computed
         over the whole span, every rank holds it), ``gather_ids`` keep the
         full layout and the chain hiddens are the shard's rows -- the
         target's capture in, the draft's FULL capture out.
@@ -617,7 +618,7 @@ class Mtp(BaseDrafter):
         rows = (
             slice(0, input_num_tokens)
             if plan is None or plan.size == 1
-            else plan.local_slice
+            else plan.local_row_ids
         )
 
         # Final chunks carry a -1 placeholder in their last shift-1 row;
@@ -649,10 +650,11 @@ class Mtp(BaseDrafter):
         )
 
         prev_hidden = draft_input.base_out_hidden_states  # [rows, H]
-        if prev_hidden.shape[0] != rows.stop - rows.start:
+        num_rows = positions.shape[0]
+        if prev_hidden.shape[0] != num_rows:
             raise RuntimeError(
                 f"the target captured {prev_hidden.shape[0]} hidden rows for the "
-                f"drafter's {rows.stop - rows.start} extend rows"
+                f"drafter's {num_rows} extend rows"
             )
         for d in range(self.spec_num_steps):
             step_ids = (

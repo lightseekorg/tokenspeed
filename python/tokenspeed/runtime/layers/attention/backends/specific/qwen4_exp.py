@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     )
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
+    )
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
 
@@ -167,6 +170,39 @@ class Qwen4ExpBackend(AttentionBackend):
             if consumer is not None
         )
 
+    def preallocate_qsa_bf16_scratch(self, plan: QSABf16ScratchPlan) -> int:
+        """Allocate the BF16 prefill scratch on this view's QSA attention leaf.
+
+        Args:
+            plan: The cache recipe's ``qsa_bf16_scratch_plan``.
+
+        Returns:
+            The bytes allocated, which the caller checks against the plan.
+        """
+        from tokenspeed.runtime.layers.attention.backends.paged.qsa import (
+            QSAAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
+            CacheGroupRouter,
+        )
+
+        router = self._full_attn_backend
+        leaves = (
+            [
+                leaf
+                for leaf in router.leaves.values()
+                if isinstance(leaf, QSAAttnBackend)
+            ]
+            if isinstance(router, CacheGroupRouter)
+            else []
+        )
+        if len(leaves) != 1:
+            raise RuntimeError(
+                "the QSA BF16 prefill scratch needs one QSA attention leaf, "
+                f"found {len(leaves)}"
+            )
+        return leaves[0].preallocate_bf16_scratch(plan)
+
     def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
         for backend in self.child_backends():
             backend.init_cuda_graph_state(max_bs, **kwargs)
@@ -187,10 +223,32 @@ class Qwen4ExpBackend(AttentionBackend):
         self._full_attn_backend.configure_runtime(**kwargs)
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
-        self._full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+        # A hybrid child also resets its GDN child's retained capacity metadata;
+        # PLE and the QSA indexer keep their breaks and retain nothing.
+        self.attention_backend.init_prefill_graph_state(max_num_tokens, max_bs)
 
     def register_step_counter(self, step_counter: StepCounter) -> None:
+        # Kept here as well: the prefill graph reads the root's counter to
+        # keep layerwise transfer on the ordinary route.
+        self.step_counter = step_counter
         self.attention_backend.register_step_counter(step_counter)
+
+    # Prefill graphs capture the attention child's GDN layers inline. PLE and
+    # the QSA indexer keep their breaks over their own live metadata, and the
+    # full-attention layers keep theirs (HybridLinearAttnBackend.forward).
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        return self.attention_backend.admits_prefill_graph(
+            token_capacity, bs, forward_mode
+        )
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        return self.attention_backend.prepare_prefill_metadata(
+            token_capacity, bs, forward_mode, capture=capture
+        )
 
     def forward(self, *args, **kwargs):
         # The attention child owns the break point and the single PD cache step.
@@ -253,6 +311,18 @@ class Qwen4ExpBackend(AttentionBackend):
         if isinstance(self.attention_backend, HybridLinearAttnBackend):
             return self.attention_backend.full_attn_backend
         return self.attention_backend
+
+    @property
+    def has_linear_attn(self) -> bool:
+        """Whether this view has Gated DeltaNet layers (a hybrid child)."""
+        return isinstance(self.attention_backend, HybridLinearAttnBackend)
+
+    @property
+    def linear_attn_backend(self) -> AttentionBackend:
+        """The Gated DeltaNet layers' backend (the hybrid composite's child)."""
+        if not isinstance(self.attention_backend, HybridLinearAttnBackend):
+            raise RuntimeError("this Qwen4-Exp view has no Gated DeltaNet layers")
+        return self.attention_backend.linear_attn_backend
 
     # Drafter length-edit hooks fan out to the attention child (a hybrid
     # composite forwards them to its full-attention router) and the indexer.
