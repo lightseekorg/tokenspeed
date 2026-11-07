@@ -53,13 +53,12 @@ from asm_checks import (
     undeclared_asm_writes,
 )
 from test_iris_muse_spark import _compile_gfx950
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.platform import ArchVersion
+from utils import is_cdna4
 
 # The cases compile gfx950 Gluon kernels from the AMD kernel package and Iris,
 # which other platforms' runners do not install.
-pytestmark = pytest.mark.skipif(
-    not current_platform().is_cdna4, reason="gfx950 inline asm checks"
-)
+pytestmark = pytest.mark.skipif(not is_cdna4(), reason="gfx950 inline asm checks")
 
 
 def _peer_signal_store():
