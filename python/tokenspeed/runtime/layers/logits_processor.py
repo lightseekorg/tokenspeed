@@ -325,13 +325,14 @@ class LogitsProcessor(nn.Module):
         tp_group: tuple[int, ...] | None = None,
         *,
         dp_lm_head_tp: bool,
+        attn_tp_size: int,
     ):
         """``tp_*`` describe the group ``lm_head`` is vocab-sharded over.
 
         ``dp_lm_head_tp`` selects the layout where that group's ranks are
-        data-parallel for attention and hold different rows: the rows are
-        all-gathered before the logits GEMM and the vocab shards transposed
-        back to each rank's own rows afterwards (``skip_all_gather`` is then
+        data-parallel for attention. ``attn_tp_size`` describes replicated
+        rows within each attention TP group: each DP slot is gathered once
+        before the logits GEMM and full-vocab logits returned to its peers (``skip_all_gather`` is then
         required, as the plain vocab all-gather does not apply). ``False`` is
         today's layout: every rank of the group holds the same rows.
         """
@@ -376,7 +377,26 @@ class LogitsProcessor(nn.Module):
                 "skip_all_gather=True"
             )
         self.dp_lm_head_tp = dp_lm_head_tp
+        self.attn_tp_size = attn_tp_size
+        if attn_tp_size < 1:
+            raise ValueError("attention TP size must be positive")
+        if dp_lm_head_tp and max(tp_size, attn_tp_size) % min(tp_size, attn_tp_size):
+            raise ValueError("LM head and attention TP groups must tile each other")
+        self._row_replicas = min(attn_tp_size, tp_size) if dp_lm_head_tp else 1
 
+        # DP head gathers contain the sampled/verify rows across DP groups,
+        # not all prefill tokens. Larger prompt-logprob batches use NCCL.
+        self._logits_ag_max_tokens = self._LOGITS_AG_MAX_TOKENS
+        if dp_lm_head_tp:
+            max_requests = global_server_args_dict.get("max_num_seqs") or 0
+            verify_tokens = (
+                global_server_args_dict.get("speculative_num_draft_tokens") or 1
+                if global_server_args_dict.get("speculative_algorithm") is not None
+                else 1
+            )
+            self._logits_ag_max_tokens = max(
+                self._logits_ag_max_tokens, max_requests * verify_tokens
+            )
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
         self._dist_argmax_binding: tuple[object, ...] | None = None
@@ -505,7 +525,7 @@ class LogitsProcessor(nn.Module):
 
         if (
             self.tp_size == 1
-            or self.skip_all_gather
+            or (self.skip_all_gather and not self.dp_lm_head_tp)
             or not self._tp_group_multicast_reachable()
         ):
             return None
@@ -515,12 +535,12 @@ class LogitsProcessor(nn.Module):
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 
-        key = (self.tp_group, vocab_padded)
+        key = (self.tp_group, vocab_padded, self._logits_ag_max_tokens)
         if key not in self._LOGITS_AG_STATES:
             self._LOGITS_AG_STATES[key] = create_state(
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
-                max_tokens=self._LOGITS_AG_MAX_TOKENS,
+                max_tokens=self._logits_ag_max_tokens,
                 hidden_size=vocab_padded,
                 device=None,
             )
@@ -1113,15 +1133,43 @@ class LogitsProcessor(nn.Module):
             )
 
         lm_head_tp_row_counts: list[int] | None = None
+        local_dp_rows: slice | None = None
         if self.dp_lm_head_tp:
             if dp_sampling:
                 raise RuntimeError("dp_lm_head_tp cannot combine with DP sampling")
             lm_head_tp_row_counts = self._lm_head_tp_row_counts(
                 hidden_states, logits_metadata
             )
-            hidden_states = token_all_gather(
-                hidden_states, self.tp_group, lm_head_tp_row_counts
-            )
+            if self._row_replicas == 1:
+                hidden_states = token_all_gather(
+                    hidden_states, self.tp_group, lm_head_tp_row_counts
+                )
+            else:
+                # Attention TP peers hold identical rows. Only one peer writes
+                # each DP slot, so the LM-head GEMM sees each token once.
+                counts = lm_head_tp_row_counts
+                replicas = self._row_replicas
+                for begin in range(0, self.tp_size, replicas):
+                    if any(
+                        n != counts[begin] for n in counts[begin : begin + replicas]
+                    ):
+                        raise ValueError(
+                            "Attention TP peers must have identical LM-head row counts"
+                        )
+                dp_counts = counts[::replicas]
+                dp_rank = self.tp_rank // replicas
+                start = sum(dp_counts[:dp_rank])
+                local_dp_rows = slice(start, start + hidden_states.shape[0])
+                gathered = hidden_states.new_zeros(
+                    (sum(dp_counts), hidden_states.shape[1])
+                )
+                if self.tp_rank % replicas == 0:
+                    gathered[local_dp_rows].copy_(hidden_states)
+                hidden_states = (
+                    all_reduce(gathered, self.tp_group)
+                    if gathered.shape[0]
+                    else gathered
+                )
 
         quant_method = getattr(lm_head, "quant_method", None)
         if should_apply_lm_head_quant_method(lm_head, quant_method):
@@ -1166,7 +1214,18 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None and not self.final_logit_softcapping:
             logits.mul_(self.logit_scale)
 
-        if lm_head_tp_row_counts is not None:
+        if local_dp_rows is not None:
+            # Reassemble the vocabulary, then give both attention TP peers the
+            # same DP slot. The slice is a view; no token rows are duplicated
+            # in the GEMM or summed across vocabulary shards.
+            if logits.shape[0]:
+                logits = self._gather_vocab_logits(
+                    logits, lm_head, require_full_vocab=require_full_vocab
+                )
+            else:
+                logits = logits.new_empty((0, logits.shape[1] * self.tp_size))
+            logits = logits[local_dp_rows]
+        elif lm_head_tp_row_counts is not None:
             # [T_full, V / W] -> [T_own, V]: this rank's rows with every
             # rank's vocab shard, in rank order like the plain all-gather.
             logits = all_to_all_transpose(
@@ -1194,61 +1253,9 @@ class LogitsProcessor(nn.Module):
                 ):
                     return logits
 
-            # The multicast buffer/kernel is BF16-only; retain other logits dtypes
-            # through the existing collective, including when a state is cached.
-            # A private full-vocab result never uses the shared buffer either.
-            state = (
-                self._all_gather_state
-                if logits.dtype == torch.bfloat16 and not require_full_vocab
-                else None
+            logits = self._gather_vocab_logits(
+                logits, lm_head, require_full_vocab=require_full_vocab
             )
-            if state is self._LOGITS_AG_STATE_UNINITIALIZED:
-                # create_state rendezvouses; leave it for an eager call.
-                if is_current_stream_capturing(logits.device):
-                    state = None
-                else:
-                    state = self._all_gather_state = self._init_all_gather_state(
-                        lm_head
-                    )
-
-            if state is not None and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS:
-                # skip_entry_sync=True assumes other sync points existing between two all_gather_inner calls.
-                logits = all_gather_inner(
-                    state,
-                    logits,
-                    tp_hidden_dim=logits.size(-1) * self.tp_size,
-                    skip_entry_sync=True,
-                    safe=False,
-                )
-            elif (
-                current_platform().is_cdna4
-                and not require_full_vocab
-                and (
-                    iris := get_global_backend().get_prepared_all_gather(
-                        self.tp_group, logits.dtype
-                    )
-                )
-                is not None
-                and iris.can_run(logits)
-            ):
-                logits = iris.run(logits)
-            else:
-                num_rows = logits.size(0)
-                local_vocab_size = logits.size(1)
-                gathered_logits = torch.empty(
-                    self.tp_size * num_rows,
-                    local_vocab_size,
-                    dtype=logits.dtype,
-                    device=logits.device,
-                )
-                all_gather_single(gathered_logits, logits, self.tp_group)
-                # Copies whole shard rows, several times faster than a transpose copy.
-                logits = torch.cat(
-                    gathered_logits.view(
-                        self.tp_size, num_rows, local_vocab_size
-                    ).unbind(0),
-                    dim=1,
-                )
 
         logits = logits[:, : self.config.vocab_size].contiguous()
 
@@ -1259,6 +1266,69 @@ class LogitsProcessor(nn.Module):
                 1.0 if self.logit_scale is None else self.logit_scale,
             )
 
+        return logits
+
+    def _gather_vocab_logits(
+        self,
+        logits: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        *,
+        require_full_vocab: bool,
+    ) -> torch.Tensor:
+        # The multicast buffer/kernel is BF16-only; retain other logits dtypes
+        # through the existing collective, including when a state is cached.
+        # A private full-vocab result never uses the shared buffer either.
+        state = (
+            self._all_gather_state
+            if logits.dtype == torch.bfloat16 and not require_full_vocab
+            else None
+        )
+        if state is self._LOGITS_AG_STATE_UNINITIALIZED:
+            # create_state rendezvouses; leave it for an eager call.
+            if is_current_stream_capturing(logits.device):
+                state = None
+            else:
+                state = self._all_gather_state = self._init_all_gather_state(lm_head)
+
+        if state is not None and logits.size(0) <= self._logits_ag_max_tokens:
+            # DP target and draft share this buffer; retain its entry barrier.
+            # The existing plain TP path has intervening synchronization.
+            logits = all_gather_inner(
+                state,
+                logits,
+                tp_hidden_dim=logits.size(-1) * self.tp_size,
+                skip_entry_sync=not self.dp_lm_head_tp,
+                safe=False,
+            )
+        elif (
+            current_platform().is_cdna4
+            and not require_full_vocab
+            and (
+                iris := get_global_backend().get_prepared_all_gather(
+                    self.tp_group, logits.dtype
+                )
+            )
+            is not None
+            and iris.can_run(logits)
+        ):
+            logits = iris.run(logits)
+        else:
+            num_rows = logits.size(0)
+            local_vocab_size = logits.size(1)
+            gathered_logits = torch.empty(
+                self.tp_size * num_rows,
+                local_vocab_size,
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            all_gather_single(gathered_logits, logits, self.tp_group)
+            # Copies whole shard rows, several times faster than a transpose copy.
+            logits = torch.cat(
+                gathered_logits.view(self.tp_size, num_rows, local_vocab_size).unbind(
+                    0
+                ),
+                dim=1,
+            )
         return logits
 
     def _argmax(self, logits: torch.Tensor) -> torch.Tensor:

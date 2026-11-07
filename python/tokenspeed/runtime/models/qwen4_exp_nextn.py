@@ -264,6 +264,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
             do_argmax=True,
+            attn_tp_size=mapping.attn.tp_size,
             dp_lm_head_tp=mapping.attn.has_dp and mapping.lm_head.has_tp,
         )
 
@@ -395,13 +396,15 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
                 ctx,
                 input_embeds=fused,
             )
-        return self.logits_processor(
-            input_ids,
-            hidden_states,
-            self.lm_head,
-            LogitsMetadata.from_forward_context(ctx),
-            aux_hidden_states,
-        )
+            # The first draft step narrows verify rows to one per request.
+            # Keep that row table active through the cross-DP head exchange.
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                LogitsMetadata.from_forward_context(ctx),
+                aux_hidden_states,
+            )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return "mtp" in name or "shared_head" in name

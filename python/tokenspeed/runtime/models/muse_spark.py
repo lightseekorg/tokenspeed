@@ -2802,6 +2802,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
+            attn_tp_size=self.mapping.attn.tp_size,
             dp_lm_head_tp=False,
         )
 

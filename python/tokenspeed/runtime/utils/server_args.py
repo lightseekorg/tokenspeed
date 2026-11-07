@@ -4343,8 +4343,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.lm_head_tp_size,
             help="Vocab-shard the LM head over this many contiguous ranks. "
-            "Under attention DP (which needs attention TP 1) the default 1 "
-            "keeps the head replicated; a wider group gathers the ranks' rows "
+            "Under attention DP the default 1 "
+            "keeps the head replicated; a wider group gathers distinct DP rows "
             "before the logits GEMM and transposes the vocab shards back. "
             "Without attention DP it must equal the attention TP size.",
         )
