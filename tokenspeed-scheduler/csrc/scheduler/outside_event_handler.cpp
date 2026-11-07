@@ -21,6 +21,8 @@
 #include "scheduler/scheduler.h"
 
 #include <algorithm>
+#include <array>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -141,12 +143,17 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                                         completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
         coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
     }
+    if (checkpoint_lineage_) {
+        demoteSupersededCheckpoint(progress);
+        recordCheckpointPublication(progress);
+    }
     coordinator_.RefreshRetainedCheckpoint(progress.retained_input_checkpoint, progress.access_epoch);
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
     // Every published entry of the request streams: its pages, its tail and
-    // the state checkpoint published with the frontier.
+    // the state checkpoint published with the frontier; a demoted entry
+    // under its pages is not stored.
     coordinator_.QueueCachedBlocksForStore(store_hashes);
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
@@ -239,6 +246,64 @@ bool Scheduler::finishCheckpointIsDead(const Request& request, const fsm::CacheP
         }
     }
     return false;
+}
+
+void Scheduler::demoteSupersededCheckpoint(const fsm::CacheProgress& progress) {
+    const std::int32_t page = coordinator_.PrefixGranularity();
+    const std::int32_t checkpoint = progress.published_state_checkpoint_tokens;
+    const std::int32_t resumed = progress.resume_tokens;
+    const std::span<const std::string> chain(progress.prefix_hashes);
+    if (checkpoint <= resumed || checkpoint / page > static_cast<std::int32_t>(chain.size()) || resumed <= 0 ||
+        resumed % page != 0) {
+        return;  // no checkpoint past a page boundary the request resumed from
+    }
+    // R's publication, when R is a recorded in-forward checkpoint, names
+    // where R's request resumed. The chain hash at R fixes every page before
+    // it, so that boundary lies on this request's chain too.
+    const CheckpointLineage::Publication* resumed_publication =
+        checkpoint_lineage_->FindPublication(chain[static_cast<std::size_t>(resumed / page) - 1]);
+    if (resumed_publication == nullptr) {
+        return;
+    }
+    const std::int32_t superseded = resumed_publication->resumed_tokens;
+    if (superseded <= 0 || superseded >= resumed || superseded % page != 0) {
+        return;
+    }
+    const std::string& superseded_hash = chain[static_cast<std::size_t>(superseded / page) - 1];
+    if (checkpoint_lineage_->FindPublication(superseded_hash) == nullptr) {
+        return;  // two turns back is no recorded in-forward checkpoint
+    }
+    // Shared -- another first admission resumed there too, or an acquisition
+    // or publication there is newer than the one R's request made when it
+    // resumed there: a fork, or a system prompt every new conversation
+    // resumes at. It stays.
+    if (checkpoint_lineage_->Resumes(superseded_hash) != 1 ||
+        coordinator_.LatestStateAccessEpoch(superseded_hash) > resumed_publication->access_epoch) {
+        return;
+    }
+    // R and C stay resumable with the window blocks they resume with: a
+    // sliding window wider than a turn reaches back behind the boundary.
+    const std::array<std::int32_t, 2> kept_boundaries{resumed, checkpoint};
+    const std::vector<CacheKey> keys =
+        coordinator_.BoundaryCheckpointKeys(chain.first(static_cast<std::size_t>(superseded / page)), kept_boundaries);
+    std::int32_t demoted = coordinator_.DemoteEntries(keys);
+    // Under the write-back policy an eviction may still be carrying one of
+    // them to the Host: it lands demoted as well.
+    demoted += tier_transfers_.DemoteInFlightEvictions(keys);
+    demoted_checkpoint_entries_ += static_cast<std::uint64_t>(demoted);
+}
+
+void Scheduler::recordCheckpointPublication(const fsm::CacheProgress& progress) {
+    const std::int32_t page = coordinator_.PrefixGranularity();
+    const std::int32_t checkpoint = progress.published_state_checkpoint_tokens;
+    const std::int32_t resumed = progress.resume_tokens;
+    if (checkpoint <= resumed || checkpoint / page > static_cast<std::int32_t>(progress.prefix_hashes.size())) {
+        return;  // no in-forward checkpoint past the point it resumed from
+    }
+    checkpoint_lineage_->RecordPublication(
+        progress.prefix_hashes[static_cast<std::size_t>(checkpoint / page) - 1],
+        CheckpointLineage::Publication{.resumed_tokens = resumed % page == 0 ? resumed : 0,
+                                       .access_epoch = progress.access_epoch});
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {

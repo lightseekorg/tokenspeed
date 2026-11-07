@@ -652,6 +652,48 @@ public:
     // entries was touched after access_epoch, the finishing request's: another
     // request acquired or published it since.
     void MarkSupersededStateInput(const ContentHash& resumed_tail_hash, std::uint64_t access_epoch);
+
+    // Superseded checkpoint demotion (SchedulerConfig::
+    // demote_superseded_state_checkpoints, docs/design/scheduler.md §1.2).
+    // A demoted entry carries this access epoch, which no access issues, so
+    // the Device and a write-through Host evict it ahead of every dated entry.
+    // A session's demotion (DemoteSessions) and a superseded input
+    // (MarkSupersededStateInput) date entries to it as well; only a demotion
+    // marks an entry demoted (PrefixCacheIndex::CachedBlockMetadata::demoted).
+    static constexpr std::uint64_t kDemotedAccessEpoch{0};
+    // Set once, by the scheduler, at construction. On, an entry a demotion
+    // marked counts as demoted until a hit, touch or republication ends it:
+    // no store or eviction write-back copies it to the Host
+    // (DemotedEntriesNotWrittenBack), and a Host segment plan takes a
+    // Host-only checkpoint boundary whose checkpoints are all demoted after
+    // the Host copies of KV a request holds on the Device and before those of
+    // unheld Device KV. Off, no entry counts as demoted. Either way a
+    // session's demoted entries and superseded inputs keep their own rules.
+    void SetCheckpointDemotion(bool enabled) { demotes_checkpoints_ = enabled; }
+    // Each State group's checkpoint at the page boundary that ends
+    // prefix_hashes and the sliding-window blocks behind it, less the blocks
+    // behind any of kept_boundaries: deeper boundaries on the same chain, in
+    // tokens, that stay resumable with their windows.
+    std::vector<CacheKey> BoundaryCheckpointKeys(std::span<const std::string> prefix_hashes,
+                                                 std::span<const std::int32_t> kept_boundaries) const;
+    // Demotes the entries of `keys` on the Device and in Host L2: dates each
+    // back to kDemotedAccessEpoch, marks it demoted and forgets its
+    // acquisition (PrefixCacheIndex::Demote), skipping one a request or a
+    // transfer holds or one demoted there already. A later hit, touch or
+    // republication dates an entry forward again and ends its demotion.
+    // Returns the entries demoted.
+    std::int32_t DemoteEntries(std::span<const CacheKey> keys);
+    // Demotes key's Host entry, as DemoteEntries does, while the segments of
+    // an eviction write-back hold it write_back_holds times to publish into
+    // it: those holds do not keep it from the demotion, any other does. False
+    // when the Host does not hold key, something else holds it, or it is
+    // demoted there already.
+    bool DemoteHostEntryHeldByWriteBack(const CacheKey& key, std::uint32_t write_back_holds);
+    // The newest access epoch any acquisition or publication of a State
+    // checkpoint under `hash` carried, on either tier, while either tier
+    // holds the boundary; 0 when neither does.
+    std::uint64_t LatestStateAccessEpoch(const ContentHash& hash) const;
+
     // Host entries evicted for one reason, each also counted as
     // device_resident when the Device index still held its key.
     struct HostEvictionCounts {
@@ -707,7 +749,9 @@ public:
     };
     // Queue every already-published non-state Device cache entry under these
     // content hashes (chain hashes and tail hashes alike) for D2H Store.
-    // Missing keys and an absent Host tier are silently skipped.
+    // Missing keys and an absent Host tier are silently skipped, and so are
+    // demoted entries (SetCheckpointDemotion): free Host space would take
+    // them back.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
     std::vector<StoreCandidate> TakePendingStores();
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
@@ -753,7 +797,9 @@ public:
     // (a shared State access epoch proves the continuation), newest Device
     // copy first; then safe closed-group KV duplicates, held Device copies
     // first and newer Device copies first within each ownership class; then
-    // Host-only cache, least recently used first. A missing Device window
+    // Host-only cache, least recently used first. A Host-only checkpoint
+    // boundary whose checkpoints are all demoted (SetCheckpointDemotion) goes
+    // after the held copies and before the unheld ones. A missing Device window
     // still protects every closed-group Host page in the required suffix.
     // Once a victim took every Host page under the page
     // above it, that page is a candidate too. The restore pass then returns,
@@ -792,8 +838,9 @@ public:
     // Publishes a Host block under key; a key that already has a Host entry
     // re-points block_ref to it. inherited_metadata carries the Device entry's
     // metadata an eviction write-back publishes under (the newer of its
-    // epoch and an existing entry's); nullopt publishes as a fresh access
-    // with no logical block index, at a chunk boundary.
+    // epoch and an existing entry's; a demoted one lands demoted unless the
+    // existing entry is newer); nullopt publishes as a fresh access with no
+    // logical block index, at a chunk boundary.
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
                         std::optional<PrefixCacheIndex::CachedBlockMetadata> inherited_metadata);
     void CacheHostTail(const ContentHash& prior, const TailPublication& tail);
@@ -825,6 +872,12 @@ public:
     // them on the Host (a tail whose hint is gone, a boundary with no
     // checkpoint boundary at or under it).
     std::uint64_t DeadEntriesNotWrittenBack() const { return dead_entries_not_written_back_; }
+    // The demoted Device entries (SetCheckpointDemotion) an admission or a
+    // restore evicted under the write-back policy -- as a victim, a request's
+    // own released slot or in a stranded suffix -- and dropped instead of
+    // recording them. Like the dead ones, they count under the eviction's
+    // cause.
+    std::uint64_t DemotedEntriesNotWrittenBack() const { return demoted_entries_not_written_back_; }
 
     // Device entries evicted for one reason, each also counted as
     // host_resident when the Host index still held its key (never without a
@@ -860,7 +913,8 @@ public:
         // every block it drops itself; only when evicting by segments.
         DeviceEvictionCounts dead_entry_collection;
         // Subset of request_reclaim considered for write-back, including
-        // entries later dropped as dead. Superseded inputs are excluded.
+        // entries later dropped as dead or demoted. Superseded inputs are
+        // excluded.
         std::uint64_t request_reclaim_for_write_back{0};
     };
     // Cumulative, never reset (accounting only).
@@ -1030,6 +1084,10 @@ private:
         std::uint32_t group_id{0};
         CacheBlockLocation location;
         std::int32_t boundary_tokens{0};
+        // A request holds the Device copy. The visit yields every held copy
+        // before the unheld ones; a Host plan with demoted checkpoint
+        // boundaries next stops at the first unheld one.
+        bool device_in_use{false};
     };
     // Unpinned Host KV copies backed by a contiguous Device KV prefix,
     // excluding pages a sliding group can force into a Host suffix. Visit in
@@ -1173,15 +1231,18 @@ private:
     // tree node goes with it. It returns the key that left the index, nullopt
     // when the entry is pinned or gone. A superseded input (MarkSupersededStateInput) an
     // admission, rotation or restore evicts counts as
-    // request_reclaim and is never recorded. With write_back_segment (an
-    // admission's or a restore's cache victim under the write-back policy) any
-    // other entry that left is recorded there -- its metadata read before it
-    // left, its Host entry held when the Host has one; the segment's
-    // newest_access_epoch rises to its epoch -- and its PendingHostStore holds
-    // the tree node, tail hint included, until the segment settles. It is
-    // judged and recorded before the entry leaves, so the node never looks
-    // empty in between. One no probe could resume from on the Host is dropped
-    // instead (DeadEntriesNotWrittenBack). nullptr drops it.
+    // request_reclaim and is never recorded; a demoted entry
+    // (SetCheckpointDemotion) is never recorded either, whatever evicts it,
+    // and counts under `reason` (DemotedEntriesNotWrittenBack). With
+    // write_back_segment (an admission's or a restore's cache victim under the
+    // write-back policy) any other entry that left is recorded there -- its
+    // metadata read before it left, its Host entry held when the Host has one;
+    // the segment's newest_access_epoch rises to its epoch -- and its
+    // PendingHostStore holds the tree node, tail hint included, until the
+    // segment settles. It is judged and recorded before the entry leaves, so
+    // the node never looks empty in between. One no probe could resume from
+    // on the Host is dropped instead (DeadEntriesNotWrittenBack). nullptr
+    // drops it.
     std::optional<CacheKey> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
                                                   DeviceEvictionCounts DeviceEvictionStats::*reason,
                                                   EvictedSegment* write_back_segment);
@@ -1196,6 +1257,12 @@ private:
     // reference to it.
     std::optional<CacheBlockLocation> locationOf(const BlockPool& pool, std::size_t group_index,
                                                  const CacheKey& key) const;
+    // Whether an entry counts as demoted (SetCheckpointDemotion): a demotion
+    // marked it and no access touched it since. A demoted session's entry or a
+    // superseded input at kDemotedAccessEpoch does not.
+    bool isDemotedEntry(const PrefixCacheIndex::CachedBlockMetadata& metadata) const {
+        return demotes_checkpoints_ && metadata.demoted;
+    }
     // Records an eviction write-back of `key`'s block under `node` (a State
     // checkpoint when `checkpoint`), and releases a record's key.
     PendingHostStore holdPendingStore(BoundaryTree::Node& node, const CacheKey& key, bool checkpoint);
@@ -1242,6 +1309,8 @@ private:
     // victims leave behind for this plan's write-back drain; and the dead
     // prefix entries either tier is left with are collected.
     bool write_back_evictions_{false};
+    // SetCheckpointDemotion.
+    bool demotes_checkpoints_{false};
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
     std::int32_t checkpoint_granularity_{1};
@@ -1297,6 +1366,7 @@ private:
     // Accounting only.
     HostEvictionStats host_evictions_;
     std::uint64_t dead_entries_not_written_back_{0};
+    std::uint64_t demoted_entries_not_written_back_{0};
     std::uint64_t store_candidates_dropped_by_flush_{0};
     DeviceEvictionStats device_evictions_;
 };

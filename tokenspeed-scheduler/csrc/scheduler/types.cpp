@@ -81,6 +81,11 @@ void SchedulerConfig::Validate() const {
     if (state_checkpoint_in_forward && disable_prefix_cache && role != Role::kD) {
         throw std::invalid_argument("Scheduler: state_checkpoint_in_forward requires prefix caching");
     }
+    // Only in-forward checkpoints are ever demoted.
+    if (demote_superseded_state_checkpoints && !state_checkpoint_in_forward && role != Role::kD) {
+        throw std::invalid_argument(
+            "Scheduler: demote_superseded_state_checkpoints requires state_checkpoint_in_forward");
+    }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }

@@ -1277,7 +1277,9 @@ Its responsibilities:
   copies go first, then unheld copies; within each class newer Device copies
   go first to reduce repeated write-back. Host-only State retains its own LRU
   order, with the retention rank, once the usable duplicate capacity is
-  exhausted.
+  exhausted. With superseded checkpoint demotion (`scheduler.md` §1.2), a
+  Host-only checkpoint boundary whose checkpoints are all demoted goes after
+  the held copies and before the unheld ones.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
   The boundary tree counts each node's closed-group duplicates as entries
