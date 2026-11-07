@@ -304,6 +304,9 @@ class _AutotuneExecutor:
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
+        # The stub gathers whole sampled rows, so autotune() runs no
+        # vocab-shard warmup.
+        self._samples_from_vocab_shard = False
 
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
