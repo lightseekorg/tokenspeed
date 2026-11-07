@@ -2194,9 +2194,13 @@ class TestCompactLayoutRoundTripTest:
                 [1, 2, 3, 9]
             )
 
-    @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
     @pytest.mark.parametrize(
-        "source_pinned", [False, True], ids=["stream_ordered", "pinned_control"]
+        "io_backend,source_pinned",
+        [
+            pytest.param("kernel", False, id="stream_ordered-kernel"),
+            pytest.param("direct", False, id="stream_ordered-direct"),
+            pytest.param("kernel", True, id="pinned_control-kernel"),
+        ],
     )
     def test_a_stream_ordered_write_back_reads_blocks_the_plan_reuses(
         self, io_backend, source_pinned
@@ -2206,9 +2210,12 @@ class TestCompactLayoutRoundTripTest:
 
         The copy is held back on the write stream, so the overwrite, enqueued
         on the fence stream right after the submission, would land first
-        unless the fence orders it behind the copy. The control submits the
-        same row as a pinned store, which fences nothing: its copy reads the
-        overwritten bytes, so the test tells the two apart.
+        unless the fence orders it behind the copy. The kernel control submits
+        the same row as a pinned store, which fences nothing: its copy reads
+        the overwritten bytes, so the test tells the two apart. Do not use DMA
+        as this negative control: its unfenced read races with the overwrite,
+        so it can also read the original bytes. Pinned sources normally stay
+        immutable until ACK; only the control deliberately violates that rule.
         """
         torch = self.torch
         device = torch.zeros((128,), dtype=torch.uint8, device="cuda")
