@@ -588,6 +588,7 @@ def fused_verify_step_supported(
         and mixed_qkv.stride(-1) == f_a_out.stride(-1) == 1
         and mixed_qkv.stride(0) % 8 == 0
         and f_a_out.stride(0) % 8 == 0
+        and conv_weights.data_ptr() % 8 == 0
         and mixed_qkv.data_ptr() % 16 == 0
         and f_a_out.data_ptr() % 16 == 0
         and f_b_weight.data_ptr() % 16 == 0

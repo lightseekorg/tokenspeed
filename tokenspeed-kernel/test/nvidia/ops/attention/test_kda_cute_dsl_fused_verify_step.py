@@ -220,13 +220,46 @@ def test_fused_step_matches_split_producers(batch, lower_bound):
     assert torch.equal(x["conv_states"], history)
 
 
+def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
+    """The last pages of a pool whose page offsets pass 2**31 elements verify
+    exactly like the same contents at the start of a small pool."""
+    x = _inputs(2, seed=70)
+    near = _fused(x)
+    pages = 2**31 // (HEADS * DIM * DIM) + 2
+    assert (pages - 1) * HEADS * DIM * DIM > 2**31
+    far_indices = torch.arange(pages - 2, pages, device="cuda", dtype=torch.int32)
+    rows = x["state_indices"].long()
+    state_pool = torch.empty(pages, HEADS, DIM, DIM, device="cuda")
+    state_pool[far_indices.long()] = x["state_pool"][rows]
+    conv_states = torch.empty(
+        pages, *x["conv_states"].shape[1:], device="cuda", dtype=torch.bfloat16
+    )
+    conv_states[far_indices.long()] = x["conv_states"][rows]
+    far = _fused(
+        dict(
+            x,
+            state_pool=state_pool,
+            conv_states=conv_states,
+            state_indices=far_indices,
+        )
+    )
+    assert torch.equal(far[0], near[0])
+    for got, want in zip(far[1], near[1]):
+        assert torch.equal(got, want)
+
+
 def test_fused_step_without_metadata_records_by_request():
     x = _inputs(4, seed=40, metadata=False)
     _assert_matches(x, _split(x), _fused(x))
 
 
-def test_unaligned_rows_fall_back_to_split_producers():
-    x = _inputs(3, seed=41, f_a_pitch=1)
+@pytest.mark.parametrize("unaligned", ["f_a rows", "conv weights"])
+def test_unaligned_inputs_fall_back_to_split_producers(unaligned):
+    x = _inputs(3, seed=41, f_a_pitch=int(unaligned == "f_a rows"))
+    if unaligned == "conv weights":
+        weights = x["conv_weights"]
+        shifted = torch.empty(weights.numel() + 1, device="cuda", dtype=weights.dtype)
+        x["conv_weights"] = shifted[1:].view_as(weights).copy_(weights)
     assert not fused_verify_step_supported(
         x["mixed_qkv"],
         x["conv_weights"],
