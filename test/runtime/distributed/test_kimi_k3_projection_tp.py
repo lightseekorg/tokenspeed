@@ -505,5 +505,153 @@ def test_model_projection_paths(size, fp8_output, tmp_path):
     )
 
 
+@torch.no_grad()
+def _empty_tp_mla_worker(rank, rendezvous):
+    from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+    from tokenspeed.runtime.distributed.comm_manager import CommManager
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.cuda.set_device(rank)
+    torch.set_default_dtype(torch.bfloat16)
+    device = torch.device("cuda", rank)
+    mapping = Mapping(
+        rank=rank,
+        world_size=2,
+        attn_tp_size=2,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=1,
+    )
+    process_group_manager.init_distributed(
+        mapping=mapping, distributed_init_method=rendezvous, backend="nccl"
+    )
+    process_group_manager.init_process_group(mapping.attn.tp_group)
+    global_server_args_dict.update(
+        chunked_prefill_size=16,
+        max_prefill_tokens=16,
+        max_model_len=32,
+        enable_allreduce_fusion=False,
+        force_deterministic_rsag=True,
+        mapping=mapping,
+    )
+    scattered_comm = CommManager(
+        mapping=mapping,
+        layer_id=1,
+        is_moe=True,
+        prev_is_moe=True,
+        dense_batch_invariant=False,
+        query_sharded=False,
+    )
+    full_comm = CommManager(
+        mapping=mapping,
+        layer_id=0,
+        is_moe=True,
+        prev_is_moe=True,
+        dense_batch_invariant=False,
+        query_sharded=False,
+    )
+    for gated in (False, True):
+        config = KimiLinearConfig(
+            hidden_size=128, num_attention_heads=4, mla_use_output_gate=gated
+        )
+        with torch.device(device):
+            attention = KimiLinearMLAAttention(
+                config=config,
+                mapping=mapping,
+                hidden_size=128,
+                num_heads=4,
+                qk_nope_head_dim=64,
+                qk_rope_head_dim=64,
+                v_head_dim=128,
+                q_lora_rank=128,
+                kv_lora_rank=128,
+                layer_id=1,
+                reduce_attn_results=False,
+                qkv_parallel=None,
+                output_parallel=None,
+            )
+            torch.manual_seed(17)
+            for parameter in attention.parameters():
+                parameter.uniform_(-0.1, 0.1)
+            attention.fused_qk_layernorm.weight_q_a.fill_(1)
+            attention.fused_qk_layernorm.weight_kv_a.fill_(1)
+        # Cache attention is independent of the row-restoration contract. Keep
+        # projections, normalization, gating and TP communication real.
+        with (
+            mock.patch.object(
+                attention, "_prefill_prologue_before_break", return_value=None
+            ),
+            mock.patch.object(
+                attention,
+                "_attn",
+                side_effect=lambda positions, q, latent, ctx, **kw: q.contiguous(),
+            ),
+        ):
+            for rows in (0, 1, 3):
+                full = (
+                    torch.arange(rows * 128, device=device)
+                    .reshape(rows, 128)
+                    .to(torch.bfloat16)
+                    / 128
+                )
+                counts = [(rows + 1) // 2, rows // 2]
+                shard = full[sum(counts[:rank]) : sum(counts[: rank + 1])].clone()
+                ctx = ForwardContext(
+                    attn_backend=mock.Mock(supports_mla_projected_value_decode=False),
+                    token_to_kv_pool=None,
+                    bs=rows,
+                    num_extends=0,
+                    input_num_tokens=rows,
+                    forward_mode=ForwardMode.DECODE,
+                    output_layout=None,
+                    global_num_tokens=[rows, rows],
+                )
+                positions = torch.arange(rows, device=device)
+                expected = attention(
+                    positions, full, ctx, full_comm, projection_out=None
+                )
+                actual = attention(
+                    positions, shard, ctx, scattered_comm, projection_out=None
+                )
+                torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.02)
+                if rows:
+                    for _ in range(2):
+                        attention(
+                            positions, shard, ctx, scattered_comm, projection_out=None
+                        )
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        captured = attention(
+                            positions, shard, ctx, scattered_comm, projection_out=None
+                        )
+                    shard.mul_(0.5)
+                    refreshed = attention(
+                        positions, shard, ctx, scattered_comm, projection_out=None
+                    )
+                    graph.replay()
+                    torch.testing.assert_close(captured, refreshed, atol=0, rtol=0)
+                    torch.cuda.synchronize()
+                    del graph, captured
+    dist.destroy_process_group()
+
+
+def test_mla_restores_empty_tp_shards(tmp_path):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 CUDA GPUs")
+    mp.spawn(
+        _empty_tp_mla_worker,
+        args=(f'file://{tmp_path / "empty-tp"}',),
+        nprocs=2,
+        join=True,
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
