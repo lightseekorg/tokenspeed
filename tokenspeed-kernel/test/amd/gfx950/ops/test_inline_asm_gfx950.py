@@ -57,6 +57,8 @@ from asm_checks import (
 from test_iris_muse_spark import _compile_gfx950
 from tokenspeed_kernel.platform import ArchVersion
 
+# The MoE stream helpers import the AMD kernel package, absent on NVIDIA runners.
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
 sys.path.insert(0, str(Path(__file__).resolve().parent / "moe"))
 from moe_stream_helpers import compile_moe_stream  # noqa: E402
 
