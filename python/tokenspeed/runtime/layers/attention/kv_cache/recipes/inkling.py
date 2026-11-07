@@ -20,9 +20,10 @@
 
 """Inkling cache recipe: attention pages plus paged ShortConv checkpoints.
 
-Every attention layer costs bytes in three groups -- its own attention group
-and the two conv checkpoint columns -- so the conv groups are declared whole
-(spec and fields together) rather than derived from a layer label.
+Every attention layer costs bytes in three groups -- its own attention group,
+the kvconv column, and its attention group's hiddenconv column -- so the conv
+groups are declared whole (spec and fields together) rather than derived from
+a layer label.
 """
 
 from __future__ import annotations
@@ -118,15 +119,15 @@ class InklingRecipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        # The bf16 conv columns are narrow next to the KV pages they alias;
-        # the fp8 variant tightens the binding enough to bound it.
-        return float("inf") if not _fp8_sconv() else 1.0
+        # Conv columns borrow KV planes without filling them; KV pages size the parent.
+        return float("inf")
 
-    # ---- groups: the layer walk, plus the two conv columns ----
+    # ---- groups: the layer walk, plus the conv checkpoint columns ----
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
-        """The attention groups from the layer walk, plus both conv columns."""
+        """The attention groups from the layer walk, plus the conv columns."""
+        attention = super().groups()
         conv = tuple(
             (
                 CacheGroupSpec(
@@ -137,7 +138,7 @@ class InklingRecipe(CacheRecipe):
                 ),
                 fields,
             )
-            for group_id, fields in self._conv_columns().items()
+            for group_id, fields in self._conv_columns(attention).items()
         )
         if self.pd_disaggregation_enabled:
             # The layer walk already stamped the attention groups.
@@ -145,7 +146,7 @@ class InklingRecipe(CacheRecipe):
             conv = tuple(
                 (spec, fields) for spec, (_, fields) in zip(policies, conv, strict=True)
             )
-        return super().groups() + conv
+        return attention + conv
 
     @override
     def fields_for_layer(
@@ -188,20 +189,34 @@ class InklingRecipe(CacheRecipe):
             prefix_granularity=self.prefix_granularity,
         )
 
-    def _conv_columns(self) -> dict[str, tuple[CacheFieldSpec, ...]]:
-        """Both ShortConv checkpoint columns, one entry per attention layer.
+    def _conv_columns(
+        self, attention: tuple[CacheGroupDeclaration, ...]
+    ) -> dict[str, tuple[CacheFieldSpec, ...]]:
+        """The ShortConv checkpoint columns, one entry per attention layer.
 
         The checkpoints alias their layer's KV planes, so they reuse the plane
         ids -- which means reproducing the group's plane numbering here. It is
         the same rule the layer walk applies (a group's Nth layer takes plane
         N) and Inkling's layers all declare fields, so the two agree.
+
+        The hidden-stream rows are not TP-sharded, so one parent's KV planes
+        cannot hold every layer's: each attention group's rows form their own
+        hiddenconv column instead. A parent then stays exactly its KV pages,
+        and the columns do not depend on TP, which P/D peers of different TP
+        widths must agree on. A row wider than its K/V plane (narrow KV heads
+        under wide TP or an FP8 KV cache) takes a plane of its own.
         """
-        columns = {KVCONV_GROUP_ID: (), HIDDENCONV_GROUP_ID: ()}
+        plane_bytes: dict[str, int] = {}
+        for _, fields in attention:
+            for field in fields:
+                plane_bytes[field.plane_id] = max(
+                    plane_bytes.get(field.plane_id, 0), field.payload_bytes
+                )
+        columns = {KVCONV_GROUP_ID: ()}
         occurrences: dict[str, int] = {}
         hiddenconv_dtype = cache_dtype_name(
             torch.float8_e5m2 if _fp8_sconv() else torch.bfloat16
         )
-        wide_hidden = cache_dtype_bytes(hiddenconv_dtype) > 1
         for layer_id, group_id in enumerate(self.group_ids):
             occurrence = occurrences.get(group_id, 0)
             occurrences[group_id] = occurrence + 1
@@ -212,6 +227,10 @@ class InklingRecipe(CacheRecipe):
             )
             k_plane = f"unit.{occurrence}.k"
             v_plane = f"unit.{occurrence}.v"
+            wide_hidden = checkpoint_rows * text_config.hidden_size * cache_dtype_bytes(
+                hiddenconv_dtype
+            ) > min(plane_bytes[k_plane], plane_bytes[v_plane])
+            hidden_group = f"{HIDDENCONV_GROUP_ID}_{group_id}"
             columns[KVCONV_GROUP_ID] += (
                 CacheFieldSpec(
                     f"layer.{layer_id}.kvconv_k",
@@ -228,7 +247,7 @@ class InklingRecipe(CacheRecipe):
                     exact_page_stride=False,
                 ),
             )
-            columns[HIDDENCONV_GROUP_ID] += (
+            columns[hidden_group] = columns.get(hidden_group, ()) + (
                 CacheFieldSpec(
                     f"layer.{layer_id}.attnconv",
                     f"unit.{occurrence}.hidden_k" if wide_hidden else k_plane,
