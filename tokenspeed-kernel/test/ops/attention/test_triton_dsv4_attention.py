@@ -75,3 +75,45 @@ def test_selected_attention_and_graph_replay(heads: int) -> None:
     graph.replay()
     expected = _reference(q, kv, selected, lens, sink)
     torch.testing.assert_close(output, expected, atol=8e-3, rtol=8e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("wide_tensor", ["q", "out"])
+def test_selected_attention_token_offsets_past_int32(wide_tensor: str) -> None:
+    torch.manual_seed(75)
+    tokens, heads, dim = 3, 1, 512
+    stride, guard = 2**30, 2**31
+    # The last row is 2**31 elements from the view's base. A wrapped offset
+    # lands on the sentinel, keeping an incorrect access inside the allocation.
+    storage = torch.empty(
+        guard + (tokens - 1) * stride + dim, device="cuda", dtype=torch.bfloat16
+    )
+    storage[:dim].fill_(-7.0)
+    wide = storage[guard:].as_strided((tokens, heads, dim), (stride, dim, 1))
+    q = torch.randn(tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(4, dim, device="cuda", dtype=torch.bfloat16)
+    sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
+    selected = torch.arange(4, device="cuda", dtype=torch.int32).repeat(tokens, 1)
+    lens = torch.full((tokens,), 4, device="cuda", dtype=torch.int32)
+    expected = _reference(q, kv, selected, lens, sink)
+    if wide_tensor == "q":
+        wide.copy_(q)
+        q = wide
+        output = torch.empty_like(expected)
+    else:
+        wide.fill_(float("nan"))
+        output = wide
+
+    actual = dsv4_prefill(
+        q,
+        kv,
+        selected,
+        lens,
+        sink,
+        dim**-0.5,
+        out=output,
+        override=None,
+        solution="triton",
+    )
+    torch.testing.assert_close(actual, expected, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(storage[:dim], torch.full_like(storage[:dim], -7.0))
