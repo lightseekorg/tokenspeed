@@ -663,8 +663,7 @@ over the target and draft `child_backends()` trees once
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` disables the prefill graph (rationale on the class) unless its
 consumer narrows a padded replay to the live rows in an eager break: a KPool
-instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, opted in
-by an explicit `--prefill-graph-capture-token-sizes` without
+instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, without
 `--enable-mixed-batch`, on the aggregated role
 (`DSAConfig.padded_prefill_replay`).
 That instance declaration follows launch arguments, so the prefill role and
@@ -1458,7 +1457,9 @@ null page 0.
 The bridge's `{gid: view}` dict is the router's input; the router does not
 require the views to share one storage, only the one-launch fill does. The
 executor pads stopped requests' state rows in place
-(`RuntimeStates.masked_state_tables`), so the views stay in that storage.
+(`RuntimeStates.masked_state_tables`), so the views stay in that storage;
+the bridge packs the state groups last and end to end, so that padding is
+one launch for every state group.
 The slot math lives in
 `paged/write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
 invariant, so locations computed over the kernel-page stack equal
@@ -1789,8 +1790,9 @@ GEMM arithmetic.
 ### Capturing recurrent layers in the outer graph
 
 `CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
-KDA, Mamba2, and GDN; each subclass only states which forwards it admits and whether
-uncaptured shapes also run the capacity layout.
+KDA, Mamba2, and GDN; each subclass only states which forwards it admits, whether
+uncaptured shapes also run the capacity layout, and whether that layout stores
+in-forward State checkpoints.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture, and replay. This consumer-stream seam builds or
 refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
@@ -1819,6 +1821,26 @@ its launch from the sequence count and reads the bounds on device
 Mamba2, uncaptured shapes keep the scheduler metadata. The scan chunks each
 sequence from its own start, so captures of any request count match eager bit
 for bit.
+
+A forward writing in-forward State checkpoints
+(`--enable-state-checkpoint-in-forward`) runs inline too: GDN is told the flag
+at construction, and its capacity metadata then keeps one fixed checkpoint slot
+per request slot (a row writes at most one). The captured scan stores a state
+at every page of the bound pool's prefix granularity, which divides every
+checkpoint offset, into one float32 scratch that all shapes share (forwards
+run in stream order), with a row per page of the widest captured token
+capacity. Before each use the refresh rewrites, in one pinned upload and a
+few device copies, each sequence's state count and each live checkpoint's
+scratch row, token index and block; an unused slot keeps an in-range token
+index and block `-1`, which the masked writers of the conv window and the
+recurrent state skip. The stored states are the scan's own, so the checkpoint
+blocks match eager bit for bit; the cost is the extra scratch writes and the
+shared scratch. A backend without the flag, and every other family, keeps such
+a forward on its live metadata at the eager break.
+
+Qwen4-Exp's composite passes these seams to its attention child, so its GDN
+layers run inline; PLE and the QSA indexer keep their breaks over their own
+live metadata.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels, and post-attention compute together.

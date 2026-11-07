@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 
 import torch
 from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata, QSAWorkspace
@@ -294,6 +295,116 @@ def qsa_sparse_attention(
         k_scale=k_scale,
         v_scale=v_scale,
         **metadata_kwargs,
+    )
+
+
+# ===-----------------------------------------------------------------------===#
+# QSA BF16 KV Scratch
+# ===-----------------------------------------------------------------------===#
+
+
+def qsa_bf16_scratch_pages(seq_lens: Iterable[int], page_size: int) -> int:
+    """Scratch pages one ``qsa_bf16_kv_scratch`` call needs.
+
+    Args:
+        seq_lens: Host lengths (cached prefix plus new tokens) of the call's
+            requests, in page-table row order.
+        page_size: Tokens per page-table entry.
+
+    Returns:
+        ``1 + sum(ceil(seq_len / page_size))``: the reserved page 0 and every
+        page of every request.
+    """
+    if page_size <= 0:
+        raise ValueError("QSA BF16 scratch page size must be positive")
+    return 1 + sum(-(-int(length) // page_size) for length in seq_lens)
+
+
+def qsa_bf16_kv_scratch(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    num_requests: int,
+    page_size: int,
+    scratch_pages: int,
+    k_scratch: torch.Tensor,
+    v_scratch: torch.Tensor,
+    page_map: torch.Tensor,
+    out_slots: torch.Tensor,
+    enable_pdl: bool,
+    override: str | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Copy one call's FP8 KV pages into a BF16 scratch and remap its slots.
+
+    Request ``r`` owns scratch pages ``[first_r, first_r + n_r)``, with
+    ``n_r = ceil(seq_lens[r] / page_size)`` and ``first_r = 1 + sum_{s < r}
+    n_s``: its page-table columns ``[0, n_r)`` are copied there in order,
+    converted exactly from E4M3 to BF16, the values an FP8 kernel reading the
+    cache at unit scale computes. Scratch page 0 is never written; padded
+    slots keep their ids and attention kernels read slot 1 for them, so the
+    caller keeps page 0 finite.
+
+    Args:
+        k_cache: FP8 E4M3FN keys ``[cache_slots, kv_heads, head_dim]``, heads
+            contiguous within a slot.
+        v_cache: Values with the keys' shape, dtype and slot stride.
+        selected_slots: Int32 physical slots ``[rows, width]`` with contiguous
+            columns; non-positive entries are padding. Every positive slot
+            must lie in its request's first ``n_r`` pages; one that does not
+            reads a stale ``page_map`` entry and becomes padding or another
+            page of this call, never an address past the copied pages.
+        page_table: Physical page ids ``[>= num_requests, pages]`` with
+            contiguous columns.
+        seq_lens: Device lengths ``[>= num_requests]``, equal to the host
+            lengths ``scratch_pages`` was computed from.
+        num_requests: Leading page-table rows to copy.
+        page_size: Tokens per page-table entry.
+        scratch_pages: ``qsa_bf16_scratch_pages`` of the host lengths; the
+            copy launch covers scratch pages ``[1, scratch_pages)``.
+        k_scratch: Contiguous BF16 keys ``[scratch_slots, kv_heads,
+            head_dim]`` holding at least ``scratch_pages`` whole pages.
+        v_scratch: BF16 values with the scratch keys' shape.
+        page_map: Contiguous int32 workspace with at least one entry per
+            cache page. For valid slots and lengths its prior contents are
+            never read: the copy writes every entry the remap reads, so it may
+            alias memory that is free until the remap finishes.
+        out_slots: Int32 output ``[rows, width]`` with contiguous columns.
+        enable_pdl: Use programmatic dependent launch where supported.
+        override: Optional registered kernel name or solution override.
+        solution: Optional kernel solution.
+
+    Returns:
+        ``out_slots``: each positive slot ``p * page_size + o`` rewritten to
+        ``page_map[p] * page_size + o``; padding unchanged.
+    """
+    kernel = select_kernel(
+        "attention",
+        "qsa_bf16_kv_scratch",
+        format_signature(
+            k_cache=dense_tensor_format(k_cache.dtype),
+            k_scratch=dense_tensor_format(k_scratch.dtype),
+        ),
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        k_cache,
+        v_cache,
+        selected_slots,
+        page_table,
+        seq_lens,
+        num_requests=num_requests,
+        page_size=page_size,
+        scratch_pages=scratch_pages,
+        k_scratch=k_scratch,
+        v_scratch=v_scratch,
+        page_map=page_map,
+        out_slots=out_slots,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -687,6 +798,8 @@ import tokenspeed_kernel.ops.attention.qsa.gluon  # noqa: E402,F401
 
 
 __all__ = [
+    "qsa_bf16_kv_scratch",
+    "qsa_bf16_scratch_pages",
     "qsa_block_scores",
     "qsa_block_topk_select",
     "qsa_block_topk_stream",
