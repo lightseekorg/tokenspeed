@@ -146,6 +146,25 @@ def test_the_prefill_decode_interval_reaches_the_scheduler():
     assert cfg.prefill_decode_interval == 64
 
 
+@pytest.mark.parametrize(
+    "flags,error",
+    [
+        (["--prefill-decode-interval", "-1"], "must be non-negative"),
+        (
+            ["--prefill-decode-interval", "64", "--disaggregation-mode", "prefill"],
+            "needs --disaggregation-mode null",
+        ),
+        (
+            ["--prefill-decode-interval", "64", "--disaggregation-mode", "decode"],
+            "needs --disaggregation-mode null",
+        ),
+    ],
+)
+def test_server_args_refuse_a_prefill_decode_interval_it_cannot_honor(flags, error):
+    with pytest.raises(ValueError, match=error):
+        prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+
+
 @pytest.mark.parametrize("tokens,pages", [(None, 0), (1, 1), (16, 1), (17, 2)])
 def test_prefill_kv_budget_is_translated_to_scheduler_pages(tokens, pages):
     flags = [] if tokens is None else ["--chunk-prefill-kv-size", str(tokens)]
