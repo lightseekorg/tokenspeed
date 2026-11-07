@@ -345,7 +345,7 @@ class TestModuleRefusals:
         from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
         plan = QueryShardPlan.from_forward(
-            total_tokens=6, input_lengths=[4, 2], size=4, rank=1
+            total_tokens=6, input_lengths=[4, 2], size=4, rank=1, device="cpu"
         )
         extend = SimpleNamespace(query_shard=plan)
         decode = SimpleNamespace(query_shard=None)
@@ -391,7 +391,7 @@ class TestModuleRefusals:
         attn.attn_mqa = Core()
         # Rank 3 holds no rows of the 3-row span.
         plan = QueryShardPlan.from_forward(
-            total_tokens=3, input_lengths=[3], size=4, rank=3
+            total_tokens=3, input_lengths=[3], size=4, rank=3, device="cpu"
         )
         assert plan.local_rows == 0
         ctx = SimpleNamespace(
@@ -481,7 +481,7 @@ class TestModuleRefusals:
             )
         )
         plan = QueryShardPlan.from_forward(
-            total_tokens=3, input_lengths=[3], size=4, rank=0
+            total_tokens=3, input_lengths=[3], size=4, rank=0, device="cpu"
         )
         with pytest.raises(RuntimeError, match="cannot take a query shard"):
             sharded(positions, hidden, ctx(query_shard=plan), comm_manager=None)

@@ -714,10 +714,10 @@ def test_distributed_four_way_lookup(monkeypatch):
         for rows in (7, 2):
             full_ids = torch.arange(rows * 3, device=device).reshape(rows, 3) % 19
             plan = QueryShardPlan.from_forward(
-                total_tokens=rows, input_lengths=[rows], size=4, rank=rank
+                total_tokens=rows, input_lengths=[rows], size=4, rank=rank, device="cpu"
             )
-            actual = table(full_ids[plan.local_slice], query_shard=plan)
-            expected = _dequant(codes, scales)[full_ids.cpu()][plan.local_slice]
+            actual = table(full_ids[plan.local_row_ids], query_shard=plan)
+            expected = _dequant(codes, scales)[full_ids.cpu()][plan.local_row_ids]
             torch.testing.assert_close(actual, expected.to(device), rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
@@ -1112,18 +1112,26 @@ def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
         partials.append(table(ids, query_shard=None).flatten(1))
     total = torch.stack(partials).sum(0)
     for rank, table in enumerate(tables):
-        plan = QueryShardPlan(4, rank, counts, (0, 0, 0, 0))
+        plan = QueryShardPlan.from_forward(
+            total_tokens=sum(counts),
+            input_lengths=[sum(counts)],
+            size=4,
+            rank=rank,
+            device="cpu",
+        )
 
         def gather(local, group, row_counts):
-            torch.testing.assert_close(local, ids[plan.local_slice])
-            assert tuple(row_counts) == counts
-            return ids
+            torch.testing.assert_close(local, ids[plan.local_row_ids])
+            assert tuple(row_counts) == plan.row_counts
+            return plan.to_gather_order(ids)
 
         def scatter(local, group, row_counts):
-            torch.testing.assert_close(local, partials[rank], rtol=0, atol=0)
-            return total[plan.local_slice]
+            torch.testing.assert_close(
+                local, plan.to_gather_order(partials[rank]), rtol=0, atol=0
+            )
+            return total[plan.local_row_ids]
 
         monkeypatch.setattr(engram, "token_all_gather_rows", gather)
         monkeypatch.setattr(engram, "token_reduce_scatter", scatter)
-        actual = table(ids[plan.local_slice], query_shard=plan)
-        torch.testing.assert_close(actual, expected[plan.local_slice], rtol=0, atol=0)
+        actual = table(ids[plan.local_row_ids], query_shard=plan)
+        torch.testing.assert_close(actual, expected[plan.local_row_ids], rtol=0, atol=0)

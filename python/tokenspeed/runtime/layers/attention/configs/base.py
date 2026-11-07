@@ -219,8 +219,8 @@ class AttnConfig:
     kvp_size: int = 1
     kvp_rank: int = 0
     kvp_group: tuple[int, ...] = (0,)
-    # Query context parallelism: the extend rows this rank computes are a
-    # contiguous shard of the chunk; the group is the attention TP group.
+    # Query context parallelism: each rank computes early and late segments
+    # of every request; the group is the attention TP group.
     qcp_size: int = 1
     qcp_rank: int = 0
     qcp_group: tuple[int, ...] = (0,)

@@ -716,10 +716,13 @@ the fused all-gather`, or `... keeps its NCCL all-gather:` with the reason.
 ## Query context parallelism on the prefill role
 
 `--query-context-parallel-size N` (QCP) splits every extend forward's rows
-over the attention TP group of a PD prefill engine: rank `r` computes the
-batch-global contiguous rows `[sum(c[:r]), sum(c[:r+1]))` of the chunk, with
-`c` the same uneven split the reduce-scatter / all-gather communication path
-uses, against the full KV history of its requests. It is a layout of the
+over the attention TP group of a PD prefill engine, request by request in
+zigzag: every request's new rows are cut into `2N` near-equal segments and
+rank `r` computes segments `r` and `2N - 1 - r` of every request, against
+the full KV history of the request. For sufficiently long requests, each
+rank holds an early and a late part, balancing causal attention and letting
+the ranks compute each history group in parallel. Short requests can leave
+some ranks empty; they still participate in all collectives. It is a layout of the
 `Mapping` (`mapping.attn.qcp_size / qcp_rank / qcp_group`), not a mode: the
 scheduler plans the same chunk on every rank, cache allocation and the P->D
 transfer see page ownership only, and `--chunked-prefill-size` keeps counting
@@ -735,6 +738,14 @@ history of each request group, and the model exit gathers only the sampled
 rows (one per request) before the LM head. Every QCP collective is data
 movement, so a row's bits do not depend on which rank computes it
 (`docs/design/numerics.md`).
+
+DSA packs whole request histories into contiguous groups within its reserved
+history workspace. It keeps the minimum group count that fits the workspace,
+then minimizes the largest group's history row count. Request order and query
+ownership stay unchanged. This reduces the peak rows presented to the indexer
+without adding history gathers; latency still depends on query distribution
+and the selected kernels. A request whose history exceeds the workspace is
+rejected.
 
 Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the

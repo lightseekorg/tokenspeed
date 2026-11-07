@@ -234,6 +234,9 @@ struct CompletedPages {
     // publish anything but kFinal: the copy-in spends blocks the request
     // holds (CacheCoordinator::Admit).
     OwnerTail owner_tail{OwnerTail::kFinal};
+    // A transfer still reads the original physical pages: publish references
+    // through a copy, without redirecting the owner to canonical blocks.
+    bool preserve_source_blocks{false};
     // This point is a natural checkpoint of the recurrent state (prompt end,
     // finish, retraction, a junction-cut chunk end): every State group
     // publishes slot 1 -- the block the forward that ended here wrote --

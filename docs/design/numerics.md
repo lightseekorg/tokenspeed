@@ -182,6 +182,15 @@ setting is fixed in each expert plan before warmup and CUDA graph capture.
 
 ## alignment.trainer
 
+`--logprob-order blockwise-16384` and `blockwise-direct-16384` select
+16384-wide sum-exp blocks with the same subtraction forms as `blockwise`
+and `blockwise-direct`. `rl-bitwise` preserves each explicit choice. Select
+the trainer's vocabulary-shard width independently of serving TP: folding
+eight narrow partials is not the same FP32 arithmetic as folding four wide
+partials. Prompt and output logprobs share the selected operation; logits
+and sampled tokens are unchanged. The model's existing rl-bitwise vocabulary
+eligibility remains a multiple of 32768.
+
 The invariance layers make a deployment agree with itself. Trainer alignment
 makes it agree with a different program: the training framework's forward,
 whose arithmetic was never written to match an inference engine. Each switch
@@ -337,13 +346,17 @@ Within one deployment they keep the contract as follows.
 ## Layout invariance of query context parallelism
 
 Every collective query context parallelism adds (`docs/design/unified_path.md`)
-is data movement: row slicing, the all-gather of rotated latent rows, index-K
+is data movement: row selection, the all-gather of rotated latent rows, index-K
 rows, gathered history rows, sampled rows and the planned prompt-logprob rows'
-activations. The per-row kernels — sparse attention over the gathered history
+activations, and the permutations between gather order and span order. The
+zigzag split of every request over the ranks only decides which rank
+computes a row. The per-row kernels — sparse attention over the gathered history
 with every head and no LSE merge, the indexer's top-k over pre-gathered rows,
 RoPE, the GEMMs — see for each row exactly the operands a single GPU would,
-so a row's bits do not depend on which rank computes it or on the batch it
-shares: the layout preserves run and batch invariance by construction. The
+so the permutation itself is byte-preserving. Bitwise equivalence also
+requires the selected kernels and reductions to be batch-invariant; identical
+operands alone do not ensure identical rounding when row counts select
+different kernel tactics. The
 prompt logprobs in particular are the tensor-parallel path's bit for bit:
 once the planned rows are gathered, every rank runs the same chunk loop over
 the same rows against the same vocab-sharded head
@@ -688,16 +701,16 @@ registers `("sampling", "block_sumexp")` with the signature
 `leaf(shifted, *, block_size)` with the fp32 `[rows, vocab]` logits already
 shifted by the row max, and returns fp32 `[rows, vocab // block_size]` block
 partials in vocabulary order, each block reduced in its own fixed tree. The
-op folds the columns left to right in fp32 — Megatron's rank-ordered
-reduction of the per-shard partials; a shard narrower than a block pairs
-back into the block's tree at its top level, so one full-vocabulary call
-equals the trainer's sharded sum bitwise when the in-block tree is pairwise
-over its tiles. The in-tree `torch_block_sumexp` sits at `Priority.PORTABLE`;
+op folds the columns left to right in fp32 — the trainer's rank-ordered
+reduction when the selected block width is its shard width. Pairing narrower
+shards first is a different reduction tree; do not infer cross-TP agreement
+from the leaf's pairwise in-block tree. The in-tree `torch_block_sumexp` sits at `Priority.PORTABLE`;
 the vendor leaf registers above it (any higher band), so plain selection
 takes it wherever it is installed and no host code names the vendor.
 The final subtraction follows the explicit form: `blockwise` negates the NLL
 and `blockwise-direct` subtracts `log(sum_exp)` from the target. Their signed-zero
 contract is described in the logprobs section above.
+
 
 The pins above cover only the paths a verified model takes, so the
 verification is recorded per model and enforced at startup

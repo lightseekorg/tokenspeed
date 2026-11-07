@@ -23,7 +23,7 @@
 Megatron's vocab-parallel cross-entropy computes, per row: the max over the
 local vocab shard and a MAX all-reduce; ``shard -= max``; the target logit
 gathered from the owning shard (zero elsewhere) and a SUM all-reduce; the
-denominator as ``sum(exp)`` over fixed 32768-wide vocab blocks whose partials
+denominator as ``sum(exp)`` over explicitly selected vocab blocks whose partials
 are folded in fp32 in block (rank) order; ``nll = log(sum_exp) - target``.
 ``blockwise_logprobs`` reproduces that order on the full vocabulary one
 rank already holds, which is bit-identical to the collective form: the max
@@ -43,10 +43,9 @@ The leaf contract (``register_kernel("sampling", "block_sumexp", ...)``):
   column ``j`` is ``sum(exp(shifted[:, j * block_size:(j + 1) *
   block_size]))`` reduced in the leaf's own fixed order;
 * the op folds the columns left to right in fp32 (``((p0 + p1) + p2) ...``),
-  Megatron's rank-ordered reduction of the per-shard partials: a shard
-  narrower than a block pairs back into the block's own tree at its top
-  level, so one full-vocabulary call and the trainer's sharded sum agree
-  bitwise whenever the leaf's in-block tree is pairwise over its tiles.
+  matching a rank-ordered reduction when the selected block width equals
+  the trainer's shard width. Pairing narrower shards before that fold is a
+  different FP32 tree and does not promise cross-topology agreement.
 
 The portable ``torch`` leaf registers at ``Priority.PORTABLE``; a vendor leaf
 with the trainer's in-block order (the fixed-order operator kit's

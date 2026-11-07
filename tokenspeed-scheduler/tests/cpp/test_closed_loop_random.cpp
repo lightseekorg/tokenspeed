@@ -709,6 +709,11 @@ struct ClosedLoop {
                 const std::string id = abortable[static_cast<std::size_t>(Rand(0, static_cast<int>(abortable.size())))];
                 ExecutionEvent abort;
                 abort.With(forward::Abort{.request_id = id});
+                if (role == Role::kP) {
+                    // The simulated peer has stopped reading; delayed local
+                    // forwards still land below before the pages are released.
+                    abort.With(pd::FailedEvent{id});
+                }
                 Advance(abort);
                 live.erase(id);
                 ++aborts;
