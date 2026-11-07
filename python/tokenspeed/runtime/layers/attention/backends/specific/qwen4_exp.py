@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     )
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
+    )
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
 
@@ -166,6 +169,39 @@ class Qwen4ExpBackend(AttentionBackend):
             )
             if consumer is not None
         )
+
+    def preallocate_qsa_bf16_scratch(self, plan: QSABf16ScratchPlan) -> int:
+        """Allocate the BF16 prefill scratch on this view's QSA attention leaf.
+
+        Args:
+            plan: The cache recipe's ``qsa_bf16_scratch_plan``.
+
+        Returns:
+            The bytes allocated, which the caller checks against the plan.
+        """
+        from tokenspeed.runtime.layers.attention.backends.paged.qsa import (
+            QSAAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
+            CacheGroupRouter,
+        )
+
+        router = self._full_attn_backend
+        leaves = (
+            [
+                leaf
+                for leaf in router.leaves.values()
+                if isinstance(leaf, QSAAttnBackend)
+            ]
+            if isinstance(router, CacheGroupRouter)
+            else []
+        )
+        if len(leaves) != 1:
+            raise RuntimeError(
+                "the QSA BF16 prefill scratch needs one QSA attention leaf, "
+                f"found {len(leaves)}"
+            )
+        return leaves[0].preallocate_bf16_scratch(plan)
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
         for backend in self.child_backends():
