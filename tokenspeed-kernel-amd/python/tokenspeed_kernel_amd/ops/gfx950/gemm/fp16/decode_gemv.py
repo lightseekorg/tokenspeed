@@ -74,6 +74,16 @@ def gluon_rowcta_bf16_gemv_geometry_gfx950(n: int, k: int) -> tuple[int, int]:
 # attention output measured slower than the MFMA GEMM.
 _ROWS_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] = {
     (512, 8192): {2: (2, 8), 4: (1, 8)},  # Muse Spark pre-expert TP8
+    # Qwen3.8-27B TP1.
+    (5120, 6144): {2: (4, 4), 4: (4, 4)},  # GDN out_proj, attention o_proj
+    (14336, 5120): {2: (4, 4)},  # attention QKV with the output gate
+    (16480, 5120): {2: (4, 4), 4: (4, 4)},  # GDN in_proj_qkvzba
+    (34816, 5120): {2: (4, 4), 4: (4, 4)},  # MLP gate-up
+    # EAGLE-4 draft layer for Qwen3.8-27B.
+    (5120, 5120): {2: (4, 4), 4: (4, 4)},  # attention o_proj
+    (5120, 16384): {2: (4, 4), 4: (4, 4)},  # MLP down
+    (15360, 10240): {2: (4, 4)},  # attention QKV
+    (32768, 5120): {2: (4, 4)},  # MLP gate-up
 }
 
 
@@ -544,6 +554,9 @@ _PREFERRED_SHAPES: frozenset[tuple[int, int]] = frozenset(
         (3648, 7168),
         (4608, 7168),
         (4608, 8192),
+        (5120, 5120),
+        (5120, 6144),
+        (5120, 16384),
         (6656, 2560),
         (7168, 1536),
         (7168, 2304),
@@ -551,8 +564,13 @@ _PREFERRED_SHAPES: frozenset[tuple[int, int]] = frozenset(
         (8192, 1024),
         (8448, 7168),
         (12800, 2560),
+        (14336, 5120),
+        (15360, 10240),
+        (16480, 5120),
         (20480, 7168),
         (32320, 5120),
+        (32768, 5120),
+        (34816, 5120),
         (38720, 4096),
         (124160, 2560),
     }
