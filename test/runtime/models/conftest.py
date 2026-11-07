@@ -41,11 +41,12 @@ def server(monkeypatch):
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     routing = {"kernel": False}
-    impl = KernelRegistry.get().get_impl("flashinfer_trtllm_unquant_moe_apply")
-    if impl is not None:
-        monkeypatch.setattr(
-            impl, "_tokenspeed_fp32_correction_bias", lambda: routing["kernel"]
-        )
+    for kind in ("unquant", "nvfp4", "fp8_channel"):
+        impl = KernelRegistry.get().get_impl(f"flashinfer_trtllm_{kind}_moe_apply")
+        if impl is not None:
+            monkeypatch.setattr(
+                impl, "_tokenspeed_fp32_correction_bias", lambda: routing["kernel"]
+            )
     monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)

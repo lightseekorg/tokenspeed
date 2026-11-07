@@ -6,6 +6,8 @@ envelope's whole job is to keep the set coherent, because RL rollout
 introduced a class of deployment where one missing switch silently
 invalidates the training signal.
 
+Under `auto`, the quantized vendor grouped sigmoid MoE policies distinguish selection precision from coefficient storage: the prepared fused path selects with FP32 logits and bias and keeps FP32 route weights through finalization, as does its precomputed fallback. The admission, rounding and scale contract is recorded in [Grouped sigmoid routing precision](moe-routing.md). Neither path claims the bitwise envelope.
+
 ## The contract
 
 `--numerics rl-bitwise` is the one bitwise envelope. It promises, within one
