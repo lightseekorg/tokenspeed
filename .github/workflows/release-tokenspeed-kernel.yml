@@ -23,8 +23,8 @@ on:
         description: "Version date override for development builds, formatted as YYYYMMDD."
         required: false
         type: string
-      version_suffix:
-        description: "Nightly only: free text such as dev1 or fa4-fix, making a manual build a development release of that date's nightly (0.1.4.post20261108.dev1, 0.1.4.post20261108.dev0+fa4.fix) that neither collides with nor shadows the scheduled nightly."
+      release_candidate:
+        description: "Nightly only: a release candidate number N (or rcN). The build is 0.1.4rcN.post20261108, which sorts below every nightly, so it neither collides with nor shadows the scheduled nightly of that date."
         required: false
         type: string
       cuda_variant:
@@ -74,7 +74,7 @@ jobs:
     outputs:
       version: ${{ steps.metadata.outputs.version }}
       version_date: ${{ steps.metadata.outputs.version_date }}
-      version_suffix: ${{ steps.metadata.outputs.version_suffix }}
+      release_candidate: ${{ steps.metadata.outputs.release_candidate }}
       tag_name: ${{ steps.metadata.outputs.tag_name }}
       cuda_matrix: ${{ steps.metadata.outputs.cuda_matrix }}
       cuda_variant: ${{ steps.metadata.outputs.cuda_variant }}
@@ -103,7 +103,7 @@ jobs:
           CUDA_VARIANT: ${{ inputs.cuda_variant }}
           NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
           VERSION_DATE: ${{ inputs.version_date }}
-          VERSION_SUFFIX: ${{ inputs.version_suffix }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           REQUESTED_TAG: ${{ inputs.tag_name }}
           REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           PUBLISH_PYPI: ${{ inputs.publish_pypi }}
@@ -123,8 +123,8 @@ jobs:
               exit 1
             fi
             CUDA_VARIANT=cu130
-          elif [ -n "$VERSION_SUFFIX" ]; then
-            echo "version_suffix applies to nightly builds only." >&2
+          elif [ -n "$RELEASE_CANDIDATE" ]; then
+            echo "release_candidate applies to nightly builds only." >&2
             exit 1
           fi
           version_date="$VERSION_DATE"
@@ -136,7 +136,7 @@ jobs:
             cd tokenspeed-kernel/python
             TOKENSPEED_KERNEL_BACKEND=cuda \
             TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
-            TOKENSPEED_KERNEL_VERSION_SUFFIX="$VERSION_SUFFIX" \
+            TOKENSPEED_KERNEL_RELEASE_CANDIDATE="$RELEASE_CANDIDATE" \
             TOKENSPEED_KERNEL_NIGHTLY="$NIGHTLY" \
             TOKENSPEED_KERNEL_GIT_SHA="$GITHUB_SHA" \
             TOKENSPEED_KERNEL_GIT_BRANCH="$GITHUB_REF_NAME" \
@@ -179,12 +179,13 @@ jobs:
           echo "cuda_variant=${CUDA_VARIANT}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "version_date=${version_date}" >> "$GITHUB_OUTPUT"
-          # setup.py normalized the suffix: "", ".devN" or ".devN+label".
-          version_suffix=""
+          # setup.py normalized the release candidate to "" or "rcN", the part
+          # between the release number and .post<date>.
+          release_candidate=""
           if [ "$NIGHTLY" = "true" ]; then
-            version_suffix="${version#*.post${version_date}}"
+            release_candidate=$(printf '%s' "${version%%.post${version_date}*}" | sed -E 's/^[0-9]+(\.[0-9]+)*//')
           fi
-          echo "version_suffix=${version_suffix}" >> "$GITHUB_OUTPUT"
+          echo "release_candidate=${release_candidate}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
           echo "cuda_matrix=${cuda_matrix}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${version}"
@@ -286,7 +287,7 @@ jobs:
             -e FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a" \
             -e TOKENSPEED_KERNEL_NIGHTLY=${{ needs.metadata.outputs.nightly }} \
             -e TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
-            -e TOKENSPEED_KERNEL_VERSION_SUFFIX=${{ needs.metadata.outputs.version_suffix }} \
+            -e TOKENSPEED_KERNEL_RELEASE_CANDIDATE=${{ needs.metadata.outputs.release_candidate }} \
             -e TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
             -e TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
             -e MAX_JOBS=8 \
@@ -353,7 +354,7 @@ jobs:
           TOKENSPEED_KERNEL_BACKEND=cuda \
           TOKENSPEED_KERNEL_NIGHTLY=${{ needs.metadata.outputs.nightly }} \
           TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
-          TOKENSPEED_KERNEL_VERSION_SUFFIX=${{ needs.metadata.outputs.version_suffix }} \
+          TOKENSPEED_KERNEL_RELEASE_CANDIDATE=${{ needs.metadata.outputs.release_candidate }} \
           TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
           TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
             python -m build --sdist --no-isolation --outdir ../../dist

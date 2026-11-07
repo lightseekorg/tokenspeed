@@ -57,25 +57,17 @@ def test_nightly_versions_and_kernel_dependency_share_date(project):
     )
 
 
-@pytest.mark.parametrize(
-    "kernel,suffix",
-    [
-        ("0.1.4.post20261108.dev1", ".dev1"),
-        ("0.1.4.post20261108.dev0+fa4.fix", ".dev0+fa4.fix"),
-    ],
-)
-def test_development_kernel_nightly_gives_tokenspeed_the_same_suffix(
-    project, kernel, suffix
+def test_release_candidate_kernel_nightly_makes_a_tokenspeed_release_candidate(
+    project,
 ):
     base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
         "project"
     ]["version"]
-    version = PREPARE(project, "20261108", kernel)
+    version = PREPARE(project, "20261108", "0.1.4rc1.post20261108")
     metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
-    assert metadata["version"] == version == f"{base_version}.post20261108{suffix}"
+    assert metadata["version"] == version == f"{base_version}rc1.post20261108"
     pins = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
-    # The pin names the label, so it matches no other build of that dev number.
-    assert pins == [f"tokenspeed-kernel=={kernel}"]
+    assert pins == ["tokenspeed-kernel==0.1.4rc1.post20261108"]
 
 
 @pytest.mark.parametrize(
@@ -91,12 +83,15 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
 
 
 @pytest.mark.parametrize(
-    "kernel", ["0.1.4.post20261108+exp1", "0.1.4rc1.post20261108.dev1"]
+    "kernel",
+    [
+        "0.1.4.post20261108.dev1",
+        "0.1.4.post20261108+exp1",
+        "0.1.4a1.post20261108",
+        "0.1.4rc1.post20261108.dev1",
+    ],
 )
-def test_kernel_with_a_bare_local_label_or_pre_release_is_refused(project, kernel):
-    # A label without a development number would satisfy the nightly's == pins,
-    # and a pre-release is no nightly of that date: only a development suffix,
-    # labeled or not, carries over.
+def test_kernel_with_anything_but_a_release_candidate_is_refused(project, kernel):
     path = project / "python/pyproject.toml"
     original = path.read_bytes()
     with pytest.raises(ValueError):

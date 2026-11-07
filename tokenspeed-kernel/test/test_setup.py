@@ -77,66 +77,57 @@ def test_nightly_version_uses_post_date(monkeypatch) -> None:
         _capture_setup_kwargs(monkeypatch, "cuda")
 
 
+def _release_version(monkeypatch) -> str:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "false")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "release/test")
+    return _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+
+
 @pytest.mark.parametrize(
-    "suffix,expected",
-    [
-        ("dev1", ".dev1"),
-        (".dev1", ".dev1"),
-        ("-dev_7", ".dev7"),
-        ("DEV", ".dev0"),
-        ("2", ".dev2"),
-        ("dev20261107001", ".dev20261107001"),
-        ("fa4-fix", ".dev0+fa4.fix"),
-        ("Fa4 Fix!", ".dev0+fa4.fix"),
-        ("+exp1", ".dev0+exp1"),
-        ("rc1", ".dev0+rc1"),
-        ("20261107.2", ".dev0+20261107.2"),
-        ("exp.007", ".dev0+exp.7"),
-        ("dev2+fa4_fix", ".dev2+fa4.fix"),
-        ("3+exp", ".dev3+exp"),
-        (".dev0+fa4.fix", ".dev0+fa4.fix"),
-    ],
+    "candidate,expected",
+    [("1", "rc1"), ("rc2", "rc2"), ("RC3", "rc3"), (" 04 ", "rc4")],
 )
-def test_nightly_version_suffix_makes_a_development_release(
-    monkeypatch, suffix, expected
+def test_nightly_release_candidate_sorts_below_every_nightly(
+    monkeypatch, candidate, expected
 ) -> None:
+    base_version = _release_version(monkeypatch)
     monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
     monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
-    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", suffix)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", candidate)
     version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
-    nightly = version.removesuffix(expected)
-    assert nightly.endswith(".post20261108")
-    # A pre-release of that date's nightly: it sorts before the nightly, and a
-    # pin of the nightly does not match it.
-    assert Version(version) < Version(nightly)
-    assert Version(version).is_prerelease
-    assert not SpecifierSet(f"=={nightly}").contains(version, prereleases=True)
+    assert version == f"{base_version}{expected}.post20261108"
     assert str(Version(version)) == version
+    # Below the previous day's nightly too, so it shadows no nightly, and the
+    # scheduled nightly's == pin does not match it.
+    assert Version(version) < Version(f"{base_version}.post20261107")
+    assert not SpecifierSet(f"=={base_version}.post20261108").contains(
+        version, prereleases=True
+    )
 
 
-@pytest.mark.parametrize("suffix", [" ", "\t", "+", "dev1+", "+++", "---", "dev1+-"])
-def test_nightly_version_suffix_refuses_a_blank_suffix_or_label(
-    monkeypatch, suffix
-) -> None:
-    # A blank suffix would publish the plain nightly version while the workflows
-    # treat the run as suffixed.
+@pytest.mark.parametrize(
+    "candidate", [" ", "rc", "dev1", "fa4-fix", "rc1+fa4", "1.5", "-1", "a1"]
+)
+def test_nightly_release_candidate_must_be_a_number(monkeypatch, candidate) -> None:
     monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
     monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
-    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", suffix)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", candidate)
     with pytest.raises(ValueError):
         _capture_setup_kwargs(monkeypatch, "cuda")
 
 
 @pytest.mark.parametrize("branch", ["main", "release/test"])
-def test_version_suffix_is_refused_outside_nightly_builds(monkeypatch, branch) -> None:
+def test_release_candidate_is_refused_outside_nightly_builds(
+    monkeypatch, branch
+) -> None:
     monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "false")
     monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", branch)
-    # The release workflow passes the (empty) suffix to every build.
-    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", "")
+    # The release workflow passes the (empty) release candidate to every build.
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "")
     _capture_setup_kwargs(monkeypatch, "cuda")
-    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", "dev1")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "1")
     with pytest.raises(ValueError):
         _capture_setup_kwargs(monkeypatch, "cuda")
 

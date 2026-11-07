@@ -152,44 +152,27 @@ def _git_branch() -> str:
         return ""
 
 
-def _nightly_version_suffix() -> str:
-    """Return the version suffix of a manual nightly build, or an empty string.
+def _nightly_release_candidate() -> str:
+    """Return the release-candidate part of a manual nightly's version, or "".
 
-    TOKENSPEED_KERNEL_VERSION_SUFFIX is free text that turns a manual nightly
-    into a development release of that date's nightly, so it neither collides
-    with the scheduled nightly of that date nor shadows it: pip skips a
-    development release unless it is pinned or pre-releases are enabled. A
-    development number becomes .devN (dev1 or 1 -> 0.1.4.post20261108.dev1),
-    other text a local label of .dev0 (fa4-fix -> 0.1.4.post20261108.dev0+fa4.fix),
-    and the two combine (dev2+fa4 -> .dev2+fa4). The label never stands alone:
-    0.1.4.post20261108+label would satisfy the nightly's ``==`` pins and be
-    preferred over it.
+    TOKENSPEED_KERNEL_RELEASE_CANDIDATE=N (or rcN) builds 0.1.4rcN.post20261108
+    instead of that date's nightly 0.1.4.post20261108. A release candidate sorts
+    below every nightly, so it neither collides with the scheduled nightly of
+    its date nor shadows any nightly: an install that a nightly satisfies still
+    gets the nightly.
 
     Raises:
-        ValueError: If the suffix is set but blank, or its local label has no
-            letter or digit.
+        ValueError: If the value is set but is not a release-candidate number.
     """
-    raw = os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX", "")
-    suffix = raw.strip()
-    if not suffix:
-        if raw:
-            raise ValueError("Nightly version suffix is blank")
+    raw = os.environ.get("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "")
+    if not raw:
         return ""
-    head, plus, label = suffix.partition("+")
-    match = re.fullmatch(
-        r"[._-]?(?:dev[._-]?)?([0-9]+)|[._-]?dev", head, flags=re.IGNORECASE
-    )
+    match = re.fullmatch(r"(?:rc)?([0-9]+)", raw.strip(), flags=re.IGNORECASE)
     if match is None:
-        number, plus, label = 0, "+", suffix
-    else:
-        number = int(match.group(1) or 0)
-    # PEP 440 local label: lowercase alphanumeric segments joined by dots, with
-    # numeric segments compared (and normalized) as integers.
-    segments = re.findall(r"[a-z0-9]+", label.lower())
-    label = ".".join(str(int(s)) if s.isdigit() else s for s in segments)
-    if plus and not label:
-        raise ValueError("Nightly version suffix label needs a letter or digit")
-    return f".dev{number}" + (f"+{label}" if label else "")
+        raise ValueError(
+            "Nightly release candidate must be a number such as 1 (or rc1)"
+        )
+    return f"rc{int(match.group(1))}"
 
 
 def _package_version() -> str:
@@ -202,11 +185,11 @@ def _package_version() -> str:
         ):
             raise ValueError("Nightly version date must be YYYYMMDD")
         datetime.strptime(version_date, "%Y%m%d")
-        return f"{BASE_VERSION}.post{version_date}{_nightly_version_suffix()}"
+        return f"{BASE_VERSION}{_nightly_release_candidate()}.post{version_date}"
 
-    if os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX"):
+    if os.environ.get("TOKENSPEED_KERNEL_RELEASE_CANDIDATE"):
         raise ValueError(
-            "TOKENSPEED_KERNEL_VERSION_SUFFIX applies to nightly builds only"
+            "TOKENSPEED_KERNEL_RELEASE_CANDIDATE applies to nightly builds only"
         )
     if _git_branch().startswith("release/"):
         return BASE_VERSION
