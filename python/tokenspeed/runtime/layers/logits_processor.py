@@ -489,6 +489,38 @@ class LogitsProcessor(nn.Module):
         self._sampled_shard_start = columns * self.tp_rank
         return True
 
+    def sampled_vocab_shard(
+        self, logits: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> SampledVocabShard:
+        """The sampled rows of this rank's raw head logits, as a vocabulary shard.
+
+        Call it only after ``keep_sampled_logits_vocab_sharded`` turns the
+        shard on.
+
+        Args:
+            logits: ``[rows, shard]`` LM-head GEMM output of this rank.
+            lm_head: The vocab-parallel head that produced them.
+
+        Returns:
+            The shard ``forward`` hands the sampler as ``vocab_shard``.
+        """
+        assert self._sampled_shard_start is not None
+        return SampledVocabShard(
+            logits=logits,
+            vocab_start=self._sampled_shard_start,
+            logit_scale=self.logit_scale,
+            softcap=self.final_logit_softcapping,
+            tp_size=self.tp_size,
+            tp_group=self.tp_group,
+            gather_full=functools.partial(
+                self._finish_logits,
+                lm_head=lm_head,
+                plan=None,
+                lm_head_tp_row_counts=None,
+                require_full_vocab=False,
+            ),
+        )
+
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
             not runtime.enabled
@@ -881,20 +913,8 @@ class LogitsProcessor(nn.Module):
             # through the same tail as the whole-row path.
             logits_layout_plan = None
             sampled_logits = None
-            vocab_shard = SampledVocabShard(
-                logits=self._project_logits(pruned_states, lm_head, None),
-                vocab_start=self._sampled_shard_start,
-                logit_scale=self.logit_scale,
-                softcap=self.final_logit_softcapping,
-                tp_size=self.tp_size,
-                tp_group=self.tp_group,
-                gather_full=functools.partial(
-                    self._finish_logits,
-                    lm_head=lm_head,
-                    plan=None,
-                    lm_head_tp_row_counts=None,
-                    require_full_vocab=False,
-                ),
+            vocab_shard = self.sampled_vocab_shard(
+                self._project_logits(pruned_states, lm_head, None), lm_head
             )
         else:
             logits_layout_plan = self._resolve_logits_layout_plan(

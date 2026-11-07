@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     verify_tree,
 )
 
+from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
     SamplingBackend,
@@ -57,15 +58,14 @@ from tokenspeed.runtime.sampling.backends.base import (
     SpeculativeSamplingPools,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
 from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
-    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
     from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
 
@@ -83,6 +83,8 @@ _COMPACT_GUMBEL_VOCAB_MAX = 32768
 _TOP_K_TOP_P_SMALL_BLOCK_SIZE = 1024
 _TOP_K_TOP_P_TUNED_VOCAB_MAX = 32768
 _TOP_K_TOP_P_PAD = 128
+# The candidate count of a batch whose finite top_k all fit in it.
+_TOP_K_TOP_P_SMALL_PAD = 64
 _TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE = 1024
 _TOP_P_PARALLEL_SAMPLE_ATTEMPTS = 3
 _TOP_P_PARALLEL_VERIFY_ATTEMPTS = 4
@@ -171,6 +173,39 @@ class TritonSamplingBackend(SamplingBackend):
 
     def vocab_shard_top_k(self) -> int | None:
         return self._vocab_shard_top_k
+
+    def warmup_vocab_shard_sampling(self, shard: SampledVocabShard) -> None:
+        """Compile ``sample`` from vocabulary shards at every candidate count.
+
+        The candidate count is a compile-time parameter of the shard
+        selection, its gather and the sampling kernel. Graph capture records
+        the top-k routes at 128 candidates only, but an eager step whose
+        finite top_k all fit in 64 selects 64 (``_select_top_k_top_p_pad``).
+        Sampling the padding slot at each count compiles both before serving.
+        Every TP rank must call it, since the selection gathers across the
+        group.
+
+        Args:
+            shard: Shard logits of the processor that feeds this sampler, at
+                least one row.
+        """
+        rows = shard.logits.shape[0]
+        device = shard.logits.device
+        output = LogitsProcessorOutput(next_token_logits=None, vocab_shard=shard)
+        info = SamplingBatchInfo(
+            req_pool_indices=torch.zeros((rows,), dtype=torch.int64, device=device),
+            valid_cache_lengths=torch.zeros(
+                (self.config.max_req_pool_size + 1,), dtype=torch.int32, device=device
+            ),
+            vocab_size=self.config.vocab_size,
+            device=device,
+        )
+        saved = (self._sample_route, self._top_k_top_p_pad)
+        self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K
+        for pad in (_TOP_K_TOP_P_SMALL_PAD, _TOP_K_TOP_P_PAD):
+            self._top_k_top_p_pad = pad
+            self.sample(output, info)
+        self._sample_route, self._top_k_top_p_pad = saved
 
     def _selects_from_vocab_shard(self, logits_output: LogitsProcessorOutput) -> bool:
         """Whether this step's route selects candidates per vocabulary shard."""
@@ -471,8 +506,8 @@ class TritonSamplingBackend(SamplingBackend):
             for sp in sampling_params_list
             if int(sp.top_k) != _TOP_K_DISABLED
         ]
-        if finite_top_ks and max(finite_top_ks) <= 64:
-            return 64
+        if finite_top_ks and max(finite_top_ks) <= _TOP_K_TOP_P_SMALL_PAD:
+            return _TOP_K_TOP_P_SMALL_PAD
         return _TOP_K_TOP_P_PAD
 
     def speculative_sampling_pools(self) -> SpeculativeSamplingPools:

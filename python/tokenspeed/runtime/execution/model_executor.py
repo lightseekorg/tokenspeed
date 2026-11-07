@@ -734,13 +734,14 @@ class ModelExecutor:
             # reduce it across vocabulary shards instead of gathering logits.
             self.model_runner.model.logits_processor.fuse_argmax()
         shard_top_k = self.sampling_backend.vocab_shard_top_k()
-        if (
+        self._samples_from_vocab_shard: bool = (
             self._pp_is_last_stage
             and shard_top_k is not None
             and self.model_runner.model.logits_processor.keep_sampled_logits_vocab_sharded(
                 self.model_runner.model.lm_head, shard_top_k
             )
-        ):
+        )
+        if self._samples_from_vocab_shard:
             logger.info(
                 f"Sampled rows stay vocab-sharded: the top-k routes select "
                 f"{shard_top_k} candidates per shard instead of gathering logits"
@@ -1189,6 +1190,8 @@ class ModelExecutor:
                             batch_sizes=(self.config.attention_tp_size,),
                             graph_phase=False,
                         )
+                if self._samples_from_vocab_shard:
+                    self._warmup_vocab_shard_sampling()
         finally:
             set_autotune_process_group(None)
 
@@ -1197,6 +1200,24 @@ class ModelExecutor:
             save_autotune_cache(cache_path, cpu_group, owner_rank)
 
         logger.info(f"Kernel startup warmup finished in {time.time() - tic:.1f}s")
+
+    def _warmup_vocab_shard_sampling(self) -> None:
+        """Compile the sampler's selection from vocabulary shards before serving.
+
+        The dummy forwards sample through no top-k route, and graph capture
+        records only one candidate count. The sampler warms each count that
+        it can pick on an eager step.
+        """
+        processor = self.model_runner.model.logits_processor
+        lm_head = self.model_runner.model.lm_head
+        logits = torch.zeros(
+            (1, lm_head.num_embeddings_per_partition),
+            dtype=lm_head.weight.dtype,
+            device=self.device,
+        )
+        self.sampling_backend.warmup_vocab_shard_sampling(
+            processor.sampled_vocab_shard(logits, lm_head)
+        )
 
     def _autotune_draft_experts(self, num_tokens: int) -> None:
         """Warm the draft model's routed-expert kernels inside the startup window.
