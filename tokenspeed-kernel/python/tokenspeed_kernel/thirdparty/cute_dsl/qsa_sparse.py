@@ -373,7 +373,10 @@ def kernel(
 
     Query heads form contiguous groups for each KV head. Non-positive selected
     slots are masked, and each query retains its own last three candidates.
-    K/V offsets are 64-bit. The enable_pdl flag is retained by CUDA graph capture.
+    With an FP8 cache, each query and KV split stops its prefix loop after the
+    last 128-entry tile holding a positive id (at least one tile); the skipped
+    tiles hold only masked entries, so the output matches the full loop. K/V
+    offsets are 64-bit. The enable_pdl flag is retained by CUDA graph capture.
     Returns BF16 output with the query's shape.
     """
     if query.ndim != 3 or query.shape[-1] != _HEAD_DIM:

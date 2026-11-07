@@ -634,7 +634,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         v_address: cutlass.Int64,
         staged_slots: cute.Tensor,
         item: cutlass.Int32,
-        num_items: cutlass.Constexpr[int],
+        num_items: cutlass.Int32,
         dim_offset: cutlass.Int32,
         smem_base: cutlass.Int64,
         smem_stage: cutlass.Int32,
@@ -643,7 +643,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
         """Gather item `item` of the K0,K1,V0,K2,V1,...,V_last stream (16 KB).
 
         Slot ids come from the CTA's shared-memory copy, so V items reuse their
-        K tile's ids and no global load precedes the copies.
+        K tile's ids and no global load precedes the copies. The stream covers
+        the row's prefix tiles up to its last one holding a positive id, so
+        `num_items` is a runtime value.
         """
         is_value = cutlass.Int32(item == num_items - 1) | (
             cutlass.Int32(item > 0) & cutlass.Int32(item % 2 == 0)
@@ -1607,6 +1609,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
         )  # P
         if cutlass.const_expr(not bf16_kv):
             smem_alloc_bits += (selected_slots.shape[1] // 128) * 128 * 32  # staged ids
+            # Per-warp prefix tile counts (16-byte aligned).
+            smem_alloc_bits += 128 + (self.threads_per_cta // warp_threads) * 32
         smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         kv_smem_dtype = k_iter.dtype
         self.kv_stages = (smem_capacity * 8 - smem_alloc_bits) // (
@@ -2812,6 +2816,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
             staged_slots = smem.allocate_tensor(
                 cutlass.Int32, cute.make_layout(static_iters_s * 128), svector_align
             )
+            # Per warp: 1 + the last staged tile holding a positive id.
+            prefix_tile_ends = smem.allocate_tensor(
+                cutlass.Int32,
+                cute.make_layout(self.threads_per_cta // warp_threads),
+                svector_align,
+            )
         if cutlass.const_expr(
             self.original_heads_per_kv == 12 and self.problem_shape[2] == 2
         ):
@@ -2959,6 +2969,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     defer_sync=True,
                 ).make_participants()
                 if cutlass.const_expr(stage_fp8_slots):
+                    prefix_tile_end = cutlass.Int32(0)
                     for stage_iter in cutlass.range_constexpr(
                         cute.ceil_div(static_iters_s * 128, self.threads_per_cta)
                     ):
@@ -2969,8 +2980,35 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 (kv_split_idx + (stage_idx // 128) * kv_splits) * 128
                                 + stage_idx % 128,
                             ]
+                            if staged_slots[stage_idx] > 0:
+                                tile_end = stage_idx // 128 + 1
+                                prefix_tile_end = (
+                                    tile_end
+                                    if tile_end > prefix_tile_end
+                                    else prefix_tile_end
+                                )
+                    prefix_tile_end = cute.arch.warp_redux_sync(
+                        prefix_tile_end, kind="max"
+                    )
+                    if lane_idx == 0:
+                        prefix_tile_ends[warp_idx] = prefix_tile_end
                 cute.arch.mbarrier_init_fence()
                 self._sync_work_threads()
+                prefix_iters = iters_s
+                if cutlass.const_expr(stage_fp8_slots):
+                    # Every role ends this row's prefix loop after its last
+                    # staged tile holding a positive id. Later tiles hold only
+                    # masked entries, which leave the softmax max, sum and O
+                    # unchanged, so this is exact for any id order. At least
+                    # one tile keeps an all-padding prefix on the full loop's
+                    # state (finite max, zero sum) for the tail and DSM merge.
+                    row_tiles = cutlass.Int32(1)
+                    for warp in cutlass.range_constexpr(
+                        self.threads_per_cta // warp_threads
+                    ):
+                        warp_tiles = prefix_tile_ends[warp]
+                        row_tiles = warp_tiles if warp_tiles > row_tiles else row_tiles
+                    prefix_iters = cute.arch.make_warp_uniform(row_tiles)
                 tmem_ptr = cute.arch.retrieve_tmem_ptr(
                     cutlass.Int32, 16, tmem_ptr_smem_ptr
                 )
@@ -3944,12 +3982,16 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 depth = _FP8_DEPTH
                                 assert self.kv_stages >= ring * _CONVERT_WARPGROUPS
                                 assert 1 <= depth < ring
-                                num_items = static_iters_s * 2
+                                # V_(s-1) follows K_s (one prefetched S stage) for
+                                # every runtime tile count >= 1.
+                                assert self.sp_stages == 2
+                                # K0,K1,V0,...,V_last over this row's prefix tiles.
+                                num_items = prefix_iters * 2
                                 k_address = k_iter.toint()
                                 v_address = v_iter.toint()
                                 # Prologue: `depth` items (or empty groups) in flight.
                                 for first in cutlass.range_constexpr(depth):
-                                    if cutlass.const_expr(first < num_items):
+                                    if cutlass.Int32(first) < num_items:
                                         self._issue_fp8_ring_item(
                                             k_address,
                                             v_address,
@@ -3966,8 +4008,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                         )
                                     else:
                                         cute.arch.cp_async_commit_group()
-                                for s in cutlass.range(prefetch_iters + static_iters_s):
-                                    if s < static_iters_s:
+                                for s in cutlass.range(prefetch_iters + prefix_iters):
+                                    if s < prefix_iters:
                                         # Convert and scale K_s (stream item 0 or 2s-1)
                                         item = 2 * s - 1 + cutlass.Int32(s == 0)
                                         # `depth` groups are pending: items item..item+depth-1.
@@ -4032,9 +4074,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
                                     if s >= prefetch_iters:
                                         # Convert and scale V_(s-1) (stream item 2s, or the last)
-                                        item = 2 * s - cutlass.Int32(
-                                            s == static_iters_s
-                                        )
+                                        item = 2 * s - cutlass.Int32(s == prefix_iters)
                                         cute.arch.cp_async_wait_group(depth - 1)
                                         cvt_load_nbar.arrive_and_wait()
                                         refill = item + depth
@@ -4099,7 +4139,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 for dk in cutlass.range_constexpr(tiles_dk):
                                     q_consumer.wait_and_advance()
                                 s_token = True  # Producer always acquires first
-                                for s in cutlass.range(iters_s):
+                                for s in cutlass.range(prefix_iters):
                                     k_token = cvt_consumer.try_wait()
                                     tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, False)
                                     s_handle = s_producer.acquire_and_advance(s_token)
@@ -4164,7 +4204,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     # The final PV tile also arrives on this named barrier.
                                     # Retire its matching QK arrival before the next query.
                                     pipeline.NamedBarrier(
-                                        barrier_id=3 + 9 * ((iters_s - 1) % 2),
+                                        barrier_id=3 + 9 * ((prefix_iters - 1) % 2),
                                         num_threads=64,
                                     ).arrive_and_wait()
                             else:
@@ -4176,9 +4216,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     mma_kq_even_nbar.arrive_and_wait()
                                     p_token = False
                                     o_token = True  # Producer always acquires first
-                                    for s in cutlass.range(iters_s):
+                                    for s in cutlass.range(prefix_iters):
                                         # Advance and wait for BMM1
-                                        if s < iters_s - 1:
+                                        if s < prefix_iters - 1:
                                             for _ in cutlass.range_constexpr(tiles_dk):
                                                 cvt_consumer.advance()
                                             # V_s follows K_{s+1} in the shared K/V stream.
@@ -4271,7 +4311,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                                         blk_tile_s,
                                                         head_offset,
                                                         heads_per_kv,
-                                                        iters_s,
+                                                        prefix_iters,
                                                         kv_split_idx,
                                                         kv_splits,
                                                         lane_idx,
@@ -4317,7 +4357,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                                         blk_tile_s,
                                                         head_offset,
                                                         heads_per_kv,
-                                                        iters_s,
+                                                        prefix_iters,
                                                         kv_split_idx,
                                                         kv_splits,
                                                         lane_idx,
@@ -4364,7 +4404,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                                     blk_tile_s,
                                                     head_offset,
                                                     heads_per_kv,
-                                                    iters_s,
+                                                    prefix_iters,
                                                     kv_split_idx,
                                                     kv_splits,
                                                     lane_idx,
@@ -4535,7 +4575,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                             if warpgroup_widx == 1 and lane_store_max:
                                                 tSsL[lane_idx] = cutlass.Float32(0)
                                             softmax_nbar.arrive_and_wait()
-                                            for s in cutlass.range(iters_s):
+                                            for s in cutlass.range(prefix_iters):
                                                 selected_tile = (
                                                     kv_split_idx + s * kv_splits
                                                 )
