@@ -1297,7 +1297,15 @@ impl OutputProcessor {
             }
 
             let nan_detected = nan_flag || state.numerical_error_detected;
-            if nan_detected && !state.finished() {
+            // P role: the scheduler requeued this computed prompt for
+            // prompts whose decode destination was allocated, and it computed
+            // again. It keeps the token it sampled the first time -- its
+            // output, grammar and logprobs hold it already -- and the remote
+            // decode carries that one; drafter candidates of the new sample
+            // would not match it. A NaN aborts it even if that token ended it.
+            let recomputed =
+                self.role == Role::Prefill && !is_decode && !state.output_ids.is_empty();
+            if nan_detected && (!state.finished() || (recomputed && !state.to_abort)) {
                 committed.stats.nan_aborts += 1;
                 state.finished_reason = Some(FinishReason::Abort {
                     message: NUMERICAL_ERROR.to_owned(),
@@ -1313,6 +1321,16 @@ impl OutputProcessor {
                     probs.truncate(1);
                 }
                 tracing::warn!(rid, "request terminated: NaN detected in logits");
+            }
+            if recomputed {
+                committed
+                    .events
+                    .push(extend_result(rid, state.output_ids.clone()));
+                if nan_detected {
+                    committed.events.push(finish(rid, true));
+                    self.release(rid, &mut committed);
+                }
+                continue;
             }
             if is_decode && self.spec_num_tokens.is_some() {
                 state.spec_verify_ct += 1;
@@ -2224,6 +2242,65 @@ mod tests {
             c.outputs[0].input_logprobs.as_ref().unwrap().values,
             [None, Some(0.0), Some(-1.0)]
         );
+    }
+
+    #[test]
+    fn a_requeued_prefill_keeps_the_token_it_sampled_first() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        register(&mut p, "r", 4, 8, &[]);
+        let prompt = batch(&[("r", 4, 0, 4)], 1);
+        let c = p.commit(&prompt, None, &result(&[9], &[1])).unwrap();
+        assert_eq!(
+            kinds(&c),
+            [("r".to_owned(), ForwardEventKind::ExtendResult, vec![9])]
+        );
+        // Computed again from a prefix hit, after a requeue: the result reports
+        // the first token, not the new sample, and drops the new candidates.
+        let again = batch(&[("r", 2, 2, 4)], 1);
+        let c = p
+            .commit(
+                &again,
+                None,
+                &ForwardResult {
+                    next_input_ids: Some(vec![vec![11, 12]]),
+                    ..result(&[11], &[1])
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            kinds(&c),
+            [("r".to_owned(), ForwardEventKind::ExtendResult, vec![9])]
+        );
+        assert!(c.events[0].spec_candidate_ids.is_empty());
+        assert_eq!(p.state("r").unwrap().output_ids, [9]);
+        assert_eq!(p.finish_prefill("r").outputs[0].output_ids, [9]);
+        // A recomputation whose logits held a NaN never transfers, and counts
+        // as a NaN abort even when the first token ended the request.
+        for max_new in [8, 1] {
+            register(&mut p, "n", 4, max_new, &[]);
+            let prompt = batch(&[("n", 4, 0, 4)], 1);
+            p.commit(&prompt, None, &result(&[9], &[1])).unwrap();
+            assert_eq!(p.state("n").unwrap().finished(), max_new == 1);
+            let c = p
+                .commit(
+                    &prompt,
+                    None,
+                    &ForwardResult {
+                        nan_flags: Some(vec![1]),
+                        ..result(&[11], &[1])
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                kinds(&c),
+                [
+                    ("n".to_owned(), ForwardEventKind::ExtendResult, vec![9]),
+                    ("n".to_owned(), ForwardEventKind::Abort, vec![]),
+                ]
+            );
+            assert_eq!(c.released, ["n"]);
+            assert_eq!(c.stats.nan_aborts, 1, "max_new_tokens {max_new}");
+        }
     }
 
     #[test]

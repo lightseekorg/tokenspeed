@@ -37,7 +37,12 @@
 // every third plan on the oldest decode (3) or prefill (-3), into a pool too
 // small for some of the images the knob takes. One P-role test turns the
 // in-forward checkpoints on for every seed and drops short prompts' ends
-// (drop_short_prompt_end_checkpoints).
+// (drop_short_prompt_end_checkpoints). The P role also draws its decode
+// allocation policy from a stream of its own; under independent admission
+// the peer grants destinations at a rate the seed draws, so computed prompts
+// wait for theirs, and now and then fails a prompt that has none yet (a
+// bootstrap timeout), computed or not. Granted work the pool or the request
+// slots block then requeues prompts that have none.
 //
 // The scheduler must never raise; under write-back no copy pins its Device
 // source; every write-back row keeps its two ends in one shard's bucket;
@@ -49,8 +54,11 @@
 // whole prompts its chunk gave way to (prefill_chunk_yield_tokens): the
 // completing prefills form a prefix of the batch. With KV cache events on,
 // every plan's drain removes only blocks the feed stored and stores none
-// twice, alike on mirrored ranks. Once everything is acknowledged, no Host
-// entry is pinned and nothing is in flight.
+// twice, alike on mirrored ranks. On the P role the prompts waiting for their
+// destination after every plan are exactly the computed ones not yet granted,
+// ended or requeued (none under early admission), a requeued prompt holds no
+// pages, and no KV goes out without a destination. Once everything is
+// acknowledged, no Host entry is pinned and nothing is in flight.
 //
 // The demotion runs turn superseded checkpoint demotion on, with the
 // in-forward checkpoints it requires (so the dead prompt ends and finishes
@@ -148,6 +156,10 @@ struct ClosedLoop {
     bool mixed{false};
     bool capacity_retraction{false};
     std::int32_t force_retraction_interval{0};
+    // The P role's draws: independent admission, and the chance a round
+    // grants a waiting prompt its destination.
+    bool independent{false};
+    double grant_probability{0.7};
     // Mirrored: allocated between the two schedulers' constructions, so the
     // second one's allocations are not the first one's at a fixed offset.
     std::vector<std::uint8_t> heap_perturbation;
@@ -159,6 +171,9 @@ struct ClosedLoop {
     struct Live {
         std::vector<std::int32_t> prompt;
         bool bootstrapped{false};
+        // The final result landed: a P prompt not bootstrapped yet waits for
+        // its destination.
+        bool computed{false};
         bool transferring{false};
         bool finished{false};
         // The fused role's generation: its token limit and what landed.
@@ -184,6 +199,16 @@ struct ClosedLoop {
 
     std::uint64_t aborts{0};
     std::uint64_t handoffs{0};
+    // Independent admission: plans after which a prompt waited for its
+    // destination, and the waiting prompts granted, failed and aborted.
+    std::uint64_t waiting_plans{0};
+    std::uint64_t waiting_grants{0};
+    std::uint64_t waiting_failures{0};
+    std::uint64_t waiting_aborts{0};
+    // Independent admission: prompts without a destination the scheduler
+    // requeued for granted work, computed ones and ones between chunks.
+    std::uint64_t computed_requeues{0};
+    std::uint64_t prefilling_requeues{0};
     // Plans that only decode and write back what they evict, and the
     // eviction write-back ops so far.
     std::uint64_t decode_only_write_backs{0};
@@ -259,6 +284,12 @@ struct ClosedLoop {
             force_retraction_interval = std::vector<std::int32_t>{0, 0, 3, -3}[retraction];
         } else {
             overlap_depth = Rand(0, 2);
+            // From its own stream, so an early-admission seed keeps its draws.
+            std::mt19937 policy_rng(seed + 1);
+            independent = std::uniform_int_distribution<int>(0, 1)(policy_rng) == 1;
+            if (independent) {
+                grant_probability = std::vector<double>{0.05, 0.2, 0.7}[Rand(0, 3)];
+            }
         }
         const std::int32_t history_block = Rand(0, 2) == 0 ? kP : kP / 2;
         // Restricted State groups require in-forward checkpoints.
@@ -270,8 +301,10 @@ struct ClosedLoop {
         const std::int32_t packing = std::max(4, kv_shards);
         SchedulerConfig cfg{};
         cfg.role = role;
-        cfg.decode_allocation_policy =
-            role == Role::kP ? std::optional{SchedulerConfig::DecodeAllocationPolicy::kEarly} : std::nullopt;
+        if (role == Role::kP) {
+            cfg.decode_allocation_policy = independent ? SchedulerConfig::DecodeAllocationPolicy::kIndependent
+                                                       : SchedulerConfig::DecodeAllocationPolicy::kEarly;
+        }
         cfg.prefix_granularity = kP;
         cfg.device_allocator.total_pages = device_pages;
         cfg.host_allocator.total_pages = host_pages;
@@ -414,6 +447,9 @@ struct ClosedLoop {
             const std::int32_t token = ++next_token;
             results.With(forward::ExtendResult{.request_id = id, .tokens = {token}});
             const auto state = live.find(id);
+            if (state != live.end()) {
+                state->second.computed = true;
+            }
             if (role != Role::kFused || state == live.end() || state->second.finished) {
                 continue;  // a finished request's delayed row
             }
@@ -437,20 +473,36 @@ struct ClosedLoop {
     }
 
     // The transfer peer: bootstraps waiting prompts, and acknowledges (or
-    // fails) the hand-offs it was given.
+    // fails) the hand-offs it was given. Under independent admission it also
+    // fails a prompt without a destination now and then, as a bootstrap
+    // timeout does, and may still grant it after that.
     void Peer(const ExecutionPlan* plan) {
         ExecutionEvent events;
         bool any = false;
         if (plan != nullptr && plan->remote_decode.has_value()) {
             for (const std::string& id : plan->remote_decode->request_ids) {
-                live[id].transferring = true;
+                // Only a live prompt whose destination is allocated sends.
+                const auto state = live.find(id);
+                if (state == live.end() || !state->second.bootstrapped || state->second.finished) {
+                    throw std::logic_error("round " + std::to_string(round) + ": " + id +
+                                           " sent its KV without a destination");
+                }
+                state->second.transferring = true;
                 ++handoffs;
             }
         }
         for (auto& [id, state] : live) {
-            if (!state.bootstrapped && Uniform() < 0.7) {
+            const bool waiting = state.computed && !state.bootstrapped && !state.finished;
+            if (!state.bootstrapped && Uniform() < grant_probability) {
                 events.With(pd::BootstrappedEvent{id});
                 state.bootstrapped = true;
+                waiting_grants += waiting ? 1 : 0;
+                any = true;
+            } else if (independent && !state.bootstrapped && !state.finished && Uniform() < 0.01) {
+                events.With(pd::FailedEvent{id});
+                stopping.insert(id);
+                state.finished = true;
+                waiting_failures += waiting ? 1 : 0;
                 any = true;
             }
             if (state.transferring && Uniform() < 0.5) {
@@ -491,6 +543,32 @@ struct ClosedLoop {
             }
         }
         DrainKvEvents();
+        if (role == Role::kP) {
+            // A prompt without a destination, computed or between chunks,
+            // that no longer holds pages was requeued for granted work: its
+            // next chunk is a first chunk again.
+            for (auto& [id, state] : live) {
+                const bool computed = state.computed;
+                if (state.bootstrapped || state.finished || !(computed || prefilling.contains(id)) ||
+                    schedulers[0]->PdTransferPinned(id)) {
+                    continue;
+                }
+                state.computed = false;
+                prefilling.erase(id);
+                ++(computed ? computed_requeues : prefilling_requeues);
+            }
+            const auto waiting = static_cast<std::size_t>(std::ranges::count_if(live, [](const auto& entry) {
+                return entry.second.computed && !entry.second.bootstrapped && !entry.second.finished;
+            }));
+            for (const std::unique_ptr<Scheduler>& scheduler : schedulers) {
+                if (scheduler->AwaitingDestinationSize() != waiting) {
+                    throw std::logic_error("round " + std::to_string(round) + ": " +
+                                           std::to_string(scheduler->AwaitingDestinationSize()) +
+                                           " prompts wait for their destination, not " + std::to_string(waiting));
+                }
+            }
+            waiting_plans += waiting > 0 ? 1 : 0;
+        }
         std::vector<std::pair<std::uint32_t, Kind>> ops;
         bool restores = false;
         for (const Operation& operation : plan.Operations()) {
@@ -550,13 +628,21 @@ struct ClosedLoop {
                 // The prompts its chunk carried: first chunks admitted after
                 // it -- beside a resident's chunk, which otherwise admits
                 // nothing behind it, every one; beside a new prompt's, those
-                // submitted after it.
+                // submitted after it. Prompts whose destination is allocated
+                // run first, so only first chunks alike in that are counted.
                 const std::string& holder = batch->request_ids[*incomplete];
                 const bool resident = prefilling.contains(holder);
+                const auto granted = [this](const std::string& id) {
+                    const auto state = live.find(id);
+                    return state != live.end() && state->second.bootstrapped;
+                };
                 std::uint64_t carried = 0;
                 for (std::size_t i = 0; i < *incomplete; ++i) {
                     const std::string& id = batch->request_ids[i];
-                    carried += !prefilling.contains(id) && (resident || Serial(id) > Serial(holder)) ? 1 : 0;
+                    carried += !prefilling.contains(id) && granted(id) == granted(holder) &&
+                                       (resident || Serial(id) > Serial(holder))
+                                   ? 1
+                                   : 0;
                 }
                 if (carried > 0) {
                     if (knobs.yield_tokens == 0) {
@@ -724,6 +810,7 @@ struct ClosedLoop {
             if (!abortable.empty() &&
                 (Uniform() < 0.05 || (role == Role::kFused && aborts == 0 && round >= kRounds / 2))) {
                 const std::string id = abortable[static_cast<std::size_t>(Rand(0, static_cast<int>(abortable.size())))];
+                waiting_aborts += live[id].computed && !live[id].bootstrapped ? 1 : 0;
                 ExecutionEvent abort;
                 abort.With(forward::Abort{.request_id = id});
                 if (role == Role::kP) {
@@ -781,17 +868,27 @@ struct ClosedLoop {
 
 }  // namespace
 
-// 64 seeds, each of its own configuration, acknowledged op by op.
+// 64 seeds, each of its own configuration, acknowledged op by op. Under
+// independent admission prompts waited for their destinations, and waiting
+// ones were granted, failed, aborted and requeued for granted work, and so
+// were prompts between chunks.
 TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     // Per write policy and shard count: the eviction write-backs and the
     // prefix loads the runs made.
     std::map<std::pair<bool, std::int32_t>, std::pair<std::uint64_t, std::uint64_t>> exercised;
     std::uint64_t aborts = 0;
     std::uint64_t handoffs = 0;
+    std::uint64_t waiting_plans = 0;
+    std::uint64_t waiting_grants = 0;
+    std::uint64_t waiting_failures = 0;
+    std::uint64_t waiting_aborts = 0;
+    std::uint64_t computed_requeues = 0;
+    std::uint64_t prefilling_requeues = 0;
     for (unsigned seed = 0; seed < 64; ++seed) {
         ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/false, LoopKnobs{});
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
-                                          << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
+                                          << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards
+                                          << (loop.independent ? " independent" : " early"));
         try {
             loop.Run();
         } catch (const std::exception& error) {
@@ -807,6 +904,12 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
         loads += stats.prefix_loads.ops;
         aborts += loop.aborts;
         handoffs += loop.handoffs;
+        waiting_plans += loop.waiting_plans;
+        waiting_grants += loop.waiting_grants;
+        waiting_failures += loop.waiting_failures;
+        waiting_aborts += loop.waiting_aborts;
+        computed_requeues += loop.computed_requeues;
+        prefilling_requeues += loop.prefilling_requeues;
     }
     // Write-back evicted, wrote back and loaded back at every shard count.
     for (const std::int32_t shards : {1, 2, 4, 8}) {
@@ -816,6 +919,12 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     }
     EXPECT_GT(aborts, 0u);
     EXPECT_GT(handoffs, 0u);
+    EXPECT_GT(waiting_plans, 0u);
+    EXPECT_GT(waiting_grants, 0u);
+    EXPECT_GT(waiting_failures, 0u);
+    EXPECT_GT(waiting_aborts, 0u);
+    EXPECT_GT(computed_requeues, 0u);
+    EXPECT_GT(prefilling_requeues, 0u);
 }
 
 // 16 seeds, each driving two schedulers as the ranks of one replica. Seeds 16
@@ -827,7 +936,8 @@ TEST(ClosedLoopRandomTest, MirroredPrefillSchedulersPlanAlike) {
     for (unsigned seed = 16; seed < 32; ++seed) {
         ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/true, LoopKnobs{});
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
-                                          << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
+                                          << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards
+                                          << (loop.independent ? " independent" : " early"));
         try {
             loop.Run();
         } catch (const std::exception& error) {
@@ -862,7 +972,8 @@ TEST(ClosedLoopRandomTest, PrefillRoleDroppingShortPromptEndsNeverRaisesAndDrain
         ClosedLoop loop(seed, Role::kP, mirrored, LoopKnobs{.drop_short_prompt_ends = true});
         SCOPED_TRACE(::testing::Message()
                      << "seed " << seed << (loop.write_back ? " write-back" : " write-through") << " overlap "
-                     << loop.overlap_depth << " shards " << loop.kv_shards << (mirrored ? " mirrored" : ""));
+                     << loop.overlap_depth << " shards " << loop.kv_shards << (mirrored ? " mirrored" : "")
+                     << (loop.independent ? " independent" : " early"));
         try {
             loop.Run();
         } catch (const std::exception& error) {
@@ -974,9 +1085,9 @@ TEST(ClosedLoopRandomTest, DemotionChainsNeverRaiseAndDrain) {
                                           .continue_below = 0.8,
                                           .conversations = true,
                                           .device_pages_factor = 4});
-                SCOPED_TRACE(::testing::Message()
-                             << "seed " << seed << (role == Role::kP ? " P" : " fused")
-                             << (write_back ? " write-back" : " write-through") << " shards " << loop.kv_shards);
+                SCOPED_TRACE(::testing::Message() << "seed " << seed << (role == Role::kP ? " P" : " fused")
+                                                  << (write_back ? " write-back" : " write-through") << " shards "
+                                                  << loop.kv_shards << (loop.independent ? " independent" : ""));
                 try {
                     loop.Run();
                 } catch (const std::exception& error) {
@@ -1048,7 +1159,8 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
             ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/seed % 4 == 3, variant.knobs);
             SCOPED_TRACE(::testing::Message()
                          << variant.name << " seed " << seed << (loop.write_back ? " write-back" : " write-through")
-                         << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
+                         << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards
+                         << (loop.independent ? " independent" : " early"));
             try {
                 loop.Run();
             } catch (const std::exception& error) {

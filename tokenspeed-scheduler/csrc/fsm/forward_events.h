@@ -187,6 +187,34 @@ private:
     CacheCoordinator* coordinator_{};
 };
 
+// P role: a prompt whose Decode destination is not allocated yet gives its
+// pages and request-pool slot to granted work and waits in Submitted to be
+// computed again (Scheduler::buildPrefillWorkerPlan); the caller published
+// what it computed first, so its next admission resumes from the prefix
+// cache. Nothing is out against the pages: no forward (the caller checks)
+// and no PD transfer -- the peer has no destination to send them to, and
+// only a remote decode, which needs one, hands them over. A computed prompt
+// drops the token its final chunk sampled; the runtime keeps that token and
+// reports it again when the prompt completes again, so the drafter
+// candidates that came with it (Request::StoreSpecCandidates) still match
+// the token sent. The drafter KV sent with them is the recomputation's,
+// though: where its sample differed, the decode node's first drafts are
+// accepted less (verification is exact, so outputs do not change).
+struct RequeueEvent : InvalidTransitionHandler<RequeueEvent> {
+    using InvalidTransitionHandler<RequeueEvent>::operator();
+
+    explicit RequeueEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
+
+    Submitted operator()(Prefilling&& state);
+    Submitted operator()(PrefillAwaitingDestination&& state);
+
+private:
+    template <typename State>
+    Submitted requeue(State&& state);
+
+    CacheCoordinator* coordinator_{};
+};
+
 // Capacity retraction: the victim's Device pages are released -- and granted
 // away in this very round -- while its KV lives on in the image the caller
 // took first (Host L2 pins for the published pages, snapshot-pool blocks for
