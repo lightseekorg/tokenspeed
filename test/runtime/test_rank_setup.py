@@ -356,10 +356,9 @@ def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatc
     # Read as such a wheel would hold them: absent, or left at their default.
     assert not getattr(cfg, "demote_superseded_state_checkpoints", False)
     assert not getattr(cfg, "drop_short_prompt_end_checkpoints", False)
-    assert [w[1] for w in warnings] == [
-        "demote_superseded_state_checkpoints",
-        "drop_short_prompt_end_checkpoints",
-    ]
+    assert len(warnings) == 2
+    assert "SchedulerConfig.demote_superseded_state_checkpoints" in warnings[0][0]
+    assert "SchedulerConfig.drop_short_prompt_end_checkpoints" in warnings[1][0]
 
 
 @pytest.mark.parametrize(

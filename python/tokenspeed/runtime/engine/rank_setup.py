@@ -50,9 +50,8 @@ def _implied_scheduler_policy(on: bool, field: str) -> bool:
     """
     if on and not hasattr(SchedulerConfig(), field):
         logger.warning(
-            "the installed tokenspeed-scheduler has no SchedulerConfig.%s; "
-            "serving the in-forward State checkpoints without that policy",
-            field,
+            f"the installed tokenspeed-scheduler has no SchedulerConfig.{field}; "
+            "serving the in-forward State checkpoints without that policy"
         )
         return False
     return on
