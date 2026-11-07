@@ -42,8 +42,15 @@
 // after every plan no retraction image was refused once planned; and under
 // write-back, after every plan, the blocks evicted for the cache (by
 // admission, stranded suffix or restore) equal the sum of the drain's
-// outcomes. Once everything is acknowledged, no Host entry is pinned and
-// nothing is in flight.
+// outcomes, the dead and demoted entries it dropped included. Once
+// everything is acknowledged, no Host entry is pinned and nothing is in
+// flight.
+//
+// The demotion runs turn superseded checkpoint demotion on, with the
+// in-forward checkpoints it requires (so the dead prompt ends and finishes
+// they skip as well), and draw conversations: most prompts are the next turn
+// of a finished one, which renders its last tokens anew, so a turn resumes at
+// the in-forward checkpoint the turn before wrote and chains of them form.
 //
 // The random runs acknowledge op by op, out of order and now and then twice.
 // The mirrored runs drive two schedulers of one seed, as two ranks of a
@@ -61,6 +68,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -77,10 +85,34 @@ namespace {
 constexpr std::int32_t kP = 8;
 constexpr std::int32_t kRounds = 300;
 
+// What a run changes in its seed's draws. The defaults change nothing: every
+// draw is still made, so a seed keeps its random stream.
+struct LoopKnobs {
+    // SchedulerConfig::demote_superseded_state_checkpoints.
+    bool demote{false};
+    // Replace the drawn write policy (true: write-back) and in-forward
+    // checkpoints when set.
+    std::optional<bool> write_back;
+    std::optional<bool> in_forward;
+    // A prompt draw below repeat_below repeats a live prompt; then one below
+    // continue_below continues a finished one; any other draw is a system
+    // prompt with new user tokens.
+    double repeat_below{0.15};
+    double continue_below{0.45};
+    // A continued prompt is the next turn of a conversation: the finished
+    // prompt (without what it generated) with its last one to four tokens
+    // rendered anew, then new user tokens; no later prompt continues the same
+    // one.
+    bool conversations{false};
+    // Multiplies the drawn Device size.
+    std::int32_t device_pages_factor{1};
+};
+
 struct ClosedLoop {
     std::mt19937 rng;
     Role role;
     bool mirrored;
+    LoopKnobs knobs;
     bool write_back{false};
     std::int32_t overlap_depth{0};
     std::int32_t kv_shards{1};
@@ -131,9 +163,10 @@ struct ClosedLoop {
     int Rand(int lo, int hi_exclusive) { return std::uniform_int_distribution<int>(lo, hi_exclusive - 1)(rng); }
     double Uniform() { return std::uniform_real_distribution<double>(0.0, 1.0)(rng); }
 
-    ClosedLoop(unsigned seed, Role loop_role, bool mirrored_ranks)
-        : rng(seed), role(loop_role), mirrored(mirrored_ranks) {
-        write_back = Rand(0, 2) == 0;
+    ClosedLoop(unsigned seed, Role loop_role, bool mirrored_ranks, LoopKnobs loop_knobs)
+        : rng(seed), role(loop_role), mirrored(mirrored_ranks), knobs(loop_knobs) {
+        // value_or's argument is evaluated either way: the draw is made.
+        write_back = knobs.write_back.value_or(Rand(0, 2) == 0);
         if (role == Role::kFused) {
             overlap_depth = 1;
             mixed = Rand(0, 2) == 0;
@@ -144,10 +177,10 @@ struct ClosedLoop {
             overlap_depth = Rand(0, 2);
         }
         const std::int32_t history_block = Rand(0, 2) == 0 ? kP : kP / 2;
-        const bool in_forward = Rand(0, 2) == 0;
+        const bool in_forward = knobs.in_forward.value_or(Rand(0, 2) == 0);
         const std::int32_t host_pages = std::vector<std::int32_t>{9, 17, 33}[Rand(0, 3)];
         kv_shards = std::vector<std::int32_t>{1, 2, 4, 8}[Rand(0, 4)];
-        const std::int32_t device_pages = std::vector<std::int32_t>{24, 40, 64}[Rand(0, 3)];
+        const std::int32_t device_pages = std::vector<std::int32_t>{24, 40, 64}[Rand(0, 3)] * knobs.device_pages_factor;
         // A parent holds at least one history block per shard.
         const std::int32_t packing = std::max(4, kv_shards);
         SchedulerConfig cfg{};
@@ -164,6 +197,7 @@ struct ClosedLoop {
         cfg.overlap_schedule_depth = overlap_depth;
         cfg.enable_mixed_prefill_decode = mixed;
         cfg.state_checkpoint_in_forward = in_forward;
+        cfg.demote_superseded_state_checkpoints = knobs.demote;
         cfg.cache_groups.push_back(CacheGroupConfig{.group_id = "full_attention",
                                                     .block_granularity = history_block,
                                                     .total_pages = (device_pages - 1) * packing + 1,
@@ -232,13 +266,18 @@ struct ClosedLoop {
             }
             const double draw = Uniform();
             std::vector<std::int32_t> tokens;
-            if (draw < 0.15 && !live.empty()) {
+            if (draw < knobs.repeat_below && !live.empty()) {
                 auto it = live.begin();
                 std::advance(it, Rand(0, static_cast<int>(live.size())));
                 tokens = it->second.prompt;
-            } else if (draw < 0.45 && !done.empty()) {
-                tokens = done[static_cast<std::size_t>(Rand(0, static_cast<int>(done.size())))];
-                if (Uniform() < 0.5) {
+            } else if (draw < knobs.continue_below && !done.empty()) {
+                const auto continued = static_cast<std::size_t>(Rand(0, static_cast<int>(done.size())));
+                tokens = done[continued];
+                if (knobs.conversations) {
+                    done.erase(done.begin() + static_cast<std::ptrdiff_t>(continued));
+                    tokens.resize(tokens.size() - std::min(tokens.size(), static_cast<std::size_t>(Rand(1, 5))));
+                    tokens.insert(tokens.end(), user.begin(), user.end());
+                } else if (Uniform() < 0.5) {
                     tokens.insert(tokens.end(), user.begin(), user.end());
                 }
             } else {
@@ -401,12 +440,12 @@ struct ClosedLoop {
             // The blocks evicted for the cache (by admission, stranded suffix
             // or restore, including reusable released inputs) add up to the drain's outcomes: a Host entry
             // already, carried by a store in flight, without Host room,
-            // copied, or dropped as dead; recopied and cancelled blocks are
-            // among the copied ones. The counts are cumulative, so the first
-            // round they differ ends the run.
+            // copied, or dropped as dead or as demoted; recopied and
+            // cancelled blocks are among the copied ones. The counts are
+            // cumulative, so the first round they differ ends the run.
             const TierTransferManager::WriteBackStats& eviction = stats.eviction_stores;
-            std::uint64_t outcomes =
-                eviction.host_cached + eviction.in_flight + eviction.no_placement + stats.dead_entries_not_written_back;
+            std::uint64_t outcomes = eviction.host_cached + eviction.in_flight + eviction.no_placement +
+                                     stats.dead_entries_not_written_back + stats.demoted_entries_not_written_back;
             for (const std::uint64_t blocks : eviction.blocks) {
                 outcomes += blocks;
             }
@@ -479,9 +518,10 @@ struct ClosedLoop {
             if (schedulers[0]->RequestTokenSize(it->first) == -1 && (it->second.finished || !it->second.transferring)) {
                 if (it->second.finished) {
                     // With what the fused role generated: every landed token
-                    // but the last was consumed.
+                    // but the last was consumed. A conversation's next turn
+                    // renders the reply anew, so it keeps the prompt alone.
                     std::vector<std::int32_t> sequence = it->second.prompt;
-                    if (!it->second.out.empty()) {
+                    if (!it->second.out.empty() && !knobs.conversations) {
                         sequence.insert(sequence.end(), it->second.out.begin(), it->second.out.end() - 1);
                     }
                     if (done.size() < 20) {
@@ -582,7 +622,7 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     std::uint64_t aborts = 0;
     std::uint64_t handoffs = 0;
     for (unsigned seed = 0; seed < 64; ++seed) {
-        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/false);
+        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/false, LoopKnobs{});
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
                                           << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
         try {
@@ -618,7 +658,7 @@ TEST(ClosedLoopRandomTest, MirroredPrefillSchedulersPlanAlike) {
     // prefix loads the runs made.
     std::map<std::pair<bool, std::int32_t>, std::pair<std::uint64_t, std::uint64_t>> exercised;
     for (unsigned seed = 16; seed < 32; ++seed) {
-        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/true);
+        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/true, LoopKnobs{});
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
                                           << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
         try {
@@ -655,7 +695,7 @@ TEST(ClosedLoopRandomTest, FusedRoleNeverRaisesAndDrains) {
     std::uint64_t decode_only_write_backs = 0;
     std::uint64_t aborts = 0;
     for (unsigned seed = 0; seed < 64; ++seed) {
-        ClosedLoop loop(seed, Role::kFused, /*mirrored_ranks=*/false);
+        ClosedLoop loop(seed, Role::kFused, /*mirrored_ranks=*/false, LoopKnobs{});
         SCOPED_TRACE(::testing::Message()
                      << "seed " << seed << (loop.write_back ? " write-back" : " write-through") << " mixed "
                      << loop.mixed << " capacity retraction " << loop.capacity_retraction << " knob "
@@ -696,7 +736,7 @@ TEST(ClosedLoopRandomTest, MirroredFusedSchedulersPlanAlike) {
     std::uint64_t write_backs = 0;
     std::uint64_t restores = 0;
     for (unsigned seed = 64; seed < 80; ++seed) {
-        ClosedLoop loop(seed, Role::kFused, /*mirrored_ranks=*/true);
+        ClosedLoop loop(seed, Role::kFused, /*mirrored_ranks=*/true, LoopKnobs{});
         SCOPED_TRACE(::testing::Message()
                      << "seed " << seed << (loop.write_back ? " write-back" : " write-through") << " mixed "
                      << loop.mixed << " capacity retraction " << loop.capacity_retraction << " knob "
@@ -717,6 +757,62 @@ TEST(ClosedLoopRandomTest, MirroredFusedSchedulersPlanAlike) {
     }
     EXPECT_GT(write_backs, 0u);
     EXPECT_GT(restores, 0u);
+}
+
+// Superseded checkpoint demotion on conversations: 16 seeds per role and
+// write policy, every fourth with mirrored ranks, with in-forward checkpoints
+// and a Device four times the drawn size, so a conversation's checkpoints
+// often outlive its next two turns; three prompts in four are a finished
+// prompt's next turn. Under write-back the demoted entries an eviction drops
+// count among the drain's outcomes.
+TEST(ClosedLoopRandomTest, DemotionChainsNeverRaiseAndDrain) {
+    // Per role and write policy: the entries demoted, and those an eviction
+    // dropped instead of writing them back.
+    std::map<std::pair<Role, bool>, std::pair<std::uint64_t, std::uint64_t>> demoted;
+    for (const Role role : {Role::kP, Role::kFused}) {
+        for (const bool write_back : {false, true}) {
+            for (unsigned seed = 0; seed < 16; ++seed) {
+                ClosedLoop loop(seed, role, /*mirrored_ranks=*/seed % 4 == 3,
+                                LoopKnobs{.demote = true,
+                                          .write_back = write_back,
+                                          .in_forward = true,
+                                          .repeat_below = 0.05,
+                                          .continue_below = 0.8,
+                                          .conversations = true,
+                                          .device_pages_factor = 4});
+                SCOPED_TRACE(::testing::Message()
+                             << "seed " << seed << (role == Role::kP ? " P" : " fused")
+                             << (write_back ? " write-back" : " write-through") << " shards " << loop.kv_shards);
+                try {
+                    loop.Run();
+                } catch (const std::exception& error) {
+                    ADD_FAILURE() << "raised: " << error.what();
+                    continue;
+                }
+                for (const std::unique_ptr<Scheduler>& scheduler : loop.schedulers) {
+                    EXPECT_EQ(scheduler->HostPoolPinnedBlocks(), 0);
+                    EXPECT_TRUE(scheduler->CanClearCache());
+                }
+                const Scheduler& scheduler = *loop.schedulers[0];
+                auto& [entries, dropped] = demoted[{role, write_back}];
+                entries += scheduler.DemotedCheckpointEntries();
+                dropped += scheduler.GetHostCacheStats().demoted_entries_not_written_back;
+            }
+        }
+    }
+    for (const Role role : {Role::kP, Role::kFused}) {
+        for (const bool write_back : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << (role == Role::kP ? "P" : "fused") << (write_back ? " write-back" : " write-through"));
+            const auto& [entries, dropped] = demoted[{role, write_back}];
+            EXPECT_GT(entries, 0u) << "the runs formed demotion chains";
+            if (write_back) {
+                EXPECT_GT(dropped, 0u) << "and evicted demoted entries";
+            } else {
+                EXPECT_EQ(dropped, 0u);
+            }
+        }
+    }
 }
 
 }  // namespace tokenspeed::test
