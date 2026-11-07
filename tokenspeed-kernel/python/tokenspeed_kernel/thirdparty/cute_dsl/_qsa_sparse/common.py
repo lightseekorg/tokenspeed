@@ -58,9 +58,9 @@ _SMALL_NUM_SPLITS = 8
 _WIDE_NUM_SPLITS = 16
 _LARGE_NUM_SPLITS = 4
 # 128-slot tiles in the 2048-entry ordered prefix, and the measured fixed
-# prologue/epilogue cost of one FP8 CTA in the same units.
+# prologue/epilogue cost of one FP8 query row in the same units.
 _PREFIX_TILES = 16
-_FP8_FIXED_TILES = 3
+_FP8_FIXED_TILES = 6
 log2_e = math.log2(math.e)
 fadd2 = cute.arch.add_packed_f32x2
 fmul2 = cute.arch.mul_packed_f32x2
@@ -137,9 +137,10 @@ def _fp8_launch_config(
 ) -> tuple[int, int]:
     """Return FP8 query rows/CTA and KV splits with the shortest critical path.
 
-    An FP8 CTA gathers and converts rows/CTA * 16 / splits ordered-prefix
-    tiles of 128 slots, plus a fixed prologue/epilogue worth about three tiles
-    (SM103 measurements). One CTA is resident per SM, so a launch costs its
+    An FP8 CTA gathers and converts 16 / splits ordered-prefix tiles of 128
+    slots per query row, plus a fixed per-row prologue/epilogue worth about
+    six tiles (SM103 measurements with the staged-id gather ring); serial
+    query rows repeat both. One CTA is resident per SM, so a launch costs its
     wave count times that per-CTA work. Ties keep the earlier candidate.
     """
     best, best_cost = (1, 1), None
@@ -147,7 +148,7 @@ def _fp8_launch_config(
         row_groups = (num_rows + rows_per_cta - 1) // rows_per_cta
         ctas = row_groups * head_tiles_per_row * splits
         waves = (ctas + sm_count - 1) // sm_count
-        cost = waves * (_PREFIX_TILES * rows_per_cta // splits + _FP8_FIXED_TILES)
+        cost = waves * rows_per_cta * (_PREFIX_TILES // splits + _FP8_FIXED_TILES)
         if best_cost is None or cost < best_cost:
             best, best_cost = (rows_per_cta, splits), cost
     return best
