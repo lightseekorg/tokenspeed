@@ -823,53 +823,74 @@ def dsa_decode_dcp_records(
     slot_order: str,
     workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sparse DSA decode of KVP-gathered query heads, written as DCP records.
-
-    :func:`dsa_prefill_dcp_records` for decode: the query read rank-major as
-    an all-gather lands it, the partials written as the records the
-    exchange sends, so neither a relayout before the core nor a repack after
-    it runs.
+    """Sparse DSA decode of KVP-gathered query heads, written as DCP records:
+    :func:`dsa_prefill_dcp_records` for decode.
 
     Args:
-        q: Absorbed MLA query ``[ranks, tokens, local_heads, R + D_rope]``:
-            rank ``r``'s TP heads at ``q[r]`` (``gather_query_heads_rank_major``),
-            BF16 or FP8. Each rank's rows are read in place when contiguous,
-            however far apart the ranks lie, as a query gathered inside a
-            larger chunk.
-        kv_cache: Dense compressed MLA KV cache, flat ``[slots, dim]`` or
-            paged; this rank's pages.
-        topk_slots: Local KV slots ``[tokens, topk]``, ``-1`` where invalid.
-        topk_lens: Live selected-slot count per token (int32 ``[tokens]``).
-        qk_nope_head_dim: Original non-RoPE q/k dimension.
-        kv_lora_rank: MLA latent rank and output head dimension.
-        qk_rope_head_dim: RoPE q/k dimension.
-        softmax_scale: Scale applied to attention logits.
-        page_size: KV cache page size.
+        q: As for :func:`dsa_prefill_dcp_records`; each rank's rows are read
+            in place when contiguous, however far apart the ranks lie, as a
+            query gathered inside a larger chunk.
         q_len_per_req: Query rows per request.
-        logit_cap: Optional logit cap (no leaf supports one).
-        k_scale: KV scale multiplier for FP8 caches.
-        solution: Optional kernel solution to force through normal selection.
-        slot_order: As for :func:`dsa_decode`. Required keyword.
         workspace: Optional flat contiguous int32 storage of at least
             :func:`dsa_decode_dcp_records_workspace_bytes` bytes for the key
             splits, such as a buffer the records' exchange reads in place.
+        Others: As for :func:`dsa_prefill_dcp_records`; ``slot_order`` as
+            for :func:`dsa_decode`.
 
     Returns:
-        Contiguous int32 ``[ranks, tokens, local_heads, kv_lora_rank / 2 + 1]``:
-        the records ``dispatch_dcp_attention_partials(out, lse,
-        degree=ranks)`` packs from ``dsa_decode(..., return_lse=True)`` on the
-        token-major gather (head ``r * local_heads + h``), leading
-        ``workspace`` when given. A row splits its keys by its own live
-        length and the launch's size, so a short one, as one near its rank's
-        share of the selection, may split less than that decode and round
-        differently; a row long enough for all its splits matches it bit for
-        bit. Raises
-        ``ValueError`` for a size :func:`dsa_decode_dcp_records_supported`
-        refuses.
+        The records ``dispatch_dcp_attention_partials`` packs from
+        ``dsa_decode(..., return_lse=True)`` on the token-major gather,
+        leading ``workspace`` when given. A row splits its keys by its own
+        live length and the launch's size, so a short one, as one near its
+        rank's share of the selection, may split less than that decode and
+        round differently; a row long enough for all its splits matches it
+        bit for bit. Raises ``ValueError`` for a size
+        :func:`dsa_decode_dcp_records_supported` refuses.
     """
+    return _dsa_dcp_records(
+        "dsa_decode_dcp_records",
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=page_size,
+        logit_cap=logit_cap,
+        k_scale=k_scale,
+        solution=solution,
+        slot_order=slot_order,
+        traits={"q_len": int(q_len_per_req)},
+        launch={"workspace": workspace},
+    )
+
+
+def _dsa_dcp_records(
+    op: str,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    *,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    logit_cap: float,
+    k_scale: float,
+    solution: str | None,
+    slot_order: str,
+    traits: dict,
+    launch: dict,
+) -> torch.Tensor:
+    """The DCP records facades' selection and launch of ``op``, with its own
+    ``traits`` and leaf arguments (``launch``)."""
     if q.dim() != 4:
         raise ValueError(
-            "dsa_decode_dcp_records takes a rank-major query "
+            f"{op} takes a rank-major query "
             f"[ranks, tokens, local_heads, head_dim], got {tuple(q.shape)}"
         )
     degree, tokens, local_heads, head_dim = q.shape
@@ -884,7 +905,7 @@ def dsa_decode_dcp_records(
             f"{tokens} query rows"
         )
     traits = {
-        "q_len": int(q_len_per_req),
+        **traits,
         "qk_nope_head_dim": int(qk_nope_head_dim),
         "kv_lora_rank": int(kv_lora_rank),
         "qk_rope_head_dim": int(qk_rope_head_dim),
@@ -896,7 +917,7 @@ def dsa_decode_dcp_records(
     }
     kernel = select_kernel(
         "attention",
-        "dsa_decode_dcp_records",
+        op,
         _attention_format_signature(q=q),
         traits=traits,
         solution=solution,
@@ -910,12 +931,10 @@ def dsa_decode_dcp_records(
         "topk": topk_slots.shape[-1],
         "page_size": int(page_size),
     }
-    ShapeCapture.get().record(
-        "attention", "dsa_decode_dcp_records", kernel.name, q.dtype, shape_params
-    )
+    ShapeCapture.get().record("attention", op, kernel.name, q.dtype, shape_params)
     with kernel_scope(
         "attention",
-        "dsa_decode_dcp_records",
+        op,
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -932,7 +951,7 @@ def dsa_decode_dcp_records(
             page_size=page_size,
             logit_cap=logit_cap,
             k_scale=k_scale,
-            workspace=workspace,
+            **launch,
             **slot_order_kwargs,
         )
 
@@ -1018,72 +1037,24 @@ def dsa_prefill_dcp_records(
         output with ``-inf`` LSE. Raises ``ValueError`` for a size
         :func:`dsa_prefill_dcp_records_supported` refuses.
     """
-    if q.dim() != 4:
-        raise ValueError(
-            "dsa_prefill_dcp_records takes a rank-major query "
-            f"[ranks, tokens, local_heads, head_dim], got {tuple(q.shape)}"
-        )
-    degree, tokens, local_heads, head_dim = q.shape
-    if topk_slots.dim() != 2 or topk_slots.shape[0] != tokens:
-        raise ValueError(
-            f"DSA records selection {tuple(topk_slots.shape)} does not match "
-            f"{tokens} query rows"
-        )
-    if topk_lens.shape != (tokens,):
-        raise ValueError(
-            f"DSA records lengths {tuple(topk_lens.shape)} do not match "
-            f"{tokens} query rows"
-        )
-    traits = {
-        "qk_nope_head_dim": int(qk_nope_head_dim),
-        "kv_lora_rank": int(kv_lora_rank),
-        "qk_rope_head_dim": int(qk_rope_head_dim),
-        "page_size": int(page_size),
-        "topk": int(topk_slots.shape[-1]),
-        "logit_cap": logit_cap != 0.0,
-        "topk_layout": "global_slots",
-        "slot_order": slot_order,
-    }
-    kernel = select_kernel(
-        "attention",
+    return _dsa_dcp_records(
         "dsa_prefill_dcp_records",
-        _attention_format_signature(q=q),
-        traits=traits,
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=page_size,
+        logit_cap=logit_cap,
+        k_scale=k_scale,
         solution=solution,
+        slot_order=slot_order,
+        traits={},
+        launch={},
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
-    shape_params = {
-        "degree": degree,
-        "tokens": tokens,
-        "local_heads": local_heads,
-        "head_dim": head_dim,
-        "topk": topk_slots.shape[-1],
-        "page_size": int(page_size),
-    }
-    ShapeCapture.get().record(
-        "attention", "dsa_prefill_dcp_records", kernel.name, q.dtype, shape_params
-    )
-    with kernel_scope(
-        "attention",
-        "dsa_prefill_dcp_records",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            kv_cache=kv_cache,
-            topk_slots=topk_slots,
-            topk_lens=topk_lens,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            page_size=page_size,
-            logit_cap=logit_cap,
-            k_scale=k_scale,
-            **slot_order_kwargs,
-        )
 
 
 @dataclass(frozen=True)

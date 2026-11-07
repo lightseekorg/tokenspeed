@@ -488,12 +488,6 @@ def gather_index_candidates(
             (*offsets.shape, 2), device=offsets.device, dtype=torch.int32
         )
     else:
-        if (
-            scores_out.shape != offsets.shape
-            or scores_out.dtype != torch.float32
-            or scores_out.stride(1) != 1
-        ):
-            raise ValueError("candidate scores need an FP32 [rows, topk] output")
         records = torch.empty(offsets.shape, device=offsets.device, dtype=torch.int32)
     _gather_candidates[(offsets.shape[0], triton.cdiv(offsets.shape[1], 256))](
         offsets,
