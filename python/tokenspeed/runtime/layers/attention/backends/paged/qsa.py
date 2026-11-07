@@ -42,6 +42,12 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
+from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+    QSABf16PrefillScratch,
+    QSABf16ScratchPlan,
+    QSAExtendLengths,
+    extend_lengths,
+)
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
     QSALayout,
     QSASelection,
@@ -52,6 +58,7 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -75,14 +82,101 @@ class QSAAttnBackend(MHAAttnBackend):
         )
         self._metadata_capacity_rows = 0
         self._qsa_workspace = QSAWorkspace()
+        # The target's BF16 copy of large FP8 prefill calls, allocated from
+        # the plan the cache recipe reserved (preallocate_bf16_scratch).
+        self._bf16_scratch: QSABf16PrefillScratch | None = None
+        # Host lengths of the current forward while the scratch is in use.
+        self._extend_lengths: QSAExtendLengths | None = None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._qsa_workspace.clear()
+        self._extend_lengths = None
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
         self._metadata_capacity_rows = max_bs * self.spec_num_tokens
+
+    def preallocate_bf16_scratch(self, plan: QSABf16ScratchPlan) -> int:
+        """Allocate the BF16 prefill scratch the cache recipe reserved.
+
+        Every attention-component build hands the same plan to the same leaf,
+        which allocates it once.
+
+        Args:
+            plan: The recipe's ``qsa_bf16_scratch_plan``.
+
+        Returns:
+            The bytes allocated, which the caller checks against the plan.
+        """
+        if self.is_draft:
+            raise RuntimeError("the QSA BF16 prefill scratch serves the target only")
+        if self.kv_cache_dtype is not torch.float8_e4m3fn or self.is_mxfp8:
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch needs an FP8 E4M3 KV cache"
+            )
+        planned = (plan.page_size, plan.kv_heads, plan.head_dim, plan.q_heads)
+        served = (
+            self.kernel_page_size,
+            self.tp_kv_head_num,
+            self.head_dim,
+            self.tp_q_head_num,
+        )
+        if planned != served:
+            raise RuntimeError(
+                f"QSA BF16 scratch plan (page, KV heads, head dim, query heads) "
+                f"{planned} does not match the attention leaf's {served}"
+            )
+        if self._bf16_scratch is None:
+            self._bf16_scratch = QSABf16PrefillScratch(plan, device=self.device)
+        elif self._bf16_scratch.plan != plan:
+            raise RuntimeError("the QSA BF16 prefill scratch was planned differently")
+        return self._bf16_scratch.nbytes
+
+    def init_forward_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
+        **kwargs,
+    ) -> None:
+        super().init_forward_metadata(
+            bs,
+            num_extends,
+            seq_lens,
+            page_table,
+            forward_mode,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_with_prefix=extend_with_prefix,
+            query_shard=query_shard,
+            page_table_cpu=page_table_cpu,
+            **kwargs,
+        )
+        # The scratch sizes a call from host mirrors, never a device read.
+        self._extend_lengths = (
+            extend_lengths(
+                bs,
+                num_extends,
+                forward_mode.is_extend(),
+                extend_prefix_lens_cpu,
+                extend_seq_lens_cpu,
+            )
+            if self._bf16_scratch is not None
+            else None
+        )
 
     def tree_support(self) -> TreeSupport:
         # The sparse layers do not read the tree mask; keep the base blockers
@@ -133,6 +227,25 @@ class QSAAttnBackend(MHAAttnBackend):
                 layout = ctx.attn_backend.sparse_topk.qsa_metadata
                 if not isinstance(layout, QSALayout):
                     raise RuntimeError("QSA selection requires the current row layout")
+                if (
+                    self._bf16_scratch is not None
+                    and max_seqlen_q is None
+                    and ctx.draft_narrowing is None
+                ):
+                    # A large target extend attends a BF16 copy of its pages;
+                    # None keeps the FP8 path below.
+                    output = self._bf16_scratch.attention(
+                        q,
+                        k_cache,
+                        v_cache,
+                        topk_indices,
+                        page_table=layout.full_page_table,
+                        seq_lens=layout.seq_lens,
+                        lengths=self._extend_lengths,
+                        scale=layer.scaling,
+                    )
+                    if output is not None:
+                        return output.reshape(rows, -1)
                 if max_seqlen_q is None:
                     metadata = self.forward_extend_metadata
                     if metadata is None:

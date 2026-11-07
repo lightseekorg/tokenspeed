@@ -63,6 +63,9 @@ if TYPE_CHECKING:
         CacheModelFamily,
         CacheSetup,
     )
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
+    )
 
 
 class CacheRecipe(ABC):
@@ -582,6 +585,21 @@ class CacheRecipe(ABC):
     def workspace_bytes(self) -> int:
         """Cache-adjacent fixed allocation this family also needs."""
         return 0
+
+    @cached_property
+    def qsa_bf16_scratch_plan(self) -> QSABf16ScratchPlan | None:
+        """The QSA BF16 prefill scratch this engine reserves, or None.
+
+        ``--enable-qsa-prefill-bf16-scratch`` serves families with QSA
+        sparse-attention layers, which override this seam and count the plan
+        in ``workspace_bytes``; every other family refuses the flag.
+        """
+        if self.server_args.enable_qsa_prefill_bf16_scratch:
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch serves QSA sparse-attention "
+                f"models; this model's cache family is {self.family!r}"
+            )
+        return None
 
     def verify_scratch_in_pool(self) -> bool:
         """Whether speculative verify stages its scratch in the bound pool.
