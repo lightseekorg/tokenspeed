@@ -88,9 +88,11 @@ public:
     // on the D role: at most one remote admission per round, beside the
     // decode batch and a restore (see buildDecodeWorkerPlan).
     //
-    // P role: completed prefills whose final chunk's result has landed; each
-    // one's decode happens on the peer node, so its KV goes out. Rows are
-    // self-contained (bootstrap token + drafter candidates).
+    // P role: completed prefills whose final chunk's result has landed and
+    // whose Decode destination is allocated (under independent decode
+    // allocation a computed prompt may wait for it); each one's decode
+    // happens on the peer node, so its KV goes out. Rows are self-contained
+    // (bootstrap token + drafter candidates).
     std::optional<ForwardBatch> remote_decode;
     // D role: admitted prompts whose prefill runs on the peer node; the
     // receive pulls their KV into the freshly admitted (and sanitized)

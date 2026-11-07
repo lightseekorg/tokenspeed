@@ -205,7 +205,9 @@ prefill that is still incomplete. Nothing behind it is scheduled that round
 (on the P role, `prefill_chunk_yield_tokens` lets whole prompts complete
 beside it; see the end of this section). A resident chunk that fails
 admission ends the prefill phases too: admitting anything behind it would
-strand it.
+strand it. (On the P role under `independent` decode allocation, granted work
+blocked behind a head of line without a destination requeues it once its
+forward landed instead, §3.1.)
 
 The reason is that per-chunk admission gives an in-progress prefill **no claim
 on the capacity it still needs**. Let a newcomer take pages while a prompt is
@@ -1181,7 +1183,9 @@ by the ordinary phases.
 
 The P role never retracts: `buildPrefillWorkerPlan` does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
-grammars). See §3.1 for why.
+grammars). See §3.1 for why. Under `independent` decode allocation it
+requeues prompts without a destination instead (§3.1): no image is taken, and
+they compute again from what the prefix cache kept.
 
 ## 3. Per role: explicit phases
 
@@ -1211,7 +1215,8 @@ outcomes but never compose the batch.
 **Phases:** completed prompts out on `plan.remote_decode` (their pages stay
 pinned until the transfer finishes, so releasing them outranks feeding more
 prompt work), then the shared local-prefill phases
-(`scheduleLocalPrefillWork`): resident chunks, then new prompts. With
+(`scheduleLocalPrefillWork`): resident chunks, then new prompts — those whose
+destination is allocated ahead of the rest (below, "Requeue"). With
 `prefill_chunk_yield_tokens`, a chunk that cannot finish gives way to the
 whole prompts waiting behind it, which complete in its forward, ahead of its
 row (§1.1). Each carried prompt's pages are then pinned until its own
@@ -1252,9 +1257,93 @@ tiers together hold distinct content up to about the sum of their capacities,
 less pinned and in-flight blocks, where write-through keeps on the Host a copy
 of what the Device holds.
 
-**Retraction: none.** A P node's pressure valve is the transfer itself — pages
-are pinned until the peer acknowledges, then released wholesale. Retracting a
-prompt whose KV is mid-transfer would strand the decode side.
+**Decode allocation** (`SchedulerConfig::decode_allocation_policy`, read only
+by `SubmitRequests`). The policy is this role's alone: under either one the D
+role allocates a request's destination once the request arrives there and its
+admission fits it. The transfer peer reports `pd::BootstrappedEvent` once
+every Decode rank allocated the request's destination, so on this role the
+event means *destination ready* (`Request::MarkDestinationReady`), whatever
+state the request is in. Under `early` a request starts in `Bootstrapping`
+and the event admits it, as on the D role. Under `independent` it starts in
+`Submitted` and computes at once, and the event only marks it: a prompt whose
+final result lands first waits in `PrefillAwaitingDestination`, with its
+pages and request-pool slot, until the event moves it to `PrefillDone`, whose
+remote decode sends the KV. A cancellation, a failed room or the bootstrap
+timeout fails the transfer, and the failure (`pd::FailedEvent`) ends the
+waiting prompt: it parks in `PdTransferring`, as every pinned request does,
+until the transfer stopped (`pd::TransferStoppedEvent`). The prompts waiting
+are bounded by the request pool's slots (`max_batch_size`) as well as by the
+pages they hold.
+`independent` requires `--disaggregation-layerwise-interval 0` (no KV streams
+during the forward), attention TP 1, KVP 1, PP 1, no external encoder and a
+model without multimodal input: the multimodal embedder releases a computed
+prompt's encoder inputs, which a requeued prompt (below) would need again.
+
+**Retraction: none.** Under `early` every admitted prompt has its
+destination, so a P node's pressure valve is the transfer itself — pages are
+pinned until the peer acknowledges, then released wholesale. Retracting a
+prompt whose KV is mid-transfer would strand the decode side. Under
+`independent` a requeue (below) frees what prompts without a destination
+hold.
+
+**Requeue: granted work first.** Under `independent` decode allocation a
+prompt computes before its destination is allocated and, once computed, waits
+for it with its pages (`PrefillAwaitingDestination`). The transfer no longer
+drains every holder: a prompt without a destination keeps pages and a
+request-pool slot until the Decode node allocates it one, and that node may
+meanwhile hold destination pages for prompts this node has not computed —
+each side waiting on the other. So the phases put granted work first
+(`buildPrefillWorkerPlan`): after the remote decodes, the head of line's chunk
+(at most one prefill is ever incomplete, §1.1), then the prompts whose
+destination is allocated, then the rest; under `early` every candidate has
+one and the order is the FIFO. While a granted admission is blocked — for
+capacity, behind a head of line without a destination whose chunk failed, or
+for a request-pool slot, which an admission does not report as a capacity
+failure — no prompt without a destination is admitted, and in a round in
+which no prefill progressed, holders without a destination are **requeued**
+(`fsm::RequeueEvent`) until the blocked admission fits: the head of line
+first, once its forward landed, then computed prompts waiting for their
+destination, newest first. For that round to come, while a computed prompt
+waits for its destination, the prompts behind a granted one that failed for
+capacity wait too, granted or not (`scheduleLocalPrefillWork`,
+`blocked_prompt_seals`): smaller prompts that kept fitting would keep every
+round in progress, and the blocked prompt would wait for the destination of
+a prompt holding its pages, which the Decode node may not allocate before the
+blocked prompt's KV frees its own. A requeue publishes what the prompt
+computed, as a retraction does (`publishCompletedPrefix`, §2), releases its
+pages and slot, drops the token its final chunk sampled and returns it to
+`Submitted`. Its room stays registered and its client sees nothing: it is
+computed again, resuming from what the prefix cache kept, once granted work
+no longer blocks or its destination is allocated, and the runtime reports the
+first token it sampled again (`OutputProcessor::commit`), which the remote
+decode carries.
+
+Why this is live: a page holder is either granted — computed ahead of all
+work without a destination, so its transfer starts and its ACK frees its
+pages — or without a destination and idle, which granted work that needs its
+pages or slot requeues, or without a destination and busy, whose forward
+lands within the in-flight depth while the sealed rounds keep it idle. While
+a granted admission is blocked, a head of line without a destination holds
+the line or stops the phases, a prompt whose final forward is out is
+computed within the in-flight depth, and while a computed one waits for its
+destination nothing behind the blocked admission is admitted. The only
+prefill progress left is that head of line's chunks (at most the rest of its
+prompt) and granted prompts ahead of the blocked one in the FIFO, which
+arrived before it; so a round without progress comes, and its requeues free
+the holders without a destination until the blocked admission fits or none
+is left. From then on it waits only for granted holders, as every admission
+does under `early`. A granted admission therefore never waits for a
+destination, every allocation the Decode node makes is served, and the wait
+is not circular. A holder that ends — an abort, a failed transfer — parks in
+`PdTransferring` (below) and is no holder any more: it is not requeued, and
+its pages return once the transport, which the event loop stops at an abort,
+reports the transfer stopped. A requeued prompt had no transfer to strand:
+the peer sends a room's KV only for a remote decode, which only `PrefillDone`
+emits, and on this role that state needs the destination (`independent`
+requires `--disaggregation-layerwise-interval 0`, so nothing streams
+earlier). The cost is recomputation, bounded by what the prefix cache lost,
+each time granted work blocks, and while a requeue is due the prompts behind
+the blocked one wait for it.
 
 While P holds a request, prefix publication uses a copy of its block table.
 Deduplication may redirect that copy to canonical cache blocks, but the real
@@ -1274,11 +1363,15 @@ then copy any tail block the index took into its pre-reserved private block.
 
 The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
-pinned — the peer's decode reads the pages from the first scheduled chunk until
-the PD ACK finishes the request. On the D role the pin is `RemotePrefilling`:
-the peer's prefill is writing the destination pages, and `RemotePrefillDone`
-ends it by leaving that state. A fused engine never transfers. Because the pin
-is the state, no event handler can forget to clear it.
+pinned until the PD ACK finishes the request: under `early` the peer's decode
+may read the pages from the first scheduled chunk (layerwise streaming), under
+`independent` only from the remote decode on. A prompt whose destination is
+not allocated yet is pinned as well, though no transfer can read its pages,
+which is why a requeue may release them. On the D role the pin is
+`RemotePrefilling`: the peer's prefill is writing the destination pages, and
+`RemotePrefillDone` ends it by leaving that state. A fused engine never
+transfers. Because the pin is the state, no event handler can forget to clear
+it.
 
 A transfer reads and writes pages through the page IDs its operations
 exported, so while the pin holds, a pinned table loses no block a transfer may
@@ -1671,7 +1764,13 @@ snapshot-pool leg (always, with `--disable-kvstore`) is indexed nowhere and
 visible through no pin, hence the explicit count. A flush is likewise refused
 while any image copy is in flight (`HasAnyInFlight` includes the snapshot
 ops). The pause drain counts suspended requests as waiting, so a correct
-runtime never hits either refusal; they are defense in depth.
+runtime never hits either refusal; they are defense in depth. On the P role
+under `independent` decode allocation every flush also refuses while a prompt
+requeued after its final chunk sampled the first token waits to be computed
+again (`Request::RequeuedAfterSampling`, §3.1): it holds no pages, but the
+runtime sends that token, sampled under the weights a flush would replace,
+with the KV of its next computation. That computation's token, or the
+request's end, lifts the refusal.
 `SnapshotPoolFreeBlocks()` and `HostPoolPinnedBlocks()` are the leak checks:
 with no request suspended both must read empty and zero.
 
@@ -1732,7 +1831,9 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   role, whole prompts may complete in its forward, ahead of its row, within
   the tokens its chunk gave up. The incomplete prefill is still admitted
   first, and a resident chunk that fails admission still stops everything
-  behind it.
+  behind it — unless, on the P role under `independent` decode allocation, it
+  has no destination and granted work waits behind it: then it is requeued
+  once its forward landed (§3.1).
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
   no PD transfer against its pages (§3.1) — and, in both tiers, is chosen only
@@ -1745,6 +1846,14 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   `onImageDoesNotFit` and nowhere else; the debug knob aborts only a victim
   whose image is refused after its publication, and leaves one its probe
   refuses running with nothing published.
+- A P requeue (§3.1) fires only under `independent` decode allocation, in a
+  round in which no prefill progressed, for a granted admission that is
+  blocked. Its victim has no destination and no forward in flight, so no
+  transfer reads its pages (an ended prompt is in `PdTransferring`, never a
+  victim); it publishes what it computed and returns to `Submitted` with its
+  room still registered. While
+  a computed prompt waits for its destination, no prompt behind a granted
+  one that failed for capacity is admitted, so such a round comes.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant, except that the
   empty-round retraction offers it to the round's decodes first (2); the
