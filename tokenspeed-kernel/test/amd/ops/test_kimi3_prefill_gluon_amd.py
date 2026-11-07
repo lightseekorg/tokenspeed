@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
@@ -42,8 +44,11 @@ from tokenspeed_kernel.ops.residual import (  # noqa: E402
 
 if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
-        attn_res_rmsnorm_gfx950 as attn_res_rmsnorm_amd,
+        attn_res_rmsnorm_gfx950,
     )
+
+    # Launched as serving does outside startup.
+    attn_res_rmsnorm_amd = functools.partial(attn_res_rmsnorm_gfx950, warmup=False)
 else:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.attn_res import (  # noqa: E402
         attn_res_rmsnorm_gfx1250 as attn_res_rmsnorm_amd,
@@ -107,7 +112,6 @@ def test_attn_res_full_history_score_ranges(tokens: int, score_scale: float) -> 
         output_rms_weight=output_weight,
         output_eps=2e-6,
         num_valid_blocks=valid_blocks,
-        warmup=False,
     )
     expected = _attn_res_reference(
         layer,
@@ -230,7 +234,6 @@ def test_attn_res_amd_entrypoint_accepts_legacy_keywords() -> None:
         output_rms_weight=output_weight,
         output_eps=output_eps,
         num_valid_blocks=valid_blocks,
-        warmup=False,
     )
     expected = _attn_res_reference(
         layer,
