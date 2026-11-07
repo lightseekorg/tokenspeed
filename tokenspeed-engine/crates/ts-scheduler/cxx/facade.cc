@@ -214,6 +214,9 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .bootstrapping = scheduler.BootstrappingSize(),
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
+        .awaiting_destination = scheduler.AwaitingDestinationSize(),
+        .requeues = scheduler.Requeues(),
+        .requeued_tokens = scheduler.RequeuedTokens(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
     };
 }
@@ -226,6 +229,10 @@ PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler) {
         .wants_prefill = probe.wants_prefill,
         .has_decode_work = probe.has_decode_work,
     };
+}
+
+std::int32_t awaiting_destination_lcm_blocks(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.AwaitingDestinationLcmBlocks();
 }
 
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id) {

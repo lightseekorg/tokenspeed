@@ -2122,6 +2122,8 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         // No forward is out against the victim's pages, so none of this
         // round's batch either.
         publishCompletedPrefix(*victim);
+        ++requeues_;
+        requeued_tokens_ += static_cast<std::uint64_t>(victim->NumComputedTokens());
         victim->Apply(fsm::RequeueEvent{&coordinator_});
         spdlog::info("[Scheduler] requeue: request {} ({} tokens) gives its pages to granted work", victim->Id(),
                      victim->TokenSize());

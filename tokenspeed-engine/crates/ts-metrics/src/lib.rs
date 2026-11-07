@@ -406,6 +406,10 @@ pub struct EngineMetrics {
     num_nan_aborted_requests: Metric,
     num_capacity_aborted_requests: Metric,
     num_preemptions: Metric,
+    /// PD, prefill: requests requeued for granted work, and the prompt
+    /// tokens they held in KV when requeued.
+    num_prefill_requeued_requests: Metric,
+    prefill_requeued_tokens: Metric,
     request_queue_time: Metric,
     /// Resident KV occupancy: pages in use (active plus reclaimable prefix
     /// entries) over the usable pages, and the same in tokens.
@@ -415,6 +419,8 @@ pub struct EngineMetrics {
     /// PD queues: the role-specific names fluentllm reports.
     num_prefill_prealloc_queue_reqs: Metric,
     num_prefill_inflight_queue_reqs: Metric,
+    num_prefill_awaiting_destination_reqs: Metric,
+    num_prefill_awaiting_destination_pages: Metric,
     num_decode_prealloc_queue_reqs: Metric,
     num_decode_kv_wait_reqs: Metric,
     num_decode_transfer_queue_reqs: Metric,
@@ -440,6 +446,9 @@ pub struct EngineMetrics {
     /// Serving-time compile totals already exported.
     exported_compiles: u64,
     exported_compile_seconds: f64,
+    /// The scheduler's requeue totals already exported.
+    exported_requeues: u64,
+    exported_requeued_tokens: u64,
 }
 
 impl EngineMetrics {
@@ -544,6 +553,23 @@ impl EngineMetrics {
                  tokenspeed:num_capacity_aborted_requests.",
                 names,
             ),
+            num_prefill_requeued_requests: Metric::counter(
+                exporter,
+                "tokenspeed:num_prefill_requeued_requests",
+                "Prefill requests without a decode destination that the scheduler requeued to \
+                 free pages or a request slot for requests whose destination is allocated \
+                 (--disaggregation-decode-allocation-policy independent). The client sees \
+                 nothing; the request is computed again.",
+                names,
+            ),
+            prefill_requeued_tokens: Metric::counter(
+                exporter,
+                "tokenspeed:prefill_requeued_tokens",
+                "Prompt tokens the requeued prefill requests held in KV when requeued, \
+                 prefix-cache hits included; an upper bound on what their next admission \
+                 computes again.",
+                names,
+            ),
             request_queue_time: Metric::histogram(
                 exporter,
                 "tokenspeed:request_queue_time_seconds",
@@ -586,6 +612,23 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_prefill_inflight_queue_reqs",
                 "Prefill requests whose KV a transfer still pins.",
+                names,
+            ),
+            num_prefill_awaiting_destination_reqs: Metric::gauge(
+                exporter,
+                "tokenspeed:num_prefill_awaiting_destination_reqs",
+                "Prefill requests computed and waiting for their decode destination \
+                 (--disaggregation-decode-allocation-policy independent); \
+                 tokenspeed:num_prefill_inflight_queue_reqs counts them too.",
+                names,
+            ),
+            num_prefill_awaiting_destination_pages: Metric::gauge(
+                exporter,
+                "tokenspeed:num_prefill_awaiting_destination_pages",
+                "KV pages in the block tables of the prefill requests waiting for their decode \
+                 destination, counted as tokenspeed:num_free_tokens counts pages; blocks held \
+                 outside the tables (such as a pending in-forward State checkpoint) are not \
+                 included.",
                 names,
             ),
             num_decode_prealloc_queue_reqs: Metric::gauge(
@@ -709,6 +752,8 @@ impl EngineMetrics {
             ),
             exported_compiles: 0,
             exported_compile_seconds: 0.0,
+            exported_requeues: 0,
+            exported_requeued_tokens: 0,
         }
     }
 
@@ -828,8 +873,16 @@ impl EngineMetrics {
     }
 
     /// The prefill role's PD queues: waiting for a decode peer, transfer in
-    /// flight, and suspended requests.
-    pub fn record_prefill_queues(&self, prealloc: i64, inflight: i64, retracted: i64) {
+    /// flight, suspended requests, and the computed requests waiting for
+    /// their decode destination with the pages in their block tables.
+    pub fn record_prefill_queues(
+        &self,
+        prealloc: i64,
+        inflight: i64,
+        retracted: i64,
+        awaiting_destination: i64,
+        awaiting_destination_pages: i64,
+    ) {
         let labels = self.labels();
         self.num_prefill_prealloc_queue_reqs
             .set(&labels, prealloc.max(0) as f64);
@@ -837,6 +890,27 @@ impl EngineMetrics {
             .set(&labels, inflight.max(0) as f64);
         self.num_retracted_queue_reqs
             .set(&labels, retracted.max(0) as f64);
+        self.num_prefill_awaiting_destination_reqs
+            .set(&labels, awaiting_destination.max(0) as f64);
+        self.num_prefill_awaiting_destination_pages
+            .set(&labels, awaiting_destination_pages.max(0) as f64);
+    }
+
+    /// The scheduler's requeue totals since start; counters only move
+    /// forward, so each call adds the difference.
+    pub fn record_prefill_requeues(&mut self, requeues: u64, requeued_tokens: u64) {
+        if requeues <= self.exported_requeues {
+            return;
+        }
+        let labels = self.labels();
+        self.num_prefill_requeued_requests
+            .inc(&labels, (requeues - self.exported_requeues) as f64);
+        self.prefill_requeued_tokens.inc(
+            &labels,
+            requeued_tokens.saturating_sub(self.exported_requeued_tokens) as f64,
+        );
+        self.exported_requeues = requeues;
+        self.exported_requeued_tokens = requeued_tokens;
     }
 
     /// The decode role's PD queues: waiting for a prefill peer to connect,

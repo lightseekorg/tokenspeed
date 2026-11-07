@@ -19,13 +19,17 @@
 # HELP tokenspeed:num_free_tokens KV tokens not held by active requests (empty plus evictable).
 # HELP tokenspeed:num_nan_aborted_requests_total Requests terminated by the NaN guard (NaN in logits or an out-of-vocab sampled token id).
 # HELP tokenspeed:num_preemptions_total Requests preempted by a capacity retraction: the scheduler suspended a resident request (its pages imaged to the Host snapshot pool; it later resumes by restore, nothing is recomputed) to free Device pages for a blocked admission. One increment per retraction victim per round, counted from the plan's snapshot-store ops; forced retractions from --debug-force-retraction-interval count too. A retraction whose victim cannot be imaged aborts it instead — see tokenspeed:num_capacity_aborted_requests.
+# HELP tokenspeed:num_prefill_awaiting_destination_pages KV pages in the block tables of the prefill requests waiting for their decode destination, counted as tokenspeed:num_free_tokens counts pages; blocks held outside the tables (such as a pending in-forward State checkpoint) are not included.
+# HELP tokenspeed:num_prefill_awaiting_destination_reqs Prefill requests computed and waiting for their decode destination (--disaggregation-decode-allocation-policy independent); tokenspeed:num_prefill_inflight_queue_reqs counts them too.
 # HELP tokenspeed:num_prefill_inflight_queue_reqs Prefill requests whose KV a transfer still pins.
 # HELP tokenspeed:num_prefill_prealloc_queue_reqs Prefill requests waiting for their decode peer to connect.
+# HELP tokenspeed:num_prefill_requeued_requests_total Prefill requests without a decode destination that the scheduler requeued to free pages or a request slot for requests whose destination is allocated (--disaggregation-decode-allocation-policy independent). The client sees nothing; the request is computed again.
 # HELP tokenspeed:num_requests_inflight Requests admitted and not finished, including PD transfer and waiting states.
 # HELP tokenspeed:num_requests_running Requests in the scheduler's running batch: prefill, prefill-done, and decode rows.
 # HELP tokenspeed:num_requests_waiting Requests waiting in the C++ scheduler queue.
 # HELP tokenspeed:num_retracted_queue_reqs Requests suspended with a retraction image.
 # HELP tokenspeed:num_used_tokens KV tokens held by resident pages (active plus reclaimable).
+# HELP tokenspeed:prefill_requeued_tokens_total Prompt tokens the requeued prefill requests held in KV when requeued, prefix-cache hits included; an upper bound on what their next admission computes again.
 # HELP tokenspeed:prefix_device_hit_tokens_total Admitted prompt tokens served from the Device prefix cache (L1).
 # HELP tokenspeed:prefix_host_hit_tokens_total Admitted prompt tokens loaded from the Host cache (L2, including L3-supplied).
 # HELP tokenspeed:prefix_l3_hit_tokens_total Token spans of successful storage keys (L3), counted per cache group.
@@ -59,13 +63,17 @@
 # TYPE tokenspeed:num_free_tokens gauge
 # TYPE tokenspeed:num_nan_aborted_requests_total counter
 # TYPE tokenspeed:num_preemptions_total counter
+# TYPE tokenspeed:num_prefill_awaiting_destination_pages gauge
+# TYPE tokenspeed:num_prefill_awaiting_destination_reqs gauge
 # TYPE tokenspeed:num_prefill_inflight_queue_reqs gauge
 # TYPE tokenspeed:num_prefill_prealloc_queue_reqs gauge
+# TYPE tokenspeed:num_prefill_requeued_requests_total counter
 # TYPE tokenspeed:num_requests_inflight gauge
 # TYPE tokenspeed:num_requests_running gauge
 # TYPE tokenspeed:num_requests_waiting gauge
 # TYPE tokenspeed:num_retracted_queue_reqs gauge
 # TYPE tokenspeed:num_used_tokens gauge
+# TYPE tokenspeed:prefill_requeued_tokens_total counter
 # TYPE tokenspeed:prefix_device_hit_tokens_total counter
 # TYPE tokenspeed:prefix_host_hit_tokens_total counter
 # TYPE tokenspeed:prefix_l3_hit_tokens_total counter
@@ -151,13 +159,17 @@ tokenspeed:num_decode_transfer_queue_reqs{app_key="",dp_rank="0",model_name="m"}
 tokenspeed:num_free_tokens{app_key="",dp_rank="0",model_name="m"} 517.0
 tokenspeed:num_nan_aborted_requests_total{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_preemptions_total{app_key="",dp_rank="0",model_name="m"} 2.0
+tokenspeed:num_prefill_awaiting_destination_pages{app_key="",dp_rank="0",model_name="m"} 6.0
+tokenspeed:num_prefill_awaiting_destination_reqs{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_prefill_inflight_queue_reqs{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:num_prefill_prealloc_queue_reqs{app_key="",dp_rank="0",model_name="m"} 1.0
+tokenspeed:num_prefill_requeued_requests_total{app_key="",dp_rank="0",model_name="m"} 3.0
 tokenspeed:num_requests_inflight{app_key="",dp_rank="0",model_name="m"} 4.0
 tokenspeed:num_requests_running{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_requests_waiting{app_key="",dp_rank="0",model_name="m"} 0.0
 tokenspeed:num_retracted_queue_reqs{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_used_tokens{app_key="",dp_rank="0",model_name="m"} 194.0
+tokenspeed:prefill_requeued_tokens_total{app_key="",dp_rank="0",model_name="m"} 340.0
 tokenspeed:prefix_device_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 40.0
 tokenspeed:prefix_host_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 30.0
 tokenspeed:prefix_l3_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 10.0

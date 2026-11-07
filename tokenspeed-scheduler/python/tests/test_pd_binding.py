@@ -179,6 +179,53 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(
     assert scheduler.available_lcm_blocks() == cfg.num_device_pages - 1
 
 
+def test_independent_prefill_counts_prompts_waiting_for_their_destination():
+    """Under independent admission computed prompts wait for their decode
+    destination with their pages and request slots; a granted prompt that
+    finds no free slot requeues the newest of them."""
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Independent
+    cfg.prefix_granularity = 2
+    cfg.max_scheduled_tokens = 8
+    cfg.max_batch_size = 3
+    cfg.num_device_pages = 64
+    cfg.num_snapshot_pages = 1
+    cfg.disable_l2_cache = True
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=2,
+            total_pages=64,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    rids = ["oldest", "older", "newest"]
+    scheduler.submit_requests(
+        [make_spec(rid, [10 * i + 1, 10 * i + 2]) for i, rid in enumerate(rids)]
+    )
+    assert scheduler.bootstrapping_size() == 0
+    assert scheduler.next_execution_plan().forward[0].request_ids == rids
+    for rid in rids:
+        result = ForwardEvent.ExtendResult()
+        result.request_id, result.tokens = rid, [5]
+        scheduler.advance(ExecutionEvent().add_event(result))
+    assert scheduler.awaiting_destination_size() == 3
+    assert scheduler.awaiting_destination_lcm_blocks() == scheduler.active_lcm_blocks()
+    assert scheduler.requeues() == scheduler.requeued_tokens() == 0
+
+    scheduler.submit_requests([make_spec("granted", [41, 42])])
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("granted")))
+    plan = scheduler.next_execution_plan()
+    assert plan.remote_decode is None
+    assert plan.forward[0].request_ids == ["granted"]
+    assert scheduler.awaiting_destination_size() == 2
+    assert scheduler.requeues() == 1
+    assert scheduler.requeued_tokens() == 2
+
+
 def test_execution_event_accepts_pd_events():
     """ExecutionEvent.add_event accepts PD events and returns self for chaining."""
     execution_event = ExecutionEvent()
