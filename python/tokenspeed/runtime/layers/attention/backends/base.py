@@ -392,7 +392,8 @@ class AttentionBackend(CachePoolBinding, ABC):
         ``capture`` only retains startup buffers at their captured addresses;
         it must not select different computation. Returns the same answer as
         :meth:`admits_prefill_graph`, except that a forward writing in-forward
-        State checkpoints keeps its live metadata and gets False; the prefill
+        State checkpoints keeps its live metadata and gets False from a
+        backend whose fixed-capacity metadata stores none; the prefill
         capture raises if an override refuses a shape that query admitted.
         Other backends keep
         their existing metadata and attention breaks. Call on the consumer

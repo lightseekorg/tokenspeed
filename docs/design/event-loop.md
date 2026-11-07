@@ -397,7 +397,11 @@ library compiles once per batch shape with no key to bucket -- FlashInfer's
 joint BF16 GEMM and the ll_bf16 router's dot-product kernel compile once per
 exact row count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
-compiles instead of compiling on the forward thread.
+compiles instead of compiling on the forward thread. The pinned FlashInfer
+TGV tiles for BF16 decode GEMMs on small weights run only before it too,
+though they compile once per tile, not per shape: their route was measured
+only inside captured graphs, so eager calls after the mark keep cuBLASLt
+(`tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/README.md`).
 
 A full garbage collection is a stall of the same kind, for every Python
 thread of the process at once. Startup leaves millions of long-lived Python
@@ -510,7 +514,13 @@ don't fit. It must not advance the scheduler itself.
 ## Principle 4: correctness never depends on the in-flight depth
 
 `in_flight_depth` parameterizes the loop: 0 (classic synchronous
-commit), 1 (the overlap schedule), or `pp_size` (the prefill chunk pipeline).
+commit), 1 (one forward ahead of its commit: the overlap schedule on a
+decoding role), or `pp_size` (the prefill chunk pipeline);
+`scheduler_utils.resolve_in_flight_depth` picks it. At PP=1 the prefill role
+runs at 1 too, the chunk pipeline's one-stage case: a round's planning,
+commit, and transfer polling overlap the chunk on the GPU. It still takes no
+overlap schedule, whose decode KV reservation (`overlap_schedule_depth`) it
+never needs. `--disable-overlap-schedule` sets the depth to 0 at PP=1.
 Dispatched forwards await commit in the `in_flight` queue. The round commits
 once the queue exceeds the effective depth (0 when the round dispatched no
 new work, so results never wait on future traffic).
@@ -657,6 +667,22 @@ registration is deferred until resume admits them, and aborted buffered
 requests never register one. An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
+
+With attention DP, memory release waits for every rank to stop admissions
+and drain its requests, forwards, cancelled embedding receives, cache copies,
+transfers and queued weight operations. A locally drained rank keeps joining
+idle forwards while a peer drains. An idle but unpaused peer prevents release:
+it could admit a request in the next round. Release intent rides the head
+gate, so every rank joins the tail's readiness agreement when any release is
+pending, including ranks without a release of their own. Ordinary rounds add
+no collective. Readiness is MIN-reduced over the replica and then attention DP
+before any release runs on the forward thread.
+
+The head gate also agrees whether any DP rank still has released regions.
+Until all regions are restored on every rank, it withholds forward permission
+through the scheduler's storage tick and suppresses idle forwards. This covers
+staggered and partial resumes without building a batch that cannot execute;
+control operations and cache acknowledgments continue to progress.
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
 Weight-update `flush_cache` and a standalone flush first MAX-reduce
@@ -815,6 +841,34 @@ bitmasks through their handles, with one C++ fill (`grammar_host.Filler`)
 on both paths: the capturable path's host node runs it inside the forward
 and advances the matchers there; the eager path runs it before the forward
 and the commit advances them.
+
+## Request-token history seeds
+
+The control plane owns each request's committed token list. `HistoryRows`
+tracks slot ownership by admission, not by client request id, and seeds a
+new owner's prefix before its first forward. Consecutive chunks on the
+same owned row append their inputs without reseeding. Prefix-cache hits,
+PD landings, slot reuse and recovery into another slot use this same path.
+
+A model profile may declare `request_token_history_lookback`: the maximum
+number of committed tokens it reads behind its write frontier. Omission
+(`None`) preserves full-prefix seeds; zero permits an empty seed. The host
+uses the maximum bound across target and draft history readers, or full
+history if either reader declares no bound. A finite bound is a model
+correctness contract, not a serving knob: every history read must stay
+within it, including resumed and speculative forwards.
+
+For a prefix of length P and bound L, the seed carries tokens
+`[max(0, P-L), P)`, retaining P as `prefix_lengths`. The Python executor
+places them at their original absolute positions, never at position zero.
+The draft row keeps its existing one-token-left shift: source positions
+`[start+1, P)` populate draft positions `[start, P-1)`. The final draft position is not
+provided by the seed, just as with full-prefix seeding; the model/drafter
+must supply any boundary token it reads. Earlier row contents are
+unspecified and must not be read. This reduces copied and uploaded tokens,
+not the context-sized history allocation or KV-cache storage. Token history
+remains token-derived state, reconstructed rather than included in
+retraction snapshots.
 
 ## Anatomy of a round
 
