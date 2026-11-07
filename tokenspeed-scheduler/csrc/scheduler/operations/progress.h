@@ -66,7 +66,7 @@ enum class PublicationPoint {
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
                                        bool stream_completed_to_host, PublicationPoint point,
-                                       bool allow_state_checkpoint);
+                                       bool allow_state_checkpoint, bool preserve_source_blocks);
 
 // A scheduling attempt advances its request's cache progress in place; unless
 // the attempt commits, the advance is undone when this goes out of scope. The

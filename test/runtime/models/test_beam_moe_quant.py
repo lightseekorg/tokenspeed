@@ -41,10 +41,11 @@ from unittest import mock
 import pytest
 import torch
 from safetensors.torch import save_file
+from tokenspeed_kernel.ops.moe import flashinfer as flashinfer_moe
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
-from tokenspeed_kernel.thirdparty.flashinfer import trtllm_bf16_moe
 
 from tokenspeed.runtime.configs import model_config as model_config_module
+from tokenspeed.runtime.configs.beam_config import BeamConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.loader import MoECheckpointLoader
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
@@ -66,8 +67,8 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
+from test.runtime.models.beam_fixture import tiny_config as base_tiny_config
 from test.runtime.models.beam_fixture import (
-    tiny_config,
     tiny_weights,
     write_tiny_checkpoint,
 )
@@ -85,6 +86,13 @@ ROUTED_APPLY = "flashinfer_trtllm_unquant_routed_moe_apply"
 FP8_ROUTED = "flashinfer_trtllm_fp8_channel_routed_moe_apply"
 NVFP4_ROUTED = "flashinfer_trtllm_nvfp4_routed_moe_apply"
 FP8 = torch.float8_e4m3fn
+
+
+def tiny_config():
+    """Use the vendor BF16 kernel's 128-wide expert alignment for this suite."""
+    config = base_tiny_config()
+    config.moe_intermediate_size = 128
+    return config
 
 
 @pytest.fixture(autouse=True)
@@ -300,7 +308,7 @@ def test_ep8_rank_hands_global_routes_and_its_expert_offset_to_the_kernel(
     layer = _moe(_ep_mapping(5), _config(**EP_GRID)).experts
     out = torch.full((3, 128), 2.0, dtype=torch.bfloat16)
     launcher = mock.Mock(return_value=[out])
-    monkeypatch.setattr(trtllm_bf16_moe, "trtllm_bf16_routed_moe", launcher)
+    monkeypatch.setattr(flashinfer_moe, "trtllm_bf16_routed_moe", launcher)
     ids = torch.tensor([[0, 160, 191, 255, 3, 170, 7, 8]] * 3, dtype=torch.int32)
     weights = torch.rand(3, 8, dtype=torch.float32)
     hidden = torch.zeros(3, 128, dtype=torch.bfloat16)
@@ -310,7 +318,7 @@ def test_ep8_rank_hands_global_routes_and_its_expert_offset_to_the_kernel(
     # Global expert ids; the kernel keeps [160, 192) and skips the rest.
     assert (kwargs["local_expert_offset"], kwargs["local_num_experts"]) == (160, 32)
     assert (kwargs["num_experts"], kwargs["top_k"]) == (256, 8)
-    assert kwargs["intermediate_size"] == 64 and kwargs["do_finalize"] is True
+    assert kwargs["intermediate_size"] == 128 and kwargs["do_finalize"] is True
     topk_ids, topk_weights = kwargs["topk_ids"]
     assert torch.equal(topk_ids, ids)
     assert torch.equal(topk_weights, weights.to(torch.bfloat16))
@@ -431,12 +439,15 @@ def bf16_once(exact):
     return bits.view(torch.float64).float().to(torch.bfloat16)
 
 
-def fp8_checkpoint(scale_dtype=torch.bfloat16, seed=0):
-    """(checkpoint tensors, BF16 reference) of the tiny Beam in the FP8 layout:
-    every linear but the router and lm_head quantized, as RAW's ignore says."""
+def fp8_checkpoint(config: BeamConfig, scale_dtype=torch.bfloat16, seed=0):
+    """Return FP8 tensors and a BF16 reference matching the consumer's config.
+
+    Every linear but the router and lm_head is quantized, as RAW's ignore says.
+    Pass the model's config so vendor-specific expert widths remain consistent.
+    """
     torch.manual_seed(seed)
     tensors, reference = {}, {}
-    for name, weight in tiny_weights(tiny_config()).items():
+    for name, weight in tiny_weights(config).items():
         module = name.removesuffix(".weight")
         quantized = (
             name.endswith("proj.weight")
@@ -511,8 +522,9 @@ def test_the_fp8_load_keeps_codes_and_scales(server, scale_dtype):
     exactly as FP32 (Q, K and V stacked, gate and up stacked, the experts'
     gate and up rows then down); every other tensor is the checkpoint's."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint(scale_dtype)
-    model = _model(ct())
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config, scale_dtype)
+    model = _model(ct(), config=config)
     assert model.load_weights(list(tensors.items())) == set(tensors)
     actual = dict(model.named_parameters())
     for layer in ("model.layers.0", "model.layers.1"):
@@ -614,8 +626,9 @@ def test_attention_runs_qkv_and_gate_as_one_fp8_gemm(server, monkeypatch):
     form one GEMM (Q/K/V rows, then the gate rows) that gives both outputs
     exactly as the two projections do."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint()
-    model = _model(ct())
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config)
+    model = _model(ct(), config=config)
     model.load_weights(list(tensors.items()))
     for layer in model.model.layers:
         attn = layer.self_attn
@@ -645,8 +658,9 @@ def test_the_offered_token_fp8_is_consumed_once(server, monkeypatch):
     and scales, then the offer is gone — a second call, even of the same rows,
     quantizes them again itself."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint()
-    model = _model(ct())
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config)
+    model = _model(ct(), config=config)
     model.load_weights(list(tensors.items()))
     attn = model.model.layers[0].self_attn
     _post_load(attn)
@@ -686,8 +700,9 @@ def test_norm_fp8_offer_matches_separate_quantization(server, sandwich, consumer
     from tokenspeed.runtime.models.beam_sandwich_fusion import BeamSandwichNorm
 
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint()
-    model = _model(ct())
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config)
+    model = _model(ct(), config=config)
     model.load_weights(list(tensors.items()))
     model.cuda()
     layer = model.model.layers[0]
@@ -786,13 +801,14 @@ def test_fp8_loader_refusals(server, name, edit, error, match):
     """One case per rule: an FP8 router, a scale that is not finite and
     positive, a weight without its scale, and a quantized tensor twice."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint()
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config)
     edit(tensors)
     items = list(tensors.items())
     if name == "twice":
         items.insert(0, (f"{Q}.weight", tensors[f"{Q}.weight"]))
     with pytest.raises(error, match=match):
-        _model(ct()).load_weights(items)
+        _model(ct(), config=config).load_weights(items)
 
 
 @pytest.fixture(scope="module")
@@ -801,11 +817,12 @@ def fp8_checkpoints(tmp_path_factory):
     root = tmp_path_factory.mktemp("fp8")
     paths = {}
     for label, raw in (("fp8", RAW), ("tensor", edited((*W, "strategy"), "tensor"))):
-        path = write_tiny_checkpoint(root / label)
+        model_config = tiny_config()
+        path = write_tiny_checkpoint(root / label, config=model_config)
         config = json.loads((path / "config.json").read_text())
         config["quantization_config"] = raw
         (path / "config.json").write_text(json.dumps(config))
-        save_file(fp8_checkpoint()[0], str(path / "model.safetensors"))
+        save_file(fp8_checkpoint(model_config)[0], str(path / "model.safetensors"))
         paths[label] = path
     return paths
 
@@ -856,8 +873,11 @@ def test_ep_ranks_load_their_own_fp8_experts(server, rank):
     """Under EP each rank holds its whole experts' codes, bit for bit, and their
     channel scales exactly as FP32; the other rank's experts are skipped."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint(torch.bfloat16)
-    model = _model(ct(), mapping=Mapping(rank=rank, world_size=2, moe_ep_size=2))
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config, torch.bfloat16)
+    model = _model(
+        ct(), mapping=Mapping(rank=rank, world_size=2, moe_ep_size=2), config=config
+    )
     experts = model.model.layers[1].mlp.experts
     assert experts.num_local_experts == 4
     model.load_weights(list(tensors.items()))
@@ -959,9 +979,9 @@ def _assert_experts_hold(experts, tensors):
         gate, up, down = (
             f"{prefix}.{p}" for p in ("gate_proj", "up_proj", "down_proj")
         )
-        assert torch.equal(experts.w13_weight[expert, :64], tensors[f"{gate}.weight"])
-        assert torch.equal(experts.w13_weight[expert, 64:], tensors[f"{up}.weight"])
-        for rows, name in ((slice(0, 64), gate), (slice(64, 128), up)):
+        assert torch.equal(experts.w13_weight[expert, :128], tensors[f"{gate}.weight"])
+        assert torch.equal(experts.w13_weight[expert, 128:], tensors[f"{up}.weight"])
+        for rows, name in ((slice(0, 128), gate), (slice(128, 256), up)):
             assert torch.equal(
                 experts.w13_weight_scale[expert, rows].view(torch.uint8),
                 tensors[f"{name}.weight_scale"].view(torch.uint8),
@@ -1069,7 +1089,7 @@ def test_a_quantized_launch_detects_the_format_and_keeps_the_moe_default(
 
     monkeypatch.setattr(moe_flashinfer, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", 128)
     caplog.set_level(logging.INFO, logger=model_config_module.__name__)
-    nvfp4 = write_tiny_checkpoint(tmp_path / "nvfp4")
+    nvfp4 = write_tiny_checkpoint(tmp_path / "nvfp4", config=tiny_config())
     (nvfp4 / "hf_quant_config.json").write_text(json.dumps(HF_QUANT_CONFIG))
     save_file(nvfp4_checkpoint(), str(nvfp4 / "model.safetensors"))
     beam_width = json.dumps({"moe_intermediate_size": 2560})

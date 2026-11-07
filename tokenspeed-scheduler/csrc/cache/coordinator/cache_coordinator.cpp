@@ -2644,7 +2644,18 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
 
 void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                           const CompletedPages& completed, std::uint64_t access_epoch) {
-    cacheCompletedBlocksForGroup<CacheTier::kDevice>(group_index, table, completed, access_epoch);
+    if (completed.preserve_source_blocks) {
+        // Register may replace duplicate refs. Only the publication view may
+        // change: the request pins the actual PD sources until its terminal ACK.
+        BlockTable publication_table = table;
+        std::vector<CacheBlockRef> checkpoints(completed.state_checkpoint_blocks.begin(),
+                                               completed.state_checkpoint_blocks.end());
+        CompletedPages publication = completed;
+        publication.state_checkpoint_blocks = checkpoints;
+        cacheCompletedBlocksForGroup<CacheTier::kDevice>(group_index, publication_table, publication, access_epoch);
+    } else {
+        cacheCompletedBlocksForGroup<CacheTier::kDevice>(group_index, table, completed, access_epoch);
+    }
 }
 
 std::int32_t CacheCoordinator::FirstPublishedPage(const CompletedPages& completed) const {

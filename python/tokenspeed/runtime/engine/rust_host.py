@@ -67,6 +67,7 @@ from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -408,6 +409,9 @@ class HostConfig:
             model without Engram.
         request_token_history: The model reads each request's committed
             token history (``ModelConfig.requires_request_token_history``).
+        request_token_history_lookback: Committed tokens the model reads
+            behind the frontier, which bounds the history seeds; None seeds
+            the whole prefix.
         physical_context_len: Tokens a request's buffers hold.
         kv_total_pages: Usable cache pages, reported with the load.
         rank: This rank.
@@ -488,6 +492,7 @@ class HostConfig:
     spec_num_tokens: int | None
     ngram_context_len: int
     request_token_history: bool
+    request_token_history_lookback: int | None
     physical_context_len: int
     kv_total_pages: int
     kv_token_capacity: int
@@ -1349,6 +1354,16 @@ class HostBootstrap:
                 ),
                 ngram_context_len=ngram_context_len,
                 request_token_history=model_config.requires_request_token_history,
+                request_token_history_lookback=(
+                    resolve_history_seed_lookback(
+                        model_config.model_profile,
+                        (
+                            draft_model_config.model_profile
+                            if draft_model_config is not None
+                            else None
+                        ),
+                    )
+                ),
                 physical_context_len=(
                     model_config.context_len + server_args.spec_context_pad
                 ),

@@ -6829,6 +6829,45 @@ protected:
     const std::vector<std::string> unrelated_page_ = ContentHashes({{5, 6, 7, 8}});
 };
 
+// A P-role publication must not deduplicate the physical pages still read
+// by the transfer, for full pages and for a final partial page alike.
+TEST_F(ShardedTailCopyPackingFourTest, PreservedPublicationKeepsPrivateTransferSources) {
+    for (const bool partial : {false, true}) {
+        SCOPED_TRACE(partial);
+        std::vector<BlockTable> canonical(2);
+        std::vector<BlockTable> source(2);
+        const auto admit = [&](std::vector<BlockTable>& table) {
+            return AdmitForTest(coordinator_, table, coordinator_.ProbePrefix({}),
+                                GroupDemand{.extent = DenseGrowth{kP}}, RequestProgress{},
+                                StateStep{StateStep::Kind::kKeep});
+        };
+        ASSERT_TRUE(admit(canonical));
+        ASSERT_TRUE(admit(source));
+        const CacheBlockLocation canonical_location = canonical[0].Blocks()[0]->Location();
+        const CacheBlockLocation source_location = source[0].Blocks()[0]->Location();
+        ASSERT_NE(source_location, canonical_location);
+        RequestProgress progress = FinalTailAtThree(/*publish_state=*/false);
+        const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 99}});
+        if (!partial) {
+            progress.completed_pages->prefix_hashes = hashes;
+            progress.completed_pages->tail.reset();
+            progress.num_computed_tokens = kP;
+        }
+        coordinator_.CacheCompletedBlocks(canonical, progress,
+                                          CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+        coordinator_.Free(canonical);
+        progress.completed_pages->preserve_source_blocks = true;
+        coordinator_.CacheCompletedBlocks(source, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+        EXPECT_EQ(source[0].Blocks()[0]->Location(), source_location);
+        EXPECT_EQ(CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, 0,
+                                                               Key(partial ? tail_hash_ : hashes.front(), 0)),
+                  canonical_location);
+        coordinator_.Free(source);
+        coordinator_.ClearCache();
+        EXPECT_EQ(pool_.NumEmptyLcmBlocks(), 3);
+    }
+}
+
 TEST_F(ShardedTailCopyPackingFourTest, HitterCopyWaitsForAHoleInTheSourceBucket) {
     CacheBlockLocation source;
     ASSERT_NO_FATAL_FAILURE(CacheTailInBucketZero(source));

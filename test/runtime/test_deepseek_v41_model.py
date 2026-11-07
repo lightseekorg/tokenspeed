@@ -4018,7 +4018,7 @@ def test_model_qcp_ced_communication_and_outputs(
             model = DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu")
         backend = _backend("cpu", 2)
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         meta = _extend(
             backend,
@@ -4063,18 +4063,22 @@ def test_model_qcp_ced_communication_and_outputs(
             view.metadata.request_indices[samples], meta.request_indices[sample_encoder]
         )
         expected = full_hidden[samples]
-        counts = plan.rows_per_rank(sample_encoder)
+        split = local.decoder_plan.split_rows(samples)
+        counts = split.rows_per_rank
+        gathered_samples = expected[torch.argsort(split.to_rows_order)]
 
         def gather(payload, group, row_counts, backend=None):
             assert group == mapping.attn.qcp_group
             assert row_counts == list(counts)
             first = sum(counts[:rank])
-            torch.testing.assert_close(payload, expected[first : first + counts[rank]])
-            return expected.clone()
+            torch.testing.assert_close(
+                payload, gathered_samples[first : first + counts[rank]]
+            )
+            return gathered_samples.clone()
 
         monkeypatch.setattr(comm_ops, "token_all_gather", gather)
         actual, captured = model.finish_forward(
-            full_hidden[local.decoder_plan.local_slice], [], ctx
+            full_hidden[local.decoder_plan.local_row_ids], [], ctx
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.shape[0] == sum(complete)
@@ -4090,9 +4094,9 @@ def test_model_qcp_ced_communication_and_outputs(
             assert row_counts == list(local.decoder_plan.row_counts)
             expected_taps = torch.cat(taps, dim=-1)
             torch.testing.assert_close(
-                payload, expected_taps[local.decoder_plan.local_slice], rtol=0, atol=0
+                payload, expected_taps[local.decoder_plan.local_row_ids], rtol=0, atol=0
             )
-            return expected_taps.clone()
+            return local.decoder_plan.to_gather_order(expected_taps)
 
         monkeypatch.setattr(
             "tokenspeed.runtime.models.deepseek_v41.token_all_gather_rows",
@@ -4100,8 +4104,8 @@ def test_model_qcp_ced_communication_and_outputs(
         )
         ctx.capture_hidden_mode = CaptureHiddenMode.FULL
         actual, captured = model.finish_forward(
-            full_hidden[local.decoder_plan.local_slice],
-            [tap[local.decoder_plan.local_slice] for tap in taps],
+            full_hidden[local.decoder_plan.local_row_ids],
+            [tap[local.decoder_plan.local_row_ids] for tap in taps],
             ctx,
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -4233,6 +4237,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                         input_lengths=[length],
                         size=4,
                         rank=rank,
+                        device=device,
                     )
                     if sharded
                     else None
@@ -4248,7 +4253,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 )
                 ctx = _ctx(backend, length, ForwardMode.EXTEND)
                 ctx.query_shard = plan
-                rows = plan.local_slice if plan is not None else slice(None)
+                rows = plan.local_row_ids if plan is not None else slice(None)
                 result, _ = adapter.model(
                     ids[rows],
                     meta.positions[rows],
@@ -4288,8 +4293,8 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
             taps = [full, -full]
             ctx.capture_hidden_mode = CaptureHiddenMode.FULL
             actual, captured = adapter.model.finish_forward(
-                full[local.decoder_plan.local_slice],
-                [tap[local.decoder_plan.local_slice] for tap in taps],
+                full[local.decoder_plan.local_row_ids],
+                [tap[local.decoder_plan.local_row_ids] for tap in taps],
                 ctx,
             )
             expected = full[torch.tensor(view.logits_rows_cpu, device=device)]

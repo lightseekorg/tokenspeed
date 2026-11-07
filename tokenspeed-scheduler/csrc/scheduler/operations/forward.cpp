@@ -218,7 +218,7 @@ std::optional<CacheCoordinator::CopyInPoint> Scheduler::promptEndCopyInPoint(con
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
                                        bool stream_completed_to_host, PublicationPoint point,
-                                       bool allow_state_checkpoint) {
+                                       bool allow_state_checkpoint, bool preserve_source_blocks) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
@@ -264,6 +264,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
             .owner_tail = point == PublicationPoint::kOwnerContinues    ? OwnerTail::kCopiedIn
                           : point == PublicationPoint::kStateCheckpoint ? OwnerTail::kKept
                                                                         : OwnerTail::kFinal,
+            .preserve_source_blocks = preserve_source_blocks,
             .publish_state = publish_state,
             .state_checkpoint_pages = state_checkpoint_pages,
             .state_checkpoint_blocks = cache_progress.published_state_checkpoint_blocks,
@@ -586,16 +587,16 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                       .checkpoint = checkpoint});
         ReservePrefillDemands(demands, config_.cache_groups, reserve);
         if (source == fsm::PrefillSource::kRemote) {
-            // The peer's retained window lands as a sparse suffix behind the
-            // hit: the first landed block is the one after the hit's last
-            // block (a partial tail block is already the hitter's own fresh
-            // page), or the window's first block when that is later.
+            // Cached windows already own the hit's blocks, including a
+            // fresh partial tail block. Replayable windows own no hit blocks:
+            // the peer must fill their whole retained suffix.
             for (std::size_t i = 0; i < demands.size(); ++i) {
                 const CacheGroupConfig& group = config_.cache_groups[i];
                 if (group.attn_kind == AttnKind::kSlidingWindow) {
                     const std::int32_t block_granularity =
                         coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
-                    const std::int32_t hit_blocks = (hit_tokens + block_granularity - 1) / block_granularity;
+                    const std::int32_t hit_blocks =
+                        group.replayable ? 0 : (hit_tokens + block_granularity - 1) / block_granularity;
                     const std::int32_t retained_begin =
                         std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                     demands[i].extent = SparseSuffix{
@@ -780,7 +781,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
         config_.StreamsDeviceCacheToHost(),
         ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kStateCheckpoint : PublicationPoint::kChunk,
-        /*allow_state_checkpoint=*/true);
+        /*allow_state_checkpoint=*/true, /*preserve_source_blocks=*/config_.role == Role::kP);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and
@@ -911,7 +912,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                config_.StreamsDeviceCacheToHost() && first_decode,
                                prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
-                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 || prompt_end);
+                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 || prompt_end,
+                               /*preserve_source_blocks=*/config_.role == Role::kP);
 
     std::vector<GroupDemand> demands =
         MakeGroupDemands(tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{reserve_tokens}}, state_step);
@@ -1098,7 +1100,8 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
         AdvanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
                                /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
-                                   (config_.role != Role::kD && num_computed_tokens <= victim.PrefillSize()));
+                                   (config_.role != Role::kD && num_computed_tokens <= victim.PrefillSize()),
+                               /*preserve_source_blocks=*/false);
     if (progress.completed_pages) {
         // A publication is a KV-event mutation: its pages from
         // CacheCoordinator::FirstPublishedPage (the newly hashed decode pages
@@ -1144,7 +1147,8 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
         AdvanceRequestProgress(request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
                                /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
-                                   (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()));
+                                   (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()),
+                               /*preserve_source_blocks=*/false);
     return tier_transfers_
         .SplitRetractionImage(
             request.BlockTablesRef(), num_computed_tokens,
