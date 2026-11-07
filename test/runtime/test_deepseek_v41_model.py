@@ -445,6 +445,20 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     assert output.next_token_logits.argmax(-1).item() == expected_token
 
 
+def test_max_forward_tokens_covers_every_request_state_slot(monkeypatch):
+    """Decode rows follow the per-request state the executor sizes, which
+    can exceed the running cap (``--max-num-seqs``)."""
+    for key, value in {
+        "chunked_prefill_size": 8,
+        "max_cudagraph_capture_size": 4,
+        "request_state_seqs": 16,
+        "speculative_algorithm": "DFLASH",
+        "speculative_num_draft_tokens": 3,
+    }.items():
+        monkeypatch.setitem(global_server_args_dict, key, value)
+    assert v41._max_forward_tokens() == 48
+
+
 def test_hc_post_rejects_unfinished_reduction():
     x = torch.zeros(1, 4)
     pending = v41.V41HCPost(x, x, x, object())
@@ -3141,7 +3155,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
         monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
         monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 128)
-        monkeypatch.setitem(global_server_args_dict, "max_num_seqs", 8)
+        monkeypatch.setitem(global_server_args_dict, "request_state_seqs", 8)
         config = _loader_config()
         config.hidden_size = 512
         config.moe_intermediate_size = 256

@@ -128,6 +128,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             host_group_packing=(),
             max_retracted_requests=0,
             host_write_policy="write_through",
+            prefill_decode_interval=0,
             storage_config=None,
             cache_groups=groups,
             state_checkpoint_in_forward=in_forward,

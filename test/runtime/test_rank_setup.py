@@ -54,6 +54,8 @@ from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E40
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
     rank_process_title,
+    request_state_slots,
+    scheduler_batch_slots,
     scheduler_config_from_args,
 )
 from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
@@ -123,6 +125,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
+        prefill_decode_interval=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -133,6 +136,35 @@ def test_make_config_requires_and_maps_the_host_write_policy():
     # Mapped as given: the scheduler, not make_config, decides what it runs.
     cfg = make_config(**fields, host_write_policy="write_back")
     assert cfg.host_write_policy == policy.WriteBack
+
+
+def test_the_prefill_decode_interval_reaches_the_scheduler():
+    args = prepare_server_args(
+        ["--model", "x", "--max-num-seqs", "8", "--prefill-decode-interval", "64"]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_interval == 64
+
+
+@pytest.mark.parametrize(
+    "flags,error",
+    [
+        (["--prefill-decode-interval", "-1"], "must be non-negative"),
+        (
+            ["--prefill-decode-interval", "64", "--disaggregation-mode", "prefill"],
+            "needs --disaggregation-mode null",
+        ),
+        (
+            ["--prefill-decode-interval", "64", "--disaggregation-mode", "decode"],
+            "needs --disaggregation-mode null",
+        ),
+    ],
+)
+def test_server_args_refuse_a_prefill_decode_interval_it_cannot_honor(flags, error):
+    with pytest.raises(ValueError, match=error):
+        prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
 
 
 @pytest.mark.parametrize("tokens,pages", [(None, 0), (1, 1), (16, 1), (17, 2)])
@@ -846,6 +878,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         max_retracted_requests=0,
         storage_config=None,
         host_write_policy="write_through",
+        prefill_decode_interval=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (
@@ -874,3 +907,20 @@ def test_a_rank_is_titled_by_its_parallel_ranks(mapping, title):
     # The attention TP rank always shows; another dimension only when it
     # has more than one rank.
     assert rank_process_title(mapping) == title
+
+
+@pytest.mark.parametrize("cap", [1, 2])
+def test_a_speculative_cap_below_attention_tp_sizes_state_for_the_warmup(cap):
+    # The draft decode warmup decodes one request per attention-TP peer, so
+    # the decode state is sized for 8 while the scheduler still runs `cap`.
+    args = ServerArgs(
+        model="x",
+        dtype="bfloat16",
+        world_size=8,
+        attn_tp_size=8,
+        ep_size=8,
+        max_num_seqs=cap,
+        speculative_algorithm="MTP",
+    )
+    assert (args.max_num_seqs, args.request_state_seqs) == (cap, 8)
+    assert (scheduler_batch_slots(args), request_state_slots(args)) == (cap, 8)

@@ -420,6 +420,9 @@ class ServerArgs:
     # chunked_prefill_size; a decode server ignores it.
     prefill_chunk_yield_tokens: int = 0
     enable_mixed_batch: bool = False
+    # Decode rounds owed to the running decodes after each prefill round; 0 is
+    # off (docs/design/scheduler.md §3.3).
+    prefill_decode_interval: int = 0
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -821,6 +824,12 @@ class ServerArgs:
     _speculative_widths_explicit: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
+    # Requests the per-request decode state (request slots, decode buffers,
+    # drafter state, decode graphs) is sized for, across attention-DP ranks.
+    # It is max_num_seqs, raised to one request per attention-TP peer per DP
+    # rank where the draft decode warmup runs (resolve_request_state_seqs).
+    # The scheduler still admits at most max_num_seqs.
+    request_state_seqs: int = dataclasses.field(default=0, init=False)
 
     @property
     def spec_context_pad(self) -> int:
@@ -848,8 +857,31 @@ class ServerArgs:
         self.resolve_communication()
         self.resolve_numerics()
         self.resolve_disaggregation()
+        self.resolve_request_state_seqs()
         self.validate_output_cumulative_probs()
         self.validate()
+
+    def resolve_request_state_seqs(self):
+        """Size per-request decode state for the draft decode warmup.
+
+        The warmup decodes one request per attention-TP peer on every DP rank,
+        so empty peers never skip the tuning collectives the others enter
+        (ModelExecutor.autotune). A smaller --max-num-seqs still caps the
+        requests the scheduler runs; only the state is sized for the warmup.
+        """
+        self.request_state_seqs = self.max_num_seqs
+        if (
+            self.speculative_algorithm is not None
+            and self.disaggregation_mode != "prefill"
+        ):
+            warmup_seqs = self.mapping.attn.dp_size * self.mapping.attn.tp_size
+            if self.max_num_seqs < warmup_seqs:
+                logger.info(
+                    f"Sizing per-request decode state for {warmup_seqs} requests "
+                    "(one per attention-TP peer for the draft decode warmup); "
+                    f"the scheduler runs at most --max-num-seqs {self.max_num_seqs}"
+                )
+                self.request_state_seqs = warmup_seqs
 
     def validate_output_cumulative_probs(self):
         from tokenspeed.runtime.utils.env import envs
@@ -2695,6 +2727,14 @@ class ServerArgs:
             raise ValueError("--input-logprob-chunk-tokens must be positive")
         if self.chunk_prefill_kv_size is not None and self.chunk_prefill_kv_size <= 0:
             raise ValueError("--chunk-prefill-kv-size must be positive")
+        if self.prefill_decode_interval < 0:
+            raise ValueError("--prefill-decode-interval must be non-negative")
+        if self.prefill_decode_interval and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--prefill-decode-interval needs --disaggregation-mode null: a "
+                "prefill engine runs no decodes and a decode engine no local "
+                "prefill rounds"
+            )
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -2713,24 +2753,6 @@ class ServerArgs:
             )
 
         self.validate_model_update_options()
-
-        if (
-            self.speculative_algorithm is not None
-            and self.disaggregation_mode != "prefill"
-            and self.max_num_seqs is not None
-        ):
-            dp_size = self.mapping.attn.dp_size
-            tp_size = self.mapping.attn.tp_size
-            # Draft startup uses one request per TP peer, even when tactic
-            # profiling is disabled. Clamping would leave empty tuning peers;
-            # exceeding this capacity would overrun per-request decode state.
-            if self.max_num_seqs // dp_size < tp_size:
-                raise ValueError(
-                    "Speculative decode warmup requires max_num_seqs // "
-                    "data_parallel_size >= attn_tp_size, got "
-                    f"{self.max_num_seqs} // {dp_size} < {tp_size}. "
-                    f"Set --max-num-seqs to at least {dp_size * tp_size}."
-                )
 
         if self.mapping.has_attn_dp:
             if self.chunked_prefill_size > self.max_prefill_tokens:
@@ -2955,7 +2977,11 @@ class ServerArgs:
             metavar="MAX_NUM_SEQS",
             type=int,
             default=ServerArgs.max_num_seqs,
-            help="Maximum number of sequences to process concurrently.",
+            help="Maximum number of sequences to process concurrently. With "
+            "speculative decoding, the server still sizes per-request decode "
+            "state for at least one request per attention-TP peer per DP rank, "
+            "which the draft decode warmup needs, but the scheduler runs at "
+            "most this many.",
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -2993,6 +3019,17 @@ class ServerArgs:
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the "
             "same iteration. Not supported with aggregated DCP.",
+        )
+        parser.add_argument(
+            "--prefill-decode-interval",
+            type=int,
+            default=ServerArgs.prefill_decode_interval,
+            help="After a round that runs a prefill chunk, run this many decode "
+            "rounds before the next prefill round, unless no decode can run. "
+            "Every chunk starts a new interval, but no prompt is held back "
+            "more than this many decode rounds in total. Trades TTFT for "
+            "fewer decode stalls. Aggregated serving only. 0 (the default) is "
+            "off.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",

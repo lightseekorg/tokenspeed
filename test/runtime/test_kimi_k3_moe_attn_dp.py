@@ -122,7 +122,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     )
     monkeypatch.setitem(kimi_k3.global_server_args_dict, "enforce_eager", False)
     monkeypatch.setitem(kimi_k3.global_server_args_dict, "max_prefill_tokens", 8192)
-    monkeypatch.setitem(kimi_k3.global_server_args_dict, "max_num_seqs", 128)
+    monkeypatch.setitem(kimi_k3.global_server_args_dict, "request_state_seqs", 128)
     monkeypatch.setitem(
         kimi_k3.global_server_args_dict, "speculative_num_draft_tokens", 4
     )

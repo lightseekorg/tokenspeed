@@ -228,6 +228,19 @@ def request_length_limits(
     return max_model_len, max_req_input_len
 
 
+def scheduler_batch_slots(server_args: ServerArgs) -> int:
+    """Requests this rank's scheduler runs at once: --max-num-seqs per
+    attention-DP rank."""
+    return server_args.max_num_seqs // max(server_args.mapping.attn.dp_size, 1)
+
+
+def request_state_slots(server_args: ServerArgs) -> int:
+    """Requests this rank's per-request decode state is sized for:
+    ``ServerArgs.request_state_seqs`` per attention-DP rank, never fewer than
+    the scheduler runs."""
+    return server_args.request_state_seqs // max(server_args.mapping.attn.dp_size, 1)
+
+
 def scheduler_config_from_args(
     server_args,
     specs,
@@ -285,6 +298,7 @@ def scheduler_config_from_args(
         prefix_replay_tokens=prefix_replay_tokens,
         cache_groups=specs.cache_groups,
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+        prefill_decode_interval=server_args.prefill_decode_interval,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
         demote_superseded_state_checkpoints=_implied_scheduler_policy(
             server_args.writes_state_checkpoints_in_forward,
