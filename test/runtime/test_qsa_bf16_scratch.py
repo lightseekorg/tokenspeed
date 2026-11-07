@@ -322,7 +322,7 @@ def test_families_without_qsa_layers_refuse_the_scratch():
 # The attention leaf, through the real router and composite backend
 # ---------------------------------------------------------------------------
 
-# The stand-ins' math runs on a GPU when there is one; the code under test stays on CPU.
+# The attention stand-in computes on a GPU if present; the rest stays on CPU.
 _STAND_IN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
