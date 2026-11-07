@@ -291,3 +291,94 @@ def test_remote_admission_lands_the_state_in_slot_one_and_decodes_in_place(
         if step > 0:
             complete_decode("next", 200 + step)
     complete_decode("next", 210)
+
+
+def make_prefill_state_config(
+    drop_short_prompt_end_checkpoints: bool,
+) -> SchedulerConfig:
+    """A prefill server for a hybrid model (one History and one State group,
+    2-token pages) with the in-forward State checkpoint under an 8-token chunk
+    budget, so a prompt of 8 tokens or fewer has none."""
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefix_granularity = 2
+    cfg.max_scheduled_tokens = 8
+    cfg.max_batch_size = 1
+    cfg.num_device_pages = 65
+    cfg.num_snapshot_pages = 1  # the P role never retracts
+    cfg.disable_l2_cache = True
+    cfg.state_checkpoint_in_forward = True
+    cfg.drop_short_prompt_end_checkpoints = drop_short_prompt_end_checkpoints
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=2,
+            total_pages=65,
+            attn_kind=AttnKind.Full,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+        ),
+        CacheGroupConfig(
+            group_id="state",
+            block_granularity=0,
+            total_pages=65,
+            attn_kind=AttnKind.State,
+            transfer_policy=CacheTransferPolicy.LatestSnapshot,
+        ),
+    ]
+    return cfg
+
+
+def prefill_and_hand_off(
+    scheduler: Scheduler, request_id: str, tokens: list[int]
+) -> int:
+    """A prefill-server turn: the prompt's forwards, the hand-off to the decode
+    peer and the peer's ACK, which finishes the request. Returns where the
+    first forward resumed."""
+    scheduler.submit_requests([make_spec(request_id, tokens)])
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent(request_id)))
+    first_prefix = None
+    scheduled = 0
+    while scheduled < len(tokens):
+        [batch] = [
+            op for op in scheduler.next_execution_plan().forward if op.request_ids
+        ]
+        prefix = list(batch.extend_prefix_lens)[0]
+        first_prefix = prefix if first_prefix is None else first_prefix
+        scheduled = prefix + list(batch.input_lengths)[0]
+        result = ForwardEvent.ExtendResult()
+        result.request_id = request_id
+        result.tokens = [100] if scheduled == len(tokens) else []
+        scheduler.advance(ExecutionEvent().add_event(result))
+    handoff = scheduler.next_execution_plan().remote_decode
+    assert handoff is not None and list(handoff.request_ids) == [request_id]
+    scheduler.advance(ExecutionEvent().add_event(PD.SucceededEvent(request_id)))
+    return first_prefix
+
+
+@pytest.mark.parametrize("drop", [False, True])
+def test_a_prefill_server_can_drop_a_short_prompt_end(drop):
+    """``drop_short_prompt_end_checkpoints``: the 5-token prompt ends inside
+    its third page. Without the flag its finish publishes that end, where a
+    longer prompt resumes; with it only the full pages, which hold no state,
+    so the longer prompt starts over."""
+    scheduler = Scheduler(make_prefill_state_config(drop))
+    assert prefill_and_hand_off(scheduler, "short", [1, 2, 3, 4, 5]) == 0
+    resumed = prefill_and_hand_off(scheduler, "longer", [1, 2, 3, 4, 5, 6, 7])
+    assert resumed == (0 if drop else 5)
+
+
+def test_a_page_aligned_short_prompt_end_keeps_its_state():
+    scheduler = Scheduler(make_prefill_state_config(True))
+    prefill_and_hand_off(scheduler, "aligned", [1, 2, 3, 4])
+    assert prefill_and_hand_off(scheduler, "longer", [1, 2, 3, 4, 5, 6]) == 4
+
+
+def test_dropping_short_prompt_ends_takes_the_prefill_role_and_the_in_forward_checkpoint():
+    cfg = make_prefill_state_config(True)
+    cfg.state_checkpoint_in_forward = False
+    with pytest.raises(ValueError, match="requires state_checkpoint_in_forward"):
+        Scheduler(cfg)
+    cfg.state_checkpoint_in_forward = True
+    cfg.role = SchedulerConfig.Role.Fused
+    with pytest.raises(ValueError, match="P role only"):
+        Scheduler(cfg)
