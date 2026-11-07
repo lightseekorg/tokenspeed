@@ -1747,9 +1747,9 @@ def dsv4_linear_fp32(
 # activations first. A layer that keeps the weight split from
 # :func:`mv_weight_split` passes it to :func:`mv`, and the
 # registry can then run the product on BF16 tensor cores
-# (``triton_bf16x3_gemm_fp32``). From 17 to 96 rows, for weights of up to 256
-# rows (a multiple of 4) with K a multiple of 512 up to 8192, the registry runs
-# it on CUDA cores from the FP32 weight instead, with or without the split
+# (``triton_bf16x3_gemm_fp32``). Without a split, from 17 to 96 rows, for
+# weights of up to 256 rows (a multiple of 4) with K a multiple of 512 up to
+# 8192, the registry runs it on CUDA cores from the FP32 weight
 # (``gluon_simt_gemm_fp32``).
 
 # Registry signature of each served (x dtype, weight dtype) pair.

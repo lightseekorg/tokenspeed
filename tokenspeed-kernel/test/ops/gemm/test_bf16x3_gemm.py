@@ -439,7 +439,7 @@ def test_weight_split_is_made_under_a_kernel_preferred_for_some_rows(
             solution="test",
             format_signatures=gemm_triton._BF16_FP32_SIG,
             traits={"m_min": frozenset({17}), "m_max": frozenset({96})},
-            priority=Priority.SPECIALIZED + 1,
+            priority=Priority.SPECIALIZED + 3,
         ),
         stand_in,
     )
