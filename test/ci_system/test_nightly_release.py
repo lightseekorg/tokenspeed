@@ -96,7 +96,7 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
 def test_kernel_with_a_bare_local_label_or_pre_release_is_refused(project, kernel):
     # A label without a development number would satisfy the nightly's == pins,
     # and a pre-release is no nightly of that date: only a development suffix,
-    # labelled or not, carries over.
+    # labeled or not, carries over.
     path = project / "python/pyproject.toml"
     original = path.read_bytes()
     with pytest.raises(ValueError):

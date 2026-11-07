@@ -39,7 +39,7 @@ def prepare_nightly(root: Path, date: str, kernel_version: str) -> str:
         raise ValueError("Kernel nightly must have the same date as TokenSpeed")
     if kernel.pre is not None or (kernel.local is not None and kernel.dev is None):
         raise ValueError(
-            "Kernel nightly may only carry a development suffix, optionally labelled"
+            "Kernel nightly may only carry a development suffix, optionally labeled"
         )
     # A manual nightly built with a suffix (0.1.4.post20261108.dev1, or
     # 0.1.4.post20261108.dev0+fa4.fix) gives TokenSpeed the same suffix, and its

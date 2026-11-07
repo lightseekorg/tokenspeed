@@ -164,6 +164,10 @@ def _nightly_version_suffix() -> str:
     and the two combine (dev2+fa4 -> .dev2+fa4). The label never stands alone:
     0.1.4.post20261108+label would satisfy the nightly's ``==`` pins and be
     preferred over it.
+
+    Raises:
+        ValueError: If the suffix is set but blank, or its local label has no
+            letter or digit.
     """
     raw = os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX", "")
     suffix = raw.strip()
