@@ -19,6 +19,8 @@
 // SOFTWARE.
 
 #pragma once
+#include <unordered_set>
+#include "cache/core/session_cache_tag.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -34,6 +36,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
+#include "cache/prefix/boundary_tree.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -73,6 +76,7 @@ public:
         // an older epoch, CacheCoordinator::MarkSupersededStateInput); this
         // one never does.
         std::uint64_t max_access_epoch{0};
+        SessionCacheOwner session;
     };
 
     // Non-owning traversal state, bound on first use to one index/pool. The
@@ -135,11 +139,32 @@ public:
         }
     }
 
+    // Every entry of these tiers holds the boundary-tree node of its hash
+    // (BoundaryTree::Hold) for as long as it is indexed, so the node follows
+    // the entries: present on a tier while some group indexes the hash there,
+    // a checkpoint there while a State group does. `state` and `closed` give
+    // this group's kind. The coordinator binds each index once, before
+    // anything is registered; an index never bound holds nothing.
+    void TrackBoundaries(BoundaryTree& tree, const BlockPool& device_pool, const BlockPool* host_pool, bool state,
+                         bool closed) {
+        const auto bind = [&](const BlockPool& pool, CacheTier tier) {
+            CacheEntries& cache_index = cacheEntries(pool);
+            _assert(cache_index.boundary_tree == nullptr && cache_index.entries.empty(),
+                    "an index tier binds its boundary tree once, before anything is registered");
+            cache_index.boundary_tree = &tree;
+            cache_index.boundary_kind = BoundaryTree::EntryKind{.tier = tier, .state = state, .closed = closed};
+        };
+        bind(device_pool, CacheTier::kDevice);
+        if (host_pool != nullptr) {
+            bind(*host_pool, CacheTier::kHost);
+        }
+    }
+
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
                   std::int32_t logical_block_index, CacheBoundaryKind boundary_kind,
-                  std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached) {
+                  std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached, SessionCacheOwner session) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         _assert(pool.BoundGroup(block_ref->Location().lcm_block_id) == group_id_,
                 "cache block must belong to the prefix index group");
@@ -151,6 +176,7 @@ public:
             if (existing_it->boundary_kind < boundary_kind) {
                 existing_it->boundary_kind = boundary_kind;
             }
+            mergeSession(*existing_it, session);
             touchEntry(cache_index, existing_it, access_epoch);
             return;
         }
@@ -159,6 +185,7 @@ public:
             if (canonical_it->boundary_kind < boundary_kind) {
                 canonical_it->boundary_kind = boundary_kind;
             }
+            mergeSession(*canonical_it, session);
             touchEntry(cache_index, canonical_it, access_epoch);
             block_ref = canonical_it->block_ref;
             return;
@@ -167,15 +194,21 @@ public:
         CacheEntry& entry = cache_index.entries.emplace_back();
         entry.key = key;
         entry.block_ref = block_ref;
-        entry.last_access_epoch = access_epoch;
+        entry.last_access_epoch = session && session->demoted ? 0 : access_epoch;
         entry.logical_block_index = logical_block_index;
         entry.boundary_kind = boundary_kind;
         entry.max_access_epoch = access_epoch;
         entry.available_order = &cache_index.available_order;
+        entry.session = std::move(session);
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
         cache_index.available_order.emplace(evictionOrder(*entry_it), entry_it);
+        if (cache_index.boundary_tree != nullptr) {
+            // The tree keys its nodes by content hash alone.
+            _assert(key.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
+            entry_it->boundary = cache_index.boundary_tree->HoldEntry(key.content_hash, cache_index.boundary_kind);
+        }
         linkCommonEntry(cache_index, entry_it);
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
@@ -189,7 +222,7 @@ public:
     void RegisterFullBlocks(const BlockPool& pool, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
                             std::uint64_t access_epoch, std::int32_t first_logical_block,
                             CacheBoundaryKind boundary_kind,
-                            std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached) {
+                            std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached, SessionCacheOwner session) {
         _assert(first_logical_block >= 0, "first_logical_block must be >= 0");
         _assert(blocks.size() == keys.size(), "one key per published block");
         for (std::size_t j = 0; j < keys.size(); ++j) {
@@ -198,7 +231,7 @@ public:
                 continue;
             }
             Register(pool, block_ref, keys[j], access_epoch, first_logical_block + static_cast<std::int32_t>(j),
-                     boundary_kind, newly_cached);
+                     boundary_kind, newly_cached, session);
         }
     }
 
@@ -423,6 +456,40 @@ public:
         return candidates;
     }
 
+    // Adjust LRU only. Active requests and transfers keep their references;
+    // shared or untagged prefixes keep their existing eviction order.
+    std::size_t DemoteSession(const BlockPool& pool, const SessionCacheOwner& session) {
+        return DemoteSessions(pool, {session.get()});
+    }
+    std::size_t DemoteSessions(const BlockPool& pool, const std::unordered_set<const SessionCacheTag*>& sessions) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (!cache_index) return 0;
+        std::size_t changed = 0;
+        for (auto it = cache_index->entries.begin(); it != cache_index->entries.end(); ++it) {
+            if (!it->session || !sessions.contains(it->session.get()) || !it->block_ref.unique() ||
+                it->last_access_epoch == 0) {
+                continue;
+            }
+            touchEntry(*cache_index, it, 0);
+            ++changed;
+        }
+        return changed;
+    }
+
+    // The key of the entry at `location` when Evict would take it: the index
+    // is its block's only owner.
+    std::optional<CacheKey> UnpinnedKeyAt(const BlockPool& pool, CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        const ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
+            return std::nullopt;
+        }
+        return entry_it->key;
+    }
+
     std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {
         CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
@@ -464,7 +531,7 @@ public:
     // Pins the probed hits: marks them acquired at access_epoch and returns
     // owning references aligned with probe.hits.
     PrefixMatch AcquireMatched(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                               const GroupPrefixProbe& probe, std::uint64_t access_epoch) {
+                               const GroupPrefixProbe& probe, std::uint64_t access_epoch, SessionCacheOwner session) {
         _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
                 "matched block range is out of bounds");
         PrefixMatch match;
@@ -479,10 +546,32 @@ public:
             _assert(entry_it != cache_index->entries.end(),
                     "cached block disappeared between match probe and acquisition");
             entry_it->was_acquired = true;
+            mergeSession(*entry_it, session);
             touchEntry(*cache_index, entry_it, access_epoch);
             match.blocks[i] = entry_it->block_ref;
         }
         return match;
+    }
+
+    // Present source blocks refresh matching entries without pinning or inserting them.
+    // Reuse by another or untagged owner also clears exclusivity on this tier.
+    void TouchExisting(const BlockPool& pool, std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks,
+                       std::uint64_t access_epoch, SessionCacheOwner session) {
+        _assert(blocks.size() <= keys.size(), "source block span exceeds key span");
+        CacheEntries* entries = findCacheEntries(pool);
+        if (entries == nullptr) {
+            return;
+        }
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            if (!blocks[i]) {
+                continue;
+            }
+            auto entry = findEntry(*entries, keys[i]);
+            if (entry != entries->entries.end()) {
+                mergeSession(*entry, session);
+                touchEntry(*entries, entry, std::max(entry->last_access_epoch, access_epoch));
+            }
+        }
     }
 
     std::vector<CacheBlockLocation> MatchedLocations(const BlockPool& pool, std::span<const CacheKey> keys,
@@ -522,7 +611,15 @@ private:
         EvictionOrderMap::node_type pinned_order;
         CacheBlockUniqueObserver unique_observer;
         CacheEntry* common_peer{nullptr};
+        SessionCacheOwner session;
+        // The entry's claim on the boundary-tree node of its hash, in a bound
+        // index (TrackBoundaries): dropped with the entry.
+        BoundaryTree::Hold boundary;
     };
+
+    static void mergeSession(CacheEntry& entry, const SessionCacheOwner& session) {
+        if (entry.session != session) entry.session.reset();
+    }
 
     struct CacheEntries {
         // Owns each CacheEntry once. The maps are non-owning secondary indices
@@ -540,6 +637,10 @@ private:
         CacheEntries* common_peer{nullptr};
         bool common_source{false};
         EvictionOrderMap common_order;
+        // TrackBoundaries: the tree each entry holds a node of, and what an
+        // entry of this tier stands for there.
+        BoundaryTree* boundary_tree{nullptr};
+        BoundaryTree::EntryKind boundary_kind{};
     };
 
     void linkCommonEntry(CacheEntries& cache_index, CacheEntryIterator entry) {
@@ -556,6 +657,8 @@ private:
         CacheEntries& source = cache_index.common_source ? cache_index : peer;
         const auto source_entry = cache_index.common_source ? entry : other;
         source.common_order.emplace(evictionOrder(*source_entry), source_entry);
+        // The source side counts the pair in the node.
+        source_entry->boundary.SetPaired(true);
     }
 
     static void restoreAvailable(void* context) noexcept {
@@ -570,6 +673,7 @@ private:
             .boundary_kind = cache_entry.boundary_kind,
             .was_acquired = cache_entry.was_acquired,
             .max_access_epoch = cache_entry.max_access_epoch,
+            .session = cache_entry.session,
         };
     }
     static EvictionOrder evictionOrder(const CacheEntry& cache_entry) {
@@ -587,6 +691,7 @@ private:
     // back of an LRU list would not preserve this order.
     void touchEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch) {
         entry_it->max_access_epoch = std::max(entry_it->max_access_epoch, access_epoch);
+        if (entry_it->session && entry_it->session->demoted) access_epoch = 0;
         if (entry_it->last_access_epoch == access_epoch) {
             return;
         }
@@ -643,7 +748,9 @@ private:
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
         if (CacheEntry* peer = entry_it->common_peer) {
             CacheEntries& source = cache_index.common_source ? cache_index : *cache_index.common_peer;
-            source.common_order.erase(evictionOrder(cache_index.common_source ? *entry_it : *peer));
+            CacheEntry& source_entry = cache_index.common_source ? *entry_it : *peer;
+            source.common_order.erase(evictionOrder(source_entry));
+            source_entry.boundary.SetPaired(false);
             peer->common_peer = nullptr;
         }
         entry_it->unique_observer.Reset();

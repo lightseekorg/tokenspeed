@@ -36,6 +36,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.kda._triton.prefill_scan_inputs import (
     prepare_capacity_scan,
@@ -61,7 +62,11 @@ _SUPPORTED_ARCHES = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
 def cutedsl_kda_supported() -> bool:
     """Whether the current platform supports the packaged CuteDSL KDA kernel."""
     platform = current_platform()
-    return platform.is_nvidia and platform.arch_version in _SUPPORTED_ARCHES
+    return (
+        platform.is_nvidia
+        and platform.arch_version in _SUPPORTED_ARCHES
+        and has_optional_package("tokenspeed_cutedsl_kda")
+    )
 
 
 if cutedsl_kda_supported():

@@ -20,6 +20,7 @@
 import math
 
 import torch
+from tokenspeed_kernel._optional import has_fa4_cute
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -30,7 +31,7 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
-if platform.is_nvidia and platform.is_blackwell:
+if platform.is_nvidia and platform.is_blackwell and has_fa4_cute():
     from flash_attn.cute import flash_attn_varlen_func
 
     # Relative-attention kernels support both SM100 and SM103.

@@ -47,7 +47,7 @@ def registry(monkeypatch):
     registry = KernelRegistry()
     monkeypatch.setattr(KernelRegistry, "_instance", registry)
     monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
-    monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "sorted")
+    monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "selection")
     return registry
 
 
@@ -75,7 +75,7 @@ def _register(registry, invariant, *, graph):
                 features=(frozenset({"batch_invariant"}) if invariant else frozenset())
                 | (frozenset({"cuda_graph"}) if graph else frozenset()),
                 traits={
-                    "slot_order": frozenset({"sorted"}),
+                    "slot_order": frozenset({"selection"}),
                     "q_len": frozenset({1, 2}),
                 },
             ),
@@ -152,7 +152,7 @@ def test_sparse_plans_keep_their_provider_across_batches_and_registry_changes(re
         qk_rope_head_dim=64,
         softmax_scale=192**-0.5,
         page_size=64,
-        slot_order="sorted",
+        slot_order="selection",
     )
     expected = dsa_prefill(
         q,
@@ -194,3 +194,19 @@ def test_sparse_plans_decide_decode_graph_capture(registry, graph):
     assert support.decode_graph is graph
     # DSA keeps prefills eager whatever the planned leaf declares.
     assert not support.prefill_graph
+
+
+def test_pinned_prefill_plan_keeps_its_core_for_kvp_prefill(registry):
+    _register(registry, True, graph=False)
+    backend = _backend()
+    assert backend.prefill_kernel_plan is not None
+    # The rank-major query layout would replace the pinned plan's sparse core.
+    assert backend.kvp_prefill_query_layout is False
+
+
+def test_unplanned_leaf_takes_the_kvp_prefill_query_layout(registry, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
+    monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "selection")
+    backend = _backend()
+    assert backend.prefill_kernel_plan is None
+    assert backend.kvp_prefill_query_layout is True

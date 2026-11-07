@@ -91,6 +91,9 @@ wire_struct! {
         pub output_top_logprobs_idx: Vec<Vec<Vec<i32>>> = Vec::new(),
         /// Resident LCM blocks, including reclaimable prefix-cache entries.
         pub kv_used_pages: i64 = 0,
+        /// Selected tokens' cumulative probability mass, parallel to the
+        /// logprob rows. Empty for the frame when diagnostics are disabled.
+        pub output_token_cumulative_probs_val: Vec<Vec<f64>> = Vec::new(),
     }
 }
 
@@ -128,6 +131,9 @@ pub struct RequestOutput<'a> {
     pub cached_tokens: i64,
     /// Logprobs of this step's tokens; empty when not requested.
     pub output_token_logprobs: &'a [f64],
+    /// Cumulative probability mass of this step's selected tokens; empty
+    /// without diagnostics or logprobs.
+    pub output_token_cumulative_probs: &'a [f64],
     /// The finish reason in full, once the request ended (from a producer
     /// that sends it).
     pub finish_details: Option<&'a FinishDetails>,
@@ -195,6 +201,10 @@ impl BatchTokenIDOutSlim {
                 "output_top_logprobs_idx",
                 self.output_top_logprobs_idx.len(),
             ),
+            (
+                "output_token_cumulative_probs_val",
+                self.output_token_cumulative_probs_val.len(),
+            ),
         ];
         if let Some((name, found)) = optional
             .iter()
@@ -203,6 +213,20 @@ impl BatchTokenIDOutSlim {
             return Err(Error::Invalid(format!(
                 "column `{name}` has {found} entries for {len} requests"
             )));
+        }
+        for (i, probs) in self.output_token_cumulative_probs_val.iter().enumerate() {
+            if !probs.is_empty()
+                && (probs.len() != self.output_ids[i].len()
+                    || probs.len() != self.output_token_logprobs_val[i].len())
+            {
+                return Err(Error::Invalid(format!(
+                    "request {} has {} cumulative probabilities for {} tokens and {} logprobs",
+                    rids[i],
+                    probs.len(),
+                    self.output_ids[i].len(),
+                    self.output_token_logprobs_val[i].len()
+                )));
+            }
         }
         fn pair<'a, A, B>(
             values: &'a [Vec<A>],
@@ -219,6 +243,10 @@ impl BatchTokenIDOutSlim {
             completion_tokens: self.completion_tokens[i],
             cached_tokens: self.cached_tokens[i],
             output_token_logprobs: &self.output_token_logprobs_val[i],
+            output_token_cumulative_probs: self
+                .output_token_cumulative_probs_val
+                .get(i)
+                .map_or(&[], Vec::as_slice),
             finish_details: self.finish_reason_details.get(i).and_then(Option::as_ref),
             spec_verify_ct: self.spec_verify_ct.get(i).copied(),
             accept_draft_tokens: self.accept_draft_tokens.get(i).copied().flatten(),

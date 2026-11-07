@@ -65,11 +65,13 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
+        input_vocab_size: int,
         vocab_size: int,
         output_length: int,
         device: str = "cuda",
     ):
         self.device = device
+        self.input_vocab_size = input_vocab_size
         self.vocab_size = vocab_size
         self.ngram_accepted_tokens: torch.Tensor | None = None
         self.ngram_needs_seed: torch.Tensor | None = None
@@ -568,7 +570,9 @@ class RuntimeStates:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         self.future_input_map[req_pool_idx, :width] = ids
-        self.spec_candidates_ready[req_pool_idx] = True
+        # fill_, not `[req_pool_idx] = True`: assigning a Python scalar stages
+        # it through a pageable host tensor, a host sync on the forward thread.
+        self.spec_candidates_ready[req_pool_idx].fill_(True)
         # The candidates come without their draft distribution; the row's
         # draft_probs still hold the sentinel reset_states wrote when the
         # remote cache length was seeded, so the first local verify rejects

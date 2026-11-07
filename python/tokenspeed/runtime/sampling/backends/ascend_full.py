@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 from tokenspeed_kernel.ops.sampling.ascend import (
     SamplingWorkspace,
@@ -42,12 +43,14 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.backends.full_base import FullSamplingBackendBase
 from tokenspeed.runtime.sampling.dp_sampling_config import slice_dp_vocab_mask
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
+from tokenspeed.runtime.sampling.sampling_params import _TOP_K_DISABLED
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
     from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
@@ -61,7 +64,17 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
     """
 
     _SUPPORTS_DP_VERIFY = True
+    _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     supports_tree_verify = False
+    top_k_exclusive_max = None
+    _MAX_TOP_K = 4096
+
+    def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
+        # Clamp before the int32 pool write, including values larger than
+        # int32. The disabled sentinel must retain whole-vocabulary sampling.
+        if sp.top_k != _TOP_K_DISABLED and sp.top_k > self._MAX_TOP_K:
+            sp = msgspec.structs.replace(sp, top_k=self._MAX_TOP_K)
+        super()._reset_slot(pool_idx, sp)
 
     def _create_capture_generator(
         self, config: SamplingBackendConfig
@@ -155,9 +168,9 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        ).float()
+        # The executor's NanGuard audits and sanitizes these logits before
+        # sampling. A second host-side tensor truth test cannot be captured.
+        logits = logits_output.next_token_logits.float()
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
                 logits=logits, vocab_mask=sampling_info.vocab_mask
@@ -277,9 +290,7 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
             accept_length_local = self._accept_length_buf[:local_bs]
 
         accept_index_local.fill_(-1)
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        ).float()
+        logits = logits_output.next_token_logits.float()
         expected_rows = local_bs * num_tokens_per_req
         if logits.shape[0] != expected_rows:
             raise RuntimeError(
@@ -317,7 +328,7 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
         accept_length_local += 1
 
         logprobs_local = None
-        if raw_logits is not None:
+        if raw_logits is not None and dp_sampling:
             logprobs_local = gather_token_logprobs(
                 raw_logits,
                 predict_local.long(),
@@ -345,8 +356,14 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
             predict = predict_local
             accept_length = accept_length_local
             self.maybe_broadcast(predict, accept_index_local, accept_length)
-            if logprobs_local is not None:
-                logits_output.next_token_logprobs = logprobs_local.reshape(-1)
+            if raw_logits is not None:
+                # Replicated TP agrees on the token before scoring it. Compute
+                # the same logprob once, for the token the caller receives.
+                logits_output.next_token_logprobs = gather_token_logprobs(
+                    raw_logits,
+                    predict.long(),
+                    logprob_order=self.config.logprob_order,
+                )
             count_pool_indices = pool_indices_local
 
         self._accumulate_accepted_prefix(

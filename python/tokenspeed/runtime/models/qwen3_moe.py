@@ -39,7 +39,6 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.qwen3 import (
     Qwen3DecoderLayer,
     Qwen3ForCausalLM,
-    Qwen3MLP,
     Qwen3Model,
 )
 from tokenspeed.runtime.models.qwen3_5_moe import (
@@ -74,7 +73,7 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
                 layer_index=layer_id,
                 prefix=add_prefix("mlp", prefix),
             )
-        elif isinstance(self.mlp, Qwen3MLP):
+        else:
             self.mlp = Qwen3_5MoeMLP(
                 parallelism="dense",
                 hidden_size=config.hidden_size,

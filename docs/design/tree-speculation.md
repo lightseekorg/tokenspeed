@@ -65,6 +65,12 @@ kernel. Verify runs it with `R = W = N`. Draft lanes run it with `R = K`
 over the `(S - 1) * K`-key lane window (below). There is no size-dependent
 second path.
 
+The `mha` leaf (the AMD path) runs the same cascade with a portable prefix
+half: the Triton extend, causal over `q_len = R` rows with its log-sum-exp
+(scaled to base 2 for the merge). It is pinned to Triton because its causal
+mask keeps row `r` at key `P - R + r` even when `P < R`, which the window
+kernel's merge assumes.
+
 Lanes that carry per-row tables (`TreeCascadeRows.row_page_table`) let a
 sliding-window draft layer see in every lane row the window frozen at the
 round's prefix end: each row decodes the prefix alone (`q_len = 1` at the
@@ -110,9 +116,26 @@ never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
 the chunked form of the delta rule, every node at once with the ancestor mask
 in place of the causal one, and keeps no node states; it also writes each
 node's replay payload row (`[k | v | a | b]`) as it reads them, so that verify
-skips the q/k/v split. In other
-trees the state of every branch point (a node with a child other than the next
-node) goes to one workspace shared by all layers
+skips the q/k/v split.
+On supported NVIDIA geometry, the kernel registry prefers the CuTe DSL WY leaf
+for short chains and 8–16-node output-only trees. Head dimensions, token count,
+output-only execution and tree support are selection traits shared by runtime
+capability queries and the actual verify call; the runtime does not choose a
+WY-specific solution. It computes the same operation with native TF32 MMA and
+can fill the same replay payload; state ownership and replay commit stay the
+same. Chains and trees enter through `gdn_decode_mtp`; the runtime passes no
+ancestor mask for a chain. The kernel package owns selection between CuTe WY,
+the Triton chunked chain and general MTP, including any one-path mask used
+internally by the fallback. Capability queries use that same selection
+contract, including the pool's state dtype. Selected implementations prepare
+their finite compilation variants during the normal startup forward under
+`kernel_warmup`; the runtime neither dispatches a vendor solution nor builds
+special warmup launches. Unsupported geometry or platforms use normal registry
+fallback. Automatic BF16 state writes require the kernel package's
+`padding_safe` capability; read-only verify leaves the
+null page untouched and ignores padded outputs. In other trees the state of
+every branch point (a node with a child other than the next node) goes to one
+workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
 and a branch reloads its parent from there. Mamba2 has no such workspace: its
 elementwise update lets a branch replay the parent's ancestors over the read
@@ -211,7 +234,7 @@ executor refuses tree drafting with them at startup.
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup) and EAGLE4; `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
-attention backend, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
+attention backend, the `mha` backend with bf16 KV, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
@@ -255,6 +278,8 @@ workspace), so nothing here is a cache group for the C++ scheduler to own.
 * `test/runtime/test_tree_attention_cascade.py` — verify and lanes through the
   `trtllm`, `trtllm_mla`, and `tokenspeed_mla` leaves (each leaf's prefix decode plus
   the window kernel) against fp32.
+* `test/runtime/test_tree_attention_cascade_mha.py` — the same through the
+  `mha` leaf's Triton prefix half.
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.
 * `test/runtime/test_tree_spec.py` — hidden-row and position compaction; the

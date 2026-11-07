@@ -278,6 +278,7 @@ class _PrimTSQSARunner:
             offsets = _group_offsets(metadata.query_start_loc, group_size)
             qo_indptr = torch.tensor(offsets, dtype=torch.int32, device=self._device)
             max_kv = metadata.block_table.shape[1] * page_size
+            # Completed current blocks compete for top-k; only a partial tail is appended.
             size = get_q_token_kv_block_sparse_workspace_size(
                 q,
                 k,
@@ -286,10 +287,11 @@ class _PrimTSQSARunner:
                 max_seq_len_kv=max_kv,
                 o_data_type=q.dtype,
                 qo_indptr=qo_indptr,
-                seq_len_q=group_size,
+                group_size=group_size,
                 kv_block_size=metadata.block_size,
                 split_kv=False,
                 share_pattern_across_kv_heads=True,
+                count_current_block_in_topk=True,
             )
             if size > self._workspace.numel():
                 # Older plans retain their allocation, including plans owned
@@ -305,7 +307,6 @@ class _PrimTSQSARunner:
             wrapper = QTokenKvBlockSparsePagedTSWrapper()
             wrapper.plan(
                 len(offsets) - 1,
-                group_size,
                 q.shape[1],
                 k.shape[1],
                 q.shape[2],
@@ -315,9 +316,11 @@ class _PrimTSQSARunner:
                 max_kv,
                 device=self._device,
                 workspace_buffer=self._workspace,
+                group_size=group_size,
                 use_packed_q=True,
                 split_kv=False,
                 share_pattern_across_kv_heads=True,
+                count_current_block_in_topk=True,
                 mask_type="causal",
                 q_data_type=q.dtype,
                 kv_data_type=k.dtype,

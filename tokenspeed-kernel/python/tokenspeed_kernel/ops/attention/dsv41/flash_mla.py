@@ -26,6 +26,7 @@ from types import ModuleType
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _PAGED_FORMATS,
     _copy_attention_heads,
@@ -39,7 +40,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _FLASH_MLA_API: ModuleType | None = None
-if current_platform().is_hopper_plus:
+if current_platform().is_hopper_plus and has_optional_package("flash_mla"):
     import flash_mla.flash_mla_interface as _FLASH_MLA_API
     from flash_mla import fused_norm_rope_attn_rope_cast as _fused_v41  # noqa: F401
 

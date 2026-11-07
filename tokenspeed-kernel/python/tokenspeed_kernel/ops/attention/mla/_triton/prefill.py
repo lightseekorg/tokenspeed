@@ -70,6 +70,10 @@ def _mla_prefill_kernel(
     q_len = tl.load(cu_seqlens_q + cur_seq + 1) - q_start
     kv_start = tl.load(cu_seqlens_kv + cur_seq)
     kv_len = tl.load(cu_seqlens_kv + cur_seq + 1) - kv_start
+    # (start + token) * per-token stride passes 2**31 elements in batches
+    # a public caller can reach; keep the addressing bases in int64.
+    q_start = q_start.to(tl.int64)
+    kv_start = kv_start.to(tl.int64)
     if HAS_QUERY_START_OFFSETS:
         q_causal_start = tl.load(query_start_offsets + cur_seq)
     else:

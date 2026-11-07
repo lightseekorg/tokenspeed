@@ -60,18 +60,23 @@ from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
     "PAD_SLOT_ID",
+    "PREFILL_QKV_CHANNEL_MULTIPLE",
     "_inkling_ring_commit_kernel",
     "_inkling_ring_sconv_decode_kernel",
     "_inkling_ring_sconv_prefill_kernel",
     "dflash2_grouped_conv",
     "select_prefill_config",
     "triton_causal_conv1d_prefill",
+    "triton_causal_conv1d_prefill_qkv",
     "triton_causal_conv1d_update",
 ]
 
 _CONV_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
 # Channels per program of the sequential update, one per thread.
 _UPDATE_BLOCK_CHANNELS = 128
+# Channels per program of the varlen prefill.
+_PREFILL_BLOCK_CHANNELS = 256
+PREFILL_QKV_CHANNEL_MULTIPLE = _PREFILL_BLOCK_CHANNELS
 
 
 @functools.cache
@@ -146,19 +151,56 @@ def triton_causal_conv1d_prefill(
         Read-only program mapping built once with this forward's sequence
         boundaries and shared by all recurrent-attention layers.
 
-    out: same shape as `x`
+    out: same shape as `x`, with contiguous channels in each token row
     """
+    out = torch.empty((x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device).T
+    _launch_causal_conv1d_prefill(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        activation,
+        pad_slot_id,
+        validate_data,
+        prefill_metadata,
+        out,
+    )
+    return out
+
+
+def _launch_causal_conv1d_prefill(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    cache_indices,
+    has_initial_state,
+    activation,
+    pad_slot_id,
+    validate_data,
+    prefill_metadata,
+    out,
+    split_out=None,
+):
     enable_pdl = pdl_enabled()
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
     batch_ptr = prefill_metadata.batch_indices
     token_chunk_offset_ptr = prefill_metadata.chunk_offsets
     if batch_ptr.device != x.device or token_chunk_offset_ptr.device != x.device:
         raise ValueError("convolution metadata must be on the input device")
     if batch_ptr.numel() == 0:
-        return out
+        return
+
+    split_args = {}
+    if split_out is not None:
+        o_k, o_v, key_dim = split_out
+        split_args = {"o_k_ptr": o_k, "o_v_ptr": o_v, "SPLIT_KEY_DIM": key_dim}
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
@@ -219,7 +261,7 @@ def triton_causal_conv1d_prefill(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
-    grid = (batch_ptr.numel(), triton.cdiv(dim, 256))
+    grid = (batch_ptr.numel(), triton.cdiv(dim, _PREFILL_BLOCK_CHANNELS))
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -260,12 +302,75 @@ def triton_causal_conv1d_prefill(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         BLOCK_M=prefill_metadata.block_m,
-        BLOCK_N=256,
+        BLOCK_N=_PREFILL_BLOCK_CHANNELS,
         num_stages=2,
         ENABLE_PDL=enable_pdl,
+        **split_args,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
-    return out
+
+
+@register_kernel(
+    "conv",
+    "causal_conv1d_prefill_qkv",
+    name="triton_causal_conv1d_prefill_qkv",
+    solution="triton",
+    signatures=format_signatures("x", "dense", _CONV_DTYPES),
+    priority=Priority.PORTABLE,
+)
+def triton_causal_conv1d_prefill_qkv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
+    key_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``triton_causal_conv1d_prefill`` written straight to contiguous q, k, v rows.
+
+    The packed ``[q | k | v]`` channels of ``x`` (``(dim, cu_seqlen)``, channel
+    last) leave as ``[cu_seqlen, key_dim]``, ``[cu_seqlen, key_dim]`` and
+    ``[cu_seqlen, dim - 2 * key_dim]`` tensors with the values the packed
+    output followed by a q/k/v split would hold. ``key_dim`` and the value
+    width must be multiples of ``PREFILL_QKV_CHANNEL_MULTIPLE``.
+    """
+    dim, cu_seqlen = x.shape
+    value_dim = dim - 2 * key_dim
+    if (
+        key_dim <= 0
+        or value_dim <= 0
+        or key_dim % _PREFILL_BLOCK_CHANNELS
+        or value_dim % _PREFILL_BLOCK_CHANNELS
+    ):
+        raise ValueError(
+            f"q/k/v widths {key_dim}, {key_dim}, {value_dim} must be positive "
+            f"multiples of {_PREFILL_BLOCK_CHANNELS}"
+        )
+    q = x.new_empty((cu_seqlen, key_dim))
+    k = x.new_empty((cu_seqlen, key_dim))
+    v = x.new_empty((cu_seqlen, value_dim))
+    _launch_causal_conv1d_prefill(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        activation,
+        pad_slot_id,
+        False,
+        prefill_metadata,
+        q,
+        split_out=(k, v, key_dim),
+    )
+    return q, k, v
 
 
 @register_kernel(

@@ -29,9 +29,14 @@ Integration contract:
   and the current speculative branch. Refresh pointer-stable input buffers for
   eager and graph forwards alike. Models receive prepared hashes and masks;
   never put request tensors in ForwardContext.
-* Hidden states, hashes and masks must be replicated within mapping.attn.tp_group.
+* Hidden states, hashes and masks share the query row layout. Without QCP they
+  are replicated within mapping.attn.tp_group; QCP lookup gathers hash IDs and
+  reduce-scatters the table contributions back to local query rows.
   GPU-resident tables are row-sharded across attention TP and all-reduced.
-  Host tables stay in anonymous or shared host memory and gather through UVA.
+  Host tables stay in anonymous or shared host memory, one packed
+  [codes | scales] row per entry, and gather through UVA. Their GPU
+  registrations are released before their backing memory is freed. When a
+  rank holds every row it looks up, the gather emits wkv's MXFP8 input directly.
   ``shared`` keeps one full copy per node and skips the lookup all-reduce.
   ``sharded`` keeps a host shard per attention-TP rank and retains the all-reduce.
   ``auto`` selects sharded when attention TP > 1. Output matches the GPU path.
@@ -56,6 +61,7 @@ import os
 import shutil
 import sys
 import tempfile
+import weakref
 from dataclasses import dataclass
 
 import numpy as np
@@ -71,7 +77,13 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.comm_ops import all_reduce, prepare_all_reduce_lane
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_reduce,
+    prepare_all_reduce_lane,
+    token_all_gather_rows,
+    token_reduce_scatter,
+)
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -491,6 +503,12 @@ class RowShardedEngramEmbedding(nn.Module):
         self.layer_id = layer_id
         self._mmap_keep: list[object] = []
         self._host_gpu_registered = False
+        # A host table holding every row its rank looks up (one shared copy, or
+        # a single attention-TP rank) needs no reduction, so its rows can feed
+        # wkv as MXFP8 directly.
+        self.serves_mxfp8_rows = host_table and (
+            host_layout == "shared" or mapping.attn.tp_size == 1
+        )
         row_sharded = (not host_table) or host_layout == "sharded"
         if row_sharded:
             self.part_num_embeddings = (
@@ -510,44 +528,43 @@ class RowShardedEngramEmbedding(nn.Module):
             and torch.distributed.get_world_size() > 1
         )
         self._shared_writer = (not shared_file) or _is_host_table_writer(mapping)
+        # Host rows keep each row's codes and scales side by side: a random-row
+        # gather over UVA is bound by address translation, one host page per
+        # row, so a packed row costs one lookup instead of two. weight and
+        # scale are column views of it.
+        self.packed: torch.Tensor | None = None
         if host_table:
-            weight_path = ""
-            scale_path = ""
-            weight_shape = (self.part_num_embeddings, embedding_dim)
-            scale_shape = (self.part_num_embeddings, embedding_dim // 32)
-            if shared_file:
-                weight_bytes = _host_table_nbytes(weight_shape, torch.float8_e4m3fn)
-                scale_bytes = _host_table_nbytes(scale_shape, torch.uint8)
-                weight_path = _engram_host_table_path(layer_id, "weight", weight_bytes)
-                scale_path = _engram_host_table_path(layer_id, "scale", scale_bytes)
-                if self._shared_writer:
-                    _create_host_file(weight_path, weight_bytes)
-                    _create_host_file(scale_path, scale_bytes)
-                torch.distributed.barrier()
-            weight, weight_mmap = _allocate_host_bytes(
-                weight_shape,
-                torch.float8_e4m3fn,
-                device,
-                shared_file,
-                weight_path,
+            packed_path = ""
+            packed_shape = (
+                self.part_num_embeddings,
+                embedding_dim + embedding_dim // 32,
             )
-            scale, scale_mmap = _allocate_host_bytes(
-                scale_shape,
+            if shared_file:
+                packed_bytes = _host_table_nbytes(packed_shape, torch.uint8)
+                packed_path = _engram_host_table_path(layer_id, "packed", packed_bytes)
+                if self._shared_writer:
+                    _create_host_file(packed_path, packed_bytes)
+                torch.distributed.barrier()
+            self.packed, packed_mmap = _allocate_host_bytes(
+                packed_shape,
                 torch.uint8,
                 device,
                 shared_file,
-                scale_path,
+                packed_path,
             )
-            for keep in (weight_mmap, scale_mmap):
-                if keep is not None:
-                    self._mmap_keep.append(keep)
-            self.weight = nn.Parameter(weight, requires_grad=False)
-            self.scale = nn.Parameter(scale, requires_grad=False)
+            if packed_mmap is not None:
+                self._mmap_keep.append(packed_mmap)
+            self.weight = nn.Parameter(
+                self.packed[:, :embedding_dim].view(torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.scale = nn.Parameter(
+                self.packed[:, embedding_dim:], requires_grad=False
+            )
             if shared_file:
                 torch.distributed.barrier()
                 if self._shared_writer:
-                    _unlink_host_file(weight_path)
-                    _unlink_host_file(scale_path)
+                    _unlink_host_file(packed_path)
         else:
             self.weight = nn.Parameter(
                 torch.empty(
@@ -590,11 +607,13 @@ class RowShardedEngramEmbedding(nn.Module):
             self._host_gpu_registered = True
             return
         platform = current_platform()
-        weight_bytes = self.weight.view(torch.uint8)
-        if not weight_bytes.is_pinned():
-            platform.register_host_tensor_for_gpu_access(weight_bytes)
-        if not self.scale.is_pinned():
-            platform.register_host_tensor_for_gpu_access(self.scale)
+        # weight and scale are views of the packed rows: register those once.
+        packed = self.packed
+        if not packed.is_pinned():
+            platform.register_host_tensor_for_gpu_access(packed)
+            weakref.finalize(
+                self, platform.unregister_host_tensor_for_gpu_access, packed
+            )
         self._host_gpu_registered = True
 
     def _apply(self, fn, recurse=True):
@@ -665,14 +684,41 @@ class RowShardedEngramEmbedding(nn.Module):
                 raise ValueError("Open Engram safetensors on CPU before slicing")
             self._copy_rows(param, rows, start - self.row_start)
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+    def mxfp8_rows(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather CUDA [T, hash columns] IDs as the MXFP8 input of wkv.
+
+        Returns E4M3 codes [T, columns * head_dim] and canonical UE8M0 scales
+        [T, columns * head_dim / 32]: forward()'s BF16 rows quantized with the
+        reference 1x32 rule, without materializing them. Only tables with
+        ``serves_mxfp8_rows`` hold every row a rank looks up.
+        """
+        if not self.serves_mxfp8_rows:
+            raise RuntimeError("This Engram table needs its rows reduced across TP")
+        return host_gather.mxfp8_row_gather(self.packed, indices, None, None)
+
+    def forward(
+        self, indices: torch.Tensor, *, query_shard: QueryShardPlan | None
+    ) -> torch.Tensor:
         """Gather [..., hash columns] IDs into BF16 [..., hash columns, head dim].
 
-        All TP peers must pass identical indices. Shared host tables gather the
-        full copy and skip the all-reduce. GPU and host-sharded tables expand
-        only local rows and reduce. Dequantization uses the same FP8/E8M0
-        torch casts in both paths.
+        Without a query shard, TP peers pass identical indices. A query shard
+        gathers IDs and reduce-scatters table contributions to its local rows.
+        Shared host tables gather the full copy and skip the all-reduce. GPU
+        and host-sharded tables expand only local rows and reduce.
+        Dequantization uses the same FP8/E8M0 torch casts in both paths.
         """
+        sharded = query_shard is not None and query_shard.size > 1
+        if sharded:
+            if indices.ndim != 2 or indices.shape[0] != query_shard.local_rows:
+                raise ValueError("Engram hashes must match the query shard rows")
+            if len(self.tp_group) != query_shard.size:
+                raise ValueError(
+                    "Engram TP and query shard groups must have equal size"
+                )
+            if self.host_layout != "shared":
+                indices = token_all_gather_rows(
+                    indices, self.tp_group, list(query_shard.row_counts)
+                )
         if indices.is_cuda and not self.host_table:
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
@@ -712,6 +758,10 @@ class RowShardedEngramEmbedding(nn.Module):
             # row capacity and drop to NCCL, which costs a ring latency plus a
             # launch stall on every step.
             flat = values.reshape(-1, values.shape[-2] * values.shape[-1])
+            if sharded:
+                return token_reduce_scatter(
+                    flat, self.tp_group, list(query_shard.row_counts)
+                ).reshape(query_shard.local_rows, values.shape[-2], values.shape[-1])
             values = all_reduce(
                 flat,
                 group=self.tp_group,
@@ -852,6 +902,8 @@ class DeepseekV41Engram(nn.Module):
         hidden_states: torch.Tensor,
         hash_ids: torch.Tensor,
         token_mask: torch.Tensor,
+        *,
+        query_shard: QueryShardPlan | None,
     ) -> torch.Tensor:
         """Inject Engram into [..., 4, hidden_size], returning the same shape/dtype.
 
@@ -868,10 +920,25 @@ class DeepseekV41Engram(nn.Module):
             raise ValueError("Engram hidden states, hashes and mask shapes disagree")
         if token_mask.dtype != torch.bool:
             raise TypeError("Engram token mask must be bool")
-        if hidden_states.numel() == 0:
+        if hidden_states.numel() == 0 and query_shard is None:
             return hidden_states
-        embeddings = self.embed(hash_ids).flatten(-2)
-        kv, _ = self.wkv(embeddings, block_scale=None, output_dtype=None)
+        if (
+            hash_ids.is_cuda
+            and hash_ids.ndim == 2
+            and self.embed.serves_mxfp8_rows
+            and isinstance(self.wkv.quant_method, Fp8LinearMethod)
+        ):
+            # The table rows are MXFP8 already: hand wkv its quantized input
+            # without the BF16 round trip. No collective runs on this path.
+            if hidden_states.numel() == 0:
+                return hidden_states
+            codes, scales = self.embed.mxfp8_rows(hash_ids)
+            kv, _ = self.wkv(codes, block_scale=scales, output_dtype=torch.bfloat16)
+        else:
+            embeddings = self.embed(hash_ids, query_shard=query_shard).flatten(-2)
+            if hidden_states.numel() == 0:
+                return hidden_states
+            kv, _ = self.wkv(embeddings, block_scale=None, output_dtype=None)
         if hidden_states.is_cuda:
             from tokenspeed_kernel.ops.residual import normalized_dot_gate
 

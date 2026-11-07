@@ -88,17 +88,18 @@ switch an envelope folds is also available individually under `auto`.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--numerics {auto,rl-bitwise}` | `auto` uses each option's default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
+| `--numerics {auto,rl-bitwise}` | `auto` uses each option's default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order selection`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
 | `--disable-autotune` | Disable startup FlashInfer tactic profiling. Matching caches still load; CuTe warmup continues except under pipeline parallelism. PrimTS skips extra group enumeration. |
 | `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
 | `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
-| `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the `deepseek_yarn` RoPE inverse frequencies (position frequencies, both divisions and the YaRN linear ramp mask) before the table is moved to the model device once; the trainer builds it on the host. Folded to `cpu` by `rl-bitwise`. |
+| `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the `deepseek_yarn` linear ramp mask. Defaults to `cuda`, independently of the frequency device. Folded to `cpu` by `rl-bitwise`. |
+| `--yarn-frequency-device {cuda,cpu}` | Device that computes YaRN powers, divisions and interpolation. Defaults to `cuda`, independently of the ramp device. Folded to `cuda` by `rl-bitwise`, overriding an explicit `cpu`; paired with its CPU ramp. |
 | `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `rl-bitwise`. |
 | `--layer-boundary-norm {fused,unfused}` | `unfused` materializes `hidden + residual` in bf16 before the norm that opens each physical layer and before the final norm, instead of the fused add+norm kernel; also vetoes all-reduce+norm fusion. Folded to `unfused` by `rl-bitwise`. |
 | `--router-topk {fused,torch}` | Correction-bias MoE routing: the fused CUDA kernel, or fp32 `torch.softmax` + `torch.topk(probs + bias)` with PyTorch tie order and `-1` zero-expert ids. Folded to `torch` by `rl-bitwise`. |
-| `--logprob-order {torch,megatron}` | Order of the selected-token log-softmax: `torch.log_softmax`, or Megatron's vocab-parallel cross-entropy order over fixed 32768-wide vocab blocks; output and prompt (input) logprobs share it. Changes logprobs only. Folded to `megatron` by `rl-bitwise`. |
-| `--dsa-slot-order {selection,sorted}` | The order a token's selected KV rows are reduced in by the sparse (DSA) attention: as the top-k leaf emitted them (`selection`), or in ascending position order (`sorted`: one reduction order per selected set, invariant across batch compositions, runs and engines -- not ascending slot order, which follows the page placement). The top-k leaf emits the order and the core keeps it, so both must declare the `slot_order` trait (registered batch-invariant leaves); a silent kernel is refused under `sorted`. Folded to `sorted` by `rl-bitwise`. |
+| `--logprob-order {torch,blockwise,blockwise-direct}` | Order of the selected-token log-softmax: `torch.log_softmax`, or fixed-width blockwise reduction over 32768-wide vocab blocks; output and prompt (input) logprobs share it. `blockwise` returns negative cross-entropy; `blockwise-direct` uses direct subtraction. Changes logprobs only. `rl-bitwise` folds to `blockwise`, overriding explicit `torch` and preserving explicit `blockwise-direct`. |
+| `--dsa-slot-order {selection,sorted}` | The order a token's selected KV rows are reduced in by the sparse (DSA) attention: as the top-k leaf emitted them (`selection`), or in ascending position order (`sorted`: one reduction order per selected set, invariant across batch compositions, runs and engines -- not ascending slot order, which follows the page placement). The top-k leaf emits the order and the core keeps it, so both must declare the `slot_order` trait (registered batch-invariant leaves); a silent kernel is refused under `sorted`. Defaults to `selection`; `rl-bitwise` fixes it to `selection`, overriding an explicit `sorted`. Both top-k and attention leaves must still be batch-invariant under `rl-bitwise`. |
 | `--moe-combine-order {rank,slot}` | How a token's routed-expert contributions meet across the MoE TP-EP group. `rank`: the MoE kernel returns this rank's partial and the host sums the partials, adding LongCat's identity zero-expert residual once around the reduction. `slot`: the MoE kernel folds the token's top-k slots in fp32 slot order across the EP group itself, residual included, as the trainer's grouped MLP does, and the host reduces nothing; needs MoE TP 1 and a kernel declaring `combine_order` with `slot` (a registered batch-invariant leaf), and vetoes all-reduce+norm fusion. Folded to `slot` by `rl-bitwise`. |
 
 ## API surface
@@ -349,6 +350,23 @@ trainer-side contract below) when that matters.
 
 ### Mooncake weight updates
 
+The runtime includes the independent WeightStore receiver at
+`tokenspeed.runtime.execution.weight_store`. Select it with
+`--model-update-sdk-module tokenspeed.runtime.execution.weight_store` and
+`--model-update-engine-type TOKENSPEED`, supply the standalone SDK's flat
+`backend=weight_store` configuration and use `--model-update-draft-weights retain`.
+This optional path requires the independent `weight_store` and `data_dist_hub`
+packages in the scheduler environment. It does not import a rollout framework or
+the previous weight-update SDK.
+
+The update request carries a complete publication directory in `snapshot`,
+encoded as `{version, zlib_base64}`. Tensor contents remain in the Store.
+The receiver validates the publication version, declares the target's logical HF
+regions and calls the standalone SDK on the Store device's current CUDA stream.
+The SDK reads and assembles the tensors; the native loader owns physical TP/EP
+layout and the surrounding weight-update session owns finalization. This path
+supports one unquantized target and retains draft checkpoint weights.
+
 `UpdateWeightsFromMooncakeReqInput` loads one committed checkpoint version
 that the RL trainer published to a Mooncake weight store through the Model
 Updater SDK. Fields: `version` (an integer), `flush_cache` (default true),
@@ -421,7 +439,7 @@ Trainer-side contract:
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
-| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. Requires prefix caching; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
+| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
@@ -574,6 +592,7 @@ parser option keeps its existing behavior.
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees and chains (see below). Off by default. |
+| `--speculative-rejection-sample-method` | Verify rule, named as vLLM's `rejection_sample_method`: `standard` (default, token-wise), `block` (block verification; see [Block verification](#block-verification-experimental)) or `synthetic` (set by `--synthetic-acceptance-length`). |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. A target whose forward returns no layer taps (for example Qwen3, Qwen3-MoE or DeepSeek V4.1) refuses these drafts and `DFLASH` at startup. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
@@ -621,6 +640,9 @@ AL `2.6`:
 
 Conflicting values between the flag and JSON configuration are rejected.
 The value must be finite and speculative decoding must be enabled.
+It selects the `synthetic` rejection method. The flashinfer backend accepts it
+only over sampled drafts (`--enable-speculative-sampling`); see
+[Block verification](#block-verification-experimental).
 For block drafters with implicit widths, the upper bound is checked against
 the checkpoint's resolved verify width when the sampler is initialized.
 
@@ -691,6 +713,9 @@ run on the draft-tree path and share its requirements, with these limits:
 - `--enable-speculative-sampling` samples harness trees and chains (not
   when measuring) and needs `--sampling-backend flashinfer`, which accepts
   them by tree rejection sampling. Static `EAGLE4` drafts do not take it.
+  Its sampling kernels are NVIDIA-only: elsewhere (AMD) harness rounds
+  draft greedy trees and chains, and the drafter refuses sampling at
+  startup.
 
 ### Draft-prob rejection sampling
 
@@ -823,11 +848,19 @@ Both Prefill and Decode engines select their transport from the detected
 platform. Startup settings pass this protocol to the Rust transfer peer,
 which keeps it when recreating a session after a memory resume.
 
+Upgrade Prefill and Decode nodes together: cache registrations now carry a
+separate cache identity in a ninth frame, and requests name that identity.
+Older peers without this field are incompatible. Each Decode cache resume
+gets a new identity even if its transport IP and port are reused. The sender
+refreshes cached remote memory keys on address reuse without changing the
+public address used by EPD.
+
 ## Observability
 
 | Parameter | Purpose |
 | --- | --- |
 | `--log-level` | Runtime log level. |
+| `--enable-async-logging` | Write Rust host and default Python root logs on background threads. Defaults to off; `--no-enable-async-logging` explicitly selects synchronous output. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
@@ -836,6 +869,8 @@ which keeps it when recreating a session after a memory resume.
 | `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+| `--otlp-traces-endpoint` | OTLP/HTTP traces endpoint (a collector's `/v1/traces`, Jaeger, Langfuse). Each finished request exports one span built from its lifecycle timestamps. |
+| `--trace-sample-ratio` | The share of requests the OTLP endpoint traces (0..1). 0, the default, disables tracing. |
 
 Every `--decode-log-interval` decode rounds the scheduler's representative rank
 prints one `Decode batch.` line: `#running-req`, `avg_seq_len` (the mean of
@@ -844,6 +879,25 @@ cost can be read alongside its batch size), device page usage, the generation
 throughput accumulated since the previous line, `avg_accept_len` /
 `accept_rate` under speculative decoding, and `#queue-req`. Every field is a
 host-side scheduler counter. The line adds no GPU synchronization.
+
+Logging is synchronous by default. With `--enable-async-logging`, the Rust
+host's `tracing` output and the default Python root logger each use a queue
+of at most 8,192 records. A background thread owns writes and flushes, so
+an occasional slow write to a distributed file system or collector does
+not hold the thread emitting the log. When a queue fills, new records are
+dropped without writing a synchronous overflow warning. This removes output
+stalls from the serving thread; it does not increase the sink's throughput.
+
+The host explicitly drains Python logs on both normal and error returns,
+before notifying the launcher of a failure; it does not rely on Python
+interpreter finalization. Python cleanup waits up to five seconds, and the
+Rust appender also performs a bounded, best-effort drain on exit. A sink
+that remains blocked through shutdown can lose pending records.
+
+Colorful Python loggers retain their direct handlers. Custom handlers remain
+under `TOKENSPEED_LOGGING_CONFIG_PATH` control: combining that variable with
+`--enable-async-logging` is rejected. Configure asynchronous handlers in the
+custom file, or use the default configuration with this flag.
 
 `#queue-req` counts requests admitted to the scheduler but not yet running.
 On a PD engine that includes requests still bootstrapping with the peer —
@@ -872,6 +926,14 @@ already-synchronized CPU result and does not add a GPU synchronization, but it
 is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
+
+Set `TOKENSPEED_VALIDATE_PAGE_IDS=1` to check every page ID in each forward's
+block tables against its cache group's page range before the forward runs.
+The structural checks (cache groups, dtype, shape, rows) always run; the scan
+reads every ID of every scheduled row, which at long contexts costs as much as
+the rest of the forward thread's table packing, so it is off by default.
+Enable it while debugging a page-table fault. The model executor reads it once
+at startup. Prefill-graph capture scans the tables it builds either way.
 
 To send observations to another monitoring system, install and select a
 [metric output plugin](../metrics-plugins.md). Selecting only external outputs
@@ -917,6 +979,21 @@ retraction whose victim cannot be imaged aborts it instead — those are
 `tokenspeed:num_capacity_aborted_requests`, never preemptions. A forced
 retraction's victim refused after its pages were published is aborted and
 counts there too.
+
+### OTLP tracing
+
+`--otlp-traces-endpoint` exports one span per request to an OTLP/HTTP
+receiver, assembled at the request's release from the same timestamps the
+stats line prints — the serving loop never blocks on it, a full export
+queue drops spans and counts them, and `--trace-sample-ratio` bounds the
+share. A request that names a continual-prompting session
+(`session_params.id`) carries it as the `session.id` attribute, so a
+tracing UI groups one conversation's requests under the session. Trace ids derive from the request id, so a span, its `Req: … Finish!`
+line and its Prometheus samples cross-reference. The span carries the GenAI
+attribute conventions (`gen_ai.request.model`, prompt and completion tokens,
+finish reason) plus the cached prompt tokens and preemption counts, with the
+lifecycle points as time-stamped events. See
+[the tracing design](../design/tracing.md).
 
 ### Per-request stats
 
@@ -1191,12 +1268,21 @@ budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size its configured pinned
-allocator reserves. On CUDA/ROCm, the launcher defaults
-`pinned_max_round_threshold_mb:1024` before starting the ranks: allocations
-up to 1 GiB round to a power of two; larger buffers use their requested size.
-This avoids reserving 274.88 GB for a 140 GB L2 buffer. Explicit thresholds
-and other allocator options are preserved. To override the default, set
+headroom per rank. Available means the smaller of the host's free memory and
+what the process's memory cgroup still allows (its limit, `memory.max` or
+`memory.high` on cgroup v2, less its usage with page cache counted as free;
+the tightest limit over its cgroup and the ones above it, found through
+`/proc/self/mountinfo`), so a container or a Slurm step is sized against its
+own limit; the sizing warning and the refusal name which one was used.
+Each buffer counts at the size its configured pinned
+allocator reserves. When the CUDA/ROCm allocator supports it, the launcher sets
+`pinned_max_round_threshold_mb:1024` as the default before starting the ranks.
+Allocations up to 1 GiB round to a power of two; larger buffers use their
+requested size.
+This avoids reserving 274.88 GB for a 140 GB L2 buffer. Allocators without this
+option keep their native defaults. The capability probe has a 60-second timeout.
+Probe failures stop startup. Explicit thresholds and other allocator options
+are preserved. To override the default, set
 `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:<MiB>` before launch;
 the legacy `PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_HIP_ALLOC_CONF` variables
 take precedence, in that order. The check reads the effective allocator
@@ -1353,3 +1439,47 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### Block verification (experimental)
+
+`--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`
+verifies a sampled draft chain by block verification instead of token-wise
+rejection. The names follow vLLM: `--enable-speculative-sampling` is
+`draft_sample_method=probabilistic`, and `--speculative-config` also accepts
+the `draft_sample_method` and `rejection_sample_method` keys. It supports `DSPARK` (probabilistic Markov drafting) and `EAGLE3`
+with `--speculative-eagle-topk 1`; block verification is defined on a single
+chain, so draft trees are refused. EAGLE3 already samples its chain under
+`--enable-speculative-sampling`, and its hot-token `q` is recorded over the full
+vocabulary with zeros outside the draft vocabulary. The feature is disabled by
+default; without it, the greedy DSpark path and the token-wise EAGLE3 verifier
+are unchanged. The initial support scope is aggregate TP, including DCP, without
+attention DP, DP sampling, pipeline parallelism or PD disaggregation. Other
+combinations fail at startup.
+
+Draft probabilities follow the request temperature; greedy requests retain
+one-hot proposals. Target filtering and grammar masks still apply before
+verification. The verifier uses clipped prefix likelihood ratios, selects the
+longest accepted prefix, and samples a prefix-scaled positive residual (or a
+target bonus token). It is not a single whole-block likelihood-ratio test.
+The output uses the existing accepted-length and state rollback contract.
+
+The existing per-request proposal RNG and verifier coin streams are reused.
+A stochastic output difference from greedy decoding is expected; validate the
+output distribution and accuracy, rather than requiring identical token IDs.
+
+Replacing `block` with `--synthetic-acceptance-length L` (the `synthetic`
+method) gives a benchmark-only mode, the equivalent of vLLM's probabilistic
+draft sampling with synthetic rejection; for `DSPARK` it also turns on sampled
+Markov drafting.
+The drafter still samples: the full-vocabulary draft logits (and DSpark's Markov
+steps) and the recorded fp32 draft probabilities all stay on the path. Verify
+gathers those probabilities and runs the standard draft-probability chain rule
+for its cost; the synthetic length then replaces its outcome, as in the greedy
+synthetic mode above. The block verifier itself is not run, because synthetic
+rejection replaces it. The token at the cutoff is drawn from the target
+probabilities at that position (the argmax for greedy requests); this costs one
+full-vocabulary pass per request. Do not use generated text for correctness or
+accuracy evaluation; validate the algorithm and its natural acceptance length
+without this flag. Full-vocabulary draft gathering, probability storage, and
+verification reductions all add work; measure their cost and natural acceptance
+length before drawing performance conclusions.

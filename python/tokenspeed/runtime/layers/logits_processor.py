@@ -46,7 +46,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
-    MEGATRON_VOCAB_BLOCK,
+    BLOCKWISE_VOCAB_BLOCK,
 )
 from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import (
@@ -70,6 +70,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -199,43 +200,6 @@ class DistArgmaxPrepared:
 
     states: dict[torch.dtype, object]
     fallback: VocabParallelArgmax
-
-
-@dataclasses.dataclass
-class LogitsProcessorOutput:
-    ## Part 1: This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
-    # The logits of the next tokens.       shape: [#seq, vocab_size]
-    next_token_logits: torch.Tensor
-    # Used when ``do_argmax=True``.   shape: [#seq]
-    next_token_ids: torch.Tensor | None = None
-    # Used by speculative decoding.
-    # The last hidden layers
-    hidden_states: torch.Tensor | None = None
-    logits_layout_plan: LogitsLayoutPlan | None = None
-
-    ## Part 2: Populated by the active SamplingBackend during sample()/verify().
-    # The logprobs of the next tokens.                              shape: [#seq]
-    next_token_logprobs: torch.Tensor | None = None
-    # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: list | None = None
-    next_token_top_logprobs_idx: list | None = None
-    # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
-    next_token_token_ids_logprobs_val: list | None = None
-    next_token_token_ids_logprobs_idx: list | None = None
-    # Eager prefills only (``ForwardContext.sampled_top_k``): the most likely
-    # tokens of each prefill row's sampled position, fp32 log-softmax values
-    # and int64 ids, set by the executor after sampling. shape: [#prefill rows, k]
-    sampled_top_logprobs_val: torch.Tensor | None = None
-    sampled_top_logprobs_idx: torch.Tensor | None = None
-
-    ## Part 3: Prefill-only. This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
-    # The logprobs of the prompt rows the forward's ``InputLogprobPlan``
-    # named, fp32 in plan order, whole on every rank.  shape: [#rows]
-    input_token_logprobs: torch.Tensor | None = None
-    # With the plan's ``top_k``: each row's most likely next tokens, fp32
-    # values and int64 ids, most likely first.  shape: [#rows, k]
-    input_top_logprobs_val: torch.Tensor | None = None
-    input_top_logprobs_idx: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
@@ -379,15 +343,15 @@ class LogitsProcessor(nn.Module):
         # --logprob-order: the log-softmax behind input (prompt) logprobs.
         self.logprob_order: str = global_server_args_dict["logprob_order"]
         if (
-            self.logprob_order == "megatron"
-            and config.vocab_size % MEGATRON_VOCAB_BLOCK != 0
+            self.logprob_order in ("blockwise", "blockwise-direct")
+            and config.vocab_size % BLOCKWISE_VOCAB_BLOCK != 0
         ):
             # The logits every logprob reads are sliced to config.vocab_size
             # (_get_logits), and the trainer's sum(exp) folds fixed-width
             # blocks of them; refuse at construction, not on the forward thread.
             raise ValueError(
-                "--logprob-order megatron folds sum(exp) over fixed "
-                f"{MEGATRON_VOCAB_BLOCK}-wide vocabulary blocks and needs a "
+                "--logprob-order blockwise folds sum(exp) over fixed "
+                f"{BLOCKWISE_VOCAB_BLOCK}-wide vocabulary blocks and needs a "
                 f"vocab_size that is a multiple of it; got {config.vocab_size}"
             )
 
@@ -1060,7 +1024,9 @@ class LogitsProcessor(nn.Module):
                 require_full_vocab=True,
             )
             out[begin:end] = gather_token_logprobs(
-                logits, plan.targets[begin:end], logprob_order=self.logprob_order
+                logits,
+                plan.targets[begin:end],
+                logprob_order=self.logprob_order,
             )
             if top is not None:
                 top[0][begin:end], top[1][begin:end] = top_token_logprobs(logits, top_k)

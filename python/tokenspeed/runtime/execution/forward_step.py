@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import gc
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -108,7 +109,20 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
-def get_batch_sizes_to_capture(config: ModelExecutorConfig):
+@dataclasses.dataclass(frozen=True)
+class DecodeLadderArgs:
+    """The executor config fields the decode graph ladder is built from
+    (``get_batch_sizes_to_capture``), as ``ModelExecutorConfig.from_server_args``
+    takes them."""
+
+    cudagraph_capture_sizes: list[int] | None
+    max_num_seqs: int
+    data_parallel_size: int
+    disable_cuda_graph_padding: bool
+    max_cudagraph_capture_size: int
+
+
+def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
@@ -186,6 +200,29 @@ class DeepEPCudaGraphRunnerAdapter:
         if cls is None or cls._buffer is None:
             return
         cls.set_dispatch_mode_as_low_latency()
+
+
+def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tuple:
+    """A captured decode graph's outputs, sliced to the live batch.
+
+    ``outputs`` is what the captured forward returned: ``(output_tokens,
+    output_lengths, output_logprobs, output_cumulative_probs,
+    forward_logprobs)`` for the padded batch. The sampled-token columns keep
+    ``bs * max_tokens_per_req`` rows and the lengths ``bs``; a decode graph
+    never gathers prompt logprobs or top-k alternatives, so its last output is
+    None.
+    """
+    tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
+    if forward_logprobs is not None:
+        raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
+    rows = bs * max_tokens_per_req
+    return (
+        tokens[:rows],
+        lengths[:bs],
+        None if logprobs is None else logprobs[:rows],
+        None if cumulative_probs is None else cumulative_probs[:rows],
+        None,
+    )
 
 
 class ForwardStepRunner:
@@ -1078,9 +1115,9 @@ class ForwardStepRunner:
         The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
         input buffers on every call — empty for a pure decode or the idle
         replay, which never read them. ``block_tables_cpu`` mirrors
-        ``block_tables`` on the host (the same group keys; empty at bs 0) for
-        backends that plan an extend from the tables without waiting on the
-        device.
+        ``block_tables`` on the host (the same group keys) for backends that
+        plan an extend from the tables without waiting on the device; a pure
+        decode, which plans nothing from them, gets none.
 
         ``settle`` finishes what the inputs still wait on (a pending draft
         round): a decode calls it once the target's decode metadata, which
@@ -1088,10 +1125,12 @@ class ForwardStepRunner:
         first.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
-        forward_logprobs)``; the last is an extend/mixed forward's
-        ``ForwardLogprobs`` (the prompt-logprob gather of
-        ``ctx.input_logprob_rows`` and the top-k alternatives
-        ``ctx.sampled_top_k`` asks for) and None otherwise.
+        output_cumulative_probs, forward_logprobs)``; the last is an
+        extend/mixed forward's ``ForwardLogprobs`` (the prompt-logprob gather
+        of ``ctx.input_logprob_rows`` and the top-k alternatives
+        ``ctx.sampled_top_k`` asks for) and None otherwise. The sampled
+        tokens' logprobs and cumulative probabilities (None when not enabled)
+        share the tokens' rows on both paths.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1221,24 +1260,8 @@ class ForwardStepRunner:
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
-            # A decode graph never gathers prompt logprobs or top-k
-            # alternatives (its captured fourth output is None).
-            (
-                output_tokens,
-                output_lengths,
-                output_logprobs,
-                _forward_logprobs,
-            ) = self.output_buffers[graph_key]
-
-            result = (
-                output_tokens[: bs * self.max_tokens_per_req],
-                output_lengths[:bs],
-                (
-                    output_logprobs[: bs * self.max_tokens_per_req]
-                    if output_logprobs is not None
-                    else None
-                ),
-                None,
+            result = live_graph_outputs(
+                self.output_buffers[graph_key], bs, self.max_tokens_per_req
             )
         else:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)

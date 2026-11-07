@@ -27,6 +27,19 @@ from collections.abc import Callable
 import torch
 
 
+def request_vocab_mask(
+    vocab_mask: torch.Tensor, requests: slice, *, mask_width: int, prefill: bool
+) -> torch.Tensor:
+    """The grammar-mask rows of ``requests``' output rows.
+
+    ``vocab_mask`` is request-major, ``mask_width`` rows per request. A
+    prefill request owns one output row, its first mask row; a decode request
+    owns all ``mask_width``, one per verify column.
+    """
+    mask = vocab_mask[requests.start * mask_width : requests.stop * mask_width]
+    return mask[::mask_width] if prefill else mask
+
+
 @dataclasses.dataclass
 class SamplingBatchInfo:
     # Basic batched sampling params. The standard hot path leaves them None;

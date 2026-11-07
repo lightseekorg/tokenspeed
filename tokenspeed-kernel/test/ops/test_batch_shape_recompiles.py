@@ -548,10 +548,11 @@ def test_dsv41_write_selection_width(with_candidates):
 
 
 def test_dsv41_page_table_geometry():
-    """The dsv41 address kernels take the page table's rows, columns and
-    strides as runtime scalars. Rows follow the batch and columns the longest
-    request, so a lone request (one row, which Triton otherwise folds into a
-    constant) or a width crossing a multiple of 16 must not recompile."""
+    """The dsv41 address kernels take the page table's rows, columns,
+    strides and pool capacity as runtime scalars. Rows follow the batch and
+    columns the longest request, so a lone request (one row, which Triton
+    otherwise folds into a constant) or a width crossing a multiple of 16
+    must not recompile."""
     from tokenspeed_kernel.ops.attention.dsv41 import triton as dsv41
     from tokenspeed_kernel.ops.attention.mla._triton import page_table
 
@@ -562,7 +563,7 @@ def test_dsv41_page_table_geometry():
     selected = (torch.arange(48, device=DEVICE, dtype=torch.int32) * 7 % 70).view(8, 6)
     n = positions.numel()
 
-    def run(rows, cols, col_stride):
+    def run(rows, cols, col_stride, pages):
         table = torch.full(
             (rows, cols * col_stride), -1, dtype=torch.int32, device=DEVICE
         )
@@ -573,7 +574,7 @@ def test_dsv41_page_table_geometry():
             torch.empty((n, 128), dtype=torch.int32, device=DEVICE),
             torch.empty(n, dtype=torch.int32, device=DEVICE),
         )
-        dsv41.decode_window(positions, requests, *window, table, 8)
+        dsv41.decode_window(positions, requests, *window, table, pages)
         compressor = tuple(
             torch.empty(n, dtype=dtype, device=DEVICE)
             for dtype in (
@@ -585,19 +586,19 @@ def test_dsv41_page_table_geometry():
                 torch.int64,
             )
         )
-        dsv41.compressor_metadata(positions, requests, table, 8, *compressor)
+        dsv41.compressor_metadata(positions, requests, table, pages, *compressor)
         selection, lengths = dsv41.selection_table(positions, requests, table, 4)
         assert (selection[:, 4:] == -1).all()
         return (
-            page_table.bounded_group_slots(positions, requests, table, 64, 1, 1, 8),
-            dsv41.global_slots(selected, positions, requests, table, 4, 8),
+            page_table.bounded_group_slots(positions, requests, table, 64, 1, 1, pages),
+            dsv41.global_slots(selected, positions, requests, table, 4, pages),
             selection[:, :4],
             lengths,
             *window,
             *compressor,
         )
 
-    expected = run(3, 8, 1)
+    expected = run(3, 8, 1, 8)
     # Pages 3, 1, 7 hold columns 0-2; column 4 is padding and resolves to -1.
     assert expected[0][[1, 3, 4, 6]].tolist() == [197, 64, 450, -1]
     with assert_no_triton_compile(
@@ -607,15 +608,17 @@ def test_dsv41_page_table_geometry():
         dsv41._decode_window_kernel,
         dsv41._compressor_metadata,
     ):
-        for rows, cols, col_stride in (
-            (1, 4, 1),
-            (1, 16, 1),
-            (2, 33, 1),
-            (16, 1024, 1),
-            (17, 129, 2),
-            (1, 6, 2),
+        for rows, cols, col_stride, pages in (
+            (1, 4, 1, 9),
+            (1, 16, 1, 16),
+            (2, 33, 1, 17),
+            (16, 1024, 1, 32),
+            (17, 129, 2, 33),
+            (1, 6, 2, 1024),
         ):
-            for got, want in zip(run(rows, cols, col_stride), expected, strict=True):
+            for got, want in zip(
+                run(rows, cols, col_stride, pages), expected, strict=True
+            ):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
@@ -1095,6 +1098,26 @@ def test_compact_kvp_pages_table_width():
     with assert_no_triton_compile(placement._compact_owned_pages):
         for cols in (10, 11, 13, 15):
             run(cols)
+
+
+def test_virtual_slots_to_local_slot_count():
+    from tokenspeed_kernel.ops.kvcache import triton_cache_placement as placement
+
+    geometry = dict(rows_per_page=128, virtual_block_count=40, degree=4, rank=1)
+
+    def run(count):
+        # Null and foreign blocks, a block past the capacity, and -1 holes.
+        slots = torch.randint(-1, 41 * 128, (count,), dtype=torch.int32)
+        want = placement.virtual_slots_to_local(slots, **geometry)
+        got = placement.virtual_slots_to_local(slots.to(DEVICE), **geometry)
+        for value, expected in zip(got, want, strict=True):
+            torch.testing.assert_close(value.cpu(), expected, rtol=0, atol=0)
+
+    # The count is unspecialized: one count warms 1 and multiples of 16 too.
+    run(33)
+    with assert_no_triton_compile(placement._translate_virtual_slots):
+        for count in (1, 7, 16, 255, 256, 257, 4096, 70001):
+            run(count)
 
 
 def test_mhc_mixes_split_count():

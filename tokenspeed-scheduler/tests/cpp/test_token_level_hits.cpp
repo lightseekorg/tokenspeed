@@ -206,7 +206,7 @@ TEST_F(TokenLevelHitSuite, RandomStreamsResumeAtTheLongestPublishedBoundary) {
                     const std::int32_t tail_tokens = expected % kP;
                     const std::int32_t tail_blocks = (tail_tokens + block_granularity - 1) / block_granularity;
                     ASSERT_EQ(pairs.size(), static_cast<std::size_t>(tail_blocks)) << id << " " << group_id;
-                    const auto& row = batch->block_tables.at(group_id).at(0);
+                    const auto row = batch->BlockTables().at(group_id).at(0);
                     const std::int32_t first_slot = (expected - tail_tokens) / block_granularity;
                     for (std::int32_t j = 0; j < tail_blocks; ++j) {
                         EXPECT_EQ(row.at(static_cast<std::size_t>(first_slot + j)),
@@ -414,7 +414,7 @@ TEST_F(GptOssShapeWithWholePagesSuite, APromptOneTokenShorterThanAFinishedOneRes
     const ForwardBatch* z = FindForwardBatch(z_plan);
     ASSERT_NE(z, nullptr);
     EXPECT_EQ(z->extend_prefix_lens, std::vector<std::int32_t>{276});
-    const auto& swa = z->block_tables.at("sliding").at(0);
+    const auto swa = z->BlockTables().at("sliding").at(0);
     ASSERT_GE(swa.size(), 5u);
     EXPECT_EQ(swa.at(0), 0);
     EXPECT_EQ(swa.at(1), 0);
@@ -424,10 +424,11 @@ TEST_F(GptOssShapeWithWholePagesSuite, APromptOneTokenShorterThanAFinishedOneRes
 }
 
 // A pool filled by prompts whose generation budget their admission prepaid
-// (retraction-exempt), each ending inside a page: their first decodes would
-// each copy the published partial block into a fresh block, and the pool has
-// none. The owner then keeps its partial block private and publishes nothing
-// at the prompt end, so every request still decodes and finishes.
+// (retraction-exempt), each ending inside a page: each first decode copies
+// the published partial block of each group into the copy-in block the
+// prompt's admission reserved, so it needs no block the pool may no longer
+// have. Every request publishes its prompt end, decodes and finishes; the
+// prompts that do not fit beside the others wait at admission.
 class ExemptOwnersFillThePoolSuite : public SchedulerTestSuite {
 protected:
     static constexpr std::int32_t kP = 16;
@@ -460,10 +461,10 @@ protected:
     }
 };
 
-TEST_F(ExemptOwnersFillThePoolSuite, FirstDecodesProceedWithoutTheirCopyIn) {
+TEST_F(ExemptOwnersFillThePoolSuite, FirstDecodesCopyInToTheirReservedBlocks) {
     // Four 23-token prompts with a two-token budget: 2 full blocks (23 + 1
-    // decode slot + 1 headroom) + 2 sliding blocks each -> 16 blocks; three
-    // more such prompts queue behind them on the remaining 8 and 0 blocks.
+    // decode slot + 1 headroom) + 2 sliding blocks and a copy-in block per
+    // group each -> 24 blocks; three more such prompts queue behind them.
     std::vector<std::string> ids;
     for (std::int32_t i = 0; i < 7; ++i) {
         ids.push_back("r" + std::to_string(i));
@@ -474,8 +475,10 @@ TEST_F(ExemptOwnersFillThePoolSuite, FirstDecodesProceedWithoutTheirCopyIn) {
     std::set<std::string> finished;
     std::int32_t idle = 0;
     std::int32_t next_token = 50000;
+    std::size_t copies = 0;
     for (std::int32_t round = 0; round < 200 && finished.size() < ids.size() && idle < 10; ++round) {
         const ExecutionPlan plan = PlanOnce();
+        copies += plan.pages_to_copy.at("full").size() + plan.pages_to_copy.at("sliding").size();
         const ForwardBatch* batch = FindForwardBatch(plan);
         if (batch == nullptr || batch->request_ids.empty()) {
             ++idle;
@@ -499,6 +502,86 @@ TEST_F(ExemptOwnersFillThePoolSuite, FirstDecodesProceedWithoutTheirCopyIn) {
         }
     }
     EXPECT_EQ(finished.size(), ids.size()) << "idle rounds: " << idle << ", waiting " << scheduler_->WaitingSize();
+    EXPECT_EQ(copies, 2 * ids.size()) << "every prompt end is published in both groups";
+    PlanOnce();
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+}
+
+// The same pool pressure on one full group packed four blocks to a parent and
+// dealt page-cyclically over 1, 2 or 4 KV-parallel shards (at 4, every bucket
+// has one slot in a parent). A prompt's tail block and its copy-in block take
+// one bucket, so at 4 shards the pair needs two parents with a hole in that
+// bucket; the prompt's other block fills a hole the pair leaves. Every request
+// still decodes, publishes its prompt end and finishes.
+class ExemptOwnersFillTheShardedPoolSuite : public SchedulerTestSuite,
+                                            public ::testing::WithParamInterface<std::int32_t> {
+protected:
+    static constexpr std::int32_t kP = 16;
+    static constexpr std::int32_t kParents = 4;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = kP;
+        cfg.device_allocator.total_pages = 1 + kParents;
+        cfg.host_allocator.total_pages = 0;
+        cfg.disable_l2_cache = true;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_mixed_prefill_decode = false;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full",
+            .block_granularity = kP,
+            .total_pages = 1 + 4 * kParents,
+            .cache_blocks_per_lcm_block = 4,
+            .attn_kind = AttnKind::kFull,
+            .shard_count = GetParam(),
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+INSTANTIATE_TEST_SUITE_P(KvShards, ExemptOwnersFillTheShardedPoolSuite, ::testing::Values(1, 2, 4));
+
+TEST_P(ExemptOwnersFillTheShardedPoolSuite, FirstDecodesCopyInToTheirReservedBlocks) {
+    // Seven 23-token prompts with a two-token budget, each two blocks and a
+    // copy-in block, over 16 slots: five run at once, two wait for their
+    // release.
+    std::vector<std::string> ids;
+    for (std::int32_t i = 0; i < 7; ++i) {
+        ids.push_back("r" + std::to_string(i));
+        Submit(RequestSpec{.request_id = ids.back(), .tokens = MakeTokens(23, 1000 * (i + 1)), .max_new_tokens = 2});
+    }
+    std::map<std::string, std::int32_t> produced;
+    std::set<std::string> finished;
+    std::int32_t idle = 0;
+    std::int32_t next_token = 50000;
+    std::size_t copies = 0;
+    for (std::int32_t round = 0; round < 200 && finished.size() < ids.size() && idle < 10; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        copies += plan.pages_to_copy.at("full").size();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->request_ids.empty()) {
+            ++idle;
+            continue;
+        }
+        idle = 0;
+        for (std::size_t row = 0; row < batch->request_ids.size(); ++row) {
+            const std::string& id = batch->request_ids[row];
+            if (row < batch->extend_prefix_lens.size() &&
+                batch->extend_prefix_lens[row] + batch->input_lengths[row] < 23) {
+                SendForwardDone(id);  // an intermediate chunk produces no token
+                continue;
+            }
+            SendForwardDone(id, {next_token++});
+            if (++produced[id] >= 2) {
+                SendFinish(id);
+                finished.insert(id);
+            }
+        }
+    }
+    EXPECT_EQ(finished.size(), ids.size()) << "idle rounds: " << idle << ", waiting " << scheduler_->WaitingSize();
+    EXPECT_EQ(copies, ids.size()) << "every prompt end is published";
     PlanOnce();
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }

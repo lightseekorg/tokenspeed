@@ -400,6 +400,68 @@ def test_prims_qsa_kernel_warmup_does_not_enable_extra_compilation(device):
     )
 
 
+def test_prims_qsa_new_batch_plans_reuse_cluster_occupancy(device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    from tokenspeed_kernel.compile_monitor import CompileMonitor
+    from tokenspeed_kernel.compile_monitor.cute_dsl import CuteDslHooks
+    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import _get_runner
+
+    q, k, v, slots, prototype = _prims_case(
+        lengths=(1,) * 8,
+        prefixes=(17,) * 8,
+        kv_heads=2,
+        shared_candidates=True,
+        block_size=4,
+        device=device,
+    )
+    k.mul_(0.25)
+    v.mul_(0.25)
+
+    def forward(routes):
+        metadata = replace(
+            prototype,
+            selected_blocks=prototype.selected_blocks[:routes],
+            block_table=prototype.block_table[:routes],
+            token_to_request=prototype.token_to_request[:routes],
+            query_positions=prototype.query_positions[:routes],
+            query_start_loc=tuple(range(routes + 1)),
+            seq_lens=prototype.seq_lens[:routes],
+        )
+        return qsa_sparse_attention(
+            q[:routes],
+            k,
+            v,
+            slots[:routes],
+            scale=1 / 16,
+            max_seqlen_q=None,
+            metadata_capacity_rows=None,
+            k_scale=None,
+            v_scale=None,
+            override=None,
+            solution="flashinfer_prims",
+            sparse_metadata=metadata,
+        )
+
+    monitor = CompileMonitor("error", 4)
+    hooks = CuteDslHooks(monitor)
+    hooks.install()
+    try:
+        runner = _get_runner(prototype.workspace, q.device)
+        runner.warmup(q, k, v, prototype, max_rows=8)
+        forward(1)
+        monitor.serving = True
+        # Each intermediate route count builds a new eager plan while the
+        # native attention kernels are already warmed for this geometry.
+        for routes in range(2, 8):
+            actual = forward(routes)
+            expected = _reference(q[:routes], k, v, slots[:routes], 1 / 16)
+            torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
+        assert monitor.stats().serving_compiles == 0
+    finally:
+        hooks.uninstall()
+
+
 @pytest.mark.parametrize("query_width", [1, 4])
 @pytest.mark.parametrize("q_heads", [6, 8])
 @pytest.mark.parametrize("capture", [False, True])
@@ -1167,12 +1229,13 @@ def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
     rows, live_rows = 4 * query_width, 3 * query_width
     q = torch.randn(rows, 6, 256, device=device, dtype=torch.bfloat16)
     q[live_rows:].fill_(float("nan"))
-    k_cache = (torch.randn(512, 1, 256, device=device, dtype=torch.bfloat16) * 0.25).to(
-        cache_dtype
-    )
-    v_cache = (torch.randn(512, 1, 256, device=device, dtype=torch.bfloat16) * 0.25).to(
-        cache_dtype
-    )
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    k_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    v_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
     # The reserved page starts at zero. Padding writes may poison slot 0,
     # while slot 1 remains a finite read target for invalid sparse entries.
     k_cache[:64].zero_()
@@ -1602,7 +1665,8 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
     if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
         pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
     torch.manual_seed(83)
-    seq_len, page_size, num_pages = 65539, 256, 1024
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    seq_len, page_size, num_pages = 3839, 256, 15
     cache_slots = (num_pages + 1) * page_size
     q = torch.randn(rows, q_heads, 256, device=device, dtype=torch.bfloat16)
     k_cache = (
@@ -1611,7 +1675,7 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
     ).to(cache_dtype)
     v_cache = (torch.randn_like(k_cache, dtype=torch.bfloat16) * 0.25).to(cache_dtype)
     # Scatter 512 four-token groups and the three-token remainder over physical
-    # pages spanning the full 256K capacity, with page zero reserved.
+    # pages spanning the whole cache, with page zero reserved.
     pages = torch.randperm(num_pages, device=device, dtype=torch.int32) + 1
     slots = torch.empty((rows, 2051), device=device, dtype=torch.int32)
     offsets = torch.arange(4, device=device, dtype=torch.int32)

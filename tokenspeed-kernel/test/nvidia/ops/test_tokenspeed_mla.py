@@ -209,6 +209,60 @@ def test_pdl_off_matches_pdl_on(
     assert _bitwise_equal(v_off, v_on)
 
 
+def test_kv_pack_reuses_compilation() -> None:
+    # This contract belongs to the in-tree kernel; the pinned wheel can
+    # precede it. Isolate the import from the wheel used by the other tests.
+    repo_root = Path(__file__).resolve().parents[4]
+    script = textwrap.dedent("""
+        import torch
+        from tokenspeed_mla.mla_kv_pack_quantize_fp8 import (
+            _mla_kv_pack_quantize_fp8_kernel,
+            mla_kv_pack_quantize_fp8,
+        )
+        from utils import assert_no_triton_compile
+
+        torch.manual_seed(0)
+        kv = torch.randn(256, 16, 256, device="cuda", dtype=torch.bfloat16)
+        pe = torch.randn(256, 1, 64, device="cuda", dtype=torch.bfloat16)
+
+        def run(tokens):
+            # With 12 heads, row counts can be non-multiples of 16.
+            nope, rope, v = kv[:tokens, :12, :128], pe[:tokens], kv[:tokens, :12, 128:]
+            k_out, v_out = mla_kv_pack_quantize_fp8(nope, rope, v)
+            k_ref = torch.cat((nope, rope.expand(-1, 12, -1)), dim=-1).to(k_out.dtype)
+            v_ref = v.to(v_out.dtype)
+            assert torch.equal(k_out.view(torch.uint8), k_ref.view(torch.uint8))
+            assert torch.equal(v_out.view(torch.uint8), v_ref.view(torch.uint8))
+
+        run(256)
+        with assert_no_triton_compile(_mla_kv_pack_quantize_fp8_kernel):
+            for tokens in (1, 3, 17, 255):
+                run(tokens)
+        """)
+    env = os.environ.copy()
+    python_path = [
+        str(repo_root / "tokenspeed-mla" / "python"),
+        str(repo_root / "tokenspeed-kernel" / "test"),
+    ]
+    if env.get("PYTHONPATH"):
+        python_path.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        "MLA KV packing compilation reuse failed:\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
 def test_sm103_bf16_decode_causal_variants_compile() -> None:
     """The SM103 BF16 decode path compiles for both mask variants."""
     repo_root = Path(__file__).resolve().parents[4]

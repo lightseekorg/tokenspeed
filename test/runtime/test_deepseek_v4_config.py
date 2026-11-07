@@ -56,7 +56,6 @@ from tokenspeed.runtime.models.deepseek_v41_dspark_heads import (
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import (
-    DeepseekV4MLP,
     DeepseekV4MoE,
     DeepseekV4MoEGate,
     DeepseekV4TopK,
@@ -583,7 +582,8 @@ class TestDeepseekV4Config:
             actual, hidden_states * 2 + hidden_states + 3, atol=0, rtol=0
         )
 
-    def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
+    @pytest.mark.parametrize("mega_moe", [False, True])
+    def test_deepseek_v4_shared_expert_tp_group(self, mega_moe):
         mapping = Mapping(
             rank=1,
             world_size=4,
@@ -595,20 +595,42 @@ class TestDeepseekV4Config:
             moe_ep_size=4,
             moe_dp_size=1,
         )
-
-        shared_mlp = DeepseekV4MLP(
-            hidden_size=8,
-            intermediate_size=16,
-            hidden_act="silu",
-            mapping=mapping,
-            quant_config=None,
-            prefix="model.layers.0.ffn.shared_experts",
+        backend = SimpleNamespace(
+            is_mega_moe=lambda: mega_moe, is_gluon_petit=lambda: False
         )
+        config = SimpleNamespace(
+            n_shared_experts=1,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            hidden_size=256,
+            moe_intermediate_size=128,
+            hidden_act="silu",
+            norm_topk_prob=True,
+        )
+        gate = SimpleNamespace(e_score_correction_bias=None, tid2eid=None)
+        experts = SimpleNamespace(topk_weights_dtype=torch.bfloat16)
 
-        assert (shared_mlp.tp_rank) == (mapping.dense.tp_rank)
-        assert (shared_mlp.tp_size) == (mapping.dense.tp_size)
-        assert (shared_mlp.tp_group) == (mapping.dense.tp_group)
-        assert (shared_mlp.tp_size) != (mapping.moe.tp_ep_size)
+        with (
+            patch.dict(global_server_args_dict, {"moe_mxfp4_fp8_activation": False}),
+            patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
+            patch.object(deepseek_v4_model, "DeepseekV4MoEGate", return_value=gate),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_routed_expert_quant_config",
+                return_value=(None, False),
+            ),
+            patch.object(deepseek_v4_model, "MoELayer", return_value=experts),
+            patch.object(deepseek_v4_model, "DeepseekV4TopK"),
+        ):
+            moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
+
+        # Normal EP reduces routed and shared partials together over TPxEP.
+        if mega_moe:
+            expected = (mapping.dense.tp_size, mapping.dense.tp_group)
+        else:
+            expected = (mapping.moe.tp_ep_size, mapping.moe.tp_ep_group)
+        for proj in (moe.shared_experts.gate_up_proj, moe.shared_experts.down_proj):
+            assert (proj.tp_size, proj.tp_group) == expected
 
     def _make_fake_mega_deepseek_v4_moe(
         self, hidden_states, input_ids, shared_experts, calls
@@ -636,6 +658,7 @@ class TestDeepseekV4Config:
             config=SimpleNamespace(num_experts_per_tok=2, norm_topk_prob=True),
             n_shared_experts=1,
             shared_experts=shared_experts,
+            shared_expert_fused=False,
             stream_fork=StreamFork(None),
             routed_scaling_factor=1.0,
             experts=routed_experts,

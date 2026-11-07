@@ -15,7 +15,7 @@ its own cache groups.
 through `select_kernel` like any other kernel family, and a helper built on the
 first:
 
-* `gqa_prologue(q, k, v, *, norm, rotary, cache, return_kv,
+* `gqa_prologue(q, k, v, *, norm, rotary, cache, query_dtype, return_kv,
   solution, override)` for multi-head and grouped-query attention;
 * `mla_prologue(query, q_pe, latent_cache, *, expanded, rotary,
   cache, solution, override)` for multi-head latent attention; `cache=None`
@@ -38,7 +38,8 @@ rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
 When a projection or collective has already applied the same head-step numerics,
 `PagedAttention.store_prepared` uses `gqa_prologue` with no norm or rotary step.
 The prologue still owns slot selection and KV conversion/writes; the returned
-query/key rows need no additional copy in the Triton solution.
+query/key rows need no additional copy in the Triton solution unless the
+backend asks for an FP8 query.
 Flows that dispatch core attention themselves call `PagedAttention.prologue`
 (GQA) or `PagedAttention.latent_prologue` (MLA). Passing `k = v = None` means
 that `prologue`/`latent_prologue` call has prepared the inputs and written
@@ -263,6 +264,13 @@ scales. MLA caches run at unit scale.
 An MLA layer reads its query in the activation dtype, except that an FP8
 latent cache gets an FP8 query, and FP8 expanded keys and values, whichever MLA
 backend serves the layer. A per-token-head cache keeps the activation dtype.
+A GQA layer's query dtype is the reader's choice, since readers of one FP8
+cache differ: the backend's `query_dtype` names it per layer and forward
+mode, and the prologue returns the query in it (the Triton solution rounds
+once from fp32, the composite converts its result), so no separate cast runs
+before attention. The MHA backend asks for unscaled FP8 in decode over an FP8
+cache; a fresh prefill attends the activation-dtype key and value rows the
+prologue returns, so extend keeps the activation dtype.
 
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
@@ -329,18 +337,39 @@ configuration and checkpoint weights; kernel selection and weight preparation
 belong to the `attention` family in `tokenspeed-kernel`. Weight preparation
 preserves coefficients and dtype.
 
+DSA's indexer uses the normalized Q latent before the main attention's Q-LoRA
+scale. Prefill applies that scale after the main Q projection;
+the fused Decode packs it into only the main Q projection panels. The shared
+Q norm and indexer projection remain unscaled. Indexer head weights retain FP32
+and include `index_head_dim**-0.5 * index_n_heads**-0.5` in every execution path.
+Moving the main scale into the shared norm changes the indexer scores. Packed
+BF16 weight scaling can round differently from activation scaling; this does
+not establish cross-provider bitwise equality.
+
 Native prologues follow the normalization, rotation and cache-write contracts
 above. Owner-sharded transport may commit prepared KV rows on the prologue's
 behalf; router-provided slots, ownership masks and cache sanitization remain
 authoritative. Distributed execution preserves each request's causal visibility.
 
-Native Prefill is selected by an explicit model-cache capability carrying its
-pre-arena workspace reservation. Ordinary cache views retain generic Prefill
-and its prefix-history metadata without loading the native transport. Generic
-MLA history gathers are temporary, never published as cache storage; their
-allocation and communication scale with the layer's cache capacity.
+DSA Prefill uses token-local queries with all heads, gathers KV and Indexer-K,
+and returns complete output rows without Q/TopK/output/LSE exchanges. MLA
+Prefill keeps its head partition: it gathers normalized Q latents, projects
+local heads, consumes gathered KV history and current rows, and retains the
+existing output reduction. Indexer-K and KV share one BF16 transport packet
+per phase; gathering and cache commit preserve their bits.
 
-Weights and communication resources are prepared before graph capture. Native
-communication reuses the existing HCCL window and validates its capacity during
-preparation. Resource owners keep buffers alive until all referencing graphs
-are destroyed and outstanding work is drained, then release them.
+The preceding KDA segment may submit history gathering. The attention entry
+ensures it if absent. Receive and packet tensors are temporary and follow actual
+batch page geometry; fixed gather workspaces are not part of the model cache.
+All user-managed Prefill work uses one execution stream and synchronous HCCL
+interfaces. Tensor references and allocator stream tracking cover every queued
+consumer. Weight preparation and Decode graph behavior remain unchanged.
+These byte-preserving gathers do not establish cross-provider bitwise equality
+for attention arithmetic or reductions.
+
+Prefill KV transport borrows an isolated accelerator process group from the
+runtime process-group manager. All world ranks create the cache-owner groups
+in the same order when publishing the cache pool, before any forward or
+decode graph capture. A forward never creates a process group; an idle DP
+rank still participates in startup. Temporary tensor ownership ends after
+the final consumer, while the process-group manager retains the communicator.
