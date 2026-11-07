@@ -285,11 +285,17 @@ exported row against a fresh resolution.
 
 Operations borrow their scheduled request's tables only until their batch is
 built. A request selected for that build cannot be retracted or scheduled
-again in it. Batch construction resolves rows directly into one owned
-contiguous buffer per group, writing null prefixes and `-1` row padding there.
-No borrowed table escapes into an execution plan. The legacy nested table
-accessor materializes the same padded rows from that buffer on demand; NumPy
-views keep their owning batch alive. Pinned staging remains runtime-owned.
+again in it. Batch construction copies one owned window per row. A group's
+window width is the largest `pages - released` of its rows; each row starts
+at `max(pages - window_width, 0)`. Its `(released, pages)` span and absolute
+column count preserve logical indexing without writing long zero prefixes.
+No borrowed table escapes into an execution plan. The runtime uploads these
+windows and reconstructs absolute rows, including zero holes and `-1`
+padding, with the existing row-expansion kernel; a host mirror is built only
+when requested. The legacy absolute-table accessors materialize a stable,
+thread-safe cached buffer on demand. Copies share the immutable snapshot,
+and NumPy views keep their owning batch alive. Pinned staging remains
+runtime-owned; the scheduler neither allocates nor borrows a Torch buffer.
 
 `CacheBatchMetadata` checks the exported groups, dtype and shape on every
 forward. `TOKENSPEED_VALIDATE_PAGE_IDS=1` additionally scans the IDs against

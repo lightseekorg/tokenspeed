@@ -5,6 +5,7 @@ from test.runtime.conftest import (
     cache_metadata_for,
     make_kimi_pool,
     whole_row_spans,
+    whole_row_windows,
 )
 
 import numpy as np
@@ -59,8 +60,8 @@ class _ForwardTables:
     def __init__(self, arrays: dict[str, np.ndarray]) -> None:
         self.arrays = arrays
 
-    def block_tables_arrays(self) -> dict[str, np.ndarray]:
-        return self.arrays
+    def block_table_windows(self) -> dict[str, tuple[np.ndarray, int]]:
+        return whole_row_windows(self.arrays)
 
     def block_table_spans(self) -> dict[str, np.ndarray]:
         return whole_row_spans(self.arrays)

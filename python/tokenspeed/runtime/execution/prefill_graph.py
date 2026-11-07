@@ -1261,7 +1261,10 @@ class PrefillGraph:
                 for group_id, array in arrays.items()
             }
             dummy_forward_op = SimpleNamespace(
-                block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+                block_table_windows=lambda: {
+                    key: (array, array.shape[1]) for key, array in arrays.items()
+                },
+                block_table_spans=lambda: spans,
             )
             cache_metadata = CacheBatchMetadata.from_forward_op(
                 dummy_forward_op,

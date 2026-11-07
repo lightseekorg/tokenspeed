@@ -206,4 +206,13 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
             csrc
             tests/cpp
     )
+
+    add_executable(tokenspeed_scheduler_forward_batch_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_forward_batch.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_forward_batch_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+    )
 endif()
