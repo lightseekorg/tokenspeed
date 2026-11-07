@@ -527,16 +527,14 @@ impl RequestState {
         }
         let generated = self.output_ids.len() as i64;
         if self.stream {
-            // A zero interval would divide by zero; it means every token.
+            // A non-positive interval means every step.
             let interval = self
                 .stream_interval
                 .unwrap_or(default_stream_interval)
                 .max(1);
-            if interval > 1 {
-                generated % interval == 1
-            } else {
-                generated % interval == 0
-            }
+            let unsent = generated - self.send_token_offset as i64;
+            // A speculative step can append several tokens and skip a send point.
+            interval == 1 || unsent >= interval || (self.send_token_offset == 0 && unsent > 0)
         } else {
             generated == 1 || generated % FORCED_STREAM_INTERVAL == 0
         }
@@ -591,26 +589,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_intervals_follow_the_python_schedule() {
-        let due = |stream: bool, interval: Option<i64>, generated: usize| {
-            let mut request = RequestState::new(
-                vec![1, 2, 3],
-                1000,
-                BTreeSet::new(),
-                stream,
-                interval,
-                false,
-            );
+    fn default_streaming_and_nonstreaming_intervals() {
+        let due = |stream: bool, generated: usize| {
+            let mut request =
+                RequestState::new(vec![1, 2, 3], 1000, BTreeSet::new(), stream, None, false);
             request.output_ids = vec![0; generated];
             request.output_due(1)
         };
-        assert!((1..5).all(|n| due(true, None, n)));
-        // An interval above one fires on its first token and every interval after.
-        assert_eq!(
-            (1..8).map(|n| due(true, Some(3), n)).collect::<Vec<_>>(),
-            [true, false, false, true, false, false, true]
-        );
+        assert!((1..5).all(|n| due(true, n)));
         // Non-streaming requests: the first token, then every 50.
-        assert!(due(false, None, 1) && !due(false, None, 2) && due(false, None, 50));
+        assert!(due(false, 1) && !due(false, 2) && due(false, 50));
     }
 }

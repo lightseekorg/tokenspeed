@@ -2347,6 +2347,31 @@ mod tests {
     }
 
     #[test]
+    fn streaming_flushes_after_crossing_the_interval() {
+        let mut state = RequestState::new(vec![0], 100, BTreeSet::new(), true, Some(4), false);
+        for (new_tokens, expected) in [
+            (&[1][..], Some(&[1][..])),
+            (&[2, 3, 4][..], None),
+            (&[5, 6][..], Some(&[2, 3, 4, 5, 6][..])),
+            (&[7, 8, 9][..], None),
+            (&[10][..], Some(&[7, 8, 9, 10][..])),
+        ] {
+            state.output_ids.extend_from_slice(new_tokens);
+            let output = OutputProcessor::stream_state("r", &mut state, 1, None);
+            assert_eq!(
+                output.as_ref().map(|chunk| chunk.output_ids.as_slice()),
+                expected
+            );
+        }
+        state.output_ids.push(11);
+        state.finished_reason = Some(FinishReason::Length(11));
+        let output = OutputProcessor::stream_state("r", &mut state, 1, None).unwrap();
+        assert_eq!(output.output_ids, [11]);
+        assert_eq!(output.finish_reason, Some("length"));
+        assert!(OutputProcessor::stream_state("r", &mut state, 1, None).is_none());
+    }
+
+    #[test]
     fn a_request_streams_until_its_stop_token() {
         let mut p = processor(None);
         register(&mut p, "r", 4, 10, &[2]);
