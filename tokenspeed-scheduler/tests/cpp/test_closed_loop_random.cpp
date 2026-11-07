@@ -35,7 +35,9 @@
 // on the P role the overlap depth, on the fused role (overlap depth 1) mixed
 // batches and retraction: none, for capacity into a snapshot pool, or forced
 // every third plan on the oldest decode (3) or prefill (-3), into a pool too
-// small for some of the images the knob takes.
+// small for some of the images the knob takes. One P-role test turns the
+// in-forward checkpoints on for every seed and drops short prompts' ends
+// (drop_short_prompt_end_checkpoints).
 //
 // The scheduler must never raise; under write-back no copy pins its Device
 // source; every write-back row keeps its two ends in one shard's bucket;
@@ -106,6 +108,9 @@ struct LoopKnobs {
     bool conversations{false};
     // Multiplies the drawn Device size.
     std::int32_t device_pages_factor{1};
+    // P role only: SchedulerConfig::drop_short_prompt_end_checkpoints, with
+    // the in-forward checkpoints on whatever in_forward says.
+    bool drop_short_prompt_ends{false};
 };
 
 struct ClosedLoop {
@@ -196,7 +201,8 @@ struct ClosedLoop {
         cfg.decode_input_tokens = 1;
         cfg.overlap_schedule_depth = overlap_depth;
         cfg.enable_mixed_prefill_decode = mixed;
-        cfg.state_checkpoint_in_forward = in_forward;
+        cfg.state_checkpoint_in_forward = in_forward || knobs.drop_short_prompt_ends;
+        cfg.drop_short_prompt_end_checkpoints = knobs.drop_short_prompt_ends;
         cfg.demote_superseded_state_checkpoints = knobs.demote;
         cfg.cache_groups.push_back(CacheGroupConfig{.group_id = "full_attention",
                                                     .block_granularity = history_block,
@@ -682,6 +688,33 @@ TEST(ClosedLoopRandomTest, MirroredPrefillSchedulersPlanAlike) {
         EXPECT_GT(write_backs, 0u) << "shards " << shards;
         EXPECT_GT(loads, 0u) << "shards " << shards;
     }
+}
+
+// 32 seeds of the P role with the in-forward checkpoints on and short
+// prompts' ends dropped, each otherwise of its own configuration; every
+// fourth drives two schedulers as the ranks of one replica.
+TEST(ClosedLoopRandomTest, PrefillRoleDroppingShortPromptEndsNeverRaisesAndDrains) {
+    // The eviction write-backs the write-back runs made.
+    std::uint64_t write_backs = 0;
+    for (unsigned seed = 0; seed < 32; ++seed) {
+        const bool mirrored = seed % 4 == 3;
+        ClosedLoop loop(seed, Role::kP, mirrored, LoopKnobs{.drop_short_prompt_ends = true});
+        SCOPED_TRACE(::testing::Message()
+                     << "seed " << seed << (loop.write_back ? " write-back" : " write-through") << " overlap "
+                     << loop.overlap_depth << " shards " << loop.kv_shards << (mirrored ? " mirrored" : ""));
+        try {
+            loop.Run();
+        } catch (const std::exception& error) {
+            ADD_FAILURE() << "raised: " << error.what();
+            continue;
+        }
+        for (const std::unique_ptr<Scheduler>& scheduler : loop.schedulers) {
+            EXPECT_EQ(scheduler->HostPoolPinnedBlocks(), 0);
+            EXPECT_TRUE(scheduler->CanClearCache());
+        }
+        write_backs += loop.schedulers[0]->GetHostCacheStats().eviction_stores.ops;
+    }
+    EXPECT_GT(write_backs, 0u);
 }
 
 // 64 seeds of the fused role, each of its own configuration, acknowledged op

@@ -254,6 +254,64 @@ def test_checkpoint_retention_leaf_distance_is_passed_when_given(flags, leaf_dis
     assert cfg.checkpoint_retention_leaf_distance == leaf_distance
 
 
+@pytest.mark.parametrize(
+    "flags, enabled",
+    [([], False), (["--enable-state-checkpoint-in-forward"], True)],
+)
+def test_a_prefill_server_drops_short_prompt_ends_with_in_forward_checkpoints(
+    flags, enabled
+):
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-transfer-backend",
+            "mooncake",
+            *flags,
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    )
+    assert cfg.state_checkpoint_in_forward is enabled
+    assert cfg.drop_short_prompt_end_checkpoints is enabled
+
+
+def test_a_fused_server_keeps_short_prompt_ends():
+    # The drop is a prefill-server policy: fused serving keeps its short
+    # prompt ends with in-forward checkpoints on.
+    args = ServerArgs(
+        model="x", max_num_seqs=8, enable_state_checkpoint_in_forward=True
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.state_checkpoint_in_forward
+    assert not cfg.drop_short_prompt_end_checkpoints
+
+
+@pytest.mark.parametrize("role, pool", [("decode", (5, 8)), ("encode", (1, 0))])
+def test_decode_and_encode_servers_drop_no_short_prompt_end(role, pool):
+    # A PD launcher may pass the prefill flags to every role; the scheduler
+    # refuses the drop outside the P role, so these servers never set it.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode=role,
+        disaggregation_transfer_backend="mooncake",
+        enable_state_checkpoint_in_forward=True,
+    )
+    cfg = _config(
+        args,
+        _specs(num_host_pages=17, num_snapshot_pages=pool[0], max_retracted=pool[1]),
+    )
+    assert not cfg.drop_short_prompt_end_checkpoints
+
+
 def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
     # Its checkpoint is only reachable through a prefix hit.
     with pytest.raises(ValueError, match="requires prefix caching"):

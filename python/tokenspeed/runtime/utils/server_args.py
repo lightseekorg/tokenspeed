@@ -424,7 +424,9 @@ class ServerArgs:
     # a next turn that re-renders the end of the prompt and its reply cannot
     # resume there. A finish also demotes the in-forward checkpoint its
     # conversation published two turns back, which both cache tiers then evict
-    # early (docs/design/scheduler.md section 1.2).
+    # early. On a prefill server a prompt too short for the in-forward
+    # checkpoint whose end lies inside a page publishes no state and no KV tail
+    # there either (docs/design/scheduler.md section 1.2).
     enable_state_checkpoint_in_forward: bool = False
     # Hybrid models: a State checkpoint a later request's checkpoint extends
     # ranks, under cache pressure, as if last used this many new requests ago. None
@@ -1520,6 +1522,18 @@ class ServerArgs:
         return (
             self.enable_state_checkpoint_in_forward
             and self.disaggregation_mode != "decode"
+        )
+
+    @property
+    def drops_short_prompt_end_checkpoints(self) -> bool:
+        """Whether this engine's scheduler drops short prompts' end checkpoints.
+
+        A prefill server does where it writes in-forward checkpoints; no other
+        role does (a fused server keeps its short prompt ends).
+        """
+        return (
+            self.writes_state_checkpoints_in_forward
+            and self.disaggregation_mode == "prefill"
         )
 
     @property
@@ -2987,7 +3001,13 @@ class ServerArgs:
             "host caches, and no new store or eviction write-back copies it to "
             "host, unless another request also resumed from it, or acquired or "
             "republished it after the conversation's previous turn resumed "
-            "there. Requires prefix caching; a decode server ignores it. See "
+            "there. On a prefill server, a prompt too short for the in-forward "
+            "checkpoint (by default, one no longer than the chunk budget) whose "
+            "end lies inside a prefix page publishes only its full pages, no "
+            "recurrent state and no KV tail at its end, since a next turn that "
+            "re-renders the end of the prompt cannot resume there; a page-aligned "
+            "prompt end keeps its state, and a fused server keeps short prompt "
+            "ends. Requires prefix caching; a decode server ignores it. See "
             "docs/design/scheduler.md section 1.2.",
         )
         parser.add_argument(
