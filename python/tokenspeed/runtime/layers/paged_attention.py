@@ -30,7 +30,7 @@ contracts must satisfy: a group must retain every token its layers can see.
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from tokenspeed_kernel.ops.attention.prologue import (
@@ -62,6 +62,9 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     K_CACHE_SCALE_SUFFIXES,
     V_CACHE_SCALE_SUFFIXES,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
 
 @dataclass(frozen=True)
@@ -270,6 +273,15 @@ class PagedAttention(nn.Module):
             ctx=ctx,
             **kwargs,
         )
+
+    def decode_kv_view(self, ctx: ForwardContext) -> "DecodeKVView | None":
+        """This layer's paged cache and decode metadata, for a kernel that runs
+        its decode attention inside a larger launch, or None when the backend
+        does not expose them (:meth:`AttentionBackend.decode_kv_view`) or the
+        forward is not a decode."""
+        if not ctx.forward_mode.is_decode():
+            return None
+        return ctx.attn_backend.decode_kv_view(self, ctx.token_to_kv_pool)
 
     def prologue(
         self,
