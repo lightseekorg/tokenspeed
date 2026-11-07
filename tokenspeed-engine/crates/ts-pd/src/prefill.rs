@@ -631,14 +631,15 @@ impl Shared {
             .cloned()
             .ok_or("CachePD request references an unregistered Decode session")?;
         let route = (registration.endpoint.clone(), registration.port);
-        if {
+        let cancelled = {
             let mut state = self.state();
             if state.cancelled.contains_key(&room) {
                 state.cancel_room(room, Some(cache_id));
             }
             state.cancelled.contains_key(&room)
                 || state.rooms.get(room) == Some(TransferPoll::Failed)
-        } {
+        };
+        if cancelled {
             self.notify_failed(route, room);
             return Ok(());
         }
