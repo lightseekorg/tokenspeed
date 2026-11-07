@@ -95,6 +95,7 @@ __all__ = [
     "has_grouped_fp8_projection",
     "prepare_fp8_projection",
     "prepare_grouped_fp8_projection",
+    "warmup_fp8_projection",
     "warmup_fp8_projections",
     # MV: small-M dense projection
     "mv",
@@ -579,7 +580,7 @@ def mm(
             ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
             also be E4M3 codes with UE8M0 ``A_scales``, canonical
             ``[M, K/32]`` or already in the 1-D F8_128x4 layout (such as
-            ``rmsnorm_quantize_fp8_group32(swizzled_scales=True)`` writes).
+            ``rmsnorm_quantize_fp8_group32(scale_layout="swizzled")`` writes).
     """
     if plan is not None and prepacked_scales:
         raise ValueError("A GEMM plan cannot use prepacked online quantization")
@@ -1601,6 +1602,36 @@ def warmup_fp8_projections(
             x, x_scales, grouped_weight, grouped_weight_scales
         )
         fp8_projection(z, z_scales, weight, weight_scales, None)
+    torch.cuda.synchronize(device)
+
+
+def warmup_fp8_projection(
+    weight: torch.Tensor, weight_scales: torch.Tensor, max_tokens: int
+) -> None:
+    """Launch ``fp8_projection`` once per tile configuration up to max_tokens.
+
+    The kernel JIT-compiles a tile configuration on its first launch; running
+    every reachable one at startup keeps compilation out of serving.
+
+    Args:
+        weight: E4M3 ``[output_dim, input_dim]`` codes given to
+            ``prepare_fp8_projection``.
+        weight_scales: Scales from ``prepare_fp8_projection``.
+        max_tokens: Largest token count a forward can carry.
+    """
+    output_dim, input_dim = weight.shape
+    device = weight.device
+    codes = torch.zeros(max_tokens * input_dim, dtype=_fp8_dtype, device=device)
+    padded = (max_tokens + 3) // 4 * 4
+    scale_storage = torch.zeros(
+        input_dim // 128 * padded, dtype=torch.int32, device=device
+    )
+    # Largest first, so the outputs each launch allocates reuse cached blocks.
+    for tokens in reversed(_warmup_token_counts(max_tokens)):
+        aligned = (tokens + 3) // 4 * 4
+        x = codes[: tokens * input_dim].view(tokens, input_dim)
+        x_scales = scale_storage.as_strided((tokens, input_dim // 128), (1, aligned))
+        fp8_projection(x, x_scales, weight, weight_scales, None)
     torch.cuda.synchronize(device)
 
 

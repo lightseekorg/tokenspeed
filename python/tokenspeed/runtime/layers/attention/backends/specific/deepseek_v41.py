@@ -291,6 +291,26 @@ class V41PrefillLayout:
     history_slots: tuple[torch.Tensor | None, ...]
 
 
+def zeroed_fused_output(
+    q: torch.Tensor, groups: int, rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zeroed grouped FP8 attention output in the fused kernel's own layout.
+
+    Batches of one prefill step fill disjoint rows, so the destination has to
+    match what the kernel returns for one batch. The codes are contiguous
+    [rows, groups, group width]. The scales keep the fused kernel's scale
+    layout: allocated as [groups, scale words, rows padded to four] and viewed
+    back to [rows, groups, scale words], which leaves the row stride at one.
+    Zeroed codes read as zero under any scale, as the zeroed BF16 output of the
+    step-by-step path does.
+    """
+    width = q.shape[1] * q.shape[2] // groups
+    codes = q.new_zeros((rows, groups, width), dtype=torch.float8_e4m3fn)
+    padded = (rows + 3) // 4 * 4
+    scales = q.new_zeros((groups, width // 128, padded), dtype=torch.int32)
+    return codes, scales.transpose(1, 2)[:, :rows].transpose(0, 1)
+
+
 @dataclass
 class V41IndexGeometry:
     # positions, request_indices and source_table are never read back: they
@@ -2246,6 +2266,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # FP8 output must follow the complete softmax, not a DCP partial.
         return self.kvp_size == 1
 
+    @property
+    def supports_fused_prefill(self) -> bool:
+        # Prefill with a query group exchanges BF16 partial heads and merges
+        # them. The fused kernel returns the output already permuted, grouped
+        # and cast, so exchanging it would mean undoing all three.
+        return self.supports_fused_attention and (
+            len(self.spec.attention_query_group) == 1
+        )
+
     def forward_v41(
         self,
         q,
@@ -2273,8 +2302,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         FP32 [positions,64] table) is given; then it is rotated with it.
 
         With fused_decode_groups, q instead uses the prepared weight's unrotated
-        layout. Local decode returns grouped FP8 codes/scales after inverse RoPE,
-        for the matching prepared output projection. SWA uses the same RoPE table.
+        layout. Local decode and pure prefill return grouped FP8 codes/scales
+        after inverse RoPE, for the matching prepared output projection; prefill
+        runs one fused call per workspace batch and the batches fill zeroed
+        codes and scales in the kernel's own layout. SWA uses the same RoPE
+        table. A mixed batch and the operator's query context parallelism keep
+        the BF16 return.
 
         q and swa_kv are [T,Hlocal,512] / [T,512]. q is post-RoPE; SWA can
         defer RMSNorm and RoPE using swa_norm_weight/eps and swa_rope_cache.
@@ -2298,14 +2331,31 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         ):
             raise ValueError("Fused V4.1 output requires 8 heads per group")
         if fused_decode_groups is not None and (
-            not forward_mode.is_decode()
+            not (forward_mode.is_decode() or forward_mode.is_extend())
             or not self.supports_fused_attention
             or swa_rope_cache is None
             or out_rope_cache is not None
         ):
             raise ValueError(
-                "Fused V4.1 attention requires local decode with its RoPE table"
+                "Fused V4.1 attention requires local decode or extend with its "
+                "RoPE table"
             )
+        # MIXED is excluded above: is_extend() is EXTEND alone. Two prefill
+        # shapes also keep the regular path. The operator's query group
+        # exchanges BF16 partial heads and merges them, which the permuted,
+        # grouped and cast rows cannot serve. A model query shard hands this
+        # call the shard's query rows, whereas the caller rotates Q from its
+        # own source rows, so the fused Q RoPE would use other positions.
+        if fused_decode_groups is not None and forward_mode.is_extend():
+            if len(self.spec.attention_query_group) > 1:
+                raise ValueError(
+                    "Fused V4.1 prefill does not serve operator query context "
+                    "parallelism"
+                )
+            if key_rows is not None:
+                raise ValueError(
+                    "Fused V4.1 prefill does not serve a model query shard"
+                )
 
         source_positions, source_requests = positions, request_indices
         source_window = None
@@ -2622,7 +2672,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             and isinstance(layout.batches[0].query_rows, slice)
             and layout.batches[0].query_rows == slice(0, q.shape[0])
         )
-        out = None if whole else torch.zeros_like(q)
+        if whole:
+            out = None
+        elif fused_decode_groups is not None:
+            out = zeroed_fused_output(q, fused_decode_groups, q.shape[0])
+        else:
+            out = torch.zeros_like(q)
         batches = list(zip(layout.batches, layout.history_slots, strict=True))
         # Run the batch whose histories the workspace still holds first, so a
         # layer after its owner reuses them even when the step needs several
@@ -2699,8 +2754,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 else batch.swa_indices
             )
             # Row subsets do not provide a writable output view; copy their
-            # compact result back explicitly after native execution.
-            output = out[rows] if out is not None and isinstance(rows, slice) else None
+            # compact result back explicitly after native execution. The fused
+            # kernel takes no destination, so its result always copies back.
+            output = (
+                out[rows]
+                if out is not None
+                and fused_decode_groups is None
+                and isinstance(rows, slice)
+                else None
+            )
             batch_q = q[rows].contiguous()
             # Padded head counts need a padded query copy per call; keep that
             # bounded by tiles. Native head counts run the batch in one call.
@@ -2710,7 +2772,29 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 else V41_PREFILL_QUERY_TILE
             )
             group = self.spec.attention_query_group
-            if (
+            if fused_decode_groups is not None:
+                # One call per batch: the fused kernel rotates this batch's
+                # queries, attends, rotates the result back and casts it, so
+                # the rows it returns are already the output projection's
+                # grouped FP8 input. Checked first: the guards above leave the
+                # head exchange and this path mutually exclusive.
+                result = dsv41.selected_attention_fp8(
+                    batch_q,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    attn_sink,
+                    softmax_scale,
+                    positions[rows],
+                    swa_rope_cache,
+                    fused_decode_groups,
+                    workspace[:, None, :],
+                    indices.contiguous(),
+                )
+            elif (
                 canonical
                 and q.is_cuda
                 and index_process_group is None
@@ -2762,6 +2846,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 )
             if out is None:
                 out = result
+            elif fused_decode_groups is not None:
+                out[0][rows] = result[0]
+                out[1][rows] = result[1]
             elif output is None:
                 out[rows] = result
             del workspace, indices
