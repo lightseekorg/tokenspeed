@@ -411,7 +411,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         kda_backend=backend_name,
         kda_recurrent_layout="v_major",
     )
-    backend._layer_state = lambda layer_id: (
+    backend.layer_state = lambda layer_id: (
         backend.forward_metadata.state_in_blocks_by_group["state"],
         backend.forward_metadata.state_out_blocks_by_group["state"],
         conv,
@@ -699,6 +699,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     )
     # No Host L2 tier: nothing to wait for before the replay.
     owner.token_to_kv_pool = SimpleNamespace(layerwise_load_tracker=None)
+    owner._route_counts = {}
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
     owner._embed_tokens = lambda ids: torch.zeros(8, 4)
@@ -719,9 +720,12 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
         forward_mode=ForwardMode.EXTEND,
         global_num_tokens=None,
     )
-    with patch(
-        "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata.from_forward_context",
-        return_value=None,
+    with (
+        patch(
+            "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata.from_forward_context",
+            return_value=None,
+        ),
+        patch("tokenspeed.runtime.execution.prefill_graph.logger") as log,
     ):
         result = owner.replay(ctx, torch.zeros(num_tokens, dtype=torch.int64), None)
     torch.testing.assert_close(result, torch.full((num_tokens, 4), float(expected)))
@@ -729,7 +733,90 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     assert events == ([] if transfer else ["refresh"]) + [
         "inline" if expected == 2 else "ordinary"
     ]
+    # A variant's first replay logs whatever the interval, so short runs show routes.
+    route = f"inline@{capture_bs}" if expected == 2 else "ordinary"
+    assert owner._route_counts == {route: 1}
+    assert f"prefill graph route first replayed: {route}" in [
+        str(call.args[0]) for call in log.info.call_args_list
+    ]
     assert len(owner._captures) == 1 + int(captured)
+
+
+@pytest.mark.parametrize("consumers", [None, (), (0, 2)])
+def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers):
+    """A captured segment holds no layerwise Host-load wait (an inline KDA
+    layer reads its loaded State inside one), so replay makes the current
+    stream wait on the last-layer event of every load the forward consumes
+    before it refreshes the inline metadata and replays. Without a Host tier,
+    or with no load this step, it waits for nothing."""
+    from contextlib import nullcontext
+    from unittest.mock import patch
+
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.prefill_graph import CapturedForward, PrefillGraph
+
+    events = []
+    tracker = None
+    names = {}
+    if consumers is not None:
+        tracker = LayerwiseLoadTracker(num_layers=2)
+        tracker.set_consumers(consumers)
+        for index, load in enumerate(tracker.event_sets):
+            names[id(load.last_layer_done_event)] = f"wait e{index}"
+
+    def prepare(bucket, bs, mode, *, capture):
+        events.append("refresh")
+        return True
+
+    def capture(label):
+        return SimpleNamespace(replay=lambda **kwargs: events.append(label))
+
+    owner = object.__new__(PrefillGraph)
+    owner._narrowing = None
+    owner._expert_load_rows = None
+    owner._captures = {
+        (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
+        (8, 1): (capture("inline"), CapturedForward(torch.ones(8, 4), None)),
+    }
+    owner.dp_size = 1
+    owner.attn_backend = SimpleNamespace(
+        step_counter=None, prepare_prefill_metadata=prepare
+    )
+    owner.token_to_kv_pool = SimpleNamespace(layerwise_load_tracker=tracker)
+    owner._route_counts = {}
+    owner._replay_bucket = lambda ctx: 8
+    owner._log_engaged_once = lambda *args: None
+    owner._embed_tokens = lambda ids: torch.zeros(8, 4)
+    owner._land_input_embeds = lambda *args: None
+    owner._padded_to = lambda *args: nullcontext()
+    owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
+    owner.input_buffers = SimpleNamespace(
+        input_ids_buf=torch.ones(8, dtype=torch.int64),
+        positions_buf=torch.ones(8, dtype=torch.int64),
+    )
+    owner.text_model = SimpleNamespace(
+        lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
+    )
+    ctx = SimpleNamespace(
+        input_num_tokens=8,
+        bs=1,
+        forward_mode=ForwardMode.EXTEND,
+        global_num_tokens=None,
+    )
+    # The Host load has its own stream; record the forward stream's waits in order.
+    stream = SimpleNamespace(wait_event=lambda event: events.append(names[id(event)]))
+    with (
+        patch("torch.cuda.current_stream", return_value=stream),
+        patch(
+            "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata."
+            "from_forward_context",
+            return_value=None,
+        ),
+    ):
+        owner.replay(ctx, torch.zeros(8, dtype=torch.int64), None)
+    waits = [f"wait e{index}" for index in consumers or ()]
+    assert events == waits + ["refresh", "inline"]
 
 
 @pytest.mark.parametrize(
@@ -1005,6 +1092,7 @@ def kimi_host_cache():
     owner._narrowing = None
     owner._expert_load_rows = None
     owner._engaged_logged = set()
+    owner._route_counts = {}
     owner._captures = {}
     owner.dp_size = 1
     owner.attn_backend = hybrid
@@ -1039,6 +1127,8 @@ def kimi_host_cache():
             torch.manual_seed(37)
             pool.arena.buffer.random_(0, 256)
             pool.get_component(kda_layer_id(pool), "recurrent_state")[1].normal_()
+            # The store follows the execution stream, not the arena-filling stream.
+            torch.cuda.synchronize()
             # Its plan also points the layerwise waits at no load again, so
             # the tests capture with none, as a server does.
             handle.execute(

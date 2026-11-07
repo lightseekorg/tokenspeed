@@ -90,6 +90,13 @@ def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any
         "dense_tp_size": mapping.dense.tp_size,
         "moe_tp_size": mapping.moe.tp_size,
         "moe_ep_size": mapping.moe.ep_size,
+        # Large prefill calls attend through another kernel; listed only when
+        # on, so deployments without it keep their identity.
+        **(
+            {"enable_qsa_prefill_bf16_scratch": True}
+            if args.enable_qsa_prefill_bf16_scratch
+            else {}
+        ),
     }
 
 

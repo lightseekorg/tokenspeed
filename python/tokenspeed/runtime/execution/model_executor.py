@@ -354,6 +354,27 @@ def warn_past_rope_table(
         )
 
 
+def drafter_accept_lengths(
+    accept_lengths: torch.Tensor, decode_requests: slice
+) -> torch.Tensor:
+    """The accepted lengths the drafter continues from.
+
+    A stopped request keeps no token and its drafts are discarded, but the
+    drafter still indexes the last accepted position, so each decode
+    request's length is at least 1. ``accept_lengths`` is left unchanged.
+
+    Args:
+        accept_lengths: ``[bs]`` accepted tokens per request.
+        decode_requests: The decode requests' rows.
+
+    Returns:
+        A new ``[bs]`` tensor.
+    """
+    lengths = accept_lengths.clone()
+    lengths[decode_requests].clamp_(min=1)
+    return lengths
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -372,6 +393,7 @@ class ModelExecutorConfig:
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
+    input_vocab_size: int
     # Logical context limit (user semantics: input validation, max_new_tokens
     # folding, stop checks all key off this).
     context_len: int
@@ -509,6 +531,7 @@ class ModelExecutorConfig:
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
+            input_vocab_size=model_config.input_vocab_size,
             context_len=model_config.context_len,
             physical_context_len=(
                 model_config.context_len + server_args.spec_context_pad
@@ -632,10 +655,11 @@ class ModelExecutor:
         self.input_buffers.init_ngram_buffers(
             ngram_context,
             model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
-            config.vocab_size,
+            config.input_vocab_size,
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
+            input_vocab_size=config.input_vocab_size,
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
@@ -646,17 +670,7 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
-        # Trees keep their draft q per tree instead (bind_tree).
-        if config.enable_speculative_sampling and not config.spec_draft_tree:
-            if config.spec_algo is None:
-                raise ValueError(
-                    "enable_speculative_sampling needs a speculative drafter to "
-                    "record proposal distributions for"
-                )
-            self.runtime_states.init_draft_probs(
-                spec_num_tokens=spec_num_tokens,
-                reject_threshold=config.spec_reject_draft_prob_threshold,
-            )
+        self._init_draft_probs(config, spec_num_tokens)
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -1807,13 +1821,8 @@ class ModelExecutor:
         if self.drafter is not None:
             draft_accept_lengths = accept_lengths
             if ctx.output_layout.num_decodes:
-                # A stopped request keeps no token; its drafts are discarded,
-                # but the drafter indexes the last accepted position.
-                draft_accept_lengths = accept_lengths.clone()
-                draft_accept_lengths[ctx.output_layout.decode_request_slice] = (
-                    draft_accept_lengths[ctx.output_layout.decode_request_slice].clamp(
-                        min=1
-                    )
+                draft_accept_lengths = drafter_accept_lengths(
+                    accept_lengths, ctx.output_layout.decode_request_slice
                 )
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,
@@ -1910,6 +1919,30 @@ class ModelExecutor:
             ib.state_write_padding_pool_index,
         )
 
+    def _init_draft_probs(
+        self, config: ModelExecutorConfig, spec_num_tokens: int
+    ) -> None:
+        """Allocate the dense per-vocab draft q under --enable-speculative-sampling.
+
+        Trees keep their draft q per tree instead (bind_tree), and DFLASH
+        (DFlash2) records a sparse q over its selector's candidates
+        (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
+        The step drafters and DSpark sample from full-vocab logits and need
+        the dense rows.
+        """
+        if not config.enable_speculative_sampling or config.spec_draft_tree:
+            return
+        if config.spec_algo is None:
+            raise ValueError(
+                "enable_speculative_sampling needs a speculative drafter to "
+                "record proposal distributions for"
+            )
+        if config.spec_algo != "DFLASH":
+            self.runtime_states.init_draft_probs(
+                spec_num_tokens=spec_num_tokens,
+                reject_threshold=config.spec_reject_draft_prob_threshold,
+            )
+
     def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
@@ -1920,6 +1953,7 @@ class ModelExecutor:
                 else None
             ),
             draft_probs=self.runtime_states.draft_probs,
+            draft_q=self.runtime_states.future_draft_q,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
@@ -2323,11 +2357,14 @@ class ModelExecutor:
                     contract=self._cache_runtime_contract,
                     num_requests=bs,
                     validate_page_ids=self._validate_page_ids,
+                    # Only an extend plans from host tables.
+                    host_tables=num_extends > 0,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
-                block_tables_cpu = dict(
-                    cache_metadata.tables_cpu(active_forward_op=forward_op)
-                )
+                if num_extends > 0:
+                    block_tables_cpu = dict(
+                        cache_metadata.tables_cpu(active_forward_op=forward_op)
+                    )
             # What the batch fixes on its own is staged while a pending round still drafts.
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,

@@ -25,6 +25,8 @@ import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     _copy_page_fields_kernel,
     _copy_state_rows_kernel,
+    _index_k_layernorm_fp8_scatter_kernel,
+    _index_k_layernorm_scatter_kernel,
     _state_verify_commit_rows_kernel,
     _store_state_rows_kernel,
     _zero_page_fields_kernel,
@@ -32,6 +34,8 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     copy_state_rows,
     fused_fp8_set_kv_buffer,
     index_k_block_split_scatter,
+    index_k_layernorm_fp8_scatter,
+    index_k_layernorm_scatter,
     state_verify_commit_rows,
     store_state_rows,
     transfer_kv_all_layer,
@@ -1287,3 +1291,248 @@ def test_index_k_scatter_mask_preserves_dummy_page(device):
     scale[1, [1, 3]] = scales[[1, 3]]
     assert torch.equal(cache, expected)
     assert torch.equal(cache[:64], before[:64])
+
+
+# index_k_layernorm_scatter (Kimi-K3.1 DSA bf16 index-K write)
+
+
+def _layernorm_inputs(tokens, head_dim, row_stride, device):
+    """Row-strided pre-norm keys and an FP32 affine, as the indexer passes them."""
+    wide = torch.randn(tokens, row_stride, device=device) * 3 + 1
+    weight = torch.rand(head_dim, device=device) + 0.5
+    bias = torch.randn(head_dim, device=device) * 0.1
+    return wide.to(torch.bfloat16)[:, :head_dim], weight, bias
+
+
+def _assert_layer_norm_rows(actual, keys, weight, bias, eps):
+    expected = torch.nn.functional.layer_norm(
+        keys.float(), (keys.shape[-1],), weight, bias, eps
+    )
+    # Within one bf16 rounding: FP32 sum order differs, so boundary values may flip.
+    torch.testing.assert_close(actual.float(), expected, rtol=2**-7, atol=1e-5)
+
+
+@pytest.mark.parametrize("head_dim", [128, 192])
+@pytest.mark.parametrize("tokens", [1, 7, 64, 300])
+@pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
+def test_index_k_layernorm_scatter_matches_layer_norm_index_put(
+    device: str, head_dim: int, tokens: int, loc_dtype: torch.dtype
+) -> None:
+    torch.manual_seed(head_dim + tokens)
+    num_slots, eps = 512, 1e-6
+    keys, weight, bias = _layernorm_inputs(tokens, head_dim, head_dim + 32, device)
+    loc = torch.randperm(num_slots, device=device)[:tokens].to(loc_dtype)
+    buf = torch.randn(num_slots, head_dim, device=device).to(torch.bfloat16)
+    before = buf.clone()
+
+    index_k_layernorm_scatter(buf, keys, weight, bias, loc, eps=eps, write_mask=None)
+
+    _assert_layer_norm_rows(buf[loc.long()], keys, weight, bias, eps)
+    untouched = torch.ones(num_slots, dtype=torch.bool, device=device)
+    untouched[loc.long()] = False
+    assert torch.equal(buf[untouched], before[untouched])
+
+
+def test_index_k_layernorm_scatter_write_mask_keeps_foreign_rows(device: str) -> None:
+    torch.manual_seed(0)
+    keys, weight, bias = _layernorm_inputs(4, 128, 160, device)
+    buf = torch.full((128, 128), 7.0, device=device, dtype=torch.bfloat16)
+    # Foreign rows point at the dummy slot 0, as unowned tokens do in serving.
+    slots = torch.tensor([0, 65, 0, 67], device=device)
+    owned = torch.tensor([False, True, False, True], device=device)
+
+    index_k_layernorm_scatter(
+        buf, keys, weight, bias, slots, eps=1e-6, write_mask=owned
+    )
+
+    _assert_layer_norm_rows(buf[[65, 67]], keys[[1, 3]], weight, bias, 1e-6)
+    untouched = torch.ones(128, dtype=torch.bool, device=device)
+    untouched[[65, 67]] = False
+    assert (buf[untouched] == 7.0).all()
+
+
+def test_index_k_layernorm_scatter_empty_is_noop(device: str) -> None:
+    buf = torch.zeros(64, 128, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(128, device=device)
+    index_k_layernorm_scatter(
+        buf,
+        torch.empty(0, 128, device=device, dtype=torch.bfloat16),
+        weight,
+        torch.zeros_like(weight),
+        torch.empty(0, dtype=torch.int64, device=device),
+        eps=1e-6,
+        write_mask=None,
+    )
+    assert torch.count_nonzero(buf) == 0
+
+
+def test_index_k_layernorm_scatter_reuses_compile_across_token_counts(
+    device: str,
+) -> None:
+    buf = torch.zeros(4096, 128, device=device, dtype=torch.bfloat16)
+
+    def run(tokens):
+        keys, weight, bias = _layernorm_inputs(tokens, 128, 160, device)
+        loc = torch.randperm(buf.shape[0], device=device)[:tokens]
+        owned = torch.rand(tokens, device=device) < 0.5
+        index_k_layernorm_scatter(
+            buf, keys, weight, bias, loc, eps=1e-6, write_mask=owned
+        )
+        _assert_layer_norm_rows(buf[loc[owned]], keys[owned], weight, bias, 1e-6)
+
+    run(1)
+    with assert_no_triton_compile(_index_k_layernorm_scatter_kernel):
+        for tokens in (4, 7, 64, 300, 2048):
+            run(tokens)
+
+
+# index_k_layernorm_fp8_scatter (Kimi-K3.1 DSA fp8_scaled index-K write)
+
+
+def _fp8_plane(num_pages, page_size, head_dim, ng, page_pad, device):
+    """A uint8 plane: the slot matrix, or a page view with padded pages."""
+    page_bytes = page_size * (head_dim + ng * 4)
+    if page_pad == 0:
+        return torch.zeros(num_pages * page_size, head_dim + ng * 4, **_u8(device))
+    backing = torch.zeros(num_pages, page_bytes + page_pad, **_u8(device))
+    return backing[:, :page_bytes]
+
+
+def _u8(device):
+    return {"dtype": torch.uint8, "device": device}
+
+
+def _plane_pages(buf, page_size, head_dim, ng):
+    """``[pages, page_bytes]`` view of a slot matrix or page-view plane."""
+    page_bytes = page_size * (head_dim + ng * 4)
+    return buf.reshape(-1, page_bytes) if buf.shape[1] != page_bytes else buf
+
+
+def _read_fp8_rows(buf, slots, page_size, head_dim, ng):
+    """The rows at ``slots``: E4M3 codes, per-group scales, dequantized FP32."""
+    pages = _plane_pages(buf, page_size, head_dim, ng)
+    page, row = slots.long() // page_size, slots.long() % page_size
+    picked = pages[page]
+    take = torch.arange(slots.numel(), device=slots.device)
+    codes = picked[:, : page_size * head_dim].reshape(-1, page_size, head_dim)
+    codes = codes[take, row]
+    scales = picked[:, page_size * head_dim :].contiguous().view(torch.float32)
+    scales = scales.view(-1, page_size, ng)[take, row]
+    values = codes.view(torch.float8_e4m3fn).float().view(-1, ng, head_dim // ng)
+    return codes, scales, (values * scales[..., None]).view(-1, head_dim)
+
+
+@pytest.mark.parametrize("head_dim,group_size", [(128, 128), (256, 128), (128, 64)])
+@pytest.mark.parametrize("tokens", [1, 7, 300])
+@pytest.mark.parametrize("page_pad", [0, 256])
+def test_index_k_layernorm_fp8_scatter_quantizes_layer_norm_rows(
+    device: str, head_dim: int, group_size: int, tokens: int, page_pad: int
+) -> None:
+    torch.manual_seed(head_dim + group_size + tokens + page_pad)
+    page_size, num_pages, eps = 64, 16, 1e-6
+    ng = head_dim // group_size
+    keys, weight, bias = _layernorm_inputs(tokens, head_dim, head_dim + 32, device)
+    loc = torch.randperm(num_pages * page_size, device=device)[:tokens]
+    buf = _fp8_plane(num_pages, page_size, head_dim, ng, page_pad, device)
+    buf.fill_(0x5A)
+    before = buf.clone()
+
+    index_k_layernorm_fp8_scatter(
+        buf,
+        keys,
+        weight,
+        bias,
+        loc,
+        eps=eps,
+        page_size=page_size,
+        group_size=group_size,
+        write_mask=None,
+    )
+
+    # Reference: quantize_fp8's token_group arithmetic on the bf16 LayerNorm rows.
+    normed = torch.nn.functional.layer_norm(
+        keys.float(), (head_dim,), weight, bias, eps
+    ).to(torch.bfloat16)
+    groups = normed.float().view(tokens, ng, group_size)
+    ref_scales = groups.abs().amax(dim=-1).clamp_min(1e-10) / 448.0
+    ref_codes = (
+        (groups / ref_scales[..., None])
+        .clamp(-448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+        .view(tokens, head_dim)
+    )
+    codes, scales, values = _read_fp8_rows(buf, loc, page_size, head_dim, ng)
+    # A boundary LayerNorm value may round either way, moving its scale one bf16 step.
+    torch.testing.assert_close(scales, ref_scales, rtol=2**-7, atol=0)
+    assert (codes == ref_codes).float().mean() > 0.99
+    # E4M3 keeps 3 mantissa bits: at most half of 32/448 of the amax off.
+    amax = groups.abs().amax(dim=-1, keepdim=True)
+    assert ((values.view_as(groups) - groups).abs() <= amax / 24).all()
+    # Every byte outside the written rows and scales is untouched.
+    pages = _plane_pages(buf, page_size, head_dim, ng)
+    written = torch.zeros(pages.shape, dtype=torch.bool, device=device)
+    for slot in loc.tolist():
+        page, row = divmod(slot, page_size)
+        written[page, row * head_dim : (row + 1) * head_dim] = True
+        scale_off = page_size * head_dim + row * ng * 4
+        written[page, scale_off : scale_off + ng * 4] = True
+    old = _plane_pages(before, page_size, head_dim, ng)
+    assert torch.equal(pages[~written], old[~written])
+
+
+def test_index_k_layernorm_fp8_scatter_write_mask_keeps_foreign_rows(
+    device: str,
+) -> None:
+    torch.manual_seed(0)
+    keys, weight, bias = _layernorm_inputs(4, 128, 160, device)
+    buf = torch.full((128, 132), 97, **_u8(device))
+    before = buf.clone()
+    # Foreign rows point at the dummy slot 0, as unowned tokens do in serving.
+    slots = torch.tensor([0, 65, 0, 67], device=device)
+    owned = torch.tensor([False, True, False, True], device=device)
+
+    index_k_layernorm_fp8_scatter(
+        buf,
+        keys,
+        weight,
+        bias,
+        slots,
+        eps=1e-6,
+        page_size=64,
+        group_size=128,
+        write_mask=owned,
+    )
+
+    assert torch.equal(buf[:64], before[:64])
+    _, _, values = _read_fp8_rows(buf, slots[[1, 3]], 64, 128, 1)
+    expected = torch.nn.functional.layer_norm(
+        keys[[1, 3]].float(), (128,), weight, bias, 1e-6
+    )
+    assert (values - expected).abs().max() <= expected.abs().max() / 24
+
+
+def test_index_k_layernorm_fp8_scatter_reuses_compile_across_token_counts(
+    device: str,
+) -> None:
+    buf = torch.zeros(4096, 132, **_u8(device))
+
+    def run(tokens):
+        keys, weight, bias = _layernorm_inputs(tokens, 128, 160, device)
+        loc = torch.randperm(buf.shape[0], device=device)[:tokens]
+        index_k_layernorm_fp8_scatter(
+            buf,
+            keys,
+            weight,
+            bias,
+            loc,
+            eps=1e-6,
+            page_size=64,
+            group_size=128,
+            write_mask=torch.rand(tokens, device=device) < 0.5,
+        )
+
+    run(1)
+    with assert_no_triton_compile(_index_k_layernorm_fp8_scatter_kernel):
+        for tokens in (4, 7, 64, 300, 2048):
+            run(tokens)

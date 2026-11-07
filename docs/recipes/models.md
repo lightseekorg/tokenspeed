@@ -90,6 +90,11 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
 `--max-model-len 1048576` keeps the checkpoint's native context, which agentic
 workloads with long cached prefixes need; prefix caching is on by default.
 
+With MXFP4 experts at MoE TP8 and EP1, startup also builds a column-split copy
+of the expert down-projection weights for prefill. The copy holds one more set
+of those weights on each GPU, which leaves less memory for the KV cache. While
+the copy exists, TokenSpeed refuses live weight updates.
+
 The two HIP runtime settings are needed for speed; TokenSpeed does not set them
 itself. `DEBUG_HIP_FORCE_GRAPH_QUEUES=1` matters most for the two-stream
 speculative decode graph. The extra capture sizes (3, 5, 6, 12) cut padding at
@@ -445,9 +450,8 @@ Notes:
 - The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly.
   You no longer need a flattened local checkpoint and a separately staged
   remote-code cache.
-- The checkpoint carries no FP8 KV scaling factors. When the target K3 uses an
-  FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
-  BF16 so context injection and draft attention match the reference precision.
+- K3's target and DSpark draft MLA caches follow the shared `--kv-cache-dtype`
+  setting, as with EAGLE3: `fp8` selects FP8; `auto` and `bfloat16` select BF16.
 - DSpark proposal blocks use non-causal MLA draft attention. Both the `mla` and
   `trtllm_mla` draft backends preserve every block row during eager execution
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
@@ -643,9 +647,11 @@ Notes:
   and output projection TP subgroups at startup.
 - On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
   breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
-  and on the aggregated role when `--prefill-graph-capture-token-sizes` names
-  the buckets and `--enable-mixed-batch` is off; elsewhere prefill runs eager.
-  `--disable-prefill-graph` turns them off.
+  and on the aggregated role unless `--enable-mixed-batch` is on; elsewhere
+  prefill runs eager. `--disable-prefill-graph` turns them off. On the
+  aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
+  out of the KV cache, and adds about 7 minutes to startup;
+  `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes 7 tokens per step, so it takes
   `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
@@ -665,13 +671,13 @@ start each one with the command below plus
 `--nnodes 2 --node-rank <rank> --dist-init-addr <first-node>:<port>`, where
 `<rank>` is the node's rank (`0` on the first node, `1` on the second) and
 `<first-node>:<port>` is the first node's address and a free port on it. Drop
-the 4 speculative flags to serve without the draft.
+the 4 speculative flags to serve without the draft. The context length is the
+checkpoint's 1,048,576 tokens.
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
-  --max-model-len 32768 \
   --kv-cache-dtype fp8 \
   --tensor-parallel-size 8 \
   --mm-encoder-tp-mode data \
