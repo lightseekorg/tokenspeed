@@ -80,6 +80,15 @@ public:
     // became dead meanwhile; one that waits for none settles here. nullopt
     // when nothing is copied.
     std::optional<WriteBackOperation> StartEvictionStores();
+    // A checkpoint demotion (CacheCoordinator::DemoteEntries) while an
+    // eviction write-back still carries some of `keys` to the Host: each such
+    // member's segment publishes it demoted, dated at the demoted epoch
+    // instead of its Device entry's. A Host entry the Host held already, which
+    // the segment holds to publish into and whose newer date its settlement
+    // would keep, is demoted now, unless something else holds it too. Returns
+    // the entries it demoted: the members that publish a new Host entry, and
+    // the Host entries.
+    std::int32_t DemoteInFlightEvictions(std::span<const CacheKey> keys);
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     // A retraction image and the two store ops that fill it. The L2 leg is a

@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.moe import flashinfer as flashinfer_moe
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 
 from tokenspeed.runtime.configs import model_config as model_config_module
+from tokenspeed.runtime.configs.beam_config import BeamConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.loader import MoECheckpointLoader
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
@@ -438,12 +439,15 @@ def bf16_once(exact):
     return bits.view(torch.float64).float().to(torch.bfloat16)
 
 
-def fp8_checkpoint(scale_dtype=torch.bfloat16, seed=0):
-    """(checkpoint tensors, BF16 reference) of the tiny Beam in the FP8 layout:
-    every linear but the router and lm_head quantized, as RAW's ignore says."""
+def fp8_checkpoint(config: BeamConfig, scale_dtype=torch.bfloat16, seed=0):
+    """Return FP8 tensors and a BF16 reference matching the consumer's config.
+
+    Every linear but the router and lm_head is quantized, as RAW's ignore says.
+    Pass the model's config so vendor-specific expert widths remain consistent.
+    """
     torch.manual_seed(seed)
     tensors, reference = {}, {}
-    for name, weight in tiny_weights(tiny_config()).items():
+    for name, weight in tiny_weights(config).items():
         module = name.removesuffix(".weight")
         quantized = (
             name.endswith("proj.weight")
@@ -518,8 +522,9 @@ def test_the_fp8_load_keeps_codes_and_scales(server, scale_dtype):
     exactly as FP32 (Q, K and V stacked, gate and up stacked, the experts'
     gate and up rows then down); every other tensor is the checkpoint's."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint(scale_dtype)
-    model = _model(ct())
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config, scale_dtype)
+    model = _model(ct(), config=config)
     assert model.load_weights(list(tensors.items())) == set(tensors)
     actual = dict(model.named_parameters())
     for layer in ("model.layers.0", "model.layers.1"):
@@ -621,8 +626,9 @@ def test_attention_runs_qkv_and_gate_as_one_fp8_gemm(server, monkeypatch):
     form one GEMM (Q/K/V rows, then the gate rows) that gives both outputs
     exactly as the two projections do."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint()
-    model = _model(ct())
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config)
+    model = _model(ct(), config=config)
     model.load_weights(list(tensors.items()))
     for layer in model.model.layers:
         attn = layer.self_attn
@@ -652,8 +658,9 @@ def test_the_offered_token_fp8_is_consumed_once(server, monkeypatch):
     and scales, then the offer is gone — a second call, even of the same rows,
     quantizes them again itself."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint()
-    model = _model(ct())
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config)
+    model = _model(ct(), config=config)
     model.load_weights(list(tensors.items()))
     attn = model.model.layers[0].self_attn
     _post_load(attn)
@@ -693,8 +700,9 @@ def test_norm_fp8_offer_matches_separate_quantization(server, sandwich, consumer
     from tokenspeed.runtime.models.beam_sandwich_fusion import BeamSandwichNorm
 
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint()
-    model = _model(ct())
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config)
+    model = _model(ct(), config=config)
     model.load_weights(list(tensors.items()))
     model.cuda()
     layer = model.model.layers[0]
@@ -793,13 +801,14 @@ def test_fp8_loader_refusals(server, name, edit, error, match):
     """One case per rule: an FP8 router, a scale that is not finite and
     positive, a weight without its scale, and a quantized tensor twice."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint()
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config)
     edit(tensors)
     items = list(tensors.items())
     if name == "twice":
         items.insert(0, (f"{Q}.weight", tensors[f"{Q}.weight"]))
     with pytest.raises(error, match=match):
-        _model(ct()).load_weights(items)
+        _model(ct(), config=config).load_weights(items)
 
 
 @pytest.fixture(scope="module")
@@ -808,11 +817,12 @@ def fp8_checkpoints(tmp_path_factory):
     root = tmp_path_factory.mktemp("fp8")
     paths = {}
     for label, raw in (("fp8", RAW), ("tensor", edited((*W, "strategy"), "tensor"))):
-        path = write_tiny_checkpoint(root / label, config=tiny_config())
+        model_config = tiny_config()
+        path = write_tiny_checkpoint(root / label, config=model_config)
         config = json.loads((path / "config.json").read_text())
         config["quantization_config"] = raw
         (path / "config.json").write_text(json.dumps(config))
-        save_file(fp8_checkpoint()[0], str(path / "model.safetensors"))
+        save_file(fp8_checkpoint(model_config)[0], str(path / "model.safetensors"))
         paths[label] = path
     return paths
 
@@ -863,8 +873,11 @@ def test_ep_ranks_load_their_own_fp8_experts(server, rank):
     """Under EP each rank holds its whole experts' codes, bit for bit, and their
     channel scales exactly as FP32; the other rank's experts are skipped."""
     server("flashinfer_trtllm")
-    tensors, _ = fp8_checkpoint(torch.bfloat16)
-    model = _model(ct(), mapping=Mapping(rank=rank, world_size=2, moe_ep_size=2))
+    config = tiny_config()
+    tensors, _ = fp8_checkpoint(config, torch.bfloat16)
+    model = _model(
+        ct(), mapping=Mapping(rank=rank, world_size=2, moe_ep_size=2), config=config
+    )
     experts = model.model.layers[1].mlp.experts
     assert experts.num_local_experts == 4
     model.load_weights(list(tensors.items()))

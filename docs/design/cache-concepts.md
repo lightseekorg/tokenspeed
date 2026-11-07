@@ -101,7 +101,11 @@ to the global empty-parent FIFO rather than any group.
 Packing is a property of each pool. Device packing satisfies attention-kernel
 strides; compact Host storage uses a parent large enough for the largest single
 group payload, then fits as many complete children of each group as that parent
-holds. Host L2 and the request-private snapshot pool use this compact geometry.
+holds. When the largest payload is a State checkpoint, or a replayable window
+block that Host L2 never stores, the parent rounds up to whole blocks of the
+cached history group with the most Host bytes per token if that lowers the Host
+bytes per cached token at an assumed State checkpoint density
+(`runtime/cache/host_storage.py`), so those KV pages pack without a gap. Host L2 and the request-private snapshot pool use this compact geometry.
 The scheduler receives their virtual packing explicitly, including each group's
 shard count. Enabling either Host pool requires `host_group_packing` with one
 value per group, in `cache_groups` order; Device packing is never a fallback.
@@ -383,8 +387,9 @@ even when the forward ends on a full page.
 Conversely, `--enable-state-checkpoint-in-forward` also skips the natural
 checkpoints that a next turn re-rendering the end of the previous prompt
 cannot resume at, with their KV tails: a prompt end inside the page whose start
-holds the pre-tail checkpoint, and a fused finish past the prompt end (same
-section).
+holds the pre-tail checkpoint, a fused finish past the prompt end, and on a
+prefill server the end of a prompt too short for a pre-tail checkpoint when it
+lies inside a page (same section).
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
@@ -402,10 +407,22 @@ masked state writer (`store_state_rows`) drops its result, and the padded
 output rows are zeroed by a device-side bound the capture cannot freeze. The
 live tokens keep the packing of the unpadded forward, so a capture of any
 request count matches eager bit for bit; nothing about padding reaches the
-cache or the scheduler. A forward that writes an in-forward State checkpoint
-keeps its live metadata instead (`prepare_prefill_metadata` returns False):
-the capacity layout carries no checkpoint, so the layer runs at its eager
-break of the ordinary prefill graph.
+cache or the scheduler. On a server that writes in-forward State checkpoints
+(`ServerArgs.writes_state_checkpoints_in_forward`, which `GdnAttnBackend`
+takes at construction), the GDN layers of a forward that writes one stay
+captured too. Their capacity metadata keeps one fixed checkpoint slot per
+request slot, and the captured scan stores a state at every multiple of the
+bound pool's prefix granularity, which divides every checkpoint offset, into
+a float32 scratch that all captured shapes share (`CapacityCheckpointLayout`).
+Before each use the refresh rewrites in place each sequence's state count and
+each live checkpoint's scratch row, token index and block; an unused slot
+keeps an in-range token index and block `-1`, which the masked writers of the
+conv window and the recurrent state skip. The checkpoint block thus receives
+the state the scan computes at its boundary, as in an eager forward. A
+capacity layout without these slots keeps such a forward on its live metadata
+(`prepare_prefill_metadata` returns False), so the layer runs at its eager
+break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
+checkpoint windows at its eager break, over live metadata.
 
 On PD decode admission, a partial leading history block is a landing slot for
 the prefill peer. Installing its private writable block also rewinds the
@@ -1266,7 +1283,9 @@ Its responsibilities:
   copies go first, then unheld copies; within each class newer Device copies
   go first to reduce repeated write-back. Host-only State retains its own LRU
   order, with the retention rank, once the usable duplicate capacity is
-  exhausted.
+  exhausted. With superseded checkpoint demotion (`scheduler.md` §1.2), a
+  Host-only checkpoint boundary whose checkpoints are all demoted goes after
+  the held copies and before the unheld ones.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
   The boundary tree counts each node's closed-group duplicates as entries

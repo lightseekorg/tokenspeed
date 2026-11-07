@@ -331,6 +331,12 @@ channel and quantize activations per token. FP32 routing weights remain FP32
 during combination. Native FP8 matrix arithmetic uses FP32 accumulators but
 need not match sequential FP32 arithmetic.
 
+On SM90 the Triton kernel stays at 32 rows per tile. A 64-row FP8 tile lowers
+to wgmma, whose accumulator is coarser than FP32, and misses the FP64 reference
+by 5e-3 to 7e-3. The smaller tiles stay within 5e-4 but give up wgmma's
+throughput: from 2048 tokens, and on wide experts at every size above 512, they
+run slower than 64-row tiles would.
+
 ## Shared MoE precision policies
 
 The unquantized Triton MoE normally keeps GEMM1 accumulators in FP32 through

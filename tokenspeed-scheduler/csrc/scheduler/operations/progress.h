@@ -86,7 +86,8 @@ public:
           resumed_tail_hash_{live.resumed_tail_hash},
           state_checkpoint_tokens_{live.state_checkpoint_tokens},
           state_checkpoint_blocks_{live.state_checkpoint_blocks},
-          published_state_checkpoint_blocks_{live.published_state_checkpoint_blocks} {}
+          published_state_checkpoint_blocks_{live.published_state_checkpoint_blocks},
+          published_state_checkpoint_tokens_{live.published_state_checkpoint_tokens} {}
     StagedCacheProgress(const StagedCacheProgress&) = delete;
     StagedCacheProgress& operator=(const StagedCacheProgress&) = delete;
     ~StagedCacheProgress() {
@@ -102,6 +103,7 @@ public:
         live_.state_checkpoint_tokens = state_checkpoint_tokens_;
         live_.state_checkpoint_blocks = std::move(state_checkpoint_blocks_);
         live_.published_state_checkpoint_blocks = std::move(published_state_checkpoint_blocks_);
+        live_.published_state_checkpoint_tokens = published_state_checkpoint_tokens_;
     }
 
     void Commit() noexcept { committed_ = true; }
@@ -115,6 +117,7 @@ private:
     std::int32_t state_checkpoint_tokens_;
     std::vector<CacheBlockRef> state_checkpoint_blocks_;
     std::vector<CacheBlockRef> published_state_checkpoint_blocks_;
+    std::int32_t published_state_checkpoint_tokens_;
     bool committed_{false};
 };
 

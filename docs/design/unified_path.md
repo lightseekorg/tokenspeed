@@ -663,8 +663,7 @@ over the target and draft `child_backends()` trees once
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` disables the prefill graph (rationale on the class) unless its
 consumer narrows a padded replay to the live rows in an eager break: a KPool
-instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, opted in
-by an explicit `--prefill-graph-capture-token-sizes` without
+instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, without
 `--enable-mixed-batch`, on the aggregated role
 (`DSAConfig.padded_prefill_replay`).
 That instance declaration follows launch arguments, so the prefill role and
@@ -775,6 +774,58 @@ respects both deterministic and batch-invariant collective settings. Empty
 consumer rows carry no deferred post. Cache-only narrowing completes the incoming
 post before the global KV producer and skips new HC mixes; idle ranks still
 participate in expert-owned dispatch/combine, which never defers another reduction.
+
+### Drafter prefill graphs
+
+With `--enable-drafter-prefill-graph` the drafter's work inside an extend
+forward replays from graphs too. The drafter declares what it records
+(`BaseDrafter.extend_graph_plan`), and the capture and the CUDA-graph memory
+projection read that one plan: Eagle's step 0 per target token bucket at each
+exact request count of `--prefill-graph-capture-batch-sizes`
+(`prefill:drafter-step0`), and its decode steps per request count
+(`prefill:drafter-decode`). They are breakable graphs in one private pool,
+apart from the target's prefill and decode pools. Their static buffers (the
+target's hidden rows at the largest bucket) are allocated outside the
+measured windows, like the target graph's static outputs, so the utilization
+headroom funds them. A drafter's single prefill graph of its own
+(`captures_prefill_graph`, the `prefill:drafter` ladder) is a separate hook
+with its own contract.
+
+Step 0 is token-shaped up to the narrowing and one row per request after it,
+so its graph pads the rows to the bucket and bakes the request count. The
+sequence mixers stay at their breaks (the QSA indexer, `PagedAttention.attend`),
+and so do the drafter steps that publish backend state a later break reads:
+the accepted-prefix publication, and per decode step the top-k reset, the
+seq_lens advance and the write window (`run_eager`). Recorded into a segment
+they would pin per-forward host state to the capture's batch (the indexer
+backend's active metadata, the router's published window). Step 0's context
+is one fixed object per (bucket, requests); the replay stages its inputs into
+static buffers (the target's hidden rows with a zero tail, the gather rows,
+the frontier), and its outputs land in static buffers the decode steps read.
+The draft prologue writes K/V inside a captured segment, which holds no
+per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
+whole Host load, as the target's replay does. These captures run each segment
+as soon as it is captured (`run_segments_while_capturing`): their breaks index
+with values a segment computes (the top-k rows the narrowing gathers, the
+decode steps' positions), which a capture alone leaves unwritten when the
+break runs.
+
+A round replays only what the graphs baked: a pure extend (MIXED rounds run
+eager), no attention DP or query shard, a fitting bucket at the exact request
+count (a round over the largest bucket still replays the decode steps). Only a
+chain drafter on one rank, without a draft sampler, token history or a top-k
+carried across steps, over a draft model that declares
+`supports_breakable_draft_extend` (its draft backend also attends in the mode
+a break passes it), captures at all. `ServerArgs` refuses the switch for the
+launches its arguments rule out, and `ModelExecutor` for a boot whose plan is
+empty.
+
+A replay is not bit-identical to a serving-time eager round in general. The
+graphs keep the kernels startup dispatch chose for them, as the decode graphs
+do: small-M BF16 GEMMs route to FlashInfer only before serving
+(`compile_monitor.is_serving`). A padded replay also runs the token-shaped
+kernels at the bucket's row count, where a kernel may pick its implementation
+or tactic by row count, as the target's padded replays do.
 
 ### Prefill requests without generated outputs
 
@@ -1074,6 +1125,11 @@ predicts position 2049 whether computed as `1024 + 1024 + 1`,
 `130 cached + 1024 + 895`, or 2048 cached tokens plus one decode input.
 Constructing the base position does not implement MTP acceptance/residual RNG
 or domain separation; multi-token FlashInfer still uses its existing coins.
+The Triton chain verify under `--enable-speculative-sampling` (DFLASH with a
+DFlash2 draft) keys its accept coins and draft noise by salted offsets
+disjoint from these positions. A row with a recorded draft q then emits an
+exact sample of the same distribution, not the position-keyed draw. Greedy
+rows and rows without a q keep the position-keyed token.
 
 With `sampling_stream=per-request`, FlashInfer and FlashInferFull route both
 `sample()` and `verify(N=1)` through the existing Gumbel pool kernel, keyed by
@@ -1453,7 +1509,9 @@ null page 0.
 The bridge's `{gid: view}` dict is the router's input; the router does not
 require the views to share one storage, only the one-launch fill does. The
 executor pads stopped requests' state rows in place
-(`RuntimeStates.masked_state_tables`), so the views stay in that storage.
+(`RuntimeStates.masked_state_tables`), so the views stay in that storage;
+the bridge packs the state groups last and end to end, so that padding is
+one launch for every state group.
 The slot math lives in
 `paged/write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
 invariant, so locations computed over the kernel-page stack equal
@@ -1784,8 +1842,9 @@ GEMM arithmetic.
 ### Capturing recurrent layers in the outer graph
 
 `CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
-KDA, Mamba2, and GDN; each subclass only states which forwards it admits and whether
-uncaptured shapes also run the capacity layout.
+KDA, Mamba2, and GDN; each subclass only states which forwards it admits, whether
+uncaptured shapes also run the capacity layout, and whether that layout stores
+in-forward State checkpoints.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture, and replay. This consumer-stream seam builds or
 refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
@@ -1814,6 +1873,26 @@ its launch from the sequence count and reads the bounds on device
 Mamba2, uncaptured shapes keep the scheduler metadata. The scan chunks each
 sequence from its own start, so captures of any request count match eager bit
 for bit.
+
+A forward writing in-forward State checkpoints
+(`--enable-state-checkpoint-in-forward`) runs inline too: GDN is told the flag
+at construction, and its capacity metadata then keeps one fixed checkpoint slot
+per request slot (a row writes at most one). The captured scan stores a state
+at every page of the bound pool's prefix granularity, which divides every
+checkpoint offset, into one float32 scratch that all shapes share (forwards
+run in stream order), with a row per page of the widest captured token
+capacity. Before each use the refresh rewrites, in one pinned upload and a
+few device copies, each sequence's state count and each live checkpoint's
+scratch row, token index and block; an unused slot keeps an in-range token
+index and block `-1`, which the masked writers of the conv window and the
+recurrent state skip. The stored states are the scan's own, so the checkpoint
+blocks match eager bit for bit; the cost is the extra scratch writes and the
+shared scratch. A backend without the flag, and every other family, keeps such
+a forward on its live metadata at the eager break.
+
+Qwen4-Exp's composite passes these seams to its attention child, so its GDN
+layers run inline; PLE and the QSA indexer keep their breaks over their own
+live metadata.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels, and post-attention compute together.

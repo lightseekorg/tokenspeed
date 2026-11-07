@@ -92,3 +92,15 @@ class LayerwiseLoadTracker:
             return
         for consumer_index in self.consumer_indices:
             self.event_sets[consumer_index].wait_for_layer(layer_index)
+
+    def wait_for_all_layers(self) -> None:
+        """Make the current stream wait for every consumed load as a whole.
+
+        Each load's last-layer event is recorded after every earlier layer's
+        copy. For work that holds no per-layer wait of its own: a CUDA-graph
+        replay, whose captured segments write and read loaded pages.
+        """
+        for consumer_index in self.consumer_indices:
+            device_module.current_stream().wait_event(
+                self.event_sets[consumer_index].last_layer_done_event
+            )

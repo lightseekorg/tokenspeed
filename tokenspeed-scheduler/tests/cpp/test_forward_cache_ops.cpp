@@ -740,6 +740,31 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
     }
 }
 
+TEST(SchedulerConfigValidateTest, DroppingShortPromptEndsTakesThePRoleAndTheInForwardCheckpoint) {
+    // The drop extends the dead checkpoints the in-forward checkpoint skips,
+    // at the P role's finish; the other roles refuse it instead of ignoring it.
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        SchedulerConfig config = MakeValidConfig();
+        config.role = role;
+        if (role != Role::kFused) {
+            for (CacheGroupConfig& group : config.cache_groups) {
+                group.transfer_policy = CacheTransferPolicy::FullSuffix;
+            }
+        }
+        SetTestSnapshotPool(config);
+        config.drop_short_prompt_end_checkpoints = true;
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument)
+            << "without the in-forward checkpoint";
+        config.state_checkpoint_in_forward = true;
+        if (role == Role::kP) {
+            EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+        } else {
+            EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+        }
+    }
+}
+
 TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
     // The pool is explicit on every role: 0 pages says nothing, the null page
     // alone says "never retract" (and takes no blob slots), anything above it

@@ -225,10 +225,6 @@ def test_kvp_launch_passes_the_full_attention_dcp_check(tmp_path) -> None:
     )
 
 
-# Named prefill buckets: the aggregated role's opt-in to the DSA padded prefill graph.
-_NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
-
-
 @pytest.mark.parametrize(
     "launch, is_draft, admitted",
     [
@@ -256,55 +252,42 @@ _NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
             False,
             False,
         ),
-        ({"disaggregation_mode": "decode", **_NAMED_BUCKETS}, False, False),
-        # Opt-in only: naming no buckets stays eager, and a cap alone names none.
-        ({"disaggregation_mode": "null"}, False, False),
         (
-            {"disaggregation_mode": "null", "prefill_graph_max_tokens": 4096},
+            {
+                "disaggregation_mode": "decode",
+                "prefill_graph_capture_sizes": [256, 1024, 4096],
+            },
             False,
             False,
         ),
-        # Named buckets admit it; no transfer step counter, so the interval cannot veto.
-        ({"disaggregation_mode": "null", **_NAMED_BUCKETS}, False, True),
+        # Admitted by default, with or without named buckets or a cap.
+        ({"disaggregation_mode": "null"}, False, True),
+        (
+            {"disaggregation_mode": "null", "prefill_graph_max_tokens": 4096},
+            False,
+            True,
+        ),
         (
             {
                 "disaggregation_mode": "null",
-                "disaggregation_layerwise_interval": 1,
-                **_NAMED_BUCKETS,
+                "prefill_graph_capture_sizes": [256, 1024, 4096],
             },
             False,
             True,
         ),
+        # No transfer step counter, so the interval cannot veto.
+        (
+            {"disaggregation_mode": "null", "disaggregation_layerwise_interval": 1},
+            False,
+            True,
+        ),
         # A MIXED round would replay with decode rows in the narrowed break.
-        (
-            {
-                "disaggregation_mode": "null",
-                "enable_mixed_batch": True,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        ({"disaggregation_mode": "null", **_NAMED_BUCKETS}, True, False),
-        (
-            {
-                "disaggregation_mode": "null",
-                "disable_prefill_graph": True,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        (
-            {
-                "disaggregation_mode": "null",
-                "pipeline_parallel_size": 2,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        ({"disaggregation_mode": "encode", **_NAMED_BUCKETS}, False, False),
+        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, False),
+        ({"disaggregation_mode": "null"}, True, False),
+        # --disable-prefill-graph turns it off.
+        ({"disaggregation_mode": "null", "disable_prefill_graph": True}, False, False),
+        ({"disaggregation_mode": "null", "pipeline_parallel_size": 2}, False, False),
+        ({"disaggregation_mode": "encode"}, False, False),
     ],
 )
 def test_dsa_padded_prefill_replay_is_admitted_on_the_prefill_and_aggregated_roles(
@@ -330,17 +313,14 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
 
     model_config = _load_k31_model_config(tmp_path)
     server_args = ServerArgs(model=str(tmp_path))
-    # The launch defaults keep the aggregated role eager.
+    # The launch defaults admit the aggregated role.
     assert server_args.disaggregation_mode == "null"
     assert server_args.disaggregation_layerwise_interval == 1
     assert server_args.prefill_graph_capture_sizes is None
     assert server_args.enable_mixed_batch is False
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
-    assert spec["padded_prefill_replay"] is False
-    # Named buckets opt in; the disable flag or a mixed batch opts back out.
-    server_args.prefill_graph_capture_sizes = [256, 4096]
-    spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
+    # The disable flag or a mixed batch turns it off.
     server_args.disable_prefill_graph = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
@@ -349,8 +329,7 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
     server_args.enable_mixed_batch = False
-    server_args.prefill_graph_capture_sizes = None
-    # The prefill role keeps its layerwise condition and needs no named buckets.
+    # The prefill role keeps its layerwise condition.
     server_args.disaggregation_mode = "prefill"
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False

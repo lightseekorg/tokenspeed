@@ -210,7 +210,8 @@ class MambaForwardMetadata:
     # chunked scan's plan for them (its interval, buffer and the buffer row of
     # each checkpoint); None when the forward writes none. A MIXED forward
     # that runs its decode rows apart writes them through its extend rows'
-    # metadata alone (_prepare_mixed_verify_metadata).
+    # metadata alone (_prepare_mixed_verify_metadata). Capacity metadata may
+    # instead keep fixed slots here (``CapacityPrefillMetadata``).
     state_checkpoints: InForwardStateCheckpoints | None = None
     scan_state_checkpoints: GdnStateCheckpoints | None = None
     scan_checkpoint_rows: torch.Tensor | None = None
@@ -642,6 +643,7 @@ class MambaAttnBackend(AttentionBackend):
         ssm_element_st = []
         conv_bytes: int | None = None
         ssm_bytes: int | None = None
+        ssm_rows_aligned = True
 
         for layer_id in layer_ids:
             conv, ssm = self._state_components(layer_id)
@@ -659,6 +661,10 @@ class MambaAttnBackend(AttentionBackend):
             ssm_src.append(ssm.data_ptr())
             ssm_src_st.append(row_stride_i32(ssm))
             ssm_element_st.append(ssm.stride(0))
+            ssm_rows_aligned &= (
+                ssm.data_ptr() % 16 == 0
+                and ssm.stride(0) * ssm.element_size() % 16 == 0
+            )
             if not self.replay_ssm:
                 ssm_dst.append(ssm_scratch.data_ptr())
                 ssm_dst_st.append(row_stride_i32(ssm_scratch))
@@ -682,6 +688,7 @@ class MambaAttnBackend(AttentionBackend):
             "ssm_element_stride": _i64(ssm_element_st),
             "ssm_scratch_stride": None if self.replay_ssm else _i64(ssm_dst_st),
             "ssm_bytes": ssm_bytes,
+            "ssm_rows_aligned": ssm_rows_aligned,
             "group_sel": _i64(group_sel),
             "num_layers": len(layer_ids),
         }
@@ -821,7 +828,12 @@ class MambaAttnBackend(AttentionBackend):
         Families with another recurrence replace the kernel; the payload,
         tables and page resolution stay shared.
         """
-        gdn_replay_commit(payload, parameters, **tables)
+        gdn_replay_commit(
+            payload,
+            parameters,
+            rows_aligned=self._verify_copy_tables_get()["ssm_rows_aligned"],
+            **tables,
+        )
 
     def tree_support(self) -> TreeSupport:
         return TreeSupport(
@@ -2063,14 +2075,18 @@ class MambaAttnBackend(AttentionBackend):
             checkpoints = self.forward_metadata.state_checkpoints
             if checkpoints is not None:
                 # The conv state at a checkpoint is the window of the
-                # conv's inputs just before it (oldest first).
+                # conv's inputs just before it (oldest first). The masked
+                # writer skips the -1 blocks of capacity metadata's unused
+                # checkpoint slots.
                 window = conv_states.shape[-1]
                 rows = checkpoints.token_index.unsqueeze(1) + torch.arange(
                     -window, 0, device=checkpoints.token_index.device
                 )
-                conv_states[
-                    checkpoints.blocks_by_group[self._state_group_for(layer_id)].long()
-                ] = (mixed_qkv[rows].transpose(1, 2).to(conv_states.dtype))
+                store_state_rows(
+                    mixed_qkv[rows].transpose(1, 2).unsqueeze(1),
+                    conv_states.unsqueeze(1),
+                    checkpoints.blocks_by_group[self._state_group_for(layer_id)],
+                )
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             if _prefill_conv_writes_qkv(
@@ -2232,7 +2248,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             # The final state goes to the live slot. Capacity metadata pads the
             # request dimension with -1 blocks whose dummy scan result the
-            # masked writer drops.
+            # masked writer drops; it skips unused checkpoint slots alike.
             store_state_rows(last_recurrent_state, ssm_states, state_out_blocks)
             if metadata.state_checkpoints is not None:
                 store_state_rows(

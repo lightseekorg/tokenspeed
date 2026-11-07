@@ -57,6 +57,10 @@ _SMALL_MAX_CLUSTERS = 8
 _SMALL_NUM_SPLITS = 8
 _WIDE_NUM_SPLITS = 16
 _LARGE_NUM_SPLITS = 4
+# 128-slot tiles in the 2048-entry ordered prefix, and the measured fixed
+# prologue/epilogue cost of one FP8 query row in the same units.
+_PREFIX_TILES = 16
+_FP8_FIXED_TILES = 6
 log2_e = math.log2(math.e)
 fadd2 = cute.arch.add_packed_f32x2
 fmul2 = cute.arch.mul_packed_f32x2
@@ -128,19 +132,51 @@ def _sm_count(device_index: int) -> int:
         return count
 
 
+def _fp8_launch_config(
+    num_rows: int, head_tiles_per_row: int, sm_count: int
+) -> tuple[int, int]:
+    """Return FP8 query rows/CTA and KV splits with the shortest critical path.
+
+    An FP8 CTA gathers and converts 16 / splits ordered-prefix tiles of 128
+    slots per query row, plus a fixed per-row prologue/epilogue worth about
+    six tiles (SM103 measurements with the staged-id gather ring); serial
+    query rows repeat both. One CTA is resident per SM, so a launch costs its
+    wave count times that per-CTA work. Ties keep the earlier candidate.
+    """
+    best, best_cost = (1, 1), None
+    for rows_per_cta, splits in ((1, 1), (2, 1), (1, 2), (1, 4)):
+        row_groups = (num_rows + rows_per_cta - 1) // rows_per_cta
+        ctas = row_groups * head_tiles_per_row * splits
+        waves = (ctas + sm_count - 1) // sm_count
+        cost = waves * rows_per_cta * (_PREFIX_TILES // splits + _FP8_FIXED_TILES)
+        if best_cost is None or cost < best_cost:
+            best, best_cost = (rows_per_cta, splits), cost
+    return best
+
+
 def _select_launch_config(
     num_rows: int,
     head_tiles_per_row: int,
     bf16_kv: bool,
     sm_count: int,
     wide_cluster_capacity: int,
+    *,
+    fp8_wave_sizing: bool,
 ) -> tuple[int, int, int, bool]:
     """Return query rows/CTA, KV splits, BF16 slots and async publication.
 
     These thresholds come from joint tile/stage measurements. They are not
     occupancy guarantees: query the compiled launch's occupancy separately.
+    With fp8_wave_sizing, large FP8 grids pick rows/CTA and splits by wave
+    count; otherwise FP8 keeps the split rule below at every size.
     """
     output_tiles = num_rows * head_tiles_per_row
+    if not bf16_kv and fp8_wave_sizing and output_tiles * 16 >= sm_count * 3:
+        # FP8 keeps synchronous gather/conversion; size its grid by waves.
+        query_rows_per_cta, splits = _fp8_launch_config(
+            num_rows, head_tiles_per_row, sm_count
+        )
+        return query_rows_per_cta, splits, 1, False
     if bf16_kv and output_tiles * 16 >= sm_count * 3:
         # Sufficient independent output work avoids split-KV. Compare one
         # query per CTA with the parent's serial two/four-query scheduling;
@@ -220,6 +256,34 @@ def copy_gmem_to_smem_u128(smem_ptr, gmem_ptr, *, loc=None, ip=None):
         "cp.async.cg.shared.global [smem_addr], [$1], 16;\n"
         "}\n",
         "l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def copy_gmem_to_smem_u128_zfill(smem_ptr, gmem_ptr, src_bytes, *, loc=None, ip=None):
+    """Issue one 16-byte asynchronous copy that reads ``src_bytes`` (16 or 0).
+
+    With 0 the destination is zero-filled without a global read. The source
+    address must still be valid; completion is tracked like any cp.async.
+    """
+    _llvm.inline_asm(
+        None,
+        [
+            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            gmem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            src_bytes.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .u32 smem_addr;\n"
+        "cvt.u32.u64 smem_addr, $0;\n"
+        "cp.async.cg.shared.global [smem_addr], [$1], 16, $2;\n"
+        "}\n",
+        "l,l,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=_llvm.AsmDialect.AD_ATT,

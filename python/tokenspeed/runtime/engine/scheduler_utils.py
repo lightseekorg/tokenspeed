@@ -126,9 +126,12 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
+    demote_superseded_state_checkpoints: bool = False,
+    drop_short_prompt_end_checkpoints: bool = False,
     max_kv_page_num: int = 0,
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
+    prefill_chunk_yield_tokens: int = 0,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -182,6 +185,18 @@ def make_config(
             State checkpoint is published at a prompt end that checkpoint
             covers (prefill and fused roles) or at a fused finish past the
             prompt end. Requires prefix caching.
+        demote_superseded_state_checkpoints:
+            On with ``--enable-state-checkpoint-in-forward``: a finish that
+            publishes an in-forward State checkpoint demotes the one its
+            conversation published two turns back, unless another request
+            shares it. Requires ``state_checkpoint_in_forward`` outside the
+            decode role.
+        drop_short_prompt_end_checkpoints:
+            On a prefill server with ``--enable-state-checkpoint-in-forward``:
+            when a prompt is too short for the in-forward checkpoint and
+            ends inside a page, no KV tail and no State checkpoint is
+            published at its end. Requires ``state_checkpoint_in_forward``
+            and the prefill role.
         max_kv_page_num: Per-local-prefill-batch budget for the sum of
             ``ceil((cached prefix + current chunk) / prefix_granularity)``
             across requests. 0 leaves the budget unbounded. Derived from
@@ -196,6 +211,13 @@ def make_config(
             ``--checkpoint-retention-leaf-distance``: checkpoints within this
             many later requests of the newest on their branch rank as it does. None keeps the
             scheduler's default, 0.
+        prefill_chunk_yield_tokens:
+            ``--prefill-chunk-yield-tokens``: the most tokens a prefill chunk
+            that cannot finish its prompt gives up, page-aligned, so that
+            bootstrapped prompts waiting behind it that fit whole run in the
+            same forward. 0 is off; the prefill role only, at most half of
+            ``max_scheduled_tokens`` (``SchedulerConfig::Validate`` refuses
+            it elsewhere).
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -215,6 +237,11 @@ def make_config(
         )
     if (storage_config is not None) != enable_l3_storage:
         raise ValueError("storage_config is required exactly when L3 is enabled")
+    if prefill_chunk_yield_tokens < 0:
+        raise ValueError(
+            "prefill_chunk_yield_tokens must be non-negative; "
+            f"got {prefill_chunk_yield_tokens}."
+        )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
@@ -243,12 +270,21 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if demote_superseded_state_checkpoints:
+        # Set only when on, as above.
+        cfg.demote_superseded_state_checkpoints = True
+    if drop_short_prompt_end_checkpoints:
+        # Likewise set only when on.
+        cfg.drop_short_prompt_end_checkpoints = True
     if checkpoint_retention_requests is not None:
         # Set only when given, as above: an older scheduler wheel keeps its
         # plain LRU by default and refuses an explicit value.
         cfg.checkpoint_retention_requests = checkpoint_retention_requests
     if checkpoint_retention_leaf_distance is not None:
         cfg.checkpoint_retention_leaf_distance = checkpoint_retention_leaf_distance
+    if prefill_chunk_yield_tokens:
+        # Set only when on, for the same reason.
+        cfg.prefill_chunk_yield_tokens = prefill_chunk_yield_tokens
     cfg.disable_l2_cache = disable_l2_cache
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
@@ -638,7 +674,8 @@ def packed_block_tables_from_forward_op(
         device: Destination device for the packed tensor.
         host_tables: Also return the tables in host memory (``tables_cpu``).
         num_reqs: Optional expected row count for every group.
-        expected_group_ids: Optional contract order and exact key set.
+        expected_group_ids: Optional pack order and exact key set; the
+            packed buffer and the returned views follow it.
         max_page_id: Optional common inclusive upper bound for page IDs.
         max_page_ids: Optional per-group inclusive upper bounds.
 
