@@ -235,23 +235,18 @@ def _entrypoints():
     namespace["TrtllmMoERunner"] = TokenSpeedFP4MoERunner
     for name in ("register_custom_op", "register_fake_op"):
         namespace[name] = functools.partial(_register_private, getattr(core, name))
-    # Newer FlashInfer separates the JIT spec factory from runner construction.
-    # Its nested operators must still resolve this private runner and registrar.
-    builder = "_build_trtllm_moe_namespace"
-    if builder in vars(core):
-        namespace[builder] = _clone(vars(core)[builder], namespace)
+    # The runner builder's nested operators must resolve this private runner and registrar.
+    namespace["_build_trtllm_moe_namespace"] = _clone(
+        core._build_trtllm_moe_namespace, namespace
+    )
     # Rebind the public dispatch and cached module factory, retaining the
     # upstream operator signatures and fake implementations.
-    factory = "_get_trtllm_moe_sm100_module_impl"
-    if hasattr(core, factory):
-        namespace[factory] = functools.cache(_clone(getattr(core, factory), namespace))
-        namespace["get_trtllm_moe_sm100_module"] = _clone(
-            core.get_trtllm_moe_sm100_module, namespace
-        )
-    else:
-        namespace["get_trtllm_moe_sm100_module"] = functools.cache(
-            _clone(core.get_trtllm_moe_sm100_module, namespace)
-        )
+    namespace["_get_trtllm_moe_sm100_module_impl"] = functools.cache(
+        _clone(core._get_trtllm_moe_sm100_module_impl, namespace)
+    )
+    namespace["get_trtllm_moe_sm100_module"] = _clone(
+        core.get_trtllm_moe_sm100_module, namespace
+    )
     for name in ("trtllm_fp4_block_scale_moe", "trtllm_fp4_block_scale_routed_moe"):
         namespace[name] = _clone(getattr(core, name), namespace)
     _require_runner_rebinding(namespace)

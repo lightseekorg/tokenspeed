@@ -72,10 +72,11 @@ class BaseDrafter:
     # forwarding without it.
     supports_request_token_history = False
 
-    # Whether this drafter proposes one token per step from its own logits
-    # and can therefore sample it from the recorded distribution q
-    # (--enable-speculative-sampling). Block drafters propose a whole block
-    # greedily and leave this False.
+    # Whether this drafter can sample its proposals from a distribution q it
+    # records for verify (--enable-speculative-sampling): the step drafters
+    # sample one token per step from their own logits (dense q), DFlash2
+    # samples its candidate walk (sparse q over the selector's candidates).
+    # Other block drafters propose a whole block greedily and leave this False.
     supports_speculative_sampling = False
 
     def __init__(

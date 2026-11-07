@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import functools
-import importlib.util
 import os
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package, has_trtllm_kernel
 
 # The package defines its feature names before importing its leaves, so the
 # partially initialized package already carries them here.
@@ -357,20 +357,16 @@ def _resolve_prefill_tile_max_seqlen_k(
     return int(candidate_lens[start:end].max().item())
 
 
-if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None:
+_HAS_DEEP_GEMM = platform.is_hopper_plus and has_optional_package("deep_gemm")
+
+if _HAS_DEEP_GEMM:
     prepare_cuda_toolkit_env()
-    if (
-        importlib.util.find_spec("trtllm_kernel") is not None
-        and importlib.util.find_spec("deep_ep") is not None
-    ):
+    if has_trtllm_kernel():
         # DeepEP must initialize before TRT-LLM's static CUDA runtime.
         import deep_ep  # noqa: F401
     import deep_gemm
 
-    if (
-        importlib.util.find_spec("trtllm_kernel") is not None
-        and importlib.util.find_spec("deep_ep") is not None
-    ):
+    if has_trtllm_kernel():
         import trtllm_kernel  # noqa: F401
 
     def _deep_gemm_paged_mqa_plan(
@@ -774,7 +770,7 @@ if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None
         return out, lens_out
 
 
-if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None:
+if _HAS_DEEP_GEMM:
 
     @register_kernel(
         "attention",
