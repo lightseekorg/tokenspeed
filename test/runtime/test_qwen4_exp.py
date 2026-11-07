@@ -1681,16 +1681,24 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(
         torch.testing.assert_close(local, expected)
         return distinct
 
-    def gather_vocab(local, group, dim):
-        assert group == mapping.lm_head.tp_group and dim == -1
+    def gather_vocab(output, local, group):
+        assert group == mapping.lm_head.tp_group
         all_hidden = torch.cat(hidden[::attn_tp])
         torch.testing.assert_close(
             local, torch.nn.functional.linear(all_hidden, draft.lm_head.weight)
         )
-        return torch.nn.functional.linear(all_hidden, full_weight)
+        output.copy_(
+            torch.cat(
+                [
+                    torch.nn.functional.linear(all_hidden, shard)
+                    for shard in full_weight.split(width, dim=0)
+                ],
+                dim=0,
+            )
+        )
 
     monkeypatch.setattr(logits_module, "all_reduce", reduce_hidden)
-    monkeypatch.setattr(logits_module, "all_gather", gather_vocab)
+    monkeypatch.setattr(logits_module, "all_gather_single", gather_vocab)
     monkeypatch.setattr(logits_module, "token_all_gather", gather)
     monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
     metadata = LogitsMetadata(
