@@ -602,6 +602,7 @@ class BeamAttention(Qwen3Attention):
         projections = (self.qkv_proj, self.gate_proj)
         if self.qkv_gate_weight is not None or self.qkv_gate_bf16 is not None:
             return
+        # NVIDIA only: on AMD, kernel_mm would bypass apply's gfx1250 kernel.
         if current_platform().is_nvidia and all(
             _plain_bf16_linear(p, self.hidden_size) for p in projections
         ):
