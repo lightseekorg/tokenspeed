@@ -147,17 +147,13 @@ def set_rocm_tool_registration_default() -> None:
 def set_rocm_hw_queue_default() -> None:
     """Default ROCm worker processes to two hardware queues per stream priority.
 
-    HIP keeps a pool of ``GPU_MAX_HW_QUEUES`` hardware queues (default 4) for
-    each stream priority and binds a stream to one at its first launch, so the
-    queue a stream gets follows the order in which the process first launches
-    on its streams. On MI350X a process's queue k and queue k+4 share a compute
-    pipe, and while a kernel runs on one of them every launch on the other
-    waits about 30 us. Kimi-K3's prefill runs its Iris side kernels on
-    high-priority streams beside the forward's GEMMs: with 4 normal and 4
-    high-priority queues, a launch whose forward queue shared a pipe with a
-    side stream's ran every prefill chunk about a third slower. With 2 per
-    priority the process has 4 queues, one per pipe. An explicit
-    ``GPU_MAX_HW_QUEUES`` is kept.
+    HIP binds each stream at its first launch to one of ``GPU_MAX_HW_QUEUES``
+    queues (default 4) per priority. On MI350X queues k and k+4 share a
+    compute pipe, and a launch on one waits about 30 us while the other runs
+    a kernel. Kimi-K3's prefill runs Iris side kernels on high-priority
+    streams beside the forward's GEMMs, so four queues per priority can pair
+    them on one pipe and slow each prefill chunk by about a third; two give
+    one queue per pipe. An explicit ``GPU_MAX_HW_QUEUES`` is kept.
     """
     import torch
 

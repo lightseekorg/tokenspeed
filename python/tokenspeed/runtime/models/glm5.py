@@ -180,10 +180,8 @@ class GlmDsaDecodeTopK:
     # placement. ``topk_indices`` then holds this rank's local cache slots,
     # its share first, and ``topk_lens`` their counts.
     owned_placement: Any = None
-    # The selecting layer's decode query rows of every rank, uint8 [ranks,
-    # rows, bytes], where they rode that share's score gather
-    # (select_owned_dsa_topk). Only that layer's core reads them;
-    # it takes them off before publishing the top-k.
+    # Every rank's decode query rows, uint8 [ranks, rows, bytes], carried by
+    # the selecting layer's score gather; only that layer's core reads them.
     gathered_query: torch.Tensor | None = None
 
 
@@ -1399,9 +1397,8 @@ class GlmDsaSparseAttentionMixin:
                 input_num_tokens=num_decode_tokens,
                 forward_mode=ForwardMode.DECODE,
             )
-        # An owned decode top-k's score gather can carry the decode rows'
-        # query heads to a records core, which then skips its own gather:
-        # the query is absorbed before the indexer for it.
+        # An owned decode top-k's score gather can carry the absorbed query
+        # to a records core, which then skips its own gather.
         q = decode_query = query_rider = gathered_query = None
         if (
             should_compute_indexer
@@ -1600,9 +1597,7 @@ class GlmDsaSparseAttentionMixin:
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Only an owned top-k's backend (takes_owned_decode_topk) gets the
-        # flag and a query its gather carried; other backends keep their
-        # signature.
+        # Other backends than an owned top-k's keep their signature.
         owned = {"topk_owned": True} if topk_owned else {}
         if gathered_query is not None:
             owned["gathered_query"] = gathered_query

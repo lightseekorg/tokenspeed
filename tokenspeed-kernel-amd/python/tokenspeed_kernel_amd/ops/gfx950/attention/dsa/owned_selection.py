@@ -163,10 +163,14 @@ def _select_owned_from_gathered_kernel(
     # compacting the whole selection's owned slots would drop it.
     keep = keep & (page >= 0)
     slot = gl.cumsum(keep.to(gl.int32), 0) - 1
-    gl.store(slots + row * WIDTH + slot, page * PAGE + position % PAGE, mask=keep)
+    gl.store(
+        slots + row.to(gl.int64) * WIDTH + slot,
+        page * PAGE + position % PAGE,
+        mask=keep,
+    )
     count = gl.sum(keep.to(gl.int32), axis=0)
     gl.store(
-        slots + row * WIDTH + local,
+        slots + row.to(gl.int64) * WIDTH + local,
         gl.full([WIDTH], -1, gl.int32, layout=rank_layout),
         mask=local >= count,
     )

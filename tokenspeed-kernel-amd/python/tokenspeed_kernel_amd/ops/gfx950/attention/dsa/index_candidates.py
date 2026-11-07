@@ -24,7 +24,6 @@
 import torch
 from tokenspeed_kernel_amd._triton import triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-    _BF16_DECODE_BLOCK_N,
     _BF16_DECODE_CHUNK_N,
     _BF16_DECODE_NUM_WARPS,
     _BF16_PREFILL_BLOCK_N,
@@ -34,11 +33,11 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
     _BF16_PREFILL_ROWS,
     _BF16_PREFILL_WAVES_PER_EU,
     _FP8_ROWS_DECODE_NUM_STAGES,
-    _FP8_ROWS_DECODE_WAVES_PER_EU,
     _FP8_ROWS_PREFILL_TILES,
     _check_fp8_rows_scorer_inputs,
     _check_standard_decode_metadata,
     _fp8_rows_buffer_load,
+    _fp8_rows_decode_shape,
     _fp8_rows_decode_splits,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (
@@ -149,9 +148,9 @@ def launch_gluon_dsa_index_candidates_gfx950(
     *,
     page_size: int,
     softmax_scale: float,
-    query_group_size: int = 1,
-    query_requests: torch.Tensor | None = None,
-    request_count: int | None = None,
+    query_group_size: int,
+    query_requests: torch.Tensor | None,
+    request_count: int | None,
 ) -> torch.Tensor:
     """Score compact pages with the exact regular-serving native arithmetic.
 
@@ -204,12 +203,9 @@ def launch_gluon_dsa_index_candidates_gfx950(
             page_stride,
         )
     rows = triton.next_power_of_2(query_group_size)
-    warps_m = min(rows, _BF16_DECODE_NUM_WARPS)
-    warps_n = _BF16_DECODE_NUM_WARPS // warps_m
-    block_n = max(_BF16_DECODE_BLOCK_N, 32 * warps_n)
-    waves = 1 if rows * q.shape[1] > 256 else 2
-    if q.shape[1] == 32 and rows <= 4:
-        waves = _FP8_ROWS_DECODE_WAVES_PER_EU
+    warps_m, warps_n, block_n, waves = _fp8_rows_decode_shape(
+        rows, q.shape[1], q_fp8=True
+    )
     chunks = triton.cdiv(width, _BF16_DECODE_CHUNK_N)
     splits = _fp8_rows_decode_splits(requests, chunks, waves, q.device)
     gluon_dsa_decode_topk_fp8_rows_gfx950[(requests, splits)](
