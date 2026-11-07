@@ -174,37 +174,65 @@ class TritonSamplingBackend(SamplingBackend):
     def vocab_shard_top_k(self) -> int | None:
         return self._vocab_shard_top_k
 
-    def warmup_vocab_shard_sampling(self, shard: SampledVocabShard) -> None:
-        """Compile ``sample`` from vocabulary shards at every candidate count.
+    def warmup_vocab_shard_sampling(
+        self,
+        shard: SampledVocabShard,
+        candidates: torch.Tensor,
+        *,
+        draft_q: DraftTreeQ | None,
+        with_vocab_mask: bool,
+    ) -> None:
+        """Compile ``sample`` and ``verify`` from vocabulary shards before serving.
 
         The candidate count is a compile-time parameter of the shard
-        selection, its gather and the sampling kernel. Graph capture records
+        selection, its gather and the sampling kernels. Graph capture records
         the top-k routes at 128 candidates only, but an eager step whose
         finite top_k all fit in 64 selects 64 (``_select_top_k_top_p_pad``).
-        Sampling the padding slot at each count compiles both before serving.
-        Every TP rank must call it, since the selection gathers across the
-        group.
-
-        Args:
-            shard: Shard logits of the processor that feeds this sampler, at
-                least one row.
+        The warmup samples and verifies the padding slot at each count, with
+        and without a vocabulary mask when the server applies one.
         """
-        rows = shard.logits.shape[0]
         device = shard.logits.device
-        output = LogitsProcessorOutput(next_token_logits=None, vocab_shard=shard)
-        info = SamplingBatchInfo(
-            req_pool_indices=torch.zeros((rows,), dtype=torch.int64, device=device),
-            valid_cache_lengths=torch.zeros(
-                (self.config.max_req_pool_size + 1,), dtype=torch.int32, device=device
-            ),
-            vocab_size=self.config.vocab_size,
-            device=device,
+        num_tokens_per_req = candidates.shape[1]
+        masks: list[torch.Tensor | None] = [None]
+        if with_vocab_mask:
+            # Every token allowed, in the int32 bitmask layout of the grammar.
+            words = (self.config.vocab_size + 31) // 32
+            masks.append(
+                torch.full(
+                    (num_tokens_per_req, words), -1, dtype=torch.int32, device=device
+                )
+            )
+        valid_cache_lengths = torch.zeros(
+            (self.config.max_req_pool_size + 1,), dtype=torch.int32, device=device
         )
+
+        def info(mask: torch.Tensor | None, rows: int) -> SamplingBatchInfo:
+            return SamplingBatchInfo(
+                req_pool_indices=torch.zeros((1,), dtype=torch.int64, device=device),
+                valid_cache_lengths=valid_cache_lengths,
+                vocab_mask=None if mask is None else mask[:rows],
+                draft_q=draft_q,
+                vocab_size=self.config.vocab_size,
+                device=device,
+            )
+
         saved = (self._sample_route, self._top_k_top_p_pad)
         self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K
         for pad in (_TOP_K_TOP_P_SMALL_PAD, _TOP_K_TOP_P_PAD):
             self._top_k_top_p_pad = pad
-            self.sample(output, info)
+            for mask in masks:
+                self.sample(
+                    LogitsProcessorOutput(
+                        next_token_logits=None, vocab_shard=shard.rows(slice(0, 1))
+                    ),
+                    info(mask, 1),
+                )
+                self.verify(
+                    LogitsProcessorOutput(next_token_logits=None, vocab_shard=shard),
+                    info(mask, num_tokens_per_req),
+                    candidates,
+                    tree=None,
+                )
         self._sample_route, self._top_k_top_p_pad = saved
 
     def _selects_from_vocab_shard(self, logits_output: LogitsProcessorOutput) -> bool:

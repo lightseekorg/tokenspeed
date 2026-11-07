@@ -321,29 +321,31 @@ def _kernel_test_utils():
 
 
 @requires_cuda
-def test_warmup_compiles_every_candidate_count(monkeypatch) -> None:
-    """After the startup warmup, samples at either candidate count compile nothing.
+@pytest.mark.parametrize("with_q,shard", [(False, 3000), (True, 900)])
+def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> None:
+    """After the startup warmup, sample and verify compile nothing at either
+    candidate count, with or without a grammar mask.
 
     Graph capture records 128 candidates per row, but an eager step whose
-    top_k all fit in 64 selects 64. The head here (four ranks, no scale or
-    softcap) differs from the other tests' head, so its selection kernels
-    are compiled only by this test.
+    top_k all fit in 64 selects 64. Each case's head (four ranks, no scale or
+    softcap, its own shard width) differs from every other test's head, so
+    only that case compiles its selection kernels.
     """
-    ranks, shard = 4, 3000
+    ranks = 4
     vocab = ranks * shard
-    raw = (torch.randn(BS, vocab, generator=torch.Generator().manual_seed(41)) * 3).to(
-        "cuda", torch.bfloat16
-    )
+    raw = (
+        torch.randn(BS * N, vocab, generator=torch.Generator().manual_seed(41)) * 3
+    ).to("cuda", torch.bfloat16)
 
-    def shard_of(rank: int) -> SampledVocabShard:
+    def shard_of(rows: int) -> SampledVocabShard:
         return SampledVocabShard(
-            logits=raw[:, rank * shard : (rank + 1) * shard],
-            vocab_start=rank * shard,
+            logits=raw[:rows, shard : 2 * shard],
+            vocab_start=shard,
             logit_scale=None,
             softcap=None,
             tp_size=ranks,
             tp_group=tuple(range(ranks)),
-            gather_full=lambda logits: raw.clone(),
+            gather_full=lambda logits: raw[:rows].clone(),
         )
 
     def all_gather_single(landing, staged, group):
@@ -363,20 +365,46 @@ def test_warmup_compiles_every_candidate_count(monkeypatch) -> None:
     backend = TritonSamplingBackend(
         dataclasses.replace(_config(), vocab_size=vocab, tp_group=tuple(range(ranks)))
     )
-    backend.warmup_vocab_shard_sampling(shard_of(1).rows(slice(0, 1)))
+    q = DraftTreeQ.zeros(POOL + 1, N - 1, 16, N, "cuda") if with_q else None
+    backend.warmup_vocab_shard_sampling(
+        shard_of(N),
+        torch.zeros((1, N), dtype=torch.int32, device="cuda"),
+        draft_q=q,
+        with_vocab_mask=True,
+    )
+    # Every token allowed.
+    mask = torch.full(
+        (BS * N, (vocab + 31) // 32), -1, dtype=torch.int32, device="cuda"
+    )
     kernels = (
         _vocab_shard_topk_kernel,
         _vocab_topk_merge_kernel,
         _top_k_top_p_gumbel_stage2_kernel,
     )
     with _kernel_test_utils().assert_no_triton_compile(*kernels):
-        # New requests each step, so the backend picks the step's count again.
-        for rid, top_k in (("a", [5, 64, 1]), ("b", [100, 3, 128])):
-            req_pool_indices = _prepare(backend, top_k, [0.9, 1.0, 1.0], 1, rid)
-            info = _info(req_pool_indices, None, None)
-            info.vocab_size = vocab
-            sampled, _ = backend.sample(
-                LogitsProcessorOutput(next_token_logits=None, vocab_shard=shard_of(1)),
-                info,
-            )
-            assert bool(((sampled >= 0) & (sampled < vocab)).all())
+        for step, top_k in enumerate(([5, 64, 1], [100, 3, 128])):
+            for masked in (False, True):
+                # New requests each time, so the backend picks the count again.
+                rid = f"s{step}m{int(masked)}r"
+                req_pool_indices = _prepare(backend, top_k, [0.9, 1.0, 1.0], 1, rid)
+                info = _info(req_pool_indices, mask[:BS] if masked else None, None)
+                info.vocab_size = vocab
+                sampled, _ = backend.sample(
+                    LogitsProcessorOutput(
+                        next_token_logits=None, vocab_shard=shard_of(BS)
+                    ),
+                    info,
+                )
+                assert bool(((sampled >= 0) & (sampled < vocab)).all())
+                req_pool_indices = _prepare(backend, top_k, [0.9, 1.0, 1.0], N, rid)
+                info = _info(req_pool_indices, mask if masked else None, q)
+                info.vocab_size = vocab
+                _, accept_length = backend.verify(
+                    LogitsProcessorOutput(
+                        next_token_logits=None, vocab_shard=shard_of(BS * N)
+                    ),
+                    info,
+                    torch.zeros((BS, N), dtype=torch.int32, device="cuda"),
+                    tree=None,
+                )
+                assert bool(((accept_length >= 1) & (accept_length <= N)).all())

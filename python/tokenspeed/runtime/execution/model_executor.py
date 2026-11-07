@@ -1206,17 +1206,27 @@ class ModelExecutor:
 
         The dummy forwards sample through no top-k route, and graph capture
         records only one candidate count. The sampler warms each count that
-        it can pick on an eager step.
+        it can pick on an eager step, for this server's verify window, draft
+        q and grammar masks.
         """
         processor = self.model_runner.model.logits_processor
         lm_head = self.model_runner.model.lm_head
+        num_tokens_per_req = self.config.output_length
         logits = torch.zeros(
-            (1, lm_head.num_embeddings_per_partition),
+            (num_tokens_per_req, lm_head.num_embeddings_per_partition),
             dtype=lm_head.weight.dtype,
             device=self.device,
         )
+        candidates = torch.zeros(
+            (1, num_tokens_per_req),
+            dtype=self.input_buffers.input_ids_buf.dtype,
+            device=self.device,
+        )
         self.sampling_backend.warmup_vocab_shard_sampling(
-            processor.sampled_vocab_shard(logits, lm_head)
+            processor.sampled_vocab_shard(logits, lm_head),
+            candidates,
+            draft_q=self.runtime_states.future_draft_q,
+            with_vocab_mask=self.config.grammar_backend != "none",
         )
 
     def _autotune_draft_experts(self, num_tokens: int) -> None:
