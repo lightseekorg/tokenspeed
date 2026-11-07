@@ -690,12 +690,15 @@ restore (§4). Replayable groups combine freely with State groups: a junction
 inside the final window yields to the window rule (above), and nothing else
 about a State group constrains a chunk.
 
-PD: a replayable group travels like any sliding-window group. The prefill
-role replays on its own local hits exactly as the fused role does and, at
-completion, transfers the group's retained tail (`full_suffix` selects the
-pages intersecting the last `sliding_window_tokens − 1` positions). Every
-page of that tail exists because a hit re-feeds the whole retention window:
-the regenerated suffix starts at or before the tail. The decode role computes no prompt rows, so
+PD: the decode role caches none of a replayable group's pages, so remote
+admission allocates its **whole retained window**, independently of the
+global prefix hit. `full_suffix` selects the same complete window for the
+destination manifest, its validation and the prefill peer's layerwise
+selection: every page intersecting the last `sliding_window_tokens − 1`
+positions. Ordinary cached windows still reuse their matched pages.
+The prefill role replays on its own local hits exactly as the fused role
+does, so every page of the retained tail exists when it sends it. The
+decode role computes no prompt rows, so
 `SchedulePrefillFirstChunkEvent` gives a remote prefill `replay = 0` and
 `Admit` leaves a demand that already names the landing's sparse suffix
 alone; the landed tail is what the first decode steps read, with no
@@ -1237,7 +1240,8 @@ phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
    the pages it waits for would starve it.
    Remote admission therefore bypasses local prefill chunking and prefix
    promotion boundaries; the destination tables must cover the entire
-   unmatched suffix advertised by the transfer manifest.
+   unmatched suffix and each replayable group's complete retained window
+   advertised by the transfer manifest (§1.3).
 4. `maybeRetractForCapacity` (§2), whose grant also rides beside the batch
    (a remote admission) or joins it (a blocked decode).
 

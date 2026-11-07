@@ -80,6 +80,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     IndexKeyInput,
     IndexQueryInput,
     index_query_rope_weights,
+    prepare_fused_decode_weights,
     rope_inplace,
     rope_pad_query,
     rope_quantize_fp8_grouped,
@@ -96,6 +97,7 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_fp8_projection,
     prepare_grouped_fp8_projection,
+    prepare_mxfp8_weight_scales,
     warmup_fp8_projections,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
@@ -1035,6 +1037,10 @@ class DeepseekV41Attention(nn.Module):
         # own method.
         self.wo_b_fp8: bool | None = None
         self.register_buffer("wo_b_scales", None, persistent=False)
+        self.register_buffer("fused_q_weight", None, persistent=False)
+        self.register_buffer("fused_q_scales", None, persistent=False)
+        self.register_buffer("fused_wo_a_weight", None, persistent=False)
+        self.register_buffer("fused_wo_a_scales", None, persistent=False)
         self.wo_b = RowParallelLinear(
             input_size=config.o_groups * config.o_lora_rank,
             output_size=config.hidden_size,
@@ -1123,6 +1129,57 @@ class DeepseekV41Attention(nn.Module):
             max_tokens,
         )
 
+    @torch.no_grad()
+    def prepare_fused_decode(self) -> None:
+        """Keep canonical weights for prefill and refresh fused decode copies.
+
+        Refresh existing buffers in place after weight updates: captured graphs
+        retain them. Q's latent norm and the indexer's projections stay canonical.
+        """
+        if (
+            self.wo_a_fp8 is not True
+            or not isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
+            or not self.wq_b.weight.is_cuda
+            or self.wq_b.weight.dtype != torch.float8_e4m3fn
+            or self.wq_b.weight.shape[1] % 128
+            or self.mapping.attn.head_tp_size != 1
+            or self.mapping.attn.kvp_size != 1
+            or self.n_local_heads not in (64, 128)
+            or self.n_local_heads != 8 * self.n_local_groups
+            or (self.head_dim, self.rotary_emb.dim) != (512, 64)
+        ):
+            return
+        prepared = prepare_fused_decode_weights(
+            self.wq_b.weight,
+            self.wq_b.weight_scale_inv,
+            self.wo_a.weight,
+            self.wo_a_scales,
+            self.n_local_heads,
+            self.n_local_groups,
+        )
+        if prepared is None:
+            return
+        query, canonical_scales, output, output_scales = prepared
+        query_scales = prepare_mxfp8_weight_scales(query, canonical_scales)
+        if query_scales is None:
+            return
+        if self.fused_q_weight is None:
+            self.fused_q_weight, self.fused_q_scales = query, query_scales
+            self.fused_wo_a_weight, self.fused_wo_a_scales = output, output_scales
+        else:
+            for destination, source in (
+                (self.fused_q_weight, query),
+                (self.fused_q_scales, query_scales),
+                (self.fused_wo_a_weight, output),
+                (self.fused_wo_a_scales, output_scales),
+            ):
+                if (
+                    destination.shape != source.shape
+                    or destination.dtype != source.dtype
+                ):
+                    raise ValueError("V4.1 fused decode weights changed layout")
+                destination.copy_(source)
+
     def _kernel_attn_sink(self):
         if not self.attn_sink.is_cuda or self.n_kernel_heads == self.n_local_heads:
             return self.attn_sink
@@ -1200,6 +1257,11 @@ class DeepseekV41Attention(nn.Module):
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
+        fused_decode = (
+            self.fused_q_weight is not None
+            and mode.is_decode()
+            and backend.supports_fused_attention
+        )
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         meta = rows.source
         source_gather = (
@@ -1444,22 +1506,35 @@ class DeepseekV41Attention(nn.Module):
                         )
                         index_q = index_weights = None
             if q_input.shape[0]:
-                q, _ = self.wq_b(
-                    q_input,
-                    block_scale=q_scale,
-                    output_dtype=qr.dtype if q_scale is not None else None,
-                )
+                if fused_decode:
+                    q = mm(
+                        q_input,
+                        self.fused_q_weight,
+                        A_scales=q_scale,
+                        B_scales=self.fused_q_scales,
+                        out_dtype=qr.dtype,
+                        quant="mxfp8",
+                        block_size=[1, 32],
+                        prepacked_scales=True,
+                    )
+                else:
+                    q, _ = self.wq_b(
+                        q_input,
+                        block_scale=q_scale,
+                        output_dtype=qr.dtype if q_scale is not None else None,
+                    )
             else:
                 q = qr.new_empty((0, self.n_local_heads * self.head_dim))
             q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
             if (
-                q.is_cuda
+                not fused_decode
+                and q.is_cuda
                 and mode.is_decode()
                 and self.head_dim == 512
                 and self.n_local_heads != self.n_kernel_heads
             ):
                 q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
-            elif q.shape[0]:
+            elif not fused_decode and q.shape[0]:
                 q = self.rotary_emb.apply_owned(q, positions, False)
             swa_rope_cache = None
             swa_norm_weight = None
@@ -1514,12 +1589,18 @@ class DeepseekV41Attention(nn.Module):
             swa_norm_weight=swa_norm_weight,
             swa_norm_eps=self.kv_norm.variance_epsilon,
             out_rope_cache=out_rope_cache,
+            fused_decode_groups=self.n_local_groups if fused_decode else None,
             key_rows=query_gather,
         )
-        if out.shape[0] == 0 and query_gather is not None:
-            return hidden_states.new_empty((0, self.wo_b.output_size))
-        out = out[:, : self.n_local_heads]
-        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+        if fused_decode:
+            codes, scales = out
+            weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
+        else:
+            if out.shape[0] == 0 and query_gather is not None:
+                return hidden_states.new_empty((0, self.wo_b.output_size))
+            out = out[:, : self.n_local_heads]
+            weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+            weight_scales = self.wo_a_scales
         target = None
         if self.mapping.attn.head_tp_size > 1:
             target = _all_reduce_output(
@@ -1532,21 +1613,20 @@ class DeepseekV41Attention(nn.Module):
             # One kernel undoes RoPE and casts every 32 channels to FP8, as the
             # reference rounds o before wo_a. Only CDNA attention rotates back
             # itself, and no grouped FP8 kernel serves CDNA.
-            codes, scales = self.rotary_emb.inverse_quantize_grouped(
-                out, positions, self.n_local_groups
-            )
+            if not fused_decode:
+                codes, scales = self.rotary_emb.inverse_quantize_grouped(
+                    out, positions, self.n_local_groups
+                )
             if self.wo_b_fp8:
                 # wo_a writes wo_b's FP8 input and scales; nothing quantizes between.
                 codes, scales = grouped_fp8_projection_quantize_fp8(
-                    codes, scales, weight, self.wo_a_scales
+                    codes, scales, weight, weight_scales
                 )
                 out = fp8_projection(
                     codes, scales, self.wo_b.weight, self.wo_b_scales, target
                 )
             else:
-                out = grouped_fp8_projection(
-                    codes, scales, weight, self.wo_a_scales, None
-                )
+                out = grouped_fp8_projection(codes, scales, weight, weight_scales, None)
                 out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
         else:
             if out_rope_cache is None:
@@ -3283,6 +3363,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 module.quant_method.prepare_weight_scales(module)
             elif isinstance(module, DeepseekV41Attention):
                 module.prepare_output_projections()
+                module.prepare_fused_decode()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded
