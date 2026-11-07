@@ -28,6 +28,8 @@ from conftest import _advance, _spec, storage_ops
 def scheduler(*, role, groups=1, host=32, timeout=100):
     cfg = ts.SchedulerConfig()
     cfg.role = role
+    if cfg.role == ts.SchedulerConfig.Role.P:
+        cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.prefix_granularity = 2
     cfg.num_snapshot_pages = 1
     cfg.num_device_pages = 64

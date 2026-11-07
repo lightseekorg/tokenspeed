@@ -124,6 +124,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("WriteThrough", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteThrough)
         .value("WriteBack", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteBack);
 
+    nb::enum_<tokenspeed::SchedulerConfig::DecodeAllocationPolicy>(scheduler_config, "DecodeAllocationPolicy")
+        .value("Early", tokenspeed::SchedulerConfig::DecodeAllocationPolicy::kEarly)
+        .value("Independent", tokenspeed::SchedulerConfig::DecodeAllocationPolicy::kIndependent);
+
     nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
         .value("Full", tokenspeed::AttnKind::kFull)
         .value("SlidingWindow", tokenspeed::AttnKind::kSlidingWindow)
@@ -184,6 +188,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
+        .def_rw("decode_allocation_policy", &tokenspeed::SchedulerConfig::decode_allocation_policy)
         .def_prop_rw(
             "num_device_pages", [](const tokenspeed::SchedulerConfig& c) { return c.device_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.device_allocator.total_pages = v; })
@@ -479,6 +484,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::BootstrappedEvent::request_id);
 
+    nb::class_<tokenspeed::pd::DestinationReadyEvent>(pd, "DestinationReadyEvent")
+        .def(nb::init<std::string>(), nb::arg("request_id"))
+        .def_ro("request_id", &tokenspeed::pd::DestinationReadyEvent::request_id);
+
     nb::class_<tokenspeed::pd::FailedEvent>(pd, "FailedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::FailedEvent::request_id);
@@ -765,7 +774,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("ready_waiting_size", &tokenspeed::Scheduler::ReadyWaitingSize,
              "Count completed prefills waiting for their first local decode permit.")
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
-             "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
+             "Count local/remote prefills, PrefillAwaitingResult, PrefillAwaitingDestination, and PrefillDone "
+             "requests.")
         .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,
              "Count RemotePrefilling requests; these are also included in prefilling_size().")
         .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,

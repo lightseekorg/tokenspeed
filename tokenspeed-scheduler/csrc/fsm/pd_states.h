@@ -82,6 +82,29 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
+// P role, independent decode allocation: a computed prompt whose Decode
+// destination is not allocated yet (no pd::DestinationReadyEvent). It keeps
+// the resources of PrefillAwaitingResult, pinned like every page-holding P
+// state, and is never scheduled; pd::DestinationReadyEvent moves it to
+// PrefillDone, whose remote decode sends the KV.
+struct PrefillAwaitingDestination {
+    PrefillAwaitingDestination(ForwardResources resources, TokenContainer::Window window,
+                               std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
+          window{window},
+          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
+
+    PrefillInfo CurrentPrefillInfo() const { return MakePrefillInfo(resources, window); }
+    std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
+    TokenContainer::Window window{};
+
+private:
+    std::int32_t reserve_num_tokens_in_next_schedule_event_{};
+};
+
 // The request ended on this engine -- aborted, or its transfer failed --
 // while a PD transfer may still read or write its pages: the peer's decode
 // reading a P request's sources, the peer's prefill writing a D request's

@@ -231,6 +231,7 @@ def _config(**overrides):
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        decode_allocation_policy=None,
         storage_config=None,
     )
     fields.update(overrides)

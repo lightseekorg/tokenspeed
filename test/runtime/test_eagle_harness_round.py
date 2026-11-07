@@ -474,6 +474,7 @@ def _decode_batch(bs: int, width: int):
             host_write_policy="write_through",
             prefill_decode_interval=0,
             prefill_decode_min_interval=0,
+            decode_allocation_policy=None,
             storage_config=None,
             decode_input_tokens=width,
             cache_groups=[

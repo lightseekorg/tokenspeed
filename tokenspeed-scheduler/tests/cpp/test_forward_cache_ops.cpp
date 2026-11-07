@@ -733,6 +733,8 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     for (const Role role : {Role::kP, Role::kD}) {
         SchedulerConfig pd = config;
         pd.role = role;
+        pd.decode_allocation_policy =
+            role == Role::kP ? std::optional{SchedulerConfig::DecodeAllocationPolicy::kEarly} : std::nullopt;
         for (CacheGroupConfig& group : pd.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
@@ -758,6 +760,8 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
     for (const Role role : {Role::kP, Role::kD}) {
         SchedulerConfig pd = MakeValidConfig();
         pd.role = role;
+        pd.decode_allocation_policy =
+            role == Role::kP ? std::optional{SchedulerConfig::DecodeAllocationPolicy::kEarly} : std::nullopt;
         for (CacheGroupConfig& group : pd.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
@@ -780,6 +784,9 @@ TEST(SchedulerConfigValidateTest, DroppingShortPromptEndsTakesThePRoleAndTheInFo
         SCOPED_TRACE(static_cast<int>(role));
         SchedulerConfig config = MakeValidConfig();
         config.role = role;
+        if (role == Role::kP) {
+            config.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
+        }
         if (role != Role::kFused) {
             for (CacheGroupConfig& group : config.cache_groups) {
                 group.transfer_policy = CacheTransferPolicy::FullSuffix;
@@ -819,6 +826,7 @@ TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether
 
     config.max_retracted_requests = 4;
     config.role = Role::kP;
+    config.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
     config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
     EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument) << "the P role never retracts";
     config.snapshot_allocator.total_pages = 1;
@@ -916,6 +924,8 @@ TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
         SCOPED_TRACE(static_cast<int>(role));
         SchedulerConfig config = MakeValidConfig();
         config.role = role;
+        config.decode_allocation_policy =
+            role == Role::kP ? std::optional{SchedulerConfig::DecodeAllocationPolicy::kEarly} : std::nullopt;
         if (role != Role::kFused) {
             config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
         }
@@ -941,6 +951,7 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
     const auto prefill = [] {
         SchedulerConfig config = MakeValidConfig();
         config.role = Role::kP;
+        config.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
         config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
         SetTestSnapshotPool(config);
         config.host_allocator.total_pages = 2;
@@ -956,12 +967,14 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
     ExpectRejectedNamingGroup(disabled_host, "requires a Host L2 cache");
     SchedulerConfig fused = prefill();
     fused.role = Role::kFused;
+    fused.decode_allocation_policy.reset();
     SetTestSnapshotPool(fused);
     ASSERT_TRUE(fused.HasSnapshotPool());
     EXPECT_NO_THROW(WithHostPackingFromDevice(fused).Validate());
     EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(fused)});
     SchedulerConfig decode = prefill();
     decode.role = Role::kD;
+    decode.decode_allocation_policy.reset();
     SetTestSnapshotPool(decode);
     ExpectRejectedNamingGroup(decode, "not available on the D role");
     SchedulerConfig l3 = prefill();

@@ -1067,6 +1067,32 @@ revision as the Python runtime. The serving host uses the scheduler embedded
 in tokenspeed-engine; upgrading the standalone scheduler wheel alone does
 not update that embedded copy.
 
+### P/D admission
+
+`--disaggregation-decode-allocation-policy` sets what a request's Decode
+allocation gates on a prefill server; the other roles refuse the flag.
+`early`, the default, admits the prefill once every Decode rank of the
+request has allocated its destination, so the KV can stream layer by layer
+during the forward. `independent` (experimental) computes the prompt without
+waiting for the Decode allocation and holds only its KV transfer: a computed
+prompt keeps its pages until the destination is allocated, and a destination
+allocated before the prompt finishes is remembered. `independent` requires
+attention TP 1, `--kv-parallel-size 1`, `--pipeline-parallel-size 1`, no
+`--enable-external-encoder`, an explicit
+`--disaggregation-layerwise-interval 0` and a model without multimodal
+input (or `--language-model-only`); anything else is refused at
+startup.
+
+Under `independent`, computed prompts waiting for their destination hold
+prefill pages. While one waits, a new prompt that does not fit in the pages
+left holds back the new prompts behind it, so that smaller prompts that keep
+fitting do not starve a larger one.
+
+<!-- TODO(stage 2, PD layer): when the prefill server admits a prompt (its
+Decode server's announcement and that destination's share of the prefill
+pool), when the Decode server allocates (once the prefill server holds every
+page of the prompt), and the timeout of each wait. -->
+
 ## Observability
 
 | Parameter | Purpose |

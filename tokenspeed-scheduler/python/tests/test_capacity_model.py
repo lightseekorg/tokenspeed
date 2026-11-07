@@ -28,6 +28,8 @@ def _sizing_config(
     """A config as the recipes hand it to the model: no page counts yet."""
     cfg = ts.SchedulerConfig()
     cfg.role = role
+    if cfg.role == ts.SchedulerConfig.Role.P:
+        cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size

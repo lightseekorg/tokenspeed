@@ -38,6 +38,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        decode_allocation_policy=None,
         storage_config=None,
         **kwargs,
     )
@@ -158,6 +159,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        decode_allocation_policy=None,
         storage_config=(
             StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=7, prefix_granularity=2
