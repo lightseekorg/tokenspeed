@@ -166,6 +166,11 @@ public:
     // RemotePrefilling (waiting for the peer's KV), waiting and retracted
     // requests are not running.
     std::size_t RunningSize() const;
+    // P role, independent admission: computed prompts waiting for their
+    // Decode destination (PrefillAwaitingDestination, a subset of
+    // PrefillSize(), not running), and the Device parents they pin.
+    std::size_t AwaitingDestinationSize() const;
+    std::int32_t AwaitingDestinationLcmBlocks() const;
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.

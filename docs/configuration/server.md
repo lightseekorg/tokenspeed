@@ -913,6 +913,30 @@ gets a new identity even if its transport IP and port are reused. The sender
 refreshes cached remote memory keys on address reuse without changing the
 public address used by EPD.
 
+### P/D admission
+
+`--disaggregation-decode-allocation-policy` sets what a request's Decode
+allocation gates on a prefill server; the other roles refuse the flag.
+`early`, the default, admits the prefill once every Decode rank of the
+request has allocated its destination, so the KV can stream layer by layer
+during the forward. `independent` (experimental) admits the prefill at once
+and holds only its KV transfer: a computed prompt keeps its pages until the
+destination is allocated, and a destination allocated before the prompt
+finishes is remembered. `independent` requires attention TP 1,
+`--kv-parallel-size 1`, `--pipeline-parallel-size 1`, no
+`--enable-external-encoder`, an explicit
+`--disaggregation-layerwise-interval 0` and a model without multimodal
+input (or `--language-model-only`); anything else is refused at
+startup.
+
+Under `independent`, computed prompts waiting for their destination hold
+prefill pages, so a Decode server short of pages also delays the prefill
+server's other prompts, including those bound for other Decode servers. A
+prompt whose destination is not allocated within
+`TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s by default) of its
+arrival fails, which also ends a wait in which Prefill and Decode each hold
+pages the other needs.
+
 ## Observability
 
 | Parameter | Purpose |

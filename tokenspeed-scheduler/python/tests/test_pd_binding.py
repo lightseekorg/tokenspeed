@@ -76,6 +76,7 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(
 ):
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 4
@@ -238,6 +239,7 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
     like a decoding role; intermediate chunks hold only their own tokens."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 4
     cfg.max_batch_size = 1
@@ -277,6 +279,7 @@ def test_prefill_role_hands_off_without_the_draft_window():
     verify window: a pool sized for the prompt and that window still hands off."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.prefix_granularity = 1
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 1
@@ -413,6 +416,7 @@ def make_prefill_state_config(
     budget, so a prompt of 8 tokens or fewer has none."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 1
@@ -492,6 +496,7 @@ def test_dropping_short_prompt_ends_takes_the_prefill_role_and_the_in_forward_ch
         Scheduler(cfg)
     cfg.state_checkpoint_in_forward = True
     cfg.role = SchedulerConfig.Role.Fused
+    cfg.decode_allocation_policy = None
     with pytest.raises(ValueError, match="P role only"):
         Scheduler(cfg)
 
@@ -502,6 +507,7 @@ def test_prefill_chunk_yield_round_trips_and_is_validated():
     cfg = SchedulerConfig()
     assert cfg.prefill_chunk_yield_tokens == 0
     cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.prefix_granularity = 16
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
@@ -525,5 +531,6 @@ def test_prefill_chunk_yield_round_trips_and_is_validated():
         Scheduler(cfg)
     cfg.prefill_chunk_yield_tokens = 16
     cfg.role = SchedulerConfig.Role.D
+    cfg.decode_allocation_policy = None
     with pytest.raises(ValueError, match="P role only"):
         Scheduler(cfg)

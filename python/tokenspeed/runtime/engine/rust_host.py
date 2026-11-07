@@ -1179,6 +1179,19 @@ class HostBootstrap:
             model_config = load_model_config(
                 server_args, server_args.model, draft_of=None
             )
+            # Refused here, where the model is known, like the layouts
+            # ServerArgs refuses: once a prompt is computed the multimodal
+            # embedder releases its encoder inputs, and a prompt computed
+            # before its destination may be computed again (a requeue).
+            if (
+                model_config.is_multimodal_active
+                and server_args.disaggregation_decode_allocation_policy == "independent"
+            ):
+                raise ValueError(
+                    "--disaggregation-decode-allocation-policy independent does "
+                    "not support a multimodal model; serve it with "
+                    "--language-model-only"
+                )
             if server_args.speculative_draft_model_path is not None:
                 draft_model_config = load_model_config(
                     server_args,

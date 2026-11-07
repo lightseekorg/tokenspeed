@@ -42,7 +42,15 @@ namespace tokenspeed {
 
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     Request* request = findRequest(event.request_id);
-    if (request != nullptr && request->IsAnyOf<fsm::Bootstrapping, fsm::Prefetching>()) {
+    if (request == nullptr) {
+        return;
+    }
+    // On the P role every Decode rank allocated the destination: a request
+    // still waiting for it is admitted, and a computed prompt parked for it
+    // sends its KV. On the D role the prefill peer answered, and the request
+    // is admitted to allocate its destination; only the P role reads the mark.
+    request->MarkDestinationReady();
+    if (request->IsAnyOf<fsm::Bootstrapping, fsm::Prefetching, fsm::PrefillAwaitingDestination>()) {
         request->Apply(fsm::BootstrappedEvent{});
     }
 }
@@ -385,7 +393,7 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
         request->NoteResultLanded();
-        request->Apply(fsm::ExtendResultEvent{event.tokens});
+        request->Apply(fsm::ExtendResultEvent{event.tokens, config_.role == Role::kP && !request->DestinationReady()});
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }

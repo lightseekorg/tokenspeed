@@ -85,6 +85,7 @@ def _scheduler(ts, make_config):
             max_retracted_requests=0,
             host_write_policy="write_through",
             prefill_decode_interval=0,
+            decode_allocation_policy=None,
             storage_config=None,
             cache_groups=groups,
         )

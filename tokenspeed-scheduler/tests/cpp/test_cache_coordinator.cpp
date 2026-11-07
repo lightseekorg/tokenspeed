@@ -150,7 +150,8 @@ TEST(CacheCoordinatorPreparedKeysTest, ProbeOwnsKeysAfterRequestIsReleased) {
         MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
     CacheCoordinator::PrefixProbe probe;
     {
-        Request request(RequestSpec{.request_id = "prepared", .tokens = {1, 2, 3, 4, 5, 6, 7}}, 2, Role::kFused);
+        Request request(RequestSpec{.request_id = "prepared", .tokens = {1, 2, 3, 4, 5, 6, 7}}, 2,
+                        /*awaits_bootstrap=*/false);
         const auto hashes = request.PromptPrefixHashes();
         for (const auto& hash : hashes) CacheForGroup(coordinator, pool, hash, 0);
         auto* admission = request.AdmissionResourcesPtr();

@@ -28,7 +28,7 @@
 
 namespace tokenspeed {
 
-Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
+Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool awaits_bootstrap)
     : id_{spec.request_id},
       session_id_{spec.session_id},
       token_container_{spec.tokens},
@@ -36,8 +36,8 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       max_new_tokens_{spec.max_new_tokens},
       max_cached_prefix_tokens_{spec.max_cached_prefix_tokens},
       prefix_granularity_{prefix_granularity},
-      state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
+      state_{awaits_bootstrap ? fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}
+                              : fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}} {}
 
 std::span<const std::string> Request::PromptPrefixHashes() {
     if (!prompt_prefix_hashes_) {
@@ -68,6 +68,7 @@ PrefillInfo Request::CurrentPrefillInfo() const {
             [](const fsm::RemotePrefilling& state) { return state.CurrentPrefillInfo(); },
             [](const fsm::PrefillDone& state) { return state.CurrentPrefillInfo(); },
             [](const fsm::PrefillAwaitingResult& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::PrefillAwaitingDestination& state) { return state.CurrentPrefillInfo(); },
             [this](const auto&) -> PrefillInfo {
                 throw std::logic_error(
                     "Request::CurrentPrefillInfo: expected Prefilling, RemotePrefilling or PrefillDone; got " +
@@ -96,6 +97,7 @@ std::int32_t Request::NumComputedTokens() const {
         Overloaded{
             [](const fsm::Prefilling& state) { return state.window.begin + state.window.size; },
             [](const fsm::PrefillDone& state) { return state.window.begin + state.window.size; },
+            [](const fsm::PrefillAwaitingDestination& state) { return state.window.begin + state.window.size; },
             // Every token but the last is computed; the last is the sampled
             // token no landed forward consumed.
             [this](const fsm::Decoding&) { return TokenSize() - 1; },

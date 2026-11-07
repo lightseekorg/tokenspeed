@@ -366,6 +366,7 @@ class TestPrefillFirst:
         dispatches in one round."""
         cfg = make_config(max_scheduled_tokens=8)
         cfg.role = SchedulerConfig.Role.P
+        cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Early
         cfg.decode_input_tokens = 0
         cfg.cache_groups[0].transfer_policy = CacheTransferPolicy.FullSuffix
         s = Scheduler(cfg)

@@ -841,15 +841,17 @@ impl OutputProcessor {
         committed
     }
 
-    /// A request's PD transfer failed. The client gets an abort unless it
-    /// already ended and tore down its stream. The scheduler keeps the
-    /// request's pages until the transfer and local forwards retire.
+    /// A request's PD transfer failed. The client gets an abort, unless it
+    /// aborted the request itself and tore down its stream. On the P role a
+    /// computed prompt's output waits for its transfer, so one its token
+    /// already ended is aborted too. The scheduler keeps the request's pages
+    /// until the transfer and local forwards retire.
     pub fn fail_transfer(&mut self, rid: &str) -> Committed {
         let mut committed = Committed::default();
         let Some(mut state) = self.states.remove(rid) else {
             return committed;
         };
-        if !state.finished() {
+        if !state.to_abort {
             state.abort("PD/EPD remote transfer failed or timed out", false, None);
             state.finished_output = false;
             committed.outputs =

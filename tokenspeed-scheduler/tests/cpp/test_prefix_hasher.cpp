@@ -49,7 +49,7 @@ key_span Keys(const std::vector<std::string>& v) {
 
 TEST(RequestPromptHashesTest, RepeatedQueriesKeepTheFullInputPageChain) {
     Request request(RequestSpec{.request_id = "prompt", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}},
-                    /*prefix_granularity=*/4, Role::kFused);
+                    /*prefix_granularity=*/4, /*awaits_bootstrap=*/false);
     const std::string first = HashPrefixPage(Tokens({1, 2, 3, 4}), "");
     const std::string second = HashPrefixPage(Tokens({5, 6, 7, 8}), first);
     const std::vector<std::string> expected{first, second};
@@ -61,7 +61,7 @@ TEST(RequestPromptHashesTest, RepeatedQueriesKeepTheFullInputPageChain) {
 
 TEST(RequestPromptHashesTest, AnAlignedInputKeepsItsLastFullPageForDecodeRoleMatching) {
     Request request(RequestSpec{.request_id = "decode", .tokens = {1, 2, 3, 4}},
-                    /*prefix_granularity=*/2, Role::kD);
+                    /*prefix_granularity=*/2, /*awaits_bootstrap=*/true);
     const std::string first = HashPrefixPage(Tokens({1, 2}), "");
     const std::string second = HashPrefixPage(Tokens({3, 4}), first);
     const auto hashes = request.PromptPrefixHashes();
@@ -70,7 +70,7 @@ TEST(RequestPromptHashesTest, AnAlignedInputKeepsItsLastFullPageForDecodeRoleMat
 
 TEST(RequestPromptHashesTest, AShortInputHasNoFullPageHashes) {
     Request request(RequestSpec{.request_id = "short", .tokens = {1, 2, 3}},
-                    /*prefix_granularity=*/4, Role::kFused);
+                    /*prefix_granularity=*/4, /*awaits_bootstrap=*/false);
     EXPECT_TRUE(request.PromptPrefixHashes().empty());
     EXPECT_TRUE(request.PromptPrefixHashes().empty());
 }

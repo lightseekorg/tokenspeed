@@ -32,6 +32,10 @@
 namespace tokenspeed {
 namespace fsm {
 
+PrefillDone BootstrappedEvent::operator()(PrefillAwaitingDestination&& state) {
+    return PrefillDone{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
+}
+
 Submitted BootstrappedEvent::operator()(Bootstrapping&& state) {
     return Submitted{std::move(state.admission)};
 }

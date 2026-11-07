@@ -393,6 +393,12 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     request_ids.reserve(request_specs.size());
     std::vector<std::unique_ptr<Request>> pending_requests;
     pending_requests.reserve(request_specs.size());
+    // The decode allocation policy picks only the initial state: a fused
+    // request, or a P one under independent admission, needs no Decode
+    // destination before it computes.
+    const bool awaits_bootstrap = config_.role == Role::kD ||
+                                  (config_.role == Role::kP &&
+                                   config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kEarly);
     for (const RequestSpec& spec : request_specs) {
         if (spec.tokens.empty()) {
             throw std::invalid_argument("Scheduler: request tokens must be non-empty");
@@ -422,7 +428,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
                                         " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
-        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, awaits_bootstrap));
     }
 
     requests_.reserve(requests_.size() + pending_requests.size());
@@ -458,7 +464,8 @@ std::size_t Scheduler::DecodingSize() const {
 
 std::size_t Scheduler::PrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult,
+                                fsm::PrefillAwaitingDestination, fsm::PrefillDone>();
     }));
 }
 
@@ -466,6 +473,23 @@ std::size_t Scheduler::RunningSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
         return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone, fsm::Decoding>();
     }));
+}
+
+std::size_t Scheduler::AwaitingDestinationSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->Is<fsm::PrefillAwaitingDestination>();
+    }));
+}
+
+std::int32_t Scheduler::AwaitingDestinationLcmBlocks() const {
+    std::vector<std::span<const BlockTable>> request_tables;
+    for (const auto& request : requests_) {
+        if (!request->Is<fsm::PrefillAwaitingDestination>()) {
+            continue;
+        }
+        request_tables.emplace_back(request->BlockTablesRef());
+    }
+    return coordinator_.NumActiveLcmBlocks(request_tables);
 }
 
 std::size_t Scheduler::RemotePrefillSize() const {

@@ -534,6 +534,8 @@ fn pd_scheduler(role: &str) -> String {
         "result = ts.Scheduler(cfg)",
         &format!(
             "cfg.role = ts.SchedulerConfig.Role.{role}\n\
+             if cfg.role == ts.SchedulerConfig.Role.P:\n    \
+             cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early\n\
              cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix\n\
              result = ts.Scheduler(cfg)"
         ),
