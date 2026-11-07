@@ -695,6 +695,9 @@ class _DecodeCaptureDouble:
 
 
 class _PrefillCaptureDouble:
+    capture_buckets = [16]
+    num_warmup = 1
+
     def __init__(self, *, disable, on_capture):
         self.disable = disable
         self._on_capture = on_capture
@@ -702,13 +705,35 @@ class _PrefillCaptureDouble:
     def capture(self, runner, *, entries, observer):
         self._on_capture(runner)
 
+    def captured_hidden_spec(self):
+        return 8, torch.float32
+
 
 class _DrafterCaptureDouble:
-    def __init__(self, on_capture):
+    """A drafter with a prefill graph of its own (``captures_prefill_graph``)
+    or with extend graphs (``extend_graph_plan``)."""
+
+    def __init__(self, *, extend_graphs, on_capture):
+        self.captures_prefill_graph = not extend_graphs
+        self._extend_graphs = extend_graphs
         self._on_capture = on_capture
 
     def capture_prefill_graph(self, stream, observer):
         self._on_capture(stream)
+
+    def extend_graph_plan(self, token_buckets, request_counts):
+        if not self._extend_graphs:
+            return {}
+        return {
+            "prefill:drafter-step0": [
+                (bucket, bs)
+                for bucket in token_buckets
+                for bs in request_counts(bucket)
+            ]
+        }
+
+    def capture_extend_graphs(self, capture, *, observer):
+        self._on_capture(capture.stream)
 
 
 class _ObserverDouble:
@@ -716,24 +741,40 @@ class _ObserverDouble:
         return nullcontext()
 
 
+@dataclass
+class _CaptureConfig:
+    """The ModelExecutorConfig fields capture_graphs() reads."""
+
+    enable_drafter_prefill_graph: bool = True
+    prefill_graph_capture_batch_sizes: list[int] | None = None
+    context_len: int = 4096
+    max_num_seqs: int = 4
+    data_parallel_size: int = 1
+
+
 class _CaptureExecutor:
     """The ModelExecutor state capture_graphs() reads, without the GPU boot."""
 
-    def __init__(
-        self, *, captures_drafter_prefill_graph, forward_step, prefill_graph, drafter
-    ):
-        self.captures_drafter_prefill_graph = captures_drafter_prefill_graph
+    # Which drafter graphs a boot records is the executor's own logic.
+    captures_drafter_prefill_graph = ModelExecutor.captures_drafter_prefill_graph
+    _drafter_extend_plan = ModelExecutor._drafter_extend_plan
+    drafter_extend_ladders = ModelExecutor.drafter_extend_ladders
+    _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
+
+    def __init__(self, *, forward_step, prefill_graph, drafter):
+        self.config = _CaptureConfig()
         self.device = "cpu"
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph
         self.drafter = drafter
+        self.draft_attn_backend = None
 
 
 @pytest.mark.parametrize("decode_disabled", [False, True])
 @pytest.mark.parametrize("prefill_disabled", [False, True])
-@pytest.mark.parametrize("has_drafter", [False, True])
+@pytest.mark.parametrize("drafter_graphs", [None, "own", "extend"])
 def test_capture_lifecycle_preserves_main_order(
-    decode_disabled, prefill_disabled, has_drafter
+    decode_disabled, prefill_disabled, drafter_graphs
 ):
     events = []
     reset_workspace_pools()
@@ -759,13 +800,16 @@ def test_capture_lifecycle_preserves_main_order(
         events.append("draft")
 
     executor = _CaptureExecutor(
-        captures_drafter_prefill_graph=not prefill_disabled and has_drafter,
         forward_step=step,
         prefill_graph=_PrefillCaptureDouble(
             disable=prefill_disabled, on_capture=capture_prefill
         ),
         drafter=(
-            _DrafterCaptureDouble(on_capture=capture_draft) if has_drafter else None
+            None
+            if drafter_graphs is None
+            else _DrafterCaptureDouble(
+                extend_graphs=drafter_graphs == "extend", on_capture=capture_draft
+            )
         ),
     )
     ModelExecutor.capture_graphs(
@@ -777,7 +821,7 @@ def test_capture_lifecycle_preserves_main_order(
     assert events == [
         *([] if decode_disabled else ["decode"]),
         *([] if prefill_disabled else ["prefill"]),
-        *(["draft"] if not prefill_disabled and has_drafter else []),
+        *(["draft"] if not prefill_disabled and drafter_graphs is not None else []),
     ]
     reset_workspace_pools()
 
