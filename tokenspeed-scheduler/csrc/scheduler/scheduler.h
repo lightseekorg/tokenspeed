@@ -133,9 +133,17 @@ public:
     std::size_t PrefillSize() const;
     // P role, independent admission: computed prompts waiting for their
     // Decode destination (PrefillAwaitingDestination, a subset of
-    // PrefillSize()), and the Device parents they pin.
+    // PrefillSize()), and the Device parents in their block tables, counted
+    // as ActiveLcmBlocks() counts them; blocks held outside the tables (e.g. a
+    // pending in-forward State checkpoint) are not included.
     std::size_t AwaitingDestinationSize() const;
     std::int32_t AwaitingDestinationLcmBlocks() const;
+    // P role, independent admission: prompts requeued for granted work since
+    // start (buildPrefillWorkerPlan), and the prompt tokens they held in KV
+    // when requeued, prefix-cache hits included: an upper bound on what their
+    // next admission computes again. Accounting only.
+    std::uint64_t Requeues() const { return requeues_; }
+    std::uint64_t RequeuedTokens() const { return requeued_tokens_; }
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
@@ -651,6 +659,9 @@ private:
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.
     PrefixHitStats prefix_hit_stats_;
+    // Accounting only (buildPrefillWorkerPlan); no decision reads them.
+    std::uint64_t requeues_{0};
+    std::uint64_t requeued_tokens_{0};
 
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (rankedReadmissions).

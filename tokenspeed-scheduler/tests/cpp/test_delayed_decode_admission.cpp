@@ -570,6 +570,8 @@ TEST_F(IndependentAdmissionRequeueTest, GrantedPromptRequeuesAComputedPromptWait
     EXPECT_FALSE(scheduler_->PdTransferPinned("waiting"));
     EXPECT_EQ(scheduler_->RequestTokenSize("waiting"), 13);
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->Requeues(), 1u);
+    EXPECT_EQ(scheduler_->RequeuedTokens(), 13u);
     for (const auto* plan : {&first, &last, &requeue}) EXPECT_FALSE(plan->remote_decode.has_value());
     SendForwardDone("granted", {7});
     const auto send = PlanOnce();
@@ -745,6 +747,7 @@ TEST_F(IndependentAdmissionRequeueTest, AStreamOfSmallerGrantedPromptsWaitsBehin
             EXPECT_EQ(admitted, std::vector<std::string>{"granted"});
             EXPECT_EQ(scheduler_->AwaitingDestinationSize(), 0u);
             EXPECT_FALSE(scheduler_->PdTransferPinned("waiting"));
+            EXPECT_EQ(scheduler_->Requeues(), 1u);
         }
     }
     for (int k = 0; k < 7; ++k) {
@@ -793,6 +796,8 @@ TEST_F(IndependentAdmissionRequeueTest, AHeadOfLineWithoutADestinationIsRequeued
     ASSERT_EQ(FindForwardBatch(requeue)->request_ids, std::vector<std::string>{"granted"});
     EXPECT_FALSE(scheduler_->PdTransferPinned("long"));
     EXPECT_TRUE(scheduler_->PdTransferPinned("parked"));
+    EXPECT_EQ(scheduler_->Requeues(), 1u);
+    EXPECT_EQ(scheduler_->RequeuedTokens(), 7u);
     // Once the granted prompt's and the parked prompt's KV went out, the
     // requeued prompt resumes from what is left of its chunk in the cache.
     SendForwardDone("granted", {7});

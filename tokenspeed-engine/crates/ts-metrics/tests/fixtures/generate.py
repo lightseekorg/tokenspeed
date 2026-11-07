@@ -113,7 +113,15 @@ def _run_scenario() -> None:
     engine.record_cache_occupancy(
         used_pages=12, active_pages=8, total_pages=40, token_capacity=647
     )
-    engine.record_prefill_queues(prealloc=1, inflight=2, retracted=0)
+    engine.record_prefill_queues(
+        prealloc=1,
+        inflight=2,
+        retracted=0,
+        awaiting_destination=1,
+        awaiting_destination_pages=6,
+    )
+    engine.record_prefill_requeues(requeues=2, requeued_tokens=300)
+    engine.record_prefill_requeues(requeues=3, requeued_tokens=340)
     engine.record_decode_queues(prealloc=3, transfer=4, retracted=1)
     engine.record_generation_tokens(25)
     engine.record_request_tokens(prompt_tokens=100, cache_hit_tokens=40)

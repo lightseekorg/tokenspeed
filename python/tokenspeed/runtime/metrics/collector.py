@@ -52,6 +52,9 @@ class EngineMetrics:
         # forward, so each round adds the difference.
         self._exported_serving_compiles = 0
         self._exported_serving_compile_seconds = 0.0
+        # The scheduler's requeue totals already exported, the same way.
+        self._exported_requeues = 0
+        self._exported_requeued_tokens = 0
 
         factory = MetricFactory(
             enabled=enabled,
@@ -171,6 +174,26 @@ class EngineMetrics:
             ),
             labelnames=labelnames,
         )
+        self.num_prefill_requeued_requests = factory.counter(
+            name="tokenspeed:num_prefill_requeued_requests",
+            documentation=(
+                "Prefill requests without a decode destination that the "
+                "scheduler requeued to free pages or a request slot for "
+                "requests whose destination is allocated "
+                "(--disaggregation-decode-allocation-policy independent). "
+                "The client sees nothing; the request is computed again."
+            ),
+            labelnames=labelnames,
+        )
+        self.prefill_requeued_tokens = factory.counter(
+            name="tokenspeed:prefill_requeued_tokens",
+            documentation=(
+                "Prompt tokens the requeued prefill requests held in KV when "
+                "requeued, prefix-cache hits included; an upper bound on what "
+                "their next admission computes again."
+            ),
+            labelnames=labelnames,
+        )
         self.kv_token_usage_ratio = factory.gauge(
             name="tokenspeed:kv_token_usage_perc",
             documentation=(
@@ -201,6 +224,29 @@ class EngineMetrics:
         self.num_prefill_inflight_queue_reqs = factory.gauge(
             name="tokenspeed:num_prefill_inflight_queue_reqs",
             documentation="Prefill requests whose KV a transfer still pins.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+        )
+        self.num_prefill_awaiting_destination_reqs = factory.gauge(
+            name="tokenspeed:num_prefill_awaiting_destination_reqs",
+            documentation=(
+                "Prefill requests computed and waiting for their decode "
+                "destination (--disaggregation-decode-allocation-policy "
+                "independent); tokenspeed:num_prefill_inflight_queue_reqs "
+                "counts them too."
+            ),
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+        )
+        self.num_prefill_awaiting_destination_pages = factory.gauge(
+            name="tokenspeed:num_prefill_awaiting_destination_pages",
+            documentation=(
+                "KV pages in the block tables of the prefill requests waiting "
+                "for their decode destination, counted as "
+                "tokenspeed:num_free_tokens counts pages; blocks held outside "
+                "the tables (such as a pending in-forward State checkpoint) "
+                "are not included."
+            ),
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -508,13 +554,38 @@ class EngineMetrics:
         )
 
     def record_prefill_queues(
-        self, *, prealloc: int, inflight: int, retracted: int
+        self,
+        *,
+        prealloc: int,
+        inflight: int,
+        retracted: int,
+        awaiting_destination: int,
+        awaiting_destination_pages: int,
     ) -> None:
         if not self.enabled:
             return
         self.num_prefill_prealloc_queue_reqs.labels(**self.labels).set(max(prealloc, 0))
         self.num_prefill_inflight_queue_reqs.labels(**self.labels).set(max(inflight, 0))
         self.num_retracted_queue_reqs.labels(**self.labels).set(max(retracted, 0))
+        self.num_prefill_awaiting_destination_reqs.labels(**self.labels).set(
+            max(awaiting_destination, 0)
+        )
+        self.num_prefill_awaiting_destination_pages.labels(**self.labels).set(
+            max(awaiting_destination_pages, 0)
+        )
+
+    def record_prefill_requeues(self, *, requeues: int, requeued_tokens: int) -> None:
+        """Export the scheduler's requeue totals since start."""
+        if not self.enabled or requeues <= self._exported_requeues:
+            return
+        self.num_prefill_requeued_requests.labels(**self.labels).inc(
+            requeues - self._exported_requeues
+        )
+        self.prefill_requeued_tokens.labels(**self.labels).inc(
+            requeued_tokens - self._exported_requeued_tokens
+        )
+        self._exported_requeues = requeues
+        self._exported_requeued_tokens = requeued_tokens
 
     def record_decode_queues(
         self, *, prealloc: int, transfer: int, retracted: int

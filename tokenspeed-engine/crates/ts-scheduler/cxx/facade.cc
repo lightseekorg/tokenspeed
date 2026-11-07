@@ -210,11 +210,18 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .bootstrapping = scheduler.BootstrappingSize(),
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
+        .awaiting_destination = scheduler.AwaitingDestinationSize(),
+        .requeues = scheduler.Requeues(),
+        .requeued_tokens = scheduler.RequeuedTokens(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
     };
 }
 
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler) { return scheduler.ActiveLcmBlocks(); }
+
+std::int32_t awaiting_destination_lcm_blocks(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.AwaitingDestinationLcmBlocks();
+}
 
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id) {
     const std::string id(group_id);
