@@ -4737,6 +4737,20 @@ def _fp8_rows_decode_splits(
     return min(splits, chunks)
 
 
+def _fp8_rows_decode_shape(
+    rows: int, heads: int, *, q_fp8: bool
+) -> tuple[int, int, int, int]:
+    """Warps over rows and over keys, key block and waves per EU of a
+    decode-row scorer launch with ``rows`` query rows per program."""
+    warps_m = min(rows, _BF16_DECODE_NUM_WARPS)
+    warps_n = _BF16_DECODE_NUM_WARPS // warps_m
+    block_n = max(_BF16_DECODE_BLOCK_N, 32 * warps_n)
+    waves_per_eu = 1 if rows * heads > 256 else 2
+    if q_fp8 and heads == 32 and rows <= 4:
+        waves_per_eu = _FP8_ROWS_DECODE_WAVES_PER_EU
+    return warps_m, warps_n, block_n, waves_per_eu
+
+
 def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -4790,15 +4804,12 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
         (q.shape[0], max_candidates), dtype=torch.float32, device=q.device
     )
     rows = _next_power_of_two(q_len_per_req)
-    warps_m = min(rows, _BF16_DECODE_NUM_WARPS)
-    warps_n = _BF16_DECODE_NUM_WARPS // warps_m
-    block_n = max(_BF16_DECODE_BLOCK_N, 32 * warps_n)
-    num_stages = _BF16_DECODE_NUM_STAGES
-    waves_per_eu = 1 if rows * q.shape[1] > 256 else 2
-    if q_scales is not None:
-        num_stages = _FP8_ROWS_DECODE_NUM_STAGES
-        if q.shape[1] == 32 and rows <= 4:
-            waves_per_eu = _FP8_ROWS_DECODE_WAVES_PER_EU
+    warps_m, warps_n, block_n, waves_per_eu = _fp8_rows_decode_shape(
+        rows, q.shape[1], q_fp8=q_scales is not None
+    )
+    num_stages = (
+        _BF16_DECODE_NUM_STAGES if q_scales is None else _FP8_ROWS_DECODE_NUM_STAGES
+    )
     chunks = triton.cdiv(max_candidates, _BF16_DECODE_CHUNK_N)
     grid = (
         seq_lens.numel(),

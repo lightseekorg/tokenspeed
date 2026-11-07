@@ -432,6 +432,7 @@ def test_gluon_owned_page_prefill_rows_store_past_int32_offsets(device):
             lengths[rows_slice],
             page_size=PAGE_SIZE,
             softmax_scale=0.1,
+            query_group_size=1,
             query_requests=requests[rows_slice],
             request_count=1,
         )

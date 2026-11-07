@@ -312,10 +312,9 @@ class CommBackend(ABC):
         ``all_gather_single``, even ``all_to_all_single`` or
         ``try_combine_records`` over ``group`` to send.
 
-        A backend whose exchange pulls each rank's input in place returns its
-        storage, which the next such exchange's producer may overwrite.
-        Collective like the exchange: every rank of ``group`` asks for the
-        same size.
+        A backend that pulls inputs in place lends its storage, which the
+        next such exchange's producer may overwrite. Every rank of ``group``
+        asks for the same size.
 
         Args:
             nbytes: Size of the input.
@@ -334,12 +333,11 @@ class CommBackend(ABC):
         output_dtype: torch.dtype,
     ) -> torch.Tensor | None:
         """Exchange DCP attention ``records`` to their head owners and combine
-        this rank's without a sink in one step, or return None for the
-        caller's even ``all_to_all_single`` and ``combine_dcp_attention_partials``.
-
-        A result is theirs bit for bit: contiguous ``[tokens, local_heads,
-        head_dim]`` of ``output_dtype``. Must decide identically on every
-        rank of ``group``.
+        this rank's in one step, bit for bit what an even
+        ``all_to_all_single`` and ``combine_dcp_attention_partials`` give, as
+        contiguous ``[tokens, local_heads, head_dim]`` of ``output_dtype``; or
+        return None for the caller to run those. Every rank of ``group``
+        decides alike.
 
         Args:
             records: Contiguous int32 ``[len(group), tokens, local_heads,
