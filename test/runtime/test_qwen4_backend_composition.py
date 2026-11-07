@@ -250,7 +250,11 @@ def test_hybrid_factory_selects_gdn_only_for_local_state(
         registry, "_create_attn_backend_with_name", lambda name, arch, config: full
     )
     backend = registry._create_hybrid_linear_attn_backend(
-        SimpleNamespace(speculative_algorithm=None, kda_backend="auto"),
+        SimpleNamespace(
+            speculative_algorithm=None,
+            kda_backend="auto",
+            writes_state_checkpoints_in_forward=False,
+        ),
         SimpleNamespace(
             hf_config=SimpleNamespace(full_attention_layer_ids=[1]),
             attention_arch="mha",
@@ -287,7 +291,9 @@ def attention_root(request):
         consumed_group_ids=(FULL_ATTENTION,),
     )
     attention = (
-        HybridLinearAttnBackend(router, SimpleNamespace(), [0])
+        HybridLinearAttnBackend(
+            router, SimpleNamespace(init_prefill_graph_state=Mock()), [0]
+        )
         if request.param
         else router
     )
@@ -346,6 +352,10 @@ def test_runtime_and_draft_setup_reach_attention_leaves(attention_root):
     root.init_prefill_graph_state(16, 4)
     leaf.configure_runtime.assert_called_once_with(token_to_kv_pool=pool)
     leaf.init_prefill_graph_state.assert_called_once_with(16, 4)
+    # A GDN child resets its retained prefill-graph metadata too.
+    if isinstance(root.attention_backend, HybridLinearAttnBackend):
+        linear = root.attention_backend.linear_attn_backend
+        linear.init_prefill_graph_state.assert_called_once_with(16, 4)
     assert root.supports_layer_sliding_window
     slots = torch.empty(4, dtype=torch.int32)
     starts = torch.tensor([8, 12], dtype=torch.int32)

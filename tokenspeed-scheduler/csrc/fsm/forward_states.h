@@ -284,6 +284,10 @@ struct Retracted {
     std::int32_t prefix_granularity{};
     CacheProgress cache_progress;
     RetractionImage image;
+    // The tails (boundaries in tokens) the image's published slots sit at,
+    // from their KV-event descriptors (Scheduler::kvEventTailsOf): the
+    // restore registers them again before its ACK republishes the slots.
+    std::vector<std::int32_t> kv_event_tails;
     // The slot-state blob's slot in the runtime's arena. Shared with the
     // store that exports into it and, later, the restore that imports from
     // it: whichever of the state and the in-flight op lives longer keeps the
@@ -328,6 +332,7 @@ struct Retracted {
 struct Restoring {
     ForwardResources resources;
     RetractionImage image;
+    std::vector<std::int32_t> kv_event_tails;  // Retracted::kv_event_tails
     std::shared_ptr<SnapshotSlotIndex> blob_slot;
     ResumeShape shape;
     std::uint32_t restore_op{0};

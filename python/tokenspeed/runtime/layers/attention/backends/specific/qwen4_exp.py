@@ -223,10 +223,32 @@ class Qwen4ExpBackend(AttentionBackend):
         self._full_attn_backend.configure_runtime(**kwargs)
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
-        self._full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+        # A hybrid child also resets its GDN child's retained capacity metadata;
+        # PLE and the QSA indexer keep their breaks and retain nothing.
+        self.attention_backend.init_prefill_graph_state(max_num_tokens, max_bs)
 
     def register_step_counter(self, step_counter: StepCounter) -> None:
+        # Kept here as well: the prefill graph reads the root's counter to
+        # keep layerwise transfer on the ordinary route.
+        self.step_counter = step_counter
         self.attention_backend.register_step_counter(step_counter)
+
+    # Prefill graphs capture the attention child's GDN layers inline. PLE and
+    # the QSA indexer keep their breaks over their own live metadata, and the
+    # full-attention layers keep theirs (HybridLinearAttnBackend.forward).
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        return self.attention_backend.admits_prefill_graph(
+            token_capacity, bs, forward_mode
+        )
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        return self.attention_backend.prepare_prefill_metadata(
+            token_capacity, bs, forward_mode, capture=capture
+        )
 
     def forward(self, *args, **kwargs):
         # The attention child owns the break point and the single PD cache step.

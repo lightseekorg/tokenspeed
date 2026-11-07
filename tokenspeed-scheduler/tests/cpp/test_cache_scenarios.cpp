@@ -97,6 +97,7 @@ void RetractForTest(Request& request, CacheCoordinator& coordinator, SnapshotSlo
     ASSERT_TRUE(taken) << "the test's snapshot pool must hold the image";
     taken->store_pairs.clear();
     request.Apply(fsm::SnapshotRetractEvent{&coordinator, epoch, request.HasGeneratedOutput(), std::move(taken->image),
+                                            /*kv_event_tails=*/{},
                                             std::make_shared<SnapshotSlotIndex>(slots.Allocate()),
                                             /*image_stores=*/{}});
 }
