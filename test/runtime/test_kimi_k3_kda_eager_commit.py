@@ -750,7 +750,7 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
     )
     assert planned_bytes == allocated_bytes
     server_args = SimpleNamespace(speculative_num_draft_tokens=T)
-    config = SimpleNamespace(max_bs=8, qcp_size=1)
+    config = SimpleNamespace(max_bs=8, qcp_size=1, kvp_size=1)
     backend = HybridLinearAttnBackend(
         AttentionBackend(harness.config, harness.config.components[0]),
         harness.backend,
