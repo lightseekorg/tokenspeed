@@ -115,9 +115,9 @@ default, pip skips a development release unless it is pinned or pre-releases are
 enabled (`--pre`, or a requirement such as `tokenspeed-kernel>=0.1.4.dev0`);
 those installs take the manual build until the scheduled nightly of its date is
 published. A pin without the label matches every label of that development
-number, so pin a labeled build with its label, as its TokenSpeed build pins its
-kernel. Suffixed builds skip the ROCm index; the scheduled nightly of the same
-date adds ROCm.
+number, so pin a labeled build with the label included; the TokenSpeed build of
+a labeled kernel pins the kernel that way. Suffixed builds skip the ROCm index;
+the scheduled nightly of the same date adds ROCm.
 
 ### From source
 
