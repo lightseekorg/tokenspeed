@@ -21,10 +21,10 @@
 """Which kernel ``layernorm.qk_rmsnorm_ssmax`` runs, decided on the host.
 
 CPU only, nothing launches: ranked selection runs the fused Triton kernel exactly
-where its host guard admits the call (Beam's TP1 and TP8 head pairs on NVIDIA SM90
-to SM103), the torch kernel everywhere else (other TP sizes and platforms), and a
-by-name call outside the guard raises instead of falling back. The kernels' byte
-equality is ``test/nvidia/ops/layernorm/test_beam_norms_cuda.py``.
+where its host guard admits the call (Beam's TP1, TP2, TP4 and TP8 head pairs on
+NVIDIA SM90 to SM103), the torch kernel everywhere else (other TP sizes and
+platforms), and a by-name call outside the guard raises instead of falling back.
+The kernels' byte equality is ``test/nvidia/ops/layernorm/test_beam_norms_cuda.py``.
 """
 
 from __future__ import annotations
@@ -119,7 +119,8 @@ def _qk(tokens=8, heads=(6, 1), head_dim=128, eps=EPS, change=None):
 QK_CASES = {
     "beam_tp1": (_qk(heads=(48, 8)), True),
     "beam_tp8": (_qk(heads=(6, 1)), True),
-    "beam_tp4": (_qk(heads=(12, 2)), False),
+    "beam_tp2": (_qk(heads=(24, 4)), True),
+    "beam_tp4": (_qk(heads=(12, 2)), True),
     "beam_tp16": (_qk(heads=(3, 1)), False),
     "int32_positions": (_qk(change="int32_positions"), True),
     "tokens_0": (_qk(tokens=0), False),
