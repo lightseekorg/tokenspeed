@@ -124,10 +124,10 @@ void Scheduler::prepareStorage(Request& request) {
             expireStorage(request);
             return;
         }
-        const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = state->hashes,
-                                                    .tokens = request.TokenSlice(0, state->max_tokens),
-                                                    .max_tokens = state->max_tokens,
-                                                    .tail = state->tail};
+        CacheCoordinator::PromptPrefix prompt{.prefix_hashes = state->hashes,
+                                              .tokens = request.TokenSlice(0, state->max_tokens),
+                                              .max_tokens = state->max_tokens,
+                                              .tail = state->tail};
         // Another request's D2H/GET may have fulfilled this dependency. This
         // bounded local check does not rehash the prompt while it waits.
         const auto probe = coordinator_.ProbePromptPrefix(prompt);
@@ -147,6 +147,7 @@ void Scheduler::prepareStorage(Request& request) {
         // The finished query retires before the GET starts: CanStart counts
         // its ticket.
         state->lease.reset();
+        prompt.prepared_keys = probe.group_keys;
         state->lease = storage_transfers_->StartRead(prompt, hits);
         if (!state->lease) releaseStorage(request);
         return;
@@ -188,7 +189,9 @@ void Scheduler::prepareStorage(Request& request) {
     if (max_tokens - local < limits.min_prefetch_tokens) return;
     const auto end = std::min<std::int64_t>(max_tokens, static_cast<std::int64_t>(local) + limits.max_prefetch_tokens);
     setBound(static_cast<std::int32_t>(end));
-    auto query = coordinator_.MissingStorageKeys(prompt(), limits.max_keys_per_operation);
+    auto query_prompt = prompt();
+    query_prompt.prepared_keys = probe.group_keys;
+    auto query = coordinator_.MissingStorageKeys(query_prompt, limits.max_keys_per_operation);
     setBound(query.max_tokens);
     auto keys = std::move(query.keys);
     auto key_tokens = std::move(query.key_tokens);
