@@ -34,8 +34,11 @@ and a group tag stored only after a wait that covers its wave's mids stores.
 import re
 
 import pytest
-from moe_stream_helpers import compile_moe_stream
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_stream
+
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
+
+from moe_stream_helpers import compile_moe_stream  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_stream  # noqa: E402
 
 _LOAD = re.compile(r"^(buffer|global)_load_\w+")
 _STORE = re.compile(r"^(buffer|global)_store_\w+")

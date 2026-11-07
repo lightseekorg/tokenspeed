@@ -27,8 +27,11 @@ only gate/up groups."""
 from collections import Counter
 
 import pytest
-from moe_stream_helpers import RECORDED_ROUTINGS, random_routings
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_stream import (
+
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
+
+from moe_stream_helpers import RECORDED_ROUTINGS, random_routings  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_stream import (  # noqa: E402
     GROUP_BYTES,
     GROUPS_PER_EXPERT,
     TAIL_SHARE,

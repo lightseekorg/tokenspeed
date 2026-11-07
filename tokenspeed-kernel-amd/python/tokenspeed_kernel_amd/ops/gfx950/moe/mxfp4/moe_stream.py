@@ -818,7 +818,11 @@ def _store_routes(out_d, y, route, cols):
     )
 
 
-@gluon.jit
+def _moe_stream_launch_metadata(grid, kernel, args):
+    return {"name": f"{kernel.name} (rows={args['ROWS']})"}
+
+
+@gluon.jit(launch_metadata=_moe_stream_launch_metadata)
 def gluon_mxfp4_moe_stream_gfx950(
     epochs,
     claims,
@@ -1297,6 +1301,11 @@ class MoeStreamWeights:
     n_phys2: int
 
 
+# Bytes a buffer descriptor covers (num_records of the weight, scale, and
+# workspace descriptors).
+_BUFFER_BYTES = 0x7FFFFFF0
+
+
 def moe_stream_weights(experts) -> MoeStreamWeights:
     """The stream's view of a processed gfx950 MXFP4 MoE layer.
 
@@ -1310,8 +1319,10 @@ def moe_stream_weights(experts) -> MoeStreamWeights:
     Raises:
         ValueError: The layout is not the slice the stream tiles (``(E, 2048,
             1024)`` gate/up, ``(E, 256, 4096)`` down, gdot128-shuffled), a
-            scale buffer does not start on a dword, or a stride the kernel
-            specializes on is not a multiple of 16.
+            scale buffer does not start on a dword, a stride the kernel
+            specializes on is not a multiple of 16, or a weight or scale
+            tensor spans more bytes than the kernel's int32 buffer offsets
+            reach.
     """
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         _extract_gluon_raw_s,
@@ -1353,6 +1364,22 @@ def moe_stream_weights(experts) -> MoeStreamWeights:
                 f"moe_stream_weights: {name} scales must be CDNA4-swizzled uint8 "
                 "(stride(1) == 1) starting on a dword, got "
                 f"{scale.dtype} strides {scale.stride()}"
+            )
+    # _strip_offsets keeps each lane's byte offset into a weight or scale
+    # tensor (expert * stride plus the in-expert offset) in int32, and the
+    # buffer descriptors cover 0x7FFFFFF0 bytes, past which loads return
+    # zeros. Refuse tensors that reach past that window.
+    for name, tensor in (
+        ("gate/up weights", w13),
+        ("gate/up scales", s13),
+        ("down weights", w2),
+        ("down scales", s2),
+    ):
+        extent = 1 + sum((n - 1) * st for n, st in zip(tensor.shape, tensor.stride()))
+        if extent > _BUFFER_BYTES:
+            raise ValueError(
+                f"moe_stream_weights: {name} must span at most {_BUFFER_BYTES} "
+                f"bytes, the reach of the kernel's int32 buffer offsets, got {extent}"
             )
     strides = dict(
         stride_w13=w13.stride(0),

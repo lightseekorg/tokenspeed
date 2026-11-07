@@ -34,7 +34,10 @@ import os
 
 import pytest
 import torch
-from moe_stream_helpers import (
+
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
+
+from moe_stream_helpers import (  # noqa: E402
     EXPERTS,
     HIDDEN,
     RECORDED_ROUTINGS,
@@ -42,7 +45,7 @@ from moe_stream_helpers import (
     make_experts,
     random_routings,
 )
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, is_cdna4  # noqa: E402
 
 if not is_cdna4():
     pytest.skip("The MXFP4 MoE stream targets gfx950", allow_module_level=True)

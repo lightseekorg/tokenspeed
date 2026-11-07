@@ -26,12 +26,17 @@ the kernel for, and rejects other layouts."""
 
 import pytest
 import torch
-from moe_stream_helpers import DIVISIBLE, PHYS, make_experts
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
+
+from moe_stream_helpers import DIVISIBLE, PHYS, make_experts  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     _extract_gluon_raw_s,
     _extract_gluon_raw_w,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_stream import moe_stream_weights
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_stream import (  # noqa: E402
+    moe_stream_weights,
+)
 
 EXPERTS = 4
 
@@ -89,3 +94,32 @@ def test_rejects_unshuffled_weights(experts):
     )
     with pytest.raises(ValueError, match="gdot128-shuffled"):
         moe_stream_weights(plain)
+
+
+def _shuffled_meta(shape):
+    # A gdot128-shuffled weight of `shape` with no storage, for sizes the
+    # host check must refuse without allocating them.
+    weight = torch.empty(shape, dtype=torch.uint8, device="meta")
+    weight.is_shuffled_for_gluon_dot = True
+    weight.gluon_dot_block_k_pk = 128
+    weight.gluon_dot_block_n = 128
+    return weight
+
+
+@pytest.mark.parametrize("num_experts, fits", [(1023, True), (1024, False)])
+def test_refuses_weights_past_the_int32_buffer_window(experts, num_experts, fits):
+    # 1024 gate/up experts span 2**31 bytes, past the 0x7FFFFFF0 bytes the
+    # kernel's int32 offsets and buffer descriptors reach.
+    w13 = _extract_gluon_raw_w(experts.w13_weight_triton_tensor)
+    w2 = _extract_gluon_raw_w(experts.w2_weight_triton_tensor)
+    layer = _layer(
+        _shuffled_meta((num_experts, *w13.shape[1:])),
+        experts.w13_precision_config,
+        _shuffled_meta((num_experts, *w2.shape[1:])),
+        experts.w2_precision_config,
+    )
+    if fits:
+        moe_stream_weights(layer)
+    else:
+        with pytest.raises(ValueError, match="gate/up weights must span"):
+            moe_stream_weights(layer)
