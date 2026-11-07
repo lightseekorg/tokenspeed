@@ -24,7 +24,7 @@ on:
         required: false
         type: string
       version_suffix:
-        description: "Nightly only: a development suffix such as dev1, so a manual build of a date (0.1.4.post20261108.dev1) neither collides with nor shadows that date's scheduled nightly."
+        description: "Nightly only: free text such as dev1 or fa4-fix, making a manual build a development release of that date's nightly (0.1.4.post20261108.dev1, 0.1.4.post20261108.dev0+fa4.fix) that neither collides with nor shadows the scheduled nightly."
         required: false
         type: string
       cuda_variant:
@@ -179,7 +179,7 @@ jobs:
           echo "cuda_variant=${CUDA_VARIANT}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "version_date=${version_date}" >> "$GITHUB_OUTPUT"
-          # setup.py validated and normalized the suffix: "" or ".devN".
+          # setup.py normalized the suffix: "", ".devN" or ".devN+label".
           version_suffix=""
           if [ "$NIGHTLY" = "true" ]; then
             version_suffix="${version#*.post${version_date}}"

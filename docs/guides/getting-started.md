@@ -105,15 +105,19 @@ to the corresponding pinned installation command above.
 To publish a manual build without touching the scheduled nightly of its date,
 run **Build and Release tokenspeed-kernel** and then **Build and Release
 TokenSpeed** from `main` with `nightly=true`, `publish_github=true`, the same
-`version_date`, and the same `version_suffix`, for example `dev1`. The suffix
-makes a development release of that date's nightly, such as
-`tokenspeed==0.1.1.post20261108.dev1` with
-`tokenspeed-kernel==0.1.4.post20261108.dev1`: the scheduled nightly still
-publishes under its own version, and pip installs the suffixed build only when
-it is pinned exactly. The suffix accepts any spelling of a development release
-(`dev1`, `.dev1`, `-dev_1`) and refuses anything else, including local labels
-(`+label`), which would match the nightly's exact pins. Suffixed builds skip the
-ROCm index; the scheduled nightly of the same date adds ROCm.
+`version_date`, and the same `version_suffix`. The suffix is free text that
+makes a development release of that date's nightly: a number (`dev1` or `1`)
+gives `tokenspeed==0.1.1.post20261108.dev1` with
+`tokenspeed-kernel==0.1.4.post20261108.dev1`, other text becomes a local label
+(`fa4-fix` gives `0.1.4.post20261108.dev0+fa4.fix`), and the two combine
+(`dev2+fa4`). The scheduled nightly still publishes under its own version. pip
+skips a development release unless it is pinned or pre-releases are enabled
+(`--pre`, or a requirement such as `tokenspeed-kernel>=0.1.4.dev0`); those
+installs take the manual build until the scheduled nightly of its date is
+published. A pin without the label matches every label of that development
+number, so pin a labelled build with its label, as its TokenSpeed build pins its
+kernel. Suffixed builds skip the ROCm index; the scheduled nightly of the same
+date adds ROCm.
 
 ### From source
 

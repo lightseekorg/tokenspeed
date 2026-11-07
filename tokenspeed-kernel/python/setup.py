@@ -153,25 +153,36 @@ def _git_branch() -> str:
 
 
 def _nightly_version_suffix() -> str:
-    """The development-release suffix of a manual nightly build, or "".
+    """The version suffix of a manual nightly build, or "".
 
-    TOKENSPEED_KERNEL_VERSION_SUFFIX turns a manual nightly into a development
-    release of that date's nightly, e.g. dev1 -> 0.1.4.post20261108.dev1, so it
-    neither collides with the scheduled nightly of that date nor shadows it: pip
-    takes a .devN release only when pinned exactly. Any PEP 440 spelling of a
-    development release is accepted (dev1, .dev1, -dev_1, DEV7) and normalized.
-    A local label (+...) is refused, since it would satisfy the nightly's
-    ``==`` pins and be preferred over it.
+    TOKENSPEED_KERNEL_VERSION_SUFFIX is free text that turns a manual nightly
+    into a development release of that date's nightly, so it neither collides
+    with the scheduled nightly of that date nor shadows it: pip skips a
+    development release unless it is pinned or pre-releases are enabled. A
+    development number becomes .devN (dev1 or 1 -> 0.1.4.post20261108.dev1),
+    other text a local label of .dev0 (fa4-fix -> 0.1.4.post20261108.dev0+fa4.fix),
+    and the two combine (dev2+fa4 -> .dev2+fa4). The label never stands alone:
+    0.1.4.post20261108+label would satisfy the nightly's ``==`` pins and be
+    preferred over it.
     """
-    suffix = os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX", "")
+    suffix = os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX", "").strip()
     if not suffix:
         return ""
-    match = re.fullmatch(r"[._-]?dev[._-]?([0-9]*)", suffix, flags=re.IGNORECASE)
+    head, plus, label = suffix.partition("+")
+    match = re.fullmatch(
+        r"[._-]?(?:dev[._-]?)?([0-9]+)|[._-]?dev", head, flags=re.IGNORECASE
+    )
     if match is None:
-        raise ValueError(
-            "Nightly version suffix must be a development release such as dev1"
-        )
-    return f".dev{int(match.group(1) or 0)}"
+        number, plus, label = 0, "+", suffix
+    else:
+        number = int(match.group(1) or 0)
+    # PEP 440 local label: lowercase alphanumeric segments joined by dots, with
+    # numeric segments compared (and normalized) as integers.
+    segments = re.findall(r"[a-z0-9]+", label.lower())
+    label = ".".join(str(int(s)) if s.isdigit() else s for s in segments)
+    if plus and not label:
+        raise ValueError("Nightly version suffix label needs a letter or digit")
+    return f".dev{number}" + (f"+{label}" if label else "")
 
 
 def _package_version() -> str:

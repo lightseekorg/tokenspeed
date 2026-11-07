@@ -25,7 +25,7 @@ on:
         description: "Nightly version date override, formatted as YYYYMMDD."
         type: string
       version_suffix:
-        description: "Nightly only: the development suffix of a manual kernel nightly (dev1 -> 0.1.1.post20261108.dev1, pinning tokenspeed-kernel 0.1.4.post20261108.dev1)."
+        description: "Nightly only: the version_suffix of the manual kernel nightly to pair with (dev1 -> 0.1.1.post20261108.dev1, pinning tokenspeed-kernel 0.1.4.post20261108.dev1)."
         type: string
 
 permissions:

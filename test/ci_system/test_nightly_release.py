@@ -57,15 +57,25 @@ def test_nightly_versions_and_kernel_dependency_share_date(project):
     )
 
 
-def test_development_kernel_nightly_gives_tokenspeed_the_same_suffix(project):
+@pytest.mark.parametrize(
+    "kernel,suffix",
+    [
+        ("0.1.4.post20261108.dev1", ".dev1"),
+        ("0.1.4.post20261108.dev0+fa4.fix", ".dev0+fa4.fix"),
+    ],
+)
+def test_development_kernel_nightly_gives_tokenspeed_the_same_suffix(
+    project, kernel, suffix
+):
     base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
         "project"
     ]["version"]
-    version = PREPARE(project, "20261108", "0.1.4.post20261108.dev1")
+    version = PREPARE(project, "20261108", kernel)
     metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
-    assert metadata["version"] == version == f"{base_version}.post20261108.dev1"
-    kernel = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
-    assert kernel == ["tokenspeed-kernel==0.1.4.post20261108.dev1"]
+    assert metadata["version"] == version == f"{base_version}.post20261108{suffix}"
+    pins = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
+    # The pin names the label, so it matches no other build of that dev number.
+    assert pins == [f"tokenspeed-kernel=={kernel}"]
 
 
 @pytest.mark.parametrize(
@@ -83,9 +93,10 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
 @pytest.mark.parametrize(
     "kernel", ["0.1.4.post20261108+exp1", "0.1.4rc1.post20261108.dev1"]
 )
-def test_kernel_with_a_local_label_or_pre_release_is_refused(project, kernel):
-    # A local label would satisfy the nightly's == pins, and a pre-release is no
-    # nightly of that date: only a development suffix carries over.
+def test_kernel_with_a_bare_local_label_or_pre_release_is_refused(project, kernel):
+    # A label without a development number would satisfy the nightly's == pins,
+    # and a pre-release is no nightly of that date: only a development suffix,
+    # labelled or not, carries over.
     path = project / "python/pyproject.toml"
     original = path.read_bytes()
     with pytest.raises(ValueError):
