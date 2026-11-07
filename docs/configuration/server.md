@@ -784,11 +784,11 @@ Memory: the recorded distributions take `(S + 2) x num_draft_tokens x vocab_size
 x 4` bytes (`--speculative-num-draft-tokens` fp32 rows per request-pool slot),
 plus a batch-ordered gather buffer of `S x num_draft_tokens x vocab_size x 4`
 bytes on the verifier. `S` is the number of requests TokenSpeed sizes decode
-state for: `--max-num-seqs`, or one request per attention-TP peer if that is
-more. 80 requests at 4 draft tokens over a 129K vocabulary cost about 330 MB in
-total. On CUDA, when the CUDA-graph memory reserve is on, the runtime charges
-both to it as startup residue, out of the KV-cache budget. Otherwise they come
-out of the `--gpu-memory-utilization` headroom.
+state for: `--max-num-seqs`, or one request per attention-TP peer on each DP
+rank if that is more. 80 requests at 4 draft tokens over a 129K vocabulary cost
+about 330 MB in total. On CUDA, when the CUDA-graph memory reserve is on, the
+runtime charges both to it as startup residue, out of the KV-cache budget.
+Otherwise they come out of the `--gpu-memory-utilization` headroom.
 
 #### DFLASH with a DFlash2 draft
 
