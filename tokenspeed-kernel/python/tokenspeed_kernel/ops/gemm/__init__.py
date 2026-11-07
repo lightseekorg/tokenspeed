@@ -685,6 +685,7 @@ def mm(
         # the same bias-free tuning branch for FI's timing collectives, even
         # when this rank's actual GEMM retains the generic biased path.
         autotune_bf16_gemm(A, B)
+        warm_tgv_decode_gemm(A, B)
         if (
             bias is None
             and M <= BF16_GEMM_MAX_M
@@ -704,6 +705,36 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_bf16_gemm(A, B, out)
+        # Decode rows on small weights take one pinned TGV tile on SM100/103
+        # under PDL (README "Decode GEMMs on small weights"). Like the joint
+        # path, only before serving: CUDA graphs captured at startup keep the
+        # tile, and eager calls while serving keep cuBLASLt. Registering the
+        # tile kernel instead (m bounds, a K-window, weight-size, and one-wave
+        # mnk_problem_filter, plus serving, bias, and 32-byte alignment traits
+        # that mm() does not pass today) was considered; it stays a shortcut
+        # like the joint path so both serving-gated FlashInfer routes sit
+        # here. So override= and solution= skip it, it cannot be benchmarked
+        # by name, and for the GEMMs it routes it precedes every registered
+        # BF16 gemm.mm kernel, plugins included.
+        tgv_tactic = (
+            flashinfer_tgv_decode_tactic(A, B, out)
+            if bias is None and not is_serving()
+            else None
+        )
+        if tgv_tactic is not None:
+            shape_params = {"M": M, "N": N, "K": K}
+            ShapeCapture.get().record(
+                "gemm", "mm", "flashinfer_tgv_decode_gemm", A.dtype, shape_params
+            )
+            with kernel_scope(
+                "gemm",
+                "mm",
+                A.dtype,
+                kernel_name="flashinfer_tgv_decode_gemm",
+                **shape_params,
+                has_out=out is not None,
+            ):
+                return flashinfer_tgv_decode_gemm(A, B, out, tgv_tactic)
         if bias is None and _use_mv(A, B):
             return mv(A, B, out)
 
@@ -3876,11 +3907,14 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: E402
     autotune_bf16_gemm,
     flashinfer_bf16_gemm,
     flashinfer_joint_bf16_supported,
+    flashinfer_tgv_decode_gemm,
+    flashinfer_tgv_decode_tactic,
     gemm_fp8_nt_groupwise,
     has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_mxfp8,
     prepare_nvfp4_a16_weights,
     swizzle_mxfp8_scale,
+    warm_tgv_decode_gemm,
 )
 
 if has_flashinfer_mxfp8():

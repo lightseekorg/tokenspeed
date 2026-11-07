@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Callable
-from typing import get_args
+import logging
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import NamedTuple, get_args
 
 import torch
-from tokenspeed_kernel.ops.tuning import is_autotuning
+from tokenspeed_kernel.ops.tuning import is_autotuning, is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -41,6 +43,8 @@ from tokenspeed_kernel.signature import (
     format_signatures,
     tensor_format,
 )
+
+logger = logging.getLogger(__name__)
 
 platform = current_platform()
 _fp8_dtype = torch.float8_e4m3fn
@@ -933,6 +937,324 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
         with torch.no_grad():
             sample = x.new_zeros((BF16_GEMM_MAX_M, weight.shape[1]))
             flashinfer_bf16_gemm(sample, weight, None)
+
+
+# ===-----------------------------------------------------------------------===#
+# BF16 decode GEMM on small weights: pinned FlashInfer TGV tiles (SM100/103)
+# ===-----------------------------------------------------------------------===#
+#
+# With PDL and before serving, mm() runs a bias-free BF16 GEMM with
+# TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M rows and
+# TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K on a weight of at most
+# TGV_DECODE_MAX_WEIGHT_BYTES with one TGV tile instead of cuBLASLt. Under
+# PDL, TGV's weight-load warp fills its shared-memory stages while the
+# producer kernel still runs; only its activation-load warp waits for the
+# producer. cuBLASLt loads nothing before the producer finishes. FI's tactic
+# profiling times each GEMM alone and cannot see this overlap, so the tile is
+# chosen here rather than by FI's tuner: the deepest-staged tile whose grid
+# fits in one wave. Without PDL there is no overlap, and cuBLASLt stays.
+#
+# FI's tuner keeps the 2-CTA TGV tactics 16 to 28, these tiles among them,
+# blocklisted (autotune() in ops/tuning.py) after replay failures of FI
+# 0.6.18's C++ TGV kernel. FI 0.7.2.post1 runs TGV as a CuTe DSL rewrite
+# (tgv_gemm_cute_ext), which these tiles call directly, outside the tuner.
+# The GPU tests capture and replay each tile, alone and in a chain of PDL
+# kernels.
+
+# The policy routes rows above TGV_DECODE_MIN_M, the joint FlashInfer path's
+# bound on SM100 and SM103 (BF16_GEMM_MAX_M there; the GPU tests check that
+# they agree). BF16_GEMM_MAX_M itself follows the host GPU, 4 on SM107, so the
+# policy keeps its own bound and depends only on its arguments.
+TGV_DECODE_MIN_M = 32
+TGV_DECODE_MAX_M = 512
+TGV_DECODE_MAX_WEIGHT_BYTES = 16 << 20
+# Measured on GB300 against cuBLASLt in a captured PDL chain (an RMSNorm, then
+# this GEMM on a weight cold in L2): with K in this window TGV was faster on
+# most shapes; outside it, it lost on many shapes, down to 0.73x cuBLASLt's
+# speed: at K of 512 to 1024, at K >= 4096 with few weight rows, and on some
+# shapes at K = 1536.
+TGV_DECODE_MIN_K = 2048
+TGV_DECODE_MAX_K = 3072
+
+
+class TgvTile(NamedTuple):
+    """One FlashInfer TGV tile, in the form of an entry of FI's tactic table.
+
+    FI swaps the GEMM operands for TGV: the kernel's M runs over weight rows
+    and its N over activation rows.
+    """
+
+    cta_m: int  # weight rows per CTA
+    cta_n: int  # activation rows per tile
+    num_ab_stage: int  # shared-memory pipeline stages
+    use_2cta: bool  # a pair of CTAs computes a tile of 2 * cta_m weight rows
+
+
+# 2-CTA tiles of 128 weight rows by 16, 32 and 64 activation rows, each with
+# the most stages that fit in shared memory, in the order the policy tries them.
+TGV_DECODE_TILES = (
+    TgvTile(cta_m=64, cta_n=16, num_ab_stage=12, use_2cta=True),
+    TgvTile(cta_m=64, cta_n=32, num_ab_stage=11, use_2cta=True),
+    TgvTile(cta_m=64, cta_n=64, num_ab_stage=9, use_2cta=True),
+)
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def select_tgv_decode_tile(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    weight_bytes: int,
+    arch: ArchVersion,
+    sm_count: int,
+    pdl: bool,
+) -> TgvTile | None:
+    """Choose the pinned TGV tile for a bias-free BF16 GEMM, or None.
+
+    The choice depends only on the arguments, and it can only be one of
+    :data:`TGV_DECODE_TILES`, so compiling those tiles at startup covers
+    every row count.
+
+    Args:
+        m: Activation rows.
+        n: Weight rows, i.e. output columns.
+        k: Weight columns, the reduction length.
+        weight_bytes: Size of the weight in bytes.
+        arch: GPU architecture.
+        sm_count: Number of streaming multiprocessors of the GPU.
+        pdl: Whether kernels launch with programmatic dependent launch
+            (:func:`~tokenspeed_kernel.platform.pdl_enabled`). The tiles are
+            pinned for the overlap PDL gives them, so without it no tile is
+            chosen.
+
+    Returns:
+        With PDL on SM100 and SM103, for
+        ``TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M``,
+        ``TGV_DECODE_MIN_K <= k <= TGV_DECODE_MAX_K`` and
+        ``weight_bytes <= TGV_DECODE_MAX_WEIGHT_BYTES``, the first tile of
+        :data:`TGV_DECODE_TILES` whose grid has at most ``sm_count`` CTAs. TGV
+        gives each CTA a whole SM's shared memory and has no split-K, so a
+        larger grid runs in more than one wave. None otherwise.
+    """
+    if (
+        not pdl
+        or arch not in _CUTE_DSL_SM100_ARCHS
+        or not TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M
+        or not TGV_DECODE_MIN_K <= k <= TGV_DECODE_MAX_K
+        or weight_bytes > TGV_DECODE_MAX_WEIGHT_BYTES
+    ):
+        return None
+    for tile in TGV_DECODE_TILES:
+        # TGV's grid: weight-row tiles rounded up to whole clusters, times
+        # activation-row tiles.
+        cluster = 2 if tile.use_2cta else 1
+        weight_ctas = _ceil_div(_ceil_div(n, tile.cta_m), cluster) * cluster
+        if weight_ctas * _ceil_div(m, tile.cta_n) <= sm_count:
+            return tile
+    return None
+
+
+def resolve_tgv_tactics(
+    tactic_table: Sequence[tuple[int, int, int, bool]],
+) -> dict[TgvTile, int] | None:
+    """Look up the tactic id of each pinned tile in a FlashInfer TGV table.
+
+    A tactic id is a position in FI's table, which a FlashInfer release may
+    reorder or extend, so the tiles are matched by shape, not by fixed ids.
+
+    Args:
+        tactic_table: FI's TGV tactic table. Entry ``i`` describes tactic
+            ``i`` as ``(cta_m, cta_n, num_ab_stage, use_2cta)``.
+
+    Returns:
+        The tactic id of every tile of :data:`TGV_DECODE_TILES`, or None when
+        the table lacks one of them.
+    """
+    tactics = {}
+    for tile in TGV_DECODE_TILES:
+        tactic = next(
+            (i for i, entry in enumerate(tactic_table) if entry == tile), None
+        )
+        if tactic is None:
+            return None
+        tactics[tile] = tactic
+    return tactics
+
+
+@dataclass(frozen=True)
+class _FlashInferTgv:
+    """FlashInfer's TGV launcher and the tactic id of each pinned tile."""
+
+    run: Callable[..., torch.Tensor]
+    tactics: Mapping[TgvTile, int]
+
+
+@functools.cache
+def _flashinfer_tgv() -> _FlashInferTgv | None:
+    """Bind the installed FlashInfer's TGV launcher and pinned tactics.
+
+    Returns:
+        The binding, or None, with one warning, when FlashInfer lacks the TGV
+        module, a launcher this file can call, or one of the pinned tiles. The
+        GEMMs then keep cuBLASLt.
+    """
+    try:
+        from flashinfer.gemm.kernels.tgv_gemm_cute_ext import (
+            _TGV_CUTE_EXT_TACTIC_CONFIGS,
+            run_tgv_cute_ext,
+        )
+    except ImportError as error:
+        logger.warning(
+            f"FlashInfer TGV is unavailable ({error}); decode-sized BF16 GEMMs "
+            "on small weights keep cuBLASLt"
+        )
+        return None
+    try:
+        # The arguments flashinfer_tgv_decode_gemm passes, by keyword.
+        inspect.signature(run_tgv_cute_ext).bind(
+            a=None, b=None, bias=None, out=None, pdl=False, tactic=0
+        )
+    except TypeError as error:
+        logger.warning(
+            f"FlashInfer's TGV launcher changed ({error}); decode-sized BF16 "
+            "GEMMs on small weights keep cuBLASLt"
+        )
+        return None
+    tactics = resolve_tgv_tactics(_TGV_CUTE_EXT_TACTIC_CONFIGS)
+    if tactics is None:
+        logger.warning(
+            f"FlashInfer's TGV tactic table lacks one of {TGV_DECODE_TILES}; "
+            "decode-sized BF16 GEMMs on small weights keep cuBLASLt"
+        )
+        return None
+    return _FlashInferTgv(run=run_tgv_cute_ext, tactics=tactics)
+
+
+def flashinfer_tgv_decode_tactic(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> int | None:
+    """Choose the FlashInfer TGV tactic for a bias-free BF16 GEMM, or None.
+
+    Args:
+        x: ``[M, K]`` activations.
+        weight: ``[N, K]`` weight.
+        out: Optional ``[M, N]`` destination.
+
+    Returns:
+        The tactic id of the :func:`select_tgv_decode_tile` tile for this GPU
+        and :func:`~tokenspeed_kernel.platform.pdl_enabled` when the operands
+        meet :func:`flashinfer_joint_bf16_supported` and the installed
+        FlashInfer lists the pinned tiles. None otherwise, and the caller
+        keeps its GEMM.
+    """
+    if not flashinfer_joint_bf16_supported(x, weight, out):
+        return None
+    tile = select_tgv_decode_tile(
+        m=x.shape[0],
+        n=weight.shape[0],
+        k=weight.shape[1],
+        weight_bytes=weight.numel() * weight.element_size(),
+        arch=platform.arch_version,
+        sm_count=platform.sm_count,
+        pdl=pdl_enabled(),
+    )
+    if tile is None:
+        return None
+    tgv = _flashinfer_tgv()
+    return None if tgv is None else tgv.tactics[tile]
+
+
+def flashinfer_tgv_decode_gemm(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None, tactic: int
+) -> torch.Tensor:
+    """Compute BF16 ``x @ weight.T`` with one pinned FlashInfer TGV tactic.
+
+    TGV accumulates in FP32 and rounds once to BF16, in another reduction
+    order than cuBLASLt, so the result is not bitwise identical to it. Each
+    output element comes from one CTA in a fixed order, so repeated calls,
+    eager or replayed from a CUDA graph, agree bit for bit.
+
+    Args:
+        x: ``[M, K]`` activations.
+        weight: ``[N, K]`` weight.
+        out: Optional ``[M, N]`` destination.
+        tactic: A tactic id from :func:`flashinfer_tgv_decode_tactic`.
+
+    Returns:
+        The ``[M, N]`` product, written to ``out`` when given.
+
+    Raises:
+        ValueError: If the operands do not meet
+            :func:`flashinfer_joint_bf16_supported` or ``tactic`` is not a
+            pinned tile of the installed FlashInfer.
+    """
+    tgv = _flashinfer_tgv()
+    if not flashinfer_joint_bf16_supported(x, weight, out) or (
+        tgv is None or tactic not in tgv.tactics.values()
+    ):
+        raise ValueError("Unsupported input to the pinned FlashInfer TGV GEMM")
+    if out is None:
+        out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    # TGV compiles once per tactic, PDL setting, and operand layout, never
+    # per shape. Canonical strides keep every call on one layout.
+    tgv.run(
+        a=_canonical_bf16_view(x.detach()),
+        b=weight.detach().t(),
+        bias=None,
+        out=_canonical_bf16_view(out),
+        pdl=pdl_enabled(),
+        tactic=tactic,
+    )
+    return out
+
+
+def warm_tgv_decode_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
+    """Compile every pinned TGV tactic during startup kernel warmup.
+
+    TGV compiles per tactic, PDL setting, and operand layout, not per shape,
+    so warming the pinned tactics on any weight the policy routes, at the
+    process's PDL setting, keeps compilation out of CUDA graph capture.
+    Does nothing outside :func:`~tokenspeed_kernel.ops.tuning.kernel_warmup`,
+    while the current stream is capturing, or for a weight no row count routes.
+
+    Args:
+        x: Activations of the encountered GEMM; only their dtype and device
+            are used.
+        weight: ``[N, K]`` weight of the encountered GEMM.
+    """
+    if not is_warming_up():
+        return
+    # The fewest rows routed. Fewer rows never need a larger grid, so if
+    # they get no tile, no row count does.
+    m = TGV_DECODE_MIN_M + 1
+    if (
+        select_tgv_decode_tile(
+            m=m,
+            n=weight.shape[0],
+            k=weight.shape[1],
+            weight_bytes=weight.numel() * weight.element_size(),
+            arch=platform.arch_version,
+            sm_count=platform.sm_count,
+            pdl=pdl_enabled(),
+        )
+        is None
+        # Asked only on SM100/SM103, where CUDA is present.
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    with torch.no_grad():
+        sample = x.new_zeros((m, weight.shape[1]))
+        if not flashinfer_joint_bf16_supported(sample, weight, None):
+            return
+        tgv = _flashinfer_tgv()
+        if tgv is None:
+            return
+        for tactic in tgv.tactics.values():
+            flashinfer_tgv_decode_gemm(sample, weight, None, tactic)
 
 
 # ===-----------------------------------------------------------------------===#
