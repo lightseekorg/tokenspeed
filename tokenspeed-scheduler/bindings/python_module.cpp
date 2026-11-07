@@ -188,7 +188,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("demote_superseded_state_checkpoints",
                 &tokenspeed::SchedulerConfig::demote_superseded_state_checkpoints)
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
-        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance);
+        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
+        // P role: the most tokens a prefill chunk that cannot finish gives up
+        // for whole prompts behind it; 0 is off, at most half of
+        // max_scheduled_tokens.
+        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and

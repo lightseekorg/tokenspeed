@@ -741,6 +741,115 @@ def test_a_decode_server_takes_the_in_forward_state_checkpoint_flag_as_a_no_op()
     assert not cfg.state_checkpoint_in_forward
 
 
+def test_the_prefill_chunk_yield_is_off_by_default():
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8"])
+    assert args.prefill_chunk_yield_tokens == 0
+    assert args.scheduler_prefill_chunk_yield_tokens == 0
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_chunk_yield_tokens == 0
+
+
+@pytest.mark.parametrize("tokens", [1024, 4096])
+def test_the_prefill_chunk_yield_reaches_a_prefill_servers_scheduler(tokens):
+    # Up to half of the chunk budget.
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--disaggregation-mode",
+            "prefill",
+            "--chunked-prefill-size",
+            "8192",
+            "--prefill-chunk-yield-tokens",
+            str(tokens),
+        ]
+    )
+    assert args.scheduler_prefill_chunk_yield_tokens == tokens
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    )
+    assert cfg.prefill_chunk_yield_tokens == tokens
+
+
+def test_a_decode_server_takes_the_prefill_chunk_yield_as_a_no_op():
+    # A decode server computes no prompt, so a PD launcher may pass the flag
+    # to both roles.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend="mooncake",
+        disable_kvstore=True,
+        prefill_chunk_yield_tokens=4096,
+    )
+    assert args.scheduler_prefill_chunk_yield_tokens == 0
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
+    assert cfg.prefill_chunk_yield_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "flags, match",
+    [
+        (["--prefill-chunk-yield-tokens", "1024"], "for prefill servers"),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--prefill-chunk-yield-tokens",
+                "-1",
+            ],
+            "non-negative",
+        ),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--chunked-prefill-size",
+                "8192",
+                "--prefill-chunk-yield-tokens",
+                "4097",
+            ],
+            "at most half",
+        ),
+    ],
+    ids=["fused", "negative", "above_half_the_chunk_budget"],
+)
+def test_the_prefill_chunk_yield_is_refused_where_it_cannot_run(flags, match):
+    # The fused scheduler retracts the largest incomplete prefill first, which
+    # a carried prompt could make the yielding one.
+    with pytest.raises(ValueError, match=match):
+        prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+
+
+def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
+    fields = dict(
+        num_device_pages=32,
+        max_scheduled_tokens=64,
+        max_batch_size=8,
+        prefix_granularity=2,
+        num_host_pages=0,
+        disable_l2_cache=True,
+        enable_l3_storage=False,
+        role="prefill",
+        num_snapshot_pages=1,
+        host_group_packing=(),
+        max_retracted_requests=0,
+        storage_config=None,
+        host_write_policy="write_through",
+    )
+    assert make_config(**fields).prefill_chunk_yield_tokens == 0
+    assert (
+        make_config(**fields, prefill_chunk_yield_tokens=16).prefill_chunk_yield_tokens
+        == 16
+    )
+    with pytest.raises(ValueError, match="non-negative"):
+        make_config(**fields, prefill_chunk_yield_tokens=-1)
+
+
 @pytest.mark.parametrize(
     ("mapping", "title"),
     [

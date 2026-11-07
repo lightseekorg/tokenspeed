@@ -21,13 +21,17 @@
 #include "integration_test_helper.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
+#include <memory>
+#include <ostream>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace tokenspeed::test {
 
@@ -850,6 +854,481 @@ TEST_F(SlidingWindowRestoreKvCacheEventTestSuite,
     EXPECT_EQ(scheduler_->RequestTokenSize("r"), -1);
 }
 
+// One prefill row of a plan: the request, the prompt positions it computes
+// and its prompt's length.
+struct PrefillRow {
+    std::string id;
+    std::int32_t start{0};
+    std::int32_t end{0};
+    std::int32_t prompt{0};
+    bool operator==(const PrefillRow&) const = default;
+};
+using PrefillRows = std::vector<PrefillRow>;
+
+inline std::ostream& operator<<(std::ostream& out, const PrefillRow& row) {
+    return out << row.id << "[" << row.start << ", " << row.end << ")/" << row.prompt;
+}
+
+// SchedulerConfig::prefill_chunk_yield_tokens on the P role: a chunk that
+// cannot finish its prompt this round -- a resident's, or a new prompt's
+// first -- ends on the last page at least the tokens of the bootstrapped
+// prompts behind it that fit whole before its budget's end, and those prompts
+// complete in its forward, their rows ahead of its own: in every round the
+// completing prefills form a prefix of the batch. 4-token pages, a 32-token
+// budget, 16 tokens yielded at most, one full-attention group; with `hybrid_`
+// three State groups beside it.
+class PrefillChunkYieldSuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kPage = 4;
+    static constexpr std::int32_t kBudget = 32;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.role = Role::kP;
+        cfg.prefix_granularity = kPage;
+        cfg.device_allocator.total_pages = 257;
+        cfg.disable_l2_cache = true;
+        cfg.max_scheduled_tokens = kBudget;
+        cfg.max_batch_size = batch_;
+        cfg.prefill_chunk_yield_tokens = yield_;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = kPage,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kFull,
+            .transfer_policy = CacheTransferPolicy::FullSuffix,
+        });
+        for (std::int32_t i = 0; hybrid_ && i < 3; ++i) {
+            cfg.cache_groups.push_back(CacheGroupConfig{
+                .group_id = "linear_attention_" + std::to_string(i),
+                .block_granularity = 0,
+                .total_pages = cfg.device_allocator.total_pages,
+                .attn_kind = AttnKind::kState,
+                .transfer_policy = CacheTransferPolicy::LatestSnapshot,
+            });
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Rebuilds the scheduler with the knob at `yield` tokens.
+    void Restart(std::int32_t yield) {
+        yield_ = yield;
+        SetUp();
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendPdSucceeded(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::SucceededEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SubmitPrompt(const std::string& id, std::vector<std::int32_t> tokens, bool bootstrap = true) {
+        Submit(RequestSpec{.request_id = id, .tokens = std::move(tokens)});
+        if (bootstrap) {
+            SendBootstrapped(id);
+        }
+    }
+
+    // Plans one round and returns its prefill rows in batch order, the
+    // completing ones first. Every prompt the plan hands off is then
+    // acknowledged (unless `ack` is false) and every row lands, a completed
+    // prompt with a sampled token.
+    PrefillRows Round(bool ack = true, ExecutionPlan* plan_out = nullptr) {
+        ExecutionPlan plan = PlanOnce();
+        PrefillRows rows;
+        if (const ForwardBatch* batch = FindForwardBatch(plan)) {
+            for (std::size_t i = 0; i < batch->NumExtends(); ++i) {
+                rows.push_back(PrefillRow{
+                    .id = batch->request_ids[i],
+                    .start = batch->extend_prefix_lens[i] + batch->extend_replay_lens[i],
+                    .end = batch->extend_prefix_lens[i] + batch->input_lengths[i],
+                    .prompt = batch->prefill_lengths[i],
+                });
+            }
+            EXPECT_TRUE(CompletingPrefillsFormAPrefix(*batch)) << ::testing::PrintToString(rows);
+            // Each row's block table is its own request's -- the row of the
+            // chunk that gave way too, moved behind the prompts it carries: a
+            // page for every position up to the chunk's end and, when the
+            // chunk completes its prompt, for its decode slot.
+            const auto tables = batch->BlockTables();
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                const std::vector<std::int32_t>& pages = tables.at("full_attention")[i];
+                const std::int32_t extent =
+                    rows[i].end + (rows[i].end == rows[i].prompt ? config_.decode_input_tokens : 0);
+                EXPECT_EQ(std::ranges::count_if(pages, [](std::int32_t page) { return page > 0; }),
+                          (extent + kPage - 1) / kPage)
+                    << rows[i];
+            }
+        }
+        handed_off_ = plan.remote_decode ? plan.remote_decode->request_ids : std::vector<std::string>{};
+        for (const std::string& id : handed_off_) {
+            if (ack) {
+                SendPdSucceeded(id);
+            }
+        }
+        for (const PrefillRow& row : rows) {
+            SendForwardDone(row.id,
+                            row.end == row.prompt ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+        }
+        if (plan_out != nullptr) {
+            *plan_out = std::move(plan);
+        }
+        return rows;
+    }
+
+    // Runs `id` to its hand-off and acknowledges it, publishing its prompt.
+    void Publish(const std::string& id, std::vector<std::int32_t> tokens) {
+        SubmitPrompt(id, std::move(tokens));
+        for (int round = 0; round < 8; ++round) {
+            Round();
+            if (std::ranges::find(handed_off_, id) != handed_off_.end()) {
+                return;
+            }
+        }
+        ADD_FAILURE() << id << " was not handed off";
+    }
+
+    // A prompt sharing `shared`'s tokens, then `tail` of its own.
+    static std::vector<std::int32_t> Extending(std::vector<std::int32_t> shared,
+                                               const std::vector<std::int32_t>& tail) {
+        shared.insert(shared.end(), tail.begin(), tail.end());
+        return shared;
+    }
+
+    std::vector<std::string> handed_off_;
+    std::int32_t yield_{16};
+    std::int32_t batch_{8};
+    bool hybrid_{false};
+};
+
+// Off, a long prompt's chunk takes the whole budget and holds the head of
+// line: the short prompts behind it wait.
+TEST_F(PrefillChunkYieldSuite, OffTheLongChunkRunsAlone) {
+    Restart(0);
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    SubmitPrompt("s1", MakeTokens(6, 2000));
+    SubmitPrompt("s2", MakeTokens(6, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 32, 64, 100}}));
+}
+
+// A resident chunk that cannot finish ends on the page at 52 (32 + 32 - 11
+// rounded down), leaving 12 tokens, enough for both waiting prompts' 11: they
+// complete in its forward, ahead of it, wait for their results and leave on
+// the next plan's remote decode, while the long prompt keeps the head of line.
+TEST_F(PrefillChunkYieldSuite, AResidentChunkGivesWayToWholePromptsBehindIt) {
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    SubmitPrompt("s1", MakeTokens(5, 2000));
+    SubmitPrompt("s2", MakeTokens(6, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 5, 5}, {"s2", 0, 6, 6}, {"long", 32, 52, 100}}));
+    EXPECT_TRUE(handed_off_.empty());
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 52, 84, 100}}));
+    EXPECT_EQ(handed_off_, (std::vector<std::string>{"s1", "s2"}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 84, 100, 100}}));
+}
+
+// A new prompt's first chunk gives way to the prompts behind it the same way:
+// 32 - 12 = 20, a page boundary.
+TEST_F(PrefillChunkYieldSuite, ANewPromptsFirstChunkGivesWayToWholePromptsBehindIt) {
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    SubmitPrompt("s1", MakeTokens(6, 2000));
+    SubmitPrompt("s2", MakeTokens(6, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 6, 6}, {"s2", 0, 6, 6}, {"long", 0, 20, 100}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 20, 52, 100}}));
+}
+
+// The chunk that gives way is admitted before the prompts it carries but runs
+// after them: a prompt admitted ahead of a new prompt's first chunk keeps its
+// row, the prompt carried behind that chunk takes the next one, and the chunk
+// -- 28 - 4 = 24 tokens, a page boundary -- runs last.
+TEST_F(PrefillChunkYieldSuite, TheChunkThatGaveWayRunsAfterThePromptsItCarries) {
+    SubmitPrompt("p0", MakeTokens(4, 500));
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    SubmitPrompt("s0", MakeTokens(4, 2000));
+    EXPECT_EQ(Round(), (PrefillRows{{"p0", 0, 4, 4}, {"s0", 0, 4, 4}, {"long", 0, 24, 100}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 24, 56, 100}}));
+}
+
+// What a prompt takes is counted past its hit: 46 tokens, 40 of them cached
+// by an earlier prompt, take 6 (32 + 32 - 6 = 58, down to 56). With State
+// groups the hit resumes at the State checkpoint the earlier prompt's finish
+// published at its end.
+TEST_F(PrefillChunkYieldSuite, APromptWhoseUncachedRestFitsIsCarried) {
+    for (const bool hybrid : {false, true}) {
+        SCOPED_TRACE(hybrid ? "State groups" : "full attention");
+        hybrid_ = hybrid;
+        Restart(16);
+        const std::vector<std::int32_t> earlier = MakeTokens(40, 5000);
+        Publish("earlier", earlier);
+        SubmitPrompt("long", MakeTokens(100, 1000));
+        EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+        SubmitPrompt("follow_up", Extending(earlier, MakeTokens(6, 7000)));
+        EXPECT_EQ(Round(), (PrefillRows{{"follow_up", 40, 46, 46}, {"long", 32, 56, 100}}));
+    }
+}
+
+// Without a State group, the long chunk's admission publishing pages a carried
+// prompt shares only lengthens its hit: probed at 32 cached tokens, the
+// prompt takes 10 and the chunk gives up as much (64 + 32 - 10 = 86, down to
+// 84), but it resumes at 40, all its pages but its last.
+TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksUnpublishedPagesResumesFurther) {
+    const std::vector<std::int32_t> long_tokens = MakeTokens(100, 1000);
+    SubmitPrompt("long", long_tokens);
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 32, 64, 100}}));
+    SubmitPrompt("sharing", Extending({long_tokens.begin(), long_tokens.begin() + 40}, {7001, 7002}));
+    EXPECT_EQ(Round(), (PrefillRows{{"sharing", 40, 42, 42}, {"long", 64, 84, 100}}));
+}
+
+// With State groups, the same pages would be cached past any State
+// checkpoint once that admission publishes them -- a junction its first chunk
+// ends at -- so a prompt sharing them is not carried on its stale probe: the
+// long chunk keeps the whole budget. Once they are published, the junction
+// keeps it out until the long prompt's final chunk.
+TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksUnpublishedPagesIsNotCarriedBesideStateGroups) {
+    hybrid_ = true;
+    Restart(16);
+    const std::vector<std::int32_t> long_tokens = MakeTokens(100, 1000);
+    SubmitPrompt("long", long_tokens);
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    SubmitPrompt("sharing", Extending({long_tokens.begin(), long_tokens.begin() + 8}, {7001, 7002}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 32, 64, 100}})) << "nothing of the long prompt was published yet";
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 64, 96, 100}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 96, 100, 100}, {"sharing", 0, 8, 10}}))
+        << "its first chunk ends at the junction";
+}
+
+// With only prompts too long to carry waiting, the plans are those without
+// the knob.
+TEST_F(PrefillChunkYieldSuite, WithOnlyLongPromptsWaitingThePlansAreThoseWithoutTheKnob) {
+    const auto run = [this](std::int32_t yield, std::vector<PrefillRows>& rows) {
+        Restart(yield);
+        SubmitPrompt("long", MakeTokens(100, 1000));
+        SubmitPrompt("other", MakeTokens(60, 2000));
+        std::vector<ExecutionPlan> plans;
+        for (int round = 0; round < 7; ++round) {
+            ExecutionPlan plan;
+            rows.push_back(Round(/*ack=*/true, &plan));
+            plans.push_back(std::move(plan));
+        }
+        return plans;
+    };
+    std::vector<PrefillRows> on;
+    std::vector<PrefillRows> off;
+    const std::vector<ExecutionPlan> plans_on = run(16, on);
+    const std::vector<ExecutionPlan> plans_off = run(0, off);
+    EXPECT_EQ(on, off);
+    EXPECT_TRUE(plans_on == plans_off);
+    EXPECT_EQ(on[0], (PrefillRows{{"long", 0, 32, 100}}));
+    EXPECT_EQ(on[3], (PrefillRows{{"long", 96, 100, 100}, {"other", 0, 28, 60}}));
+}
+
+// A final chunk never gives way: it completes, and the prompts behind it are
+// admitted as without the knob, a long one's first chunk taking what is left.
+TEST_F(PrefillChunkYieldSuite, AFinalChunkDoesNotGiveWay) {
+    const auto run = [this](std::int32_t yield) {
+        Restart(yield);
+        SubmitPrompt("long", MakeTokens(40, 1000));
+        std::vector<PrefillRows> rows{Round()};
+        SubmitPrompt("s1", MakeTokens(6, 2000));
+        SubmitPrompt("s2", MakeTokens(6, 3000));
+        SubmitPrompt("other", MakeTokens(60, 4000));
+        for (int round = 0; round < 3; ++round) {
+            rows.push_back(Round());
+        }
+        return rows;
+    };
+    const std::vector<PrefillRows> on = run(16);
+    EXPECT_EQ(on[1], (PrefillRows{{"long", 32, 40, 40}, {"s1", 0, 6, 6}, {"s2", 0, 6, 6}, {"other", 0, 12, 60}}));
+    EXPECT_EQ(on, run(0));
+}
+
+// A prompt still waiting for its bootstrap is not carried; once bootstrapped
+// it is (64 + 32 - 6 = 90, down to 88).
+TEST_F(PrefillChunkYieldSuite, APromptWaitingForItsBootstrapIsNotCarried) {
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    SubmitPrompt("s1", MakeTokens(6, 2000), /*bootstrap=*/false);
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 32, 64, 100}}));
+    SendBootstrapped("s1");
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 6, 6}, {"long", 64, 88, 100}}));
+}
+
+// The carried prompts take at most the knob's 16 tokens, in FIFO order: a
+// third 6-token prompt waits for the next round. The long prompt keeps at
+// least 32 - 16 - (4 - 1) = 13 tokens of every round: 20, 20 and 16 here.
+TEST_F(PrefillChunkYieldSuite, TheCarriedPromptsTakeAtMostTheKnob) {
+    SubmitPrompt("long", MakeTokens(120, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 120}}));
+    for (int i = 0; i < 4; ++i) {
+        SubmitPrompt("s" + std::to_string(i), MakeTokens(6, 2000 + 100 * i));
+    }
+    EXPECT_EQ(Round(), (PrefillRows{{"s0", 0, 6, 6}, {"s1", 0, 6, 6}, {"long", 32, 52, 120}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"s2", 0, 6, 6}, {"s3", 0, 6, 6}, {"long", 52, 72, 120}}));
+    SubmitPrompt("s4", MakeTokens(15, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s4", 0, 15, 15}, {"long", 72, 88, 120}})) << "72 + 32 - 15 = 89, down to 88";
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 88, 120, 120}}));
+}
+
+// A prompt whose first chunk would end at a junction -- its KV is cached
+// past the last State checkpoint it can resume at -- cannot run whole, so it
+// is not carried, and alone it makes nothing give way.
+TEST_F(PrefillChunkYieldSuite, APromptCutAtAJunctionIsNotCarried) {
+    hybrid_ = true;
+    Restart(16);
+    const std::vector<std::int32_t> shared = MakeTokens(8, 5000);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    SubmitPrompt("junction", Extending(shared, {6100, 6101}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 32, 64, 100}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 64, 96, 100}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 96, 100, 100}, {"junction", 0, 8, 10}}))
+        << "its first chunk ends at the junction";
+}
+
+// A new prompt's first chunk cut at its junction leaves even more of the
+// round to the prompts it carries.
+TEST_F(PrefillChunkYieldSuite, AFirstChunkCutAtItsJunctionStillCarriesWholePrompts) {
+    hybrid_ = true;
+    Restart(16);
+    const std::vector<std::int32_t> shared = MakeTokens(8, 5000);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(92, 8000)));
+    SubmitPrompt("s1", MakeTokens(6, 2000));
+    SubmitPrompt("s2", MakeTokens(6, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 6, 6}, {"s2", 0, 6, 6}, {"holder", 0, 8, 100}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 8, 40, 100}}));
+}
+
+// Every carried prompt takes a batch row beside the long prompt's: with
+// three rows two are carried.
+TEST_F(PrefillChunkYieldSuite, TheBatchBoundsTheCarriedPrompts) {
+    batch_ = 3;
+    Restart(16);
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    for (int i = 0; i < 3; ++i) {
+        SubmitPrompt("s" + std::to_string(i), MakeTokens(4, 2000 + 100 * i));
+    }
+    EXPECT_EQ(Round(), (PrefillRows{{"s0", 0, 4, 4}, {"s1", 0, 4, 4}, {"long", 32, 56, 100}}));
+}
+
+// ... and a request slot: with two completed prompts holding theirs until
+// their transfers are acknowledged, two of the five slots are free beside
+// the long prompt's, though the batch has room for four.
+TEST_F(PrefillChunkYieldSuite, TheFreeRequestSlotsBoundTheCarriedPrompts) {
+    batch_ = 5;
+    Restart(16);
+    SubmitPrompt("p0", MakeTokens(4, 500));
+    SubmitPrompt("p1", MakeTokens(4, 600));
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"p0", 0, 4, 4}, {"p1", 0, 4, 4}, {"long", 0, 24, 100}}));
+    for (int i = 0; i < 3; ++i) {
+        SubmitPrompt("s" + std::to_string(i), MakeTokens(4, 2000 + 100 * i));
+    }
+    EXPECT_EQ(Round(/*ack=*/false), (PrefillRows{{"s0", 0, 4, 4}, {"s1", 0, 4, 4}, {"long", 24, 48, 100}}));
+    EXPECT_EQ(handed_off_, (std::vector<std::string>{"p0", "p1"}));
+}
+
+// Under a steady stream of short prompts the long prompt still advances by at
+// least 32 - 16 - 3 = 13 tokens a round (16 here), so its 200 tokens take 12
+// rounds -- within 1 + ceil((200 - 32) / 13) = 14, against 7 without the knob
+// -- and every prompt carried beside it completes in that round, ahead of it.
+TEST_F(PrefillChunkYieldSuite, ALongPromptStillFinishesUnderAStreamOfShortPrompts) {
+    SubmitPrompt("long", MakeTokens(200, 1000));
+    int rounds = 0;
+    for (int next = 0; rounds < 20;) {
+        for (int i = 0; i < 3; ++i, ++next) {
+            SubmitPrompt("s" + std::to_string(next), MakeTokens(5, 10000 + 10 * next));
+        }
+        const PrefillRows rows = Round();
+        ++rounds;
+        ASSERT_FALSE(rows.empty());
+        // The final chunk completes and runs first; every earlier one gives
+        // way and runs last.
+        if (rows[0].id == "long" && rows[0].end == 200) {
+            break;
+        }
+        const PrefillRow& chunk = rows.back();
+        ASSERT_EQ(chunk.id, "long") << "round " << rounds;
+        EXPECT_GE(chunk.end - chunk.start, 13) << "round " << rounds;
+        EXPECT_EQ(chunk.end % kPage, 0) << "round " << rounds;
+        ASSERT_EQ(rows.size(), 4u) << "round " << rounds;
+        for (std::size_t i = 0; i + 1 < rows.size(); ++i) {
+            EXPECT_EQ(rows[i].start, 0);
+            EXPECT_EQ(rows[i].end, rows[i].prompt) << rows[i].id << " is carried whole";
+        }
+    }
+    EXPECT_EQ(rounds, 12);
+}
+
+// Two ranks' schedulers given the same events build the same plans.
+TEST_F(PrefillChunkYieldSuite, MirroredSchedulersPlanAlike) {
+    std::vector<std::unique_ptr<Scheduler>> ranks;
+    ranks.push_back(std::make_unique<Scheduler>(config_));
+    // So the second rank's allocations are not the first's at a fixed offset.
+    const std::vector<std::uint8_t> heap_perturbation(4096);
+    ranks.push_back(std::make_unique<Scheduler>(config_));
+    const auto advance = [&ranks](const ExecutionEvent& event) {
+        for (const std::unique_ptr<Scheduler>& rank : ranks) {
+            rank->Advance(event);
+        }
+    };
+    const auto submit = [&](const std::string& id, const std::vector<std::int32_t>& tokens) {
+        for (const std::unique_ptr<Scheduler>& rank : ranks) {
+            rank->SubmitRequests({RequestSpec{.request_id = id, .tokens = tokens}});
+        }
+        ExecutionEvent bootstrapped;
+        bootstrapped.With(pd::BootstrappedEvent{id});
+        advance(bootstrapped);
+    };
+    submit("long", MakeTokens(200, 1000));
+    int carrying_rounds = 0;
+    for (int round = 0, next = 0; round < 12; ++round) {
+        for (int i = 0; i < 2; ++i, ++next) {
+            submit("s" + std::to_string(next), MakeTokens(1 + next % 7, 10000 + 10 * next));
+        }
+        const ExecutionPlan plan = ranks[0]->NextExecutionPlan();
+        ASSERT_TRUE(ranks[1]->NextExecutionPlan() == plan) << "round " << round;
+        if (plan.remote_decode) {
+            ExecutionEvent acks;
+            for (const std::string& id : plan.remote_decode->request_ids) {
+                acks.With(pd::SucceededEvent{id});
+            }
+            advance(acks);
+        }
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->NumExtends() == 0) {
+            continue;
+        }
+        // The long prompt's chunk runs after the prompts it carries.
+        EXPECT_TRUE(CompletingPrefillsFormAPrefix(*batch)) << "round " << round;
+        const std::size_t last = batch->NumExtends() - 1;
+        const bool last_incomplete =
+            batch->extend_prefix_lens[last] + batch->input_lengths[last] < batch->prefill_lengths[last];
+        carrying_rounds += last_incomplete && batch->NumExtends() > 1;
+        ExecutionEvent results;
+        for (std::size_t i = 0; i < batch->NumExtends(); ++i) {
+            const bool complete = batch->extend_prefix_lens[i] + batch->input_lengths[i] == batch->prefill_lengths[i];
+            results.With(forward::ExtendResult{
+                .request_id = batch->request_ids[i],
+                .tokens = complete ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{},
+            });
+        }
+        advance(results);
+    }
+    EXPECT_GT(carrying_rounds, 0);
+}
+
 TEST_F(SchedulerTestSuite, SubmitRequestsRejectsEmptyTokens) {
     EXPECT_THROW(Submit(RequestSpec{.request_id = "empty"}), std::invalid_argument);
 }
@@ -1274,6 +1753,53 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     } catch (const std::invalid_argument& error) {
         EXPECT_NE(std::string{error.what()}.find("device cache"), std::string::npos) << error.what();
     }
+}
+
+// prefill_chunk_yield_tokens is off by default on every role, and on is a P
+// role option of at most half the chunk budget.
+TEST(SchedulerConstructionTest, PrefillChunkYieldIsAPrefillRoleOptionOfAtMostHalfTheBudget) {
+    const auto config = [](Role role, std::int32_t budget, std::int32_t yield) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.max_scheduled_tokens = budget;
+        cfg.max_batch_size = 8;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kFull,
+            .transfer_policy =
+                role == Role::kFused ? CacheTransferPolicy::Unspecified : CacheTransferPolicy::FullSuffix,
+        });
+        cfg.prefill_chunk_yield_tokens = yield;
+        SetTestSnapshotPool(cfg);
+        return WithHostPackingFromDevice(cfg);
+    };
+    const auto refusal = [&](Role role, std::int32_t budget, std::int32_t yield) -> std::string {
+        try {
+            config(role, budget, yield).Validate();
+        } catch (const std::invalid_argument& error) {
+            return error.what();
+        }
+        return {};
+    };
+    for (const Role role : {Role::kP, Role::kD, Role::kFused}) {
+        EXPECT_EQ(SchedulerConfig{}.prefill_chunk_yield_tokens, 0);
+        EXPECT_EQ(refusal(role, 64, 0), "") << "off by default";
+        EXPECT_NE(refusal(role, 64, -1).find("must be >= 0"), std::string::npos);
+    }
+    EXPECT_NE(refusal(Role::kFused, 64, 8).find("P role only"), std::string::npos);
+    EXPECT_NE(refusal(Role::kD, 64, 8).find("P role only"), std::string::npos);
+    EXPECT_EQ(refusal(Role::kP, 64, 32), "") << "half the budget";
+    EXPECT_NE(refusal(Role::kP, 64, 33).find("at most half"), std::string::npos);
+    EXPECT_EQ(refusal(Role::kP, 65, 32), "");
+    EXPECT_NE(refusal(Role::kP, 65, 33).find("at most half"), std::string::npos);
+    // The Scheduler refuses it before building anything.
+    EXPECT_THROW(Scheduler{config(Role::kFused, 64, 8)}, std::invalid_argument);
+    EXPECT_NO_THROW(Scheduler{config(Role::kP, 64, 32)});
 }
 
 }  // namespace tokenspeed::test

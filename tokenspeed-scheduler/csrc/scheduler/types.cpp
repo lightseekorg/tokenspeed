@@ -93,6 +93,22 @@ void SchedulerConfig::Validate() const {
         throw std::invalid_argument(
             "Scheduler: demote_superseded_state_checkpoints requires state_checkpoint_in_forward");
     }
+    if (prefill_chunk_yield_tokens < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be >= 0");
+    }
+    // The fused role retracts the largest incomplete prefill first, which a
+    // carried prompt could make the yielding request itself; the D role
+    // computes no prompt.
+    if (prefill_chunk_yield_tokens > 0 && role != Role::kP) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) is for the P role only");
+    }
+    if (prefill_chunk_yield_tokens > max_scheduled_tokens / 2) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be at most half of "
+            "max_scheduled_tokens (--chunked-prefill-size)");
+    }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }

@@ -382,3 +382,36 @@ def test_dropping_short_prompt_ends_takes_the_prefill_role_and_the_in_forward_ch
     cfg.role = SchedulerConfig.Role.Fused
     with pytest.raises(ValueError, match="P role only"):
         Scheduler(cfg)
+
+
+def test_prefill_chunk_yield_round_trips_and_is_validated():
+    """The P-role knob is off by default, reaches the scheduler, and a value
+    above half the chunk budget is refused at construction."""
+    cfg = SchedulerConfig()
+    assert cfg.prefill_chunk_yield_tokens == 0
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefix_granularity = 16
+    cfg.max_scheduled_tokens = 32
+    cfg.max_batch_size = 4
+    cfg.num_device_pages = 64
+    cfg.num_snapshot_pages = 1  # the P role never retracts
+    cfg.disable_l2_cache = True
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=16,
+            total_pages=64,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    cfg.prefill_chunk_yield_tokens = 16
+    assert cfg.prefill_chunk_yield_tokens == 16
+    Scheduler(cfg)
+    cfg.prefill_chunk_yield_tokens = 17
+    with pytest.raises(ValueError, match="at most half of max_scheduled_tokens"):
+        Scheduler(cfg)
+    cfg.prefill_chunk_yield_tokens = 16
+    cfg.role = SchedulerConfig.Role.D
+    with pytest.raises(ValueError, match="P role only"):
+        Scheduler(cfg)

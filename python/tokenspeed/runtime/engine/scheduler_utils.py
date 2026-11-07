@@ -132,6 +132,7 @@ def make_config(
     max_kv_page_num: int = 0,
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
+    prefill_chunk_yield_tokens: int = 0,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -215,6 +216,13 @@ def make_config(
             ``--checkpoint-retention-leaf-distance``: checkpoints within this
             many later requests of the newest on their branch rank as it does. None keeps the
             scheduler's default, 0.
+        prefill_chunk_yield_tokens:
+            ``--prefill-chunk-yield-tokens``: the most tokens a prefill chunk
+            that cannot finish its prompt gives up, page-aligned, so that
+            bootstrapped prompts waiting behind it that fit whole run in the
+            same forward. 0 is off; the prefill role only, at most half of
+            ``max_scheduled_tokens`` (``SchedulerConfig::Validate`` refuses
+            it elsewhere).
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -234,6 +242,11 @@ def make_config(
         )
     if (storage_config is not None) != enable_l3_storage:
         raise ValueError("storage_config is required exactly when L3 is enabled")
+    if prefill_chunk_yield_tokens < 0:
+        raise ValueError(
+            "prefill_chunk_yield_tokens must be non-negative; "
+            f"got {prefill_chunk_yield_tokens}."
+        )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
@@ -274,6 +287,9 @@ def make_config(
         cfg.checkpoint_retention_requests = checkpoint_retention_requests
     if checkpoint_retention_leaf_distance is not None:
         cfg.checkpoint_retention_leaf_distance = checkpoint_retention_leaf_distance
+    if prefill_chunk_yield_tokens:
+        # Set only when on, for the same reason.
+        cfg.prefill_chunk_yield_tokens = prefill_chunk_yield_tokens
     cfg.disable_l2_cache = disable_l2_cache
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
