@@ -99,7 +99,7 @@ def test_the_dummy_loader_marks_the_draft_embedding_initialized(monkeypatch):
 def test_the_dummy_loader_derives_the_kimi_k25_text_model(monkeypatch):
     derived = []
 
-    # The DeepSeek-V3 text model needs process groups; only its derivation is observed.
+    # The DeepSeek-V3 text model needs process groups; record its derivation.
     class _TextModel(nn.Module):
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
