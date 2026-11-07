@@ -126,6 +126,10 @@ class _WindowAttention:
     def query_metadata(self, mode):
         return self.meta
 
+    @property
+    def supports_fused_attention(self) -> bool:
+        return True
+
     def _workspace(self, swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps):
         """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
 
@@ -171,6 +175,7 @@ class _WindowAttention:
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        fused_decode_groups,
         out_rope_cache=None,
         key_rows,
     ):
@@ -178,9 +183,34 @@ class _WindowAttention:
             raise ValueError("DSpark window attention does not accept query sharding")
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
+        if fused_decode_groups is not None and (
+            not forward_mode.is_decode()
+            or swa_rope_cache is None
+            or out_rope_cache is not None
+        ):
+            raise ValueError(
+                "Fused DSpark attention requires decode with its RoPE table"
+            )
         kv = self._workspace(
             swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
         )
+        if fused_decode_groups is not None:
+            return dsv41.selected_attention_fp8(
+                q,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                attn_sink,
+                softmax_scale,
+                positions,
+                swa_rope_cache,
+                fused_decode_groups,
+                kv.view(-1, 1, kv.shape[-1]),
+                self.selection.indices,
+            )
         if q.is_cuda and q.shape[-1] == 512:
             out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
         else:

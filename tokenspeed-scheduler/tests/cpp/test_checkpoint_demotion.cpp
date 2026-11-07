@@ -884,6 +884,17 @@ protected:
         const std::int32_t prefix =
             batch == nullptr || batch->request_ids.empty() ? -1 : batch->extend_prefix_lens.at(0);
         SendAbortEvent(id);
+        if (role_ == Role::kP) {
+            // Cancellation retains P's pages until the transfer and the
+            // probe's dispatched forward have both retired.
+            ExecutionEvent event;
+            event.With(pd::FailedEvent{id});
+            scheduler_->Advance(std::move(event));
+            if (prefix >= 0) {
+                SendForwardDone(id);
+            }
+            EXPECT_FALSE(scheduler_->PdTransferPinned(id));
+        }
         AckWriteBacks(PlanOnce());
         return prefix;
     }

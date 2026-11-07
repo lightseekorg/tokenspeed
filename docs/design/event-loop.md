@@ -664,6 +664,22 @@ requests never register one. An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
 
+With attention DP, memory release waits for every rank to stop admissions
+and drain its requests, forwards, cancelled embedding receives, cache copies,
+transfers and queued weight operations. A locally drained rank keeps joining
+idle forwards while a peer drains. An idle but unpaused peer prevents release:
+it could admit a request in the next round. Release intent rides the head
+gate, so every rank joins the tail's readiness agreement when any release is
+pending, including ranks without a release of their own. Ordinary rounds add
+no collective. Readiness is MIN-reduced over the replica and then attention DP
+before any release runs on the forward thread.
+
+The head gate also agrees whether any DP rank still has released regions.
+Until all regions are restored on every rank, it withholds forward permission
+through the scheduler's storage tick and suppresses idle forwards. This covers
+staggered and partial resumes without building a batch that cannot execute;
+control operations and cache acknowledgments continue to progress.
+
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
 Weight-update `flush_cache` and a standalone flush first MAX-reduce
 flush intent across attention DP so every DP rank enters the same
@@ -821,6 +837,34 @@ bitmasks through their handles, with one C++ fill (`grammar_host.Filler`)
 on both paths: the capturable path's host node runs it inside the forward
 and advances the matchers there; the eager path runs it before the forward
 and the commit advances them.
+
+## Request-token history seeds
+
+The control plane owns each request's committed token list. `HistoryRows`
+tracks slot ownership by admission, not by client request id, and seeds a
+new owner's prefix before its first forward. Consecutive chunks on the
+same owned row append their inputs without reseeding. Prefix-cache hits,
+PD landings, slot reuse and recovery into another slot use this same path.
+
+A model profile may declare `request_token_history_lookback`: the maximum
+number of committed tokens it reads behind its write frontier. Omission
+(`None`) preserves full-prefix seeds; zero permits an empty seed. The host
+uses the maximum bound across target and draft history readers, or full
+history if either reader declares no bound. A finite bound is a model
+correctness contract, not a serving knob: every history read must stay
+within it, including resumed and speculative forwards.
+
+For a prefix of length P and bound L, the seed carries tokens
+`[max(0, P-L), P)`, retaining P as `prefix_lengths`. The Python executor
+places them at their original absolute positions, never at position zero.
+The draft row keeps its existing one-token-left shift: source positions
+`[start+1, P)` populate draft positions `[start, P-1)`. The final draft position is not
+provided by the seed, just as with full-prefix seeding; the model/drafter
+must supply any boundary token it reads. Earlier row contents are
+unspecified and must not be read. This reduces copied and uploaded tokens,
+not the context-sized history allocation or KV-cache storage. Token history
+remains token-derived state, reconstructed rather than included in
+retraction snapshots.
 
 ## Anatomy of a round
 

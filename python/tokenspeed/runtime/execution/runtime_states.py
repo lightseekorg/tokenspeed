@@ -248,7 +248,8 @@ class RuntimeStates:
 
         ``capacity`` is zero for a model that reads no history, else the
         physical context length. Row ``s`` holds ``[0, valid_cache_lengths[s])``
-        committed tokens; the model's kernels append every forward's inputs
+        committed tokens (only the last ones a bounded-lookback model reads,
+        after a reseed); the model's kernels append every forward's inputs
         past that frontier, and resuming extends are reseeded from host
         snapshots (:meth:`seed_request_token_history`). Like the n-gram tail,
         this is executor state that follows ``valid_cache_lengths``; it is
@@ -300,7 +301,6 @@ class RuntimeStates:
         input_start_offsets: torch.Tensor,
         active_request_mask: torch.Tensor,
         committed_lengths: torch.Tensor,
-        row_offset: int,
     ) -> RequestTokenHistoryView:
         """Combine the draft history with one packed-batch layout.
 
@@ -311,8 +311,6 @@ class RuntimeStates:
             active_request_mask: ``[bs]`` False rows are graph padding.
             committed_lengths: ``[pool + 1]`` per-slot write frontier for this
                 draft step; the drafter owns and advances it.
-            row_offset: Batch-global row of the forward's first local input
-                row (a query shard's start; 0 otherwise).
         """
         if self.draft_request_token_history_ids is None:
             raise RuntimeError("draft request token history is not enabled")
@@ -322,7 +320,6 @@ class RuntimeStates:
             req_pool_indices=req_pool_indices,
             input_start_offsets=input_start_offsets,
             active_request_mask=active_request_mask,
-            row_offset=row_offset,
         )
 
     def request_token_history_view(
@@ -331,13 +328,8 @@ class RuntimeStates:
         req_pool_indices: torch.Tensor,
         input_start_offsets: torch.Tensor,
         active_request_mask: torch.Tensor,
-        row_offset: int,
     ) -> RequestTokenHistoryView:
-        """Combine the persistent history with one packed-batch layout.
-
-        ``row_offset`` is the batch-global row of the forward's first local
-        input row (a query shard's start; 0 otherwise).
-        """
+        """Combine the persistent history with one packed-batch layout."""
         if self.request_token_history_ids is None:
             raise RuntimeError("request token history is not enabled")
         return RequestTokenHistoryView(
@@ -346,14 +338,15 @@ class RuntimeStates:
             req_pool_indices=req_pool_indices,
             input_start_offsets=input_start_offsets,
             active_request_mask=active_request_mask,
-            row_offset=row_offset,
         )
 
     def seed_request_token_history(self, seeds: RequestHistorySeeds) -> None:
         """Restore the committed prefix of each seeded slot.
 
-        One pinned upload carries every seed; each row is then written from
-        its device slice on the current stream. Returns None.
+        A seed may carry only the prefix's tail (a model with a bounded
+        history lookback); it lands at the positions ending at the prefix
+        length. One pinned upload carries every seed; each row is then
+        written from its device slice on the current stream. Returns None.
         """
         history = self.request_token_history_ids
         if history is None:
@@ -368,7 +361,7 @@ class RuntimeStates:
                     f"request token history prefix {prefix_length} exceeds "
                     f"capacity {capacity}"
                 )
-        if sum(seeds.prefix_lengths) == 0:
+        if sum(len(tokens) for tokens in seeds.tokens) == 0:
             return
         device_tokens = torch.tensor(
             list(itertools.chain.from_iterable(seeds.tokens)),
@@ -377,17 +370,20 @@ class RuntimeStates:
         ).to(self.device, non_blocking=True)
         offset = 0
         draft = self.draft_request_token_history_ids
-        for slot, prefix_length in zip(seeds.slots, seeds.prefix_lengths):
-            history[slot, :prefix_length].copy_(
-                device_tokens[offset : offset + prefix_length]
+        for slot, prefix_length, tokens in zip(
+            seeds.slots, seeds.prefix_lengths, seeds.tokens
+        ):
+            start = prefix_length - len(tokens)
+            history[slot, start:prefix_length].copy_(
+                device_tokens[offset : offset + len(tokens)]
             )
-            if draft is not None and prefix_length > 1:
+            if draft is not None and len(tokens) > 1:
                 # The draft stream is the request stream shifted one token
                 # left, at the same positions.
-                draft[slot, : prefix_length - 1].copy_(
-                    device_tokens[offset + 1 : offset + prefix_length]
+                draft[slot, start : prefix_length - 1].copy_(
+                    device_tokens[offset + 1 : offset + len(tokens)]
                 )
-            offset += prefix_length
+            offset += len(tokens)
 
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter)
