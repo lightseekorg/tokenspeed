@@ -41,6 +41,27 @@ from tokenspeed.runtime.execution.types import (
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 
 
+def _stacked_view(tables: Sequence[torch.Tensor]) -> torch.Tensor | None:
+    """``tables`` as one ``[len(tables), rows, cols]`` view when they are
+    equal-shape row-major tables laid end to end in one storage, else None."""
+    if not tables:
+        return None
+    first = tables[0]
+    rows, cols = first.shape
+    storage = first.untyped_storage().data_ptr()
+    start = first.storage_offset()
+    for i, table in enumerate(tables):
+        if (
+            table.dtype != first.dtype
+            or table.shape != first.shape
+            or not table.is_contiguous()
+            or table.untyped_storage().data_ptr() != storage
+            or table.storage_offset() != start + i * rows * cols
+        ):
+            return None
+    return first.as_strided((len(tables), rows, cols), (rows * cols, cols, 1))
+
+
 class RuntimeStates:
     """Own runtime state tensors keyed by request-pool index.
 
@@ -546,12 +567,19 @@ class RuntimeStates:
 
         The tables are this step's own upload, so the rows are padded in
         place: they stay views of the one packed upload, which the attention
-        routers unpack in a single launch.
+        routers unpack in a single launch. The upload holds the state groups'
+        tables end to end, so one launch pads them all; tables laid out any
+        other way take one launch each.
         """
         stopped_rows = self.stopped.index_select(0, req_pool_indices)[:, None]
         tables = dict(block_tables)
-        for group_id in state_group_ids:
-            tables[group_id].masked_fill_(stopped_rows, -1)
+        state_tables = [tables[group_id] for group_id in state_group_ids]
+        stacked = _stacked_view(state_tables)
+        if stacked is not None:
+            stacked.masked_fill_(stopped_rows, -1)
+            return tables
+        for table in state_tables:
+            table.masked_fill_(stopped_rows, -1)
         return tables
 
     def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:
