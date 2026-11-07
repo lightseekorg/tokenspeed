@@ -1046,6 +1046,10 @@ class _KvpPrefillBackend:
     def prefill_index_columns(self) -> int | None:
         return self._index_columns
 
+    def history_prefill_plan(self):
+        # The sharded extend arm, not a prefill over gathered histories.
+        return None
+
 
 class _IdentityAttnComm:
     """A prefill rank's pre-attention communication (attention DP 1): the
