@@ -1,0 +1,31 @@
+{
+  "convolution_passed": 40,
+  "backend_and_measurement_passed": 56,
+  "gdn_head_partition_passed": 3,
+  "real_hccl_ranks": [
+    {
+      "rank": 0,
+      "pid": 1385013,
+      "device": "npu:0",
+      "visible": "0,1",
+      "all_reduce": true,
+      "all_gather": true,
+      "reduce_scatter": true,
+      "allocated": 7168
+    },
+    {
+      "rank": 1,
+      "pid": 1385014,
+      "device": "npu:1",
+      "visible": "0,1",
+      "all_reduce": true,
+      "all_gather": true,
+      "reduce_scatter": true,
+      "allocated": 7168
+    }
+  ],
+  "http_tp2_passed": true,
+  "weights_08b_sha256_verified": true,
+  "precommit_log": "hw2-evidence/precommit-submission-final.log",
+  "precommit_all_files_passed": true
+}

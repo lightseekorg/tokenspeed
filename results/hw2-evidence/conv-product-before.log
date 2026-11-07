@@ -1,0 +1,59 @@
+F
+=================================== FAILURES ===================================
+____________ test_half_convolution_keeps_products_in_fp32[prefill] _____________
+
+mode = 'prefill'
+
+    @pytest.mark.parametrize("mode", ["prefill", "decode"])
+    def test_half_convolution_keeps_products_in_fp32(mode):
+        # Cancellation exposes rounding a half product before the FP32 sum.
+        channels = 17
+        a = 1 + 2**-9
+        weight = torch.tensor([a, -1, 0, 0], dtype=torch.float16).repeat(channels, 1)
+        history = torch.tensor([a, 1, 0], dtype=torch.float16).repeat(channels, 1)
+        x = torch.zeros(1, channels, dtype=torch.float16, device="npu")
+        pool = history.npu().unsqueeze(0).clone()
+        indices = torch.tensor([0], device="npu", dtype=torch.int32)
+        if mode == "decode":
+            actual = causal_conv1d_update(x, pool, weight.npu(), activation=None,
+                                         conv_state_indices=indices, parent_indices=None)
+        else:
+            bounds = torch.tensor([0, 1], device="npu", dtype=torch.int32)
+            metadata = build_causal_conv1d_prefill_metadata(bounds, torch.tensor([1]), 64)
+            actual = causal_conv1d_fn(x.T, weight.npu(), None, pool, bounds,
+                                     cache_indices=indices,
+                                     has_initial_state=torch.tensor([True], device="npu"),
+                                     activation=None, prefill_metadata=metadata).T
+        expected = torch.full((1, channels), a*a-1, dtype=torch.float64).half()
+>       torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+E       AssertionError: Tensor-likes are not equal!
+E
+E       Mismatched elements: 17 / 17 (100.0%)
+E       Greatest absolute difference: 3.814697265625e-06 at index (0, 0)
+E       Greatest relative difference: 0.0009756088256835938 at index (0, 0)
+
+tokenspeed-kernel-npu/test/test_causal_conv.py:147: AssertionError
+=============================== warnings summary ===============================
+../../../opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58
+../../../opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58
+  /opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+    warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+
+../../../opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58
+../../../opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58
+  /opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+    warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+
+../../../opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66
+  /opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /opt/miniconda3/envs/aics/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+    warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+
+test/test_causal_conv.py::test_half_convolution_keeps_products_in_fp32[prefill]
+  /home/course-user/hw2-precision-diagnostic/tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/triton.py:142: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at build/CMakeFiles/torch_npu.dir/compiler_depend.ts:338.)
+    out = torch.empty_like(x)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tokenspeed-kernel-npu/test/test_causal_conv.py::test_half_convolution_keeps_products_in_fp32[prefill]
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 38 deselected, 6 warnings in 9.63s

@@ -35,6 +35,14 @@ from pathlib import Path
 import torch
 
 
+def rank_directory(root: Path) -> Path:
+    """Keep TP workers' evidence separate, preserving the TP=1 file layout."""
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        root = root / f"rank-{torch.distributed.get_rank()}"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def install() -> None:
     """Observe real forwards and audit parameter loading without changing math."""
     from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -47,6 +55,36 @@ def install() -> None:
     current_request = None
     step = 0
     layer_values = {}
+    collectives = []
+    collect_communication = False
+    profiled_phases = set()
+
+    from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend
+
+    def observe_collective(name, original):
+        @functools.wraps(original)
+        def observed(backend, tensor, *args, **kwargs):
+            group_index = 1 if name == "all_gather_single" else 0
+            group = kwargs["group"] if "group" in kwargs else args[group_index]
+            if collect_communication and len(group) > 1:
+                payload = args[0] if name == "all_gather_single" else tensor
+                tensors = (payload,) if isinstance(payload, torch.Tensor) else payload
+                collectives.append(
+                    dict(
+                        name=name,
+                        shapes=[list(t.shape) for t in tensors],
+                        dtypes=[str(t.dtype) for t in tensors],
+                        payload_bytes=sum(
+                            t.numel() * t.element_size() for t in tensors
+                        ),
+                    )
+                )
+            return original(backend, tensor, *args, **kwargs)
+
+        return observed
+
+    for name in ("all_reduce", "all_gather_single", "reduce_scatter"):
+        setattr(HcclBackend, name, observe_collective(name, getattr(HcclBackend, name)))
 
     @functools.wraps(original_load)
     def audited_load(self, weights):
@@ -65,6 +103,14 @@ def install() -> None:
         ]
         devices = sorted({str(p.device) for p in parameters.values()})
         audit = dict(
+            rank=(
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            ),
+            pid=os.getpid(),
+            visible_devices=os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+            logical_device=torch.npu.current_device(),
             checkpoint_tensors=len(checkpoint_names),
             loaded_names=len(loaded),
             parameter_names=len(parameters),
@@ -75,12 +121,13 @@ def install() -> None:
             skipped_mtp=sum("mtp" in name for name in checkpoint_names),
             unique_parameter_count=sum(p.numel() for p in self.parameters()),
             allocated_after_load=torch.npu.memory_allocated(),
+            parameter_shapes={name: list(p.shape) for name, p in parameters.items()},
         )
-        root = Path(os.environ["QWEN35_PROBE_DIR"])
+        root = rank_directory(Path(os.environ["QWEN35_PROBE_DIR"]))
         (root / "weight-audit.json").write_text(json.dumps(audit, indent=2) + "\n")
         assert not missing, f"Unloaded parameters: {missing}"
         assert not audit["unexpected"], audit
-        assert devices == ["npu:0"], devices
+        assert devices == [f"npu:{torch.npu.current_device()}"], devices
         if os.environ.get("QWEN35_LAYER_TRACE"):
 
             def trace_layer(index):
@@ -98,7 +145,7 @@ def install() -> None:
 
     @functools.wraps(original_forward)
     def observed_forward(self, ctx, input_ids, positions, *args, **kwargs):
-        nonlocal current_request, step
+        nonlocal current_request, step, collect_communication
         root = Path(os.environ["QWEN35_PROBE_DIR"])
         control_path = root / "active.json"
         if not control_path.exists():
@@ -113,17 +160,59 @@ def install() -> None:
                     self, ctx, input_ids, positions, *args, **kwargs
                 )
             current_request, step = control["id"], 0
+            profiled_phases.clear()
             torch.npu.reset_peak_memory_stats()
-        request_dir = root / current_request
+        request_dir = rank_directory(root) / current_request
         request_dir.mkdir(exist_ok=True)
+        if step == 0:
+            pool = ctx.token_to_kv_pool
+            (request_dir.parent / "cache-plan.json").write_text(
+                json.dumps(
+                    dict(
+                        pool_type=type(pool).__name__,
+                        token_capacity=pool.arena.size,
+                        arena_bytes=pool.arena.allocated_device_bytes,
+                        states={
+                            str(layer): [
+                                dict(shape=list(t.shape), dtype=str(t.dtype))
+                                for t in pool.get_state_buffers(layer)
+                            ]
+                            for layer in pool.state_group_by_layer
+                        },
+                    ),
+                    indent=2,
+                )
+                + "\n"
+            )
         assert input_ids.device.type == positions.device.type == "npu"
+        if control["mode"] == "benchmark":
+            output = original_forward(self, ctx, input_ids, positions, *args, **kwargs)
+            # No per-forward synchronization, events or CPU logits in timed runs.
+            record = dict(
+                step=step,
+                mode=ctx.forward_mode.name,
+                tokens=input_ids.numel(),
+                batch_size=ctx.bs,
+                allocated=torch.npu.memory_allocated(),
+                reserved=torch.npu.memory_reserved(),
+                peak_allocated=torch.npu.max_memory_allocated(),
+                peak_reserved=torch.npu.max_memory_reserved(),
+            )
+            with (request_dir / "steps.jsonl").open("a") as handle:
+                handle.write(json.dumps(record) + "\n")
+            step += 1
+            return output
         torch.npu.synchronize()
         start_event = torch.npu.Event(enable_timing=True)
         end_event = torch.npu.Event(enable_timing=True)
         profiler = None
-        if control["mode"] == "profile" and step in (0, 1):
+        phase = "decode" if ctx.forward_mode.is_decode() else "prefill"
+        if control["mode"] == "profile" and (
+            step == 0 or (phase == "decode" and phase not in profiled_phases)
+        ):
             import torch_npu
 
+            profiled_phases.add(phase)
             profiler = torch_npu.profiler.profile(
                 activities=[
                     torch_npu.profiler.ProfilerActivity.CPU,
@@ -135,7 +224,8 @@ def install() -> None:
                 record_shapes=True,
                 with_stack=False,
                 experimental_config=torch_npu.profiler._ExperimentalConfig(
-                    export_type=torch_npu.profiler.ExportType.Text
+                    profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                    export_type=torch_npu.profiler.ExportType.Text,
                 ),
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     str(request_dir / f"profile-{step}")
@@ -143,10 +233,13 @@ def install() -> None:
             )
             profiler.start()
         started = time.perf_counter()
+        collectives.clear()
+        collect_communication = True
         if os.environ.get("QWEN35_LAYER_TRACE"):
             layer_values.clear()
         start_event.record()
         output = original_forward(self, ctx, input_ids, positions, *args, **kwargs)
+        collect_communication = False
         end_event.record()
         torch.npu.synchronize()
         wall_ms = (time.perf_counter() - started) * 1000
@@ -158,6 +251,8 @@ def install() -> None:
             step=step,
             mode=ctx.forward_mode.name,
             tokens=input_ids.numel(),
+            batch_size=ctx.bs,
+            collectives=collectives.copy(),
             wall_ms=wall_ms,
             event_span_ms=start_event.elapsed_time(end_event),
             allocated=torch.npu.memory_allocated(),

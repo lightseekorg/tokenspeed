@@ -121,3 +121,40 @@ def test_decode_remapping_and_reinitialized_request(dtype):
     torch.testing.assert_close(
         actual.cpu().double(), fresh_expected, atol=4e-3, rtol=4e-3
     )
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_half_convolution_keeps_products_in_fp32(mode):
+    # Cancellation exposes rounding a half product before the FP32 sum.
+    channels = 17
+    a = 1 + 2**-9
+    weight = torch.tensor([a, -1, 0, 0], dtype=torch.float16).repeat(channels, 1)
+    history = torch.tensor([a, 1, 0], dtype=torch.float16).repeat(channels, 1)
+    x = torch.zeros(1, channels, dtype=torch.float16, device="npu")
+    pool = history.npu().unsqueeze(0).clone()
+    indices = torch.tensor([0], device="npu", dtype=torch.int32)
+    if mode == "decode":
+        actual = causal_conv1d_update(
+            x,
+            pool,
+            weight.npu(),
+            activation=None,
+            conv_state_indices=indices,
+            parent_indices=None,
+        )
+    else:
+        bounds = torch.tensor([0, 1], device="npu", dtype=torch.int32)
+        metadata = build_causal_conv1d_prefill_metadata(bounds, torch.tensor([1]), 64)
+        actual = causal_conv1d_fn(
+            x.T,
+            weight.npu(),
+            None,
+            pool,
+            bounds,
+            cache_indices=indices,
+            has_initial_state=torch.tensor([True], device="npu"),
+            activation=None,
+            prefill_metadata=metadata,
+        ).T
+    expected = torch.full((1, channels), a * a - 1, dtype=torch.float64).half()
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)

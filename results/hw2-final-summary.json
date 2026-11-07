@@ -1,0 +1,7539 @@
+{
+  "quality": [
+    {
+      "model": "08b",
+      "steps": 96,
+      "greedy_equal": 96,
+      "strict_pass": true,
+      "failed_steps": [],
+      "max_abs": 0.0859375,
+      "max_rms": 0.017586003988981247,
+      "min_cosine": 0.9999746084213257,
+      "max_kl": 0.00010390056559117511
+    },
+    {
+      "model": "4b",
+      "steps": 32,
+      "greedy_equal": 32,
+      "strict_pass": false,
+      "failed_steps": [
+        3,
+        4,
+        13,
+        18,
+        19
+      ],
+      "max_abs": 3.18994140625,
+      "max_rms": 0.2774868309497833,
+      "min_cosine": 0.9973822236061096,
+      "max_kl": 0.002684164559468627
+    },
+    {
+      "model": "9b",
+      "steps": 32,
+      "greedy_equal": 32,
+      "strict_pass": false,
+      "failed_steps": [
+        4,
+        13
+      ],
+      "max_abs": 0.96875,
+      "max_rms": 0.15225835144519806,
+      "min_cosine": 0.9989997148513794,
+      "max_kl": 0.1460331678390503
+    },
+    {
+      "model": "27b",
+      "steps": 32,
+      "greedy_equal": 32,
+      "strict_pass": false,
+      "failed_steps": [
+        1,
+        2,
+        3,
+        18
+      ],
+      "max_abs": 1.6748046875,
+      "max_rms": 0.24482318758964539,
+      "min_cosine": 0.9983686208724976,
+      "max_kl": 0.0012187502579763532
+    }
+  ],
+  "performance": [
+    {
+      "source": "results/hw2-08b-v2-tp1-benchmark.json",
+      "model": "hw1-qwen35-model",
+      "tp": 1,
+      "input_tokens": 128,
+      "concurrency": 1,
+      "output_tokens": 128,
+      "formal_waves": 10,
+      "metrics": {
+        "ttft_ms": {
+          "median": 158.6558900307864,
+          "min": 157.1062901057303,
+          "max": 161.3329299725592,
+          "stdev": 1.4929328305031693
+        },
+        "tpot_ms": {
+          "median": 45.16338039460908,
+          "min": 44.350667559637095,
+          "max": 45.60940495992857,
+          "stdev": 0.3827210215585775
+        },
+        "output_tokens_per_second": {
+          "median": 21.71115842367312,
+          "min": 21.497930265451036,
+          "max": 22.10134238301086,
+          "stdev": 0.18379867697281624
+        },
+        "wall_seconds": {
+          "median": 5.895593379857019,
+          "min": 5.791503420099616,
+          "max": 5.954061550088227,
+          "stdev": 0.04955530675750513
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 2139450880,
+          "peak_reserved_bytes": 2470445056,
+          "decode_batch_histogram": {
+            "1": 1271
+          },
+          "observed_forward_count": 1281
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-08b-v2-tp1-benchmark.json",
+      "model": "hw1-qwen35-model",
+      "tp": 1,
+      "input_tokens": 128,
+      "concurrency": 4,
+      "output_tokens": 128,
+      "formal_waves": 10,
+      "metrics": {
+        "ttft_ms": {
+          "median": 270.6863998901099,
+          "min": 266.8959051370621,
+          "max": 273.4526600688696,
+          "stdev": 2.335401329049872
+        },
+        "tpot_ms": {
+          "median": 46.94273080640127,
+          "min": 45.081695275909205,
+          "max": 47.599839134596465,
+          "stdev": 0.802916712074938
+        },
+        "output_tokens_per_second": {
+          "median": 81.54763178676886,
+          "min": 80.44849811547091,
+          "max": 84.80516337935194,
+          "stdev": 1.3889712054472627
+        },
+        "wall_seconds": {
+          "median": 6.278547454858199,
+          "min": 6.037368240300566,
+          "max": 6.364320179913193,
+          "stdev": 0.10435599864120994
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 2146530304,
+          "peak_reserved_bytes": 2472542208,
+          "decode_batch_histogram": {
+            "3": 10,
+            "4": 1270,
+            "1": 10
+          },
+          "observed_forward_count": 1310
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-08b-v2-tp1-benchmark.json",
+      "model": "hw1-qwen35-model",
+      "tp": 1,
+      "input_tokens": 2048,
+      "concurrency": 1,
+      "output_tokens": 128,
+      "formal_waves": 10,
+      "metrics": {
+        "ttft_ms": {
+          "median": 1041.9403198175132,
+          "min": 1041.1982699297369,
+          "max": 1044.2589498125017,
+          "stdev": 0.919951149844735
+        },
+        "tpot_ms": {
+          "median": 45.1133701176654,
+          "min": 44.543948031844586,
+          "max": 45.340017400916636,
+          "stdev": 0.2918518497513919
+        },
+        "output_tokens_per_second": {
+          "median": 18.902774218728386,
+          "min": 18.823199231026905,
+          "max": 19.104273025868473,
+          "stdev": 0.10201108469582786
+        },
+        "wall_seconds": {
+          "median": 6.77150918985717,
+          "min": 6.700071749743074,
+          "max": 6.800119279883802,
+          "stdev": 0.03630945649588926
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 2268670464,
+          "peak_reserved_bytes": 2472542208,
+          "decode_batch_histogram": {
+            "1": 1280
+          },
+          "observed_forward_count": 1290
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-08b-v2-tp1-benchmark.json",
+      "model": "hw1-qwen35-model",
+      "tp": 1,
+      "input_tokens": 2048,
+      "concurrency": 4,
+      "output_tokens": 128,
+      "formal_waves": 10,
+      "metrics": {
+        "ttft_ms": {
+          "median": 2503.949992242269,
+          "min": 2501.6681500710547,
+          "max": 2507.3554951231927,
+          "stdev": 1.791991987964359
+        },
+        "tpot_ms": {
+          "median": 57.53313244217787,
+          "min": 56.847868742069274,
+          "max": 58.17230287242651,
+          "stdev": 0.42273484896430563
+        },
+        "output_tokens_per_second": {
+          "median": 51.816720915393056,
+          "min": 51.4036719879593,
+          "max": 52.28353666618908,
+          "stdev": 0.282075449784478
+        },
+        "wall_seconds": {
+          "median": 9.880983464885503,
+          "min": 9.792757580056787,
+          "max": 9.960377930197865,
+          "stdev": 0.05379081380217911
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 2380608512,
+          "peak_reserved_bytes": 2663383040,
+          "decode_batch_histogram": {
+            "2": 20,
+            "3": 10,
+            "4": 1260,
+            "1": 10
+          },
+          "observed_forward_count": 1330
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-08b-v2-tp2-benchmark.json",
+      "model": "hw1-qwen35-model",
+      "tp": 2,
+      "input_tokens": 128,
+      "concurrency": 1,
+      "output_tokens": 128,
+      "formal_waves": 10,
+      "metrics": {
+        "ttft_ms": {
+          "median": 148.3563049696386,
+          "min": 140.4424300417304,
+          "max": 163.94843999296427,
+          "stdev": 6.03642740865797
+        },
+        "tpot_ms": {
+          "median": 54.81858680934066,
+          "min": 53.538456771845425,
+          "max": 56.515972045668235,
+          "stdev": 0.8012333181049964
+        },
+        "output_tokens_per_second": {
+          "median": 18.008543201007434,
+          "min": 17.434044025794947,
+          "max": 18.42424043829346,
+          "stdev": 0.26635278405862284
+        },
+        "wall_seconds": {
+          "median": 7.1077457999344915,
+          "min": 6.947369169909507,
+          "max": 7.341956909745932,
+          "stdev": 0.10610721786932925
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 1287768064,
+          "peak_reserved_bytes": 1509949440,
+          "decode_batch_histogram": {
+            "1": 1275
+          },
+          "observed_forward_count": 1285
+        },
+        {
+          "rank": 1,
+          "peak_allocated_bytes": 1287768064,
+          "peak_reserved_bytes": 1509949440,
+          "decode_batch_histogram": {
+            "1": 1272
+          },
+          "observed_forward_count": 1282
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-08b-v2-tp2-benchmark.json",
+      "model": "hw1-qwen35-model",
+      "tp": 2,
+      "input_tokens": 128,
+      "concurrency": 4,
+      "output_tokens": 128,
+      "formal_waves": 10,
+      "metrics": {
+        "ttft_ms": {
+          "median": 213.14467256888747,
+          "min": 205.36346011795104,
+          "max": 223.0353553313762,
+          "stdev": 4.980473819110118
+        },
+        "tpot_ms": {
+          "median": 57.74342765807959,
+          "min": 56.62390078586621,
+          "max": 58.17727944777002,
+          "stdev": 0.5686462132135145
+        },
+        "output_tokens_per_second": {
+          "median": 67.32003275149202,
+          "min": 66.88009769086365,
+          "max": 68.62518135767017,
+          "stdev": 0.6591393882138022
+        },
+        "wall_seconds": {
+          "median": 7.6055398599710315,
+          "min": 7.460818170104176,
+          "max": 7.655491210054606,
+          "stdev": 0.07355793710723785
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 1292094976,
+          "peak_reserved_bytes": 1509949440,
+          "decode_batch_histogram": {
+            "3": 10,
+            "4": 1270,
+            "1": 9
+          },
+          "observed_forward_count": 1309
+        },
+        {
+          "rank": 1,
+          "peak_allocated_bytes": 1292094976,
+          "peak_reserved_bytes": 1509949440,
+          "decode_batch_histogram": {
+            "3": 10,
+            "4": 1270,
+            "1": 3
+          },
+          "observed_forward_count": 1303
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-08b-v2-tp2-benchmark.json",
+      "model": "hw1-qwen35-model",
+      "tp": 2,
+      "input_tokens": 2048,
+      "concurrency": 1,
+      "output_tokens": 128,
+      "formal_waves": 10,
+      "metrics": {
+        "ttft_ms": {
+          "median": 582.7134349383414,
+          "min": 579.1147900745273,
+          "max": 586.2349499948323,
+          "stdev": 1.909767295624993
+        },
+        "tpot_ms": {
+          "median": 53.938022163865256,
+          "min": 53.07579157492659,
+          "max": 54.58188842336728,
+          "stdev": 0.4344286265813981
+        },
+        "output_tokens_per_second": {
+          "median": 17.219028780164678,
+          "min": 17.040850368689288,
+          "max": 17.477873036528372,
+          "stdev": 0.12770267712970007
+        },
+        "wall_seconds": {
+          "median": 7.433638165006414,
+          "min": 7.323545590043068,
+          "max": 7.5113622401840985,
+          "stdev": 0.054888878807240624
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 1370328576,
+          "peak_reserved_bytes": 1509949440,
+          "decode_batch_histogram": {
+            "1": 1280
+          },
+          "observed_forward_count": 1290
+        },
+        {
+          "rank": 1,
+          "peak_allocated_bytes": 1370328576,
+          "peak_reserved_bytes": 1509949440,
+          "decode_batch_histogram": {
+            "1": 1280
+          },
+          "observed_forward_count": 1290
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-08b-v2-tp2-benchmark.json",
+      "model": "hw1-qwen35-model",
+      "tp": 2,
+      "input_tokens": 2048,
+      "concurrency": 4,
+      "output_tokens": 128,
+      "formal_waves": 10,
+      "metrics": {
+        "ttft_ms": {
+          "median": 1351.8003773642704,
+          "min": 1349.9683795962483,
+          "max": 1356.5009797457606,
+          "stdev": 2.099779424469591
+        },
+        "tpot_ms": {
+          "median": 61.099306615179515,
+          "min": 60.07792350403436,
+          "max": 61.68808507931045,
+          "stdev": 0.527682838328793
+        },
+        "output_tokens_per_second": {
+          "median": 55.676958985971766,
+          "min": 55.20753613619503,
+          "max": 56.47710770862948,
+          "stdev": 0.41093275899945353
+        },
+        "wall_seconds": {
+          "median": 9.195910054957494,
+          "min": 9.065620049834251,
+          "max": 9.274096180219203,
+          "stdev": 0.06753085365156225
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 1407032320,
+          "peak_reserved_bytes": 1509949440,
+          "decode_batch_histogram": {
+            "2": 20,
+            "3": 10,
+            "4": 1260,
+            "1": 10
+          },
+          "observed_forward_count": 1330
+        },
+        {
+          "rank": 1,
+          "peak_allocated_bytes": 1407032320,
+          "peak_reserved_bytes": 1509949440,
+          "decode_batch_histogram": {
+            "2": 20,
+            "3": 10,
+            "4": 1260,
+            "1": 10
+          },
+          "observed_forward_count": 1330
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-27b-v2-tp2-benchmark.json",
+      "model": "Qwen3.5-27B",
+      "tp": 2,
+      "input_tokens": 128,
+      "concurrency": 1,
+      "output_tokens": 32,
+      "formal_waves": 3,
+      "metrics": {
+        "ttft_ms": {
+          "median": 443.13035998493433,
+          "min": 437.763350084424,
+          "max": 445.1010897755623,
+          "stdev": 3.7976087861256
+        },
+        "tpot_ms": {
+          "median": 134.49334160935493,
+          "min": 133.36425547998758,
+          "max": 134.5371925872901,
+          "stdev": 0.6648984701294393
+        },
+        "output_tokens_per_second": {
+          "median": 6.9353595146089155,
+          "min": 6.934339540624769,
+          "max": 6.9985391120702385,
+          "stdev": 0.036774735113673324
+        },
+        "wall_seconds": {
+          "median": 4.614036220125854,
+          "min": 4.572382819838822,
+          "max": 4.614714900031686,
+          "stdev": 0.024246894561783135
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 27941983744,
+          "peak_reserved_bytes": 28527558656,
+          "decode_batch_histogram": {
+            "1": 93
+          },
+          "observed_forward_count": 96
+        },
+        {
+          "rank": 1,
+          "peak_allocated_bytes": 27941983744,
+          "peak_reserved_bytes": 28527558656,
+          "decode_batch_histogram": {
+            "1": 93
+          },
+          "observed_forward_count": 96
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-27b-v2-tp2-benchmark.json",
+      "model": "Qwen3.5-27B",
+      "tp": 2,
+      "input_tokens": 128,
+      "concurrency": 4,
+      "output_tokens": 32,
+      "formal_waves": 3,
+      "metrics": {
+        "ttft_ms": {
+          "median": 807.3756699450314,
+          "min": 795.740514760837,
+          "max": 831.7984300665557,
+          "stdev": 18.40299479391056
+        },
+        "tpot_ms": {
+          "median": 141.58805500295375,
+          "min": 137.45296226003236,
+          "max": 142.1615346860621,
+          "stdev": 2.5689986775222637
+        },
+        "output_tokens_per_second": {
+          "median": 13.125823955764442,
+          "min": 12.996499073413505,
+          "max": 13.328198839537038,
+          "stdev": 0.16718515365878128
+        },
+        "wall_seconds": {
+          "median": 9.751768759917468,
+          "min": 9.603698259685189,
+          "max": 9.848806149791926,
+          "stdev": 0.12343622230748802
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 27950242816,
+          "peak_reserved_bytes": 28527558656,
+          "decode_batch_histogram": {
+            "2": 3,
+            "3": 93,
+            "1": 97
+          },
+          "observed_forward_count": 202
+        },
+        {
+          "rank": 1,
+          "peak_allocated_bytes": 27950242816,
+          "peak_reserved_bytes": 28527558656,
+          "decode_batch_histogram": {
+            "2": 3,
+            "3": 93,
+            "1": 98
+          },
+          "observed_forward_count": 203
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-27b-v2-tp2-benchmark.json",
+      "model": "Qwen3.5-27B",
+      "tp": 2,
+      "input_tokens": 2048,
+      "concurrency": 1,
+      "output_tokens": 32,
+      "formal_waves": 3,
+      "metrics": {
+        "ttft_ms": {
+          "median": 2864.215620327741,
+          "min": 2860.596870072186,
+          "max": 2864.7787901572883,
+          "stdev": 2.269396735815248
+        },
+        "tpot_ms": {
+          "median": 131.8381877405749,
+          "min": 124.72925677655205,
+          "max": 132.41254257398748,
+          "stdev": 4.27979095227365
+        },
+        "output_tokens_per_second": {
+          "median": 4.6056998206995585,
+          "min": 4.591171988170342,
+          "max": 4.753946507017467,
+          "stdev": 0.09007744992333949
+        },
+        "wall_seconds": {
+          "median": 6.947912639938295,
+          "min": 6.731249489821494,
+          "max": 6.9698979002423584,
+          "stdev": 0.13189600454245415
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 28278560768,
+          "peak_reserved_bytes": 28932308992,
+          "decode_batch_histogram": {
+            "1": 96
+          },
+          "observed_forward_count": 99
+        },
+        {
+          "rank": 1,
+          "peak_allocated_bytes": 28278560768,
+          "peak_reserved_bytes": 28932308992,
+          "decode_batch_histogram": {
+            "1": 96
+          },
+          "observed_forward_count": 99
+        }
+      ]
+    },
+    {
+      "source": "results/hw2-27b-v2-tp2-benchmark.json",
+      "model": "Qwen3.5-27B",
+      "tp": 2,
+      "input_tokens": 2048,
+      "concurrency": 4,
+      "output_tokens": 32,
+      "formal_waves": 3,
+      "metrics": {
+        "ttft_ms": {
+          "median": 9225.944420089945,
+          "min": 9211.100935237482,
+          "max": 9242.24758008495,
+          "stdev": 15.579021972095955
+        },
+        "tpot_ms": {
+          "median": 178.71511741841752,
+          "min": 177.93500337809803,
+          "max": 229.1479670938345,
+          "stdev": 29.345211298292064
+        },
+        "output_tokens_per_second": {
+          "median": 6.469211071369138,
+          "min": 5.330080511830153,
+          "max": 6.479050276985185,
+          "stdev": 0.6605359897945461
+        },
+        "wall_seconds": {
+          "median": 19.786029329989105,
+          "min": 19.755981899797916,
+          "max": 24.014646629802883,
+          "stdev": 2.450113344280686
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "peak_allocated_bytes": 28278560768,
+          "peak_reserved_bytes": 28932308992,
+          "decode_batch_histogram": {
+            "1": 12,
+            "2": 186
+          },
+          "observed_forward_count": 210
+        },
+        {
+          "rank": 1,
+          "peak_allocated_bytes": 28278560768,
+          "peak_reserved_bytes": 28932308992,
+          "decode_batch_histogram": {
+            "1": 12,
+            "2": 186
+          },
+          "observed_forward_count": 210
+        }
+      ]
+    }
+  ],
+  "capacity": [
+    {
+      "model": "08b",
+      "tp": 1,
+      "rank": 0,
+      "pid": 1452968,
+      "logical_device": 0,
+      "visible_devices": "0",
+      "unique_parameter_count": 752393024,
+      "allocated_after_load_bytes": 1574239232,
+      "peak_allocated_bytes": 2139441664,
+      "peak_reserved_bytes": 2470445056,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 213909504,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                6144,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "08b",
+      "tp": 2,
+      "rank": 0,
+      "pid": 1453557,
+      "logical_device": 0,
+      "visible_devices": "0,1",
+      "unique_parameter_count": 376224288,
+      "allocated_after_load_bytes": 831084032,
+      "peak_allocated_bytes": 1287758848,
+      "peak_reserved_bytes": 1509949440,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 106954752,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "08b",
+      "tp": 2,
+      "rank": 1,
+      "pid": 1453558,
+      "logical_device": 1,
+      "visible_devices": "0,1",
+      "unique_parameter_count": 376224288,
+      "allocated_after_load_bytes": 831084032,
+      "peak_allocated_bytes": 1287758848,
+      "peak_reserved_bytes": 1509949440,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 106954752,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                3072,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                8,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "4b",
+      "tp": 1,
+      "rank": 0,
+      "pid": 1431081,
+      "logical_device": 0,
+      "visible_devices": "0",
+      "unique_parameter_count": 4205751296,
+      "allocated_after_load_bytes": 8512679936,
+      "peak_allocated_bytes": 9565995008,
+      "peak_reserved_bytes": 9862905856,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 570425344,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "4b",
+      "tp": 2,
+      "rank": 0,
+      "pid": 1431368,
+      "logical_device": 0,
+      "visible_devices": "0,1",
+      "unique_parameter_count": 2102962432,
+      "allocated_after_load_bytes": 4314440192,
+      "peak_allocated_bytes": 5076767232,
+      "peak_reserved_bytes": 5324668928,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 285212672,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "4b",
+      "tp": 2,
+      "rank": 1,
+      "pid": 1431369,
+      "logical_device": 1,
+      "visible_devices": "0,1",
+      "unique_parameter_count": 2102962432,
+      "allocated_after_load_bytes": 4314440192,
+      "peak_allocated_bytes": 5076767232,
+      "peak_reserved_bytes": 5324668928,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 285212672,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "9b",
+      "tp": 1,
+      "rank": 0,
+      "pid": 1454746,
+      "logical_device": 0,
+      "visible_devices": "0",
+      "unique_parameter_count": 8953803264,
+      "allocated_after_load_bytes": 17975446016,
+      "peak_allocated_bytes": 19029547520,
+      "peak_reserved_bytes": 19354615808,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 570425344,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                8192,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                32,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "9b",
+      "tp": 2,
+      "rank": 0,
+      "pid": 1454905,
+      "logical_device": 0,
+      "visible_devices": "0,1",
+      "unique_parameter_count": 4477038336,
+      "allocated_after_load_bytes": 9021917696,
+      "peak_allocated_bytes": 9785031168,
+      "peak_reserved_bytes": 10118758400,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 285212672,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "9b",
+      "tp": 2,
+      "rank": 1,
+      "pid": 1454906,
+      "logical_device": 1,
+      "visible_devices": "0,1",
+      "unique_parameter_count": 4477038336,
+      "allocated_after_load_bytes": 9021917696,
+      "peak_allocated_bytes": 9785031168,
+      "peak_reserved_bytes": 10118758400,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 16384,
+        "arena_bytes": 285212672,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                17,
+                4096,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                17,
+                16,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "27b",
+      "tp": 1,
+      "rank": 0,
+      "pid": 1455192,
+      "logical_device": 0,
+      "visible_devices": "0",
+      "unique_parameter_count": 26895998464,
+      "allocated_after_load_bytes": 53862913536,
+      "peak_allocated_bytes": 55458089984,
+      "peak_reserved_bytes": 56010735616,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 15360,
+        "arena_bytes": 1107296256,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "32": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "33": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "34": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "36": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "37": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "38": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "40": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "41": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "42": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "44": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "45": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "46": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "48": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "49": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "50": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "52": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "53": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "54": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "56": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "57": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "58": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "60": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "61": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "62": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                11,
+                10240,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                48,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "27b",
+      "tp": 2,
+      "rank": 0,
+      "pid": 1456120,
+      "logical_device": 0,
+      "visible_devices": "0,1",
+      "unique_parameter_count": 13448336640,
+      "allocated_after_load_bytes": 27032574464,
+      "peak_allocated_bytes": 28066488320,
+      "peak_reserved_bytes": 28527558656,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 15360,
+        "arena_bytes": 553648128,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "32": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "33": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "34": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "36": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "37": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "38": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "40": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "41": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "42": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "44": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "45": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "46": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "48": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "49": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "50": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "52": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "53": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "54": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "56": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "57": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "58": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "60": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "61": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "62": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "27b",
+      "tp": 2,
+      "rank": 1,
+      "pid": 1456121,
+      "logical_device": 1,
+      "visible_devices": "0,1",
+      "unique_parameter_count": 13448336640,
+      "allocated_after_load_bytes": 27032574464,
+      "peak_allocated_bytes": 28066488320,
+      "peak_reserved_bytes": 28527558656,
+      "cache": {
+        "pool_type": "HybridMHATokenToKVPool",
+        "token_capacity": 15360,
+        "arena_bytes": 553648128,
+        "states": {
+          "0": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "1": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "2": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "4": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "26": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "28": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "29": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "30": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "32": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "33": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "34": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "36": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "37": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "38": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "40": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "41": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "42": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "44": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "45": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "46": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "48": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "49": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "50": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "52": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "5": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "6": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "53": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "54": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "56": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "57": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "58": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "60": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "61": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "62": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "8": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "9": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "10": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "13": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "16": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "18": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "21": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "24": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "12": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "14": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "17": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "20": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "22": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ],
+          "25": [
+            {
+              "shape": [
+                11,
+                5120,
+                3
+              ],
+              "dtype": "torch.float16"
+            },
+            {
+              "shape": [
+                11,
+                24,
+                128,
+                128
+              ],
+              "dtype": "torch.float32"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "source_manifest": {
+    "runs": {
+      "hw2-08b-v2-tp1-benchmark": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-08b-v2-tp1-capture": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-08b-v2-tp1-profile": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-08b-v2-tp2-benchmark": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-08b-v2-tp2-capture": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-08b-v2-tp2-profile": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-27b-v2-tp1-capture": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-27b-v2-tp2-benchmark": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-27b-v2-tp2-capture": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-4b-v2-tp1-capture": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-4b-v2-tp2-capture": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-9b-v2-tp1-capture": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      },
+      "hw2-9b-v2-tp2-capture": {
+        "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+        "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+      }
+    },
+    "same_kernel_sources": true,
+    "current_source_matches": true
+  },
+  "validation": {
+    "convolution_passed": 40,
+    "backend_and_measurement_passed": 56,
+    "gdn_head_partition_passed": 3,
+    "real_hccl_ranks": [
+      {
+        "rank": 0,
+        "pid": 1385013,
+        "device": "npu:0",
+        "visible": "0,1",
+        "all_reduce": true,
+        "all_gather": true,
+        "reduce_scatter": true,
+        "allocated": 7168
+      },
+      {
+        "rank": 1,
+        "pid": 1385014,
+        "device": "npu:1",
+        "visible": "0,1",
+        "all_reduce": true,
+        "all_gather": true,
+        "reduce_scatter": true,
+        "allocated": 7168
+      }
+    ],
+    "http_tp2_passed": true,
+    "weights_08b_sha256_verified": true,
+    "precommit_log": "hw2-evidence/precommit-submission-final.log",
+    "precommit_all_files_passed": true
+  }
+}

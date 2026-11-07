@@ -1,0 +1,188 @@
+{
+  "config": {
+    "model": "/home/course-user/models/Qwen3.5-4B",
+    "device": "npu",
+    "dtype": "float16",
+    "kv_cache_dtype": "float16",
+    "attention_backend": "mha",
+    "sampling_backend": "greedy",
+    "disable_prefill_graph": true,
+    "disable_pdl": true,
+    "enforce_eager": true,
+    "enable_prefix_caching": false,
+    "disable_kvstore": true,
+    "language_model_only": true,
+    "enable_output_logprobs": true,
+    "seed": 2026,
+    "mamba_ssm_dtype": "float32",
+    "world_size": 2,
+    "max_model_len": 4096,
+    "max_num_seqs": 1,
+    "max_total_tokens": 16384,
+    "chunked_prefill_size": 4096,
+    "prefix_granularity": 128,
+    "retraction_snapshot_ratio": 0,
+    "disable_autotune": true,
+    "log_level": "info",
+    "attn_tp_size": 2,
+    "dense_tp_size": 2,
+    "disable_overlap_schedule": false,
+    "enable_allreduce_fusion": false
+  },
+  "arguments": {
+    "model": "/home/course-user/models/Qwen3.5-4B",
+    "tp": 2,
+    "mode": "capture",
+    "lengths": [
+      128
+    ],
+    "concurrencies": [
+      1
+    ],
+    "output_tokens": 32,
+    "warmups": 0,
+    "repeats": 1,
+    "overlap": "on",
+    "work_dir": "/home/course-user/hw2-runs/4b-v2-tp2-capture",
+    "output": "results/hw2-4b-v2-tp2-capture.json"
+  },
+  "trials": [
+    {
+      "wall_seconds": 8.115329340100288,
+      "output_tokens": 32,
+      "output_tokens_per_second": 3.943154819592885,
+      "ttft_ms": 5755.24833984673,
+      "tpot_ms": 76.11049322651759,
+      "requests": [
+        {
+          "index": 0,
+          "output_ids": [
+            13,
+            79091,
+            279,
+            1067,
+            9077,
+            13,
+            220,
+            561,
+            3302,
+            1809,
+            7574,
+            10727,
+            3992,
+            1558,
+            42903,
+            13,
+            79091,
+            279,
+            1067,
+            9077,
+            13,
+            271,
+            248068,
+            198,
+            90700,
+            8340,
+            25,
+            271,
+            16,
+            13,
+            220,
+            2972
+          ],
+          "text": ". Explain the result clearly.  The research group studies efficient language model inference. Explain the result clearly.\n\n<think>\nThinking Process:\n\n1.  **",
+          "meta_info": {
+            "id": "56d08e8bf9154205bf0332d4e9f0faf9",
+            "finish_reason": {
+              "type": "length",
+              "length": 32
+            },
+            "prompt_tokens": 128,
+            "weight_version": "default",
+            "completion_tokens": 32,
+            "cached_tokens": 0,
+            "e2e_latency": 8.113715410232544
+          },
+          "ttft_ms": 5755.24833984673,
+          "tpot_ms": 76.11049322651759,
+          "wall_seconds": 8.114673629868776,
+          "input_tokens": 128,
+          "output_tokens": 32
+        }
+      ],
+      "id": "length-128-c1-r0",
+      "input_tokens": 128,
+      "concurrency": 1,
+      "warmup": false
+    }
+  ],
+  "source_sha256": {
+    "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+    "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+  },
+  "visible_devices": "0,1",
+  "eos_check": {
+    "wall_seconds": 4.215508960187435,
+    "output_tokens": 3,
+    "output_tokens_per_second": 0.7116578397372474,
+    "ttft_ms": 4066.7399098165333,
+    "tpot_ms": 74.18864499777555,
+    "requests": [
+      {
+        "index": 0,
+        "input_ids": [
+          248045,
+          846,
+          198,
+          3710,
+          369,
+          220,
+          16,
+          22,
+          478,
+          220,
+          17,
+          20,
+          30,
+          21134,
+          25899,
+          13,
+          248046,
+          198,
+          248045,
+          74455,
+          198,
+          248068,
+          271,
+          248069,
+          271
+        ],
+        "output_ids": [
+          19,
+          17,
+          248046
+        ],
+        "text": "42",
+        "meta_info": {
+          "id": "011f7c9ac5b646ffb77b8c197c75c510",
+          "finish_reason": {
+            "type": "stop",
+            "matched": 248046
+          },
+          "prompt_tokens": 25,
+          "weight_version": "default",
+          "completion_tokens": 3,
+          "cached_tokens": 0,
+          "e2e_latency": 4.214439392089844
+        },
+        "ttft_ms": 4066.7399098165333,
+        "tpot_ms": 74.18864499777555,
+        "wall_seconds": 4.215117199812084
+      }
+    ]
+  },
+  "eos_check_passed": true,
+  "completed": true,
+  "raw_result_file": "/home/course-user/hw2-runs/4b-v2-tp2-capture/result-full-before-compaction.json"
+}

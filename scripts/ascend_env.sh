@@ -19,10 +19,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Source from the repository root after choosing one physical chip explicitly.
-if [[ -z "${ASCEND_RT_VISIBLE_DEVICES:-}" || "${ASCEND_RT_VISIBLE_DEVICES}" == *,* ]]; then
-    echo 'Set ASCEND_RT_VISIBLE_DEVICES to exactly one physical device ID.' >&2
+# Source from the repository root after choosing the physical chips explicitly.
+if [[ ! "${ASCEND_RT_VISIBLE_DEVICES:-}" =~ ^[0-9]+(,[0-9]+)?$ ]]; then
+    echo 'Set ASCEND_RT_VISIBLE_DEVICES to one or two physical device IDs.' >&2
     return 1
+fi
+if [[ "${ASCEND_RT_VISIBLE_DEVICES}" == *,* ]]; then
+    IFS=, read -r _ascend_first _ascend_second <<< "${ASCEND_RT_VISIBLE_DEVICES}"
+    if [[ "${_ascend_first}" == "${_ascend_second}" ]]; then
+        echo 'Physical device IDs must be distinct.' >&2
+        return 1
+    fi
+    unset _ascend_first _ascend_second
 fi
 source .venv/bin/activate
 # CANN's script expands optional variables, including under a caller's `set -u`.

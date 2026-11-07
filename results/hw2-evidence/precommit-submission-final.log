@@ -1,0 +1,17 @@
+check for broken symlinks............................(no files to check)Skipped
+trim trailing whitespace.................................................Passed
+fix end of files.........................................................Passed
+check yaml...............................................................Passed
+check toml...............................................................Passed
+check python ast.........................................................Passed
+check for added large files..............................................Passed
+check for merge conflicts................................................Passed
+check that scripts with shebangs are executable..........................Passed
+detect private key.......................................................Passed
+debug statements (python)................................................Passed
+don't commit to branch...................................................Passed
+clang-format.............................................................Passed
+isort....................................................................Passed
+black-jupyter............................................................Passed
+nbstripout...........................................(no files to check)Skipped
+AMD ops README line length...............................................Passed

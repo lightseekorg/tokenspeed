@@ -204,3 +204,61 @@ def test_ragged_prefill_and_split_equivalence():
         packed.final_state[2:3], second.final_state, atol=0, rtol=0
     )
     torch.testing.assert_close(initial, before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("value_heads", [16, 32, 48])
+def test_tp_head_partition_preserves_recurrence_exactly(value_heads):
+    torch.manual_seed(53 + value_heads)
+    length, key_heads, dim = 7, 16, 128
+    q, k = [
+        torch.randn(1, length, key_heads, dim, dtype=torch.float16).npu()
+        for _ in range(2)
+    ]
+    v = torch.randn(1, length, value_heads, dim, dtype=torch.float16).npu()
+    g = -torch.rand(1, length, value_heads).npu() / 8
+    beta = torch.rand(1, length, value_heads, dtype=torch.float16).npu()
+    state = torch.randn(1, value_heads, dim, dim).npu() * 0.01
+    original_state = state.clone()
+    bounds = torch.tensor([0, length], dtype=torch.int32, device="npu")
+
+    def run(q, k, v, g, beta, state):
+        return gdn_chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=dim**-0.5,
+            initial_state=state,
+            cu_seqlens=bounds,
+            qk_l2norm=True,
+            output_final_state=True,
+            output_h=False,
+            solution="ascend",
+        )
+
+    full = run(q, k, v, g, beta, state)
+    parts = []
+    for rank in range(2):
+        key = slice(rank * key_heads // 2, (rank + 1) * key_heads // 2)
+        value = slice(rank * value_heads // 2, (rank + 1) * value_heads // 2)
+        parts.append(
+            run(
+                q[:, :, key].contiguous(),
+                k[:, :, key].contiguous(),
+                v[:, :, value].contiguous(),
+                g[:, :, value].contiguous(),
+                beta[:, :, value].contiguous(),
+                state[:, value].contiguous(),
+            )
+        )
+    torch.testing.assert_close(
+        torch.cat([p.out for p in parts], dim=2), full.out, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        torch.cat([p.final_state for p in parts], dim=1),
+        full.final_state,
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(state, original_state, atol=0, rtol=0)

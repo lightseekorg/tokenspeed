@@ -385,7 +385,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
                     matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
 
-            acc += matrix_x * matrix_w  # [BLOCK_N]
+            # Promote before multiplication: a half product would round before the FP32 sum.
+            acc = tl.fma(matrix_x.to(tl.float32), matrix_w.to(tl.float32), acc)
 
         if KERNEL_WIDTH == 2:
             col0 = matrix_x
@@ -641,7 +642,8 @@ def _causal_conv1d_update_kernel(
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
                     matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
 
-            acc += matrix_x * matrix_w  # [BLOCK_N]
+            # Promote before multiplication: a half product would round before the FP32 sum.
+            acc = tl.fma(matrix_x.to(tl.float32), matrix_w.to(tl.float32), acc)
 
         if KERNEL_WIDTH == 2:
             col0 = matrix_x
@@ -816,7 +818,7 @@ def _causal_conv1d_tree_update_kernel(
         )
         values = values + (tl.where(node >= 0, from_x, from_init),)
     for c in tl.static_range(KERNEL_WIDTH):
-        acc += values[c] * weights[c]
+        acc = tl.fma(values[c].to(tl.float32), weights[c].to(tl.float32), acc)
         if c > 0:
             if out_row >= 0:
                 tl.store(

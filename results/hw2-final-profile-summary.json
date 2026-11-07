@@ -1,0 +1,1541 @@
+{
+  "method": "Union of official profiler Computing and Communication device intervals; overlap is their intersection; idle is the complement between first and last device task. Never add ranks or use profiler latency as benchmark latency.",
+  "traces": [
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp1-profile/length-128-c1-r3/profile-0/5664fbce7f43_1460379_20261107093810282_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "f1a029a2c58e223c80d3952adb1c6d3b3eb2b93ac792beb70165c85bd38d5aa3",
+      "rank": "rank-0",
+      "request": "length-128-c1-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 128,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 130.1293601281941,
+      "diagnostic_event_span_ms": 129.86436462402344,
+      "compute_ms": 71.57746000000003,
+      "communication_ms": 0,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 0.0,
+      "device_active_union_ms": 71.57746000000003,
+      "device_first_to_last_ms": 129.6687,
+      "idle_between_tasks_ms": 58.09123999999997,
+      "kernel_families": {
+        "other_device_math": {
+          "count": 421,
+          "duration_sum_ms": 3.4908400000000013
+        },
+        "device_indexing": {
+          "count": 146,
+          "duration_sum_ms": 3.223439999999999
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 1.2787599999999995
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 2.14442
+        },
+        "dtype_layout_device_copy": {
+          "count": 366,
+          "duration_sum_ms": 1.8320800000000022
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 49.97636000000001
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 9.428259999999998
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.2033
+        }
+      },
+      "collectives": {},
+      "hccl_op_count": 0,
+      "hccl_wait_sum_ms": 0,
+      "hccl_sdma_copy_time_sum_ms": 0,
+      "experiment": "08b-v2-tp1-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp1-profile/length-128-c1-r3/profile-1/5664fbce7f43_1460379_20261107093814371_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "1a84090713320b0f2b9f121c9363588b44afdd6bff7d8de255f1363b1e567853",
+      "rank": "rank-0",
+      "request": "length-128-c1-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 1,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 66.31951034069061,
+      "diagnostic_event_span_ms": 65.97454071044922,
+      "compute_ms": 7.281540000000055,
+      "communication_ms": 0,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 0.0,
+      "device_active_union_ms": 7.281540000000055,
+      "device_first_to_last_ms": 65.54216,
+      "idle_between_tasks_ms": 58.26061999999994,
+      "kernel_families": {
+        "other_device_math": {
+          "count": 169,
+          "duration_sum_ms": 0.5891200000000002
+        },
+        "device_indexing": {
+          "count": 19,
+          "duration_sum_ms": 1.2942399999999998
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.16118000000000005
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.6354200000000005
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 2.90804
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.4054
+        },
+        "dtype_layout_device_copy": {
+          "count": 132,
+          "duration_sum_ms": 0.2038399999999999
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.0843
+        }
+      },
+      "collectives": {},
+      "hccl_op_count": 0,
+      "hccl_wait_sum_ms": 0,
+      "hccl_sdma_copy_time_sum_ms": 0,
+      "experiment": "08b-v2-tp1-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp1-profile/length-128-c4-r3/profile-0/5664fbce7f43_1460379_20261107093821392_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "63659298d69856dcb06a9b890505257c3c329b2d68d6319620a70c423af9dc33",
+      "rank": "rank-0",
+      "request": "length-128-c4-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 384,
+      "batch_size": 3,
+      "diagnostic_forward_wall_ms": 240.54333986714482,
+      "diagnostic_event_span_ms": 240.28688049316406,
+      "compute_ms": 189.89222000000012,
+      "communication_ms": 0,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 0.0,
+      "device_active_union_ms": 189.89222000000012,
+      "device_first_to_last_ms": 240.1114,
+      "idle_between_tasks_ms": 50.21917999999988,
+      "kernel_families": {
+        "other_device_math": {
+          "count": 445,
+          "duration_sum_ms": 6.626599999999997
+        },
+        "device_indexing": {
+          "count": 146,
+          "duration_sum_ms": 4.805700000000002
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 3.462180000000001
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 3.0532999999999997
+        },
+        "dtype_layout_device_copy": {
+          "count": 360,
+          "duration_sum_ms": 2.6373400000000022
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 144.92065999999997
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 23.830299999999998
+        },
+        "attention": {
+          "count": 18,
+          "duration_sum_ms": 0.55614
+        }
+      },
+      "collectives": {},
+      "hccl_op_count": 0,
+      "hccl_wait_sum_ms": 0,
+      "hccl_sdma_copy_time_sum_ms": 0,
+      "experiment": "08b-v2-tp1-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp1-profile/length-128-c4-r3/profile-1/5664fbce7f43_1460379_20261107093825587_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "86bef6545a7fe11e977463e35c2f18a489395e3401115433c245c8c455010cae",
+      "rank": "rank-0",
+      "request": "length-128-c4-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 3,
+      "batch_size": 3,
+      "diagnostic_forward_wall_ms": 54.829690139740705,
+      "diagnostic_event_span_ms": 54.48754119873047,
+      "compute_ms": 11.750579999999982,
+      "communication_ms": 0,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 0.0,
+      "device_active_union_ms": 11.750579999999982,
+      "device_first_to_last_ms": 54.20156000000001,
+      "idle_between_tasks_ms": 42.45098000000003,
+      "kernel_families": {
+        "other_device_math": {
+          "count": 175,
+          "duration_sum_ms": 0.7441599999999997
+        },
+        "device_indexing": {
+          "count": 19,
+          "duration_sum_ms": 1.29988
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.18159999999999998
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.7437600000000002
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 6.1802600000000005
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 1.03152
+        },
+        "dtype_layout_device_copy": {
+          "count": 192,
+          "duration_sum_ms": 0.47458
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.09481999999999999
+        }
+      },
+      "collectives": {},
+      "hccl_op_count": 0,
+      "hccl_wait_sum_ms": 0,
+      "hccl_sdma_copy_time_sum_ms": 0,
+      "experiment": "08b-v2-tp1-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp1-profile/length-2048-c1-r3/profile-0/5664fbce7f43_1460379_20261107093834245_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "fe9dbd7739091d10ed62a5924d2c2676b98fc1334e5d8d96454644e15c700edd",
+      "rank": "rank-0",
+      "request": "length-2048-c1-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 2048,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 1009.788169991225,
+      "diagnostic_event_span_ms": 1009.2385864257812,
+      "compute_ms": 982.6718600000012,
+      "communication_ms": 0,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 0.0,
+      "device_active_union_ms": 982.6718600000012,
+      "device_first_to_last_ms": 1008.9112999999999,
+      "idle_between_tasks_ms": 26.239439999998694,
+      "kernel_families": {
+        "other_device_math": {
+          "count": 415,
+          "duration_sum_ms": 25.284720000000014
+        },
+        "device_indexing": {
+          "count": 146,
+          "duration_sum_ms": 7.337139999999999
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 18.23146
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 11.704900000000002
+        },
+        "dtype_layout_device_copy": {
+          "count": 372,
+          "duration_sum_ms": 3.9079399999999986
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 767.3373
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 146.99046
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 1.8779400000000002
+        }
+      },
+      "collectives": {},
+      "hccl_op_count": 0,
+      "hccl_wait_sum_ms": 0,
+      "hccl_sdma_copy_time_sum_ms": 0,
+      "experiment": "08b-v2-tp1-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp1-profile/length-2048-c1-r3/profile-1/5664fbce7f43_1460379_20261107093839075_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "bac8cb57f70b62e3d3deabb39eec2fcf335f9f760f0b4e5fc6e7b5d2298cee64",
+      "rank": "rank-0",
+      "request": "length-2048-c1-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 1,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 55.89431989938021,
+      "diagnostic_event_span_ms": 55.649818420410156,
+      "compute_ms": 7.469140000000005,
+      "communication_ms": 0,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 0.0,
+      "device_active_union_ms": 7.469140000000005,
+      "device_first_to_last_ms": 55.371719999999996,
+      "idle_between_tasks_ms": 47.90257999999999,
+      "kernel_families": {
+        "other_device_math": {
+          "count": 169,
+          "duration_sum_ms": 0.5858599999999998
+        },
+        "device_indexing": {
+          "count": 19,
+          "duration_sum_ms": 1.3196799999999997
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.15929999999999997
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.6621000000000004
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 2.90438
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.38702
+        },
+        "dtype_layout_device_copy": {
+          "count": 132,
+          "duration_sum_ms": 0.19843999999999998
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.25236000000000003
+        }
+      },
+      "collectives": {},
+      "hccl_op_count": 0,
+      "hccl_wait_sum_ms": 0,
+      "hccl_sdma_copy_time_sum_ms": 0,
+      "experiment": "08b-v2-tp1-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp1-profile/length-2048-c4-r3/profile-0/5664fbce7f43_1460379_20261107093856638_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "53fb68efd2551903f7a59f72f54d6329220a3a0eee808b7974e9296a8a481c2e",
+      "rank": "rank-0",
+      "request": "length-2048-c4-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 4096,
+      "batch_size": 2,
+      "diagnostic_forward_wall_ms": 1935.1054299622774,
+      "diagnostic_event_span_ms": 1934.8302001953125,
+      "compute_ms": 1923.0843399999983,
+      "communication_ms": 0,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 0.0,
+      "device_active_union_ms": 1923.0843399999983,
+      "device_first_to_last_ms": 1934.62258,
+      "idle_between_tasks_ms": 11.538240000001679,
+      "kernel_families": {
+        "other_device_math": {
+          "count": 421,
+          "duration_sum_ms": 53.20932000000002
+        },
+        "device_indexing": {
+          "count": 140,
+          "duration_sum_ms": 11.680939999999993
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 35.904900000000005
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 19.553580000000007
+        },
+        "dtype_layout_device_copy": {
+          "count": 360,
+          "duration_sum_ms": 9.183319999999997
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 1532.4559599999998
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 257.2408
+        },
+        "attention": {
+          "count": 12,
+          "duration_sum_ms": 3.8555200000000003
+        }
+      },
+      "collectives": {},
+      "hccl_op_count": 0,
+      "hccl_wait_sum_ms": 0,
+      "hccl_sdma_copy_time_sum_ms": 0,
+      "experiment": "08b-v2-tp1-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp1-profile/length-2048-c4-r3/profile-1/5664fbce7f43_1460379_20261107093902587_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "f33d0e1fedc5966bb65333c71b7e78af528c6a03b7b9832aff0a5efeecce338a",
+      "rank": "rank-0",
+      "request": "length-2048-c4-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 2,
+      "batch_size": 2,
+      "diagnostic_forward_wall_ms": 57.11888009682298,
+      "diagnostic_event_span_ms": 56.84115982055664,
+      "compute_ms": 11.053180000000033,
+      "communication_ms": 0,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 0.0,
+      "device_active_union_ms": 11.053180000000033,
+      "device_first_to_last_ms": 56.55572,
+      "idle_between_tasks_ms": 45.50253999999997,
+      "kernel_families": {
+        "other_device_math": {
+          "count": 175,
+          "duration_sum_ms": 0.7065400000000002
+        },
+        "device_indexing": {
+          "count": 19,
+          "duration_sum_ms": 1.3897399999999998
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.17209999999999998
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.7073399999999994
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 5.62656
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.78376
+        },
+        "dtype_layout_device_copy": {
+          "count": 192,
+          "duration_sum_ms": 0.4176599999999998
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.24948
+        }
+      },
+      "collectives": {},
+      "hccl_op_count": 0,
+      "hccl_wait_sum_ms": 0,
+      "hccl_sdma_copy_time_sum_ms": 0,
+      "experiment": "08b-v2-tp1-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-0/length-128-c1-r3/profile-0/5664fbce7f43_1463484_20261107093945218_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "efddcc8cea9c96b33305bfa68ed38a4f3c1f82a117eb6d5a40151f7ad347bc3f",
+      "rank": "rank-0",
+      "request": "length-128-c1-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 128,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 123.53766011074185,
+      "diagnostic_event_span_ms": 123.20236206054688,
+      "compute_ms": 40.693820000000144,
+      "communication_ms": 45.94152000000001,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 45.94152000000001,
+      "device_active_union_ms": 86.63534000000016,
+      "device_first_to_last_ms": 122.968,
+      "idle_between_tasks_ms": 36.33265999999985,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 362,
+          "duration_sum_ms": 1.5541200000000013
+        },
+        "other_device_math": {
+          "count": 484,
+          "duration_sum_ms": 12.822799999999999
+        },
+        "device_indexing": {
+          "count": 147,
+          "duration_sum_ms": 3.473840000000001
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.9421200000000002
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.2587800000000002
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 25.82884
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 4.56194
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.19344000000000003
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 12845056
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 248320
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 43.93471999999999,
+      "hccl_sdma_copy_time_sum_ms": 0.14632000000000003,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-0/length-128-c1-r3/profile-1/5664fbce7f43_1463484_20261107093950496_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "359242c21bfdbae043873e847e6bd5dac21279b045be60c1f2891486e3c65c69",
+      "rank": "rank-0",
+      "request": "length-128-c1-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 1,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 77.27577025070786,
+      "diagnostic_event_span_ms": 76.76286315917969,
+      "compute_ms": 6.246080000000009,
+      "communication_ms": 62.32134,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 62.321340000000006,
+      "device_active_union_ms": 68.56742000000001,
+      "device_first_to_last_ms": 76.18755999999999,
+      "idle_between_tasks_ms": 7.620139999999978,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 140,
+          "duration_sum_ms": 0.18967999999999996
+        },
+        "other_device_math": {
+          "count": 232,
+          "duration_sum_ms": 9.80372
+        },
+        "device_indexing": {
+          "count": 20,
+          "duration_sum_ms": 1.5144399999999998
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.1509
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 0.9779399999999994
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 2.6999600000000004
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.23621999999999996
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.08002
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 100352
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 248320
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 61.72537999999998,
+      "hccl_sdma_copy_time_sum_ms": 0.06607999999999999,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-0/length-128-c4-r3/profile-0/5664fbce7f43_1463484_20261107093957576_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "268c0ebfd7e16a79a1d1972dba3c63a79caa3b66c0677dfa2655da5d03aedf63",
+      "rank": "rank-0",
+      "request": "length-128-c4-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 384,
+      "batch_size": 3,
+      "diagnostic_forward_wall_ms": 171.53326980769634,
+      "diagnostic_event_span_ms": 171.21287536621094,
+      "compute_ms": 102.47794000000019,
+      "communication_ms": 45.88052,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 45.88051999999999,
+      "device_active_union_ms": 148.35846000000018,
+      "device_first_to_last_ms": 171.01244,
+      "idle_between_tasks_ms": 22.65397999999982,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 350,
+          "duration_sum_ms": 1.9715800000000008
+        },
+        "other_device_math": {
+          "count": 508,
+          "duration_sum_ms": 14.427240000000005
+        },
+        "device_indexing": {
+          "count": 147,
+          "duration_sum_ms": 4.30576
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 2.514560000000001
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.9347599999999994
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 75.07994000000001
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 11.23298
+        },
+        "attention": {
+          "count": 18,
+          "duration_sum_ms": 0.54794
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 38535168
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 744960
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 44.496739999999996,
+      "hccl_sdma_copy_time_sum_ms": 0.30349999999999994,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-0/length-128-c4-r3/profile-1/5664fbce7f43_1463484_20261107094002999_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "c60e25169acff22b38fe1e8b6ddb25e426913941ac6c1e2fab565dc4c3e71630",
+      "rank": "rank-0",
+      "request": "length-128-c4-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 3,
+      "batch_size": 3,
+      "diagnostic_forward_wall_ms": 84.17916018515825,
+      "diagnostic_event_span_ms": 83.65087890625,
+      "compute_ms": 7.612660000000065,
+      "communication_ms": 14.925880000000028,
+      "overlap_ms": 3.552713678800501e-15,
+      "exposed_communication_ms": 14.925880000000024,
+      "device_active_union_ms": 22.53854000000009,
+      "device_first_to_last_ms": 82.87026,
+      "idle_between_tasks_ms": 60.33171999999991,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 200,
+          "duration_sum_ms": 0.4042799999999998
+        },
+        "other_device_math": {
+          "count": 238,
+          "duration_sum_ms": 9.831899999999994
+        },
+        "device_indexing": {
+          "count": 20,
+          "duration_sum_ms": 1.40508
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.15770000000000003
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.0538599999999998
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 3.4405799999999997
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.53554
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.0834
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 301056
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 744960
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 12.521679999999998,
+      "hccl_sdma_copy_time_sum_ms": 0.07904000000000001,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-0/length-2048-c1-r3/profile-0/5664fbce7f43_1463484_20261107094010822_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "48627d563c383c22536bd99db19d72ef4d56844987fd1cf61324af92ca100c06",
+      "rank": "rank-0",
+      "request": "length-2048-c1-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 2048,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 542.1700100414455,
+      "diagnostic_event_span_ms": 541.7700805664062,
+      "compute_ms": 498.7520800000004,
+      "communication_ms": 19.710400000000057,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 19.710400000000107,
+      "device_active_union_ms": 518.4624800000005,
+      "device_first_to_last_ms": 541.4690400000001,
+      "idle_between_tasks_ms": 23.00655999999958,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 380,
+          "duration_sum_ms": 2.718820000000001
+        },
+        "other_device_math": {
+          "count": 478,
+          "duration_sum_ms": 27.11288
+        },
+        "device_indexing": {
+          "count": 147,
+          "duration_sum_ms": 7.7503400000000005
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 12.891159999999994
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 6.568800000000003
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 381.2921
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 70.46684
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.9783000000000001
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 205520896
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 248320
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 18.132780000000004,
+      "hccl_sdma_copy_time_sum_ms": 1.39424,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-0/length-2048-c1-r3/profile-1/5664fbce7f43_1463484_20261107094016544_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "472066e49c2c187797f48a826709140e5c2e52faf4f6755b48c11ac75997ae77",
+      "rank": "rank-0",
+      "request": "length-2048-c1-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 1,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 85.0942200049758,
+      "diagnostic_event_span_ms": 84.6547622680664,
+      "compute_ms": 6.30579999999999,
+      "communication_ms": 40.63388000000001,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 40.63388000000001,
+      "device_active_union_ms": 46.93968,
+      "device_first_to_last_ms": 84.1242,
+      "idle_between_tasks_ms": 37.18452,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 140,
+          "duration_sum_ms": 0.18964000000000003
+        },
+        "other_device_math": {
+          "count": 232,
+          "duration_sum_ms": 9.658019999999997
+        },
+        "device_indexing": {
+          "count": 20,
+          "duration_sum_ms": 1.3836600000000001
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.15192000000000003
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 0.9975799999999998
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 2.68868
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.22974
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.24436000000000002
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 100352
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 248320
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 39.02183999999999,
+      "hccl_sdma_copy_time_sum_ms": 0.06806000000000001,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-0/length-2048-c4-r3/profile-0/5664fbce7f43_1463484_20261107094029189_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "eca9c112b2d0ece19a65500adc3b2adff4abd4a99a338b92109dfd98e1ac8833",
+      "rank": "rank-0",
+      "request": "length-2048-c4-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 4096,
+      "batch_size": 2,
+      "diagnostic_forward_wall_ms": 1023.186500184238,
+      "diagnostic_event_span_ms": 1022.697998046875,
+      "compute_ms": 981.7119000000004,
+      "communication_ms": 9.470559999999937,
+      "overlap_ms": 1.1368683772161603e-13,
+      "exposed_communication_ms": 9.470559999999864,
+      "device_active_union_ms": 991.1824600000002,
+      "device_first_to_last_ms": 1022.3834599999999,
+      "idle_between_tasks_ms": 31.20099999999968,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 368,
+          "duration_sum_ms": 3.9304199999999985
+        },
+        "other_device_math": {
+          "count": 484,
+          "duration_sum_ms": 44.68421999999997
+        },
+        "device_indexing": {
+          "count": 141,
+          "duration_sum_ms": 12.801999999999992
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 24.226020000000005
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 11.093579999999996
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 757.2036600000001
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 140.1867
+        },
+        "attention": {
+          "count": 12,
+          "duration_sum_ms": 1.9650999999999998
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 411041792
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 496640
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 8.21124,
+      "hccl_sdma_copy_time_sum_ms": 2.65012,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-0/length-2048-c4-r3/profile-1/5664fbce7f43_1463484_20261107094035453_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "313426b5e33407aec0d6f36c7b5b2c169a04bd27cae57e8ff363bbbc152036db",
+      "rank": "rank-0",
+      "request": "length-2048-c4-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 2,
+      "batch_size": 2,
+      "diagnostic_forward_wall_ms": 92.72775985300541,
+      "diagnostic_event_span_ms": 92.26709747314453,
+      "compute_ms": 7.37868000000007,
+      "communication_ms": 66.34732000000001,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 66.34732000000001,
+      "device_active_union_ms": 73.72600000000008,
+      "device_first_to_last_ms": 91.88514,
+      "idle_between_tasks_ms": 18.159139999999923,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 200,
+          "duration_sum_ms": 0.38322000000000017
+        },
+        "other_device_math": {
+          "count": 238,
+          "duration_sum_ms": 10.007699999999993
+        },
+        "device_indexing": {
+          "count": 20,
+          "duration_sum_ms": 1.56508
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.15375999999999998
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.03286
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 3.0522400000000003
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.41112000000000004
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.24653999999999998
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 200704
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 496640
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 64.94214000000002,
+      "hccl_sdma_copy_time_sum_ms": 0.07273999999999997,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-1/length-128-c1-r3/profile-0/5664fbce7f43_1463485_20261107093945219_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "35c790afc2b17066511c43aa8677541b2c55806da432ab4e6de9ccefb85fbb05",
+      "rank": "rank-1",
+      "request": "length-128-c1-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 128,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 116.12884001806378,
+      "diagnostic_event_span_ms": 115.66586303710938,
+      "compute_ms": 40.885716999999914,
+      "communication_ms": 19.726052000000035,
+      "overlap_ms": 7.105427357601002e-15,
+      "exposed_communication_ms": 19.72605200000003,
+      "device_active_union_ms": 60.611768999999946,
+      "device_first_to_last_ms": 115.320198,
+      "idle_between_tasks_ms": 54.70842900000006,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 362,
+          "duration_sum_ms": 1.5956459999999997
+        },
+        "other_device_math": {
+          "count": 484,
+          "duration_sum_ms": 12.897513499999992
+        },
+        "device_indexing": {
+          "count": 147,
+          "duration_sum_ms": 3.6545230000000006
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.9762149999999999
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.2586845000000004
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 25.7851285
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 4.560074500000001
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.198048
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 12845056
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 248320
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 17.121186499999997,
+      "hccl_sdma_copy_time_sum_ms": 0.151194,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-1/length-128-c1-r3/profile-1/5664fbce7f43_1463485_20261107093950494_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "6b25dd3b5c37d8b77e083d8f50920e43fac35fb48873f2356f58d966c18c4f61",
+      "rank": "rank-1",
+      "request": "length-128-c1-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 1,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 72.90865015238523,
+      "diagnostic_event_span_ms": 72.41921997070312,
+      "compute_ms": 6.326320000000035,
+      "communication_ms": 8.46643700000001,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 8.46643700000001,
+      "device_active_union_ms": 14.792757000000044,
+      "device_first_to_last_ms": 71.85194500000001,
+      "idle_between_tasks_ms": 57.05918799999997,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 140,
+          "duration_sum_ms": 0.19192649999999997
+        },
+        "other_device_math": {
+          "count": 232,
+          "duration_sum_ms": 9.563998999999999
+        },
+        "device_indexing": {
+          "count": 20,
+          "duration_sum_ms": 1.6591580000000001
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.147195
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 0.9752924999999999
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 2.6575575000000002
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.23047349999999997
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.08167949999999999
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 100352
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 248320
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 6.064914500000001,
+      "hccl_sdma_copy_time_sum_ms": 0.0733815,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-1/length-128-c4-r3/profile-0/5664fbce7f43_1463485_20261107093957576_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "21753f76d6d7df99d595ec90ded39ce99cfc66f0f2d31f61e320ed9c5e70e4a2",
+      "rank": "rank-1",
+      "request": "length-128-c4-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 384,
+      "batch_size": 3,
+      "diagnostic_forward_wall_ms": 169.06828992068768,
+      "diagnostic_event_span_ms": 168.5996856689453,
+      "compute_ms": 103.10059299999989,
+      "communication_ms": 8.328997000000008,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 8.328997000000015,
+      "device_active_union_ms": 111.4295899999999,
+      "device_first_to_last_ms": 168.259405,
+      "idle_between_tasks_ms": 56.82981500000008,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 350,
+          "duration_sum_ms": 2.007224000000001
+        },
+        "other_device_math": {
+          "count": 508,
+          "duration_sum_ms": 14.533403500000004
+        },
+        "device_indexing": {
+          "count": 147,
+          "duration_sum_ms": 4.8253425
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 2.5596555
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.9543285
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 75.11951
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 11.2430185
+        },
+        "attention": {
+          "count": 18,
+          "duration_sum_ms": 0.5460115000000001
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 38535168
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 744960
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 6.092058000000001,
+      "hccl_sdma_copy_time_sum_ms": 0.29725450000000003,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-1/length-128-c4-r3/profile-1/5664fbce7f43_1463485_20261107094002998_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "ab766c8b4a99a3e9046b7eb976036d5894a6aee837f0645b0f46890386021f9b",
+      "rank": "rank-1",
+      "request": "length-128-c4-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 3,
+      "batch_size": 3,
+      "diagnostic_forward_wall_ms": 77.2559898905456,
+      "diagnostic_event_span_ms": 76.84748077392578,
+      "compute_ms": 7.921358000000031,
+      "communication_ms": 51.520948999999966,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 51.520948999999966,
+      "device_active_union_ms": 59.442307,
+      "device_first_to_last_ms": 76.37395,
+      "idle_between_tasks_ms": 16.931642999999994,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 200,
+          "duration_sum_ms": 0.4140584999999999
+        },
+        "other_device_math": {
+          "count": 238,
+          "duration_sum_ms": 9.993880499999992
+        },
+        "device_indexing": {
+          "count": 20,
+          "duration_sum_ms": 1.7090300000000003
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.16325949999999997
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.0388284999999995
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 3.3940334999999995
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.5920225
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.08235900000000002
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 301056
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 744960
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 50.64583650000001,
+      "hccl_sdma_copy_time_sum_ms": 0.07731399999999998,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-1/length-2048-c1-r3/profile-0/5664fbce7f43_1463485_20261107094010821_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "8f61d1e4aa4eef2b852d4904811513a845702b233b4df4f3fa45f1b8909ab05e",
+      "rank": "rank-1",
+      "request": "length-2048-c1-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 2048,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 537.5884100794792,
+      "diagnostic_event_span_ms": 537.2691650390625,
+      "compute_ms": 499.80222499999974,
+      "communication_ms": 13.517563000000166,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 13.517563000000166,
+      "device_active_union_ms": 513.3197879999999,
+      "device_first_to_last_ms": 537.152807,
+      "idle_between_tasks_ms": 23.83301900000015,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 380,
+          "duration_sum_ms": 2.7712649999999983
+        },
+        "other_device_math": {
+          "count": 478,
+          "duration_sum_ms": 26.981603000000007
+        },
+        "device_indexing": {
+          "count": 147,
+          "duration_sum_ms": 8.3188365
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 13.047473000000002
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 6.5797385
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 381.706137
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 70.53875199999999
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.9981394999999998
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 205520896
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 248320
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 12.255860500000004,
+      "hccl_sdma_copy_time_sum_ms": 1.4086195000000004,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-1/length-2048-c1-r3/profile-1/5664fbce7f43_1463485_20261107094016541_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "36df2464c7180f109b17de8f7c4c82e33107c790b0e5bb33eb11f5aca93eb993",
+      "rank": "rank-1",
+      "request": "length-2048-c1-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 1,
+      "batch_size": 1,
+      "diagnostic_forward_wall_ms": 87.2329599224031,
+      "diagnostic_event_span_ms": 86.43636322021484,
+      "compute_ms": 6.514141999999985,
+      "communication_ms": 35.94404799999996,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 35.94404799999996,
+      "device_active_union_ms": 42.458189999999945,
+      "device_first_to_last_ms": 85.121111,
+      "idle_between_tasks_ms": 42.662921000000054,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 140,
+          "duration_sum_ms": 0.19324899999999998
+        },
+        "other_device_math": {
+          "count": 232,
+          "duration_sum_ms": 9.716451499999998
+        },
+        "device_indexing": {
+          "count": 20,
+          "duration_sum_ms": 1.6286105000000002
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.14777899999999997
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 0.9886950000000001
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 2.6687610000000004
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.22565400000000002
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.240158
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 100352
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 248320
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 33.91101600000001,
+      "hccl_sdma_copy_time_sum_ms": 0.07109600000000002,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-1/length-2048-c4-r3/profile-0/5664fbce7f43_1463485_20261107094029187_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "29c0a79f350cd3a1bb32b90cedc8625c8e273d4e0009dfa7d3f336190e15931d",
+      "rank": "rank-1",
+      "request": "length-2048-c4-r3",
+      "step": 0,
+      "mode": "EXTEND",
+      "tokens": 4096,
+      "batch_size": 2,
+      "diagnostic_forward_wall_ms": 1040.2875198051333,
+      "diagnostic_event_span_ms": 1039.79736328125,
+      "compute_ms": 986.7880069999997,
+      "communication_ms": 39.144294000000244,
+      "overlap_ms": -2.2737367544323206e-13,
+      "exposed_communication_ms": 39.1442940000004,
+      "device_active_union_ms": 1025.932301,
+      "device_first_to_last_ms": 1039.771086,
+      "idle_between_tasks_ms": 13.838784999999916,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 368,
+          "duration_sum_ms": 3.962647999999999
+        },
+        "other_device_math": {
+          "count": 484,
+          "duration_sum_ms": 46.608406
+        },
+        "device_indexing": {
+          "count": 141,
+          "duration_sum_ms": 14.019604000000005
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 26.983095
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 11.060936
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 757.5518680000001
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 140.15413999999998
+        },
+        "attention": {
+          "count": 12,
+          "duration_sum_ms": 2.0094610000000004
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 411041792
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 496640
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 39.01700550000001,
+      "hccl_sdma_copy_time_sum_ms": 2.7174525000000003,
+      "experiment": "08b-v2-tp2-profile"
+    },
+    {
+      "trace": "/home/course-user/hw2-runs/08b-v2-tp2-profile/rank-1/length-2048-c4-r3/profile-1/5664fbce7f43_1463485_20261107094035452_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+      "trace_sha256": "715cb14c7fe9174ac7bd18c13a54f734883b67e38c48628344a22935db4531dc",
+      "rank": "rank-1",
+      "request": "length-2048-c4-r3",
+      "step": 1,
+      "mode": "DECODE",
+      "tokens": 2,
+      "batch_size": 2,
+      "diagnostic_forward_wall_ms": 70.57841029018164,
+      "diagnostic_event_span_ms": 69.83661651611328,
+      "compute_ms": 7.48427700000002,
+      "communication_ms": 8.737595000000013,
+      "overlap_ms": 0.0,
+      "exposed_communication_ms": 8.737595000000013,
+      "device_active_union_ms": 16.221872000000033,
+      "device_first_to_last_ms": 68.877691,
+      "idle_between_tasks_ms": 52.655818999999966,
+      "kernel_families": {
+        "dtype_layout_device_copy": {
+          "count": 200,
+          "duration_sum_ms": 0.38143400000000005
+        },
+        "other_device_math": {
+          "count": 238,
+          "duration_sum_ms": 9.858162999999998
+        },
+        "device_indexing": {
+          "count": 20,
+          "duration_sum_ms": 1.7703840000000002
+        },
+        "normalization": {
+          "count": 67,
+          "duration_sum_ms": 0.15775450000000002
+        },
+        "dense_matmul": {
+          "count": 97,
+          "duration_sum_ms": 1.040189
+        },
+        "causal_convolution": {
+          "count": 18,
+          "duration_sum_ms": 2.9998395
+        },
+        "gdn_recurrence": {
+          "count": 18,
+          "duration_sum_ms": 0.37088899999999997
+        },
+        "attention": {
+          "count": 6,
+          "duration_sum_ms": 0.2437985
+        }
+      },
+      "collectives": {
+        "all_reduce": {
+          "calls": 49,
+          "logical_input_bytes": 200704
+        },
+        "all_gather_single": {
+          "calls": 1,
+          "logical_input_bytes": 496640
+        }
+      },
+      "hccl_op_count": 50,
+      "hccl_wait_sum_ms": 6.1883255,
+      "hccl_sdma_copy_time_sum_ms": 0.07835899999999997,
+      "experiment": "08b-v2-tp2-profile"
+    }
+  ]
+}

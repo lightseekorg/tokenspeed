@@ -1,0 +1,274 @@
+[
+  {
+    "model": "08b",
+    "rank": 0,
+    "phase": "EXTEND",
+    "tokens": 128,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 49,
+        "logical_input_bytes": 12845056
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "08b",
+    "rank": 0,
+    "phase": "DECODE",
+    "tokens": 1,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 49,
+        "logical_input_bytes": 100352
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "08b",
+    "rank": 1,
+    "phase": "EXTEND",
+    "tokens": 128,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 49,
+        "logical_input_bytes": 12845056
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "08b",
+    "rank": 1,
+    "phase": "DECODE",
+    "tokens": 1,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 49,
+        "logical_input_bytes": 100352
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "4b",
+    "rank": 0,
+    "phase": "EXTEND",
+    "tokens": 128,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 65,
+        "logical_input_bytes": 42598400
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "4b",
+    "rank": 0,
+    "phase": "DECODE",
+    "tokens": 1,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 65,
+        "logical_input_bytes": 332800
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "4b",
+    "rank": 1,
+    "phase": "EXTEND",
+    "tokens": 128,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 65,
+        "logical_input_bytes": 42598400
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "4b",
+    "rank": 1,
+    "phase": "DECODE",
+    "tokens": 1,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 65,
+        "logical_input_bytes": 332800
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "9b",
+    "rank": 0,
+    "phase": "EXTEND",
+    "tokens": 128,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 65,
+        "logical_input_bytes": 68157440
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "9b",
+    "rank": 0,
+    "phase": "DECODE",
+    "tokens": 1,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 65,
+        "logical_input_bytes": 532480
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "9b",
+    "rank": 1,
+    "phase": "EXTEND",
+    "tokens": 128,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 65,
+        "logical_input_bytes": 68157440
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "9b",
+    "rank": 1,
+    "phase": "DECODE",
+    "tokens": 1,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 65,
+        "logical_input_bytes": 532480
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "27b",
+    "rank": 0,
+    "phase": "EXTEND",
+    "tokens": 128,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 129,
+        "logical_input_bytes": 169082880
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "27b",
+    "rank": 0,
+    "phase": "DECODE",
+    "tokens": 1,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 129,
+        "logical_input_bytes": 1320960
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "27b",
+    "rank": 1,
+    "phase": "EXTEND",
+    "tokens": 128,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 129,
+        "logical_input_bytes": 169082880
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  },
+  {
+    "model": "27b",
+    "rank": 1,
+    "phase": "DECODE",
+    "tokens": 1,
+    "batch_size": 1,
+    "collectives": {
+      "all_reduce": {
+        "calls": 129,
+        "logical_input_bytes": 1320960
+      },
+      "all_gather_single": {
+        "calls": 1,
+        "logical_input_bytes": 248320
+      }
+    }
+  }
+]

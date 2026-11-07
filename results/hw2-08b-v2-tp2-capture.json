@@ -1,0 +1,337 @@
+{
+  "config": {
+    "model": "/tmp/hw1-qwen35-model",
+    "device": "npu",
+    "dtype": "float16",
+    "kv_cache_dtype": "float16",
+    "attention_backend": "mha",
+    "sampling_backend": "greedy",
+    "disable_prefill_graph": true,
+    "disable_pdl": true,
+    "enforce_eager": true,
+    "enable_prefix_caching": false,
+    "disable_kvstore": true,
+    "language_model_only": true,
+    "enable_output_logprobs": true,
+    "seed": 2026,
+    "mamba_ssm_dtype": "float32",
+    "world_size": 2,
+    "max_model_len": 4096,
+    "max_num_seqs": 1,
+    "max_total_tokens": 16384,
+    "chunked_prefill_size": 4096,
+    "prefix_granularity": 128,
+    "retraction_snapshot_ratio": 0,
+    "disable_autotune": true,
+    "log_level": "info",
+    "attn_tp_size": 2,
+    "dense_tp_size": 2,
+    "disable_overlap_schedule": false,
+    "enable_allreduce_fusion": false
+  },
+  "arguments": {
+    "model": "/tmp/hw1-qwen35-model",
+    "tp": 2,
+    "mode": "capture",
+    "lengths": [
+      1,
+      128,
+      2048
+    ],
+    "concurrencies": [
+      1
+    ],
+    "output_tokens": 32,
+    "warmups": 0,
+    "repeats": 1,
+    "overlap": "on",
+    "work_dir": "/home/course-user/hw2-runs/08b-v2-tp2-capture",
+    "output": "results/hw2-08b-v2-tp2-capture.json"
+  },
+  "trials": [
+    {
+      "wall_seconds": 6.3689020103774965,
+      "output_tokens": 32,
+      "output_tokens_per_second": 5.024413933180187,
+      "ttft_ms": 4569.33604972437,
+      "tpot_ms": 58.03564225413626,
+      "requests": [
+        {
+          "index": 0,
+          "output_ids": [
+            2614,
+            513,
+            5081,
+            5576,
+            4602,
+            318,
+            4058,
+            10926,
+            8,
+            883,
+            10774,
+            76467,
+            321,
+            91570,
+            13,
+            198,
+            22365,
+            314,
+            279,
+            2614,
+            369,
+            264,
+            27649,
+            314,
+            279,
+            2691,
+            37274,
+            30,
+            198,
+            32,
+            13,
+            1049
+          ],
+          "text": " following are multiple choice questions (with answers) about Human Anatomy and Physiology.\nWhich of the following is a characteristic of the cell membrane?\nA. It",
+          "meta_info": {
+            "id": "9e9eec2507af446e853883083e3b331f",
+            "finish_reason": {
+              "type": "length",
+              "length": 32
+            },
+            "prompt_tokens": 1,
+            "weight_version": "default",
+            "completion_tokens": 32,
+            "cached_tokens": 0,
+            "e2e_latency": 6.367900609970093
+          },
+          "ttft_ms": 4569.33604972437,
+          "tpot_ms": 58.03564225413626,
+          "wall_seconds": 6.368440959602594,
+          "input_tokens": 1,
+          "output_tokens": 32,
+          "finish_reason": {
+            "type": "length",
+            "length": 32
+          }
+        }
+      ],
+      "id": "length-1-c1-r0",
+      "input_tokens": 1,
+      "concurrency": 1,
+      "warmup": false
+    },
+    {
+      "wall_seconds": 6.0111913699656725,
+      "output_tokens": 32,
+      "output_tokens_per_second": 5.323403969450192,
+      "ttft_ms": 4261.262800078839,
+      "tpot_ms": 56.440485806594936,
+      "requests": [
+        {
+          "index": 0,
+          "output_ids": [
+            13,
+            79091,
+            279,
+            1067,
+            9077,
+            13,
+            220,
+            561,
+            3302,
+            1809,
+            7574,
+            10727,
+            3992,
+            1558,
+            42903,
+            13,
+            79091,
+            279,
+            1067,
+            9077,
+            13,
+            220,
+            561,
+            3302,
+            1809,
+            7574,
+            10727,
+            3992,
+            1558,
+            42903,
+            13,
+            79091
+          ],
+          "text": ". Explain the result clearly.  The research group studies efficient language model inference. Explain the result clearly.  The research group studies efficient language model inference. Explain",
+          "meta_info": {
+            "id": "931783ff09b04242902a5eb4b27e4df0",
+            "finish_reason": {
+              "type": "length",
+              "length": 32
+            },
+            "prompt_tokens": 128,
+            "weight_version": "default",
+            "completion_tokens": 32,
+            "cached_tokens": 0,
+            "e2e_latency": 6.010488033294678
+          },
+          "ttft_ms": 4261.262800078839,
+          "tpot_ms": 56.440485806594936,
+          "wall_seconds": 6.010917860083282,
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "finish_reason": {
+            "type": "length",
+            "length": 32
+          }
+        }
+      ],
+      "id": "length-128-c1-r0",
+      "input_tokens": 128,
+      "concurrency": 1,
+      "warmup": false
+    },
+    {
+      "wall_seconds": 6.412876840215176,
+      "output_tokens": 32,
+      "output_tokens_per_second": 4.989960168785384,
+      "ttft_ms": 4629.016919992864,
+      "tpot_ms": 57.53270129583055,
+      "requests": [
+        {
+          "index": 0,
+          "output_ids": [
+            13,
+            79091,
+            279,
+            1067,
+            9077,
+            13,
+            220,
+            561,
+            3302,
+            1809,
+            7574,
+            10727,
+            3992,
+            1558,
+            42903,
+            13,
+            79091,
+            279,
+            1067,
+            9077,
+            13,
+            220,
+            561,
+            3302,
+            1809,
+            7574,
+            10727,
+            3992,
+            1558,
+            42903,
+            13,
+            79091
+          ],
+          "text": ". Explain the result clearly.  The research group studies efficient language model inference. Explain the result clearly.  The research group studies efficient language model inference. Explain",
+          "meta_info": {
+            "id": "58d22b7e6dfc423386290ceda27cb41c",
+            "finish_reason": {
+              "type": "length",
+              "length": 32
+            },
+            "prompt_tokens": 2048,
+            "weight_version": "default",
+            "completion_tokens": 32,
+            "cached_tokens": 0,
+            "e2e_latency": 6.412096261978149
+          },
+          "ttft_ms": 4629.016919992864,
+          "tpot_ms": 57.53270129583055,
+          "wall_seconds": 6.412530660163611,
+          "input_tokens": 2048,
+          "output_tokens": 32,
+          "finish_reason": {
+            "type": "length",
+            "length": 32
+          }
+        }
+      ],
+      "id": "length-2048-c1-r0",
+      "input_tokens": 2048,
+      "concurrency": 1,
+      "warmup": false
+    }
+  ],
+  "source_sha256": {
+    "python/tokenspeed/runtime/distributed/comm_backend/hccl.py": "d659ab894dd122c017eee3c217606698718e56e9d93cf86e6c2bdc09752d5978",
+    "tokenspeed-kernel/python/tokenspeed_kernel/ops/conv/_triton/causal_conv1d.py": "2c07e872302371aa9781bc4bba37c2eae4324fa7143bd5fffa73e426eb1ca15f",
+    "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn.py": "adb426a1c56082e4d6ee5d9e4b02bae7888c47c95e3d2c56dde4cb4ad7d3036c"
+  },
+  "visible_devices": "0,1",
+  "eos_check": {
+    "wall_seconds": 4.028812659904361,
+    "output_tokens": 3,
+    "output_tokens_per_second": 0.7446362621565076,
+    "ttft_ms": 3918.9520101062953,
+    "tpot_ms": 54.750795010477304,
+    "requests": [
+      {
+        "index": 0,
+        "input_ids": [
+          248045,
+          846,
+          198,
+          3710,
+          369,
+          220,
+          16,
+          22,
+          478,
+          220,
+          17,
+          20,
+          30,
+          21134,
+          25899,
+          13,
+          248046,
+          198,
+          248045,
+          74455,
+          198,
+          248068,
+          271,
+          248069,
+          271
+        ],
+        "output_ids": [
+          19,
+          17,
+          248046
+        ],
+        "text": "42",
+        "meta_info": {
+          "id": "1066ffcf6bc14ee9ab17dba81ff2f16f",
+          "finish_reason": {
+            "type": "stop",
+            "matched": 248046
+          },
+          "prompt_tokens": 25,
+          "weight_version": "default",
+          "completion_tokens": 3,
+          "cached_tokens": 0,
+          "e2e_latency": 4.028024196624756
+        },
+        "ttft_ms": 3918.9520101062953,
+        "tpot_ms": 54.750795010477304,
+        "wall_seconds": 4.02845360012725
+      }
+    ]
+  },
+  "eos_check_passed": true,
+  "completed": true
+}

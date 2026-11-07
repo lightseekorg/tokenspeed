@@ -1,0 +1,84 @@
+{
+  "source": "Qwen/Qwen3.5-4B",
+  "endpoint": "https://modelscope.cn",
+  "files": [
+    {
+      "file": "LICENSE",
+      "sha256": "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32",
+      "size": 11343,
+      "revision": "f09dfc75214c5f2f4940ae6a26c126ce93828a9b"
+    },
+    {
+      "file": "chat_template.jinja",
+      "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+      "size": 7756,
+      "revision": "f09dfc75214c5f2f4940ae6a26c126ce93828a9b"
+    },
+    {
+      "file": "config.json",
+      "sha256": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+      "size": 3161,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    },
+    {
+      "file": "configuration.json",
+      "sha256": "f888421726665e8a84b738eed42a64875aed79de8be7daade851ac8bf4c0cef9",
+      "size": 73,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    },
+    {
+      "file": "merges.txt",
+      "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+      "size": 3353259,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    },
+    {
+      "file": "model.safetensors-00001-of-00002.safetensors",
+      "sha256": "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61",
+      "size": 5329398688,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    },
+    {
+      "file": "model.safetensors-00002-of-00002.safetensors",
+      "sha256": "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188",
+      "size": 3990429408,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    },
+    {
+      "file": "model.safetensors.index.json",
+      "sha256": "cf3f798ee02ba45f9622aa8892a47369ab667d0afbf154ee7c2212de42e6302d",
+      "size": 76196,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    },
+    {
+      "file": "preprocessor_config.json",
+      "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+      "size": 390,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    },
+    {
+      "file": "tokenizer.json",
+      "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+      "size": 12807982,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    },
+    {
+      "file": "tokenizer_config.json",
+      "sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+      "size": 16710,
+      "revision": "f09dfc75214c5f2f4940ae6a26c126ce93828a9b"
+    },
+    {
+      "file": "video_preprocessor_config.json",
+      "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+      "size": 385,
+      "revision": "f09dfc75214c5f2f4940ae6a26c126ce93828a9b"
+    },
+    {
+      "file": "vocab.json",
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+      "size": 6722759,
+      "revision": "fcb1a040bb418b0b8add6f6f6c475386abc2cb97"
+    }
+  ]
+}

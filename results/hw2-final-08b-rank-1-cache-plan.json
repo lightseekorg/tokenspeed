@@ -1,0 +1,349 @@
+{
+  "pool_type": "HybridMHATokenToKVPool",
+  "token_capacity": 16384,
+  "arena_bytes": 106954752,
+  "states": {
+    "0": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "1": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "2": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "4": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "10": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "13": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "16": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "18": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "21": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "5": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "8": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "12": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "14": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "17": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "20": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "22": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "6": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "9": [
+      {
+        "shape": [
+          17,
+          3072,
+          3
+        ],
+        "dtype": "torch.float16"
+      },
+      {
+        "shape": [
+          17,
+          8,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    ]
+  }
+}

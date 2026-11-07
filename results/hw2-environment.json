@@ -1,0 +1,21 @@
+{
+  "python": "3.11.16",
+  "architecture": "aarch64",
+  "packages": {
+    "torch": "2.9.0+cpu",
+    "torch-npu": "2.9.0",
+    "triton-ascend": "3.2.1",
+    "transformers": "5.12.0",
+    "tokenspeed-scheduler": "0.1.41",
+    "numpy": "2.4.6",
+    "apache-tvm-ffi": "0.1.13",
+    "huggingface-hub": "1.32.0"
+  },
+  "driver": "25.5.2",
+  "cann": "9.0.0",
+  "physical_chips": [
+    0,
+    1
+  ],
+  "board": 0
+}
