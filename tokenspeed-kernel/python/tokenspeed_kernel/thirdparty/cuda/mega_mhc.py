@@ -45,7 +45,7 @@ def is_mega_mhc_available() -> bool:
     return True
 
 
-def shifted_post_pre_norm(
+def _launch(
     x,
     residual,
     pre,
@@ -59,14 +59,8 @@ def shifted_post_pre_norm(
     sinkhorn_iters,
     norm_weight,
     norm_eps,
+    quantize_fp8,
 ):
-    """Return new residual, normalized input and next pre/post/comb coefficients.
-
-    Inputs follow ``try_mhc_shifted_post_pre_norm``. Do not capture or replay
-    this call in a CUDA graph: DeepGEMM split barriers can read the previous
-    replay's partials.
-    No input is mutated, and no output is retained outside this invocation.
-    """
     api = _api()
     if api.get_pdl() != pdl_enabled():
         api.set_pdl(pdl_enabled())
@@ -74,6 +68,15 @@ def shifted_post_pre_norm(
     new_pre, new_post, new_comb = (
         torch.empty_like(tensor) for tensor in (pre, post, comb)
     )
+    tokens, hidden = x.shape
+    y_fp8 = y_sf = None
+    if quantize_fp8:
+        # Packed group-32 scales, MN-major with the token count padded to four
+        # so every column starts 16-byte aligned for TMA.
+        y_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        y_sf = torch.empty(
+            hidden // 128, (tokens + 3) // 4 * 4, dtype=torch.int32, device=x.device
+        ).mT[:tokens]
     api.mega_mhc(
         x=x,
         residual=residual,
@@ -97,5 +100,87 @@ def shifted_post_pre_norm(
         new_post_mix=new_post.unsqueeze(-1),
         new_comb_res_mix=new_comb,
         y_bf16=y,
+        y_fp8=y_fp8,
+        y_gemm_sf=y_sf,
     )
-    return new_residual, y, new_pre, new_post, new_comb
+    return new_residual, y, new_pre, new_post, new_comb, y_fp8, y_sf
+
+
+def shifted_post_pre_norm(
+    x,
+    residual,
+    pre,
+    post,
+    comb,
+    weight,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
+    norm_weight,
+    norm_eps,
+):
+    """Return new residual, normalized input and next pre/post/comb coefficients.
+
+    Inputs follow ``try_mhc_shifted_post_pre_norm``. Do not capture or replay
+    this call in a CUDA graph: DeepGEMM split barriers can read the previous
+    replay's partials.
+    No input is mutated, and no output is retained outside this invocation.
+    """
+    return _launch(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+        False,
+    )[:5]
+
+
+def shifted_post_pre_norm_quantize_fp8(
+    x,
+    residual,
+    pre,
+    post,
+    comb,
+    weight,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
+    norm_weight,
+    norm_eps,
+):
+    """``shifted_post_pre_norm`` that also returns the input's FP8 codes and scales.
+
+    The extra outputs are E4M3 ``[T,H]`` codes and int32 ``[T,H/128]`` packed
+    group-32 UE8M0 scales, strided ``(1, T padded to 4)``: the layout
+    ``fp8_projection`` reads. The BF16 input is returned as well.
+    """
+    new_residual, y, new_pre, new_post, new_comb, y_fp8, y_sf = _launch(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+        True,
+    )
+    return new_residual, y, new_pre, new_post, new_comb, y_fp8, y_sf

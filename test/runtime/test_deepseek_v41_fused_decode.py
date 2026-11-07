@@ -388,7 +388,11 @@ def test_fused_decode_matches_canonical_and_keeps_prefill_weights(
         _ctx(fused_prefill_backend, 1, ForwardMode.EXTEND),
         reduce_output=True,
     )
-    torch.testing.assert_close(fused_prefill, plain_prefill, rtol=0, atol=0)
+    # Prefill now runs the fused FP8 attention, so it is no longer bitwise equal
+    # to the plain path. Use the same relative-L2 envelope as the decode
+    # comparison above.
+    prefill_delta = (fused_prefill.float() - plain_prefill.float()).norm(dim=-1)
+    assert torch.all(prefill_delta / plain_prefill.float().norm(dim=-1) < 0.055)
     for actual, expected in zip(
         (
             attn.wq_b.weight,
@@ -579,3 +583,93 @@ def test_tp_attention_is_not_prepared_for_fused_decode():
     attn.prepare_fused_decode()
     assert attn.n_local_heads == 32
     assert attn.fused_q_weight is None
+
+
+def test_zeroed_fused_output_has_the_kernels_layout():
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+        zeroed_fused_output,
+    )
+
+    rows, groups = 5, 8
+    q = torch.zeros(rows, 64, 512, dtype=torch.bfloat16)
+    codes, scales = zeroed_fused_output(q, groups, rows)
+    assert codes.dtype == torch.float8_e4m3fn
+    assert codes.shape == (rows, groups, 64 * 512 // groups)
+    assert codes.is_contiguous()
+    assert scales.dtype == torch.int32
+    assert scales.shape == (rows, groups, 64 * 512 // groups // 128)
+    # Rows are the fastest dimension, over storage padded to four rows.
+    assert scales.stride(0) == 1
+    assert scales.stride(1) == (rows + 3) // 4 * 4 * scales.shape[2]
+    assert not codes.view(torch.uint8).any()
+    assert not scales.any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_prefill_support_follows_the_query_group():
+    backend, _ = _real_backend()
+    assert backend.supports_fused_prefill
+    backend.spec = replace(backend.spec, attention_query_group=(0, 1))
+    assert backend.supports_fused_attention
+    assert not backend.supports_fused_prefill
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("guard", ["query_group", "query_shard"])
+def test_fused_prefill_rejects_layouts_it_cannot_serve(guard):
+    backend, tables = _real_backend()
+    meta = cache_test._extend(backend, tables, [3], [0], [0], [3])
+    if guard == "query_group":
+        backend.spec = replace(backend.spec, attention_query_group=(0, 1))
+        key_rows, message = None, "operator query context parallelism"
+    else:
+        # The guard reads only whether key_rows is present.
+        key_rows, message = object(), "model query shard"
+    q = torch.zeros(3, 64, 512, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=message):
+        backend.forward_v41(
+            q,
+            torch.zeros(3, 512, device="cuda", dtype=torch.bfloat16),
+            layer_id=1,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=torch.zeros(64, device="cuda", dtype=torch.float32),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=torch.zeros(1, 64, device="cuda", dtype=torch.float32),
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=8,
+            key_rows=key_rows,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_warmup_covers_every_deep_gemm_front_projection(monkeypatch):
+    # Serving must not compile on the forward thread, and the JIT compile check
+    # does not watch DeepGEMM, so a projection left out of the warmup would
+    # stall the first forward unnoticed.
+    attn = _attention(seed=11)
+    _load_decode_projections(attn, seed=11)
+    attn.prepare_fused_decode()
+    warmed = []
+    monkeypatch.setattr(
+        v41_model,
+        "warmup_fp8_projection",
+        lambda weight, scales, tokens: warmed.append(weight.data_ptr()),
+    )
+    attn.warmup_query_projections(64)
+    # Every attention-front projection the forward runs on DeepGEMM; wo_a/wo_b
+    # are the output projections warmup_output_projections covers instead.
+    front = [attn.wq_a_wkv] + ([] if attn.indexer is None else [attn.indexer.wq_b])
+    expected = {attn.fused_q_weight.data_ptr()}
+    for layer in front:
+        method = layer.quant_method
+        assert isinstance(method, _ReferenceFp8LinearMethod)
+        assert method.projection_weight_scales is not None
+        expected.add(layer.weight.data_ptr())
+    assert set(warmed) == expected
