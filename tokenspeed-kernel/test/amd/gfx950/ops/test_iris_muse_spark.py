@@ -1333,7 +1333,7 @@ def _sliding_tail_assembly() -> str:
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
         iris_fused_sliding_attention_twoshot_muse_attntail as fn,
     )
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     pointers = {
         name: kind
@@ -1402,7 +1402,7 @@ def _sliding_tail_assembly() -> str:
             PEER_SIGNAL_STORE_CACHE=".wt",
         ),
         num_warps=4,
-        options=sched_compile_options(),
+        options=extern_compile_options(),
     )
     return kernel.asm["amdgcn"]
 
@@ -1472,7 +1472,7 @@ def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
         iris_fused_sliding_attention_twoshot_muse_attntail as fn,
     )
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     types = {
         "q_ptr": "*fp8e4nv",
@@ -1544,7 +1544,7 @@ def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
         },
         num_warps=4,
         unspecialized=("rows", "gate_stride"),
-        options=sched_compile_options(),
+        options=extern_compile_options(),
     )
     lines = [
         line.strip()
@@ -1691,7 +1691,7 @@ def test_moetail_lamport_codegen(block_m):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
         iris_fused_gemv_lamport_allgather_muse_moetail as fn,
     )
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     types = {
         "x_ptr": "*bf16",
@@ -1731,7 +1731,7 @@ def test_moetail_lamport_codegen(block_m):
         },
         num_warps=16,
         unspecialized=("region", "M"),
-        options=sched_compile_options(),
+        options=extern_compile_options(),
     )
     assembly = kernel.asm["amdgcn"]
     lines = assembly.splitlines()

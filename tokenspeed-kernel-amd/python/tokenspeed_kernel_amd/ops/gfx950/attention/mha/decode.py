@@ -27,10 +27,10 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._scheduling import (
+from tokenspeed_kernel_amd._extern import (
     arithmetic_fence,
+    extern_compile_options,
     release_drain,
-    sched_compile_options,
     wave_uniform_i32,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
@@ -1528,7 +1528,7 @@ def launch_gluon_mha_decode_gfx950(
             is_fp8,
             config.num_stages,
             num_warps=config.num_warps,
-            **sched_compile_options(),
+            **extern_compile_options(),
         )
     else:
         # Always use split-k for full attention
@@ -1571,7 +1571,7 @@ def launch_gluon_mha_decode_gfx950(
             is_fp8,
             config.num_stages,
             num_warps=config.num_warps,
-            **sched_compile_options(),
+            **extern_compile_options(),
         )
 
         # Sink is a single global softmax entry, so split-k must merge it once in
@@ -2368,7 +2368,7 @@ def launch_gluon_mha_decode_balanced_gfx950(
         is_fp8,
         _BALANCED_STAGES,
         num_warps=num_warps,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     has_sink = sinks is not None
     gluon_mha_decode_balanced_reduce_gfx950[(q.shape[0], q.shape[1])](

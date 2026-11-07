@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._scheduling import arithmetic_fence, sched_compile_options
+from tokenspeed_kernel_amd._extern import arithmetic_fence, extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
 
 async_copy = gl.amd.cdna4.async_copy
@@ -531,7 +531,7 @@ def gluon_rowcta_bf16_gemv_gfx950(
         OUTPUTS_PER_WAVE=outputs_per_wave,
         NUM_WARPS=num_warps,
         num_warps=num_warps,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     return out
 
