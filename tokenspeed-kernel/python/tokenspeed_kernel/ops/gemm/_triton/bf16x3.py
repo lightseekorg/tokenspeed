@@ -322,12 +322,13 @@ def triton_bf16x3_gemm_fp32(
         enable_fp_fusion=False,
     )
     if use_ws:
-        _bf16x3_splitk_reduce_kernel[(triton.cdiv(m * n, 1024),)](
+        # 128-element blocks spread a decode step's few partials over enough CTAs to hide the load latency.
+        _bf16x3_splitk_reduce_kernel[(triton.cdiv(m * n, 128),)](
             ws,
             out,
             m * n,
             SPLIT=cfg.split,
-            BLOCK=1024,
+            BLOCK=128,
             num_warps=4,
             enable_fp_fusion=False,
         )

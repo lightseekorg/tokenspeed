@@ -1597,13 +1597,10 @@ def gluon_wmma_dense_gemv_gfx1250(
 # activations, 132 points with N 4 to 256 and K 512 to 8192 from 17 to 96
 # rows, at 1.23x to 5.17x (median 2.72x). FP32 activations, and N 512 or 1024,
 # were slower than Torch at some points in those rows (28 of 105 and 3 of 36)
-# and are left to Torch. Against the BF16x3 split kernel on 256-row weights (K
-# 3072 to 7168, separate runs), this kernel was faster at every K up to 48
-# rows, while at 64 and 96 rows the split kernel was faster at some K from
-# 4096, by up to 1.29x; the band is not cut there, since without a split this
-# kernel is the only fast path. One step above the band start, so a broader
-# FP32 kernel registered at the band start for the same rows does not take
-# them.
+# and are left to Torch. A caller that keeps a weight split gets the BF16x3
+# split kernel instead, registered above this one. One step above the band
+# start, so a broader FP32 kernel registered at the band start for the same
+# rows does not take them.
 register_kernel(
     "gemm",
     "mv",

@@ -825,9 +825,9 @@ class BeamRouter(ReplicatedLinear):
 
     def forward(self, hidden_states: torch.Tensor):
         # BF16 rows times the FP32 weight, FP32 logits (gemm.mv): the
-        # FP32 row-CTA kernel up to 16 rows, the FP32 CUDA-core leaf from 17 to
-        # 96 rows, the BF16x3 tensor-core kernel on the weight split from 97
-        # rows, Torch's FP32 matmul where no kernel takes the call.
+        # FP32 row-CTA kernel up to 16 rows, the BF16x3 tensor-core kernel on
+        # the weight split from 17 rows, Torch's FP32 matmul where no kernel
+        # takes the call.
         return kernel_mv(hidden_states, self.weight, weight_split=self.weight_split)
 
 
