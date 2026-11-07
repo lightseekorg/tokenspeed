@@ -67,7 +67,7 @@ instead. Three knobs shard those weights over contiguous groups of DP ranks
 | Parameter | Use |
 | --- | --- |
 | `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj`, and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--query-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
-| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
+| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); a wider group gathers distinct DP groups' rows before the logits GEMM and transposes the vocabulary shards back. Attention TP greater than one is supported; LM-head and attention TP widths must tile each other. Without attention DP it must equal the attention TP size. |
 | `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
 | `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
 
