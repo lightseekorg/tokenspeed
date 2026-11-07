@@ -661,7 +661,8 @@ private:
     // DrainKvEvents reconciles each marked boundary against its residency, so
     // the order of evictions and publications inside one admission does not
     // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with a cached child.
+    // with any Device cached child, including State entries excluded from
+    // routing residency: their later mutations still need the descriptor.
     struct KvEventBoundary {
         KvBlockStoredEvent stored;
         // Position in the prefix chain (page index). Consumers resolve a

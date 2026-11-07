@@ -4658,26 +4658,31 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASessionResumedFromHostIsNotCopiedA
 }
 
 // KV events keep the Device's view: a written-back boundary is removed when it
-// leaves the Device, and its Host publication reports nothing. (A boundary is
-// published while every group holds it, so of s1's boundaries only the tail
-// with its checkpoints is.)
+// leaves the Device, and its Host publication reports nothing.
 TEST_P(StateCheckpointPrefillHostShardSuite, KvEventsKeepDeviceSemantics) {
     kv_events_ = true;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     CompleteSession("s1", MakeTokens(22));
     const std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
-    ASSERT_EQ(stored.size(), 1u);
-    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(stored[0]));
-    EXPECT_EQ(std::get<KvBlockStoredEvent>(stored[0]).token_ids, (std::vector<std::int32_t>{21, 22}));
+    // History pages precede the tail even though only the tail has State.
+    ASSERT_EQ(stored.size(), 6u);
+    std::set<std::uint64_t> stored_hashes;
+    for (const auto& event : stored) {
+        const auto& hashes = std::get<KvBlockStoredEvent>(event).block_hashes;
+        stored_hashes.insert(hashes.begin(), hashes.end());
+    }
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     SendBootstrapped("f1");
     const ExecutionPlan plan = PlanOnce();
     ASSERT_EQ(ExtractCacheOpsOfKind<WriteBackBatch>(plan).size(), 1u);
     const std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
-    ASSERT_EQ(removed.size(), 1u);
-    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
-    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes,
-              std::get<KvBlockStoredEvent>(stored[0]).block_hashes);
+    ASSERT_EQ(removed.size(), stored.size());
+    std::set<std::uint64_t> removed_hashes;
+    for (const auto& event : removed) {
+        const auto& block = std::get<KvBlockRemovedEvent>(event);
+        removed_hashes.insert(block.block_hashes.begin(), block.block_hashes.end());
+    }
+    EXPECT_EQ(removed_hashes, stored_hashes);
     AckWriteBacks(plan);
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
