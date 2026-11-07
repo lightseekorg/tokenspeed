@@ -102,6 +102,19 @@ does not need the kernel workflow's CUDA build-variant inputs. To install a
 replacement of an already installed version, add `--no-cache-dir --force-reinstall`
 to the corresponding pinned installation command above.
 
+To publish a manual build without touching the scheduled nightly of its date,
+run **Build and Release tokenspeed-kernel** and then **Build and Release
+TokenSpeed** from `main` with `nightly=true`, `publish_github=true`, the same
+`version_date`, and the same `version_suffix`, for example `dev1`. The suffix
+makes a development release of that date's nightly, such as
+`tokenspeed==0.1.1.post20261108.dev1` with
+`tokenspeed-kernel==0.1.4.post20261108.dev1`: the scheduled nightly still
+publishes under its own version, and pip installs the suffixed build only when
+it is pinned exactly. The suffix accepts any spelling of a development release
+(`dev1`, `.dev1`, `-dev_1`) and refuses anything else, including local labels
+(`+label`), which would match the nightly's exact pins. Suffixed builds skip the
+ROCm index; the scheduled nightly of the same date adds ROCm.
+
 ### From source
 
 For H100/H200 with CUDA Toolkit 12.9, use the

@@ -57,6 +57,7 @@ import ctypes
 import importlib
 import json
 import os
+import re
 import shlex
 import shutil
 import site
@@ -151,6 +152,28 @@ def _git_branch() -> str:
         return ""
 
 
+def _nightly_version_suffix() -> str:
+    """The development-release suffix of a manual nightly build, or "".
+
+    TOKENSPEED_KERNEL_VERSION_SUFFIX turns a manual nightly into a development
+    release of that date's nightly, e.g. dev1 -> 0.1.4.post20261108.dev1, so it
+    neither collides with the scheduled nightly of that date nor shadows it: pip
+    takes a .devN release only when pinned exactly. Any PEP 440 spelling of a
+    development release is accepted (dev1, .dev1, -dev_1, DEV7) and normalized.
+    A local label (+...) is refused, since it would satisfy the nightly's
+    ``==`` pins and be preferred over it.
+    """
+    suffix = os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX", "")
+    if not suffix:
+        return ""
+    match = re.fullmatch(r"[._-]?dev[._-]?([0-9]*)", suffix, flags=re.IGNORECASE)
+    if match is None:
+        raise ValueError(
+            "Nightly version suffix must be a development release such as dev1"
+        )
+    return f".dev{int(match.group(1) or 0)}"
+
+
 def _package_version() -> str:
     if os.environ.get("TOKENSPEED_KERNEL_NIGHTLY") == "true":
         version_date = _version_date()
@@ -161,7 +184,7 @@ def _package_version() -> str:
         ):
             raise ValueError("Nightly version date must be YYYYMMDD")
         datetime.strptime(version_date, "%Y%m%d")
-        return f"{BASE_VERSION}.post{version_date}"
+        return f"{BASE_VERSION}.post{version_date}{_nightly_version_suffix()}"
 
     if _git_branch().startswith("release/"):
         return BASE_VERSION

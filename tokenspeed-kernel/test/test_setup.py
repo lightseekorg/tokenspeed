@@ -11,6 +11,7 @@ import pytest
 import setuptools
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
+from packaging.version import Version
 from setuptools import build_meta
 
 SETUP_PY = Path(__file__).parents[1] / "python" / "setup.py"
@@ -71,6 +72,45 @@ def test_nightly_version_uses_post_date(monkeypatch) -> None:
     )
 
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260230")
+    with pytest.raises(ValueError):
+        _capture_setup_kwargs(monkeypatch, "cuda")
+
+
+@pytest.mark.parametrize(
+    "suffix,expected",
+    [
+        ("dev1", ".dev1"),
+        (".dev1", ".dev1"),
+        ("-dev_7", ".dev7"),
+        ("DEV", ".dev0"),
+        ("dev20261107001", ".dev20261107001"),
+    ],
+)
+def test_nightly_version_suffix_makes_a_development_release(
+    monkeypatch, suffix, expected
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", suffix)
+    version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+    nightly = version.removesuffix(expected)
+    assert nightly.endswith(".post20261108")
+    # A pre-release of that date's nightly: it sorts before the nightly, and
+    # pip takes it only when pinned exactly.
+    assert Version(version) < Version(nightly)
+    assert Version(version).is_prerelease
+    assert str(Version(version)) == version
+
+
+@pytest.mark.parametrize("suffix", ["+exp1", "dev1+exp", ".post2", "rc1", "2", "dev 1"])
+def test_nightly_version_suffix_refuses_anything_but_a_development_release(
+    monkeypatch, suffix
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", suffix)
     with pytest.raises(ValueError):
         _capture_setup_kwargs(monkeypatch, "cuda")
 
