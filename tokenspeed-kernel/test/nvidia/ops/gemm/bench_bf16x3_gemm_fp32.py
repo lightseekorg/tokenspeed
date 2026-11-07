@@ -22,9 +22,8 @@
 
 Compares the BF16x3 split kernel with the FP32 Torch product ``x.float() @
 w.T`` at IEEE precision, per call and against FP64. Where
-``mv(x, w, weight_split=...)`` selects another kernel (the FP32
-CUDA-core kernel for rows 17 to 96 of weights up to 256 rows with K a multiple
-of 512 up to 8192), that call is timed too. Run with
+``mv(x, w, weight_split=...)`` selects another kernel (the FP32 row-CTA
+kernel up to 16 rows), that call is timed too. Run with
 PYTHONPATH=tokenspeed-kernel/python from the repository root, for example::
 
     python tokenspeed-kernel/test/nvidia/ops/gemm/bench_bf16x3_gemm_fp32.py \
