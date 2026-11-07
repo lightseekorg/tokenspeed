@@ -82,6 +82,33 @@ with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
 The kernels accumulate in FP32 and return BF16; reduction order can change
 rounding relative to the original GEMM.
 
+## Offline-tuned hipBLASLt solutions (ROCm)
+
+Dense BF16/FP16 projections that no registered kernel claims run `torch.mm`,
+which on ROCm takes hipBLASLt's heuristic solution. For skinny row counts, such
+as speculative-decoding verify steps, a measured solution can be much faster.
+`hipblaslt.py` replays such measurements read-only through PyTorch TunableOp
+when `TOKENSPEED_HIPBLASLT_TUNED_FILE` names a results file. The file is loaded
+once per process, before graph capture. GEMMs it does not list keep the
+default solution. Serving never tunes or rewrites the file.
+
+A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
+versions and the GPU architecture stamped in its `Validator` rows. On any
+mismatch the whole file is ignored with a warning and every GEMM keeps the
+default. Regenerate the file after changing the stack, on an idle GPU of the
+serving type, for each weight shape `N x K` and each row count to cover
+(captured verify or decode token counts):
+
+```bash
+python -m tokenspeed_kernel.ops.gemm.hipblaslt --dtype bfloat16 \
+    --shapes 14336x5120,5120x6144,16480x5120,34816x5120,5120x17408 \
+    --rows 64,128,192,256,384,512 --out hipblaslt_tuned.csv
+```
+
+Tuning rotates weight copies through `--cold-bytes`, so each timing reads the
+weight from HBM as a serving step does. Another solution can sum K in another
+order, so results differ from the default within BF16 rounding.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
