@@ -242,24 +242,44 @@ Later query-count, request-count, and table-width changes reuse these binaries
 while refreshing the launch grid. Grouping and occupancy policies are the same
 during prefill, decode, and CUDA graphs.
 
-## Rubin FP8 decode head tile
+## FP8 decode head tile and grid
 
 The direct-slot CuTe path uses a 16-column tile for twelve query heads per KV
-head with FP8 caches on SM107, once `query_rows * kv_heads >= SM_count`. Each
-query retains its independent selected-slot list. Covering all twelve heads in
-one tile avoids the second gather/conversion stream of the eight-column tactic.
-Both tactics compute sixteen padded head columns in total; useful QK/PV work
-is unchanged.
+head with FP8 caches: on SM100/SM103 for every grid, and on SM107 once
+`query_rows * kv_heads >= SM_count`. Each query retains its independent
+selected-slot list. Covering all twelve heads in one tile avoids the second
+gather/conversion stream of the eight-column tactic. Both tactics compute
+sixteen padded head columns in total; useful QK/PV work is unchanged.
 
 `_select_head_tile` owns the device/grid policy. Query packing and the grouped
 BF16 private-prefix fallback use a separate fixed-geometry helper, so launch
 policy cannot change their padding.
 
-This selects static geometry inside the existing decode provider. Split4, one
-query per CTA, cache layout, writers, prefix/offload ownership and descales keep
-their contracts. Smaller grids and other architectures keep the prior tactic.
-Startup warmup enumerates both tiles before graph capture, and rows remain
-dynamic within each configuration. Tests cover Hq/Hkv of 24/2 and 12/1, target
-and draft query widths, both sides of the 212-SM grid threshold, padding,
-refreshed cache values, PDL on/off, large KV
-offsets and execution without further compilation after warmup.
+On SM100/SM103, an FP8 grid of at least `3 * SM_count / 16` output tiles picks
+its query rows per CTA and KV splits from 1x1, 2x1, 1x2 and 1x4. With one
+resident CTA per SM, the choice minimizes the wave count times the per-CTA
+work: each of its query rows gathers the 2048-entry prefix slots within one KV
+split and adds a fixed per-row cost fitted on SM103. Smaller grids, and every
+FP8 grid on SM107, keep the split rule with one query per CTA.
+
+Within its KV split, each FP8 query row ends the prefix loop after the last
+128-entry tile holding a positive id, and runs at least one tile. The CTA
+finds that tile while it stages the row's slot ids in shared memory (a warp
+max-reduce, then a CTA-wide maximum after the staging barrier); the gather
+ring, both MMA warps and the softmax share it as their loop bound. Later tiles
+hold only masked entries, which leave the softmax maximum, sum and output
+unchanged, so outputs are bitwise identical to the full loop for any id order,
+and an all-padding prefix keeps the full loop's state for the tail and the
+split merge. The bound is runtime data, not a compile-time parameter. Grid
+sizing still assumes full prefixes: rows with fewer selected slots, such as
+short contexts and padded rows, finish sooner.
+
+The tile and grid choice selects static geometry inside the existing decode
+provider. Cache layout, writers, prefix/offload ownership and descales keep
+their contracts.
+Startup warmup enumerates every tile and launch configuration before graph
+capture, and rows remain dynamic within each configuration. Tests cover Hq/Hkv
+of 24/2 and 12/1, target and draft query widths, both sides of the SM107
+212-SM grid threshold, the SM100/SM103 wave-count choices, padding, prefixes
+ending inside or on the edge of a tile, refreshed cache values, PDL on/off,
+large KV offsets and execution without further compilation after warmup.
