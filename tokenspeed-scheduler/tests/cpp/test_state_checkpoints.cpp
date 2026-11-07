@@ -60,7 +60,7 @@ protected:
         SendAbortEvent(id);
         if (config_.role == Role::kP) {
             ExecutionEvent event;
-            event.With(pd::FailedEvent{.request_id = id});
+            event.With(pd::FailedEvent{id});
             scheduler_->Advance(std::move(event));
             if (scheduler_->PdTransferPinned(id)) {
                 SendForwardDone(id);
