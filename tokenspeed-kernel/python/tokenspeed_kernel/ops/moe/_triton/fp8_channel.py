@@ -301,8 +301,9 @@ def _launch_config(
 
     Tuned on a GB200 for 256 experts with top-8 routing, where
     ``num_tokens / 32`` is an expert's mean route count: 16-row tiles up to
-    16 routes per expert, 64-row tiles above. Other shapes run correctly with
-    these tiles but were not tuned.
+    16 routes per expert, 64-row tiles above (32-row tiles on SM90, see
+    ``sm90`` below). Other shapes run correctly with these tiles but were not
+    tuned.
     ``*_ctas_per_sm`` sizes each persistent grid in programs per SM (capped by
     the tile count), so co-resident programs hide each other's load latency.
 
