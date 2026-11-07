@@ -98,21 +98,41 @@ ensure_flashinfer_jit_cache() {
         return 0
     fi
 
-    local wheel_url
-    wheel_url="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache_installer.py" \
+    # pip does not retry a wheel whose content fails the index hash check: a
+    # corrupted CDN edge object answering with a truncated or empty body then
+    # breaks every install on the cluster (observed 2026-11-05 for a
+    # FlashInfer GitHub release asset). Resolve the wheels and their hashes
+    # from the FlashInfer index and download through the verified cache.
+    # Runners without a persistent wheelhouse still get verified downloads.
+    local CI_WHEEL_CACHE_DIR="${CI_WHEEL_CACHE_DIR:-$(mktemp -d)}"
+
+    local resolved
+    resolved="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache_installer.py" \
         --requirements "${CUDA_REQ}" \
-        --cuda-index "${CUINDEX}")"
-    if [ -z "${wheel_url}" ]; then
+        --cuda-index "${CUINDEX}" \
+        --resolve-metapackage)"
+    if [ -z "${resolved}" ]; then
         return 0
     fi
 
+    local wheel_url wheel_sha256
+    read -r wheel_url wheel_sha256 <<< "${resolved}"
+    local wheels=()
+    wheels+=("$(cache_remote_wheel "${wheel_url}" "${wheel_sha256}")")
+
     # Since 0.7.0 the pinned wheel depends on separate architecture providers.
-    local index_url="https://flashinfer.ai/whl/cu${CUINDEX}"
-    if [[ "${wheel_url}" == */nightly-v* ]]; then
-        index_url="https://flashinfer.ai/whl/nightly/cu${CUINDEX}"
-    fi
+    local providers
+    providers="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache_installer.py" \
+        --requirements "${CUDA_REQ}" \
+        --cuda-index "${CUINDEX}" \
+        --list-providers "${wheels[0]}")"
+    while read -r wheel_url wheel_sha256; do
+        [ -n "${wheel_url}" ] || continue
+        wheels+=("$(cache_remote_wheel "${wheel_url}" "${wheel_sha256}")")
+    done <<< "${providers}"
+
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --index-url "${index_url}" "${wheel_url}"
+        --force-reinstall --no-deps "${wheels[@]}"
 }
 
 echo "=========================================="

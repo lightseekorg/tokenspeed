@@ -9,10 +9,12 @@ import pytest
 SCRIPT = Path(__file__).with_name("package_cache.sh")
 
 
-def run_bash(command: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_bash(
+    command: str, env: dict[str, str], check: bool = True
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", "-c", f'source "{SCRIPT}"; {command}'],
-        check=True,
+        check=check,
         capture_output=True,
         text=True,
         env=env,
@@ -237,3 +239,92 @@ def test_installed_wheel_requires_matching_version_and_archive(
         env,
     )
     assert result.stdout.strip() == ("reuse" if matches else "install")
+
+
+def fake_curl_env(tmp_path: Path, script: str) -> tuple[dict[str, str], Path, Path]:
+    bin_dir = tmp_path / "bin"
+    cache_dir = tmp_path / "wheelhouse"
+    bin_dir.mkdir()
+    cache_dir.mkdir()
+    fake_curl = bin_dir / "curl"
+    fake_curl.write_text(script)
+    fake_curl.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "CI_WHEEL_CACHE_DIR": str(cache_dir),
+            "CI_WHEEL_DOWNLOAD_RETRY_DELAY": "0",
+            "CURL_CALLS": str(tmp_path / "curl-calls"),
+            "PATH": f"{bin_dir}:{env['PATH']}",
+        }
+    )
+    return env, cache_dir, tmp_path / "curl-calls"
+
+
+FLAKY_CURL = """#!/bin/bash
+set -e
+printf 'called\\n' >> "${CURL_CALLS}"
+count="$(wc -l < "${CURL_CALLS}")"
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--output" ]; then
+        if [ "${count}" -eq 1 ]; then
+            printf '%s' "${FIRST_BODY}" > "$2"
+        else
+            printf 'complete wheel' > "$2"
+        fi
+        exit 0
+    fi
+    shift
+done
+exit 1
+"""
+
+
+@pytest.mark.parametrize("first_body", ["truncated", ""])
+def test_cached_remote_wheel_retries_unverified_download(
+    tmp_path: Path, first_body: str
+):
+    env, cache_dir, calls = fake_curl_env(tmp_path, FLAKY_CURL)
+    env["FIRST_BODY"] = first_body
+    expected_sha256 = sha256(b"complete wheel").hexdigest()
+
+    result = run_bash(
+        f'cache_remote_wheel "https://example.test/pkg.whl" "{expected_sha256}"',
+        env,
+    )
+
+    assert result.stdout.strip() == str(cache_dir / "pkg.whl")
+    assert calls.read_text().splitlines() == ["called", "called"]
+    assert (cache_dir / "pkg.whl").read_text() == "complete wheel"
+    assert not list(cache_dir.glob("*.tmp.*"))
+
+
+ALWAYS_CORRUPT_CURL = """#!/bin/bash
+set -e
+printf 'called\\n' >> "${CURL_CALLS}"
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--output" ]; then
+        printf 'truncated' > "$2"
+        exit 0
+    fi
+    shift
+done
+exit 1
+"""
+
+
+def test_cached_remote_wheel_gives_up_after_retries(tmp_path: Path):
+    env, cache_dir, calls = fake_curl_env(tmp_path, ALWAYS_CORRUPT_CURL)
+    expected_sha256 = sha256(b"complete wheel").hexdigest()
+
+    result = run_bash(
+        f'cache_remote_wheel "https://example.test/pkg.whl" "{expected_sha256}"',
+        env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert calls.read_text().splitlines() == ["called"] * 3
+    assert not (cache_dir / "pkg.whl").exists()
+    assert not list(cache_dir.glob("*.tmp.*"))
+    assert "Giving up" in result.stderr
