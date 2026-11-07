@@ -751,6 +751,7 @@ def _decode_compute(backend, inputs, bs):
                 swa_rope_cache=None,
                 swa_norm_weight=None,
                 swa_norm_eps=0.0,
+                fused_decode_groups=None,
                 key_rows=None,
             )
         )
@@ -1663,6 +1664,7 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        fused_decode_groups=None,
         key_rows=None,
     )
     record = backend.sparse_topk.prefill
@@ -1839,6 +1841,7 @@ def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None,
         )
 
@@ -1874,6 +1877,7 @@ def test_deferred_swa_norm_without_rope_cache_is_refused():
             swa_rope_cache=None,
             swa_norm_weight=torch.ones(512, dtype=torch.bfloat16),
             swa_norm_eps=1e-6,
+            fused_decode_groups=None,
             key_rows=None,
         )
 
@@ -1902,6 +1906,7 @@ def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        fused_decode_groups=None,
         key_rows=None,
     )
     backend.cache_pool.arena.buffer.zero_()
@@ -1926,6 +1931,7 @@ def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
                 swa_rope_cache=None,
                 swa_norm_weight=None,
                 swa_norm_eps=0.0,
+                fused_decode_groups=None,
                 key_rows=None,
             )
         )
@@ -1960,6 +1966,7 @@ def test_gpu_mixed_swa_matches_separate_extend_and_decode():
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None,
         )
 
@@ -2043,6 +2050,7 @@ def test_gpu_replayed_rows_attend_from_the_window_start_only():
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None,
         )
 
@@ -2169,6 +2177,7 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        fused_decode_groups=None,
         key_rows=None,
     )
     slots, lengths = captured[0][2:4]
@@ -3378,6 +3387,7 @@ def test_gpu_sharded_swa_preserves_output_and_cache(monkeypatch, case, fused_rop
             swa_rope_cache=rope,
             swa_norm_weight=norm,
             swa_norm_eps=1e-6 if fused_rope else 0.0,
+            fused_decode_groups=None,
             key_rows=key_rows,
         )
 
@@ -3538,6 +3548,7 @@ def test_gpu_model_qcp_preserves_global_selections(
             swa_rope_cache=None,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
+            fused_decode_groups=None,
             key_rows=None if plan is None else QueryShardGather(plan, (0, 1, 2, 3)),
         )
 
