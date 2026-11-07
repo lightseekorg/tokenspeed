@@ -23,6 +23,7 @@ from __future__ import annotations
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 from tokenspeed_kernel.ops.metadata.ngram import NGramHashParams, prepare_ngram_inputs
@@ -74,6 +75,7 @@ class InputBuffers:
         self.ngram_hash_ids_buf: torch.Tensor | None = None
         self.ngram_padding_hash: torch.Tensor | None = None
         self.ngram_hash_params: NGramHashParams | None = None
+        self._ngram_vocab_size = 0
         self._ngram_active_tokens = 0
         # Per-modality in-vocab draft tokens; when set, fill rewrites the
         # drafter-only shift-1 buffer's media pad ids in place so drafters
@@ -197,6 +199,7 @@ class InputBuffers:
                 f"fewer than the vocabulary of {vocab_size}"
             )
         self.ngram_hash_params = hash_params
+        self._ngram_vocab_size = vocab_size
         self.ngram_previous_tokens_buf = torch.full(
             (self.max_num_tokens, context_len),
             -1,
@@ -325,7 +328,7 @@ class InputBuffers:
             self.ngram_prefix_buf[:bs],
             self.ngram_hash_ids_buf[:refresh_tokens],
             total_tokens,
-            runtime_states.vocab_size,
+            runtime_states.input_vocab_size,
             uniform_length,
             self.ngram_hash_params,
         )
@@ -383,7 +386,7 @@ class InputBuffers:
 
         Args:
             substitute_ids: in-vocab token id per media modality.
-            vocab_size: target vocabulary size, for validation.
+            vocab_size: target input vocabulary size, for validation.
         """
         invalid = {
             modality: token_id
@@ -408,23 +411,21 @@ class InputBuffers:
         and writes none of them (see ``load_round_inputs``)."""
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
+        # Request metadata still casts C++ vectors to lists on each read.
+        # Cache repeated reads, especially inside the per-row all() below.
+        req_pool_indices = forward_op.request_pool_indices
+        input_lengths = forward_op.input_lengths
 
         # CPU-side fast path: when the scheduler always emits a decode_input_ids
         # list (even though every entry is -1, meaning "no override").
         decode_input_ids = forward_op.decode_input_ids
         if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
             decode_input_ids = None
-        n_req = len(forward_op.request_pool_indices)
-        n_len = len(forward_op.input_lengths)
         req_pool_indices_cpu, input_lengths_cpu = self._bulk_pinned(
-            (n_req, torch.int64), (n_len, torch.int32)
+            (len(req_pool_indices), torch.int64), (len(input_lengths), torch.int32)
         )
-        req_pool_indices_cpu.copy_(
-            torch.as_tensor(forward_op.request_pool_indices, dtype=torch.int64)
-        )
-        input_lengths_cpu.copy_(
-            torch.as_tensor(forward_op.input_lengths, dtype=torch.int32)
-        )
+        req_pool_indices_cpu.copy_(torch.as_tensor(req_pool_indices, dtype=torch.int64))
+        input_lengths_cpu.copy_(torch.as_tensor(input_lengths, dtype=torch.int32))
         self.req_pool_indices_buf[:batch_size].copy_(
             req_pool_indices_cpu,
             non_blocking=True,
@@ -445,12 +446,13 @@ class InputBuffers:
                 decode_width=runtime_states.future_input_map.shape[1],
             )
 
+        extend_prefix_lens = forward_op.extend_prefix_lens
+        prefill_lengths = forward_op.prefill_lengths
         self.all_extends_mid_chunk = (
             num_extends > 0
             and num_extends == batch_size
             and all(
-                forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
-                < forward_op.prefill_lengths[i]
+                extend_prefix_lens[i] + input_lengths[i] < prefill_lengths[i]
                 for i in range(num_extends)
             )
         )
@@ -458,16 +460,16 @@ class InputBuffers:
         if num_extends > 0:
             # Fresh bulk pinned per step (see _bulk_pinned: persistent staging races overlap scheduling).
             self.extend_prefix_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.extend_prefix_lens, dtype=torch.int32
+                extend_prefix_lens, dtype=torch.int32
             )
             self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.input_lengths[:num_extends], dtype=torch.int32
+                input_lengths[:num_extends], dtype=torch.int32
             )
             self.extend_replay_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.extend_replay_lens, dtype=torch.int32
             )
             self.extend_prompt_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.prefill_lengths[:num_extends], dtype=torch.int32
+                prefill_lengths[:num_extends], dtype=torch.int32
             )
             if self.reads_state_checkpoints:
                 self.extend_state_checkpoint_lens_cpu[:num_extends] = torch.as_tensor(
@@ -534,20 +536,19 @@ class InputBuffers:
 
         # Determine input_ids and forward_mode
         if num_extends > 0:
-            prefill_token_count = sum(forward_op.input_lengths[:num_extends])
-            n_ids = len(forward_op.input_ids)
-            (input_ids_cpu,) = self._bulk_pinned((n_ids, torch.int32))
-            input_ids_cpu.copy_(
-                torch.as_tensor(forward_op.input_ids, dtype=torch.int32)
+            prefill_token_count = sum(input_lengths[:num_extends])
+            input_ids = forward_op.input_ids
+            shifted_ids = forward_op.shifted_input_ids
+            input_ids_cpu, shifted_ids_cpu = self._bulk_pinned(
+                (input_ids.size, torch.int32), (shifted_ids.size, torch.int32)
             )
+            # Copy the scheduler's read-only int32 views directly into this
+            # step's writable pinned storage; no intermediate token copy.
+            np.copyto(input_ids_cpu.numpy(), input_ids, casting="no")
+            np.copyto(shifted_ids_cpu.numpy(), shifted_ids, casting="no")
             self.input_ids_buf[:prefill_token_count].copy_(
                 input_ids_cpu,
                 non_blocking=True,
-            )
-            n_sh = len(forward_op.shifted_input_ids)
-            (shifted_ids_cpu,) = self._bulk_pinned((n_sh, torch.int32))
-            shifted_ids_cpu.copy_(
-                torch.as_tensor(forward_op.shifted_input_ids, dtype=torch.int32)
             )
             self.shifted_prefill_ids_buf[:prefill_token_count].copy_(
                 shifted_ids_cpu,
@@ -720,6 +721,22 @@ class InputBuffers:
                 out=self.input_ids_buf[:total_tokens].view(-1, width),
             )
 
+        width = runtime_states.future_input_map.shape[1]
+        if (
+            num_extends < batch_size
+            and width > 1
+            and runtime_states.vocab_size < runtime_states.input_vocab_size
+        ):
+            # Only draft columns index output probabilities. Column 0 may be
+            # an explicit input-only token, as may any token in the prompt.
+            prefill_tokens = sum(forward_op.input_lengths[:num_extends])
+            candidates = self.input_ids_buf[prefill_tokens:total_tokens].view(
+                -1, width
+            )[:, 1:]
+            # Preserve the verifier's defensive output bound even when the
+            # embedding admits a larger input-only token range.
+            candidates.clamp_(0, runtime_states.vocab_size - 1)
+
         # Defensive clamp of the target-model IDs into the valid vocab range.
         # Decode IDs come from future_input_map, written by the previous
         # sampler/drafter; a stale/corrupt value must not reach the captured
@@ -728,7 +745,7 @@ class InputBuffers:
         # final chunk's last row (patched by the drafter with the round's
         # sampled token), and every id the drafters consume is sampled or
         # substituted in-vocab by construction.
-        vocab_size = runtime_states.vocab_size
+        vocab_size = runtime_states.input_vocab_size
         self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 
@@ -736,13 +753,36 @@ class InputBuffers:
         """Prepare padded decode graph inputs for a rank with no real tokens."""
         if self.ngram_previous_tokens_buf is not None:
             assert self.ngram_token_mask_buf is not None
-            self.ngram_previous_tokens_buf[:total_tokens].fill_(-1)
-            self.ngram_token_mask_buf[:total_tokens].zero_()
             assert (
                 self.ngram_hash_ids_buf is not None
                 and self.ngram_padding_hash is not None
             )
-            self.ngram_hash_ids_buf[:total_tokens].copy_(self.ngram_padding_hash)
+            assert self.ngram_seed_buf is not None
+            assert self.ngram_prefix_buf is not None
+            assert self.ngram_hash_params is not None
+            # Empty requests prepare dummy and idle padding without reading
+            # accepted history; the executor controls the warmup scope.
+            empty = self.ngram_seed_buf[:0]
+            context_len = self.ngram_previous_tokens_buf.shape[1]
+            prepare_ngram_inputs(
+                snapshots=empty.view(0, context_len + 1),
+                positions=empty,
+                reset=empty,
+                slots=empty,
+                cache_lengths=self.seq_lens_buf[:0],
+                request_ends=empty,
+                tail=self.ngram_previous_tokens_buf[:0],
+                needs_seed=self.ngram_token_mask_buf[:0],
+                ids=self.input_ids_buf,
+                previous=self.ngram_previous_tokens_buf[:total_tokens],
+                token_mask=self.ngram_token_mask_buf[:total_tokens],
+                prefix=self.ngram_prefix_buf[:0],
+                hashes=self.ngram_hash_ids_buf[:total_tokens],
+                total=0,
+                vocab_size=self._ngram_vocab_size,
+                uniform_length=0,
+                hash_params=self.ngram_hash_params,
+            )
         if total_tokens > 0:
             self.input_ids_buf[:total_tokens].fill_(1)
             self.positions_buf[:total_tokens].fill_(0)

@@ -119,6 +119,7 @@ def _recipe(
             speculative_draft_tree=False,
             enable_replay_ssm=True,
             mamba_ssm_dtype="float32",
+            enable_qsa_prefill_bf16_scratch=False,
         ),
         model_config=model_config,
         attn_config=config,

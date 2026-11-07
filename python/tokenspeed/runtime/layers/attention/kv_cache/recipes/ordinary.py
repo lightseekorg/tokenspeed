@@ -28,7 +28,7 @@ MHA draft is just layers with two different geometries in one plan.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from functools import cached_property
 
@@ -57,6 +57,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     MXFP8_KV_SCALE_TILE_TOKENS,
     CacheGroupDeclaration,
+    SlidingWindowTokens,
+    layer_attn_kind_windows,
     layer_group_ids,
 )
 
@@ -108,6 +110,38 @@ class OrdinaryRecipe(CacheRecipe):
         if len(draft) != self.num_draft_layers:
             draft = (FULL_ATTENTION,) * self.num_draft_layers
         return target + draft
+
+    @property
+    @override
+    def sliding_window_tokens(self) -> SlidingWindowTokens:
+        """A per-layer target window list covers only the target's layers, so
+        with a draft the target and draft windows are resolved separately and
+        concatenated: each draft layer takes the window given by its own layer
+        type and the draft config. A single target window is returned
+        unchanged and, as before, also applies to sliding draft layers. Block
+        drafters mark their layers full-history, so in neither case does a
+        draft window change how many tokens the cache keeps.
+        """
+        target = self.attn_config.component(SoftmaxAttnConfig).sliding_window_tokens
+        if self.draft_attn_config is None or not isinstance(target, Sequence):
+            return target
+        num_target = self.num_target_layers
+        draft_spec = self.draft_attn_config.component(SoftmaxAttnConfig)
+        # Without one layer type per draft layer, the draft layers default to
+        # full-history and have no window.
+        draft = (
+            draft_spec.sliding_window_tokens
+            if len(tuple(draft_spec.cache_layer_types)) == self.num_draft_layers
+            else None
+        )
+        return tuple(
+            window
+            for labels, windows in (
+                (self.layer_types[:num_target], target),
+                (self.layer_types[num_target:], draft),
+            )
+            for _, window in layer_attn_kind_windows(labels, windows)
+        )
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
@@ -279,12 +313,12 @@ def _config_layer_fields(
     rows = prefix_granularity
     if isinstance(spec, DSAConfig):
         return _mla_layer_fields(config, rows, layer_id, occurrence) + (
-            _index_k_field(config, rows, layer_id),
+            index_k_field(config, rows, layer_id),
         )
     if isinstance(spec, MSAConfig):
         fields = _mha_layer_fields(config, rows, layer_id, occurrence)
         if local_layer_id in spec.sparse_layer_ids:
-            fields += (_index_k_field(config, rows, layer_id),)
+            fields += (index_k_field(config, rows, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, rows, layer_id, occurrence)
@@ -372,8 +406,14 @@ def _mla_layer_fields(config, rows: int, layer_id: int, occurrence: int):
     )
 
 
-def _index_k_field(config, rows: int, layer_id: int) -> CacheFieldSpec:
-    """The sparse indexer's key row for one layer (DSA bytes, MSA elements)."""
+def index_k_field(config, rows: int, layer_id: int) -> CacheFieldSpec:
+    """The sparse indexer's key rows for one layer (DSA bytes, MSA elements).
+
+    Args:
+        config: The attention config owning the layer.
+        rows: Token rows per cache page: the recipe's prefix granularity.
+        layer_id: The layer's id in the merged plan.
+    """
     from tokenspeed.runtime.layers.attention.configs.dsa import (
         DSAConfig,
         dsa_index_k_row_bytes,

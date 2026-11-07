@@ -21,10 +21,12 @@
 
 """Rotary Positional Embeddings."""
 
+import dataclasses
 import itertools
 import logging
 import math
-from typing import Any
+from collections.abc import Callable
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -301,14 +303,36 @@ def _yarn_find_correction_dim(
     )
 
 
-# Find dim range bounds based on rotations
-def _yarn_find_correction_range(
+def yarn_find_correction_range(
     low_rot: int,
     high_rot: int,
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
 ) -> tuple[int, int]:
+    """The YaRN correction range: rotary-dimension bounds for the ramp mask.
+
+    Inverts the RoPE frequency formula to find, for each rotation count, the
+    rotary dimension whose period over ``max_position_embeddings`` positions
+    completes that many rotations. Dimensions below the low bound rotate more
+    than ``low_rot`` times (high frequency, left unscaled by YaRN); dimensions
+    above the high bound rotate fewer than ``high_rot`` times (low frequency,
+    fully interpolated); the ramp from ``yarn_linear_ramp_mask`` blends between
+    the two across ``[low, high]``.
+
+    Args:
+        low_rot: Rotation count marking the end of the unscaled region
+            (YaRN's ``beta_fast``).
+        high_rot: Rotation count marking the start of the fully interpolated
+            region (YaRN's ``beta_slow``).
+        dim: Rotary dimension of the embedding.
+        base: RoPE frequency base.
+        max_position_embeddings: Original (pre-scaling) maximum position.
+
+    Returns:
+        ``(low, high)`` rotary-dimension indices, floor/ceil-rounded and
+        clamped to ``[0, dim - 1]``.
+    """
     low = math.floor(
         _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
     )
@@ -318,7 +342,7 @@ def _yarn_find_correction_range(
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
-def _yarn_linear_ramp_mask(
+def yarn_linear_ramp_mask(
     low: float,
     high: float,
     dim: int,
@@ -348,10 +372,26 @@ def _yarn_linear_ramp_mask(
     return ramp_func
 
 
-def _yarn_get_mscale(scale: float = 1) -> float:
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    """The YaRN attention magnitude correction ``0.1 * mscale * ln(scale) + 1``.
+
+    YaRN scales attention logits up slightly as the context is extended to
+    compensate for the entropy drop of interpolated rotary embeddings; the
+    cos/sin cache is multiplied by this factor.
+
+    Args:
+        scale: Context extension factor (``rope_scaling["factor"]``); no
+            correction is applied at or below 1.
+        mscale: Model-specific multiplier on the log term (DeepSeek's
+            ``mscale`` / ``mscale_all_dim``); 1 gives the original YaRN
+            formula.
+
+    Returns:
+        The magnitude correction factor, 1.0 when ``scale <= 1``.
+    """
     if scale <= 1:
         return 1.0
-    return 0.1 * math.log(scale) + 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
@@ -381,7 +421,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
         # Get n-d magnitude scaling corrected for interpolation
-        self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
+        self.mscale = float(yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -393,7 +433,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-        low, high = _yarn_find_correction_range(
+        low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,
@@ -403,7 +443,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(
+            - yarn_linear_ramp_mask(
                 low, high, self.rotary_dim // 2, dtype=torch.float, device=None
             )
         ) * self.extrapolation_factor
@@ -520,12 +560,6 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         return Rotary(self.cos_sin_cache, positions + offset, RopeStyle.NEOX, None)
 
 
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
 class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     """RotaryEmbedding extended with YaRN method.
 
@@ -548,18 +582,18 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: str | None = "cuda",
+        device: str | None = None,
         ramp_device: str,
+        frequency_device: str,
     ) -> None:
         """
         Args:
             device: Device the cos/sin cache is built on and the inverse
-                frequencies are moved to.
-            ramp_device: Device the whole inverse-frequency table (the
-                position frequencies, both divisions and the YaRN linear ramp
-                mask) is computed on before moving to ``device`` once
-                (``--yarn-ramp-mask-device``); the trainer computes it on the
-                host.
+                frequencies are moved to; None selects the platform default
+                (``"npu"`` on NPU, ``"cuda"`` elsewhere).
+            ramp_device: Device that computes the YaRN linear ramp mask.
+            frequency_device: Device that computes the powers, divisions and
+                interpolation. The ramp is transferred here before combining.
         """
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -572,27 +606,30 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
             * attn_factor
         )
-        self.device = device
+        self.device = (
+            device
+            if device is not None
+            else ("npu" if current_platform().is_npu else "cuda")
+        )
         self.ramp_device = ramp_device
+        self.frequency_device = frequency_device
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
-        # Every division of the table runs on ramp_device and the result moves
-        # to the model device once: CPU and CUDA round each of them
-        # differently at ulp level, and the trainer builds the whole table on
-        # the host.
+        # Power/division and ramp construction can have different rounding
+        # contracts. Move the ramp without recomputing its values.
         pos_freqs = self.base ** (
             torch.arange(
-                0, self.rotary_dim, 2, dtype=torch.float, device=self.ramp_device
+                0, self.rotary_dim, 2, dtype=torch.float, device=self.frequency_device
             )
             / self.rotary_dim
         )
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-        low, high = _yarn_find_correction_range(
+        low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,
@@ -602,21 +639,19 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(
+            - yarn_linear_ramp_mask(
                 low,
                 high,
                 self.rotary_dim // 2,
                 dtype=torch.float,
                 device=self.ramp_device,
-            )
+            ).to(self.frequency_device)
         ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
             + inv_freq_extrapolation * inv_freq_mask
         )
-        if self.device is not None:
-            inv_freq = inv_freq.to(self.device)
-        return inv_freq
+        return inv_freq.to(self.device)
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
@@ -1187,6 +1222,252 @@ class MRotaryEmbedding(RotaryEmbedding):
             return position_ids, mrope_position_deltas
 
 
+@dataclasses.dataclass(frozen=True)
+class RopeScaling:
+    """A ``rope_scaling`` config dict parsed once into typed fields.
+
+    ``from_dict`` validates the type tag (``rope_type``, legacy ``type``) and
+    the keys the selected scaling type requires, so a malformed checkpoint
+    config fails here with the missing keys named instead of a ``KeyError``
+    deep in ``get_rope``. Keys the selected type does not consume stay
+    ignored, as before.
+    """
+
+    rope_type: str
+    factor: float | None = None
+    original_max_position_embeddings: int | None = None
+    low_freq_factor: float | None = None
+    high_freq_factor: float | None = None
+    alpha: float | None = None
+    extrapolation_factor: float = 1
+    attn_factor: float = 1
+    beta_fast: int = 32
+    beta_slow: int = 1
+    mscale: float = 1
+    mscale_all_dim: float = 0
+    short_factor: list[float] | None = None
+    long_factor: list[float] | None = None
+    short_mscale: float | None = None
+    long_mscale: float | None = None
+    mrope_section: list[int] | None = None
+    mrope_interleaved: bool = False
+
+    # Keys each scaling type must carry, beyond the type tag. "dynamic" needs
+    # "alpha" for the NTK-alpha variant and "factor" otherwise.
+    _REQUIRED_KEYS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "llama3": (
+            "factor",
+            "low_freq_factor",
+            "high_freq_factor",
+            "original_max_position_embeddings",
+        ),
+        "linear": ("factor",),
+        "yarn": ("factor", "original_max_position_embeddings"),
+        "deepseek_yarn": ("factor", "original_max_position_embeddings"),
+        "longrope": (
+            "short_factor",
+            "long_factor",
+            "original_max_position_embeddings",
+        ),
+    }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RopeScaling":
+        """Parse and validate a checkpoint's ``rope_scaling`` dict."""
+        if "rope_type" in raw:
+            rope_type = raw["rope_type"]
+        elif "type" in raw:
+            rope_type = raw["type"]
+        else:
+            raise ValueError("Unknown RoPE scaling type")
+
+        known = {f.name for f in dataclasses.fields(cls)} - {"rope_type"}
+        scaling = cls(
+            rope_type=rope_type, **{k: v for k, v in raw.items() if k in known}
+        )
+
+        required = cls._REQUIRED_KEYS.get(rope_type, ())
+        if rope_type == "dynamic":
+            required = ("alpha",) if "alpha" in raw else ("factor",)
+        missing = [k for k in required if k not in raw]
+        if missing:
+            raise ValueError(
+                f"rope_scaling type {rope_type!r} misses required "
+                f"key(s): {', '.join(missing)}"
+            )
+        return scaling
+
+
+@dataclasses.dataclass(frozen=True)
+class _RopeCommonArgs:
+    """Constructor arguments every rotary embedding shares."""
+
+    head_size: int
+    rotary_dim: int
+    max_position: int
+    base: int
+    is_neox_style: bool
+    dtype: torch.dtype
+
+
+@dataclasses.dataclass(frozen=True)
+class _YarnDevices:
+    """Construction devices deepseek_yarn rounding depends on."""
+
+    ramp_device: str
+    frequency_device: str
+
+
+def _build_llama3(
+    args: _RopeCommonArgs, scaling: RopeScaling, yarn: _YarnDevices
+) -> RotaryEmbedding:
+    return Llama3RotaryEmbedding(
+        args.head_size,
+        args.rotary_dim,
+        args.max_position,
+        args.base,
+        args.is_neox_style,
+        args.dtype,
+        scaling.factor,
+        scaling.low_freq_factor,
+        scaling.high_freq_factor,
+        scaling.original_max_position_embeddings,
+    )
+
+
+def _build_default(
+    args: _RopeCommonArgs, scaling: RopeScaling, yarn: _YarnDevices
+) -> RotaryEmbedding:
+    if scaling.mrope_section is not None:
+        return MRotaryEmbedding(
+            args.head_size,
+            args.rotary_dim,
+            args.max_position,
+            args.base,
+            args.is_neox_style,
+            args.dtype,
+            mrope_section=scaling.mrope_section,
+            mrope_interleaved=scaling.mrope_interleaved,
+        )
+    return RotaryEmbedding(
+        args.head_size,
+        args.rotary_dim,
+        args.max_position,
+        args.base,
+        args.is_neox_style,
+        args.dtype,
+    )
+
+
+def _build_linear(
+    args: _RopeCommonArgs, scaling: RopeScaling, yarn: _YarnDevices
+) -> RotaryEmbedding:
+    return LinearScalingRotaryEmbedding(
+        args.head_size,
+        args.rotary_dim,
+        args.max_position,
+        args.base,
+        args.is_neox_style,
+        scaling.factor,
+        args.dtype,
+    )
+
+
+def _build_dynamic(
+    args: _RopeCommonArgs, scaling: RopeScaling, yarn: _YarnDevices
+) -> RotaryEmbedding:
+    if scaling.alpha is not None:
+        return DynamicNTKAlphaRotaryEmbedding(
+            args.head_size,
+            args.rotary_dim,
+            args.max_position,
+            args.base,
+            args.is_neox_style,
+            scaling.alpha,
+            args.dtype,
+        )
+    return DynamicNTKScalingRotaryEmbedding(
+        args.head_size,
+        args.rotary_dim,
+        args.max_position,
+        args.base,
+        args.is_neox_style,
+        scaling.factor,
+        args.dtype,
+    )
+
+
+def _build_yarn(
+    args: _RopeCommonArgs, scaling: RopeScaling, yarn: _YarnDevices
+) -> RotaryEmbedding:
+    return YaRNScalingRotaryEmbedding(
+        args.head_size,
+        args.rotary_dim,
+        scaling.original_max_position_embeddings,
+        args.base,
+        args.is_neox_style,
+        scaling.factor,
+        args.dtype,
+        extrapolation_factor=scaling.extrapolation_factor,
+        attn_factor=scaling.attn_factor,
+        beta_fast=scaling.beta_fast,
+        beta_slow=scaling.beta_slow,
+    )
+
+
+def _build_deepseek_yarn(
+    args: _RopeCommonArgs, scaling: RopeScaling, yarn: _YarnDevices
+) -> RotaryEmbedding:
+    return DeepseekScalingRotaryEmbedding(
+        args.head_size,
+        args.rotary_dim,
+        scaling.original_max_position_embeddings,
+        args.base,
+        args.is_neox_style,
+        scaling.factor,
+        args.dtype,
+        ramp_device=yarn.ramp_device,
+        frequency_device=yarn.frequency_device,
+        extrapolation_factor=scaling.extrapolation_factor,
+        attn_factor=scaling.attn_factor,
+        beta_fast=scaling.beta_fast,
+        beta_slow=scaling.beta_slow,
+        mscale=scaling.mscale,
+        mscale_all_dim=scaling.mscale_all_dim,
+    )
+
+
+def _build_longrope(
+    args: _RopeCommonArgs, scaling: RopeScaling, yarn: _YarnDevices
+) -> RotaryEmbedding:
+    return Phi3LongRoPEScaledRotaryEmbedding(
+        args.head_size,
+        args.rotary_dim,
+        args.max_position,
+        scaling.original_max_position_embeddings,
+        args.base,
+        args.is_neox_style,
+        scaling.short_factor,
+        scaling.long_factor,
+        short_mscale=scaling.short_mscale,
+        long_mscale=scaling.long_mscale,
+    )
+
+
+# One builder per rope_scaling type; get_rope only resolves the table.
+_ROPE_BUILDERS: dict[
+    str, Callable[[_RopeCommonArgs, RopeScaling, _YarnDevices], RotaryEmbedding]
+] = {
+    "llama3": _build_llama3,
+    "default": _build_default,
+    "linear": _build_linear,
+    "dynamic": _build_dynamic,
+    "yarn": _build_yarn,
+    "deepseek_yarn": _build_deepseek_yarn,
+    "longrope": _build_longrope,
+}
+
+
 _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 
 
@@ -1214,10 +1495,10 @@ def get_rope(
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
 
-    # deepseek_yarn builds its inverse frequencies on the launch's chosen
-    # device; the cache must not hand a cuda-built table to a cpu launch or
-    # vice versa.
+    # Both construction devices affect deepseek_yarn rounding, so a cached
+    # table must match the launch's ramp and frequency choices.
     yarn_ramp_mask_device = global_server_args_dict["yarn_ramp_mask_device"]
+    yarn_frequency_device = global_server_args_dict["yarn_frequency_device"]
     key = (
         head_size,
         rotary_dim,
@@ -1227,6 +1508,7 @@ def get_rope(
         rope_scaling_args,
         dtype,
         yarn_ramp_mask_device,
+        yarn_frequency_device,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -1236,152 +1518,16 @@ def get_rope(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
-        if "rope_type" in rope_scaling:
-            scaling_type = rope_scaling["rope_type"]
-        elif "type" in rope_scaling:
-            scaling_type = rope_scaling["type"]
-        else:
-            raise ValueError("Unknown RoPE scaling type")
-
-        if scaling_type == "llama3":
-            scaling_factor = rope_scaling["factor"]
-            low_freq_factor = rope_scaling["low_freq_factor"]
-            high_freq_factor = rope_scaling["high_freq_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            rotary_emb = Llama3RotaryEmbedding(
-                head_size,
-                rotary_dim,
-                max_position,
-                base,
-                is_neox_style,
-                dtype,
-                scaling_factor,
-                low_freq_factor,
-                high_freq_factor,
-                original_max_position,
-            )
-        elif scaling_type == "default":
-            if "mrope_section" in rope_scaling:
-                rotary_emb = MRotaryEmbedding(
-                    head_size,
-                    rotary_dim,
-                    max_position,
-                    base,
-                    is_neox_style,
-                    dtype,
-                    mrope_section=rope_scaling["mrope_section"],
-                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
-                )
-            else:
-                rotary_emb = RotaryEmbedding(
-                    head_size,
-                    rotary_dim,
-                    max_position,
-                    base,
-                    is_neox_style,
-                    dtype,
-                )
-        elif scaling_type == "linear":
-            scaling_factor = rope_scaling["factor"]
-            rotary_emb = LinearScalingRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                max_position,
-                base,
-                is_neox_style,
-                scaling_factor,
-                dtype,
-            )
-        elif scaling_type == "dynamic":
-            scaling_factor = rope_scaling["factor"]
-            if "alpha" in rope_scaling:
-                rotary_emb = DynamicNTKAlphaRotaryEmbedding(
-                    head_size,
-                    rotary_dim,
-                    max_position,
-                    base,
-                    is_neox_style,
-                    rope_scaling["alpha"],
-                    dtype,
-                )
-            else:
-                rotary_emb = DynamicNTKScalingRotaryEmbedding(
-                    head_size,
-                    rotary_dim,
-                    max_position,
-                    base,
-                    is_neox_style,
-                    scaling_factor,
-                    dtype,
-                )
-        elif scaling_type == "yarn":
-            scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k
-                in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
-            }
-            rotary_emb = YaRNScalingRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                original_max_position,
-                base,
-                is_neox_style,
-                scaling_factor,
-                dtype,
-                **extra_kwargs,
-            )
-        elif scaling_type == "deepseek_yarn":
-            scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k
-                in (
-                    "extrapolation_factor",
-                    "attn_factor",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                )
-            }
-            rotary_emb = DeepseekScalingRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                original_max_position,
-                base,
-                is_neox_style,
-                scaling_factor,
-                dtype,
-                device="npu" if current_platform().is_npu else "cuda",
-                ramp_device=yarn_ramp_mask_device,
-                **extra_kwargs,
-            )
-        elif scaling_type == "longrope":
-            short_factor = rope_scaling["short_factor"]
-            long_factor = rope_scaling["long_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k in ("short_mscale", "long_mscale")
-            }
-            rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                max_position,
-                original_max_position,
-                base,
-                is_neox_style,
-                short_factor,
-                long_factor,
-                **extra_kwargs,
-            )
-        else:
-            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        scaling = RopeScaling.from_dict(rope_scaling)
+        builder = _ROPE_BUILDERS.get(scaling.rope_type)
+        if builder is None:
+            raise ValueError(f"Unknown RoPE scaling type {scaling.rope_type}")
+        rotary_emb = builder(
+            _RopeCommonArgs(
+                head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            ),
+            scaling,
+            _YarnDevices(yarn_ramp_mask_device, yarn_frequency_device),
+        )
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb

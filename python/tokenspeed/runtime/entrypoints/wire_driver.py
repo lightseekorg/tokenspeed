@@ -89,6 +89,8 @@ class Completion:
     # Prompt tokens served from the prefix cache.
     cached_tokens: int = 0
     output_token_logprobs: list[float] = dataclasses.field(default_factory=list)
+    # Selected-token cumulative probability diagnostics, parallel to logprobs.
+    output_token_cumulative_probs: list[float] = dataclasses.field(default_factory=list)
     # The prompt logprobs (None for the first position) and their tokens.
     input_token_logprobs: tuple[list[float | None], list[int]] | None = None
     # With speculative decoding: verify rounds, and accepted tokens per round.
@@ -96,8 +98,17 @@ class Completion:
     accept_draft_tokens: float | None = None
 
     def add(self, chunk: dict) -> None:
+        cumulative_probs = chunk["output_token_cumulative_probs"]
+        if cumulative_probs and (
+            len(cumulative_probs) != len(chunk["output_ids"])
+            or len(cumulative_probs) != len(chunk["output_token_logprobs"])
+        ):
+            raise ValueError(
+                "Cumulative probabilities must match the chunk's tokens and logprobs"
+            )
         self.output_ids.extend(chunk["output_ids"])
         self.output_token_logprobs.extend(chunk["output_token_logprobs"])
+        self.output_token_cumulative_probs.extend(cumulative_probs)
         self.finish_reason = chunk["finish_reason"]
         self.finish_details = chunk["finish_details"]
         self.prompt_tokens = chunk["prompt_tokens"]
@@ -153,6 +164,11 @@ class WireDriver:
         )
         handshake_port = listener.handshake_address.rsplit(":", 1)[1]
         pending = listener.accept()
+        # What the engine was started with, for callers that borrow it.
+        self.server_args = list(server_args)
+        self.num_engines = num_engines
+        self.routing = routing
+        self.startup_timeout_s = startup_timeout_s
         self._encoder = MsgpackEncoder()
         self.process = subprocess.Popen(
             [

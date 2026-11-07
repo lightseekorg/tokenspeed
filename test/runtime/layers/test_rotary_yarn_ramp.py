@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``--yarn-ramp-mask-device``: where deepseek_yarn computes its inv_freq table."""
+"""YaRN ramp and frequency construction devices and their cache identity."""
 
 from __future__ import annotations
 
@@ -30,9 +30,9 @@ import torch
 import tokenspeed.runtime.layers.rotary_embedding as rotary_module
 from tokenspeed.runtime.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
     get_rope,
+    yarn_find_correction_range,
+    yarn_linear_ramp_mask,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -52,7 +52,7 @@ def _cpu_reference_ramp(low: float, high: float, dim: int) -> torch.Tensor:
 
 def _cpu_reference_inv_freq() -> torch.Tensor:
     pos_freqs = BASE ** (torch.arange(0, ROTARY_DIM, 2, dtype=torch.float) / ROTARY_DIM)
-    low, high = _yarn_find_correction_range(
+    low, high = yarn_find_correction_range(
         32, 1, ROTARY_DIM, BASE, ORIGINAL_MAX_POSITION
     )
     mask = 1 - _cpu_reference_ramp(low, high, ROTARY_DIM // 2)
@@ -61,10 +61,10 @@ def _cpu_reference_inv_freq() -> torch.Tensor:
 
 def test_cpu_ramp_matches_the_pure_cpu_reference():
     low, high = 3, 29
-    ramp = _yarn_linear_ramp_mask(low, high, ROTARY_DIM // 2, torch.float, device="cpu")
+    ramp = yarn_linear_ramp_mask(low, high, ROTARY_DIM // 2, torch.float, device="cpu")
     assert torch.equal(ramp, _cpu_reference_ramp(low, high, ROTARY_DIM // 2))
     # The degenerate range is widened, not divided by zero.
-    flat = _yarn_linear_ramp_mask(5, 5, 8, torch.float, device=None)
+    flat = yarn_linear_ramp_mask(5, 5, 8, torch.float, device=None)
     assert torch.isfinite(flat).all()
 
 
@@ -79,6 +79,7 @@ def _rope(device: str, ramp_device: str) -> DeepseekScalingRotaryEmbedding:
         torch.bfloat16,
         device=device,
         ramp_device=ramp_device,
+        frequency_device=ramp_device,
     )
 
 
@@ -120,6 +121,7 @@ def test_get_rope_reads_the_switch_and_keys_its_cache_on_it(monkeypatch):
     }
     monkeypatch.setattr(rotary_module, "_ROPE_DICT", {})
     monkeypatch.setitem(global_server_args_dict, "yarn_ramp_mask_device", "cpu")
+    monkeypatch.setitem(global_server_args_dict, "yarn_frequency_device", "cuda")
     cpu_rope = get_rope(
         ROTARY_DIM, ROTARY_DIM, 8192, BASE, False, dict(rope_scaling), torch.bfloat16
     )
@@ -134,8 +136,50 @@ def test_get_rope_reads_the_switch_and_keys_its_cache_on_it(monkeypatch):
     )
     assert cuda_rope is not cpu_rope
     assert cuda_rope.ramp_device == "cuda"
-    # Same inv_freq up to the ulp-level division difference the switch exists for.
+    # Keep the frequency device fixed to isolate the ramp choice in the cache.
     cpu_freq = cpu_rope._compute_inv_freq(SCALING_FACTOR).cpu()
     cuda_freq = cuda_rope._compute_inv_freq(SCALING_FACTOR).cpu()
     assert torch.allclose(cpu_freq, cuda_freq, rtol=1e-6, atol=0)
     assert math.isclose(float(cpu_freq[0]), 1.0, rel_tol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_frequencies_with_cpu_ramp_match_mixed_device_trainer(monkeypatch):
+    monkeypatch.setattr(rotary_module, "_ROPE_DICT", {})
+    monkeypatch.setitem(global_server_args_dict, "yarn_ramp_mask_device", "cpu")
+    monkeypatch.setitem(global_server_args_dict, "yarn_frequency_device", "cpu")
+    scaling = {
+        "rope_type": "deepseek_yarn",
+        "factor": SCALING_FACTOR,
+        "original_max_position_embeddings": ORIGINAL_MAX_POSITION,
+    }
+    legacy = get_rope(
+        ROTARY_DIM, ROTARY_DIM, 8192, BASE, False, scaling, torch.bfloat16
+    )
+    monkeypatch.setitem(global_server_args_dict, "yarn_frequency_device", "cuda")
+    mixed = get_rope(
+        ROTARY_DIM,
+        ROTARY_DIM,
+        8192,
+        BASE,
+        False,
+        scaling,
+        torch.bfloat16,
+    )
+    freq = BASE ** (
+        torch.arange(0, ROTARY_DIM, 2, device="cuda", dtype=torch.float32) / ROTARY_DIM
+    )
+    low, high = yarn_find_correction_range(
+        32, 1, ROTARY_DIM, BASE, ORIGINAL_MAX_POSITION
+    )
+    mask = 1 - _cpu_reference_ramp(low, high, ROTARY_DIM // 2).cuda()
+    expected = (1 / (SCALING_FACTOR * freq)) * (1 - mask) + (1 / freq) * mask
+    actual = mixed._compute_inv_freq(SCALING_FACTOR)
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    assert mixed is not legacy
+    assert mixed is get_rope(
+        ROTARY_DIM, ROTARY_DIM, 8192, BASE, False, scaling, torch.bfloat16
+    )
+    assert torch.equal(
+        legacy._compute_inv_freq(SCALING_FACTOR).cpu(), _cpu_reference_inv_freq()
+    )

@@ -44,10 +44,15 @@ from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.thirdparty.trtllm_blockwise._kernel import (
     Sm100BlockwiseGemmKernel,
 )
-from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import _run
+from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import (
+    DEFAULT_TACTICS,
+    _run,
+    prepare,
+)
 
 
 @lru_cache(maxsize=512)
@@ -61,6 +66,17 @@ def _nearest_token_buckets(tokens: int) -> tuple[int, ...]:
 
 
 _CACHE_EXTRAS = ("e4m3_fp32_128x128_bf16_v1", "profile_l2_buffers")
+_OP = "trtllm_cutedsl_fp8_blockscale"
+# (N, K, device) whose servable tactics startup warmup compiled.
+_warmed_shapes = set()
+
+
+def _bucket_shapes(shapes, bucket):
+    """Shapes with M (rows of A, its scales and the output) set to ``bucket``."""
+    return tuple(
+        (bucket, *shape[1:]) if index in (0, 2, 4) else shape
+        for index, shape in enumerate(shapes)
+    )
 
 
 class BlockwiseGemmRunner(TunableRunner):
@@ -164,10 +180,38 @@ class BlockwiseGemmRunner(TunableRunner):
 _runner = BlockwiseGemmRunner()
 
 
+def _warm_servable_tactics(tuner, inputs):
+    """Compile every tactic a later call with these N, K and device can launch.
+
+    Serving takes the cached tactic of its token bucket, else of the nearest
+    cached bucket, else the row-count rule, and compiles it on first use. A
+    cache loaded from file holds tactics that startup's own token counts never
+    launch, so compile all of them during startup warmup instead.
+    """
+    a, b = inputs[:2]
+    shape_key = (*b.shape, a.device.index)
+    if shape_key in _warmed_shapes:
+        return
+    shapes = tuple(tuple(tensor.shape) for tensor in inputs)
+    tactics = set(DEFAULT_TACTICS)
+    for bucket in get_hybrid_num_tokens_buckets(1 << 30):
+        hit, _, tactic, _ = tuner.search_cache(
+            _OP,
+            [_runner],
+            _bucket_shapes(shapes, bucket),
+            _runner.tuning_config,
+            inputs=inputs,
+        )
+        if hit and tactic != -1:
+            tactics.add(tactic)
+    prepare(*inputs, tactics)
+    _warmed_shapes.add(shape_key)
+
+
 def run(a, b, a_scales, b_scales, out):
     inputs = [a, b, a_scales, b_scales, out]
     tuner = AutoTuner.get()
-    op = "trtllm_cutedsl_fp8_blockscale"
+    op = _OP
     if tuner.is_tuning_mode and op not in tuner._effective_skip_ops:
         original_repeat = tuner.repeat
         _runner._profile_base_repeat = original_repeat
@@ -229,18 +273,16 @@ def run(a, b, a_scales, b_scales, out):
                 for bucket in _nearest_token_buckets(m):
                     if bucket == current_bucket:
                         continue
-                    bucket_shapes = tuple(
-                        (bucket, *shape[1:]) if index in (0, 2, 4) else shape
-                        for index, shape in enumerate(shapes)
-                    )
                     hit, _, cached_tactic, _ = tuner.search_cache(
                         op,
                         [_runner],
-                        bucket_shapes,
+                        _bucket_shapes(shapes, bucket),
                         _runner.tuning_config,
                         inputs=inputs,
                     )
                     if hit:
                         runner, tactic = _runner, cached_tactic
                         break
+    if is_warming_up() and not torch.cuda.is_current_stream_capturing():
+        _warm_servable_tactics(tuner, inputs)
     return runner(inputs, tactic=tactic)

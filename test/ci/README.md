@@ -22,8 +22,14 @@ Supported task types:
 Task types that start a server (`server_smoke`, `eval`, `perf`) run with
 `TOKENSPEED_JIT_COMPILE_CHECK=error` unless the task's `env` sets it: a
 compile-time kernel parameter that keeps taking new values after startup
-(a per-batch `tl.constexpr`) fails the run. The server log names the kernel,
-the parameter, and the launching call site.
+(a per-batch `tl.constexpr` or static CuTe DSL dimension), a call site that
+keeps recompiling specializations a kernel already has, or a direct
+`@cute.jit` call after startup fails the run. The server log names the kernel,
+the cause, and the launching call site. They also run with
+`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error`, which no task may change
+(validation rejects a task or `runner.env` that sets it): a host
+synchronization on the forward thread's per-round path after startup fails
+the run, and the server log names its Python location.
 
 Currently configured task directories:
 
@@ -52,13 +58,16 @@ On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
 `tokenspeed-kernel/test/ops/` and `tokenspeed-kernel/test/nvidia/thirdparty/`,
 keeping the numerics suite in a separate process. `ut-tokenspeed-kernel-part-ii`
 runs those two directories, keeping the TRT-LLM communication and CUDA suites in
-separate processes. Together the two tasks cover the kernel suite once. AMD
-runners run the whole suite in the single `ut-tokenspeed-kernel` task.
+separate processes. `ut-tokenspeed-kernel-post-submit` runs the slow files that
+`ut-tokenspeed-kernel-part-i` ignores (the non-FP8 GEMM autotune capacity test)
+on pushes to `main` only. Together the three tasks cover the kernel suite once.
+AMD runners run the whole suite in the single `ut-tokenspeed-kernel` task.
 
-Conversely, AMD runners split the `runtime-1gpu` suite across
-`ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
-by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
-runners run the whole suite in `ut-runtime-1gpu`.
+All runners split the `runtime-1gpu` suite across `ut-runtime-1gpu-part-i` and
+`ut-runtime-1gpu-part-ii`, which balance test files by their registered
+`est_time` (`run_ci_suite.py --auto-partition-*`). The suite starts one `pytest`
+process per file, so per-file startup is a large share of its time, and
+running it in one job takes longer than the kernel unit tests.
 
 The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four GB200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
@@ -77,6 +86,21 @@ of at least 0.96.
 The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
 GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
 unquantized.
+
+The Qwen3.8 Flash Next MXFP4 monokernel task serves the same checkpoint on
+one GPU with `--decode-monokernel` and three-step MTP. It uses the same 2-GPU
+MI35x runners, whose Hugging Face cache already holds the checkpoint. It sends the first
+128 GSM8K test questions one at a time
+(`test/single_request_benchmark/gsm8k_decode.py`). Every decode step then has
+one request, so the decode monokernel serves every step. The batched GSM8K
+eval runs more than four token rows per step, so it keeps the regular path.
+One server start gates two things. The benchmark exits with status 1 when
+accuracy is below 0.88. `perf_reference` gates the per-request decode rate,
+which leaves out time to first token. The reference is the median of three
+runs on that runner, rounded down. The task stays optional until later runs
+confirm it. The benchmark
+writes per-request records under
+`.ci-artifacts/published/gsm8k-single-request`.
 
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
@@ -477,6 +501,9 @@ requested pull request. The generated `srun` steps name that variable in
 `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`. That pin and the
 in-tree package carry the same version, so pip keeps the wheel and an unreleased
 in-tree kernel change never runs.
+Tests of unreleased MLA implementation behavior, such as KV packing compilation
+reuse, import the in-tree package in a subprocess with an explicit `PYTHONPATH`.
+This keeps those checks independent of the installed wheel used by API tests.
 
 The job gets the node exclusively by default so another job cannot contend for
 its GPU or fixed service ports. Runtime cleanup is
@@ -606,8 +633,8 @@ this repository. Pull-request runs execute the merge commit's dispatcher, so
 the run covers dispatcher changes before merge. The workflow skips fork pull
 requests until the coordinator pool uses ephemeral runners with a protected
 approval environment. Use the manual `Slurm Dispatch` workflow after review.
-New commits cancel the older run for the same pull request or the `main`
-branch.
+New commits cancel the older run for the same pull request. A push to `main`
+does not cancel a running run; only the newest waiting run is kept.
 
 Submission is fail-closed and requires the repository variable
 `TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated
@@ -682,10 +709,10 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
-The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.2 by image digest.
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.3 by image digest.
 When upgrading, keep the FlashInfer Python requirement, release cubin checksum,
-and runner JIT-cache version aligned. FlashInfer 0.7.2 also requires
-cuDNN frontend 1.31.0 or newer and splits its JIT cache into provider packages.
+and runner JIT-cache version aligned. FlashInfer 0.7.3 also requires
+cuDNN frontend 1.32.0 or newer and splits its JIT cache into provider packages.
 GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
 index and checks their installed versions again after dependency installation.
 

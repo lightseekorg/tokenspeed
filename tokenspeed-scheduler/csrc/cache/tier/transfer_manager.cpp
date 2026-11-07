@@ -180,7 +180,8 @@ std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_
         return {};
     }
     // An eviction write-back's tickets publish through their segments: they
-    // go with the op, and the segments hold the same Host blocks.
+    // go with the op, and the segments hold the same Host blocks. Erasing the
+    // record lands every StoreWait on the op.
     std::vector<StoreTicket> stores =
         it->second.publishes_at_ack ? std::move(it->second.tickets) : std::vector<StoreTicket>{};
     write_backs_.erase(it);
@@ -200,8 +201,7 @@ std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_
     // less the members that became dead meanwhile.
     WriteBackStats& eviction_stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kEviction)];
     for (auto segment = in_flight_segments_.begin(); segment != in_flight_segments_.end();) {
-        std::erase(segment->pending_store_ops, op_id);
-        if (!segment->pending_store_ops.empty()) {
+        if (!std::ranges::all_of(segment->stores, &StoreWait::Landed)) {
             ++segment;
             continue;
         }
@@ -212,13 +212,6 @@ std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_
         published.insert(published.end(), std::make_move_iterator(settled.begin()),
                          std::make_move_iterator(settled.end()));
         segment = in_flight_segments_.erase(segment);
-    }
-    // Every segment left still waits for an op that is out.
-    for (const InFlightSegment& segment : in_flight_segments_) {
-        _assert(!segment.pending_store_ops.empty() &&
-                    std::ranges::all_of(segment.pending_store_ops,
-                                        [&](std::uint32_t waited) { return write_backs_.contains(waited); }),
-                "an unsettled write-back segment waits for an op still in flight");
     }
     return published;
 }
@@ -232,8 +225,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     // The newest Device access first, recording order among equals: the
     // placement drops whole segments from the back, the oldest first.
     std::ranges::stable_sort(segments, std::ranges::greater{}, &CacheCoordinator::EvictedSegment::newest_access_epoch);
-    const InFlightHostBlocks in_flight = inFlightHostBlocks();
-    std::vector<std::vector<std::uint32_t>> pending_store_ops(segments.size());
+    const InFlightHostBlocks in_flight_blocks = inFlightHostBlocks();
+    std::vector<std::vector<StoreWait>> stores(segments.size());
     // Per row to place, its member's index in its segment, with the group and
     // bucket of each: the Host copy lives in its Device source's bucket.
     std::vector<std::size_t> member_of_row;
@@ -252,11 +245,11 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
                 ++stats.host_cached;  // held since the eviction
                 continue;
             }
-            if (const auto it = in_flight.find(member.key); it != in_flight.end()) {
+            if (const auto it = in_flight_blocks.find(member.key); it != in_flight_blocks.end()) {
                 ++stats.in_flight;
                 member.host_block = it->second.block;
-                if (std::ranges::find(pending_store_ops[s], it->second.op_id) == pending_store_ops[s].end()) {
-                    pending_store_ops[s].push_back(it->second.op_id);
+                if (std::ranges::find(stores[s], it->second.store.op_id, &StoreWait::op_id) == stores[s].end()) {
+                    stores[s].push_back(it->second.store);
                 }
                 continue;
             }
@@ -279,6 +272,9 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     // eviction and may be granted again in this plan, so no ticket holds
     // them; the runtime orders the copy ahead of the plan's page reuse.
     std::optional<std::uint32_t> op_id;
+    // The op's lifetime: segments wait on the op before its record exists,
+    // so it is made here and handed to the record below.
+    std::shared_ptr<const StoreInFlight> in_flight;
     std::vector<CacheTransfer> transfers;
     std::vector<StoreTicket> tickets;
     for (std::size_t s = 0; s < segments.size(); ++s) {
@@ -300,6 +296,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
                     "Host store pairs blocks of different owners");
             if (!op_id) {
                 op_id = nextOpId();
+                in_flight = std::make_shared<StoreInFlight>();
             }
             transfers.push_back(CacheTransfer{
                 .group_id = member.key.group_id,
@@ -326,9 +323,9 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
             }
         }
         if (row_range.first_row < row_range.past_end_row) {
-            pending_store_ops[s].push_back(*op_id);
+            stores[s].push_back(StoreWait{.op_id = *op_id, .in_flight = in_flight});
         }
-        if (pending_store_ops[s].empty()) {
+        if (stores[s].empty()) {
             // Every member is on the Host already: nothing to wait for.
             const std::size_t num_members = segments[s].members.size();
             stats.cancelled +=
@@ -336,7 +333,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
             continue;
         }
         in_flight_segments_.push_back(
-            InFlightSegment{.segment = std::move(segments[s]), .pending_store_ops = std::move(pending_store_ops[s])});
+            InFlightSegment{.segment = std::move(segments[s]), .stores = std::move(stores[s])});
     }
     if (!op_id) {
         return std::nullopt;
@@ -344,7 +341,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     const bool inserted = write_backs_
                               .emplace(*op_id, InFlightWriteBack{.guard = StoreSourceGuard::kStreamOrdered,
                                                                  .tickets = std::move(tickets),
-                                                                 .publishes_at_ack = false})
+                                                                 .publishes_at_ack = false,
+                                                                 .in_flight = std::move(in_flight)})
                               .second;
     _assert(inserted, "duplicate store op id");
     ++stats.ops;
@@ -353,6 +351,43 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
         .transfers = std::move(transfers),
         .source_pinned = false,
     };
+}
+
+std::int32_t TierTransferManager::DemoteInFlightEvictions(std::span<const CacheKey> keys) {
+    if (in_flight_segments_.empty() || keys.empty()) {
+        return 0;
+    }
+    const std::unordered_set<CacheKey, CacheKeyHash> demoted_keys(keys.begin(), keys.end());
+    std::int32_t demoted = 0;
+    // Per key, the members holding its Host entry to publish into: the Host
+    // held it when the Device entry was evicted, or an earlier store
+    // published it since.
+    std::unordered_map<CacheKey, std::uint32_t, CacheKeyHash> host_entry_holds;
+    for (InFlightSegment& in_flight : in_flight_segments_) {
+        for (CacheCoordinator::EvictedBlock& member : in_flight.segment.members) {
+            if (!demoted_keys.contains(member.key)) {
+                continue;
+            }
+            const bool holds_host_entry =
+                member.host_block && member.host_block == coordinator_.FindHostCachedBlock(member.key);
+            if (holds_host_entry) {
+                ++host_entry_holds[member.key];
+            }
+            if (!member.metadata.demoted) {
+                member.metadata.last_access_epoch = CacheCoordinator::kDemotedAccessEpoch;
+                member.metadata.was_acquired = false;
+                member.metadata.demoted = true;
+                // One publishing into a Host entry counts with that entry.
+                demoted += holds_host_entry ? 0 : 1;
+            }
+        }
+    }
+    // The settlement keeps the newer of a member's date and its Host entry's,
+    // so the Host entry is dated back here.
+    for (const auto& [key, holds] : host_entry_holds) {
+        demoted += coordinator_.DemoteHostEntryHeldByWriteBack(key, holds) ? 1 : 0;
+    }
+    return demoted;
 }
 
 void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
@@ -369,8 +404,9 @@ TierTransferManager::InFlightHostBlocks TierTransferManager::inFlightHostBlocks(
             // skips them, the others borrow their ticket's block), so a key
             // travels on at most one ticket an ACK publishes, beside those of
             // eviction write-backs (which only an eviction drain borrows).
-            const InFlightHostBlock carried{
-                .block = ticket.host_block_ref, .op_id = op_id, .publishes_at_ack = write_back.publishes_at_ack};
+            const InFlightHostBlock carried{.block = ticket.host_block_ref,
+                                            .store = StoreWait{.op_id = op_id, .in_flight = write_back.in_flight},
+                                            .publishes_at_ack = write_back.publishes_at_ack};
             if (const auto [it, inserted] = by_key.emplace(ticket.key, carried);
                 !inserted && carried.publishes_at_ack) {
                 it->second = carried;
@@ -424,8 +460,9 @@ TierTransferManager::RetractionImageSplit TierTransferManager::SplitRetractionIm
                 // write-back's segment may publish it later or never, after
                 // the image has counted its L2 leg as landed.
                 if (const auto it = in_flight.find(slot.key); it != in_flight.end() && it->second.publishes_at_ack) {
-                    if (std::ranges::find(split.pending_store_ops, it->second.op_id) == split.pending_store_ops.end()) {
-                        split.pending_store_ops.push_back(it->second.op_id);
+                    if (std::ranges::find(split.host_slot_stores, it->second.store.op_id, &StoreWait::op_id) ==
+                        split.host_slot_stores.end()) {
+                        split.host_slot_stores.push_back(it->second.store);
                     }
                     slot.block = it->second.block;
                     split.host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
@@ -489,7 +526,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
         }
     }
     std::vector<std::vector<ImageSlot>> host_slots = std::move(split.host_slots);
-    std::vector<std::uint32_t> pending_store_ops = std::move(split.pending_store_ops);
+    std::vector<StoreWait> image_stores = std::move(split.host_slot_stores);
 
     // The L2 leg: the rows of the boundaries the split counted get Host
     // blocks by its plan, copied by this retraction's own write-back.
@@ -542,19 +579,18 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
             transfers[i].page_offset = host_store_pairs[i].key.page_offset;
             ++stats.blocks[transfers[i].group_id];
         }
-        const bool inserted = write_backs_
-                                  .emplace(op_id, InFlightWriteBack{.guard = StoreSourceGuard::kStreamOrdered,
-                                                                    .tickets = std::move(tickets),
-                                                                    .publishes_at_ack = true})
-                                  .second;
+        const auto [record, inserted] =
+            write_backs_.emplace(op_id, InFlightWriteBack{.guard = StoreSourceGuard::kStreamOrdered,
+                                                          .tickets = std::move(tickets),
+                                                          .publishes_at_ack = true});
         _assert(inserted, "duplicate store op id");
+        image_stores.push_back(StoreWait{.op_id = op_id, .in_flight = record->second.in_flight});
         ++stats.ops;
         stores.host_store = WriteBackOperation{
             .op_id = op_id,
             .transfers = std::move(transfers),
             .source_pinned = false,
         };
-        pending_store_ops.push_back(op_id);
     }
     {
         const std::uint32_t op_id = nextOpId();
@@ -570,15 +606,12 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
             .snapshot_slot = blob_slot->slot_,
             .transfers = resolveTransfers(taken->store_pairs),
         };
-        const bool inserted = snapshot_stores_
-                                  .emplace(op_id, InFlightSnapshotStore{.request_id = request_id,
-                                                                        .destinations = std::move(destinations),
-                                                                        .blob_slot = std::move(blob_slot)})
-                                  .second;
+        const auto [record, inserted] = snapshot_stores_.emplace(
+            op_id, InFlightSnapshotStore{.destinations = std::move(destinations), .blob_slot = std::move(blob_slot)});
         _assert(inserted, "duplicate snapshot store op id");
-        pending_store_ops.push_back(op_id);
+        image_stores.push_back(StoreWait{.op_id = op_id, .in_flight = record->second.in_flight});
     }
-    stores.pending_store_ops = std::move(pending_store_ops);
+    stores.image_stores = std::move(image_stores);
     return stores;
 }
 
@@ -625,14 +658,8 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
     return op;
 }
 
-std::optional<std::string> TierTransferManager::CompleteSnapshotStore(std::uint32_t op_id) {
-    auto it = snapshot_stores_.find(op_id);
-    if (it == snapshot_stores_.end()) {
-        return std::nullopt;
-    }
-    std::string request_id = std::move(it->second.request_id);
-    snapshot_stores_.erase(it);
-    return request_id;
+void TierTransferManager::CompleteSnapshotStore(std::uint32_t op_id) {
+    snapshot_stores_.erase(op_id);
 }
 
 std::optional<std::string> TierTransferManager::SnapshotRestoreRequest(std::uint32_t op_id) const {

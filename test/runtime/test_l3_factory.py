@@ -37,7 +37,7 @@ from tokenspeed_scheduler import StorageKind
 from transformers import Qwen3Config
 
 from tokenspeed.runtime.cache.host_storage import HostCacheResources, HostCacheStorage
-from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.cache.l3.factory import _kv_producer_options, l3_settings
 from tokenspeed.runtime.cache.transfer.layout import (
     CacheField,
     CacheGroupLayout,
@@ -55,6 +55,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheMemoryPlan,
     CachePlaneLayout,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -117,6 +118,15 @@ def construction(tmp_path):
             groups=groups,
             buffers=(torch.zeros(68, dtype=torch.uint8),),
             consumers=(("layer.0.k",),),
+        ),
+        group_specs=(
+            CacheGroupSpec(
+                "full",
+                "full_history",
+                rows_per_page=1,
+                entry_stride_tokens=2,
+                replayable=False,
+            ),
         ),
         num_host_lcm_blocks=16,
     )
@@ -205,6 +215,21 @@ def test_settings_freeze_namespace_inputs_before_weight_version_switch(construct
         executor.close(5.0)
 
 
+def test_settings_separate_yarn_frequency_devices(construction):
+    args, model, _, factory_kwargs = construction
+    args.yarn_ramp_mask_device = "cpu"
+    args.yarn_frequency_device = "cpu"
+    cpu = l3_settings(args, model, None, **factory_kwargs)
+    args.yarn_frequency_device = "cuda"
+    cuda = l3_settings(args, model, None, **factory_kwargs)
+    assert cpu.deployment_id != cuda.deployment_id
+    args.yarn_frequency_device = "cpu"
+    assert (
+        l3_settings(args, model, None, **factory_kwargs).deployment_id
+        == cpu.deployment_id
+    )
+
+
 def test_settings_include_the_draft_checkpoint_identity(construction, tmp_path):
     args, model, _, factory_kwargs = construction
     path = tmp_path / "draft"
@@ -216,6 +241,20 @@ def test_settings_include_the_draft_checkpoint_identity(construction, tmp_path):
     with_draft = l3_settings(args, model, draft, **factory_kwargs)
     assert not target_only.has_draft and with_draft.has_draft
     assert target_only.deployment_id != with_draft.deployment_id
+
+
+def test_settings_separate_the_qsa_bf16_prefill_scratch(construction):
+    args, model, _, factory_kwargs = construction
+    # Off, the producer facts are those of a build without the option, so
+    # existing deployments keep their identity.
+    assert "enable_qsa_prefill_bf16_scratch" not in _kv_producer_options(
+        args, draft_dtype=""
+    )
+    without = l3_settings(args, model, None, **factory_kwargs)
+    args.enable_qsa_prefill_bf16_scratch = True
+    with_scratch = l3_settings(args, model, None, **factory_kwargs)
+    # Large prefill calls attend through another kernel.
+    assert with_scratch.deployment_id != without.deployment_id
 
 
 def test_settings_refuse_head_partitioned_payload_on_cyclic_owners(construction):

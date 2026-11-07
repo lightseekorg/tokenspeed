@@ -184,32 +184,22 @@ class EagleHarnessConfig:
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class _DecodeLadderArgs:
-    """The executor config fields the decode graph ladder is built from
-    (``forward_step.get_batch_sizes_to_capture``), as
-    ``ModelExecutorConfig.from_server_args`` takes them."""
-
-    cudagraph_capture_sizes: list[int] | None
-    max_num_seqs: int
-    data_parallel_size: int
-    disable_cuda_graph_padding: bool
-    max_cudagraph_capture_size: int
-
-
 def decode_graph_floors(server_args: ServerArgs) -> tuple[tuple[int, int], ...]:
     """Each decode graph's padded batch and the largest live batch size below
     the forwards replaying it: the ladder entry before it when batches pad up
     to the ladder, else one below it. Empty under attention data parallelism,
     where any smaller live batch can replay a graph (a rank pads to the
     largest rank's batch)."""
-    from tokenspeed.runtime.execution.forward_step import get_batch_sizes_to_capture
+    from tokenspeed.runtime.execution.forward_step import (
+        DecodeLadderArgs,
+        get_batch_sizes_to_capture,
+    )
 
     dp_size = server_args.mapping.attn.dp_size
     if dp_size > 1:
         return ()
     ladder = get_batch_sizes_to_capture(
-        _DecodeLadderArgs(
+        DecodeLadderArgs(
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             max_num_seqs=server_args.max_num_seqs,
             data_parallel_size=dp_size,

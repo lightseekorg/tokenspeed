@@ -872,6 +872,7 @@ type Completed = (
     Option<(u64, f64)>,
     Option<Vec<i32>>,
     Option<(Option<Vec<f64>>, Option<TopLogprobs>, Option<TopLogprobs>)>,
+    Option<Vec<f64>>,
 );
 
 /// A launched forward's results, once they landed.
@@ -885,6 +886,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         serving_compiles,
         grammar_terminated_at,
         logprobs,
+        output_token_cumulative_probs,
     ): Completed = plane.call_method1("complete", (launched,))?.extract()?;
     let (input_token_logprobs, input_top_logprobs, output_top_logprobs) =
         logprobs.unwrap_or_default();
@@ -892,6 +894,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         output_tokens,
         output_lengths,
         output_logprobs,
+        output_token_cumulative_probs,
         nan_flags,
         next_input_ids,
         serving_compiles,
@@ -968,6 +971,7 @@ class Plane:
         self.held = None
         self.unblock = threading.Event()
         self.failing = False
+        self.cumulative_probs = None
 
     def note(self, name):
         self.calls.append((name, threading.get_ident()))
@@ -993,7 +997,7 @@ class Plane:
 
     def complete(self, launched):
         self.note("complete")
-        return ([launched], [1], None, None, None, None, None, None)
+        return ([launched], [1], None, None, None, None, None, None, self.cumulative_probs)
 
     def note_committed(self, launched):
         self.note("note_committed")
@@ -1074,6 +1078,25 @@ result = (Plane(), ts.Scheduler(cfg))
                 .extract()
                 .unwrap()
         })
+    }
+
+    #[test]
+    fn completion_keeps_the_selected_tokens_cumulative_probabilities() {
+        let (plane, mut scheduler) = plane();
+        Python::attach(|py| plane.setattr(py, "cumulative_probs", vec![0.875]).unwrap());
+        let batch = batch();
+        let dispatch = Dispatch {
+            forward: Some(&batch),
+            ..Dispatch::default()
+        };
+        let mut data_plane = start(&plane);
+        let forward = data_plane
+            .execute(scheduler.next_execution_plan(), &dispatch)
+            .unwrap()
+            .unwrap();
+        let result = data_plane.complete(forward).unwrap();
+        assert_eq!(result.output_tokens, [100]);
+        assert_eq!(result.output_token_cumulative_probs, Some(vec![0.875]));
     }
 
     #[test]

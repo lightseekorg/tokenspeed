@@ -40,10 +40,4 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
 void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
-// One row per config group_id. Each group allocator resolves the LCM placement
-// to the kernel-visible page id.
-std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const CacheCoordinator& coordinator,
-                                                                  const std::vector<BlockTable>& tables,
-                                                                  std::span<const std::string> group_ids);
-
 }  // namespace tokenspeed

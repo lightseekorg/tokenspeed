@@ -96,3 +96,10 @@ The CI launchers in `test/ci_system/` (`serve_qwen35_397b_nvfp4_pd_1p1d.sh`,
 `serve_qwen35_122b_nvfp4_epd_1e1p2d.sh`,
 `serve_deepseek_v41_flash_pd_1p1d.sh`) are complete single- and two-node
 examples.
+
+## Ascend device handling
+
+On supported Ascend NPUs, encode and prefill use the selected NPU device
+for copy-completion events and the device process group for embedding
+reconstruction. The prefill producer-step counter also resides on that device.
+Use an Ascend-compatible Mooncake build for embedding and KV transfers.

@@ -74,6 +74,7 @@ __all__ = [
     "current_forward_ctx",
     "current_valid_rows",
     "is_breakable_capture_active",
+    "run_eager",
     "scrub_padding_tail",
     "slice_to_real_tokens",
     "weak_ref_tensor",
@@ -205,6 +206,15 @@ class BreakableCapture:
             its documented "pass the same stream for effective memory sharing".
         handoff_storage: An optional handoff storage map shared with captures that
             never replay while this one's handoffs are live; see ``_handoff_view``.
+        run_segments_while_capturing: Whether each segment runs once as soon
+            as it is captured, before the break that follows it (default
+            False). A capture records a segment's kernels without running
+            them, so without this a break that runs during the capture reads
+            whatever the pool held for the tensors the segment computes, and
+            one that indexes with such a tensor can fault. Replays are
+            unaffected. The drafter's extend captures need it: their breaks
+            index with the top-k rows the narrowing gathers and with positions
+            a captured step advances.
     """
 
     _active: BreakableCapture | None = None
@@ -215,8 +225,11 @@ class BreakableCapture:
         pool: Any | None = None,
         stream: torch.cuda.Stream | None = None,
         handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
+        *,
+        run_segments_while_capturing: bool = False,
     ) -> None:
         self.pool = pool
+        self._run_segments_while_capturing = run_segments_while_capturing
         self.segments: list[Callable[[], Any]] = []
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing = False
@@ -314,6 +327,9 @@ class BreakableCapture:
         """
         assert self._capturing, "add_eager called outside an active capture"
         self._end_segment()
+        if self._run_segments_while_capturing:
+            # The segment just captured recorded its kernels without running them.
+            self.segments[-1]()
         result = fn()
         self.segments.append(fn)
         self._begin_segment()
@@ -349,6 +365,29 @@ def is_breakable_capture_active() -> bool:
     """True while a :class:`BreakableCapture` is open AND currently capturing."""
     cap = BreakableCapture.current()
     return cap is not None and cap._capturing
+
+
+def run_eager(fn: Callable[[], Any]) -> Any:
+    """Call ``fn()``; under a breakable capture, also on every replay.
+
+    For a side-effecting step whose effect a captured segment cannot carry:
+    one that updates host-side state later breaks read (a backend's published
+    write window, a per-forward memo), or whose device writes land at
+    addresses that host state picks per forward. Under a capture the current
+    segment ends, ``fn`` runs and is recorded as a break, and the next segment
+    starts; :meth:`BreakableCapture.replay` re-invokes it in order. ``fn``
+    binds its arguments at capture time, so a tensor it reads must keep its
+    address across replays (a static buffer, or a graph tensor the closure
+    holds and an earlier segment rewrites). Outside a capture -- eager, or a
+    plain ``torch.cuda.graph`` capture -- it is a direct call.
+
+    Returns:
+        ``fn``'s result from this call.
+    """
+    cap = BreakableCapture.current()
+    if cap is None or not cap._capturing:
+        return fn()
+    return cap.add_eager(fn)
 
 
 def _record_break(

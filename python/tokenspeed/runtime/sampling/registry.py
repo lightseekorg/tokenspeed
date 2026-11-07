@@ -45,6 +45,50 @@ def _get_default_backend_name() -> str:
     return "greedy"
 
 
+def _is_sampling_backend_available(backend_name: str) -> bool:
+    """Check if a sampling backend is available."""
+    from tokenspeed_kernel.platform import current_platform
+
+    platform = current_platform()
+
+    if backend_name == "greedy":
+        return True
+    if backend_name == "flashinfer":
+        if not platform.is_nvidia:
+            return False
+        try:
+            from tokenspeed.runtime.sampling.backends import flashinfer  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+    if backend_name == "flashinfer_full":
+        if not platform.is_nvidia:
+            return False
+        try:
+            from tokenspeed.runtime.sampling.backends import (  # noqa: F401
+                flashinfer_full,
+            )
+
+            return True
+        except ImportError:
+            return False
+    if backend_name == "triton":
+        return True
+    if backend_name == "triton_full":
+        return True
+    if backend_name == "ascend_full":
+        if not platform.is_npu:
+            return False
+        try:
+            from tokenspeed.runtime.sampling.backends import ascend_full  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+    return False
+
+
 def _resolve_backend_name(server_args: ServerArgs) -> str:
     return server_args.sampling_backend or _get_default_backend_name()
 
@@ -53,17 +97,8 @@ def register_backend(name: str, cls: type[SamplingBackend]) -> None:
     _BACKEND_REGISTRY[name] = cls
 
 
-def create_sampling_backend(
-    server_args: ServerArgs,
-    *,
-    max_bs: int,
-    max_draft_tokens_per_req: int,
-    device: str,
-    random_seed: int = DEFAULT_RANDOM_SEED,
-    max_req_pool_size: int = 0,
-    vocab_size: int = 0,
-    tp_group: tuple[int, ...] | None = None,
-) -> SamplingBackend:
+def get_sampling_backend_class(server_args: ServerArgs) -> type[SamplingBackend]:
+    """Resolve the selected implementation and its admission capabilities."""
     # Trigger concrete-backend registration on first use.
     from tokenspeed.runtime.sampling.backends import flashinfer as _fi  # noqa: F401
     from tokenspeed.runtime.sampling.backends import (  # noqa: F401
@@ -83,7 +118,21 @@ def create_sampling_backend(
         raise ValueError(
             f"Unknown sampling backend: {name!r}. Available: {list(_BACKEND_REGISTRY)}"
         )
-    cls = _BACKEND_REGISTRY[name]
+    return _BACKEND_REGISTRY[name]
+
+
+def create_sampling_backend(
+    server_args: ServerArgs,
+    *,
+    max_bs: int,
+    max_draft_tokens_per_req: int,
+    device: str,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+    max_req_pool_size: int = 0,
+    vocab_size: int = 0,
+    tp_group: tuple[int, ...] | None = None,
+) -> SamplingBackend:
+    cls = get_sampling_backend_class(server_args)
 
     return cls(
         SamplingBackendConfig.from_server_args(

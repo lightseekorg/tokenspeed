@@ -116,7 +116,12 @@ def _layout(num_lcm_blocks, groups):
 
 def _contract(layout, shard_counts):
     specs = tuple(
-        SimpleNamespace(group_id=group.group_id, shard_count=shard)
+        SimpleNamespace(
+            group_id=group.group_id,
+            attn_kind="full_history",
+            shard_count=shard,
+            replayable=False,
+        )
         for group, shard in zip(layout.groups, shard_counts)
     )
     return SimpleNamespace(
@@ -1001,21 +1006,48 @@ def test_two_ranks_round_trip_a_sharded_image_through_both_tiers(io_backend):
 
 
 def _round_trip_two_ranks(io_backend, executors):
+    compile_check = nullcontext()
+    if io_backend == "kernel":
+        import importlib.util
+
+        from tokenspeed_kernel.ops.kvcache.triton import _transfer_cache_blocks_kernel
+
+        # Earlier tests must not hide a missing startup specialization.
+        _transfer_cache_blocks_kernel.device_caches.clear()
+        helper_spec = importlib.util.spec_from_file_location(
+            "retraction_kernel_test_utils",
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "tokenspeed-kernel",
+                "test",
+                "utils.py",
+            ),
+        )
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        compile_check = helper.assert_no_triton_compile(_transfer_cache_blocks_kernel)
     torch.manual_seed(0)
     # Per rank: 2 local LCM blocks x packing 2 = 4 local blocks of 8 B at
     # stride 16 from offset 8. The sharded group has 2 x 2 x 2 = 8 virtual
     # blocks; rank r owns v with (v - 1) % 2 == r at local (v - 1) // 2 + 1.
     # Host packing is 1: 3 compact parents hold 6 virtual blocks across 2 owners.
     contract = SimpleNamespace(
-        group_specs=(SimpleNamespace(group_id="full", shard_count=2),),
+        group_specs=(
+            SimpleNamespace(
+                group_id="full",
+                attn_kind="full_history",
+                shard_count=2,
+                replayable=False,
+            ),
+        ),
         virtual_block_counts={"full": 1 + 2 * 2 * 2},
         num_lcm_blocks=2,
         token_capacity=32,
     )
-    buffers = {
-        rank: torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
-        for rank in (0, 1)
-    }
+    initial = torch.arange(128, dtype=torch.uint8)
+    buffers = {rank: initial.cuda() for rank in (0, 1)}
     slot_states = {rank: _CudaSlotState(rows=4, width=5) for rank in (0, 1)}
     with patch.object(executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
         for rank in (0, 1):
@@ -1051,6 +1083,8 @@ def _round_trip_two_ranks(io_backend, executors):
                 world_cpu_group=None,
             )
     assert (executors[0].num_host_pages, executors[0].num_snapshot_pages) == (4, 4)
+    for buffer in buffers.values():
+        assert torch.equal(buffer.cpu(), initial)
 
     originals = {
         rank: torch.randint(1, 255, (128,), dtype=torch.uint8, device="cuda")
@@ -1099,11 +1133,12 @@ def _round_trip_two_ranks(io_backend, executors):
         pool_index=3,
     )
     empty_restore = _restore_op(4, 2, [], pool_index=0)
-    for executor in executors.values():
-        executor.submit_load_backs(
-            [restore, empty_restore],
-            prerequisite_stream=stream,
-        )
+    with compile_check:
+        for executor in executors.values():
+            executor.submit_load_backs(
+                [restore, empty_restore],
+                prerequisite_stream=stream,
+            )
     torch.cuda.synchronize()
     assert [_acks(executor.poll_results()) for executor in executors.values()] == [
         _restore_done(2, 4),

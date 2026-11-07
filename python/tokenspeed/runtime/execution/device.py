@@ -1002,6 +1002,7 @@ class DeviceHandle:
                     req.version,
                     self._mooncake_update_models(),
                     require_complete=require_complete,
+                    snapshot=req.snapshot,
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
@@ -1092,7 +1093,7 @@ def start_expert_load_window(executor) -> None:
 
 
 def arm_data_plane_sync_debug(device: str) -> None:
-    """Arm torch's sync-debug mode for the serving phase when asked to.
+    """Arm torch's sync-debug mode for the serving phase; it cannot be off.
 
     Startup synchronizes on purpose -- weight loading, tuning, graph capture,
     the PD transfer and L2 executor builders, the EPD receive's NCCL
@@ -1103,18 +1104,19 @@ def arm_data_plane_sync_debug(device: str) -> None:
     synchronization that serializes the data plane against the step in
     flight -- ``.cpu()``, ``.item()``, ``.tolist()``, ``bool(tensor)``,
     ``nonzero``, pageable host<->device copies, ``stream.synchronize()``.
+    ``TOKENSPEED_DATA_PLANE_SYNC_DEBUG`` picks whether a report warns or
+    raises.
     """
     mode = envs.TOKENSPEED_DATA_PLANE_SYNC_DEBUG.get()
-    if mode == "default":
-        return
     if mode not in ("warn", "error"):
         raise ValueError(
-            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be default, warn or error, got {mode!r}"
+            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be warn or error, got {mode!r}; "
+            "the data-plane sync check cannot be disabled"
         )
     if torch.device(device).type != "cuda":
-        logger.warning(
-            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG={mode!s} ignored on {device!s}: "
-            "sync-debug mode is a CUDA facility"
+        logger.info(
+            f"Data-plane sync check unavailable on {device!s}: sync-debug mode "
+            "is a CUDA facility"
         )
         return
     torch.cuda.set_sync_debug_mode(mode)
@@ -1362,8 +1364,14 @@ def build_device_side(
         NULL_MEMORY_DELTA_OBSERVER,
         DriverMemoryDeltaObserver,
     )
-    from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
+    from tokenspeed.runtime.execution.prefill_graph import (
+        check_rank_uniform_prefill_plan,
+        narrowing_prefill_model,
+    )
     from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        prepare_prefix_history_transport,
+    )
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1395,6 +1403,12 @@ def build_device_side(
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
+        prepare_prefix_history_transport(
+            server_args,
+            model_config,
+            [runner.model for runner in (target, draft) if runner is not None],
+            torch.device(server_args.device, gpu_id),
+        )
     if communication_first:
         prepare_multimodal()
 
@@ -1492,6 +1506,14 @@ def build_device_side(
             draft_attn_backend=attention.draft_attn_backend,
             draft_token_to_kv_pool=views.draft_token_to_kv_pool,
         )
+    # Breaks of these graphs may run collectives; an instance-wide fact, so ranks agree.
+    replays_prefill_graphs = server_args.disaggregation_mode == "prefill" or (
+        server_args.disaggregation_mode == "null"
+        and model_config.dsa_padded_prefill_replay
+    )
+    if replays_prefill_graphs:
+        # Ranks must plan alike: one rank eager while its peers replay hangs them.
+        check_rank_uniform_prefill_plan(executor.prefill_graph, server_args)
     # Once per process, before the probe: a graph keeps its capture-time tactic.
     with (
         startup_memory.measure("startup"),
@@ -1499,6 +1521,13 @@ def build_device_side(
         current_platform().restore_stack_limit(),
     ):
         executor.autotune()
+    if probing and current_platform().is_nvidia:
+        # After empty_cache, reserved minus allocated is residue pinned by live buffers.
+        device_module = torch.get_device_module(server_args.device)
+        pinned = device_module.memory_reserved() - device_module.memory_allocated()
+        logger.info(
+            f"startup allocator cache after empty_cache: {pinned / 2**30:.2f} GiB"
+        )
     if probing:
         # Consumers above keep the probe's: they read only block-count-invariant fields.
         with startup_phase("graph.probe_rebind"):
@@ -1526,6 +1555,16 @@ def build_device_side(
 
     with startup_phase("graph.capture"):
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+    if replays_prefill_graphs and not executor.prefill_graph.disable:
+        # Release capture-stream cache no forward reuses; graph pools are not freed.
+        device_module = torch.get_device_module(server_args.device)
+        before = device_module.memory_reserved() - device_module.memory_allocated()
+        device_module.empty_cache()
+        after = device_module.memory_reserved() - device_module.memory_allocated()
+        logger.info(
+            f"post-capture allocator cache: {before / 2**30:.2f} -> "
+            f"{after / 2**30:.2f} GiB"
+        )
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
     start_expert_load_window(executor)
@@ -1571,7 +1610,9 @@ def build_device_side(
         host_tail_packing = {
             group.group_id: packing * shards[group.group_id]
             for group, packing in zip(
-                layout.groups, compute_host_group_packing(layout), strict=True
+                layout.groups,
+                compute_host_group_packing(layout, group_specs=contract.group_specs),
+                strict=True,
             )
         }
     snapshot_pool = _retraction_pool_request(

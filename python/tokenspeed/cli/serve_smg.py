@@ -719,13 +719,13 @@ def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
     host = _get_from_args(engine_args, "--metrics-host", "127.0.0.1")
     pinned = _get_from_args(engine_args, "--metrics-port")
     if pinned is not None and int(pinned) != 0:
-        return engine_args, f"http://{host}:{int(pinned)}/metrics"
+        return engine_args, f"http://{join_host_port(host, int(pinned))}/metrics"
     if pinned is not None:
         engine_args = _drop_from_args(engine_args, "--metrics-port")
     port = _free_port_avoiding_ephemeral_range()
     return (
         [*engine_args, "--metrics-port", str(port)],
-        f"http://{host}:{port}/metrics",
+        f"http://{join_host_port(host, port)}/metrics",
     )
 
 
@@ -930,7 +930,7 @@ async def run_smg(
 
         await _probe_or_stop(
             wait_http_ready(
-                f"http://{user_host}:{user_port}/liveness",
+                f"http://{join_host_port(user_host, user_port)}/liveness",
                 timeout=float(opts.gateway_startup_timeout),
             ),
             stop,
@@ -947,14 +947,16 @@ async def run_smg(
 
         await _probe_or_stop(
             wait_http_ready(
-                f"http://{user_host}:{user_port}/readiness",
+                f"http://{join_host_port(user_host, user_port)}/readiness",
                 timeout=float(opts.engine_startup_timeout),
             ),
             stop,
             procs={ENGINE_TAG: engine, GATEWAY_TAG: gateway},
         )
 
-        sys.stdout.write(f"ts serve ready on http://{user_host}:{user_port}\n")
+        sys.stdout.write(
+            f"ts serve ready on http://{join_host_port(user_host, user_port)}\n"
+        )
         if metrics_url is not None:
             sys.stdout.write(f"engine metrics available at {metrics_url}\n")
         sys.stdout.flush()

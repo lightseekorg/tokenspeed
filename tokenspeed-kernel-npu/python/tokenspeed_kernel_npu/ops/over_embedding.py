@@ -36,10 +36,10 @@ def _load_flash_oe_ops() -> None:
         "npu_append_packed_oe_lookup",
         "npu_register_host_oe_tables",
     )
-    missing = [name for name in required if not hasattr(torch.ops.flash, name)]
+    missing = [name for name in required if not hasattr(torch.ops.custom, name)]
     if missing:
         raise RuntimeError(
-            "flash_ops is missing required OE operators: " + ", ".join(missing)
+            "flash_ops is missing required custom OE operators: " + ", ".join(missing)
         )
 
 
@@ -57,7 +57,7 @@ def register_host_tables(
         device_index = npu_device.index
         if device_index is None:
             device_index = torch.npu.current_device()
-    torch.ops.flash.npu_register_host_oe_tables(list(oe_tables), device_index)
+    torch.ops.custom.npu_register_host_oe_tables(list(oe_tables), device_index)
 
 
 def append_packed_lookup(
@@ -74,7 +74,7 @@ def append_packed_lookup(
 ) -> None:
     """Append, hash, and lookup Host or Device tables in one Flash operator."""
     _load_flash_oe_ops()
-    torch.ops.flash.npu_append_packed_oe_lookup(
+    torch.ops.custom.npu_append_packed_oe_lookup(
         input_ids,
         input_start_offsets,
         req_pool_indices,

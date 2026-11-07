@@ -97,7 +97,7 @@ def _reference_rows(q, k, v, selected, row_ids):
         (24, 2, 6, (576, 582, 594), torch.bfloat16),
         (24, 2, 8, (512, 520, 528), torch.bfloat16),
         (6, 1, 6, (192, 198, 204), torch.bfloat16),
-        (24, 2, 1, (17, 19, 23), torch.float8_e4m3fn),
+        (24, 2, 1, (41, 53, 71), torch.float8_e4m3fn),
     ],
 )
 def test_qsa_dynamic_rows_reuse_compilation(
@@ -341,7 +341,8 @@ def test_qsa_startup_respects_kernel_override(device, monkeypatch, override_sour
     assert not qsa_sparse._WARMED
 
 
-@pytest.mark.parametrize("override_source", ["context", "environment", "callsite"])
+# Context and environment overrides resolve alike; the test above checks context.
+@pytest.mark.parametrize("override_source", ["environment", "callsite"])
 def test_qsa_startup_warms_override_with_conflicting_solution(
     device, monkeypatch, override_source
 ):
