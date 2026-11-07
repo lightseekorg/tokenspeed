@@ -44,7 +44,7 @@ holds (``V41Metadata.global_write_floor``).
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
