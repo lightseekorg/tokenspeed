@@ -81,12 +81,26 @@ def test_refuses_without_speculative_decoding():
         ServerArgs(model="x", enable_speculative_sampling=True)
 
 
-@pytest.mark.parametrize("algorithm", ["DFLASH", "DSPARK"])
-def test_refuses_block_drafters(algorithm):
+@pytest.mark.parametrize("backend", ["flashinfer", "triton"])
+def test_refuses_dspark(backend):
     with pytest.raises(ValueError, match="whole block greedily") as error:
-        _args(speculative_algorithm=algorithm)
-    hinted = "pass --speculative-rejection-sample-method block" in str(error.value)
-    assert hinted == (algorithm == "DSPARK")
+        _args(speculative_algorithm="DSPARK", sampling_backend=backend)
+    assert "pass --speculative-rejection-sample-method block" in str(error.value)
+
+
+def test_dflash_resolves_with_the_triton_verifier():
+    # DFlash2's walk records a sparse q only the triton verify reads.
+    args = _args(speculative_algorithm="DFLASH", sampling_backend="triton")
+    assert args.enable_speculative_sampling
+    assert args.sampling_backend == "triton"
+
+
+@pytest.mark.parametrize(
+    "backend", ["flashinfer", "flashinfer_full", "triton_full", "greedy"]
+)
+def test_dflash_refuses_every_other_verifier(backend):
+    with pytest.raises(ValueError, match="DFLASH needs --sampling-backend triton"):
+        _args(speculative_algorithm="DFLASH", sampling_backend=backend)
 
 
 @pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3"])
