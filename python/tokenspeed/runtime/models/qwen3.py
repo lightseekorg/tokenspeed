@@ -369,7 +369,7 @@ class Qwen3ForCausalLM(BaseCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
     ) -> set[str]:
-        # Qwen3-Embedding checkpoints name the backbone's tensors without the model prefix.
+        # Qwen3-Embedding checkpoints omit the backbone's model prefix.
         if "Embedding" in self.config.name_or_path:
             weights = ((add_prefix(name, "model"), w) for name, w in weights)
         return super().load_weights(weights, **kwargs)

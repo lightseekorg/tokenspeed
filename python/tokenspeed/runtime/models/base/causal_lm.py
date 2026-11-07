@@ -435,7 +435,7 @@ class BaseCausalLM(nn.Module):
 
     # Weight loading.
 
-    def get_stacked_params_mapping(self) -> list[tuple[str, str, str]]:
+    def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
 
         return []
 
@@ -472,7 +472,7 @@ class BaseCausalLM(nn.Module):
             if expert_loader is not None and expert_loader.is_expert_checkpoint_weight(
                 name
             ):
-                # Experts this rank does not match belong to another expert-parallel rank.
+                # Experts this rank does not match belong to another EP rank.
                 if expert_loader.matches(name):
                     loaded.add(expert_loader.load(name, loaded_weight))
                 continue
