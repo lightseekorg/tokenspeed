@@ -643,6 +643,7 @@ class MambaAttnBackend(AttentionBackend):
         ssm_element_st = []
         conv_bytes: int | None = None
         ssm_bytes: int | None = None
+        ssm_rows_aligned = True
 
         for layer_id in layer_ids:
             conv, ssm = self._state_components(layer_id)
@@ -660,6 +661,10 @@ class MambaAttnBackend(AttentionBackend):
             ssm_src.append(ssm.data_ptr())
             ssm_src_st.append(row_stride_i32(ssm))
             ssm_element_st.append(ssm.stride(0))
+            ssm_rows_aligned &= (
+                ssm.data_ptr() % 16 == 0
+                and ssm.stride(0) * ssm.element_size() % 16 == 0
+            )
             if not self.replay_ssm:
                 ssm_dst.append(ssm_scratch.data_ptr())
                 ssm_dst_st.append(row_stride_i32(ssm_scratch))
@@ -683,6 +688,7 @@ class MambaAttnBackend(AttentionBackend):
             "ssm_element_stride": _i64(ssm_element_st),
             "ssm_scratch_stride": None if self.replay_ssm else _i64(ssm_dst_st),
             "ssm_bytes": ssm_bytes,
+            "ssm_rows_aligned": ssm_rows_aligned,
             "group_sel": _i64(group_sel),
             "num_layers": len(layer_ids),
         }
@@ -822,7 +828,12 @@ class MambaAttnBackend(AttentionBackend):
         Families with another recurrence replace the kernel; the payload,
         tables and page resolution stay shared.
         """
-        gdn_replay_commit(payload, parameters, **tables)
+        gdn_replay_commit(
+            payload,
+            parameters,
+            rows_aligned=self._verify_copy_tables_get()["ssm_rows_aligned"],
+            **tables,
+        )
 
     def tree_support(self) -> TreeSupport:
         return TreeSupport(

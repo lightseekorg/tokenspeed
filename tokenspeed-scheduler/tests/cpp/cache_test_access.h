@@ -54,6 +54,15 @@ struct CacheCoordinatorTestAccess {
                                             /*write_back_segment=*/nullptr);
     }
 
+    // One Device entry's eviction without its cascade, counted under `reason`
+    // and recorded into `segment` as an eviction write-back would (nullptr
+    // drops it); false when the entry is pinned or gone.
+    static bool EvictAloneInto(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location,
+                               CacheCoordinator::DeviceEvictionCounts CacheCoordinator::DeviceEvictionStats::*reason,
+                               CacheCoordinator::EvictedSegment* segment) {
+        return coordinator.evictCachedBlockAlone(group_id, location, reason, segment).has_value();
+    }
+
     static bool RecordDeviceEviction(CacheCoordinator& coordinator, const CacheKey& key,
                                      CacheCoordinator::EvictedSegment& segment) {
         const auto location = coordinator.locationOf(coordinator.pool_, key.group_id, key);
