@@ -115,12 +115,28 @@ def test_nightly_version_suffix_makes_a_development_release(
     assert str(Version(version)) == version
 
 
-@pytest.mark.parametrize("suffix", ["+", "dev1+", "+++", "---", "dev1+-"])
-def test_nightly_version_suffix_refuses_an_empty_label(monkeypatch, suffix) -> None:
+@pytest.mark.parametrize("suffix", [" ", "\t", "+", "dev1+", "+++", "---", "dev1+-"])
+def test_nightly_version_suffix_refuses_a_blank_suffix_or_label(
+    monkeypatch, suffix
+) -> None:
+    # A blank suffix would publish the plain nightly version while the workflows
+    # treat the run as suffixed.
     monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
     monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", suffix)
+    with pytest.raises(ValueError):
+        _capture_setup_kwargs(monkeypatch, "cuda")
+
+
+@pytest.mark.parametrize("branch", ["main", "release/test"])
+def test_version_suffix_is_refused_outside_nightly_builds(monkeypatch, branch) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "false")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", branch)
+    # The release workflow passes the (empty) suffix to every build.
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", "")
+    _capture_setup_kwargs(monkeypatch, "cuda")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", "dev1")
     with pytest.raises(ValueError):
         _capture_setup_kwargs(monkeypatch, "cuda")
 

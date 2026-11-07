@@ -165,8 +165,11 @@ def _nightly_version_suffix() -> str:
     0.1.4.post20261108+label would satisfy the nightly's ``==`` pins and be
     preferred over it.
     """
-    suffix = os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX", "").strip()
+    raw = os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX", "")
+    suffix = raw.strip()
     if not suffix:
+        if raw:
+            raise ValueError("Nightly version suffix is blank")
         return ""
     head, plus, label = suffix.partition("+")
     match = re.fullmatch(
@@ -197,6 +200,10 @@ def _package_version() -> str:
         datetime.strptime(version_date, "%Y%m%d")
         return f"{BASE_VERSION}.post{version_date}{_nightly_version_suffix()}"
 
+    if os.environ.get("TOKENSPEED_KERNEL_VERSION_SUFFIX"):
+        raise ValueError(
+            "TOKENSPEED_KERNEL_VERSION_SUFFIX applies to nightly builds only"
+        )
     if _git_branch().startswith("release/"):
         return BASE_VERSION
 
