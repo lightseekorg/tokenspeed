@@ -1,10 +1,11 @@
 # Asynchronous global L3 cache
 
-L3 extends the existing Device → Host cache hierarchy with shared Mooncake
-objects. The scheduler prepares Host data before ordinary Device admission.
+L3 extends the existing Device → Host cache hierarchy with shared storage
+objects, using Mooncake or native 3FS USRBIO. The scheduler prepares Host data
+before ordinary Device admission.
 All requests still use the same matcher, admission planner, H2D operations and
-forward path. Selecting `--kvstore-storage-backend mooncake` selects this
-asynchronous implementation; there is no second synchronous scheduling mode.
+forward path. Selecting `--kvstore-storage-backend mooncake` or `hf3fs` selects
+this asynchronous implementation; there is no second synchronous scheduling mode.
 
 ## Ownership
 
@@ -51,8 +52,9 @@ Configuration follows the same ownership boundary. `StorageConfig` is the
 read-only scheduling contract for credits, deadlines and pressure watermarks.
 `StorageRuntimeConfig` contains that contract plus the executor's worker counts
 and backend-health settings. `MooncakeStoreSettings` contains connection
-settings and this rank's segment share. The JSON `async` object tunes this one
-asynchronous path; it does
+settings and this rank's segment share. `Hf3fsStoreSettings` contains the 3FS
+directory, native library and per-client resource limits. The JSON `async`
+object tunes this one asynchronous path; it does
 not select another execution mode. See
 [server configuration](../configuration/server.md#host-l2-and-mooncake-store-l3)
 for settings and defaults.
@@ -189,7 +191,7 @@ does not make PD cancellation immediate or bound it to one forward chunk.
 ## Write transaction
 
 A D2H completion publishes Host L2 and releases its Device source immediately
-after replica agreement. It never waits for Mooncake. C++ queues bounded,
+after replica agreement. It never waits for L3 storage. C++ queues bounded,
 nonowning backup candidates. At PUT dispatch it rechecks Host residency and
 acquires source references; evicted candidates are skipped. Queued candidates
 therefore cannot pin Host memory indefinitely.
@@ -212,7 +214,7 @@ L2 sizing is capped to a common count across ranks; an explicit size that
 does not fit is rejected. L2 and L3 share this allocation; attaching L3 does
 not allocate another arena. This is not an atomic reservation across containers
 or independent P/D worlds. Deployment sizing must account for their combined
-allocations, Mooncake segments/staging and independent storage owners.
+allocations, backend segments/staging and independent storage owners.
 Runtime operation/Host credits bound L3 ownership, not process RSS.
 
 Query, GET and PUT have separate bounded queues and workers. The total
@@ -491,6 +493,44 @@ See [server configuration](../configuration/server.md#host-l2-and-mooncake-store
 for limits and backend settings, [cache concepts](cache-concepts.md) for
 geometry and key compatibility, and [event loop](event-loop.md) for the two
 centralized feedback points.
+
+## Native 3FS USRBIO backend
+
+`hf3fs` implements the same Host-only Store contract and uses the existing
+scheduler, identity, owner mapping and completion agreement. It requires a
+complete `fuse.hf3fs` mount, its `3fs-virt` interface, shared-memory access and a
+compatible `libhf3fs_api_shared.so`. There is no POSIX payload fallback.
+The native bindings mirror
+[`hf3fs_usrbio.h` at revision `6c856acb4baad524e6def1d3381aeded4e491b5a`](https://github.com/deepseek-ai/3FS/blob/6c856acb4baad524e6def1d3381aeded4e491b5a/src/lib/api/hf3fs_usrbio.h);
+the deployed library must provide that ABI.
+
+Keys map to small index files under `usrbio-v1/<namespace>/<bucket>/`; each
+index names a writer-owned segment and byte range. Native writes and segment
+sync complete before atomic index publication. Existing valid indexes are
+create-only; undecodable indexes are treated as absent and can be atomically
+replaced with a complete record. This validates metadata structure, not payload
+integrity. Different valid-looking offsets and same-length payload corruption
+are not detected by a checksum. Temporary-index cleanup failures are logged
+separately and do not turn a successful publication into a failed PUT.
+
+Native DMA uses registered staging memory, with one synchronous copy to or
+from Host per transfer. `failures_retire = true` describes Host ownership:
+when a call returns, native I/O cannot touch the caller's Host ranges. Once
+all native completions retire, failed or short reads return per-object failure
+evidence while full-length peers remain usable. Operation-wide failures do not
+invent object evidence. A rejected first prep queues no I/O and leaves the ring
+reusable. Clock acquisition occurs before any prep.
+
+If I/O has been exposed and retirement cannot be proved, the lane is
+quarantined and its staging memory, file registrations and library remain
+alive until process exit. Such rings are not automatically replaced. Reads
+use independent lanes; writes share one lane, so unresolved write I/O can
+require a client restart. Scheduler soft deadlines do not cancel native I/O.
+
+Limits include per-key filesystem metadata work, one staging copy, no
+per-object segment space reclamation, and no automatic quarantined-ring
+recovery. Namespace removal requires the existing executor quiescence fence.
+The backend does not add checkpoint generation or cross-topology cache sharing.
 
 ## Disabled storage and scope
 

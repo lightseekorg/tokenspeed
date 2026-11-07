@@ -28,9 +28,10 @@ use ts_mooncake::store::StoreSetup;
 
 use crate::{
     executor::{monotonic_clock, Executor, ExecutorConfig, Namespace},
+    hf3fs_usrbio::{UsrBioConfig, UsrBioStore},
     layout::HostLayout,
     mooncake::MooncakeStore,
-    store::{process_memory_store, HostBuffer, Store},
+    store::{process_memory_store, HostBuffer, Store, StoreError},
 };
 
 /// The store an executor runs against.
@@ -39,6 +40,13 @@ pub enum StoreSettings {
     /// The process's in-memory store (`--kvstore-storage-backend memory`),
     /// shared by its executors.
     Memory,
+    /// Native USRBIO access to an existing 3FS mount.
+    Hf3fs {
+        /// Dedicated cache directory on 3FS.
+        directory: PathBuf,
+        /// Required native I/O settings.
+        usrbio: UsrBioConfig,
+    },
     /// The Mooncake store, through `library`.
     Mooncake {
         /// `libmooncake_store.so`.
@@ -67,12 +75,16 @@ pub struct Settings {
 
 impl Settings {
     /// Connect the store and start the workers.
-    pub fn start(&self) -> Result<Executor, ts_mooncake::Error> {
+    pub fn start(&self) -> Result<Executor, StoreError> {
         let store: Box<dyn Store> = match &self.store {
             StoreSettings::Memory => Box::new(process_memory_store()),
-            StoreSettings::Mooncake { library, setup } => {
-                Box::new(MooncakeStore::connect(library, setup, self.host)?)
+            StoreSettings::Hf3fs { directory, usrbio } => {
+                Box::new(UsrBioStore::connect(directory, usrbio.clone())?)
             }
+            StoreSettings::Mooncake { library, setup } => Box::new(
+                MooncakeStore::connect(library, setup, self.host)
+                    .map_err(|e| StoreError(e.to_string()))?,
+            ),
         };
         Ok(Executor::start(
             store,
@@ -138,6 +150,20 @@ impl Settings {
         let backend: String = settings.getattr("backend")?.extract()?;
         let store = match backend.as_str() {
             "memory" => StoreSettings::Memory,
+            "hf3fs" => {
+                let hf3fs = settings.getattr("hf3fs")?;
+                StoreSettings::Hf3fs {
+                    directory: PathBuf::from(hf3fs.getattr("directory")?.extract::<String>()?),
+                    usrbio: UsrBioConfig {
+                        library: PathBuf::from(hf3fs.getattr("library")?.extract::<String>()?),
+                        entries: hf3fs.getattr("entries")?.extract()?,
+                        buffer_bytes: hf3fs.getattr("buffer_bytes")?.extract()?,
+                        timeout_ms: hf3fs.getattr("timeout_ms")?.extract()?,
+                        segment_bytes: hf3fs.getattr("segment_bytes")?.extract()?,
+                        read_rings: hf3fs.getattr("read_rings")?.extract()?,
+                    },
+                }
+            }
             "mooncake" => {
                 let mooncake = settings.getattr("mooncake")?;
                 StoreSettings::Mooncake {

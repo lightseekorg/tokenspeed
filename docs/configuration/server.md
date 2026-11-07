@@ -1231,18 +1231,21 @@ old-weight KV is never restored under new weights.
 `--debug-force-retraction-interval` exercises the path without pressure in
 tests (see the flag above).
 
-### Host L2 and Mooncake Store L3
+<a id="host-l2-and-mooncake-store-l3"></a>
+
+### Host L2 and shared storage L3
 
 Host KVStore (`--kvstore-ratio` / `--kvstore-size`) is a compact pinned
-buffer under GPU cache (flat KV). `--kvstore-storage-backend mooncake`
-adds Mooncake Store as L3 under that buffer:
+buffer under Device KV cache (flat KV). `--kvstore-storage-backend mooncake`
+adds Mooncake Store as L3 under that buffer. `hf3fs` selects native 3FS
+USRBIO for the same L3 interface (see below):
 
 ```
-GPU Device KV (L1)
+Device KV (L1)
   ↕ D2H / H2D
 Host pinned buffer (L2 / flat KV)
   ↕ batch_put_from / batch_get_into
-Mooncake Store (L3)
+Mooncake Store or native 3FS USRBIO (L3)
 ```
 
 Host L2 and the retraction snapshot pool pack each group's payload independently
@@ -1376,7 +1379,46 @@ each owner subgroup; head-partitioned payloads in a sharded group are
 rejected at startup. Existing model and parallelism restrictions still apply.
 Use a scheduler built from the matching runtime source.
 
-Deploy a Mooncake master and storage providers before starting inference.
+**3FS USRBIO deployment.** Select `--kvstore-storage-backend hf3fs` and
+provide a dedicated existing directory on a complete `fuse.hf3fs` mount:
+
+```bash
+--kvstore-storage-backend hf3fs \
+--kvstore-storage-backend-extra-config '{"hf3fs":{"directory":"/mnt/3fs/tokenspeed-cache","library":"/opt/3fs/libhf3fs_api_shared.so"},"async":{"wait_timeout_ms":10000}}'
+```
+
+Both paths are required and absolute. The mount must expose `3fs-virt` and
+support native shared-memory registration; a local directory is rejected.
+Install the compatible 3FS native library and resolve its dynamic dependencies
+in the inference environment. No additional application metadata server is
+required: indexes live on 3FS. Existing model/parallelism restrictions and the
+requirement for Host L2 still apply.
+
+The `hf3fs` object accepts these resource settings:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `entries` | 16 | Maximum I/Os in one native submission; 1–4096 |
+| `buffer_bytes` | 16777216 | Registered staging capacity per ring; 1–1073741824 |
+| `timeout_ms` | 10000 | Native completion wait; 1–3600000 ms, separate from the scheduler soft deadline |
+| `segment_bytes` | 1073741824 | Maximum pre-sized segment length; at least `buffer_bytes`, at most 2^63−1 |
+| `read_rings` | 2 | Independent read lanes; 1–8, in addition to one write ring |
+
+Resource values must be integers; booleans and unknown settings are rejected.
+`buffer_bytes` must accommodate each stored object, including state snapshots.
+Budget `(read_rings + 1) * buffer_bytes` staging bytes per client, plus ring
+metadata and any quarantined resources. Segment lengths are not live-payload
+byte counts. Space is reclaimed by namespace cleanup, not per-object eviction.
+
+Index and payload misses use ordinary computation. Per-object retired read
+failures do not discard healthy batch peers. Unresolved native I/O quarantines
+the affected lane until process exit; automatic ring replacement is not
+implemented. See [the L3 design](../design/async-l3-cache.md#native-3fs-usrbio-backend)
+for retirement semantics and limitations. `async` settings continue to tune the
+same executor and scheduler path.
+
+**Mooncake deployment.** Deploy a Mooncake master and storage providers
+before starting inference.
 The master holds metadata; providers hold the cached bytes. Providers backed
 by CPU DRAM need no GPU memory. Set `global_segment_size` to `0` in inference
 workers to use those providers without mounting storage in the workers.
@@ -1426,9 +1468,12 @@ rows with full-length success on every owner become ordinary Host entries.
 The group matcher chooses the reusable prefix, which may be shorter than
 requested. A soft deadline permits local computation while native I/O keeps
 its Host references until retirement. A result detached by timeout or
-cancellation cannot publish data. Unknown native retirement quarantines the
-buffers and disables new L3 work until process restart; valid L2 hits and
-ordinary computation can continue. D2H publication and Device-source release
+cancellation cannot publish data. When a store cannot guarantee Host-buffer
+retirement, those buffers are quarantined and new L3 work is disabled until
+process restart; valid L2 hits and ordinary computation can continue. The 3FS
+backend instead confines unresolved native I/O to its own staging memory and
+quarantines the affected native lane, as described above.
+D2H publication and Device-source release
 wait for replica copy agreement, independently of L3 PUT. The PD prefill role
 can prepare L3 hits; decode receives its missing cache from the prefill peer.
 

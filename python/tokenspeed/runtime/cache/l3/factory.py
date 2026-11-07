@@ -32,6 +32,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.cache.l3.config import (
+    Hf3fsStoreSettings,
     L3Settings,
     MooncakeStoreSettings,
     parse_extra_config,
@@ -149,7 +150,7 @@ def l3_settings(
     if server_args.kvstore_storage_backend is None:
         return None
     backend = server_args.kvstore_storage_backend.strip().lower()
-    if backend not in ("memory", "mooncake"):
+    if backend not in ("memory", "mooncake", "hf3fs"):
         raise ValueError(
             "unsupported KVStore storage backend "
             f"{server_args.kvstore_storage_backend!r}"
@@ -320,6 +321,13 @@ def l3_settings(
         owner_rank=int(ownership.rank),
         tp_rank=int(server_args.mapping.attn.tp_rank),
         backend=backend,
+        hf3fs=(
+            Hf3fsStoreSettings.resolve(
+                parse_extra_config(server_args.kvstore_storage_backend_extra_config)
+            )
+            if backend == "hf3fs"
+            else None
+        ),
         mooncake=(
             MooncakeStoreSettings.resolve(
                 parse_extra_config(server_args.kvstore_storage_backend_extra_config),

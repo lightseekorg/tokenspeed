@@ -3112,10 +3112,11 @@ class ServerArgs:
         parser.add_argument(
             "--kvstore-storage-backend",
             type=str,
-            choices=["mooncake", "memory"],
+            choices=["mooncake", "memory", "hf3fs"],
             default=ServerArgs.kvstore_storage_backend,
             help="L3 store under compact Host (flat) KV. "
             "'mooncake' is Mooncake Store (SGLang/vLLM HiCache equivalent). "
+            "'hf3fs' uses native USRBIO on a mounted 3FS filesystem. "
             "'memory' is an in-process dict for tests. Requires Host L2 "
             "(do not pass --disable-kvstore).",
         )
@@ -3125,7 +3126,8 @@ class ServerArgs:
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
-            "global_segment_size, protocol, device_name, tenant_id.",
+            "global_segment_size, protocol, device_name, tenant_id. "
+            "For hf3fs: hf3fs={directory: absolute path, library: absolute USRBIO library path}.",
         )
         # Retraction snapshot pool
         parser.add_argument(
