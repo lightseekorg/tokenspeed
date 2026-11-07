@@ -346,11 +346,15 @@ def _reference_attention(
     v_scale = 1.0 if v_scale is None else v_scale
     rows, heads, dim = q.shape
     kv_heads = k_cache.shape[1]
+    # Dequantize the whole cache once, not every gathered chunk: converting the
+    # gathered FP8 rows took over half of this helper's CPU time.
+    k_cache = k_cache.float() * k_scale
+    v_cache = v_cache.float() * v_scale
     result = torch.empty_like(q)
     for start in range(0, rows, 32):
         slots = selected_slots[start : start + 32].long()
-        keys = k_cache[slots.clamp_min(0)].float() * k_scale
-        values = v_cache[slots.clamp_min(0)].float() * v_scale
+        keys = k_cache[slots.clamp_min(0)]
+        values = v_cache[slots.clamp_min(0)]
         query = q[start : start + 32].float().view(-1, kv_heads, heads // kv_heads, dim)
         scores = torch.einsum("ckgd,cnkd->ckgn", query, keys) * scale
         scores = scores.masked_fill(~(slots > 0)[:, None, None, :], float("-inf"))
