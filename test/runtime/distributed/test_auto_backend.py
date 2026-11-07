@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import textwrap
+from importlib.util import find_spec
 from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -26,6 +27,11 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+# These cases fake AMD, whose Iris reach check imports an AMD-only package.
+needs_iris = pytest.mark.skipif(
+    find_spec("iris") is None, reason="iris is packaged for ROCm only"
+)
 
 
 def test_runtime_import_without_iris():
@@ -177,6 +183,7 @@ def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
     assert len(created) == 1
 
 
+@needs_iris
 def test_public_preparation_preserves_capacities(backend, monkeypatch):
     from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_buffers
 
@@ -364,6 +371,7 @@ def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(
     backend._nccl.all_reduce.assert_not_called()
 
 
+@needs_iris
 def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
     backend,
     monkeypatch,
@@ -384,6 +392,7 @@ def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
     backend._nccl.all_reduce_two.assert_called_once_with(*tensors, group, op=None)
 
 
+@needs_iris
 def test_acquire_all_reduce_outputs_uses_iris(backend, monkeypatch):
     monkeypatch.setattr(
         "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
@@ -408,6 +417,7 @@ def test_acquire_all_reduce_outputs_uses_iris(backend, monkeypatch):
     )
 
 
+@needs_iris
 def test_acquire_all_reduce_outputs_amd_uses_base_when_iris_is_ineligible(
     backend,
     monkeypatch,
@@ -464,6 +474,7 @@ def test_acquire_all_reduce_outputs_preserves_trtllm(backend, monkeypatch):
     backend._iris.acquire_all_reduce_outputs.assert_not_called()
 
 
+@needs_iris
 @pytest.mark.parametrize("num_outputs", [1, 2])
 def test_symmetric_outputs_route_back_to_iris(backend, monkeypatch, num_outputs):
     monkeypatch.setattr(
@@ -480,6 +491,7 @@ def test_symmetric_outputs_route_back_to_iris(backend, monkeypatch, num_outputs)
     backend._nccl.all_reduce.assert_not_called()
 
 
+@needs_iris
 def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setattr(

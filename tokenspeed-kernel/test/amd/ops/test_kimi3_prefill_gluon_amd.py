@@ -107,6 +107,7 @@ def test_attn_res_full_history_score_ranges(tokens: int, score_scale: float) -> 
         output_rms_weight=output_weight,
         output_eps=2e-6,
         num_valid_blocks=valid_blocks,
+        warmup=False,
     )
     expected = _attn_res_reference(
         layer,
@@ -229,6 +230,7 @@ def test_attn_res_amd_entrypoint_accepts_legacy_keywords() -> None:
         output_rms_weight=output_weight,
         output_eps=output_eps,
         num_valid_blocks=valid_blocks,
+        warmup=False,
     )
     expected = _attn_res_reference(
         layer,
