@@ -1277,28 +1277,25 @@ class HostBootstrap:
                 and server_args.disaggregation_mode == "null"
                 and server_args.sampling_backend == "greedy"
                 and server_args.chunked_prefill_size > 0
-                and model_config.context_len > 5 * decode_input_tokens
             ):
                 from tokenspeed.runtime.execution.startup_warmup import (
+                    request_path_phases,
                     warmup_request_path,
                 )
                 from tokenspeed.runtime.utils import set_random_seed
 
-                # TP8's short final chunk has 128 rows per rank at bs16,
-                # reaching the medium-M MoE path as well as full chunks.
-                tail = max(1, 128 * mapping.attn.tp_size // max_batch_size)
-                long_prompt = min(
-                    server_args.chunked_prefill_size + tail,
-                    model_config.context_len - 5 * decode_input_tokens,
-                )
                 with startup_phase("kernels.request_path"):
                     forwards = warmup_request_path(
                         device.handle,
                         scheduler_config,
-                        phases=(
-                            (1, min(5, long_prompt)),
-                            (1, min(1024, long_prompt)),
-                            (max_batch_size, long_prompt),
+                        phases=request_path_phases(
+                            chunk_tokens=server_args.chunked_prefill_size,
+                            context_len=model_config.context_len,
+                            token_capacity=geometry.token_capacity,
+                            prefix_granularity=geometry.prefix_granularity,
+                            max_batch_size=max_batch_size,
+                            decode_width=decode_input_tokens,
+                            attn_tp_size=mapping.attn.tp_size,
                         ),
                         decode_width=decode_input_tokens,
                         decode_steps=2,
