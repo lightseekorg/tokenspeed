@@ -412,6 +412,12 @@ class ServerArgs:
     max_prefill_tokens: int = 8192
     # Optional bound on summed per-request KV pages in a local prefill batch.
     chunk_prefill_kv_size: int | None = None
+    # Opt-in, prefill servers: the most tokens a prefill chunk that cannot
+    # finish its prompt gives up, page-aligned, so that bootstrapped prompts
+    # waiting behind it that fit whole run in the same forward
+    # (docs/design/scheduler.md section 1.1). 0 is off; at most half of
+    # chunked_prefill_size; a decode server ignores it.
+    prefill_chunk_yield_tokens: int = 0
     enable_mixed_batch: bool = False
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
@@ -1505,6 +1511,16 @@ class ServerArgs:
         )
 
     @property
+    def scheduler_prefill_chunk_yield_tokens(self) -> int:
+        """The tokens this engine's prefill chunks give up for whole prompts
+        waiting behind them: the flag on a prefill server, 0 on a decode
+        server, which computes no prompt (validate_cache_options refuses the
+        flag on every other server)."""
+        if self.disaggregation_mode != "prefill":
+            return 0
+        return self.prefill_chunk_yield_tokens
+
+    @property
     def retraction_snapshot_pool_disabled(self) -> bool:
         """Whether no image can ever be taken, so a capacity block aborts.
 
@@ -2381,6 +2397,29 @@ class ServerArgs:
                     "--kvstore-write-policy write_back does not support "
                     f"{', '.join(unsupported)}"
                 )
+        # The yield belongs to the prefill scheduler, which never retracts; a
+        # decode server takes the flag as a no-op, so a PD launcher may pass
+        # it to both roles.
+        if self.prefill_chunk_yield_tokens < 0:
+            raise ValueError(
+                "--prefill-chunk-yield-tokens must be non-negative; got "
+                f"{self.prefill_chunk_yield_tokens}"
+            )
+        if self.prefill_chunk_yield_tokens > 0:
+            if self.disaggregation_mode not in ("prefill", "decode"):
+                raise ValueError(
+                    "--prefill-chunk-yield-tokens is for prefill servers "
+                    "(--disaggregation-mode prefill; a decode server ignores it)"
+                )
+            if (
+                self.disaggregation_mode == "prefill"
+                and self.prefill_chunk_yield_tokens > self.chunked_prefill_size // 2
+            ):
+                raise ValueError(
+                    "--prefill-chunk-yield-tokens must be at most half of "
+                    f"--chunked-prefill-size ({self.chunked_prefill_size}); got "
+                    f"{self.prefill_chunk_yield_tokens}"
+                )
 
     def validate_weight_memory_policy(self):
         """Memory saving chooses its weight semantics explicitly."""
@@ -2930,6 +2969,21 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="Maximum number of tokens the scheduler may issue in a single iteration. Setting this to -1 disables chunked prefill.",
+        )
+        parser.add_argument(
+            "--prefill-chunk-yield-tokens",
+            type=int,
+            default=ServerArgs.prefill_chunk_yield_tokens,
+            metavar="N",
+            help="Prefill servers: the room, in tokens, a prefill chunk that "
+            "cannot finish its prompt makes for bootstrapped prompts waiting "
+            "behind it that fit whole (counted past their prefix hit), so they "
+            "run complete in the same forward instead of waiting for the long "
+            "prompt's chunk to pass. The chunk ends on an earlier page and gives "
+            "up fewer than N plus one page, only while such prompts wait and "
+            "only what they take. 0 (default) is off; at most half of "
+            "--chunked-prefill-size. A decode server ignores it. See "
+            "docs/design/scheduler.md section 1.1.",
         )
         parser.add_argument(
             "--enable-mixed-batch",
