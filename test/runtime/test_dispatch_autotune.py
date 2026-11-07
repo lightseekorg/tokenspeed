@@ -1876,6 +1876,50 @@ def test_mm_runs_the_joint_bf16_gemm_only_before_serving(monkeypatch, serving):
     assert len(generic_calls) == int(serving)
 
 
+@pytest.mark.parametrize("tactic", [None, 21])
+@pytest.mark.parametrize("serving", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("override", [None, "forced"])
+def test_mm_runs_the_pinned_tgv_tile_only_before_serving(
+    monkeypatch, tactic, serving, bias, override
+):
+    """Decode rows above the joint bound run the TGV tactic the adapter picks,
+    only before serving and only without bias or a forced kernel. When it
+    picks none, or is not asked, selection runs as before."""
+    decisions, tgv_calls, generic_calls = [], [], []
+    monkeypatch.setattr(gemm_module, "autotune_bf16_gemm", lambda *args: None)
+    monkeypatch.setattr(
+        gemm_module,
+        "flashinfer_tgv_decode_tactic",
+        lambda a, b, out: decisions.append((a, b, out)) or tactic,
+    )
+    monkeypatch.setattr(
+        gemm_module,
+        "flashinfer_tgv_decode_gemm",
+        lambda a, b, out, chosen: tgv_calls.append(chosen) or torch.mm(a, b.T, out=out),
+    )
+    monkeypatch.setattr(gemm_module, "is_serving", lambda: serving)
+    monkeypatch.setattr(gemm_module, "pdl_enabled", lambda: False)
+    monkeypatch.setattr(
+        gemm_module, "select_kernel", _SelectKernelDouble(_generic_mm(generic_calls))
+    )
+    x = torch.randn(48, 4, dtype=torch.bfloat16)
+    w = torch.randn(8, 4, dtype=torch.bfloat16)
+    out = torch.empty(48, 8, dtype=torch.bfloat16)
+    b = torch.ones(8, dtype=torch.bfloat16) if bias else None
+    assert gemm_module.mm(x, w, bias=b, out=out, override=override) is out
+    torch.testing.assert_close(out, x @ w.T + (b if b is not None else 0))
+    asked = not serving and not bias and override is None
+    if asked:
+        ((a, weight, destination),) = decisions
+        assert a is x and weight is w and destination is out
+    else:
+        assert decisions == []
+    routed = asked and tactic is not None
+    assert tgv_calls == ([tactic] if routed else [])
+    assert len(generic_calls) == int(not routed)
+
+
 # ---------------------------------------------------------------------------
 # Dense unquantized apply
 # ---------------------------------------------------------------------------
