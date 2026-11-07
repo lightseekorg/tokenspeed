@@ -242,6 +242,7 @@ def test_direct_mfma_decode_stage1_matches_reference(
         TOPK,
         0,
         None,
+        prefetch_tiles=0,
         BLOCK_N=block_n,
     )
     torch.cuda.synchronize()
@@ -261,6 +262,48 @@ def test_direct_mfma_decode_stage1_matches_reference(
     torch.testing.assert_close(
         actual.float(), expected, atol=_BF16_ATOL, rtol=_BF16_RTOL
     )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8])
+@pytest.mark.parametrize("prefetch_tiles", [1, 2, 8])
+def test_direct_stage1_prefetch_is_bitwise(
+    num_tokens: int, prefetch_tiles: int
+) -> None:
+    """Keeping K tiles in flight reorders loads, never the MFMAs."""
+    generator = torch.Generator(device="cuda").manual_seed(20261102 + num_tokens)
+    _, _, _, _, w13, w13_scale, _, _ = _make_runtime_weights(generator)
+    hidden = _exact_mxfp4_activation(num_tokens, HIDDEN, generator)
+    topk_ids = _round_robin_topk(num_tokens)
+    hidden_mxfp4, hidden_scale = _quantize_mxfp4_activation(hidden)
+
+    def run(prefetch: int) -> tuple[torch.Tensor, torch.Tensor]:
+        out = torch.empty(
+            (num_tokens * TOPK, INTERMEDIATE // 2), dtype=torch.uint8, device="cuda"
+        )
+        out_scale = empty_swizzled_cdna4_mxfp4_scale(
+            num_tokens * TOPK, INTERMEDIATE // 32, device=torch.device("cuda")
+        )
+        invoke_stage1_mxfp4_mfma_decode_gluon(
+            hidden_mxfp4,
+            hidden_scale,
+            w13,
+            w13_scale,
+            topk_ids,
+            out,
+            TOPK,
+            0,
+            out_scale,
+            prefetch_tiles=prefetch,
+            BLOCK_N=64,
+        )
+        return out, _logical_cdna4_scales(
+            out_scale, num_tokens * TOPK, INTERMEDIATE // 32
+        )
+
+    expected, expected_scale = run(0)
+    actual, actual_scale = run(prefetch_tiles)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_scale, expected_scale)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 16])
@@ -286,6 +329,7 @@ def test_direct_stage1_fused_quantization_matches_staged(num_tokens: int) -> Non
         TOPK,
         0,
         None,
+        prefetch_tiles=0,
         BLOCK_N=64,
     )
     expected, expected_scale = _quantize_mxfp4_activation(staged)
@@ -306,6 +350,7 @@ def test_direct_stage1_fused_quantization_matches_staged(num_tokens: int) -> Non
         TOPK,
         0,
         actual_scale,
+        prefetch_tiles=0,
         BLOCK_N=64,
     )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -373,7 +418,7 @@ def test_direct_mfma_decode_stage2_matches_reference(
 @pytest.mark.parametrize("num_tokens", [1, 4, 16])
 @pytest.mark.parametrize(
     ("block_n", "pipeline_k"),
-    [(16, True), (32, False), (32, True)],
+    [(16, True), (32, False), (32, True), (64, True)],
 )
 def test_direct_mfma_decode_deferred_ep_routes(
     num_tokens: int,
@@ -410,6 +455,7 @@ def test_direct_mfma_decode_deferred_ep_routes(
         TOPK,
         expert_start,
         None,
+        prefetch_tiles=0,
         BLOCK_N=32,
     )
     inter_mxfp4, inter_scale = _quantize_mxfp4_activation(intermediate)
@@ -532,6 +578,7 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         TOPK,
         expert_start,
         reference_scales,
+        prefetch_tiles=0,
         BLOCK_N=64,
         swiglu_alpha=1.0,
         swiglu_limit=0.0,
@@ -582,6 +629,8 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         sorted_routes,
         descriptors,
         group_count,
+        sorted_routes,
+        descriptors,
         intermediate,
         intermediate_scales,
         rows,
@@ -614,8 +663,8 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         sorted_routes,
         descriptors,
         group_count,
+        descriptors.shape[0],
         output,
-        rows,
         INTERMEDIATE=INTERMEDIATE,
         OUTPUT=HIDDEN,
         XS0=intermediate_scales.stride(0),
@@ -628,10 +677,6 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         BLOCK_K=128,
         BLOCK_M=16,
         PREFETCH_TILES=1,
-        ROUTES_FROM_IDS=False,
-        TOPK=TOPK,
-        EXPERT_START=expert_start,
-        NUM_EXPERTS=NUM_EXPERTS,
         num_warps=1,
     )
     owned = (ids.flatten() >= expert_start) & (
@@ -713,6 +758,7 @@ def test_route_tile_schedules_match_direct_reference(
         TOPK,
         expert_start,
         reference_scales,
+        prefetch_tiles=0,
         BLOCK_N=64,
         swiglu_alpha=1.0,
         swiglu_limit=0.0,
@@ -791,6 +837,7 @@ def _direct_route_reference(packed, scales, w13, s13, w2, s2, ids, expert_start)
         TOPK,
         expert_start,
         intermediate_scales,
+        prefetch_tiles=0,
         BLOCK_N=64,
         swiglu_alpha=1.0,
         swiglu_limit=0.0,
@@ -1056,6 +1103,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 8,
                 expert_start,
                 intermediate_scales,
+                prefetch_tiles=0,
                 BLOCK_N=64,
                 swiglu_alpha=1.0,
                 swiglu_limit=0.0,

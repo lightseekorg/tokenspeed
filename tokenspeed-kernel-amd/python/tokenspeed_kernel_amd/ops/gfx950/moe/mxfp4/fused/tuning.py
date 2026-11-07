@@ -113,6 +113,9 @@ _EP1_STAGE2 = _RouteTileStage(128, 256, 0, 1)
 # slice, fewer than one per route, so each keeps up to eight K tiles of loads
 # in flight to keep HBM busy.
 _ID_GROUPS_STAGE = _RouteTileStage(64, 128, 8, 4)
+# At EP1, 128-column stage 2 tiles (four K tiles each) beat 64-column tiles
+# at 14-16 rows.
+_EP1_ID_STAGE2 = _RouteTileStage(128, 128, 8, 4)
 
 # Key: hidden width, intermediate width, local experts, global experts, top-k.
 # Entries: inclusive row bounds and the route-tile schedule. Rows outside every
@@ -151,13 +154,14 @@ _EP8_ROUTE_TILES = _ID_ROUTE_TILES + (
 _ROUTE_TILE_CONFIGS = {
     (4096, 4096, 32, 256, 8): _EP8_ROUTE_TILES,
     (4096, 4096, 64, 256, 8): _DECODE_ROUTE_TILES,
-    # EP1 (TP8 intermediate shard), 14-16 rows: route tiles beat direct decode
-    # with recorded routing but not with uniform routing, where few experts
-    # repeat (as in the CI kernel benchmark). Below 14 rows, route tiles lose
-    # on samples with few repeated experts, so direct decode keeps them.
-    # 17-128 rows: faster than the staged package, which catches up at 160 rows.
+    # EP1 (TP8 intermediate shard), 10-16 rows: grouping the routes from the
+    # top-k IDs beats the direct decode on recorded verify and plain decode
+    # routing, except a few plain decode samples with many distinct experts.
+    # At 6-8 rows plain decode routing loses, so the direct decode keeps
+    # them. 17-128 rows: faster than the staged package; with uniform and
+    # Zipf routing it breaks even at 160 rows.
     (4096, 512, 256, 256, 8): (
-        (14, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),
+        (10, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _EP1_ID_STAGE2)),
         (17, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2)),
         (65, 128, _RouteTileConfig(128, _EP1_STAGE, _EP1_STAGE2)),
     ),
@@ -169,6 +173,64 @@ assert all(
     for entries in _ROUTE_TILE_CONFIGS.values()
     for _, max_rows, config in entries
 )
+
+# Key: hidden width, intermediate width, local experts, global experts, top-k.
+# K tiles of loads the direct decode stage 1 (one program per route and
+# 64-column slice) keeps in flight ahead of its MFMA. Shapes without an entry
+# load one K tile at a time (0).
+_DIRECT_STAGE1_PREFETCH_TILES = {
+    # EP1 (TP8 intermediate shard). Measured on MI355X with both MoE stages
+    # in graph replay over four cold weight copies at 1-12 rows; depths 1-4
+    # were slower than 8. The EP8 shard showed no consistent gain at any
+    # depth, so it keeps 0.
+    (4096, 512, 256, 256, 8): 8,
+}
+
+
+def _select_direct_stage1_prefetch_tiles(
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int | None,
+    top_k: int,
+) -> int:
+    """Return the direct decode stage 1's ``PREFETCH_TILES`` for this shape."""
+    shape = (hidden_dim, inter_dim, num_local_experts, num_experts, top_k)
+    return _DIRECT_STAGE1_PREFETCH_TILES.get(shape, 0)
+
+
+# Key: hidden width, intermediate width, local experts, global experts, top-k.
+# Entries: inclusive row bounds and the deferred direct decode stage 2's
+# BLOCK_N (columns per program; one route per program). Rows outside every
+# entry keep the default. Wider tiles give each program more weight columns
+# to stream per route.
+_DIRECT_STAGE2_DEFERRED_BLOCK_N = {
+    # EP1 (TP8 intermediate shard). Measured on MI355X against 16 columns
+    # with both MoE stages in graph replay over four cold weight copies and
+    # recorded verify and plain decode routing. 1-2 rows keep 16: wider
+    # tiles were slower there.
+    (4096, 512, 256, 256, 8): ((3, 5, 32), (6, 9, 64)),
+}
+
+
+def _select_direct_stage2_deferred_block_n(
+    num_tokens: int,
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int | None,
+    top_k: int,
+) -> int | None:
+    """Return the deferred direct decode stage 2's ``BLOCK_N`` for this shape
+    and row count, or None for the default."""
+    shape = (hidden_dim, inter_dim, num_local_experts, num_experts, top_k)
+    for min_rows, max_rows, block_n in _DIRECT_STAGE2_DEFERRED_BLOCK_N.get(shape, ()):
+        if min_rows <= num_tokens <= max_rows:
+            return block_n
+    return None
+
 
 # Largest row count any route-tile entry serves; callers that do not want
 # route tiles pass 0 instead.

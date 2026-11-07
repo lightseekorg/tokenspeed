@@ -733,6 +733,8 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             pre_expert_proj=None,
             post_expert_proj=None,
             down_columns=None,
+            expert_tp8_mxfp4=False,
+            moe_stream=None,
         )
     layer = SimpleNamespace(
         iris_state=None,
@@ -749,7 +751,10 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             ),
         ),
         config=SimpleNamespace(
-            hidden_size=8192, moe_hidden_size=4096, num_experts_per_tok=8
+            hidden_size=8192,
+            moe_hidden_size=4096,
+            moe_intermediate_size=4096,
+            num_experts_per_tok=8,
         ),
         model=SimpleNamespace(iris_state=None, layers=[layer]),
     )
@@ -2261,6 +2266,8 @@ def _muse_tp_routes_worker(rank, world_size, device):
     moe.pre_expert_proj = None
     moe.post_expert_proj = None
     moe.down_columns = None
+    moe.expert_tp8_mxfp4 = False
+    moe.moe_stream = None
     moe.tp_group, moe.tp_size, moe.topk = group, world_size, topk
     moe.ep_group, moe.ep_size = (rank,), 1
     moe.post_expert_norm = MuseSparkRMSNorm(width, 1e-8, True, 1.0)
@@ -3168,6 +3175,8 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     moe.pre_expert_proj = None
     moe.post_expert_proj = None
     moe.down_columns = None
+    moe.expert_tp8_mxfp4 = False
+    moe.moe_stream = None
     moe.ep_group, moe.ep_size, moe.topk = group, world_size, 8
     moe.tp_size = 1
     moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)

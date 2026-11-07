@@ -42,7 +42,9 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed_kernel.ops.moe import MoeStreamDecode
 from tokenspeed_kernel.ops.residual import residual_gate_coefficients
+from tokenspeed_kernel.selection import SelectedKernel
 
 from tokenspeed.runtime.configs.model_config import is_audio_model, is_multimodal_model
 from tokenspeed.runtime.configs.muse_spark_config import (
@@ -1342,6 +1344,7 @@ def test_quantized_combined_prepares_routing_once_per_token_count(
     """The experts get the prepared routing when it exists; otherwise one is prepared for next time."""
     moe = _stub(MuseSparkMoE)
     moe.expert_quant_kind = "nvfp4"
+    moe.moe_stream = None
     moe.iris_state = None
     moe.tp_size, moe.ep_size = 1, 1
     moe.topk, moe.prepared_routing = 2, {}
@@ -1917,6 +1920,93 @@ def test_attention_publishes_a_served_batch_for_the_boundary_to_reduce(
     assert (sentinel, ranks) == (None, 1)
     assert rows.shape == (3, attn.hidden_size) and not rows.isnan().any()
     assert calls == [("publish", 1, attn.o_proj.weight.shape[0])]
+
+
+class _RecordingExperts(torch.nn.Module):
+    """Stands in for the planned MoE kernel's GPU launch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def forward(self, **kwargs):
+        self.calls.append(kwargs)
+        routes = kwargs["deferred_out"]
+        return routes, None, "planned map"
+
+
+def _stream_moe(bound: bool) -> tuple[MuseSparkMoE, _RecordingExperts, list[tuple]]:
+    """A Muse MoE layer whose stream kernel and planned kernel record their
+    launches (the stream bound as expert TP8 on gfx950 binds it, or not)."""
+    moe = _stub(MuseSparkMoE)
+    moe.experts = _RecordingExperts()
+    launches: list[tuple] = []
+
+    def stream_kernel(state, x_quantized, topk_ids, w, deferred_out):
+        launches.append((state, x_quantized, topk_ids, w, deferred_out))
+        return deferred_out
+
+    moe.moe_stream = (
+        MoeStreamDecode(
+            SelectedKernel("gluon_mxfp4_moe_stream_gfx950", stream_kernel), "state"
+        )
+        if bound
+        else None
+    )
+    return moe, moe.experts, launches
+
+
+def _expert_routes(moe, rows, *, quantized=True, destination=True):
+    packed = torch.zeros(rows, 2048, dtype=torch.uint8)
+    scales = torch.zeros(rows, 128, dtype=torch.uint8)
+    ids = torch.zeros(rows, 8, dtype=torch.int32)
+    out = torch.empty(rows * 8, 4096, dtype=torch.bfloat16) if destination else None
+    routes, route_map = moe._expert_routes(
+        torch.empty(rows, 4096, dtype=torch.bfloat16),
+        (packed, scales) if quantized else None,
+        torch.ones(rows, 8),
+        ids,
+        None,
+        rows,
+        rows,
+        None,
+        out,
+    )
+    return routes, route_map, (packed, scales), ids, out
+
+
+@pytest.mark.parametrize("rows", sorted(module._MOE_STREAM_ROWS))
+def test_bound_stream_runs_the_selected_decode_rows(rows) -> None:
+    moe, experts, launches = _stream_moe(bound=True)
+    routes, route_map, x_quantized, ids, out = _expert_routes(moe, rows)
+    assert experts.calls == []
+    assert launches == [("state", x_quantized, ids, experts, out)]
+    # Canonical token/slot rows: the reduction needs no route map.
+    assert routes is out and route_map is None
+
+
+@pytest.mark.parametrize(
+    "rows,bound,quantized,destination",
+    [
+        (4, True, True, True),  # a row count the stream does not serve
+        (16, True, True, True),  # two verify blocks: the route-tile decode
+        (8, False, True, True),  # no stream bound (EP8, other GPUs, BF16)
+        (8, True, False, True),  # BF16 input the planned kernel quantizes
+        (8, True, True, False),  # no borrowed route destination
+    ],
+)
+def test_other_batches_keep_the_planned_kernel(
+    rows, bound, quantized, destination
+) -> None:
+    moe, experts, launches = _stream_moe(bound=bound)
+    routes, route_map, x_quantized, ids, out = _expert_routes(
+        moe, rows, quantized=quantized, destination=destination
+    )
+    assert launches == []
+    (call,) = experts.calls
+    assert call["topk_output"].topk_ids is ids
+    assert call["deferred_out"] is out and call["do_finalize"] is False
+    assert route_map == "planned map"
 
 
 if __name__ == "__main__":

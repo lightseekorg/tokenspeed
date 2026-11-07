@@ -2258,6 +2258,62 @@ output through LDS so each scattered route row is stored as one contiguous
 run; at 8K tokens that BF16 per-route write and its combine read dominate the
 second GEMM.
 
+### gfx950 MXFP4 MoE decode stream
+
+`gluon_mxfp4_moe_stream_gfx950` (`moe/mxfp4/moe_stream.py`) runs the gate/up
+and down projections of a few decode rows as one launch, in place of the
+direct decode's two. It is registered as `moe.stream_decode` and selected
+for expert-TP slices of hidden 4096, intermediate slice 512, 256 local
+experts and top 8 on devices with 256 CUs. The caller picks the row counts.
+
+#### Contract
+
+- MXFP4 rows `[rows, 2048]` (unit column stride) with CDNA4-swizzled E8M0
+  scales, contiguous int32 ids `[rows, 8]` indexing the local experts, at
+  most 16 rows. `rows` is a compile-time size: one compilation per row
+  count, so callers use a fixed small set.
+- Weights are the direct decode's gdot128-shuffled banks and swizzled scales,
+  read in place (`moe_stream_weights`).
+- Output: contiguous BF16 `[rows * 8, 4096]` unweighted route rows in
+  token/slot order, bitwise equal to the direct decode's deferred output
+  (same per-column MFMA chain over K, SwiGLU, MXFP4 requantization of the
+  intermediate and down chain).
+- `MoeStreamState` holds per-workgroup launch counters, role claims, the
+  intermediate hand-off and the readiness tags (uncached memory). Launches
+  sharing it run one after another, including graph replays. A launch whose
+  workgroups do not cover every (XCD, slot) role exactly once raises a
+  queue error instead of skipping work.
+
+#### Algorithm
+
+256 workgroups of 8 waves, one per CU. Every token is an A row of each
+touched expert (MFMA M = 16), so each touched expert's weights are read once.
+The plan is closed-form from the ids in every workgroup: whole experts go to
+XCDs round-robin and the leftover `E % 8` experts are split by 64-column
+group over all XCDs. Half of each XCD's workgroups get only gate/up groups,
+sized to half a full workgroup's bytes (`TAIL_SHARE`); the others take the
+remaining groups, then the down units (64 output columns of one expert),
+earliest-ready expert first.
+
+Each wave keeps 8 weight chunks in flight (1 KB each, one 16-byte load per
+lane) and refills the one it consumed eight steps ahead, across item
+boundaries, so its vector loads never drain. Four waves compute a group's
+four 16-column strips, exchange their SwiGLU values through LDS without a
+barrier (an LDS counter spun on by the waves), quantize and store the
+group's intermediate, and publish a per-strip tag once a later weight load
+(returned in order after the stores) completes. Down units wait for their
+expert's 64 tags with scalar loads that bypass the scalar cache, so the wait
+does not queue behind the wave's weight loads; tags written on another XCD
+are visible because the tag buffer is uncached. The tags carry a per-launch
+value in two copies chosen by launch parity; each launch clears the copy the
+next one reads. Every access to the intermediates and the tags, the clear
+included, is system scope (SC0 SC1), because waves on other XCDs read them.
+
+Progress: gate/up work never waits on another workgroup and every workgroup
+finishes it before its first down wait, so the waits end once all 256
+workgroups have started; with 256 CUs they all run as soon as earlier work
+on the stream has drained. The waits have no deadline.
+
 ### gfx1250 MXFP4 experts
 
 On gfx1250, the MoE API selects Gluon kernels with FP8 or MXFP4 activations
