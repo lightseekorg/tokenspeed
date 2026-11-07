@@ -22,10 +22,13 @@
 
 Exercise execution modes with all consumers, then each optional consumer alone.
 The same runner entry also commits ordinary hybrid targets without a Qwen4 root.
+A padded replay also sets MegaMoE's live-request counts and restores them, even
+when it fails.
 """
 
 import os
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -144,6 +147,7 @@ def _runner(
     wrapper._cuda_graph_key = lambda bs: bs
     wrapper._prepare_request_token_history_graph_inputs = lambda **kwargs: None
     wrapper._expert_load_rows = None
+    wrapper._mega_moe_live_requests = None
     wrapper._graph_debug = False
     wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
     result = (
@@ -264,6 +268,39 @@ def test_failed_execution_does_not_commit_stale_staging(use_graph):
         _run(wrapper, ForwardMode.DECODE)
     assert events == ["metadata", "execute"]
     assert commits == {"recurrent": [], "ple": [], "qsa": []}
+
+
+@pytest.mark.parametrize("has_drafter", [False, True])
+@pytest.mark.parametrize("fail_forward", [False, True])
+def test_padded_replay_routes_live_mega_moe_rows_then_restores(
+    fail_forward, has_drafter
+):
+    wrapper, _, _ = _runner(
+        use_graph=True,
+        has_drafter=has_drafter,
+        consumers=(),
+        fail_forward=fail_forward,
+    )
+    live_requests = torch.ones(2, dtype=torch.int32)
+    wrapper._mega_moe_live_requests = live_requests
+    seen = []
+    replay = wrapper.graphs[4].replay
+
+    def recording_replay():
+        seen.append(live_requests.tolist())
+        return replay()
+
+    wrapper.graphs[4] = SimpleNamespace(replay=recording_replay)
+    with (
+        pytest.raises(RuntimeError, match="forward failed")
+        if fail_forward
+        else nullcontext()
+    ):
+        _run(wrapper, ForwardMode.DECODE)
+    # MegaMoE routes the rows of the 2 live of 4 padded requests; the replay,
+    # even a failed one, leaves (1, 1) so later eager forwards route every row.
+    assert seen == [[2, 4]]
+    assert live_requests.tolist() == [1, 1]
 
 
 if __name__ == "__main__":

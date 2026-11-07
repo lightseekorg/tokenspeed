@@ -711,6 +711,19 @@ also writes the activation scales the shared expert reads: MN-major, with rows
 grouped by the BLOCK_M MegaMoE picks for the token count. The shared expert's
 SwiGLU uses the routed experts' clamp.
 
+## DeepSeek V4 MegaMoE filler rows (`deep_gemm.py`)
+
+Every MegaMoE launch, warmup included, passes the staging kernel the shared
+int32 `(live, padded)` request pair from `mega_moe_live_requests`. Staging
+writes codes and scales for every row, but each row at or past
+`num_tokens * live // padded` gets expert id -1 and weight 0. MegaMoE's
+dispatch and combine skip negative ids, so such a row's output is zero, or
+the fused shared expert's output alone. The pair is (1, 1), which routes
+every row, except during a padded decode-graph replay (the padding contract
+in `docs/design/unified_path.md`). The share is right only when each rank
+stages its attention-DP group's whole padded batch, not a TP shard of it.
+The kernel reads the counts at launch, so new values do not recompile it.
+
 ## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
 
 On Blackwell with one TP8 group shared by attention and MoE, a decode forward

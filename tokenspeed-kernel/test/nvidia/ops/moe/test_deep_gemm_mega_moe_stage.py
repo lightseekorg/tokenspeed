@@ -42,7 +42,7 @@ def _stage(hidden, weights, ids):
         torch.full((tokens, ids.shape[1]), -1, device="cuda", dtype=torch.int64),
         torch.empty(tokens, ids.shape[1], device="cuda", dtype=torch.float32),
     )
-    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, None, None)
+    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, None, None, None)
     return out
 
 
@@ -160,7 +160,7 @@ def test_shared_scales_land_in_block_m_rows(tokens, block_m):
         torch.empty_like(plain[2]),
         torch.empty_like(plain[3]),
     )
-    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, shared, block_m)
+    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, shared, block_m, None)
 
     for got, want in zip(out, plain):
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
@@ -190,6 +190,7 @@ def test_shared_block_m_does_not_recompile():
             *out,
             _shared_scales(512),
             block_m,
+            None,
         )
 
     for tokens in (1, 64, 300):
@@ -197,3 +198,47 @@ def test_shared_block_m_does_not_recompile():
     with assert_no_triton_compile(_stage_mxfp4_mega_moe_inputs_kernel):
         for tokens, block_m in ((2, 32), (65, 48), (300, 192), (512, 128)):
             stage(tokens, block_m)
+
+
+@pytest.mark.parametrize(
+    "tokens,live,padded",
+    [
+        (48, 5, 8),
+        (48, 0, 8),
+        (96, 16, 16),
+        (1500, 7, 250),
+        # tokens * live exceeds int32.
+        (1500, 2**21, 2**22),
+    ],
+)
+def test_filler_rows_route_no_experts(tokens, live, padded):
+    torch.manual_seed(tokens + live)
+    hidden = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(tokens, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (tokens, 6), device="cuda", dtype=torch.int32)
+    plain = _stage(hidden, weights, ids)
+    out = tuple(torch.empty_like(t) for t in plain)
+    counts = torch.tensor([live, padded], device="cuda", dtype=torch.int32)
+    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, None, None, counts)
+
+    rows = tokens * live // padded
+    # Codes and scales are staged for every row; routing only for live ones.
+    for got, want in zip(out[:2], plain[:2]):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    assert torch.equal(out[2][:rows], plain[2][:rows])
+    assert torch.equal(out[3][:rows], plain[3][:rows])
+    assert (out[2][rows:] == -1).all()
+    assert (out[3][rows:] == 0).all()
+
+
+def test_live_counts_do_not_recompile():
+    hidden = torch.randn(96, 512, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(96, 6, device="cuda", dtype=torch.float32)
+    ids = torch.randint(0, 384, (96, 6), device="cuda", dtype=torch.int32)
+    counts = torch.ones(2, device="cuda", dtype=torch.int32)
+    out = _stage(hidden, weights, ids)
+    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, None, None, counts)
+    with assert_no_triton_compile(_stage_mxfp4_mega_moe_inputs_kernel):
+        for live, padded in ((3, 16), (0, 16), (16, 16)):
+            counts.copy_(torch.tensor([live, padded]))
+            stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, None, None, counts)
