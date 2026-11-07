@@ -68,6 +68,7 @@ pub struct FakeEngine {
     /// Every message the engine received on its input socket, in order.
     pub received: mpsc::UnboundedReceiver<EngineRequest>,
     kill: mpsc::UnboundedSender<()>,
+    answer: mpsc::UnboundedSender<()>,
     task: JoinHandle<()>,
 }
 
@@ -75,6 +76,11 @@ impl FakeEngine {
     /// Announce shutdown with the sentinel and stop serving.
     pub fn shut_down(&self) {
         let _ = self.kill.send(());
+    }
+
+    /// Send the control replies a [`Role::HoldingControls`] engine holds.
+    pub fn answer_controls(&self) {
+        let _ = self.answer.send(());
     }
 
     /// The next message the engine received.
@@ -113,6 +119,10 @@ pub fn start(handshake_address: &str, index: u16, dp_rank: i64, dp_size: i64) ->
 pub enum Role {
     /// A scheduler, which takes add, abort and control requests.
     Scheduler,
+    /// A scheduler that holds its control replies until told
+    /// ([`FakeEngine::answer_controls`]), each flush reply naming its flush
+    /// (`rid`: "1", "2", ...).
+    HoldingControls,
     /// An EPD encode server, which takes encode requests only.
     Encoder,
 }
@@ -127,6 +137,7 @@ pub fn start_as(
 ) -> FakeEngine {
     let (received_tx, received) = mpsc::unbounded_channel();
     let (kill, kill_rx) = mpsc::unbounded_channel();
+    let (answer, answer_rx) = mpsc::unbounded_channel();
     let handshake_address = handshake_address.to_owned();
     let task = tokio::spawn(async move {
         run(
@@ -137,16 +148,19 @@ pub fn start_as(
             role,
             received_tx,
             kill_rx,
+            answer_rx,
         )
         .await;
     });
     FakeEngine {
         received,
         kill,
+        answer,
         task,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     handshake_address: String,
     index: u16,
@@ -155,6 +169,7 @@ async fn run(
     role: Role,
     received: mpsc::UnboundedSender<EngineRequest>,
     mut kill: mpsc::UnboundedReceiver<()>,
+    mut answer: mpsc::UnboundedReceiver<()>,
 ) {
     let mut handshake = DealerSocket::with_options(options(index));
     handshake.connect(&handshake_address).await.unwrap();
@@ -183,7 +198,7 @@ async fn run(
         ..Default::default()
     };
     match role {
-        Role::Scheduler => registration.declare_scheduler(),
+        Role::Scheduler | Role::HoldingControls => registration.declare_scheduler(),
         Role::Encoder => registration.declare_encoder(),
     }
     input
@@ -194,12 +209,23 @@ async fn run(
     output.connect(&init.addresses.outputs[0]).await.unwrap();
 
     let mut running: HashSet<String> = HashSet::new();
+    let mut held: Vec<ControlOutput> = Vec::new();
+    let mut flushes = 0;
     loop {
         let frames = tokio::select! {
             message = input.recv() => message.unwrap().into_vec(),
             _ = kill.recv() => {
                 output.send(single(EngineOutput::Dead.to_frames())).await.unwrap();
                 return;
+            }
+            Some(()) = answer.recv() => {
+                for reply in held.drain(..) {
+                    output
+                        .send(single(EngineOutput::Control(Box::new(reply)).to_frames()))
+                        .await
+                        .unwrap();
+                }
+                continue;
             }
         };
         let request = EngineRequest::from_frames(&frames).unwrap();
@@ -241,8 +267,10 @@ async fn run(
             EngineRequest::Control(request) => {
                 let reply = match *request {
                     ControlRequest::FlushCache(_) => {
+                        flushes += 1;
                         ControlOutput::FlushCache(FlushCacheReqOutput {
-                            rid: None,
+                            rid: (role == Role::HoldingControls)
+                                .then(|| StrOrList::One(flushes.to_string())),
                             http_worker_ipc: None,
                             success: index == 0,
                         })
@@ -256,6 +284,10 @@ async fn run(
                     }
                     other => panic!("no fake reply to {}", other.tag()),
                 };
+                if role == Role::HoldingControls {
+                    held.push(reply);
+                    continue;
+                }
                 output
                     .send(single(EngineOutput::Control(Box::new(reply)).to_frames()))
                     .await
