@@ -51,10 +51,12 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     gluon_mm_a16w16_medium_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
     launch_gluon_grouped_mm_a16w16_decode_gfx950,
+    launch_gluon_mm_a16w16_column_shard_gfx950,
     launch_gluon_mm_a16w16_decode_add3_gfx950,
     launch_gluon_mm_a16w16_decode_gfx950,
     launch_gluon_mm_a16w16_medium_gfx950,
     launch_gluon_mm_a16w16_splitk_gfx950,
+    supports_gluon_mm_a16w16_column_shard_gfx950,
     supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
 )
@@ -896,3 +898,35 @@ def test_medium_coalesced_store_masks_strided_out() -> None:
     assert actual is out
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=_RTOL)
     assert torch.all(backing[:, n:] == 7.0)
+
+
+@pytest.mark.parametrize("m", [9, 13, 16])
+def test_column_shard_equals_the_replicated_decode_gemm_columns(m: int) -> None:
+    """Each 1024-column shard of the [8192, 4096] decode GEMM is bitwise its columns."""
+    torch.manual_seed(60 + m)
+    a = torch.randn((m, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((8192, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    assert supports_gluon_mm_a16w16_column_shard_gfx950(m, 8192, 1024, 4096)
+    full = launch_gluon_mm_a16w16_decode_gfx950(
+        a, b, torch.bfloat16, counters=torch.zeros(1, dtype=torch.int32, device="cuda")
+    )
+    for shard in (0, 5):
+        out = torch.empty(m, 1024, dtype=torch.bfloat16, device="cuda")
+        launch_gluon_mm_a16w16_column_shard_gfx950(
+            a, b[shard * 1024 : (shard + 1) * 1024], out
+        )
+        assert torch.equal(out, full[:, shard * 1024 : (shard + 1) * 1024]), shard
+
+
+def test_column_shard_row_count_does_not_recompile() -> None:
+    torch.manual_seed(77)
+    a = torch.randn((16, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((1024, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    out = torch.empty(16, 1024, dtype=torch.bfloat16, device="cuda")
+    # One warm-up per integer specialization class of the row count (16 is
+    # divisible by 16, 9 is not); every other row count reuses one of them.
+    for m in (9, 16):
+        launch_gluon_mm_a16w16_column_shard_gfx950(a[:m].contiguous(), b, out[:m])
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for m in range(9, 17):
+            launch_gluon_mm_a16w16_column_shard_gfx950(a[:m].contiguous(), b, out[:m])

@@ -23,7 +23,14 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._scheduling import release_drain, sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+    GROUP_SIZE_M,
+    _choose_decode_config,
+    _get_partial_scratch,
+    gluon_mm_a16w16_medium_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
 
 buffer = gl.amd.cdna4.buffer
@@ -52,11 +59,13 @@ def _launch_metadata(grid, kernel, args):
 @gluon.jit
 def _load_x_step(x_ptr, x_offs, row_mask, k, step, K: gl.constexpr, STEP: gl.constexpr):
     """Load K step ``step`` of every row's activations, zero past ``K``."""
+    # No ``other``: a masked lane's buffer load gets an out-of-range offset
+    # and reads zero (CDNA4 ISA 9.1.5.1), while ``other`` would add a
+    # v_cndmask per loaded register.
     return gl.amd.cdna4.buffer_load(
         x_ptr,
         x_offs + step * STEP,
         mask=row_mask & (k + step * STEP < K)[None, :],
-        other=0.0,
     )
 
 
@@ -325,14 +334,7 @@ def gluon_fp32_router_gemv_splitk_gfx950(
     # each wave waits for its stores to complete, and the barrier orders every
     # wave's stores before the counter bump. A release atomic would instead
     # write back this XCD's whole L2 (BUFFER_WBL2).
-    gl.inline_asm_elementwise(
-        asm="s_waitcnt vmcnt(0)",
-        constraints="=v,0",
-        args=[om],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    release_drain()
     gl.barrier()
     arrived = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
     if arrived == SPLIT_K - 1:
@@ -453,12 +455,216 @@ def launch_gluon_fp32_router_gemv_gfx950(
         CHUNKS=chunks,
         MULTIPLIER=float(multiplier),
         num_warps=waves,
+        **sched_compile_options(),
     )
     return out
 
 
+# Router tiles (BLOCK_M, BLOCK_N, SPLIT_K, waves, chunks) when the router
+# shares a launch with a decode GEMM: the 9-64 row split-K tile, 128 programs
+# at 256 outputs. Its programs read 32 KB of activations each where a
+# one-output GEMV program reads all 256 KB. Next to a 512 x 8192 decode
+# GEMM's 128 programs, this tile beat the GEMV (two outputs per program) at
+# 8 rows in graph replay on MI355X.
+_WITH_MM_ROUTER_CONFIG = (16, 16, 8, 4, 1)
+_WITH_MM_MAX_ROWS = 16
+_MM_GROUP_SIZE_M = gl.constexpr(GROUP_SIZE_M)
+
+
+@gluon.jit(do_not_specialize=("M",))
+def gluon_fp32_router_gemv_mm_a16w16_gfx950(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    router_partial_ptr,
+    router_counter_ptr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    partial_ptr,
+    counter_ptr,
+    M,
+    MM_N,
+    stride_am,
+    stride_bn,
+    stride_cm,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    CHUNKS: gl.constexpr,
+    MULTIPLIER: gl.constexpr,
+    ROUTER_PROGRAMS: gl.constexpr,
+    MM_K: gl.constexpr,
+    MM_BLOCK_M: gl.constexpr,
+    MM_BLOCK_N: gl.constexpr,
+    MM_BLOCK_K: gl.constexpr,
+    MM_WARPS_M: gl.constexpr,
+    MM_WARPS_N: gl.constexpr,
+    MM_NUM_BUFFERS: gl.constexpr,
+    MM_SPLIT_K: gl.constexpr,
+    MM_NUM_XCDS: gl.constexpr,
+):
+    """Run the split-K router GEMM and an independent decode GEMM in one launch.
+
+    Programs ``[0, ROUTER_PROGRAMS)`` are :func:`gluon_fp32_router_gemv_splitk_gfx950`
+    on ``x``; the rest are ``gluon_mm_a16w16_medium_gfx950`` computing
+    ``c = a @ b.T``. Neither waits on the other, so the launch saves one kernel
+    boundary and both weight streams share the CUs.
+    """
+    if gl.program_id(0) < ROUTER_PROGRAMS:
+        gluon_fp32_router_gemv_splitk_gfx950(
+            x_ptr,
+            weight_ptr,
+            out_ptr,
+            router_partial_ptr,
+            router_counter_ptr,
+            M,
+            K,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+            SPLIT_K,
+            CHUNKS,
+            MULTIPLIER,
+        )
+    else:
+        gluon_mm_a16w16_medium_gfx950(
+            a_ptr, b_ptr, c_ptr, c_ptr, c_ptr, partial_ptr, counter_ptr, M, MM_N,
+            MM_K, stride_am, 1, 1, stride_bn, stride_cm, 1, stride_cm, 1,
+            stride_cm, 1, MM_BLOCK_M, MM_BLOCK_N, MM_BLOCK_K, MM_WARPS_M,
+            MM_WARPS_N, MM_NUM_BUFFERS, _MM_GROUP_SIZE_M, False, MM_SPLIT_K,
+            MM_NUM_XCDS, ROUTER_PROGRAMS
+        )  # fmt: skip
+
+
+def supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(
+    rows: int, n: int, k: int, mm_n: int, mm_k: int
+) -> bool:
+    """Whether ``rows`` router rows and the ``[mm_n, mm_k]`` decode GEMM share a launch."""
+    block_m, block_n, split_k, waves, _ = _WITH_MM_ROUTER_CONFIG
+    mm_config = _choose_decode_config(rows, mm_n, mm_k)
+    return (
+        0 < rows <= _WITH_MM_MAX_ROWS
+        and n % block_n == 0
+        and k % (split_k * waves * 16) == 0
+        and mm_config is not None
+        # Both halves run the same wave count, the launch's num_warps.
+        and mm_config[3] * mm_config[4] == waves
+    )
+
+
+def gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows: int, n: int) -> int:
+    """Router arrival counters a router + decode GEMM launch needs."""
+    block_m, block_n = _WITH_MM_ROUTER_CONFIG[:2]
+    return triton.cdiv(rows, block_m) * (n // block_n)
+
+
+def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    multiplier: float,
+    counters: torch.Tensor,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+    mm_out: torch.Tensor,
+    mm_counters: torch.Tensor,
+) -> torch.Tensor:
+    """Project FP32 router rows and compute ``mm_out = mm_a @ mm_b.T`` in one launch.
+
+    The router runs the split-K GEMM for every supported row count, so its
+    logits round as that GEMM's do at 9-16 rows; ``mm_out`` is bitwise what
+    the decode GEMM alone writes.
+
+    Args:
+        x: Contiguous FP32 router rows ``[M, K]``.
+        weight: Contiguous FP32 ``[N, K]`` weight from
+            :func:`transpose_fp32_router_weight_gfx950`.
+        multiplier: Scale applied to every logit.
+        counters: Zeroed int32 arrival counters for the router's tiles, at
+            least ``N // 16`` of them; the launch leaves them zeroed.
+        mm_a: Contiguous BF16 ``[M, mm_k]`` rows.
+        mm_b: Contiguous BF16 ``[mm_n, mm_k]`` weight.
+        mm_out: ``[M, mm_n]`` BF16 destination with unit inner stride.
+        mm_counters: Zeroed split-K counters of the decode GEMM, as for
+            ``launch_gluon_mm_a16w16_decode_gfx950``.
+
+    Returns:
+        FP32 router logits ``[M, N]``.
+    """
+    rows, k = x.shape
+    n = weight.shape[0]
+    mm_n, mm_k = mm_b.shape
+    if not supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(rows, n, k, mm_n, mm_k):
+        raise ValueError(
+            f"router + decode GEMM launch does not support {rows} rows of a "
+            f"[{n}, {k}] router with a [{mm_n}, {mm_k}] GEMM"
+        )
+    if (
+        x.dtype != torch.float32
+        or weight.dtype != torch.float32
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or weight.shape[1] != k
+        or mm_a.dtype != torch.bfloat16
+        or mm_b.dtype != torch.bfloat16
+        or mm_out.dtype != torch.bfloat16
+        or not mm_a.is_contiguous()
+        or not mm_b.is_contiguous()
+        or tuple(mm_a.shape) != (rows, mm_k)
+        or tuple(mm_out.shape) != (rows, mm_n)
+        or mm_out.stride(1) != 1
+    ):
+        raise ValueError(
+            "router + decode GEMM launch needs contiguous FP32 router rows and "
+            "weight, contiguous BF16 GEMM operands and a row-major BF16 output"
+        )
+    block_m, block_n, split_k, waves, chunks = _WITH_MM_ROUTER_CONFIG
+    router_tiles = gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows, n)
+    check_splitk_counters(
+        counters, router_tiles, x.device, "gfx950 router + decode GEMM launch"
+    )
+    out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
+    router_partial = torch.empty(
+        (split_k * router_tiles * block_m * block_n,),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    mm_block_m, mm_block_n, mm_block_k, warps_m, warps_n, buffers, mm_split, xcds = (
+        _choose_decode_config(rows, mm_n, mm_k)
+    )
+    mm_tiles = triton.cdiv(rows, mm_block_m) * triton.cdiv(mm_n, mm_block_n)
+    if mm_split > 1:
+        check_splitk_counters(
+            mm_counters, mm_tiles, x.device, "gfx950 router + decode GEMM launch"
+        )
+        partial = _get_partial_scratch(
+            x.device, mm_tiles, mm_split, mm_block_n, mm_block_m
+        )
+    else:
+        partial = mm_counters = mm_out
+    router_programs = router_tiles * split_k
+    gluon_fp32_router_gemv_mm_a16w16_gfx950[(router_programs + mm_tiles * mm_split,)](
+        x, weight, out, router_partial, counters, mm_a, mm_b, mm_out, partial,
+        mm_counters, rows, mm_n, mm_a.stride(0), mm_b.stride(0), mm_out.stride(0),
+        K=k, N=n, BLOCK_M=block_m, BLOCK_N=block_n, SPLIT_K=split_k,
+        CHUNKS=chunks, MULTIPLIER=float(multiplier),
+        ROUTER_PROGRAMS=router_programs, MM_K=mm_k, MM_BLOCK_M=mm_block_m,
+        MM_BLOCK_N=mm_block_n, MM_BLOCK_K=mm_block_k, MM_WARPS_M=warps_m,
+        MM_WARPS_N=warps_n, MM_NUM_BUFFERS=buffers, MM_SPLIT_K=mm_split,
+        MM_NUM_XCDS=xcds, num_warps=waves,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),), **sched_compile_options(),
+    )  # fmt: skip
+    return out
+
+
 __all__ = [
+    "gluon_fp32_router_gemv_mm_a16w16_gfx950",
+    "gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950",
     "gluon_fp32_router_gemv_num_counters_gfx950",
+    "launch_gluon_fp32_router_gemv_mm_a16w16_gfx950",
+    "supports_gluon_fp32_router_gemv_mm_a16w16_gfx950",
     "launch_gluon_fp32_router_gemv_gfx950",
     "transpose_fp32_router_weight_gfx950",
 ]

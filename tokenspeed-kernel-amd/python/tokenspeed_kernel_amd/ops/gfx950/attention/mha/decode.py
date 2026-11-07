@@ -795,7 +795,7 @@ class AttentionProgram:
 
 
 @gluon.jit
-def _stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
+def stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
     """Load, wait for and consume one K/V page at a time; enough when other
     waves of the grid cover the load latency."""
     cfg = program.cfg
@@ -822,7 +822,7 @@ def _stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
 
 
 @gluon.jit
-def _stream_split_pipelined(
+def stream_split_pipelined(
     program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES: gl.constexpr
 ):
     cfg = program.cfg
@@ -845,7 +845,7 @@ def _stream_split_pipelined(
     # A split with fewer pages than buffers would spend more on the pipeline
     # prologue than it hides.
     if program.split_end - program.split_start < iteration_tokens:
-        return _stream_split_single_buffer(
+        return stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem.index(0), v_smem.index(0)
         )
     # Prologue: prefetch the first NUM_STAGES - 1 pages.
@@ -985,11 +985,11 @@ def gluon_mha_decode_gfx950(
         v_smem = gl.allocate_shared_memory(
             v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
         )
-        m_i, l_i, acc = _stream_split_single_buffer(
+        m_i, l_i, acc = stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem, v_smem
         )
     else:
-        m_i, l_i, acc = _stream_split_pipelined(
+        m_i, l_i, acc = stream_split_pipelined(
             program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
     program.store_split(acc, l_i, m_i)
@@ -1152,11 +1152,11 @@ def _mha_decode_sliding_split_atomic(
         v_smem = gl.allocate_shared_memory(
             v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
         )
-        m_i, l_i, acc = _stream_split_single_buffer(
+        m_i, l_i, acc = stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem, v_smem
         )
     else:
-        m_i, l_i, acc = _stream_split_pipelined(
+        m_i, l_i, acc = stream_split_pipelined(
             program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
 
@@ -1878,7 +1878,7 @@ def _stream_balanced(
     NUM_STAGES: gl.constexpr,
 ):
     """Stream a balanced split, software-pipelined NUM_STAGES deep as
-    _stream_split_pipelined when the split spans at least one iteration,
+    stream_split_pipelined when the split spans at least one iteration,
     else single-buffered in the first LDS buffer: balanced splits can be
     shorter than one iteration, which the split grid's pipelined splits
     never are."""
@@ -1896,7 +1896,7 @@ def _stream_balanced(
     iteration_tokens: gl.constexpr = NUM_STAGES * cfg.BLOCK_N
     short = program.split_end - program.split_start < iteration_tokens
     if short:
-        return _stream_split_single_buffer(
+        return stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem.index(0), v_smem.index(0)
         )
     pages = program.load_page_indices(program.split_start, NUM_STAGES)
@@ -1939,7 +1939,7 @@ def _stream_balanced(
             acc = program.compute_pv(p, v, acc)
         pages = next_pages
         next_pages = later_pages
-    # As _stream_split_pipelined: wait for this wave's prefetched copies
+    # As stream_split_pipelined: wait for this wave's prefetched copies
     # before the layout conversions reuse their LDS.
     async_copy.wait_group(0)
     return m_i, l_i, acc

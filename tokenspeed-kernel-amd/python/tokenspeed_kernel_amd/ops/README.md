@@ -77,6 +77,13 @@ Qwen3.8-Flash-Next decode batches.
   single rounding. It reuses the decode tile for `M` and accepts only buckets
   without split-K (Kimi K3 latent up-projection, `2 <= M <= 32`), replacing a
   separate add kernel.
+- `launch_gluon_mm_a16w16_column_shard_gfx950` runs the decode kernel over a
+  column shard `[shard_n, K]` of a replicated weight with full-K 16x16 tiles
+  (512-deep K, three buffers). Every output issues its 16x16x32 MFMAs over K
+  in order on one FP32 accumulator, whatever the tile shape. When the full
+  GEMM's measured config has no split-K
+  (`supports_gluon_mm_a16w16_column_shard_gfx950`), each column therefore
+  equals the replicated GEMM's bitwise.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use, but the package does not register
   them for automatic selection.
@@ -140,7 +147,9 @@ except for the measured `(N, K)` entries in `_CONFIGS`.
 
 A few-row program streams a tile of weight rows, reusing each load across
 its input rows. Each (input row, output) keeps the single-row reduction;
-FMA throughput limits this path to a few rows. The gated projection
+FMA throughput limits this path to a few rows. All of a lane's weight chunks
+are issued up front and the input rows one chunk ahead, so a wave waits for
+one memory round trip instead of one per chunk. The gated projection
 recomputes its normalized, gated input in every program.
 
 ### gfx950 FP32 router GEMV
@@ -182,6 +191,30 @@ partials in split order, scales, writes the tile and resets the counter. A
 tile's programs can run on different XCDs, so partials are stored and loaded
 at system scope, which bypasses the per-XCD L2. Weight loads are
 non-temporal.
+
+### gfx950 FP32 router with a decode GEMM
+
+`gluon_fp32_router_gemv_mm_a16w16_gfx950` (`gemm/fp32/router_gemv.py`) runs
+the router's split-K GEMM and an independent BF16 decode GEMM
+(`gluon_mm_a16w16_medium_gfx950`) in one launch.
+`gemm.fp32_router_gemv_execute_with_mm` selects it.
+
+#### Contract
+
+- Router operands as for the router GEMV; `mm_a` `[M, K']` and `mm_b`
+  `[N', K']` contiguous BF16, `mm_out` an `[M, N']` BF16 destination.
+- `1 <= M <= 16`, `N` a multiple of 16, `K` a multiple of 512, and a measured
+  four-wave decode GEMM config for `(M, N', K')`.
+- `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
+  16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
+  rows and differ from the GEMV's in the last bits at 1-8 rows.
+
+#### Algorithm
+
+Programs `[0, P)` are the router's split-K programs and the rest the decode
+GEMM's, with its program ids offset by `P`. Neither half waits on the other.
+The split-K router reads 32 KB of activations per program, where a GEMV
+program reads all of them, so both weight streams finish together.
 
 ### gfx950 dense BF16 decode GEMV
 
