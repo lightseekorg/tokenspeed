@@ -283,3 +283,42 @@ of 24/2 and 12/1, target and draft query widths, both sides of the SM107
 212-SM grid threshold, the SM100/SM103 wave-count choices, padding, prefixes
 ending inside or on the edge of a tile, refreshed cache values, PDL on/off,
 large KV offsets and execution without further compilation after warmup.
+
+## BF16 KV scratch for FP8 prefill
+
+`qsa_bf16_kv_scratch` copies the FP8 E4M3 KV pages one call can read into a
+caller-owned BF16 scratch and rewrites the call's selected slots to it, so a
+large prefill call over an FP8 cache can run the direct-slot CuTe kernel's
+BF16 path, one query row at a time (`max_seqlen_q=1`), instead of the FP8
+prefill kernel that selection picks: FlashInfer FA2 by default on NVIDIA,
+where the CuTe kernel is registered for decode only, or the CuTe kernel's FP8
+path under a kernel override. The runtime uses it behind
+`--enable-qsa-prefill-bf16-scratch`.
+
+Request `r` owns scratch pages `[first_r, first_r + n_r)`, with
+`n_r = ceil(seq_lens[r] / page_size)` and `first_r = 1 + sum(n_s for s < r)`.
+`qsa_bf16_scratch_pages` gives a call's page count from host lengths and the
+copy launches one program row per scratch page, so planning reads nothing
+from the device. Each request's page-table columns `[0, n_r)` are copied in
+order. E4M3 to BF16 is exact, so the BF16 kernel sees the values an FP8 kernel
+reading the cache at unit scale computes. Scratch page 0 is never written:
+padding keeps its ids, and the caller keeps page 0 finite for the reads that
+still address slot 1.
+
+The page map has one int32 entry per cache page. The copy writes every entry
+the remap then reads, so its prior contents are never read and it may alias
+memory that is free until the remap finishes; the runtime uses the attention
+output buffer, which the kernel writes after the remap. This holds when every
+positive slot lies in its request's pages and the device lengths match the
+host lengths the launch was sized from. A slot outside them reads a stale
+entry and becomes padding or another page of the call, never an address past
+the copied pages. Page, slot and row offsets are 64-bit. Request and slot
+counts and the table and slot-row strides opt out of scalar specialization;
+the page size, slot width and PDL are compile-time.
+
+The direct-slot CuTe kernel's BF16 gathers zero-fill padded entries, a
+`cp.async` with zero source bytes, instead of reading slot 1, a line every CTA
+would otherwise read. The softmax masks padded entries by their ids, so the
+output is unchanged; rows near request starts have many of them.
+`cute_dsl_blackwell_qsa_sparse_attention` also accepts a caller-owned `out`,
+so the runtime's scratch path allocates nothing while serving.

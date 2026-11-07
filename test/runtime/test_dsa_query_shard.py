@@ -682,6 +682,7 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
         draft_backend=draft_router,
         uses_paged_state_verify=False,
         is_inkling=False,
+        qsa_bf16_scratch=None,
     )
     _prepare_fixed_workspaces(**kwargs, expected_bytes=planned)
     workspace = target_router.history_gather_workspace()

@@ -265,6 +265,34 @@ def copy_gmem_to_smem_u128(smem_ptr, gmem_ptr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def copy_gmem_to_smem_u128_zfill(smem_ptr, gmem_ptr, src_bytes, *, loc=None, ip=None):
+    """Issue one 16-byte asynchronous copy that reads ``src_bytes`` (16 or 0).
+
+    With 0 the destination is zero-filled without a global read. The source
+    address must still be valid; completion is tracked like any cp.async.
+    """
+    _llvm.inline_asm(
+        None,
+        [
+            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            gmem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            src_bytes.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .u32 smem_addr;\n"
+        "cvt.u32.u64 smem_addr, $0;\n"
+        "cp.async.cg.shared.global [smem_addr], [$1], 16, $2;\n"
+        "}\n",
+        "l,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def prefetch_gmem_l2(gmem_ptr, *, loc, ip):
     _llvm.inline_asm(
         None,
