@@ -819,6 +819,10 @@ public:
     // them on the Host (a tail whose hint is gone, a boundary with no
     // checkpoint boundary at or under it).
     std::uint64_t DeadEntriesNotWrittenBack() const { return dead_entries_not_written_back_; }
+    // The Device-only entries (a sliding group's slid-out pages, which never
+    // reach Host) an admission or a restore evicted under the write-back
+    // policy; like dead entries, they are not written back.
+    std::uint64_t DeviceOnlyEntriesNotWrittenBack() const { return device_only_entries_not_written_back_; }
 
     // Device entries evicted for one reason, each also counted as
     // host_resident when the Host index still held its key (never without a
@@ -1110,29 +1114,35 @@ private:
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
+    // `host_eligible`: the blocks may reach Host (stream when published,
+    // register on the Host tier, be stored at finish). False only for a
+    // sliding group's pages published because they slide out of the window,
+    // which stay Device prefix entries.
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host, bool host_eligible);
     // Registers blocks[j] under keys[j] (logical block first_logical_block + j)
     // and reports and streams what was newly cached; cacheFullBlocksForGroup
     // passes a table window, an in-forward State checkpoint its own block.
     template <CacheTier Tier>
     void cacheBlocksForGroup(std::size_t group_index, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
                              std::int32_t first_logical_block, std::uint64_t access_epoch,
-                             CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+                             CacheBoundaryKind boundary_kind, bool stream_completed_to_host, bool host_eligible);
     // One run of table slots a publication registers in a group, the key of
-    // each (keys[j] is slot first_cache_block + j), and the boundary kind it
-    // registers them under.
+    // each (keys[j] is slot first_cache_block + j), the boundary kind it
+    // registers them under, and whether the blocks may reach Host.
     struct PublishedRange {
         std::int32_t first_cache_block{0};
         std::vector<CacheKey> keys;
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        bool host_eligible{true};
     };
     // What publishing `completed` covers in one group -- every newly hashed
-    // page plus the tail's blocks of a prefix-closed group, the blocks holding
-    // the window behind the newest boundary of a sliding group, slot 1 of a
-    // State group at a non-chunk point, nothing for a replayable one.
+    // page plus the tail's blocks of a prefix-closed group; the windows behind
+    // the newest boundary and the tail, then every newly hashed page the table
+    // still holds (Device-only), of a sliding group; slot 1 of a State group at
+    // a non-chunk point; nothing for a replayable one.
     // The one source for cacheCompletedBlocksForGroup and for
     // PublishedDataSlotsAfter.
     std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
@@ -1291,6 +1301,7 @@ private:
     // Accounting only.
     HostEvictionStats host_evictions_;
     std::uint64_t dead_entries_not_written_back_{0};
+    std::uint64_t device_only_entries_not_written_back_{0};
     std::uint64_t store_candidates_dropped_by_flush_{0};
     DeviceEvictionStats device_evictions_;
 };

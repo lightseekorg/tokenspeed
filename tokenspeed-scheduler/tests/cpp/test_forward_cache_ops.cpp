@@ -222,12 +222,14 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
         EXPECT_TRUE(tables[1].Blocks()[i]) << "slot " << i;
     }
 
-    // Only the two-page resume tail is cached. The older two SWA pages become
-    // free before four fresh pages are acquired, for a net cost of two.
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 2);
+    // All four SWA pages are published before the slide, so the two punched
+    // ones stay cached (evictable) rather than free: four fresh pages cost
+    // four empty parents, but only two available ones.
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 4);
+    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), free_before_chunk - 2);
 
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
 }
@@ -270,9 +272,11 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
         EXPECT_TRUE(tables[1].Blocks()[i]) << "slot " << i;
     }
     EXPECT_EQ(tables[0].NumBlocks(), 7);
-    // Pool: the uncached SWA prefix frees four parents, then one page per group
-    // consumes two parents.
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before + 2);
+    // Pool: the four punched SWA pages were published first, so they stay
+    // cached (evictable) instead of empty; one page per group consumes two
+    // parents.
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before - 2);
+    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), free_before + 2);
 }
 
 TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {

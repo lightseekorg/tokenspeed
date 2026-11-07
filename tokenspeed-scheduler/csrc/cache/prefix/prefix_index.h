@@ -53,9 +53,11 @@ private:
     using CacheEntryIterator = CacheEntryList::iterator;
     using ConstCacheEntryIterator = CacheEntryList::const_iterator;
 
-    // Index key: oldest access epoch first, with location as a stable tie-break.
+    // Index key: lowest eviction rank first (EvictionRank: the access epoch,
+    // with unproven slid-out pages ahead of every other epoch), with location
+    // as a stable tie-break.
     struct EvictionOrder {
-        std::uint64_t last_access_epoch{0};
+        std::uint64_t rank{0};
         std::int32_t lcm_block_id{0};
         std::int32_t slot_index{0};
 
@@ -77,7 +79,44 @@ public:
         // one never does.
         std::uint64_t max_access_epoch{0};
         SessionCacheOwner session;
+        // False for a sliding group's page published only because it slid out
+        // of its request's window: a Device prefix entry that never reaches Host.
+        bool host_eligible{true};
     };
+
+    // A sliding-window page published Device-only -- outside every window its
+    // request published, which in practice is an interior page of a prefill
+    // chunk -- at an interior chunk point (kChunk), and never hit. It can
+    // resume only a prefix that diverges at its page, so eviction takes it
+    // before every other cached block: kept like the rest, these pages roughly
+    // double a finished long-prompt request's footprint and push whole older
+    // requests out first. Pages published at an endpoint (prompt end, finish,
+    // retraction) keep the old order, so the window a resent page-aligned
+    // prompt resumes at, one page below its end, survives; so do pages that
+    // were ever hit or lifted into a window. Decode pages enter a window when
+    // published, so they are not covered. Trade-off: under pressure a shared
+    // prefix's first resume at an interior boundary can miss.
+    static bool IsUnprovenSlidOut(bool host_eligible, bool was_acquired, CacheBoundaryKind boundary_kind) noexcept {
+        return !host_eligible && !was_acquired && boundary_kind == CacheBoundaryKind::kChunk;
+    }
+    static bool IsUnprovenSlidOut(const CachedBlockMetadata& metadata) noexcept {
+        return IsUnprovenSlidOut(metadata.host_eligible, metadata.was_acquired, metadata.boundary_kind);
+    }
+
+    // The order eviction takes entries in, lowest first: the access epoch for
+    // an unproven slid-out page and for epoch 0 (an uncached or superseded
+    // block, already first), the epoch above kKeptRank for every other entry.
+    // Epochs stay far below kKeptRank, so every unproven slid-out page comes
+    // before any other entry with a nonzero epoch, oldest first among them.
+    // Every traversal and bound (PeekEvictionRank, NextEvictionRank, the
+    // admission planner's candidates) compares ranks, never raw epochs.
+    static constexpr std::uint64_t kKeptRank = std::uint64_t{1} << 63;
+    static std::uint64_t EvictionRank(std::uint64_t last_access_epoch, bool unproven_slid_out) noexcept {
+        return last_access_epoch == 0 || unproven_slid_out ? last_access_epoch : kKeptRank | last_access_epoch;
+    }
+    static std::uint64_t EvictionRank(const CachedBlockMetadata& metadata) noexcept {
+        return EvictionRank(metadata.last_access_epoch, IsUnprovenSlidOut(metadata));
+    }
 
     // Non-owning traversal state, bound on first use to one index/pool. The
     // index and pool must outlive it; do not insert, erase, or re-key entries
@@ -174,7 +213,7 @@ public:
         if (existing_it != cache_index.entries.end()) {
             _assert(existing_it->key == key, "one cache block location cannot change cache key");
             if (existing_it->boundary_kind < boundary_kind) {
-                existing_it->boundary_kind = boundary_kind;
+                rekeyEntry(cache_index, existing_it, [&](CacheEntry& entry) { entry.boundary_kind = boundary_kind; });
             }
             mergeSession(*existing_it, session);
             touchEntry(cache_index, existing_it, access_epoch);
@@ -183,7 +222,7 @@ public:
         CacheEntryIterator canonical_it = findEntry(cache_index, key);
         if (canonical_it != cache_index.entries.end()) {
             if (canonical_it->boundary_kind < boundary_kind) {
-                canonical_it->boundary_kind = boundary_kind;
+                rekeyEntry(cache_index, canonical_it, [&](CacheEntry& entry) { entry.boundary_kind = boundary_kind; });
             }
             mergeSession(*canonical_it, session);
             touchEntry(cache_index, canonical_it, access_epoch);
@@ -238,6 +277,36 @@ public:
     bool Contains(const BlockPool& pool, const CacheKey& key) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index != nullptr && findEntry(*cache_index, key) != cache_index->entries.end();
+    }
+
+    // Whether the entry under `key` exists and a Host store may copy it.
+    bool HostEligible(const BlockPool& pool, const CacheKey& key) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return false;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, key);
+        return entry_it != cache_index->entries.end() && entry_it->host_eligible;
+    }
+
+    // Sets the Host eligibility of the existing entries under `keys`; absent
+    // keys are skipped. Appends each key whose entry changed to `changed`
+    // unless it is null.
+    void SetHostEligible(const BlockPool& pool, std::span<const CacheKey> keys, bool host_eligible,
+                         std::vector<CacheKey>* changed) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return;
+        }
+        for (const CacheKey& key : keys) {
+            CacheEntryIterator entry_it = findEntry(*cache_index, key);
+            if (entry_it != cache_index->entries.end() && entry_it->host_eligible != host_eligible) {
+                rekeyEntry(*cache_index, entry_it, [&](CacheEntry& entry) { entry.host_eligible = host_eligible; });
+                if (changed != nullptr) {
+                    changed->push_back(key);
+                }
+            }
+        }
     }
     bool Contains(const BlockPool& pool, CacheBlockLocation location) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
@@ -318,10 +387,11 @@ public:
         return metadataOf(*entry_it);
     }
 
-    // The next potentially evictable epoch. Entries known to be pinned have
-    // already left available_order and rejoin it when their last owner leaves.
-    // Reading the order key does not inspect owners or advance the cursor.
-    std::optional<std::uint64_t> PeekEvictionEpoch(const BlockPool& pool, EvictionCursor& cursor) const {
+    // The next potentially evictable eviction rank (EvictionRank). Entries
+    // known to be pinned have already left available_order and rejoin it when
+    // their last owner leaves. Reading the order key does not inspect owners
+    // or advance the cursor.
+    std::optional<std::uint64_t> PeekEvictionRank(const BlockPool& pool, EvictionCursor& cursor) const {
         if (cursor.cache_index_ == nullptr) {
             cursor.cache_index_ = findCacheEntries(pool);
             if (cursor.cache_index_ == nullptr) {
@@ -332,23 +402,24 @@ public:
         if (cursor.next_ == cursor.cache_index_->available_order.end()) {
             return std::nullopt;
         }
-        return cursor.next_->first.last_access_epoch;
+        return cursor.next_->first.rank;
     }
 
-    // Appends a complete unpinned epoch, skipping fully pinned epochs up to
-    // max_access_epoch. False means either exhaustion or a later epoch; Peek
-    // distinguishes them. A later epoch stays unread for the next call.
-    bool NextEvictionEpoch(const BlockPool& pool, EvictionCursor& cursor, std::uint64_t max_access_epoch,
-                           std::vector<EvictionCandidate>& out) const {
-        const auto next_epoch = PeekEvictionEpoch(pool, cursor);
-        if (!next_epoch || *next_epoch > max_access_epoch) {
+    // Appends a complete unpinned rank (one access epoch of one eviction
+    // class), skipping fully pinned ranks up to max_rank. False means either
+    // exhaustion or a later rank; Peek distinguishes them. A later rank stays
+    // unread for the next call.
+    bool NextEvictionRank(const BlockPool& pool, EvictionCursor& cursor, std::uint64_t max_rank,
+                          std::vector<EvictionCandidate>& out) const {
+        const auto next_rank = PeekEvictionRank(pool, cursor);
+        if (!next_rank || *next_rank > max_rank) {
             return false;
         }
         auto& available = cursor.cache_index_->available_order;
-        while (cursor.next_ != available.end() && cursor.next_->first.last_access_epoch <= max_access_epoch) {
-            const std::uint64_t epoch = cursor.next_->first.last_access_epoch;
+        while (cursor.next_ != available.end() && cursor.next_->first.rank <= max_rank) {
+            const std::uint64_t rank = cursor.next_->first.rank;
             const std::size_t initial_size = out.size();
-            while (cursor.next_ != available.end() && cursor.next_->first.last_access_epoch == epoch) {
+            while (cursor.next_ != available.end() && cursor.next_->first.rank == rank) {
                 const auto current = cursor.next_++;
                 CacheEntry& cache_entry = *current->second;
                 if (cache_entry.block_ref.unique()) {
@@ -435,7 +506,7 @@ public:
     }
 
     // Every unpinned entry of one tier, in no particular order. Callers that
-    // only want the oldest few should use NextEvictionEpoch() instead; this is
+    // only want the oldest few should use NextEvictionRank() instead; this is
     // for the ones that genuinely need the whole set. The metadata rides along
     // because recovering it afterwards would cost a lookup per entry.
     std::vector<EvictionCandidate> EvictableCandidates(const BlockPool& pool) const {
@@ -545,7 +616,9 @@ public:
             CacheEntryIterator entry_it = findEntry(*cache_index, keys[static_cast<std::size_t>(begin_blocks) + i]);
             _assert(entry_it != cache_index->entries.end(),
                     "cached block disappeared between match probe and acquisition");
-            entry_it->was_acquired = true;
+            if (!entry_it->was_acquired) {
+                rekeyEntry(*cache_index, entry_it, [](CacheEntry& entry) { entry.was_acquired = true; });
+            }
             mergeSession(*entry_it, session);
             touchEntry(*cache_index, entry_it, access_epoch);
             match.blocks[i] = entry_it->block_ref;
@@ -607,6 +680,8 @@ private:
         bool was_acquired{false};
         // See CachedBlockMetadata::max_access_epoch.
         std::uint64_t max_access_epoch{0};
+        // See CachedBlockMetadata::host_eligible.
+        bool host_eligible{true};
         EvictionOrderMap* available_order{nullptr};
         EvictionOrderMap::node_type pinned_order;
         CacheBlockUniqueObserver unique_observer;
@@ -674,12 +749,15 @@ private:
             .was_acquired = cache_entry.was_acquired,
             .max_access_epoch = cache_entry.max_access_epoch,
             .session = cache_entry.session,
+            .host_eligible = cache_entry.host_eligible,
         };
     }
     static EvictionOrder evictionOrder(const CacheEntry& cache_entry) {
         const CacheBlockLocation location = cache_entry.block_ref->Location();
         return EvictionOrder{
-            .last_access_epoch = cache_entry.last_access_epoch,
+            .rank = EvictionRank(
+                cache_entry.last_access_epoch,
+                IsUnprovenSlidOut(cache_entry.host_eligible, cache_entry.was_acquired, cache_entry.boundary_kind)),
             .lcm_block_id = location.lcm_block_id,
             .slot_index = location.slot_index,
         };
@@ -695,11 +773,20 @@ private:
         if (entry_it->last_access_epoch == access_epoch) {
             return;
         }
-        auto available_node = cache_index.available_order.extract(evictionOrder(*entry_it));
+        rekeyEntry(cache_index, entry_it, [&](CacheEntry& entry) { entry.last_access_epoch = access_epoch; });
+    }
+    // Every write of a field evictionOrder() reads (access epoch, Host
+    // eligibility, hit flag, boundary kind) goes through here, so the entry
+    // keeps its place in available_order, its parked pinned_order node and
+    // common_order. The map nodes are moved, not reallocated.
+    template <typename Mutate>
+    static void rekeyEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, Mutate&& mutate) {
+        const EvictionOrder before = evictionOrder(*entry_it);
+        auto available_node = cache_index.available_order.extract(before);
         auto common_node = cache_index.common_source && entry_it->common_peer != nullptr
-                               ? cache_index.common_order.extract(evictionOrder(*entry_it))
+                               ? cache_index.common_order.extract(before)
                                : EvictionOrderMap::node_type{};
-        entry_it->last_access_epoch = access_epoch;
+        mutate(*entry_it);
         if (common_node) {
             common_node.key() = evictionOrder(*entry_it);
             cache_index.common_order.insert(std::move(common_node));

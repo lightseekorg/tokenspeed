@@ -364,17 +364,56 @@ TEST_F(GptOssShapeSuite, APromptOneTokenShorterThanAFinishedOneResumesAtItsLastP
     SendAbortEvent("y");
     PlanOnce();
 
-    // X[:-37]: 239 tokens, probed up to 238. The full group holds pages 0..2,
-    // but the sliding group publishes only the lookback behind its newest
-    // boundary (256) and its tails; the blocks behind 192 slid out of X's
-    // table unpublished, so no boundary below 256 is resumable.
+    // X[:-37]: 239 tokens, probed up to 238. The full group holds pages 0..2
+    // and the sliding group published every page X computed before it slid
+    // out of X's window, so the window [65, 192) behind 192 is still cached.
     std::vector<std::int32_t> cut(prompt.begin(), prompt.end() - 37);
     Submit(RequestSpec{.request_id = "z", .tokens = cut, .max_new_tokens = 4});
     const ExecutionPlan cut_plan = PlanOnce();
     const ForwardBatch* cut_batch = FindForwardBatch(cut_plan);
     ASSERT_NE(cut_batch, nullptr);
     ASSERT_EQ(cut_batch->request_ids, std::vector<std::string>{"z"});
-    EXPECT_EQ(cut_batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(cut_batch->extend_prefix_lens, std::vector<std::int32_t>{192});
+}
+
+// A page-aligned prompt resent as is is probed only up to n - 1, so its best
+// boundary is one page below its end, behind which the window has slid out
+// of the finished request's table; prompts sharing a shorter prefix resume
+// at their last common page. Each needs the sliding pages the finished
+// request published before they slid out.
+TEST_F(GptOssShapeSuite, SlidOutWindowPagesStayResumableBelowTheNewestBoundary) {
+    const std::vector<std::int32_t> prompt = MakeTokens(256);
+    Submit(RequestSpec{.request_id = "x", .tokens = prompt, .max_new_tokens = 4});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    std::int32_t next_token = 5000;
+    SendForwardDone("x", {next_token++});
+    for (std::int32_t step = 0; step < 3; ++step) {
+        ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr) << "decode step " << step;
+        SendForwardDone("x", {next_token++});
+    }
+    SendFinish("x");
+    PlanOnce();
+
+    const auto resumed_at = [&](const std::string& id, const std::vector<std::int32_t>& tokens) {
+        Submit(RequestSpec{.request_id = id, .tokens = tokens, .max_new_tokens = 4});
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        EXPECT_NE(batch, nullptr) << id;
+        const std::int32_t hit = batch == nullptr ? -1 : batch->extend_prefix_lens.at(0);
+        SendAbortEvent(id);
+        PlanOnce();
+        return hit;
+    };
+    const auto shared_then_new = [&](std::int32_t shared, std::int32_t first_new) {
+        std::vector<std::int32_t> tokens(prompt.begin(), prompt.begin() + shared);
+        for (std::int32_t i = 0; i < 40; ++i) {
+            tokens.push_back(first_new + i);
+        }
+        return tokens;
+    };
+    EXPECT_EQ(resumed_at("resend", prompt), 192);
+    EXPECT_EQ(resumed_at("share_192", shared_then_new(192, 7000)), 192);
+    EXPECT_EQ(resumed_at("share_128", shared_then_new(128, 7100)), 128);
 }
 
 class GptOssShapeWithWholePagesSuite : public GptOssShapeSuite {

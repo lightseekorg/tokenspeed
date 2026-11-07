@@ -336,6 +336,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
         .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
+        .def_ro("device_only_entries_not_written_back",
+                &tokenspeed::HostCacheStats::device_only_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
 

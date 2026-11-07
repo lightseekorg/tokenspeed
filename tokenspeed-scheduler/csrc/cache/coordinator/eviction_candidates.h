@@ -53,8 +53,9 @@ public:
         CacheBlockLocation location;
         std::uint32_t group_id;
         BoundaryTier boundary_tier{BoundaryTier::kUncached};
-        // The epoch the candidate ranks at, and its distance when aged.
-        std::uint64_t rank_epoch{0};
+        // The PrefixCacheIndex::EvictionRank the candidate ranks at (the
+        // aging cutoff's for an aged checkpoint), and its distance when aged.
+        std::uint64_t rank{0};
         std::int32_t aged_distance{0};
     };
 
@@ -67,6 +68,7 @@ public:
           request_reclaim_locations_{request_reclaim_locations},
           aging_{aging},
           removed_checkpoints_{removed_checkpoints},
+          aged_rank_{PrefixCacheIndex::EvictionRank(aging.cutoff_epoch, false)},
           aged_floor_{aging.tree != nullptr ? aging.tree->LeafDistance() : 0},
           next_aged_distance_{aging.tree != nullptr ? CheckpointTree::kMaxDistance : 0} {
         cursors_.reserve(groups.size());
@@ -80,7 +82,7 @@ public:
         Candidate candidate{.last_access_epoch = metadata ? metadata->last_access_epoch : 0,
                             .location = location,
                             .group_id = group_id};
-        candidate.rank_epoch = candidate.last_access_epoch;
+        candidate.rank = metadata ? PrefixCacheIndex::EvictionRank(*metadata) : 0;
         const std::int32_t position = metadata ? metadata->logical_block_index : -1;
         const CacheBoundaryKind kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
         const bool closed = groups_[group_id].Matcher().IsPrefixClosed();
@@ -105,30 +107,30 @@ public:
         std::ranges::sort(candidates, {}, [](const Candidate& candidate) { return evictionKey(candidate); });
     }
 
-    // A request release can precede the cache; never inspect a newer epoch.
-    std::optional<Candidate> Next(std::uint64_t max_rank_epoch) {
+    // A request release can precede the cache; never inspect a later rank.
+    std::optional<Candidate> Next(std::uint64_t max_rank) {
         while (true) {
             const Candidate* best = nullptr;
             GroupCursor* best_group = nullptr;
             enum class Source { kGroup, kAged, kRequeued } source{Source::kGroup};
             const auto consider = [&](const Candidate& candidate, Source from, GroupCursor* group) {
-                if (candidate.rank_epoch <= max_rank_epoch && (best == nullptr || Before(candidate, *best))) {
+                if (candidate.rank <= max_rank && (best == nullptr || Before(candidate, *best))) {
                     best = &candidate;
                     source = from;
                     best_group = group;
                 }
             };
             GroupCursor* next_group = nullptr;
-            std::optional<std::uint64_t> next_epoch;
+            std::optional<std::uint64_t> next_rank;
             for (GroupCursor& group : cursors_) {
                 if (group.next_candidate < group.candidates.size()) {
                     consider(group.Current(), Source::kGroup, &group);
                 } else if (!group.index_exhausted) {
-                    const auto epoch = groups_[group.group_id].Index().PeekEvictionEpoch(pool_, group.index_cursor);
-                    if (!epoch) {
+                    const auto rank = groups_[group.group_id].Index().PeekEvictionRank(pool_, group.index_cursor);
+                    if (!rank) {
                         group.index_exhausted = true;
-                    } else if (*epoch <= max_rank_epoch && (!next_epoch || *epoch < *next_epoch)) {
-                        next_epoch = epoch;
+                    } else if (*rank <= max_rank && (!next_rank || *rank < *next_rank)) {
+                        next_rank = rank;
                         next_group = &group;
                     }
                 }
@@ -139,16 +141,16 @@ public:
             if (!requeued_.empty()) {
                 consider(requeued_.front(), Source::kRequeued, nullptr);
             }
-            // Read complete equal epochs before applying policy tie-breaks.
-            if (next_group != nullptr && (best == nullptr || *next_epoch <= best->rank_epoch)) {
-                loadEpoch(*next_group, *next_epoch);
+            // Read complete equal ranks before applying policy tie-breaks.
+            if (next_group != nullptr && (best == nullptr || *next_rank <= best->rank)) {
+                loadRank(*next_group, *next_rank);
                 continue;
             }
             // Each distance's aged checkpoints are read once those of every
             // larger distance are gone.
-            if (next_aged_distance_ > aged_floor_ && aging_.cutoff_epoch <= max_rank_epoch &&
-                (best == nullptr || best->rank_epoch > aging_.cutoff_epoch ||
-                 (best->rank_epoch == aging_.cutoff_epoch && best->aged_distance < next_aged_distance_))) {
+            if (next_aged_distance_ > aged_floor_ && aged_rank_ <= max_rank &&
+                (best == nullptr || best->rank > aged_rank_ ||
+                 (best->rank == aged_rank_ && best->aged_distance < next_aged_distance_))) {
                 loadAgedDistance();
                 continue;
             }
@@ -173,7 +175,8 @@ public:
                         return candidate;
                     }
                     Candidate own_rank = candidate;
-                    own_rank.rank_epoch = own_rank.last_access_epoch;
+                    // A State checkpoint is never a slid-out sliding-window page.
+                    own_rank.rank = PrefixCacheIndex::EvictionRank(own_rank.last_access_epoch, false);
                     own_rank.aged_distance = 0;
                     requeued_.push_back(own_rank);
                     std::ranges::push_heap(requeued_, after);
@@ -190,7 +193,7 @@ private:
     static std::tuple<std::uint64_t, std::int32_t, std::uint64_t, BoundaryTier, std::int64_t, std::uint32_t,
                       std::int32_t, std::int32_t>
     evictionKey(const Candidate& candidate) {
-        return std::tuple{candidate.rank_epoch,
+        return std::tuple{candidate.rank,
                           -candidate.aged_distance,
                           candidate.last_access_epoch,
                           candidate.boundary_tier,
@@ -229,7 +232,7 @@ private:
         std::size_t next_candidate{0};
     };
 
-    void loadEpoch(GroupCursor& group, std::uint64_t epoch) {
+    void loadRank(GroupCursor& group, std::uint64_t rank) {
         if (!group.started) {
             group.started = true;
             ++group_scans_;
@@ -237,7 +240,7 @@ private:
         group.candidates.clear();
         group.next_candidate = 0;
         epoch_scratch_.clear();
-        groups_[group.group_id].Index().NextEvictionEpoch(pool_, group.index_cursor, epoch, epoch_scratch_);
+        groups_[group.group_id].Index().NextEvictionRank(pool_, group.index_cursor, rank, epoch_scratch_);
         scanned_candidates_ += epoch_scratch_.size();
         for (const auto& entry : epoch_scratch_) {
             if (excluded(entry.location) || aged(group.group_id, entry)) {
@@ -249,7 +252,7 @@ private:
     }
 
     // The unpinned State entries of the next distance's aged checkpoints,
-    // as loadEpoch skips them.
+    // as loadRank skips them.
     void loadAgedDistance() {
         const std::int32_t distance = next_aged_distance_--;
         aged_.clear();
@@ -266,7 +269,7 @@ private:
                     continue;
                 }
                 Candidate candidate = MakeCandidate(group_id, entry->location, entry->metadata);
-                candidate.rank_epoch = aging_.cutoff_epoch;
+                candidate.rank = aged_rank_;
                 candidate.aged_distance = distance;
                 aged_.emplace_back(candidate, &hash);
             }
@@ -283,6 +286,8 @@ private:
     const RemovedCheckpoints* removed_checkpoints_;
     std::vector<GroupCursor> cursors_;
     std::vector<PrefixCacheIndex::EvictionCandidate> epoch_scratch_;
+    // The rank aged checkpoints take: the aging cutoff as a kept entry's rank.
+    std::uint64_t aged_rank_;
     std::int32_t aged_floor_;
     // The aged candidates of the distance being read, and the next distance
     // to read (the leaf distance once every aged distance was read).
