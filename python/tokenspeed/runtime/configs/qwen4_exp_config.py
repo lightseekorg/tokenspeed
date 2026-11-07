@@ -65,6 +65,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         layer_types: list[str] | None = None,
         rope_parameters: dict | None = None,
         num_experts: int | None = None,
+        decode_monokernel: bool = False,
         **kwargs,
     ) -> None:
         if hc_count <= 1:
@@ -103,6 +104,10 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         self._qwen4_exp_layer_types = (
             list(layer_types) if layer_types is not None else None
         )
+        # Whether the model builds its decoder layers from the decode
+        # monokernel classes. ModelConfig sets it from --decode-monokernel;
+        # checkpoints do not hold it.
+        self.decode_monokernel = bool(decode_monokernel)
 
     @property
     def layers_block_type(self) -> list[str]:
