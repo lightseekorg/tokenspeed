@@ -41,6 +41,27 @@ from tokenspeed.runtime.execution.types import (
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 
 
+def _stacked_view(tables: Sequence[torch.Tensor]) -> torch.Tensor | None:
+    """``tables`` as one ``[len(tables), rows, cols]`` view when they are
+    equal-shape row-major tables laid end to end in one storage, else None."""
+    if not tables:
+        return None
+    first = tables[0]
+    rows, cols = first.shape
+    storage = first.untyped_storage().data_ptr()
+    start = first.storage_offset()
+    for i, table in enumerate(tables):
+        if (
+            table.dtype != first.dtype
+            or table.shape != first.shape
+            or not table.is_contiguous()
+            or table.untyped_storage().data_ptr() != storage
+            or table.storage_offset() != start + i * rows * cols
+        ):
+            return None
+    return first.as_strided((len(tables), rows, cols), (rows * cols, cols, 1))
+
+
 class RuntimeStates:
     """Own runtime state tensors keyed by request-pool index.
 
@@ -65,11 +86,13 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
+        input_vocab_size: int,
         vocab_size: int,
         output_length: int,
         device: str = "cuda",
     ):
         self.device = device
+        self.input_vocab_size = input_vocab_size
         self.vocab_size = vocab_size
         self.ngram_accepted_tokens: torch.Tensor | None = None
         self.ngram_needs_seed: torch.Tensor | None = None
@@ -225,7 +248,8 @@ class RuntimeStates:
 
         ``capacity`` is zero for a model that reads no history, else the
         physical context length. Row ``s`` holds ``[0, valid_cache_lengths[s])``
-        committed tokens; the model's kernels append every forward's inputs
+        committed tokens (only the last ones a bounded-lookback model reads,
+        after a reseed); the model's kernels append every forward's inputs
         past that frontier, and resuming extends are reseeded from host
         snapshots (:meth:`seed_request_token_history`). Like the n-gram tail,
         this is executor state that follows ``valid_cache_lengths``; it is
@@ -277,7 +301,6 @@ class RuntimeStates:
         input_start_offsets: torch.Tensor,
         active_request_mask: torch.Tensor,
         committed_lengths: torch.Tensor,
-        row_offset: int,
     ) -> RequestTokenHistoryView:
         """Combine the draft history with one packed-batch layout.
 
@@ -288,8 +311,6 @@ class RuntimeStates:
             active_request_mask: ``[bs]`` False rows are graph padding.
             committed_lengths: ``[pool + 1]`` per-slot write frontier for this
                 draft step; the drafter owns and advances it.
-            row_offset: Batch-global row of the forward's first local input
-                row (a query shard's start; 0 otherwise).
         """
         if self.draft_request_token_history_ids is None:
             raise RuntimeError("draft request token history is not enabled")
@@ -299,7 +320,6 @@ class RuntimeStates:
             req_pool_indices=req_pool_indices,
             input_start_offsets=input_start_offsets,
             active_request_mask=active_request_mask,
-            row_offset=row_offset,
         )
 
     def request_token_history_view(
@@ -308,13 +328,8 @@ class RuntimeStates:
         req_pool_indices: torch.Tensor,
         input_start_offsets: torch.Tensor,
         active_request_mask: torch.Tensor,
-        row_offset: int,
     ) -> RequestTokenHistoryView:
-        """Combine the persistent history with one packed-batch layout.
-
-        ``row_offset`` is the batch-global row of the forward's first local
-        input row (a query shard's start; 0 otherwise).
-        """
+        """Combine the persistent history with one packed-batch layout."""
         if self.request_token_history_ids is None:
             raise RuntimeError("request token history is not enabled")
         return RequestTokenHistoryView(
@@ -323,14 +338,15 @@ class RuntimeStates:
             req_pool_indices=req_pool_indices,
             input_start_offsets=input_start_offsets,
             active_request_mask=active_request_mask,
-            row_offset=row_offset,
         )
 
     def seed_request_token_history(self, seeds: RequestHistorySeeds) -> None:
         """Restore the committed prefix of each seeded slot.
 
-        One pinned upload carries every seed; each row is then written from
-        its device slice on the current stream. Returns None.
+        A seed may carry only the prefix's tail (a model with a bounded
+        history lookback); it lands at the positions ending at the prefix
+        length. One pinned upload carries every seed; each row is then
+        written from its device slice on the current stream. Returns None.
         """
         history = self.request_token_history_ids
         if history is None:
@@ -345,7 +361,7 @@ class RuntimeStates:
                     f"request token history prefix {prefix_length} exceeds "
                     f"capacity {capacity}"
                 )
-        if sum(seeds.prefix_lengths) == 0:
+        if sum(len(tokens) for tokens in seeds.tokens) == 0:
             return
         device_tokens = torch.tensor(
             list(itertools.chain.from_iterable(seeds.tokens)),
@@ -354,17 +370,20 @@ class RuntimeStates:
         ).to(self.device, non_blocking=True)
         offset = 0
         draft = self.draft_request_token_history_ids
-        for slot, prefix_length in zip(seeds.slots, seeds.prefix_lengths):
-            history[slot, :prefix_length].copy_(
-                device_tokens[offset : offset + prefix_length]
+        for slot, prefix_length, tokens in zip(
+            seeds.slots, seeds.prefix_lengths, seeds.tokens
+        ):
+            start = prefix_length - len(tokens)
+            history[slot, start:prefix_length].copy_(
+                device_tokens[offset : offset + len(tokens)]
             )
-            if draft is not None and prefix_length > 1:
+            if draft is not None and len(tokens) > 1:
                 # The draft stream is the request stream shifted one token
                 # left, at the same positions.
-                draft[slot, : prefix_length - 1].copy_(
-                    device_tokens[offset + 1 : offset + prefix_length]
+                draft[slot, start : prefix_length - 1].copy_(
+                    device_tokens[offset + 1 : offset + len(tokens)]
                 )
-            offset += prefix_length
+            offset += len(tokens)
 
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter)
@@ -434,6 +453,13 @@ class RuntimeStates:
         # the rows, so a (re)admitted request verifies its first chain against
         # the sentinel and never a previous occupant's distributions.
         self.reset_draft_probs(extend_request_pool_indices)
+        if self.future_draft_q is not None:
+            # The sparse draft q (sampled trees, the DFlash2 chain) the same
+            # way: slot -1 on every node is "no proposal", so the first verify
+            # checks the drafts against the target's own draw (target-only
+            # rule) instead of a previous occupant's q. A PD landing resets
+            # here too, before its shipped candidates arrive without q.
+            self.future_draft_q.slot.index_fill_(0, extend_request_pool_indices, -1)
         if self.ngram_accepted_tokens is not None:
             assert self.ngram_needs_seed is not None
             self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
@@ -537,12 +563,19 @@ class RuntimeStates:
 
         The tables are this step's own upload, so the rows are padded in
         place: they stay views of the one packed upload, which the attention
-        routers unpack in a single launch.
+        routers unpack in a single launch. The upload holds the state groups'
+        tables end to end, so one launch pads them all; tables laid out any
+        other way take one launch each.
         """
         stopped_rows = self.stopped.index_select(0, req_pool_indices)[:, None]
         tables = dict(block_tables)
-        for group_id in state_group_ids:
-            tables[group_id].masked_fill_(stopped_rows, -1)
+        state_tables = [tables[group_id] for group_id in state_group_ids]
+        stacked = _stacked_view(state_tables)
+        if stacked is not None:
+            stacked.masked_fill_(stopped_rows, -1)
+            return tables
+        for table in state_tables:
+            table.masked_fill_(stopped_rows, -1)
         return tables
 
     def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:
@@ -574,4 +607,6 @@ class RuntimeStates:
         # The candidates come without their draft distribution; the row's
         # draft_probs still hold the sentinel reset_states wrote when the
         # remote cache length was seeded, so the first local verify rejects
-        # them at column 1 and samples token 0 from the full target.
+        # them at column 1 and samples token 0 from the full target. A sparse
+        # draft q (future_draft_q) row holds slot -1 from the same reset, so
+        # there the first verify checks them by the target-only rule.

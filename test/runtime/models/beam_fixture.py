@@ -133,9 +133,10 @@ def tiny_weights(config: BeamConfig) -> dict[str, torch.Tensor]:
     return weights
 
 
-def write_tiny_checkpoint(directory: Path) -> Path:
+def write_tiny_checkpoint(directory: Path, *, config: BeamConfig | None = None) -> Path:
+    """Write matching config, weights and tokenizer, using the tiny config if omitted."""
     directory.mkdir(parents=True, exist_ok=False)
-    config = tiny_config()
+    config = tiny_config() if config is None else config
     config.save_pretrained(directory)
     save_file(tiny_weights(config), str(directory / "model.safetensors"))
     vocabulary = {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3}

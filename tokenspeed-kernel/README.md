@@ -11,6 +11,11 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own. Others can use it
 directly.
 
+The vendored CUDA routing, sampling, and softmax kernels share reduction
+operators selected by the CCCL header version. CCCL releases before 2.8 use
+CUB operators; newer releases use CUDA operators. This supports building the
+same reductions with CUDA 12.8 without changing their algorithms.
+
 ## Public API
 
 ```python
@@ -164,6 +169,11 @@ folder.
 TokenSpeed-kernel carefully curates external dependencies and actively
 re-evaluates their inclusion to maintain minimal dependencies and enable
 faster iteration.
+
+CUDA provider discovery tolerates missing optional native packages, including
+FlashMLA and DeepGEMM. Providers expose native implementations when their
+corresponding packages are available. Direct calls to unavailable native
+entry points raise an error.
 
 ### Numerics, benchmarking, profiling
 

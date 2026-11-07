@@ -20,9 +20,8 @@
 
 from __future__ import annotations
 
-import importlib.util
-
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -191,7 +190,7 @@ def deepgemm_mm_fp8_blockscale(
     return block_fp8_mm(A, B, A_scales, B_scales, out, enable_pdl=pdl_enabled())
 
 
-if importlib.util.find_spec("deep_gemm") is not None:
+if has_optional_package("deep_gemm"):
     # SM100's MMA takes the per-32 UE8M0 scales natively.
     _SM100 = CapabilityRequirement(
         vendors=frozenset({"nvidia"}),
