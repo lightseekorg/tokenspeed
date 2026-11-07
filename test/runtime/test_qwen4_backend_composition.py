@@ -64,6 +64,7 @@ def _config(*, is_draft: bool, width: int):
         context_len=512,
         max_bs=4,
         qcp_size=1,
+        kvp_size=1,
     )
 
 

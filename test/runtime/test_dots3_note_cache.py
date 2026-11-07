@@ -522,7 +522,7 @@ def test_swa_prefill_gathers_only_live_window_pages(swa_leaf):
     table[0, 112:129] = torch.arange(1, 18, device="cuda", dtype=torch.int32)
     table[1, :2] = torch.tensor([18, 19], device="cuda", dtype=torch.int32)
     leaf._init_prefill_metadata(
-        prefix + extend, prefix, prefix_cpu, extend, extend_cpu, table
+        prefix + extend, prefix, prefix_cpu, extend, extend_cpu, table, None
     )
     meta = leaf.chunked_prefill_metadata
     # The partial first page is retained; only its pre-window token is masked.
@@ -552,6 +552,7 @@ def test_swa_leaf_cold_prefill_masks_the_left_boundary(swa_leaf):
         lens_cpu.cuda(),
         lens_cpu,
         torch.zeros((1, 256), device="cuda", dtype=torch.int32),
+        None,
     )
     q = torch.zeros(length, heads, 256, device="cuda", dtype=torch.bfloat16)
     k, v = torch.zeros_like(q), torch.zeros(
@@ -621,7 +622,7 @@ def test_swa_prefix_lengths_do_not_recompile_metadata(swa_leaf):
         prefix_cpu = torch.tensor(prefix_lengths, dtype=torch.int32)
         prefix = prefix_cpu.cuda()
         swa_leaf._init_prefill_metadata(
-            prefix + extend, prefix, prefix_cpu, extend, extend_cpu, table
+            prefix + extend, prefix, prefix_cpu, extend, extend_cpu, table, None
         )
 
     initialize([4097, 45, 0])

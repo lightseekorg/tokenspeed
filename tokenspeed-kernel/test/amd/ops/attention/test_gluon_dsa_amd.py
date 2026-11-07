@@ -2536,6 +2536,147 @@ def test_dsa_dense_split_variants_compile_during_warmup() -> None:
             torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
+def _reference_lse(
+    q: torch.Tensor,
+    latent: torch.Tensor,
+    rope: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    keys = torch.cat([latent.float(), rope.float()], dim=-1)
+    lse = torch.full(q.shape[:2], -float("inf"), device=q.device)
+    for token in range(q.shape[0]):
+        count = int(topk_lens[token].item())
+        if count:
+            selected = keys.index_select(0, topk_slots[token, :count].long())
+            scores = (q[token].float() @ selected.T) * softmax_scale
+            lse[token] = torch.logsumexp(scores, dim=-1)
+    return lse
+
+
+def _split_selected_slots(
+    topk_slots: torch.Tensor, topk_lens: torch.Tensor
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Two disjoint halves of every row's selection, each packed to the front."""
+
+    halves = []
+    for parity in (0, 1):
+        slots = torch.full_like(topk_slots, -1)
+        lens = torch.zeros_like(topk_lens)
+        for token in range(topk_slots.shape[0]):
+            kept = topk_slots[token, parity : int(topk_lens[token].item()) : 2]
+            slots[token, : kept.numel()] = kept
+            lens[token] = kept.numel()
+        halves.append((slots, lens))
+    return halves
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the LSE output is gfx950's")
+@pytest.mark.parametrize(
+    "mode,api",
+    [
+        pytest.param("decode", gluon_dsa_decode, id="decode"),
+        pytest.param("prefill", gluon_dsa_prefill, id="prefill"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("kv_kind", "num_kv_splits"),
+    [
+        pytest.param("bf16", 1, id="bf16-one_split"),
+        pytest.param("bf16", 4, id="bf16-four_splits"),
+        pytest.param("e4m3", 1, id="e4m3-one_split"),
+        pytest.param("e4m3", 4, id="e4m3-four_splits"),
+        pytest.param("sparse", None, id="packed_sparse"),
+    ],
+)
+def test_dsa_lse_merges_disjoint_selections_into_the_full_attention(
+    monkeypatch, mode: str, api, kv_kind: str, num_kv_splits: int | None
+) -> None:
+    device = "cuda"
+    num_heads = 16
+    num_slots = 4096
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    generator = _generator(device, 2026)
+    if num_kv_splits is not None:
+        monkeypatch.setattr(
+            gfx950_dsa_backend, "_select_num_kv_splits", lambda **_: num_kv_splits
+        )
+    q = _randn_bf16(
+        (4, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=generator,
+    )
+    latent = _randn_bf16((num_slots, kv_lora_rank), device=device, generator=generator)
+    rope = _randn_bf16(
+        (num_slots, qk_rope_head_dim), device=device, generator=generator
+    )
+    if kv_kind == "sparse":
+        sparse_kv, ref_latent = _pack_sparse_kv(latent, rope)
+        caches = {"kv_cache": None, "sparse_kv_cache": sparse_kv}
+        ref_rope = rope
+    else:
+        dtype = torch.bfloat16 if kv_kind == "bf16" else torch.float8_e4m3fn
+        q = q.to(dtype)
+        kv_cache = torch.cat([latent, rope], dim=-1).to(dtype)
+        caches = {"kv_cache": kv_cache, "sparse_kv_cache": None}
+        ref_latent = kv_cache[:, :kv_lora_rank]
+        ref_rope = kv_cache[:, kv_lora_rank:]
+    # An empty row, a short row, a partial row and a full selection.
+    topk_lens = torch.tensor([0, 7, 700, topk], device=device, dtype=torch.int32)
+    topk_slots = torch.full((4, topk), -1, device=device, dtype=torch.int32)
+    for token in range(4):
+        count = int(topk_lens[token].item())
+        topk_slots[token, :count] = torch.randperm(
+            num_slots, device=device, generator=generator
+        )[:count]
+
+    def attend(slots: torch.Tensor, lens: torch.Tensor, return_lse: bool):
+        return api(
+            q=q,
+            topk_slots=slots,
+            topk_lens=lens,
+            max_seqlen_k=num_slots,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=64,
+            return_lse=return_lse,
+            **caches,
+        )
+
+    out, lse = attend(topk_slots, topk_lens, True)
+    assert lse.shape == (4, num_heads) and lse.dtype == torch.float32
+    assert torch.equal(out, attend(topk_slots, topk_lens, False))
+    assert torch.isneginf(lse[0]).all()
+    assert (out[0] == 0).all()
+    ref_lse = _reference_lse(
+        q, ref_latent, ref_rope, topk_slots, topk_lens, softmax_scale
+    )
+    torch.testing.assert_close(lse[1:], ref_lse[1:], rtol=0, atol=2e-2)
+
+    (out_a, lse_a), (out_b, lse_b) = (
+        attend(slots, lens, True)
+        for slots, lens in _split_selected_slots(topk_slots, topk_lens)
+    )
+    peak = torch.maximum(lse_a, lse_b)[1:]
+    weight_a = torch.exp(lse_a[1:] - peak)
+    weight_b = torch.exp(lse_b[1:] - peak)
+    merged = (
+        weight_a[..., None] * out_a[1:].float()
+        + weight_b[..., None] * out_b[1:].float()
+    ) / (weight_a + weight_b)[..., None]
+    torch.testing.assert_close(merged, out[1:].float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        peak + torch.log(weight_a + weight_b), lse[1:], rtol=0, atol=2e-2
+    )
+
+
 @pytest.mark.skipif(
     not is_cdna4(),
     reason="GLM-5.3-Flash dense prefill is specific to gfx950",

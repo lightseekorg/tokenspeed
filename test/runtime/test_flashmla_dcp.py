@@ -841,9 +841,131 @@ def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
 
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("query_width", [1, 6])
+@pytest.mark.parametrize(
+    "arm",
+    [
+        # The leaf's decode selections are not the core the records op
+        # stands in for.
+        "unprobed",
+        # A decode that core would run without splitting its keys.
+        "split_size",
+        # Rank-major gather, records core, records exchange.
+        "records",
+    ],
+)
 def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
-    monkeypatch, rank, query_width
+    monkeypatch, rank, query_width, arm
 ):
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+
+    backend, layer, pool = _sharded_decode_backend(rank, query_width, arm)
+    query = torch.zeros(query_width, 2, 128, dtype=torch.bfloat16)
+    slots = torch.full((query_width, 512), -1, dtype=torch.int32)
+    slots[:, :4] = torch.tensor([64, 128, 192, 256])
+
+    calls = []
+    sizes = []
+
+    def check_selection(kwargs):
+        # Owned local slot 64 moves first; the owned count is the core's length.
+        expected = torch.full_like(slots, -1)
+        expected[:, 0] = 64
+        torch.testing.assert_close(kwargs["topk_slots"], expected)
+        torch.testing.assert_close(
+            kwargs["topk_lens"], torch.ones(query_width, dtype=torch.int32)
+        )
+
+    def gather(q, group):
+        calls.append("gather")
+        assert group == backend.kvp_group
+        return q.repeat(1, 4, 1)
+
+    def decode(**kwargs):
+        calls.append("decode")
+        assert kwargs["return_lse"] is True
+        torch.testing.assert_close(
+            kwargs["kv_seq_lens"],
+            torch.arange(129 - query_width, 129, dtype=torch.int32),
+        )
+        check_selection(kwargs)
+        assert kwargs["q"].shape == (query_width, 8, 128)
+        return torch.full((query_width, 8, 128), 7.0), torch.zeros(query_width, 8)
+
+    def combine(out, lse, *, group, rank, sink, keep_all_heads):
+        calls.append("combine")
+        assert sink is None and group == backend.kvp_group
+        assert keep_all_heads is False
+        assert lse.shape == out.shape[:-1]
+        return out[:, rank * 2 : (rank + 1) * 2]
+
+    def supported(
+        *, tokens, heads, topk, q_dtype, kv_dtype, kv_lora_rank, qk_rope_head_dim
+    ):
+        # Host values every rank shares: the rows, the gathered heads, the
+        # selection width and the leaf's geometry.
+        sizes.append((tokens, heads, topk, q_dtype, kv_dtype, kv_lora_rank))
+        assert qk_rope_head_dim == 0
+        return arm == "records"
+
+    def gather_rank_major(q, group):
+        calls.append("gather_rank_major")
+        assert group == backend.kvp_group
+        return q.unsqueeze(0).repeat(4, 1, 1, 1)
+
+    def records_core(**kwargs):
+        calls.append("records_core")
+        check_selection(kwargs)
+        assert kwargs["q"].shape == (4, query_width, 2, 128)
+        assert kwargs["q_len_per_req"] == query_width
+        assert kwargs["kv_lora_rank"] == 128 and kwargs["softmax_scale"] == 0.1
+        assert kwargs["solution"] is None and kwargs["slot_order"] == "selection"
+        return torch.zeros((4, query_width, 2, 65), dtype=torch.int32)
+
+    def combine_records(records, *, group, head_dim, partial_dtype, output_dtype, sink):
+        calls.append("combine_records")
+        assert records.shape == (4, query_width, 2, 65)
+        assert group == backend.kvp_group and sink is None and head_dim == 128
+        assert partial_dtype == output_dtype == torch.bfloat16
+        return torch.full((query_width, 2, 128), 7.0)
+
+    monkeypatch.setattr(dsa, "gather_query_heads", gather)
+    monkeypatch.setattr(dsa, "dsa_decode", decode)
+    monkeypatch.setattr(dsa, "combine_attention_partials", combine)
+    monkeypatch.setattr(dsa, "dsa_decode_dcp_records_supported", supported)
+    monkeypatch.setattr(
+        dsa,
+        "dsa_decode_dcp_records_workspace_bytes",
+        lambda **_: 4 * query_width * 2 * 65 * 4,
+    )
+    monkeypatch.setattr(dsa, "gather_query_heads_rank_major", gather_rank_major)
+    monkeypatch.setattr(dsa, "dsa_decode_dcp_records", records_core)
+    monkeypatch.setattr(dsa, "combine_attention_records", combine_records)
+    out = backend.forward_sparse_decode(
+        q=query,
+        layer=layer,
+        token_to_kv_pool=pool,
+        bs=1,
+        topk_indices=slots,
+        topk_lens=None,
+    )
+    assert out.shape == (query_width, 256)
+    assert (out == 7).all()
+    # The size check runs only once the probe allows the arm.
+    asked = arm in ("split_size", "records")
+    expected_sizes = [(query_width, 8, 512, torch.bfloat16, torch.float32, 128)]
+    assert sizes == (expected_sizes if asked else [])
+    assert calls == (
+        ["gather_rank_major", "records_core", "combine_records"]
+        if arm == "records"
+        else ["gather", "decode", "combine"]
+    )
+
+
+def _sharded_decode_backend(rank, query_width, arm):
+    """A DSA leaf of a 4-rank KVP group holding the attention-TP slice (2 of
+    8 heads) of a BF16 cache, its decode metadata one 128-token request of
+    ``query_width`` verify rows; the records probe passed unless ``arm`` is
+    ``"unprobed"``. Returns the backend, the layer and the pool."""
     from types import SimpleNamespace
 
     from tokenspeed.runtime.layers.attention.backends.paged import dsa
@@ -872,6 +994,11 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     # A target verify publishing no causal lengths: _k_row_causal_lengths derives them.
     backend.is_draft = False
     backend.spec_num_tokens = query_width
+    # configure_runtime's probe verdict, set directly: the probe admits only
+    # gfx950's dense core on an FP8 cache
+    # (test_dcp_decode_records_core_follows_every_decode_selection), and the
+    # forward reads only this flag, whatever the query dtype.
+    backend._dcp_decode_records_core = arm != "unprobed"
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0,
@@ -880,9 +1007,6 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
             _dsa_kv_seq_lens=None,
         )
     )
-    query = torch.zeros(query_width, 2, 128, dtype=torch.bfloat16)
-    slots = torch.full((query_width, 512), -1, dtype=torch.int32)
-    slots[:, :4] = torch.tensor([64, 128, 192, 256])
     pool = SimpleNamespace(
         quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
     )
@@ -894,46 +1018,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
         scaling=0.1,
         logit_cap=0.0,
     )
-
-    def gather(q, group):
-        assert group == backend.kvp_group
-        return q.repeat(1, 4, 1)
-
-    def decode(**kwargs):
-        assert kwargs["return_lse"] is True
-        torch.testing.assert_close(
-            kwargs["kv_seq_lens"],
-            torch.arange(129 - query_width, 129, dtype=torch.int32),
-        )
-        # Owned local slot 64 moves first; the owned count is the core's length.
-        expected = torch.full_like(slots, -1)
-        expected[:, 0] = 64
-        torch.testing.assert_close(kwargs["topk_slots"], expected)
-        torch.testing.assert_close(
-            kwargs["topk_lens"], torch.ones(query_width, dtype=torch.int32)
-        )
-        assert kwargs["q"].shape == (query_width, 8, 128)
-        return torch.full((query_width, 8, 128), 7.0), torch.zeros(query_width, 8)
-
-    def combine(out, lse, *, group, rank, sink, keep_all_heads):
-        assert sink is None and group == backend.kvp_group
-        assert keep_all_heads is False
-        assert lse.shape == out.shape[:-1]
-        return out[:, rank * 2 : (rank + 1) * 2]
-
-    monkeypatch.setattr(dsa, "gather_query_heads", gather)
-    monkeypatch.setattr(dsa, "dsa_decode", decode)
-    monkeypatch.setattr(dsa, "combine_attention_partials", combine)
-    out = backend.forward_sparse_decode(
-        q=query,
-        layer=layer,
-        token_to_kv_pool=pool,
-        bs=1,
-        topk_indices=slots,
-        topk_lens=None,
-    )
-    assert out.shape == (query_width, 256)
-    assert (out == 7).all()
+    return backend, layer, pool
 
 
 @pytest.mark.parametrize("rank", range(4))

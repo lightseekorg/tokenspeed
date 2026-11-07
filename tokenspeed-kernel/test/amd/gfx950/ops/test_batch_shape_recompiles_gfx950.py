@@ -360,6 +360,40 @@ def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
                 run(queries, 2100)
 
 
+@pytest.mark.parametrize("blocks", [2, 5, 8])
+def test_attn_res_startup_covers_prefill_and_decode_warp_counts(blocks):
+    from tokenspeed_kernel.ops.residual import attn_res_fwd
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (
+        gluon_attn_res_fwd_gfx950,
+    )
+
+    torch.manual_seed(31)
+    hidden, tokens = 7168, 256
+    residual = torch.randn(tokens, hidden, device=DEVICE, dtype=torch.bfloat16)
+    history = torch.randn(blocks, tokens, hidden, device=DEVICE, dtype=torch.bfloat16)
+    score_weight = torch.randn(hidden, device=DEVICE, dtype=torch.bfloat16) * 0.01
+    norm_weight = torch.ones(hidden, device=DEVICE, dtype=torch.bfloat16)
+
+    def run(rows):
+        return attn_res_fwd(
+            residual[:rows],
+            history[:, :rows],
+            score_weight,
+            norm_weight,
+            out_norm_weight=norm_weight,
+            num_valid_blocks=blocks,
+        )
+
+    # Prefill warms four warps. A small eager tail takes eight; graph capture
+    # can fuse that layer and never reach this ordinary tail kernel.
+    with kernel_warmup(enabled=True):
+        expected = run(tokens)
+    with assert_no_triton_compile(gluon_attn_res_fwd_gfx950):
+        for rows in (1, 3, 17, 64):
+            torch.testing.assert_close(run(rows), expected[:rows], atol=2e-2, rtol=1e-2)
+
+
 # FP8 caches run their own variants.
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]

@@ -523,7 +523,7 @@ def test_startup_checks_the_planned_bytes_against_the_allocation(kernels):
     plan = _plan()
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=1),
-        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        config=SimpleNamespace(max_bs=4, qcp_size=1, kvp_size=1),
         backend=root,
         draft_backend=None,
         uses_paged_state_verify=False,

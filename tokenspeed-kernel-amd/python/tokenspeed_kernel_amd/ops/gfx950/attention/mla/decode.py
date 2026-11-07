@@ -725,6 +725,7 @@ class AttentionProgram:
         Out,
         sm_scale,
         kv_scale,
+        num_kv_splits,
     ):
         if cfg.REGIME == "bh64":
             cur_batch = (
@@ -751,7 +752,11 @@ class AttentionProgram:
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch)
 
         num_pages = gl.cdiv(cur_batch_seq_len, cfg.PAGE_SIZE)
-        pages_per_split = gl.cdiv(num_pages, cfg.NUM_KV_SPLITS)
+        if cfg.REGIME == "bh16bn64" or cfg.REGIME == "bh16bn128":
+            # NUM_KV_SPLITS is only the power-of-two partial stride here.
+            pages_per_split = gl.cdiv(num_pages, num_kv_splits)
+        else:
+            pages_per_split = gl.cdiv(num_pages, cfg.NUM_KV_SPLITS)
         split_start_page = split_kv_id * pages_per_split
         split_end_page = gl.minimum(split_start_page + pages_per_split, num_pages)
         split_kv_start = split_start_page * cfg.PAGE_SIZE
@@ -1056,7 +1061,7 @@ class AttentionProgram:
 # ===-----------------------------------------------------------------------===#
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["num_kv_splits"])
 def _mla_decode_gluon(
     Q_nope,
     Q_pe,
@@ -1067,6 +1072,7 @@ def _mla_decode_gluon(
     O,
     sm_scale,
     kv_scale,
+    num_kv_splits,
     stride_q_nope_bs: gl.constexpr,
     stride_q_nope_h: gl.constexpr,
     stride_q_pe_bs: gl.constexpr,
@@ -1139,6 +1145,7 @@ def _mla_decode_gluon(
         O,
         sm_scale,
         kv_scale,
+        num_kv_splits,
     )
 
     _mla_decode_program(program, Mid_lse, Final_lse)
@@ -1461,13 +1468,14 @@ def _mla_decode_program(program, Mid_lse, Final_lse):
     program.store_lse(e_max, e_sum, Mid_lse, Final_lse)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_kv_splits"])
 def _mla_softmax_reducev_kernel(
     Logits,
     Mid_lse,
     O,
     Final_lse,
     B_seq_len,
+    num_kv_splits,
     stride_l_b: tl.constexpr,
     stride_l_h: tl.constexpr,
     stride_l_s: tl.constexpr,
@@ -1478,57 +1486,57 @@ def _mla_softmax_reducev_kernel(
     stride_o_h: tl.constexpr,
     stride_fl_b: tl.constexpr,
     stride_fl_h: tl.constexpr,
-    NUM_KV_SPLITS: tl.constexpr,
+    REDUCE_SPLITS: tl.constexpr,
+    VALUE_TILE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    HEAD_DIM_CKV: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
-
-    offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
-    offs_l = cur_batch * stride_l_b + cur_head * stride_l_h + offs_d_ckv
-    offs_ml = cur_batch * stride_ml_b + cur_head * stride_ml_h
+    column = tl.program_id(2)
 
     cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
     num_pages = tl.cdiv(cur_batch_seq_len, PAGE_SIZE)
-    pages_per_split = tl.cdiv(num_pages, NUM_KV_SPLITS)
+    pages_per_split = tl.cdiv(num_pages, num_kv_splits)
 
-    e_sum = 0.0
-    e_max = -float("inf")
-    acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
+    # Splits past the count and the empty trailing splits of a short sequence
+    # hold no partial: stage 1 writes neither their output nor their lse.
+    split = tl.arange(0, REDUCE_SPLITS)
+    valid = (split < num_kv_splits) & (split * pages_per_split < num_pages)
+    lse = tl.load(
+        Mid_lse
+        + cur_batch * stride_ml_b
+        + cur_head * stride_ml_h
+        + split * stride_ml_s,
+        mask=valid,
+        other=-float("inf"),
+    )
+    maximum = tl.max(lse, 0)
+    safe_max = tl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = tl.exp(lse - safe_max)
+    denom = tl.sum(weights, 0)
 
-    for split_kv_id in range(NUM_KV_SPLITS):
-        split_valid = split_kv_id * pages_per_split < num_pages
-        logits = tl.load(
-            Logits + offs_l + split_kv_id * stride_l_s,
-            mask=split_valid,
-            other=0.0,
-        )
-        logits_1 = tl.load(
-            Mid_lse + offs_ml + split_kv_id * stride_ml_s,
-            mask=split_valid,
-            other=-float("inf"),
-        )
-
-        n_e_max = tl.maximum(logits_1, e_max)
-        old_scale = tl.exp(e_max - n_e_max)
-        acc *= old_scale
-        exp_logic = tl.exp(logits_1 - n_e_max)
-        acc += exp_logic * logits
-
-        e_sum = e_sum * old_scale + exp_logic
-        e_max = n_e_max
-
+    offs_d = column * VALUE_TILE + tl.arange(0, VALUE_TILE)
+    values = tl.load(
+        Logits
+        + cur_batch * stride_l_b
+        + cur_head * stride_l_h
+        + split[:, None] * stride_l_s
+        + offs_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    result = tl.sum(values * weights[:, None], 0)
     tl.store(
-        O + cur_batch * stride_o_b + cur_head * stride_o_h + offs_d_ckv,
-        acc / e_sum,
+        O + cur_batch * stride_o_b + cur_head * stride_o_h + offs_d,
+        tl.where(denom > 0, result / denom, 0.0),
     )
     if HAS_FINAL_LSE:
-        tl.store(
-            Final_lse + cur_batch * stride_fl_b + cur_head * stride_fl_h,
-            e_max + tl.log(e_sum),
-        )
+        if column == 0:
+            tl.store(
+                Final_lse + cur_batch * stride_fl_b + cur_head * stride_fl_h,
+                maximum + tl.log(denom),
+            )
 
 
 @gluon.jit
@@ -2511,6 +2519,15 @@ def _gluon_mla_decode_gfx950(
         num_kv_splits = _select_num_kv_splits_bh16bn64(
             batch=batch_size, max_seqlen_k=max_seqlen_k, block_n=block_n
         )
+    # The bh16 regimes take the split count at runtime and compile only the
+    # power-of-two partial width, so an eager batch of any size reuses the
+    # binaries that graph capture compiled. The projected-value reducer
+    # sizes its loop from the partial width, so it keeps the exact count.
+    split_bucket = (
+        triton.next_power_of_2(num_kv_splits)
+        if (regime == "bh16bn64" or regime == "bh16bn128") and value_weight is None
+        else num_kv_splits
+    )
 
     def _grid(splits: int) -> tuple[int, ...]:
         if regime == "bh64":
@@ -2527,7 +2544,7 @@ def _gluon_mla_decode_gfx950(
     common_kwargs = {
         "BLOCK_H": block_h,
         "BLOCK_N": block_n,
-        "NUM_KV_SPLITS": num_kv_splits,
+        "NUM_KV_SPLITS": split_bucket,
         "PAGE_SIZE": page_size,
         "HEAD_DIM_CKV": kv_lora_rank,
         "HEAD_DIM_KPE": qk_rope_head_dim,
@@ -2556,6 +2573,7 @@ def _gluon_mla_decode_gfx950(
             logits_buf,
             softmax_scale,
             1.0,  # kv_scale (bf16 -> no dequant)
+            1,
             q_nope.stride(0),
             q_nope.stride(1),
             q_pe.stride(0),
@@ -2580,12 +2598,12 @@ def _gluon_mla_decode_gfx950(
         # stage-2 reduce merges them, masking the trailing empty splits that a
         # short sequence leaves behind.
         logits = torch.empty(
-            (batch_size, nhead, num_kv_splits, kv_lora_rank),
+            (batch_size, nhead, split_bucket, kv_lora_rank),
             dtype=out.dtype,
             device=q.device,
         )
         mid_lse = torch.empty(
-            (batch_size, nhead, num_kv_splits),
+            (batch_size, nhead, split_bucket),
             dtype=torch.float32,
             device=q.device,
         )
@@ -2600,6 +2618,7 @@ def _gluon_mla_decode_gfx950(
             logits,
             softmax_scale,
             1.0,  # kv_scale (bf16 -> no dequant)
+            num_kv_splits,
             q_nope.stride(0),
             q_nope.stride(1),
             q_pe.stride(0),
@@ -2620,7 +2639,6 @@ def _gluon_mla_decode_gfx950(
             **common_kwargs,
         )
 
-        reduce_grid = (batch_size, nhead)
         if value_weight is not None:
             if return_lse or projected_out is None:
                 raise ValueError("MLA projected-value decode requires out")
@@ -2635,12 +2653,18 @@ def _gluon_mla_decode_gfx950(
                 out=projected_out,
             )
         else:
-            _mla_softmax_reducev_kernel[reduce_grid](
+            reduce_splits = triton.next_power_of_2(num_kv_splits)
+            # Hold the merged tile at 8K partial elements, at least 64 wide.
+            value_tile = max(64, min(kv_lora_rank, 8192 // reduce_splits))
+            _mla_softmax_reducev_kernel[
+                (batch_size, nhead, kv_lora_rank // value_tile)
+            ](
                 logits,
                 mid_lse,
                 o,
                 final_lse,
                 cache_seqlens,
+                num_kv_splits,
                 logits.stride(0),
                 logits.stride(1),
                 logits.stride(2),
@@ -2651,9 +2675,9 @@ def _gluon_mla_decode_gfx950(
                 o.stride(1),
                 stride_final_lse_b,
                 stride_final_lse_h,
-                NUM_KV_SPLITS=num_kv_splits,
+                REDUCE_SPLITS=reduce_splits,
+                VALUE_TILE=value_tile,
                 PAGE_SIZE=page_size,
-                HEAD_DIM_CKV=kv_lora_rank,
                 HAS_FINAL_LSE=return_lse,
             )
 

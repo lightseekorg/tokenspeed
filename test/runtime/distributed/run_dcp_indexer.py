@@ -334,6 +334,8 @@ def main() -> None:
     backend.num_local_heads = 2
     backend.num_attention_heads = 2 * len(group)
     backend.slot_order = "selection"
+    # configure_runtime's probe verdict on a BF16 cache.
+    backend._dcp_decode_records_core = False
     # A three-row verify without causal lengths: decode derives them from seq_lens_k.
     backend.is_draft = False
     backend.spec_num_tokens = 3

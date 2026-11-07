@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from test.ci_system.ci_register import register_cuda_ci
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
@@ -10,6 +11,8 @@ from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
 
 import pytest
 import torch
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
 def _plan(num_lcm_blocks: int, *, tp_size: int = 8):
@@ -243,6 +246,61 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
         recipe.cache_budget_bytes - expected_workspace_bytes
     ) // layout.lcm_block_bytes - 1
     assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_the_amd_kvp_prefill_reserves_its_gather_workspace(monkeypatch) -> None:
+    """Kimi-K3.1 over KVP pages on AMD (a prefill over gathered histories,
+    ``dsa_kvp_history_prefill``): the recipe plans the DSA history gather
+    workspace beside the KDA verify staging, and alone on a prefill-only
+    engine; elsewhere the verify staging alone."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.configs import dsa as dsa_configs
+    from tokenspeed.runtime.layers.attention.configs.dsa import (
+        dsa_history_gather_workspace_bytes,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
+        lambda dtype, **kwargs: False,
+    )
+    monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
+    recipe, _, _ = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="EAGLE3",
+        speculative_num_draft_tokens=4,
+        dsa_index_k_format="fp8_scaled",
+    )
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        device="cuda",
+        kvp_size=8,
+        kvp_group=tuple(range(8)),
+        components=(
+            replace(recipe.attn_config.components[0], backend_name="dsa"),
+            *recipe.attn_config.components[1:],
+        ),
+    )
+
+    def on(is_amd: bool) -> None:
+        monkeypatch.setattr(
+            dsa_configs, "current_platform", lambda: SimpleNamespace(is_amd=is_amd)
+        )
+
+    on(False)
+    verify = recipe.workspace_bytes()
+    assert verify > 0
+    on(True)
+    history = dsa_history_gather_workspace_bytes(
+        recipe.attn_config, max_model_len=recipe.attn_config.context_len
+    )
+    assert history > 0
+    assert recipe.workspace_bytes() == verify + history
+    recipe.server_args.disaggregation_mode = "prefill"
+    assert recipe.workspace_bytes() == history
 
 
 def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:

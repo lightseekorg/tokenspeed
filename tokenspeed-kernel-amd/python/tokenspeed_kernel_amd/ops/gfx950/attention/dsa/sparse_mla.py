@@ -126,6 +126,7 @@ __all__ = [
     "gluon_dsa_kpool_prefill_logits_gfx950",
     "gluon_dsa_kpool_prefill_plan_logits_gfx950",
     "gluon_dsa_logical_topk_gfx950",
+    "gluon_dsa_row_bounded_logical_topk_gfx950",
     "launch_gluon_dsa_prefill_topk_bf16_gfx950",
     "launch_gluon_dsa_prefill_topk_fp8_gfx950",
     "launch_gluon_dsa_prefill_topk_fp8_rows_gfx950",
@@ -2239,7 +2240,10 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             candidate_end = candidate_end - (q_len_per_req - 1) + q_offset
     else:
         req = row
-        candidate_start = gl.load(row_starts + row).to(gl.int32)
+        if row_starts is None:
+            candidate_start = gl.full([], 0, gl.int32)
+        else:
+            candidate_start = gl.load(row_starts + row).to(gl.int32)
         candidate_end = gl.load(row_ends + row).to(gl.int32)
 
     candidate_len = gl.maximum(candidate_end - candidate_start, 0)
@@ -2270,7 +2274,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     shared_histogram.store(slot_zeros)
     shared_output_counters.store(output_counter_zeros)
 
-    row_offset = row * logits_stride
+    row_offset = row.to(gl.int64) * logits_stride
     if ALIGNED_ROWS:
         # Unspecialized logits_stride hides the 16-byte alignment dwordx4 loads need.
         row_offset = gl.multiple_of(row_offset, 4)
@@ -3310,6 +3314,91 @@ def gluon_dsa_logical_topk_gfx950(
         Logical column indices padded with ``-1`` and valid counts per row.
     """
     topk = int(topk)
+    out, lens_out = _check_logical_topk_args(
+        logits, row_starts, row_ends, topk=topk, out=out, lens_out=lens_out
+    )
+    if logits.shape[0] == 0:
+        return out, lens_out
+    return _dsa_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def gluon_dsa_row_bounded_logical_topk_gfx950(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor | None,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`gluon_dsa_logical_topk_gfx950` for rows whose ranges are far
+    narrower than ``logits``, such as KVP ranks' owned candidates in a
+    max-model-len-wide buffer.
+
+    One workgroup selects each row over its own range, so the cost follows
+    the rows' lengths, not the buffer's width; the width-planned kernels
+    scan the whole width (MI350X, 64 rows over 1M columns: 25 us at 6K-token
+    rows against 86 us, 78 against 99 at 128K). Past about 200K-token rows
+    the persistent kernel's split rows are faster.
+
+    Args and returns as :func:`gluon_dsa_logical_topk_gfx950`, except that
+    ``row_starts`` may be None: every row then starts at column 0, without
+    a launch filling zeros to say so.
+    """
+    topk = int(topk)
+    out, lens_out = _check_logical_topk_args(
+        logits,
+        row_ends if row_starts is None else row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+    rows, cols = logits.shape
+    if rows == 0:
+        return out, lens_out
+    if cols <= topk:
+        return _dsa_topk_indices(
+            logits,
+            torch.zeros_like(row_ends) if row_starts is None else row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+    return _dsa_oneblock_topk_indices(
+        logits,
+        # No block table outside decode; any int32 pointer stands in.
+        row_ends,
+        row_starts,
+        row_ends,
+        block_table_cols=0,
+        page_size=1,
+        topk=topk,
+        q_len_per_req=1,
+        is_decode=False,
+        plan=_oneblock_launch_plan(cols, is_decode=False),
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _check_logical_topk_args(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor | None,
+    lens_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     _check_topk_contract(topk)
     if logits.dim() != 2:
         raise ValueError(f"logits must be 2-D, got shape={tuple(logits.shape)}")
@@ -3365,17 +3454,7 @@ def gluon_dsa_logical_topk_gfx950(
             raise ValueError("lens_out must be on the same device as logits")
         if not lens_out.is_contiguous():
             raise ValueError("lens_out must be contiguous")
-
-    if rows == 0:
-        return out, lens_out
-    return _dsa_topk_indices(
-        logits,
-        row_starts,
-        row_ends,
-        topk=topk,
-        out=out,
-        lens_out=lens_out,
-    )
+    return out, lens_out
 
 
 def gluon_dsa_kpool_prefill_logits_gfx950(
@@ -4658,6 +4737,20 @@ def _fp8_rows_decode_splits(
     return min(splits, chunks)
 
 
+def _fp8_rows_decode_shape(
+    rows: int, heads: int, *, q_fp8: bool
+) -> tuple[int, int, int, int]:
+    """Warps over rows and over keys, key block and waves per EU of a
+    decode-row scorer launch with ``rows`` query rows per program."""
+    warps_m = min(rows, _BF16_DECODE_NUM_WARPS)
+    warps_n = _BF16_DECODE_NUM_WARPS // warps_m
+    block_n = max(_BF16_DECODE_BLOCK_N, 32 * warps_n)
+    waves_per_eu = 1 if rows * heads > 256 else 2
+    if q_fp8 and heads == 32 and rows <= 4:
+        waves_per_eu = _FP8_ROWS_DECODE_WAVES_PER_EU
+    return warps_m, warps_n, block_n, waves_per_eu
+
+
 def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -4711,15 +4804,12 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
         (q.shape[0], max_candidates), dtype=torch.float32, device=q.device
     )
     rows = _next_power_of_two(q_len_per_req)
-    warps_m = min(rows, _BF16_DECODE_NUM_WARPS)
-    warps_n = _BF16_DECODE_NUM_WARPS // warps_m
-    block_n = max(_BF16_DECODE_BLOCK_N, 32 * warps_n)
-    num_stages = _BF16_DECODE_NUM_STAGES
-    waves_per_eu = 1 if rows * q.shape[1] > 256 else 2
-    if q_scales is not None:
-        num_stages = _FP8_ROWS_DECODE_NUM_STAGES
-        if q.shape[1] == 32 and rows <= 4:
-            waves_per_eu = _FP8_ROWS_DECODE_WAVES_PER_EU
+    warps_m, warps_n, block_n, waves_per_eu = _fp8_rows_decode_shape(
+        rows, q.shape[1], q_fp8=q_scales is not None
+    )
+    num_stages = (
+        _BF16_DECODE_NUM_STAGES if q_scales is None else _FP8_ROWS_DECODE_NUM_STAGES
+    )
     chunks = triton.cdiv(max_candidates, _BF16_DECODE_CHUNK_N)
     grid = (
         seq_lens.numel(),

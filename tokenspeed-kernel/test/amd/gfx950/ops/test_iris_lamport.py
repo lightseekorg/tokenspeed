@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import ArchVersion, current_platform
-from utils import polling_cycles, votes_with_subgroup_mask
+from utils import assert_no_triton_compile, polling_cycles, votes_with_subgroup_mask
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_amd, reason="Iris requires AMD ROCm"
@@ -40,7 +40,8 @@ def _require_iris():
 
 
 @pytest.mark.parametrize("rank", range(8))
-def test_lamport_buffer_polling_codegen(rank, tmp_path):
+@pytest.mark.parametrize("fused_moe", (False, True))
+def test_lamport_buffer_polling_codegen(rank, fused_moe, tmp_path):
     """Cache flags alone do not prevent a future compiler from hoisting loads.
 
     Compile without launching and require all seven 16-byte peer reads to
@@ -52,26 +53,52 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
         iris_arch_policy,
         iris_lamport_allreduce,
     )
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.moe_reduce import (
+        iris_k3moe_lamport_allreduce_topk,
+    )
 
-    fn = iris_lamport_allreduce
-    signature = {
-        name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
+    constants = {
+        "RANK": rank,
+        "WORLD_SIZE": 8,
+        "MAX_ELEMENTS": 6 * 10752,
+        "NUM_STAGES": 3,
+        "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
+            ArchVersion(9, 5)
+        ).peer_signal_store,
     }
-    signature.update({name: "i64" for name in fn.arg_names[4:12]})
+    if fused_moe:
+        fn = iris_k3moe_lamport_allreduce_topk
+        signature = {
+            "partials_ptr": "*bf16",
+            "input_sym_ptr": "*bf16",
+            "region_sym_ptr": "*bf16",
+            "output_ptr": "*bf16",
+            "epochs": "*i32",
+            "regions": ("i64",) * 8,
+            "TOTAL_ELEMENTS": "i32",
+            "ROUTED_ELEMENTS": "i32",
+        }
+        constants.update(ROUTED_WIDTH=3584, TOPK=8)
+    else:
+        fn = iris_lamport_allreduce
+        signature = {
+            name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
+        }
+        signature.update({name: "i64" for name in fn.arg_names[4:12]})
+        signature["TOTAL_ELEMENTS"] = "i32"
+    attrs = {}
+    for index, name in enumerate(fn.arg_names):
+        if name == "regions":
+            attrs.update(
+                {(index, peer): [["tt.divisibility", 16]] for peer in range(8)}
+            )
+        elif name in signature and name not in ("TOTAL_ELEMENTS", "ROUTED_ELEMENTS"):
+            attrs[(index,)] = [["tt.divisibility", 16]]
     source = gluon._runtime.GluonASTSource(
         fn,
         signature,
-        constexprs={
-            "RANK": rank,
-            "WORLD_SIZE": 8,
-            "TOTAL_ELEMENTS": 6 * 10752,
-            "MAX_ELEMENTS": 6 * 10752,
-            "NUM_STAGES": 3,
-            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
-                ArchVersion(9, 5)
-            ).peer_signal_store,
-        },
-        attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
+        constexprs=constants,
+        attrs=attrs,
     )
     kernel = triton.compile(
         source,
@@ -314,6 +341,33 @@ def _check_lamport_state(rank, device):
             if use_lamport:
                 expected_epochs[: rows * 21] = (expected_epochs[: rows * 21] + 1) % 3
             torch.testing.assert_close(epochs, expected_epochs, atol=0, rtol=0)
+
+    # The fused top-k path must also reuse its binary as the payload grows.
+    # Its routed producer view is deliberately wrong: the partials replace it.
+    for rows in (1, 5, 7):
+        inputs = state.all_reduce.acquire_outputs(((rows, 3584), (rows, 7168)))
+        inputs[0].fill_(-313)
+        inputs[1].fill_(rank + 1)
+        partials = (
+            torch.arange(1, 9, dtype=torch.bfloat16, device=device)
+            .view(1, 8, 1)
+            .expand(rows, 8, 3584)
+            .contiguous()
+            * (rank + 1)
+        ).view(rows * 8, 3584)
+        if rows == 1:
+            outputs = state.reduce_moe(inputs, routed_partials=partials)
+        else:
+            with assert_no_triton_compile():
+                outputs = state.reduce_moe(inputs, routed_partials=partials)
+        torch.testing.assert_close(
+            outputs[0], torch.full_like(outputs[0], 36 * 36), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            outputs[1], torch.full_like(outputs[1], 36), atol=0, rtol=0
+        )
+        expected_epochs[: rows * 21] = (expected_epochs[: rows * 21] + 1) % 3
+        torch.testing.assert_close(epochs, expected_epochs, atol=0, rtol=0)
 
     # Capture every row count, then alternate Lamport and pull without host
     # synchronization between replays. Skipped tiles retain independent epochs.

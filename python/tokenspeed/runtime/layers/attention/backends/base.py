@@ -43,7 +43,7 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -99,18 +99,22 @@ class SparseTopKShare:
     verify window); each family stores its own record type. ``qsa_metadata``
     holds QSA's layer-invariant row geometry so it is built once per forward;
     ``qsa_selection`` retains its logical candidates alongside physical slots.
+    ``write_slots`` holds the KVP-local write slots the layers resolved from
+    the round's virtual write slots (``placement.resolve_write_slots``).
     """
 
     prefill: Any | None = None
     decode: Any | None = None
     qsa_metadata: Any | None = None
     qsa_selection: Any | None = None
+    write_slots: list = field(default_factory=list)
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
         self.qsa_metadata = None
         self.qsa_selection = None
+        self.write_slots = []
 
 
 class CachePoolBinding:
@@ -149,6 +153,20 @@ class CachePoolBinding:
 
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
         """Return logical-slot ownership, or None for local/replicated storage."""
+        return None
+
+    def takes_owned_decode_topk(self, layer: PagedAttention) -> bool:
+        """Whether ``layer``'s sparse decode takes this rank's share of the
+        top-k as local cache slots (``topk_owned``) instead of the whole
+        selection as scheduler slots."""
+        return False
+
+    def dcp_decode_query_rider(
+        self, layer: PagedAttention, q: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Bytes of ``q`` for an owned decode top-k's score gather to carry
+        to ``layer``'s sparse decode (``gathered_query``), or None where
+        that decode gathers its query itself."""
         return None
 
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:

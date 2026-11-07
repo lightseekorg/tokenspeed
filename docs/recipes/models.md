@@ -726,6 +726,12 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   `mla` backend select the kernels.
 - Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
   NVIDIA only.
+- Optionally, add `--kv-parallel-size 8 --decode-context-parallel-size 8` for
+  long contexts or many concurrent requests. Each GPU then stores one eighth of
+  every request's full-attention pages, so about 55 requests of 50K input and
+  500 output tokens run at once, and decode attends each GPU's share of the
+  selected keys. See
+  [KV parallelism](../serving/parallelism.md#kv-parallelism).
 - The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2

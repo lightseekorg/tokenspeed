@@ -176,6 +176,13 @@ INDEX_K_WORKSPACE_ROWS_FEATURE = "index_k_workspace_rows"
 # Leaves declaring this get `pages` planned once per forward and must not recompact.
 INDEX_CANDIDATE_PAGES_FEATURE = "index_candidate_pages"
 
+# Feature a ``dsa_index_candidates`` leaf declares when it takes the
+# ``scores_out`` keyword: it writes the scores there (a collective's send
+# buffer), -inf for every invalid candidate, and returns the positions as
+# their own contiguous matrix. For other leaves the facade copies both
+# instead.
+INDEX_CANDIDATE_SCORES_OUT_FEATURE = "index_candidate_scores_out"
+
 # Storage of an index-key plane, read off its dtype (README, "Index-K plane
 # formats"): one layout per dtype, never guessed from a row width alone.
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -726,6 +733,229 @@ def dsa_prefill(
         )
 
 
+def dsa_decode_dcp_records_supported(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether :func:`dsa_decode_dcp_records` serves a decode of this size.
+
+    Host values only, so every rank of a KVP group decides alike before the
+    query gather. The op has one leaf, gfx950's dense matrix core, which
+    writes a row's records itself or through its reduction over split keys:
+    other inputs, and other platforms, are refused.
+
+    Args:
+        tokens: Query rows.
+        heads: Gathered query heads, every rank's.
+        topk: Selected-slot width.
+        q_dtype: The query's dtype.
+        kv_dtype: The KV cache's dtype.
+        kv_lora_rank: MLA latent rank.
+        qk_rope_head_dim: RoPE q/k dimension.
+    """
+    if not current_platform().is_amd:
+        return False
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+        gluon_dsa_decode_dcp_records_supported_gfx950,
+    )
+
+    return gluon_dsa_decode_dcp_records_supported_gfx950(
+        tokens=tokens,
+        heads=heads,
+        topk=topk,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+
+
+def dsa_decode_dcp_records_workspace_bytes(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> int:
+    """Bytes of the ``workspace`` :func:`dsa_decode_dcp_records` writes for a
+    decode of this size, which :func:`dsa_decode_dcp_records_supported`
+    accepts: its key splits, the records first. Host values only; arguments
+    as for :func:`dsa_decode_dcp_records_supported`."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+        gluon_dsa_decode_dcp_records_workspace_bytes_gfx950,
+    )
+
+    return gluon_dsa_decode_dcp_records_workspace_bytes_gfx950(
+        tokens=tokens,
+        heads=heads,
+        topk=topk,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+
+
+def dsa_decode_dcp_records(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    solution: str | None = None,
+    *,
+    slot_order: str,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse DSA decode of KVP-gathered query heads, written as DCP records:
+    :func:`dsa_prefill_dcp_records` for decode.
+
+    Args:
+        q: As for :func:`dsa_prefill_dcp_records`; each rank's rows are read
+            in place when contiguous, however far apart the ranks lie, as a
+            query gathered inside a larger chunk.
+        q_len_per_req: Query rows per request.
+        workspace: Optional flat contiguous int32 storage of at least
+            :func:`dsa_decode_dcp_records_workspace_bytes` bytes for the key
+            splits, such as a buffer the records' exchange reads in place.
+        Others: As for :func:`dsa_prefill_dcp_records`; ``slot_order`` as
+            for :func:`dsa_decode`.
+
+    Returns:
+        The records ``dispatch_dcp_attention_partials`` packs from
+        ``dsa_decode(..., return_lse=True)`` on the token-major gather,
+        leading ``workspace`` when given. A row splits its keys by its own
+        live length and the launch's size, so a short one, as one near its
+        rank's share of the selection, may split less than that decode and
+        round differently; a row long enough for all its splits matches it
+        bit for bit. Raises ``ValueError`` for a size
+        :func:`dsa_decode_dcp_records_supported` refuses.
+    """
+    return _dsa_dcp_records(
+        "dsa_decode_dcp_records",
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=page_size,
+        logit_cap=logit_cap,
+        k_scale=k_scale,
+        solution=solution,
+        slot_order=slot_order,
+        traits={"q_len": int(q_len_per_req)},
+        launch={"workspace": workspace},
+    )
+
+
+def _dsa_dcp_records(
+    op: str,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    *,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    logit_cap: float,
+    k_scale: float,
+    solution: str | None,
+    slot_order: str,
+    traits: dict,
+    launch: dict,
+) -> torch.Tensor:
+    """The DCP records facades' selection and launch of ``op``, with its own
+    ``traits`` and leaf arguments (``launch``)."""
+    if q.dim() != 4:
+        raise ValueError(
+            f"{op} takes a rank-major query "
+            f"[ranks, tokens, local_heads, head_dim], got {tuple(q.shape)}"
+        )
+    degree, tokens, local_heads, head_dim = q.shape
+    if topk_slots.dim() != 2 or topk_slots.shape[0] != tokens:
+        raise ValueError(
+            f"DSA records selection {tuple(topk_slots.shape)} does not match "
+            f"{tokens} query rows"
+        )
+    if topk_lens.shape != (tokens,):
+        raise ValueError(
+            f"DSA records lengths {tuple(topk_lens.shape)} do not match "
+            f"{tokens} query rows"
+        )
+    traits = {
+        **traits,
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "page_size": int(page_size),
+        "topk": int(topk_slots.shape[-1]),
+        "logit_cap": logit_cap != 0.0,
+        "topk_layout": "global_slots",
+        "slot_order": slot_order,
+    }
+    kernel = select_kernel(
+        "attention",
+        op,
+        _attention_format_signature(q=q),
+        traits=traits,
+        solution=solution,
+    )
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
+    shape_params = {
+        "degree": degree,
+        "tokens": tokens,
+        "local_heads": local_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+    }
+    ShapeCapture.get().record("attention", op, kernel.name, q.dtype, shape_params)
+    with kernel_scope(
+        "attention",
+        op,
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            **launch,
+            **slot_order_kwargs,
+        )
+
+
 def dsa_prefill_dcp_records_supported(*, tokens: int, heads: int, topk: int) -> bool:
     """Whether :func:`dsa_prefill_dcp_records` serves a prefill of this size.
 
@@ -807,72 +1037,24 @@ def dsa_prefill_dcp_records(
         output with ``-inf`` LSE. Raises ``ValueError`` for a size
         :func:`dsa_prefill_dcp_records_supported` refuses.
     """
-    if q.dim() != 4:
-        raise ValueError(
-            "dsa_prefill_dcp_records takes a rank-major query "
-            f"[ranks, tokens, local_heads, head_dim], got {tuple(q.shape)}"
-        )
-    degree, tokens, local_heads, head_dim = q.shape
-    if topk_slots.dim() != 2 or topk_slots.shape[0] != tokens:
-        raise ValueError(
-            f"DSA records selection {tuple(topk_slots.shape)} does not match "
-            f"{tokens} query rows"
-        )
-    if topk_lens.shape != (tokens,):
-        raise ValueError(
-            f"DSA records lengths {tuple(topk_lens.shape)} do not match "
-            f"{tokens} query rows"
-        )
-    traits = {
-        "qk_nope_head_dim": int(qk_nope_head_dim),
-        "kv_lora_rank": int(kv_lora_rank),
-        "qk_rope_head_dim": int(qk_rope_head_dim),
-        "page_size": int(page_size),
-        "topk": int(topk_slots.shape[-1]),
-        "logit_cap": logit_cap != 0.0,
-        "topk_layout": "global_slots",
-        "slot_order": slot_order,
-    }
-    kernel = select_kernel(
-        "attention",
+    return _dsa_dcp_records(
         "dsa_prefill_dcp_records",
-        _attention_format_signature(q=q),
-        traits=traits,
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=page_size,
+        logit_cap=logit_cap,
+        k_scale=k_scale,
         solution=solution,
+        slot_order=slot_order,
+        traits={},
+        launch={},
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
-    shape_params = {
-        "degree": degree,
-        "tokens": tokens,
-        "local_heads": local_heads,
-        "head_dim": head_dim,
-        "topk": topk_slots.shape[-1],
-        "page_size": int(page_size),
-    }
-    ShapeCapture.get().record(
-        "attention", "dsa_prefill_dcp_records", kernel.name, q.dtype, shape_params
-    )
-    with kernel_scope(
-        "attention",
-        "dsa_prefill_dcp_records",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            kv_cache=kv_cache,
-            topk_slots=topk_slots,
-            topk_lens=topk_lens,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            page_size=page_size,
-            logit_cap=logit_cap,
-            k_scale=k_scale,
-            **slot_order_kwargs,
-        )
 
 
 @dataclass(frozen=True)
@@ -1102,6 +1284,9 @@ def dsa_index_candidates(
     local_tokens: int,
     solution: str | None,
     pages: DSAIndexCandidatePages | None = None,
+    q_scales: torch.Tensor | None = None,
+    query_group_size: int = 1,
+    scores_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score a query tile against owned Index-K pages and select local candidates.
 
@@ -1113,11 +1298,35 @@ def dsa_index_candidates(
     ``pages`` are this tile's rows of a :func:`plan_dsa_index_candidates`
     result for the same table, requests and causal lengths, at the table's
     width or planned narrower (its ``columns``).
+    ``scores_out`` (FP32 ``[rows, topk]`` with contiguous rows) receives the
+    scores, -inf for every invalid (-1) offset and NaN score, which are
+    returned as it, and the offsets come back as their own contiguous
+    matrix.
     The caller validates that topk is a positive power of two during setup.
     """
+    if scores_out is not None and (
+        scores_out.shape != (q.shape[0], topk)
+        or scores_out.dtype != torch.float32
+        or scores_out.stride(1) != 1
+    ):
+        raise ValueError("candidate scores need an FP32 [rows, topk] output")
     _check_index_candidate_inputs(
         q, weights, index_k_cache, local_page_table, query_requests, causal_lens
     )
+    if q_scales is not None:
+        if (
+            q.dtype != torch.float8_e4m3fn
+            or q_scales.dtype != torch.float32
+            or q_scales.shape != q.shape[:2]
+            or q_scales.device != q.device
+        ):
+            raise ValueError(
+                "FP8 candidate queries require matching FP32 per-head scales"
+            )
+    elif q.dtype == torch.float8_e4m3fn:
+        raise ValueError("FP8 candidate queries require explicit per-head scales")
+    if query_group_size < 1:
+        raise ValueError("candidate query group size must be positive")
     query_requests = query_requests.contiguous()
     causal_lens = causal_lens.contiguous()
     if initial_tokens < 0 or local_tokens < 0 or initial_tokens + local_tokens > topk:
@@ -1129,16 +1338,31 @@ def dsa_index_candidates(
     if not q.shape[0]:
         return (
             torch.empty((0, topk), device=q.device, dtype=torch.int32),
-            torch.empty((0, topk), device=q.device, dtype=torch.float32),
+            (
+                torch.empty((0, topk), device=q.device, dtype=torch.float32)
+                if scores_out is None
+                else scores_out
+            ),
         )
     kernel = _select_index_candidates_kernel(
         q, weights, index_k_cache, page_size=page_size, solution=solution
     )
     pages_kwargs = _index_candidate_pages_kwargs(kernel, pages)
+    query_kwargs = (
+        {"q_scales": q_scales, "query_group_size": query_group_size}
+        if q_scales is not None
+        else {}
+    )
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    writes_scores = (
+        scores_out is not None
+        and spec is not None
+        and INDEX_CANDIDATE_SCORES_OUT_FEATURE in spec.features
+    )
     with kernel_scope(
         "attention", "dsa_index_candidates", q.dtype, kernel_name=kernel.name
     ):
-        return kernel(
+        offsets, scores = kernel(
             q,
             weights,
             index_k_cache,
@@ -1151,7 +1375,18 @@ def dsa_index_candidates(
             initial_tokens=initial_tokens,
             local_tokens=local_tokens,
             **pages_kwargs,
+            **query_kwargs,
+            **({"scores_out": scores_out} if writes_scores else {}),
         )
+    if scores_out is None or writes_scores:
+        return offsets, scores
+    torch.where(
+        (offsets >= 0) & (scores == scores),
+        scores,
+        scores.new_full((), -float("inf")),
+        out=scores_out,
+    )
+    return offsets.contiguous(), scores_out
 
 
 def dsa_merge_candidates(
@@ -1186,6 +1421,98 @@ def dsa_merge_candidates(
         "attention", "dsa_merge_candidates", records.dtype, kernel_name=kernel.name
     ):
         return kernel(records, topk=topk)
+
+
+def dsa_select_owned_candidates_supported(
+    *, ranks: int, rows: int, topk: int, rank_stride: int
+) -> bool:
+    """Whether :func:`dsa_select_owned_candidates` serves gathered scores of
+    ``ranks`` ranks' ``rows`` rows of ``topk`` candidates, ``rank_stride``
+    elements apart.
+
+    Host values only, so every rank of a KVP group decides alike before the
+    scores are gathered. The op has one leaf, gfx950's one-launch selection:
+    other sizes, and other platforms, keep :func:`dsa_merge_candidates`.
+    """
+    if not current_platform().is_cdna4:
+        return False
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
+        gathered_owned_selection_supported,
+    )
+
+    return gathered_owned_selection_supported(
+        ranks=ranks, rows=rows, topk=topk, rank_stride=rank_stride
+    )
+
+
+def dsa_select_owned_candidates(
+    scores: torch.Tensor,
+    positions: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    *,
+    rank: int,
+    topk: int,
+    page_size: int,
+    solution: str | None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """This KVP rank's share of a global top-k, from every rank's gathered
+    candidate scores, as local cache slots.
+
+    The selection is :func:`dsa_merge_candidates`' over candidates with
+    these scores, restricted to this rank's candidates, whose positions only
+    this rank holds: a rank selects its own share of the same global top-k
+    the other ranks select theirs of, so no positions are exchanged.
+
+    Args:
+        scores: FP32 ``[ranks, rows, candidates]``, every rank's
+            ``dsa_index_candidates`` scores (invalid ones ``-inf``) in the
+            all-gather's rank-major layout, rows contiguous; the rank stride
+            may be wider.
+        positions: Int32 ``[rows, candidates]`` logical positions of this
+            rank's candidates, rows contiguous.
+        local_page_table: Int32 ``[requests, pages]`` local pages of this
+            rank (``-1`` where not owned), rows contiguous.
+        query_requests: Int32 ``[rows]`` request of every row.
+        rank: This rank's index in ``scores``.
+        topk: Entries selected per row over all ranks.
+        page_size: Tokens per page of ``local_page_table``.
+        solution: None selects the best supported kernel; a name forces one.
+        out: Optional contiguous int32 ``[rows, topk]`` output.
+        lens_out: Optional int32 ``[rows]`` output.
+
+    Returns:
+        Int32 ``[rows, topk]`` local slots of this rank's selected candidates
+        in candidate order, ``-1`` after, and int32 ``[rows]`` counts. Ties
+        at the k-th score go to the ranks in order, and within a rank in
+        candidate order, so the ranks' shares partition one selection.
+    """
+    kernel = select_kernel(
+        "attention",
+        "dsa_select_owned_candidates",
+        _attention_format_signature(scores=scores),
+        traits={"topk": topk},
+        solution=solution,
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_select_owned_candidates",
+        scores.dtype,
+        kernel_name=kernel.name,
+    ):
+        return kernel(
+            scores,
+            positions,
+            local_page_table,
+            query_requests,
+            rank=rank,
+            topk=topk,
+            page_size=page_size,
+            out=out,
+            lens_out=lens_out,
+        )
 
 
 def plan_dsa_topk(
@@ -1801,12 +2128,16 @@ if current_platform().is_npu:
 __all__ = [
     "CANDIDATE_LENS_CPU_FEATURE",
     "INDEX_CANDIDATE_PAGES_FEATURE",
+    "INDEX_CANDIDATE_SCORES_OUT_FEATURE",
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
     "SLOT_ORDERS",
     "DSAIndexCandidatePages",
     "DSAResources",
     "prepare_dsa_resources",
     "dsa_decode",
+    "dsa_decode_dcp_records",
+    "dsa_decode_dcp_records_supported",
+    "dsa_decode_dcp_records_workspace_bytes",
     "dsa_index_candidates_accepts_pages",
     "dsa_interleave_rope",
     "dsa_prefill",

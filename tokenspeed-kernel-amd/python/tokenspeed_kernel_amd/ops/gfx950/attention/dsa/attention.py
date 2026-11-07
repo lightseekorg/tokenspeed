@@ -23,12 +23,16 @@
 from __future__ import annotations
 
 import functools
+import math
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
 
 __all__ = [
+    "gluon_dsa_decode_dcp_records_supported_gfx950",
+    "gluon_dsa_decode_dcp_records_workspace_bytes_gfx950",
+    "launch_gluon_dsa_decode_dcp_records_gfx950",
     "launch_gluon_dsa_decode_gfx950",
     "launch_gluon_dsa_prefill_gfx950",
 ]
@@ -289,15 +293,26 @@ def _dsa_store_output(
     num_heads,
     output_layout: gl.constexpr,
     BLOCK_H: gl.constexpr,
+    stride_o_r,
+    LOCAL_HEADS: gl.constexpr,
 ):
-    """Normalize and store four output phases, keeping empty rows exactly zero."""
+    """Normalize and store four output phases, keeping empty rows exactly zero.
+    With ``LOCAL_HEADS`` head ``r * LOCAL_HEADS + h`` lands at rank ``r``'s
+    local head ``h``, as DCP records hold them."""
 
     l_i_out = gl.convert_layout(l_i, gl.SliceLayout(1, output_layout))
     safe_l_i = gl.where(l_i_out > 0.0, l_i_out, 1.0)
     valid = l_i_out[:, None] > 0.0
     offs_h = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, output_layout))
     offs_v = gl.arange(0, 128, layout=gl.SliceLayout(0, output_layout))
-    o_row = o_base + offs_h[:, None].to(tl.int64) * stride_o_h
+    if LOCAL_HEADS:
+        o_row = (
+            o_base
+            + (offs_h // LOCAL_HEADS)[:, None].to(tl.int64) * stride_o_r
+            + (offs_h % LOCAL_HEADS)[:, None].to(tl.int64) * stride_o_h
+        )
+    else:
+        o_row = o_base + offs_h[:, None].to(tl.int64) * stride_o_h
     mask = (offs_h < num_heads)[:, None]
     acc0 = gl.where(valid, acc0 / safe_l_i[:, None], 0.0)
     acc1 = gl.where(valid, acc1 / safe_l_i[:, None], 0.0)
@@ -336,6 +351,9 @@ def _dsa_store_output(
         "stride_lse_h",
         "stride_lse_s",
         "num_kv_splits",
+        "stride_o_r",
+        "stride_lse_r",
+        "split_tiles",
     )
 )
 def _dsa_dense_mfma_kv_kernel(
@@ -347,6 +365,11 @@ def _dsa_dense_mfma_kv_kernel(
     partial_lse,
     stride_q_t: tl.int64,
     stride_q_h: tl.int64,
+    # Head r * Q_LOCAL_HEADS + h of a rank-major query is at q[r, token, h];
+    # a token-major query has Q_LOCAL_HEADS 0 and no rank stride. The query
+    # strides stay specialized: the direct-to-LDS copy needs their 16-element
+    # alignment, which every token count shares.
+    stride_q_r: tl.int64,
     stride_kv_t: tl.int64,
     stride_o_t: tl.int64,
     stride_o_h: tl.int64,
@@ -358,6 +381,14 @@ def _dsa_dense_mfma_kv_kernel(
     scale: tl.float32,
     num_heads: tl.int32,
     num_kv_splits: tl.int32,
+    # A rank-major query writes DCP records: every split's output and LSE
+    # land rank-major (these rank strides) in a record-shaped workspace whose
+    # split 0 is the records, and a row splits only into as many parts as
+    # its live tiles fill split_tiles each (at most num_kv_splits). A row of
+    # one split stores its record itself; the reduction merges the rest.
+    stride_o_r: tl.int64,
+    stride_lse_r: tl.int64,
+    split_tiles: tl.int32,
     TOPK: gl.constexpr,
     BLOCK_H: gl.constexpr,
     TILE_K: gl.constexpr,
@@ -368,6 +399,8 @@ def _dsa_dense_mfma_kv_kernel(
     NATIVE_FP8: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
     SPLIT_KV: gl.constexpr,
+    STORE_LSE: gl.constexpr,
+    Q_LOCAL_HEADS: gl.constexpr,
 ):
     # CDNA4 exposes the FP8 MFMA at K=32. Keeping FP8 operands native halves
     # the score/value instruction count and avoids per-tile BF16 expansion.
@@ -515,6 +548,28 @@ def _dsa_dense_mfma_kv_kernel(
         split_idx: gl.constexpr = 0
     hg_offset = hg_idx * BLOCK_H
     valid_len = gl.load(topk_lens + token_idx).to(tl.int32)
+    total_tiles = gl.cdiv(
+        gl.minimum(gl.maximum(valid_len, 0), TOPK),
+        TILE_K,
+    )
+    if SPLIT_KV:
+        if Q_LOCAL_HEADS:
+            row_splits = gl.minimum(
+                num_kv_splits, gl.maximum(gl.cdiv(total_tiles, split_tiles), 1)
+            )
+            # Before the query's copy to LDS: nothing may be in flight.
+            if split_idx >= row_splits:
+                return
+        else:
+            row_splits = num_kv_splits
+        tile_start = (split_idx * total_tiles) // row_splits
+        tile_end = ((split_idx + 1) * total_tiles) // row_splits
+        split_has_tiles = tile_start < tile_end
+        num_tiles = gl.maximum(tile_end - tile_start, 1)
+    else:
+        tile_start: gl.constexpr = 0
+        split_has_tiles: gl.constexpr = True
+        num_tiles = gl.maximum(total_tiles, 1)
 
     offs_h_qlora = hg_offset + gl.arange(
         0,
@@ -524,11 +579,17 @@ def _dsa_dense_mfma_kv_kernel(
     offs_v_qlora = gl.arange(0, D_V, layout=gl.SliceLayout(0, blk_qlora))
     mask_h_qlora = offs_h_qlora < num_heads
     q_base = token_idx.to(tl.int64) * stride_q_t
-    q_offs_lora = (
-        q_base
-        + offs_h_qlora[:, None].to(tl.int64) * stride_q_h
-        + offs_v_qlora[None, :].to(tl.int64)
-    )
+    if Q_LOCAL_HEADS:
+        q_rows_lora = (offs_h_qlora // Q_LOCAL_HEADS).to(tl.int64) * stride_q_r + (
+            offs_h_qlora % Q_LOCAL_HEADS
+        ).to(tl.int64) * stride_q_h
+        q_offs_lora = q_base + q_rows_lora[:, None] + offs_v_qlora[None, :].to(tl.int64)
+    else:
+        q_offs_lora = (
+            q_base
+            + offs_h_qlora[:, None].to(tl.int64) * stride_q_h
+            + offs_v_qlora[None, :].to(tl.int64)
+        )
 
     offs_h_qrope = hg_offset + gl.arange(
         0,
@@ -537,11 +598,19 @@ def _dsa_dense_mfma_kv_kernel(
     )
     offs_r_qrope = gl.arange(0, D_ROPE, layout=gl.SliceLayout(0, blk_qrope))
     mask_h_qrope = (offs_h_qrope < num_heads) & HAS_ROPE
-    q_offs_rope = (
-        q_base
-        + offs_h_qrope[:, None].to(tl.int64) * stride_q_h
-        + (D_V + offs_r_qrope[None, :]).to(tl.int64)
-    )
+    if Q_LOCAL_HEADS:
+        q_rows_rope = (offs_h_qrope // Q_LOCAL_HEADS).to(tl.int64) * stride_q_r + (
+            offs_h_qrope % Q_LOCAL_HEADS
+        ).to(tl.int64) * stride_q_h
+        q_offs_rope = (
+            q_base + q_rows_rope[:, None] + (D_V + offs_r_qrope[None, :]).to(tl.int64)
+        )
+    else:
+        q_offs_rope = (
+            q_base
+            + offs_h_qrope[:, None].to(tl.int64) * stride_q_h
+            + (D_V + offs_r_qrope[None, :]).to(tl.int64)
+        )
 
     smem_dtype: gl.constexpr = (
         gl.float8e5 if NATIVE_E5M2 else gl.float8e4nv if NATIVE_FP8 else gl.bfloat16
@@ -587,19 +656,6 @@ def _dsa_dense_mfma_kv_kernel(
             )
         gl.amd.cdna4.async_copy.commit_group()
 
-    total_tiles = gl.cdiv(
-        gl.minimum(gl.maximum(valid_len, 0), TOPK),
-        TILE_K,
-    )
-    if SPLIT_KV:
-        tile_start = (split_idx * total_tiles) // num_kv_splits
-        tile_end = ((split_idx + 1) * total_tiles) // num_kv_splits
-        split_has_tiles = tile_start < tile_end
-        num_tiles = gl.maximum(tile_end - tile_start, 1)
-    else:
-        tile_start: gl.constexpr = 0
-        split_has_tiles: gl.constexpr = True
-        num_tiles = gl.maximum(total_tiles, 1)
     topk_base = token_idx.to(tl.int64) * stride_topk_t
 
     first_tile_base = tile_start * TILE_K
@@ -937,17 +993,27 @@ def _dsa_dense_mfma_kv_kernel(
         num_heads,
         blk_out_phase,
         BLOCK_H,
+        stride_o_r,
+        Q_LOCAL_HEADS,
     )
-    if SPLIT_KV:
+    if SPLIT_KV or STORE_LSE:
         lse = gl.where(l_new > 0.0, m_new + gl.log(l_new), -float("inf"))
         lse = gl.convert_layout(lse, gl.SliceLayout(1, mfma_s))
         offs_h_lse = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_s))
         mask_h_lse = offs_h_lse < num_heads
-        lse_offsets = (
-            token_idx.to(tl.int64) * stride_lse_t
-            + offs_h_lse.to(tl.int64) * stride_lse_h
-            + split_idx.to(tl.int64) * stride_lse_s
-        )
+        if Q_LOCAL_HEADS:
+            lse_offsets = (
+                token_idx.to(tl.int64) * stride_lse_t
+                + (offs_h_lse // Q_LOCAL_HEADS).to(tl.int64) * stride_lse_r
+                + (offs_h_lse % Q_LOCAL_HEADS).to(tl.int64) * stride_lse_h
+            )
+        else:
+            lse_offsets = (
+                token_idx.to(tl.int64) * stride_lse_t
+                + offs_h_lse.to(tl.int64) * stride_lse_h
+            )
+        if SPLIT_KV:
+            lse_offsets += split_idx.to(tl.int64) * stride_lse_s
         gl.amd.cdna4.buffer_store(
             stored_value=lse,
             ptr=partial_lse,
@@ -1000,6 +1066,7 @@ def _dsa_sparse_prefill_fp8_kernel(
     D_ROPE: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
     SPLIT_KV: gl.constexpr,
+    STORE_LSE: gl.constexpr,
 ):
     """Native-FP8 sparse MLA for prefill rows, one key tile at a time.
 
@@ -1260,16 +1327,19 @@ def _dsa_sparse_prefill_fp8_kernel(
         num_heads,
         blk_out_phase,
         BLOCK_H,
+        0,
+        0,
     )
-    if SPLIT_KV:
+    if SPLIT_KV or STORE_LSE:
         lse = gl.where(l_i > 0.0, m_i + gl.log(l_i), -float("inf"))
         lse = gl.convert_layout(lse, gl.SliceLayout(1, mfma_s))
         offs_h_lse = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_s))
         lse_offsets = (
             token_idx.to(tl.int64) * stride_lse_t
             + offs_h_lse.to(tl.int64) * stride_lse_h
-            + split_idx.to(tl.int64) * stride_lse_s
         )
+        if SPLIT_KV:
+            lse_offsets += split_idx.to(tl.int64) * stride_lse_s
         gl.amd.cdna4.buffer_store(
             stored_value=lse,
             ptr=partial_lse,
@@ -1282,6 +1352,8 @@ def _dsa_sparse_prefill_fp8_kernel(
     do_not_specialize=(
         "stride_lse_t",
         "stride_lse_h",
+        "stride_lo_t",
+        "stride_lo_h",
         "num_kv_splits",
     )
 )
@@ -1289,6 +1361,7 @@ def _dsa_dense_mfma_reduce_kernel(
     partial_out,
     partial_lse,
     out,
+    lse_out,
     stride_po_t,
     stride_po_h,
     stride_po_s,
@@ -1297,9 +1370,12 @@ def _dsa_dense_mfma_reduce_kernel(
     stride_lse_s,
     stride_o_t,
     stride_o_h,
+    stride_lo_t,
+    stride_lo_h,
     num_kv_splits,
     D_V: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
+    STORE_LSE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -1340,6 +1416,110 @@ def _dsa_dense_mfma_reduce_kernel(
     safe_denom = tl.where(denom > 0.0, denom, 1.0)
     result = tl.where(denom > 0.0, acc / safe_denom, 0.0)
     tl.store(out + token_idx * stride_o_t + head_idx * stride_o_h + offs_v, result)
+    if STORE_LSE:
+        tl.store(
+            lse_out + token_idx * stride_lo_t + head_idx * stride_lo_h,
+            tl.where(denom > 0.0, safe_max_lse + tl.log(safe_denom), -float("inf")),
+        )
+
+
+@triton.jit(
+    do_not_specialize=(
+        "stride_s",
+        "stride_r",
+        "stride_t",
+        "stride_h",
+        "stride_lse_s",
+        "stride_lse_r",
+        "stride_lse_t",
+        "stride_lse_h",
+        "num_kv_splits",
+        "topk_width",
+        "tile_k",
+        "split_tiles",
+    )
+)
+def _dsa_dense_mfma_records_reduce_kernel(
+    records,
+    records_lse,
+    topk_lens,
+    # Split s of head r * LOCAL_HEADS + h sits at records[s, r, token, h]
+    # (its LSE likewise); split 0 is the record, which the merge overwrites.
+    stride_s,
+    stride_r,
+    stride_t,
+    stride_h,
+    stride_lse_s,
+    stride_lse_r,
+    stride_lse_t,
+    stride_lse_h,
+    num_heads,
+    # A row ran as many splits as its live tiles fill split_tiles each, at
+    # most num_kv_splits; the core stored a one-split row's record itself.
+    num_kv_splits,
+    topk_width,
+    tile_k,
+    split_tiles,
+    LOCAL_HEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_V: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    valid_len = tl.load(topk_lens + token_idx).to(tl.int32)
+    total_tiles = tl.cdiv(tl.minimum(tl.maximum(valid_len, 0), topk_width), tile_k)
+    row_splits = tl.minimum(
+        num_kv_splits, tl.maximum(tl.cdiv(total_tiles, split_tiles), 1)
+    )
+    if row_splits == 1:
+        return
+    offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < num_heads
+    rank = offs_h // LOCAL_HEADS
+    head = offs_h % LOCAL_HEADS
+    base = rank * stride_r + token_idx * stride_t + head * stride_h
+    lse_base = rank * stride_lse_r + token_idx * stride_lse_t + head * stride_lse_h
+    offs_v = tl.arange(0, D_V)
+
+    max_lse = tl.full([BLOCK_H], -float("inf"), dtype=tl.float32)
+    for split_idx in range(row_splits):
+        split_lse = tl.load(
+            records_lse + lse_base + split_idx * stride_lse_s,
+            mask=mask_h,
+            other=-float("inf"),
+        )
+        max_lse = tl.maximum(max_lse, split_lse)
+
+    denom = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, D_V], dtype=tl.float32)
+    safe_max_lse = tl.where(max_lse > -float("inf"), max_lse, 0.0)
+    for split_idx in range(row_splits):
+        split_lse = tl.load(
+            records_lse + lse_base + split_idx * stride_lse_s,
+            mask=mask_h,
+            other=-float("inf"),
+        )
+        split_valid = split_lse > -float("inf")
+        safe_split_lse = tl.where(split_valid, split_lse, 0.0)
+        weight = tl.where(split_valid, tl.exp(safe_split_lse - safe_max_lse), 0.0)
+        partial = tl.load(
+            records + base[:, None] + split_idx * stride_s + offs_v[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc += weight[:, None] * partial
+        denom += weight
+
+    safe_denom = tl.where(denom > 0.0, denom, 1.0)
+    result = tl.where(denom[:, None] > 0.0, acc / safe_denom[:, None], 0.0)
+    # The merge overwrites split 0 in place, and every warp reads its LSE: no
+    # warp may store before all have loaded.
+    tl.debug_barrier()
+    tl.store(records + base[:, None] + offs_v[None, :], result, mask=mask_h[:, None])
+    tl.store(
+        records_lse + lse_base,
+        tl.where(denom > 0.0, safe_max_lse + tl.log(safe_denom), -float("inf")),
+        mask=mask_h,
+    )
 
 
 @gluon.jit
@@ -1349,6 +1529,7 @@ def _dsa_dense_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    lse,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
     kv_lora_rank: gl.constexpr,
@@ -1358,6 +1539,7 @@ def _dsa_dense_kv_kernel(
     softmax_scale: gl.constexpr,
     BLOCK_TOPK: gl.constexpr,
     BLOCK_V: gl.constexpr,
+    STORE_LSE: gl.constexpr,
 ):
     token = gl.program_id(0)
     head = gl.program_id(1)
@@ -1435,6 +1617,10 @@ def _dsa_dense_kv_kernel(
     result = gl.where(denom > 0.0, result, 0.0)
     out_base = (token * num_heads + head) * kv_lora_rank
     gl.store(out + out_base + v_offsets, result, mask=v_mask)
+    if STORE_LSE:
+        if v_block == 0:
+            row_lse = gl.where(denom > 0.0, max_score + gl.log(denom), -float("inf"))
+            gl.store(lse + token * num_heads + head, row_lse)
 
 
 @gluon.jit
@@ -1446,6 +1632,7 @@ def _dsa_packed_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    lse,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
     kv_lora_rank: gl.constexpr,
@@ -1455,6 +1642,7 @@ def _dsa_packed_kv_kernel(
     softmax_scale: gl.constexpr,
     BLOCK_TOPK: gl.constexpr,
     BLOCK_V: gl.constexpr,
+    STORE_LSE: gl.constexpr,
 ):
     token = gl.program_id(0)
     head = gl.program_id(1)
@@ -1547,6 +1735,10 @@ def _dsa_packed_kv_kernel(
     result = gl.where(denom > 0.0, result, 0.0)
     out_base = (token * num_heads + head) * kv_lora_rank
     gl.store(out + out_base + v_offsets, result, mask=v_mask)
+    if STORE_LSE:
+        if v_block == 0:
+            row_lse = gl.where(denom > 0.0, max_score + gl.log(denom), -float("inf"))
+            gl.store(lse + token * num_heads + head, row_lse)
 
 
 def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
@@ -1686,6 +1878,40 @@ def _select_num_kv_splits(
     )
 
 
+# Each split of a KVP decode's records row runs at least this many of its live
+# key tiles. A rank owns about an eighth of each row's top-k, which the
+# launch's split count, sized for full rows, would spread a tile or less per
+# split.
+_RECORDS_MIN_SPLIT_TILES = 2
+# Heads one program of the records reduction merges: few enough that a small
+# launch's split rows spread over the CUs, enough that a large launch of
+# one-split rows exits in few programs.
+_RECORDS_REDUCE_HEADS = 2
+
+
+def _records_split_tiles(
+    *, tokens: int, heads: int, ranks: int, topk: int, tile_k: int, num_kv_splits: int
+) -> int:
+    """Live key tiles per split of a KVP decode's records rows.
+
+    A row of a rank's typical share (``topk / ranks`` keys) splits only while
+    the launch's rows and head groups fill under three quarters of the CUs,
+    into as many parts as reach that; longer rows split proportionally more,
+    and a full-width row into all ``num_kv_splits``. Splitting a launch that
+    already fills the CUs only adds the reduction: on MI350X, 32 to 64 rows
+    of 96 heads and 256 keys take 20-25 us unsplit against 29-37 us in two
+    splits.
+    """
+    typical_tiles = triton.cdiv(triton.cdiv(topk, ranks), tile_k)
+    base_ctas = tokens * triton.cdiv(heads, 16)
+    splits = max(1, _GFX950_COMPUTE_UNITS * 3 // 4 // base_ctas)
+    full_row = triton.cdiv(topk, tile_k) // num_kv_splits
+    return max(
+        _RECORDS_MIN_SPLIT_TILES,
+        min(triton.cdiv(typical_tiles, splits), full_row),
+    )
+
+
 def _trim_topk_slots_for_context(
     topk_slots: torch.Tensor,
     max_seqlen_k: int,
@@ -1731,10 +1957,12 @@ def _run_dense_kv(
     is_prefill: bool,
     out: torch.Tensor | None = None,
     warm_split_variants: bool = False,
+    lse: torch.Tensor | None,
 ) -> torch.Tensor:
+    tokens, heads = q.shape[0], q.shape[1]
     if out is None:
         out = torch.empty(
-            (q.shape[0], q.shape[1], kv_lora_rank),
+            (tokens, heads, kv_lora_rank),
             dtype=_output_dtype(q),
             device=q.device,
         )
@@ -1744,7 +1972,7 @@ def _run_dense_kv(
     # kernel. This keeps graph replay on one compiled object when those
     # runtime lengths change.
     schedule = dict(
-        num_heads=q.shape[1],
+        num_heads=heads,
         topk_width=topk_slots.shape[1],
         max_seqlen_k=int(topk_slots.shape[1]),
         is_fp8=q.dtype in _FP8_DTYPES,
@@ -1759,9 +1987,9 @@ def _run_dense_kv(
         qk_rope_head_dim=qk_rope_head_dim,
         is_prefill=is_prefill,
     )
-    if warm_split_variants and q.shape[0] > 0:
+    if warm_split_variants and tokens > 0:
         # One row per reduce bucket compiles every split variant serving can reach.
-        for num_kv_splits in _warmup_split_counts(q.shape[0], **schedule):
+        for num_kv_splits in _warmup_split_counts(tokens, **schedule):
             launch(
                 q[:1],
                 kv_cache,
@@ -1769,16 +1997,21 @@ def _run_dense_kv(
                 topk_lens[:1],
                 out[:1],
                 num_kv_splits=num_kv_splits,
+                lse=None if lse is None else lse[:1],
+                records=False,
+                workspace=None,
             )
-    launch(
+    return launch(
         q,
         kv_cache,
         topk_slots,
         topk_lens,
         out,
-        num_kv_splits=_select_num_kv_splits(num_tokens=q.shape[0], **schedule),
+        num_kv_splits=_select_num_kv_splits(num_tokens=tokens, **schedule),
+        lse=lse,
+        records=False,
+        workspace=None,
     )
-    return out
 
 
 @functools.cache
@@ -1797,32 +2030,76 @@ def _launch_dense_kv(
     kv_cache: torch.Tensor,
     topk_slots: torch.Tensor,
     topk_lens: torch.Tensor,
-    out: torch.Tensor,
+    out: torch.Tensor | None,
     *,
     num_kv_splits: int,
     softmax_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     is_prefill: bool,
-) -> None:
+    lse: torch.Tensor | None,
+    records: bool,
+    workspace: torch.Tensor | None,
+) -> torch.Tensor:
+    """``q`` is ``[tokens, heads, dim]``; with ``records`` it is a KVP
+    gather's rank-major ``[ranks, tokens, local_heads, dim]``, and each head's
+    output and LSE land in its DCP record (int32 ``[ranks, tokens,
+    local_heads, kv_lora_rank / 2 + 1]``, returned) instead of ``out`` and
+    ``lse``. The records then lead ``workspace`` (flat int32) when given."""
+    if not records:
+        tokens, heads = q.shape[0], q.shape[1]
+        stride_q_r, stride_q_t, stride_q_h = 0, q.stride(0), q.stride(1)
+    else:
+        ranks, tokens, q_local_heads = q.shape[:3]
+        heads = ranks * q_local_heads
+        stride_q_r, stride_q_t, stride_q_h = q.stride()[:3]
     # Direct-to-shared copies preserve the source bits. Mixed inputs must
     # convert to the common BF16 compute format before their shared store.
     convert_inputs = q.dtype != kv_cache.dtype
     native_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
-    if num_kv_splits == 1:
+    tile_k = 64 if qk_rope_head_dim == 0 else 32
+    split_tiles = 1
+    stride_o_r = stride_lse_r = 0
+    if records:
+        split_tiles = _records_split_tiles(
+            tokens=tokens,
+            heads=heads,
+            ranks=ranks,
+            topk=topk_slots.shape[1],
+            tile_k=tile_k,
+            num_kv_splits=num_kv_splits,
+        )
+        # One record-shaped plane per split; split 0 is the records, which a
+        # one-split row writes directly and the reduction overwrites.
+        planes = (num_kv_splits, ranks, tokens, q_local_heads, kv_lora_rank // 2 + 1)
+        if workspace is None:
+            workspace = torch.empty(planes, dtype=torch.int32, device=q.device)
+        else:
+            workspace = workspace[: math.prod(planes)].view(planes)
+        # A record is the head's output bits, then its LSE word.
+        stage_out = workspace.view(_output_dtype(q))
+        partial_lse = workspace.view(torch.float32)[..., -1]
+        stride_o_s, stride_o_r, stride_o_t, stride_o_h = stage_out.stride()[:4]
+        stride_lse_s, stride_lse_r, stride_lse_t, stride_lse_h = partial_lse.stride()
+    elif num_kv_splits == 1:
         stage_out = out
-        partial_lse = out
         stride_o_t, stride_o_h = out.stride(0), out.stride(1)
         stride_o_s = 0
-        stride_lse_t = stride_lse_h = stride_lse_s = 0
+        if lse is None:
+            partial_lse = out
+            stride_lse_t = stride_lse_h = stride_lse_s = 0
+        else:
+            partial_lse = lse
+            stride_lse_t, stride_lse_h = lse.stride()
+            stride_lse_s = 0
     else:
         stage_out = torch.empty(
-            (q.shape[0], q.shape[1], num_kv_splits, kv_lora_rank),
-            dtype=out.dtype,
+            (tokens, heads, num_kv_splits, kv_lora_rank),
+            dtype=_output_dtype(q),
             device=q.device,
         )
         partial_lse = torch.empty(
-            (q.shape[0], q.shape[1], num_kv_splits),
+            (tokens, heads, num_kv_splits),
             dtype=torch.float32,
             device=q.device,
         )
@@ -1831,20 +2108,13 @@ def _launch_dense_kv(
 
     def grid(meta):
         return (
-            q.shape[0],
-            triton.cdiv(q.shape[1], meta["BLOCK_H"]),
+            tokens,
+            triton.cdiv(heads, meta["BLOCK_H"]),
             num_kv_splits,
         )
 
-    args = (
-        q,
-        kv_cache,
-        topk_slots,
-        topk_lens,
-        stage_out,
-        partial_lse,
-        q.stride(0),
-        q.stride(1),
+    buffers = (q, kv_cache, topk_slots, topk_lens, stage_out, partial_lse)
+    scalars = (
         kv_cache.stride(0),
         stride_o_t,
         stride_o_h,
@@ -1854,26 +2124,39 @@ def _launch_dense_kv(
         stride_lse_s,
         topk_slots.stride(0),
         float(softmax_scale),
-        q.shape[1],
+        heads,
         num_kv_splits,
-        topk_slots.shape[1],
     )
-    if is_prefill and native_fp8 and qk_rope_head_dim == 64:
+    store_lse = (lse is not None or records) and num_kv_splits == 1
+    if is_prefill and native_fp8 and qk_rope_head_dim == 64 and not records:
         _dsa_sparse_prefill_fp8_kernel[grid](
-            *args,
+            *buffers,
+            stride_q_t,
+            stride_q_h,
+            *scalars,
+            TOPK=topk_slots.shape[1],
             BLOCK_H=16,
             TILE_K=64,
             D_V=kv_lora_rank,
             D_ROPE=qk_rope_head_dim,
             NATIVE_E5M2=q.dtype == torch.float8_e5m2,
             SPLIT_KV=num_kv_splits > 1,
+            STORE_LSE=store_lse,
             num_warps=4,
             # Four CTAs per CU: their LDS fits, and 128 VGPRs hold the loop.
             waves_per_eu=4,
         )
     else:
         _dsa_dense_mfma_kv_kernel[grid](
-            *args,
+            *buffers,
+            stride_q_t,
+            stride_q_h,
+            stride_q_r,
+            *scalars,
+            stride_o_r,
+            stride_lse_r,
+            split_tiles,
+            TOPK=topk_slots.shape[1],
             D_V=kv_lora_rank,
             # MFMA-legal shape for no-RoPE models; HAS_ROPE=False removes all RoPE work.
             D_ROPE=max(qk_rope_head_dim, 64),
@@ -1884,17 +2167,47 @@ def _launch_dense_kv(
                 q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
             ),
             SPLIT_KV=num_kv_splits > 1,
+            STORE_LSE=store_lse,
+            # A model's heads per rank: one more binary for the records.
+            Q_LOCAL_HEADS=q_local_heads if records else 0,
             BLOCK_H=16,
-            TILE_K=64 if qk_rope_head_dim == 0 else 32,
+            TILE_K=tile_k,
             num_warps=4,
             # Unbounded SLP splits the in-loop KV prefetch around an LDS wait.
             llvm_cl_opts="slp-schedule-budget=100",
         )
-    if num_kv_splits > 1:
-        _dsa_dense_mfma_reduce_kernel[(q.shape[0], q.shape[1])](
+    if num_kv_splits > 1 and records:
+        # The splits merge into their split 0, the records.
+        _dsa_dense_mfma_records_reduce_kernel[
+            (tokens, triton.cdiv(heads, _RECORDS_REDUCE_HEADS))
+        ](
+            stage_out,
+            partial_lse,
+            topk_lens,
+            stride_o_s,
+            stride_o_r,
+            stride_o_t,
+            stride_o_h,
+            stride_lse_s,
+            stride_lse_r,
+            stride_lse_t,
+            stride_lse_h,
+            heads,
+            num_kv_splits,
+            topk_slots.shape[1],
+            tile_k,
+            split_tiles,
+            LOCAL_HEADS=q_local_heads,
+            BLOCK_H=_RECORDS_REDUCE_HEADS,
+            D_V=kv_lora_rank,
+            num_warps=4,
+        )
+    elif num_kv_splits > 1:
+        _dsa_dense_mfma_reduce_kernel[(tokens, heads)](
             stage_out,
             partial_lse,
             out,
+            out if lse is None else lse,
             stage_out.stride(0),
             stage_out.stride(1),
             stage_out.stride(2),
@@ -1903,11 +2216,15 @@ def _launch_dense_kv(
             partial_lse.stride(2),
             out.stride(0),
             out.stride(1),
+            0 if lse is None else lse.stride(0),
+            0 if lse is None else lse.stride(1),
             num_kv_splits,
             D_V=kv_lora_rank,
             MAX_SPLITS=triton.next_power_of_2(num_kv_splits),
+            STORE_LSE=lse is not None,
             num_warps=4,
         )
+    return workspace[0] if records else out
 
 
 def _run_dense_kv_scalar(
@@ -1919,6 +2236,7 @@ def _run_dense_kv_scalar(
     softmax_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    lse: torch.Tensor | None,
 ) -> torch.Tensor:
     kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
     out = torch.empty(
@@ -1932,6 +2250,7 @@ def _run_dense_kv_scalar(
         topk_slots,
         topk_lens,
         out,
+        out if lse is None else lse,
         q.shape[1],
         q.shape[2],
         kv_lora_rank,
@@ -1941,6 +2260,7 @@ def _run_dense_kv_scalar(
         float(softmax_scale),
         BLOCK_TOPK=32,
         BLOCK_V=64,
+        STORE_LSE=lse is not None,
         num_warps=4,
     )
     return out
@@ -1955,6 +2275,7 @@ def _run_packed_kv(
     softmax_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    lse: torch.Tensor | None,
 ) -> torch.Tensor:
     row_bytes = int(packed_kv.shape[1])
     out = torch.empty(
@@ -1970,6 +2291,7 @@ def _run_packed_kv(
         topk_slots,
         topk_lens,
         out,
+        out if lse is None else lse,
         q.shape[1],
         q.shape[2],
         kv_lora_rank,
@@ -1979,6 +2301,7 @@ def _run_packed_kv(
         float(softmax_scale),
         BLOCK_TOPK=32,
         BLOCK_V=64,
+        STORE_LSE=lse is not None,
         num_warps=4,
     )
     return out
@@ -2001,7 +2324,8 @@ def _run_dsa(
     max_seqlen_k: int,
     is_prefill: bool,
     warm_split_variants: bool,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     _check_inputs(
         q,
         topk_slots,
@@ -2044,6 +2368,13 @@ def _run_dsa(
         expected_numel = q.shape[0] * q.shape[1] * kv_lora_rank
         if out.numel() == expected_numel and out.dtype == _output_dtype(q):
             out_view = out.view(q.shape[0], q.shape[1], kv_lora_rank)
+    # Natural-log LSE of the scaled scores per (token, head); -inf for rows
+    # without a valid key, as the DCP partial merge expects.
+    lse = (
+        torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
     # The tiled kernel maps to dense BF16 or FP8 KV. TokenSpeed's packed sparse
     # FP8 rows use a different physical layout, so they use the packed sparse
     # implementation instead of the dense tiled implementation.
@@ -2056,6 +2387,7 @@ def _run_dsa(
             softmax_scale=softmax_scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+            lse=lse,
         )
     elif kv_cache is not None:
         dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
@@ -2077,6 +2409,7 @@ def _run_dsa(
                 is_prefill=is_prefill,
                 out=out_view,
                 warm_split_variants=warm_split_variants,
+                lse=lse,
             )
         else:
             result = _run_dense_kv_scalar(
@@ -2087,14 +2420,15 @@ def _run_dsa(
                 softmax_scale=softmax_scale,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
+                lse=lse,
             )
     else:
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")
-    if out is None:
-        return result
-    if result is not out_view:
-        out.copy_(result.reshape_as(out))
-    return out
+    if out is not None:
+        if result is not out_view:
+            out.copy_(result.reshape_as(out))
+        result = out
+    return (result, lse) if return_lse else result
 
 
 def launch_gluon_dsa_decode_gfx950(
@@ -2115,10 +2449,10 @@ def launch_gluon_dsa_decode_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     warm_split_variants: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del q_len_per_req
-    if logit_cap != 0.0 or return_lse:
-        raise ValueError("Gluon DSA does not support logit_cap or return_lse")
+    if logit_cap != 0.0:
+        raise ValueError("Gluon DSA does not support logit_cap")
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,
@@ -2135,6 +2469,204 @@ def launch_gluon_dsa_decode_gfx950(
         max_seqlen_k=max_seqlen_k,
         is_prefill=False,
         warm_split_variants=warm_split_variants,
+        return_lse=return_lse,
+    )
+
+
+def gluon_dsa_decode_dcp_records_supported_gfx950(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether :func:`launch_gluon_dsa_decode_dcp_records_gfx950` serves a
+    decode of this size: the dense matrix core, whose one-split rows store
+    their records and whose reduction merges the others'. Host values
+    only."""
+    if tokens <= 0 or not _use_dense_mfma_core(
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    ):
+        return False
+    # The core's buffer loads and stores and the reduction keep int32 offsets
+    # into the query and the split workspace; a decode's are tens of MB.
+    query_bytes = tokens * heads * (kv_lora_rank + qk_rope_head_dim) * q_dtype.itemsize
+    return query_bytes < 2**31 and (
+        gluon_dsa_decode_dcp_records_workspace_bytes_gfx950(
+            tokens=tokens,
+            heads=heads,
+            topk=topk,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        < 2**31
+    )
+
+
+def gluon_dsa_decode_dcp_records_workspace_bytes_gfx950(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> int:
+    """Bytes of the int32 workspace a
+    :func:`launch_gluon_dsa_decode_dcp_records_gfx950` decode of this size
+    writes: one record-shaped plane per key split, the records first. Host
+    values only."""
+    splits = _records_num_kv_splits(
+        tokens=tokens,
+        heads=heads,
+        topk=topk,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+    return splits * tokens * heads * (kv_lora_rank // 2 + 1) * 4
+
+
+def _records_num_kv_splits(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    qk_rope_head_dim: int,
+) -> int:
+    """The key splits of a records decode, as ``_run_dense_kv`` schedules
+    the same decode."""
+    return _select_num_kv_splits(
+        num_tokens=tokens,
+        num_heads=heads,
+        topk_width=topk,
+        max_seqlen_k=topk,
+        is_fp8=q_dtype in _FP8_DTYPES,
+        native_fp8=q_dtype == kv_dtype and q_dtype in _FP8_DTYPES,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=False,
+    )
+
+
+def launch_gluon_dsa_decode_dcp_records_gfx950(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """:func:`launch_gluon_dsa_decode_gfx950` with ``return_lse`` over a
+    KVP gather's rank-major query ``[ranks, tokens, local_heads, dim]``,
+    returning the DCP records (int32 ``[ranks, tokens, local_heads,
+    kv_lora_rank / 2 + 1]``) ``dispatch_dcp_attention_partials`` packs from
+    its output and LSE.
+
+    A row runs at most as many key splits as its live tiles fill with
+    :func:`_records_split_tiles` each, so a short one may split less than
+    that decode and round differently; a row filling every split matches it.
+    Ranks may lie further apart than their contiguous rows; other layouts
+    are copied first. The records lead ``workspace`` when given (flat
+    contiguous int32 of at least
+    :func:`gluon_dsa_decode_dcp_records_workspace_bytes_gfx950` bytes).
+    Raises ``ValueError`` for a size
+    :func:`gluon_dsa_decode_dcp_records_supported_gfx950` refuses."""
+    if logit_cap != 0.0:
+        raise ValueError("Gluon DSA does not support logit_cap")
+    _check_inputs(
+        q,
+        topk_slots,
+        topk_lens,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        page_size=page_size,
+    )
+    ranks, tokens, local_heads, _ = q.shape
+    dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
+    if not gluon_dsa_decode_dcp_records_supported_gfx950(
+        tokens=tokens,
+        heads=ranks * local_heads,
+        topk=topk_slots.shape[1],
+        q_dtype=q.dtype,
+        kv_dtype=dense_kv.dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    ):
+        raise ValueError(
+            "DSA decode records need the dense matrix core "
+            "(check gluon_dsa_decode_dcp_records_supported_gfx950 first)"
+        )
+    if workspace is not None:
+        needed = gluon_dsa_decode_dcp_records_workspace_bytes_gfx950(
+            tokens=tokens,
+            heads=ranks * local_heads,
+            topk=topk_slots.shape[1],
+            q_dtype=q.dtype,
+            kv_dtype=dense_kv.dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        if (
+            workspace.dtype != torch.int32
+            or workspace.dim() != 1
+            or not workspace.is_contiguous()
+            or workspace.nbytes < needed
+        ):
+            raise ValueError(
+                f"DSA records need a flat contiguous int32 workspace of {needed} "
+                f"bytes, got {workspace.dtype} {tuple(workspace.shape)}"
+            )
+    dim = q.shape[3]
+    # The query's direct-to-LDS copy needs a 16-byte-aligned base and
+    # 16-element-aligned row offsets, and its buffer loads a span under 2**31
+    # bytes.
+    if (
+        q.stride()[1:] != (local_heads * dim, dim, 1)
+        or q.stride(0) % 16
+        or q.data_ptr() % 16
+        or ((ranks - 1) * q.stride(0) + tokens * local_heads * dim) * q.element_size()
+        >= 2**31
+    ):
+        q = q.contiguous()
+    return _launch_dense_kv(
+        q,
+        dense_kv,
+        topk_slots.contiguous(),
+        topk_lens.contiguous(),
+        None,
+        num_kv_splits=_records_num_kv_splits(
+            tokens=tokens,
+            heads=ranks * local_heads,
+            topk=topk_slots.shape[1],
+            q_dtype=q.dtype,
+            kv_dtype=dense_kv.dtype,
+            qk_rope_head_dim=qk_rope_head_dim,
+        ),
+        softmax_scale=float(softmax_scale) * float(k_scale),
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=False,
+        lse=None,
+        records=True,
+        workspace=workspace,
     )
 
 
@@ -2156,10 +2688,10 @@ def launch_gluon_dsa_prefill_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     warm_split_variants: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del q_len_per_req
-    if logit_cap != 0.0 or return_lse:
-        raise ValueError("Gluon DSA does not support logit_cap or return_lse")
+    if logit_cap != 0.0:
+        raise ValueError("Gluon DSA does not support logit_cap")
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,
@@ -2176,4 +2708,5 @@ def launch_gluon_dsa_prefill_gfx950(
         max_seqlen_k=max_seqlen_k,
         is_prefill=True,
         warm_split_variants=warm_split_variants,
+        return_lse=return_lse,
     )

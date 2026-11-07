@@ -2283,6 +2283,37 @@ dense / MoE groups that are neither 1 nor the attention TP width in
 attention family (GPU DSA), device, and KV cache (bf16: the gathered write is
 `latent_store`, native rows only) in `AttnConfig`, which sees them resolved.
 
+## Request-path startup coverage
+
+Model-only tuning uses a small probe cache. Rebinding the final cache can
+change pointer-range specializations and state-cache dimensions. It also
+leaves page initialization, input preparation and accepted-state commits
+untouched. Capturing decode alone does not prepare eager prefill against
+those final allocations.
+
+For AMD CDNA4 padded DSA prefill with greedy EAGLE3 and no host cache,
+mixed prefill/decode, pipeline parallelism, attention data parallelism or
+disaggregation, startup drives bounded synthetic requests through the ordinary
+scheduler and device path before constructing the live scheduler. Separate temporary
+schedulers cover a short cold prefix, a medium cold prefix and a full
+request batch with chunked prefill and two decode rounds. Temporary request
+identities and outputs remain private. Each phase drains pending drafting
+and device work; subsequent real admissions use ordinary slot and page
+initialization. Startup resets the random seed after this coverage.
+
+Runtime payload counts and page-table widths do not select new binaries.
+The small Iris all-reduce keeps fixed mailbox geometry, validates complete
+tiles on the host and uses a uniform tile predicate so runtime payload
+bounds retain coherent 16-byte peer transactions. Paged history-table row
+offsets are computed in 64 bits before multiplying by the runtime stride.
+Scalar prefix-length reads share one binary across slice alignments.
+
+`test_startup_request_warmup.py` checks scheduler isolation and draining;
+`test_startup_compile_keys.py` checks binary reuse across runtime sizes;
+`test_mla_prefix_chunks.py` exercises a table offset beyond 2**31.
+Full serving validation must additionally show no compilation after
+readiness with the compilation monitor enabled.
+
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path

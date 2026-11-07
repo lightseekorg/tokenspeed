@@ -80,6 +80,7 @@ def _capture_iris_preparation(monkeypatch):
             sharded=SimpleNamespace(
                 output=torch.empty((kwargs["sharded_max_rows"], 7168), device="meta")
             ),
+            pull_exchange=None,
         )
 
     prepare = Mock(side_effect=allocate)
@@ -194,6 +195,7 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         all_reduce=None,
         device=torch.device("cuda:0"),
         rank_in_group=0,
+        pull_exchange_max_bytes=0,
     )
 
 
@@ -235,6 +237,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             all_reduce=None,
             device=torch.device("cuda:0"),
             rank_in_group=0,
+            pull_exchange_max_bytes=0,
         ),
         call(
             group=moe_group,
@@ -248,6 +251,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             all_reduce=None,
             device=torch.device("cuda:0"),
             rank_in_group=0,
+            pull_exchange_max_bytes=0,
         ),
     ]
 
@@ -289,6 +293,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
         all_reduce=None,
         device=torch.device("cuda:0"),
         rank_in_group=0,
+        pull_exchange_max_bytes=0,
     )
 
 
@@ -328,6 +333,7 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         all_reduce=None,
         device=torch.device("cuda:0"),
         rank_in_group=0,
+        pull_exchange_max_bytes=0,
     )
 
 

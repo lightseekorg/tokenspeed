@@ -156,6 +156,13 @@ def expert_placement_requested(server_args) -> bool:
     )
 
 
+# Kimi-K3's prefill runs Iris side kernels on high-priority streams, so its
+# launches cap ROCm's hardware queues (launcher.set_rocm_hw_queue_default).
+_KIMI_K3_ARCHITECTURES = frozenset(
+    {"KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration"}
+)
+
+
 def _checkpoint_architectures(
     model: str, revision: str | None, download: bool = False
 ) -> list[str] | None:
@@ -814,6 +821,9 @@ class ServerArgs:
     _beam_checkpoint: bool | None = dataclasses.field(
         default=False, init=False, repr=False
     )
+    _kimi_k3_checkpoint: bool | None = dataclasses.field(
+        default=False, init=False, repr=False
+    )
     _beam_grammar_none_warned: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
@@ -908,13 +918,14 @@ class ServerArgs:
         """Model defaults that must be known before any process starts.
 
         ModelConfig applies a model's other defaults in the scheduler, but TF32
-        follows the environment the launch exports before it starts the
-        scheduler (``engine._set_envs_and_config``), so the checkpoint is read
-        here (``_checkpoint_architectures``). Beam serves without TF32: its FP32
-        router hands rows past the decode GEMV leaf's 16 to a Torch FP32
-        matmul, which TF32 would run with a 10-bit mantissa. Without the
-        network, ``_beam_checkpoint`` is None for a hub id the cache does not
-        hold yet; engine setup calls this again with ``download``.
+        and Kimi-K3's ROCm hardware queues follow the environment the launch
+        exports before it starts the scheduler (``engine._set_envs_and_config``),
+        so the checkpoint is read here (``_checkpoint_architectures``). Beam
+        serves without TF32: its FP32 router hands rows past the decode GEMV
+        leaf's 16 to a Torch FP32 matmul, which TF32 would run with a 10-bit
+        mantissa. Without the network, ``_beam_checkpoint`` and
+        ``_kimi_k3_checkpoint`` are None for a hub id the cache does not hold
+        yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
         if self.decode_monokernel and architectures is not None:
@@ -923,6 +934,11 @@ class ServerArgs:
                 raise ValueError(refusal)
         self._beam_checkpoint = (
             None if architectures is None else "BeamForCausalLM" in architectures
+        )
+        self._kimi_k3_checkpoint = (
+            None
+            if architectures is None
+            else not _KIMI_K3_ARCHITECTURES.isdisjoint(architectures)
         )
         if self._beam_checkpoint and not self.disable_tf32:
             self.disable_tf32 = True

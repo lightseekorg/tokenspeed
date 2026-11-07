@@ -28,6 +28,8 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_index_candidates,
     dsa_index_candidates_accepts_pages,
     dsa_merge_candidates,
+    dsa_select_owned_candidates,
+    dsa_select_owned_candidates_supported,
     plan_dsa_index_candidates,
 )
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
@@ -35,6 +37,7 @@ from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
 )
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_exchange_input,
     all_gather,
     all_gather_single,
     all_to_all_single,
@@ -370,6 +373,8 @@ def select_dsa_topk(
     metadata: DCPIndexMetadata | None = None,
     row_owner: bool = False,
     columns: int | None = None,
+    q_scales: torch.Tensor | None = None,
+    query_group_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return request-relative global Top-K from local Index-K pages.
 
@@ -443,44 +448,21 @@ def select_dsa_topk(
         rows, tile_rows, degree, topk, max_logits_bytes, row_owner=row_owner
     )
 
-    def tile_pages(start: int, end: int) -> DSAIndexCandidatePages | None:
-        if metadata.pages is not None:
-            return metadata.pages.rows(start, end)
-        if metadata.columns is None:
-            return None
-        # Plan this tile's pages, or the leaf would size its logits by the whole table.
-        pages = plan_dsa_index_candidates(
-            q[start:end],
-            weights[start:end],
-            index_k_cache,
-            metadata.local_page_table,
-            metadata.query_requests[start:end],
-            metadata.causal_lens[start:end],
-            page_size=page_size,
-            columns=metadata.columns,
-        )
-        if pages is None:
-            raise RuntimeError(
-                "owned-width index tiles need a candidate leaf that scores "
-                "planned pages"
-            )
-        return pages
-
     def score_tile(start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return dsa_index_candidates(
-            q[start:end],
-            weights[start:end],
+        return _score_rows(
+            q,
+            weights,
             index_k_cache,
-            metadata.local_page_table,
-            metadata.query_requests[start:end],
-            metadata.causal_lens[start:end],
+            metadata,
+            start,
+            end,
             page_size=page_size,
             topk=topk,
             softmax_scale=softmax_scale,
             initial_tokens=initial_tokens,
             local_tokens=local_tokens,
-            solution=None,
-            pages=tile_pages(start, end),
+            q_scales=q_scales,
+            query_group_size=query_group_size,
         )
 
     def exchange(first: int, last: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -515,6 +497,216 @@ def select_dsa_topk(
         indices[first:last].copy_(part)
         lengths[first:last].copy_(part_lengths)
     return indices, lengths
+
+
+def _tile_pages(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    metadata: DCPIndexMetadata,
+    start: int,
+    end: int,
+    page_size: int,
+) -> DSAIndexCandidatePages | None:
+    """Candidate pages for query rows ``[start, end)``: the forward's planned
+    pages sliced to them, None when tiles are not planned at an owned width,
+    else this tile's pages planned ``metadata.columns`` wide. Raises when the
+    candidate leaf cannot score planned pages."""
+    if metadata.pages is not None:
+        return metadata.pages.rows(start, end)
+    if metadata.columns is None:
+        return None
+    # Plan this tile's pages, or the leaf would size its logits by the whole table.
+    pages = plan_dsa_index_candidates(
+        q[start:end],
+        weights[start:end],
+        index_k_cache,
+        metadata.local_page_table,
+        metadata.query_requests[start:end],
+        metadata.causal_lens[start:end],
+        page_size=page_size,
+        columns=metadata.columns,
+    )
+    if pages is None:
+        raise RuntimeError(
+            "owned-width index tiles need a candidate leaf that scores planned pages"
+        )
+    return pages
+
+
+def _score_rows(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    metadata: DCPIndexMetadata,
+    start: int,
+    end: int,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    initial_tokens: int,
+    local_tokens: int,
+    q_scales: torch.Tensor | None,
+    query_group_size: int,
+    scores_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Local candidates of rows ``[start, end)`` in one tile."""
+    return dsa_index_candidates(
+        q[start:end],
+        weights[start:end],
+        index_k_cache,
+        metadata.local_page_table,
+        metadata.query_requests[start:end],
+        metadata.causal_lens[start:end],
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        initial_tokens=initial_tokens,
+        local_tokens=local_tokens,
+        solution=None,
+        pages=_tile_pages(q, weights, index_k_cache, metadata, start, end, page_size),
+        scores_out=scores_out,
+        q_scales=None if q_scales is None else q_scales[start:end],
+        query_group_size=(
+            query_group_size
+            if start % query_group_size == 0 and end % query_group_size == 0
+            else 1
+        ),
+    )
+
+
+def owned_dsa_topk_fits(
+    rows: int,
+    metadata: DCPIndexMetadata,
+    *,
+    page_size: int,
+    topk: int,
+    rider_bytes: int,
+) -> bool:
+    """Whether :func:`select_owned_dsa_topk`, gathering ``rider_bytes`` per
+    rank with the scores, serves ``metadata``'s rows in one tile. Host values
+    only, the same on every rank."""
+    columns = metadata.columns or metadata.local_page_table.shape[1]
+    if _tile_rows(rows, columns, page_size, None) < rows:
+        return False
+    return dsa_select_owned_candidates_supported(
+        ranks=len(metadata.placement.group),
+        rows=rows,
+        topk=topk,
+        rank_stride=rows * topk + rider_bytes // 4,
+    )
+
+
+def select_owned_dsa_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    *,
+    metadata: DCPIndexMetadata,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    initial_tokens: int,
+    local_tokens: int,
+    rider: torch.Tensor | None,
+    q_scales: torch.Tensor | None,
+    query_group_size: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """This rank's share of :func:`select_dsa_topk`'s selection over
+    ``metadata``'s rows, as local cache slots, for rows that
+    :func:`owned_dsa_topk_fits`.
+
+    Only the candidates' scores are gathered: every rank derives the same
+    k-th score from all of them and keeps its own candidates through it, so
+    positions never leave their rank. ``rider`` bytes of every row ride the
+    same all-gather, saving a later gather of the same rows.
+
+    Args:
+        rider: Contiguous uint8 ``[rows, width]`` of this rank, ``width`` a
+            multiple of 4, or None.
+
+    Returns:
+        ``out``: int32 ``[rows, topk]`` local slots, this rank's selected
+        candidates first and ``-1`` after; ``lens_out``: int32 ``[rows]``
+        counts, bit for bit what compacting :func:`select_dsa_topk`'s
+        selection to this rank's owned slots gives; and every rank's rider
+        rows ``[ranks, rows, width]`` (a view of the gathered buffer; None
+        without a rider).
+    """
+    rows = q.shape[0]
+    if metadata.query_requests.shape != (rows,):
+        raise ValueError("DCP index metadata was built for other rows")
+    if rider is not None and (
+        rider.dtype != torch.uint8
+        or rider.dim() != 2
+        or rider.shape[0] != rows
+        or rider.shape[1] % 4
+        or not rider.is_contiguous()
+    ):
+        raise ValueError(
+            "a rider is a contiguous uint8 [rows, width] matrix, width a "
+            "multiple of 4"
+        )
+    group = metadata.placement.group
+    score_bytes = rows * topk * 4
+    if len(group) > 1:
+        # Every rank's chunk is its scores, then its rider rows, written
+        # where an exchange that pulls in place reads them.
+        send = acquire_exchange_input(
+            score_bytes + (0 if rider is None else rider.numel()), q, group
+        )
+        local = send[:score_bytes].view(torch.float32).view(rows, topk)
+        if rider is not None:
+            send[score_bytes:].view(rows, -1).copy_(rider)
+    else:
+        local = torch.empty((rows, topk), device=q.device, dtype=torch.float32)
+    positions, _ = _score_rows(
+        q,
+        weights,
+        index_k_cache,
+        metadata,
+        0,
+        rows,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        initial_tokens=initial_tokens,
+        local_tokens=local_tokens,
+        q_scales=q_scales,
+        query_group_size=query_group_size,
+        scores_out=local,
+    )
+    gathered_rider = None
+    if len(group) > 1:
+        gathered = torch.empty(
+            (len(group), send.numel()), device=q.device, dtype=torch.uint8
+        )
+        all_gather_single(gathered.flatten(), send, group)
+        scores = (
+            gathered[:, :score_bytes].view(torch.float32).view(len(group), rows, topk)
+        )
+        if rider is not None:
+            gathered_rider = gathered[:, score_bytes:].view(len(group), rows, -1)
+    else:
+        scores = local.unsqueeze(0)
+        if rider is not None:
+            gathered_rider = rider.unsqueeze(0)
+    out, lens_out = dsa_select_owned_candidates(
+        scores,
+        positions,
+        metadata.local_page_table,
+        metadata.query_requests,
+        rank=metadata.placement.rank,
+        topk=topk,
+        page_size=page_size,
+        solution=None,
+        out=out,
+        lens_out=lens_out,
+    )
+    return out, lens_out, gathered_rider
 
 
 def _join_tiles(

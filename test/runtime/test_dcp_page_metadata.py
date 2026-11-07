@@ -483,3 +483,113 @@ def test_max_owned_index_pages_of_no_pages_is_zero():
             page_size=64,
             placement=placement,
         )
+
+
+def test_write_slots_resolve_once_per_forward_and_slots(monkeypatch):
+    """Every layer's write at the forward's slots reuses one resolution; other
+    slots, rewritten slots, another placement and the next forward resolve
+    again, each with ``resolve_cache_slots``'s result."""
+    from types import SimpleNamespace
+
+    import tokenspeed.runtime.layers.attention.dcp.placement as placement_mod
+
+    resolved = []
+
+    def counting(loc, placement):
+        resolved.append(loc.clone())
+        return resolve_cache_slots(loc, placement)
+
+    monkeypatch.setattr(placement_mod, "resolve_cache_slots", counting)
+    monkeypatch.setattr(
+        placement_mod, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    placement = CachePlacement(128, 9, (0, 1, 2, 3), 2)
+    # The forward's SparseTopKShare field.
+    share = SimpleNamespace(write_slots=[])
+    loc = torch.arange(200, 264, dtype=torch.int64) * 7
+
+    first = placement_mod.resolve_write_slots(loc, placement, share)
+    for view in (loc, loc[:64], loc.view(64)):
+        again = placement_mod.resolve_write_slots(view, placement, share)
+        assert again[0] is first[0] and again[1] is first[1]
+    assert len(resolved) == 1
+    expected = resolve_cache_slots(loc, placement)
+    assert torch.equal(first[0], expected[0]) and torch.equal(first[1], expected[1])
+
+    placement_mod.resolve_write_slots(loc[:32], placement, share)
+    other = CachePlacement(128, 9, (0, 1, 2, 3), 1)
+    placement_mod.resolve_write_slots(loc, other, share)
+    assert len(resolved) == 3
+    loc.add_(128)
+    rewritten = placement_mod.resolve_write_slots(loc, placement, share)
+    assert len(resolved) == 4
+    assert torch.equal(rewritten[0], resolve_cache_slots(loc, placement)[0])
+    # SparseTopKShare.clear at the next forward's metadata build.
+    share.write_slots = []
+    placement_mod.resolve_write_slots(loc, placement, share)
+    assert len(resolved) == 5
+    unsharded = placement_mod.resolve_write_slots(loc, None, share)
+    assert unsharded[0] is loc and unsharded[1] is None
+
+
+def test_write_slots_reuse_only_within_one_capture_state(monkeypatch):
+    """A graph capture resolves the forward's slots itself rather than reusing
+    an eager resolution, and an eager write never reuses the capture's."""
+    from types import SimpleNamespace
+
+    import tokenspeed.runtime.layers.attention.dcp.placement as placement_mod
+
+    resolved = []
+
+    def counting(loc, placement):
+        resolved.append(loc.clone())
+        return resolve_cache_slots(loc, placement)
+
+    capturing = [False]
+    monkeypatch.setattr(placement_mod, "resolve_cache_slots", counting)
+    monkeypatch.setattr(
+        placement_mod, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    monkeypatch.setattr(
+        placement_mod.torch.cuda, "is_current_stream_capturing", lambda: capturing[0]
+    )
+    placement = CachePlacement(128, 9, (0, 1, 2, 3), 2)
+    share = SimpleNamespace(write_slots=[])
+    loc = torch.arange(200, 264, dtype=torch.int64) * 7
+
+    eager = placement_mod.resolve_write_slots(loc, placement, share)
+    capturing[0] = True
+    captured = placement_mod.resolve_write_slots(loc, placement, share)
+    assert len(resolved) == 2 and captured[0] is not eager[0]
+    again = placement_mod.resolve_write_slots(loc, placement, share)
+    assert again[0] is captured[0] and len(resolved) == 2
+    capturing[0] = False
+    after = placement_mod.resolve_write_slots(loc, placement, share)
+    assert after[0] is eager[0] and len(resolved) == 2
+
+
+def test_write_slots_resolve_at_every_write_off_amd(monkeypatch):
+    """Off AMD every layer's write resolves its own slots."""
+    from types import SimpleNamespace
+
+    import tokenspeed.runtime.layers.attention.dcp.placement as placement_mod
+
+    resolved = []
+
+    def counting(loc, placement):
+        resolved.append(loc.clone())
+        return resolve_cache_slots(loc, placement)
+
+    monkeypatch.setattr(placement_mod, "resolve_cache_slots", counting)
+    monkeypatch.setattr(
+        placement_mod, "current_platform", lambda: SimpleNamespace(is_amd=False)
+    )
+    placement = CachePlacement(128, 9, (0, 1, 2, 3), 2)
+    share = SimpleNamespace(write_slots=[])
+    loc = torch.arange(200, 264, dtype=torch.int64) * 7
+
+    for _ in range(3):
+        slots, owned = placement_mod.resolve_write_slots(loc, placement, share)
+    assert len(resolved) == 3 and not share.write_slots
+    expected = resolve_cache_slots(loc, placement)
+    assert torch.equal(slots, expected[0]) and torch.equal(owned, expected[1])

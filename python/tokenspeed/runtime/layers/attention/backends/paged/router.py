@@ -996,6 +996,19 @@ class CacheGroupRouter(AttentionBackend):
     def cache_placement(self, layer):
         return self._leaf_for(layer).cache_placement(layer)
 
+    def takes_owned_decode_topk(self, layer):
+        # Offloaded layers read prepared hot rows of the scheduler slots.
+        if self._offload_adapter is not None and self._offload_adapter.offloads_layer(
+            layer.layer_id
+        ):
+            return False
+        return self._leaf_for(layer).takes_owned_decode_topk(layer)
+
+    def dcp_decode_query_rider(self, layer, q):
+        if not self.takes_owned_decode_topk(layer):
+            return None
+        return self._leaf_for(layer).dcp_decode_query_rider(layer, q)
+
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
 
@@ -1184,6 +1197,14 @@ class CacheGroupRouter(AttentionBackend):
         return self._sole_leaf("gather_history_index_k").gather_history_index_k(
             layer_id, token_to_kv_pool, group
         )
+
+    def gather_history_index_k_pages(self, layer_id: int, token_to_kv_pool, group):
+        return self._sole_leaf(
+            "gather_history_index_k_pages"
+        ).gather_history_index_k_pages(layer_id, token_to_kv_pool, group)
+
+    def history_prefill_plan(self):
+        return self._sole_leaf("history_prefill_plan").history_prefill_plan()
 
     # DSA KVP prefill: top-k over KVP pages tiles by the leaf's planned owned width.
 
