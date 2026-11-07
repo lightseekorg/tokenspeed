@@ -419,12 +419,10 @@ class ServerArgs:
     # no chunk is cut for it. The prompt end that checkpoint covers and a
     # fused finish past the prompt end then publish no state and no KV tail:
     # a next turn that re-renders the end of the prompt and its reply cannot
-    # resume there (docs/design/scheduler.md section 1.2).
+    # resume there. A finish also demotes the in-forward checkpoint its
+    # conversation published two turns back, which both cache tiers then evict
+    # early (docs/design/scheduler.md section 1.2).
     enable_state_checkpoint_in_forward: bool = False
-    # Opt-in, with in-forward checkpoints: a finish demotes the in-forward State
-    # checkpoint its conversation published two turns back, which both cache
-    # tiers then evict early.
-    demote_superseded_state_checkpoints: bool = False
     # Hybrid models: a State checkpoint a later request's checkpoint extends
     # ranks, under cache pressure, as if last used this many new requests ago. None
     # is the scheduler's default, 16 times the per-rank batch size.
@@ -1484,24 +1482,12 @@ class ServerArgs:
 
         This is the flag, except on a decode server, whose prompts arrive by
         transfer. Its scheduler then also skips the dead prompt-end and finish
-        checkpoints; a decode server publishes them as ever.
+        checkpoints and demotes superseded in-forward checkpoints; a decode
+        server publishes the former as ever.
         """
         return (
             self.enable_state_checkpoint_in_forward
             and self.disaggregation_mode != "decode"
-        )
-
-    @property
-    def demotes_superseded_state_checkpoints(self) -> bool:
-        """Whether this engine's finishes demote superseded State checkpoints.
-
-        This is the flag where in-forward checkpoints are written, which
-        validation requires; a decode server, which writes none, takes the
-        flag as a no-op.
-        """
-        return (
-            self.demote_superseded_state_checkpoints
-            and self.writes_state_checkpoints_in_forward
         )
 
     @property
@@ -2342,15 +2328,6 @@ class ServerArgs:
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
                 )
-        if (
-            self.demote_superseded_state_checkpoints
-            and self.disaggregation_mode != "decode"
-            and not self.enable_state_checkpoint_in_forward
-        ):
-            raise ValueError(
-                "--demote-superseded-state-checkpoints demotes in-forward State "
-                "checkpoints; it requires --enable-state-checkpoint-in-forward"
-            )
         _require_choice(
             "--kvstore-write-policy",
             self.kvstore_write_policy,
@@ -2966,24 +2943,15 @@ class ServerArgs:
             "finish, as on a prefill server, is kept if the state at the "
             "boundary has left the cache); a next turn that repeats the "
             "previous reply verbatim resumes at an earlier checkpoint instead "
-            "and recomputes the reply. Requires prefix caching; a decode server "
-            "ignores it. See docs/design/scheduler.md section 1.2.",
-        )
-        parser.add_argument(
-            "--demote-superseded-state-checkpoints",
-            action="store_true",
-            dest="demote_superseded_state_checkpoints",
-            default=ServerArgs.demote_superseded_state_checkpoints,
-            help="Hybrid (recurrent-state) models, with "
-            "--enable-state-checkpoint-in-forward: when a request publishes an "
-            "in-forward State checkpoint past the one it resumed from, which its "
-            "own predecessor wrote past an earlier one, that earlier checkpoint "
-            "-- two turns back on the conversation -- is evicted early from the "
-            "device and host caches, and no new store or eviction write-back "
-            "copies it to host, unless another request also resumed from it, or "
-            "acquired or republished it after the conversation's previous turn "
-            "resumed there. A decode server takes the flag as a no-op. Off by "
-            "default. See docs/design/scheduler.md section 1.2.",
+            "and recomputes the reply. When a request publishes an in-forward "
+            "checkpoint past the one it resumed from, which its own predecessor "
+            "wrote past an earlier one, that earlier checkpoint -- two turns "
+            "back on the conversation -- is evicted early from the device and "
+            "host caches, and no new store or eviction write-back copies it to "
+            "host, unless another request also resumed from it, or acquired or "
+            "republished it after the conversation's previous turn resumed "
+            "there. Requires prefix caching; a decode server ignores it. See "
+            "docs/design/scheduler.md section 1.2.",
         )
         parser.add_argument(
             "--checkpoint-retention-requests",

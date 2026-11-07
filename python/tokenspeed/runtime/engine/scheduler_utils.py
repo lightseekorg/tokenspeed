@@ -184,7 +184,7 @@ def make_config(
             covers (prefill and fused roles) or at a fused finish past the
             prompt end. Requires prefix caching.
         demote_superseded_state_checkpoints:
-            ``--demote-superseded-state-checkpoints``: a finish that
+            On with ``--enable-state-checkpoint-in-forward``: a finish that
             publishes an in-forward State checkpoint demotes the one its
             conversation published two turns back, unless another request
             shares it. Requires ``state_checkpoint_in_forward`` outside the

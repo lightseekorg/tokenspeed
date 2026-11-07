@@ -474,16 +474,16 @@ that publishes no end state (above) marks the input all the same: the prompt
 end, or the pre-tail checkpoint the next turn resumes at instead, was
 published or found cached earlier.
 
-**Superseded checkpoints (opt-in).** With in-forward checkpoints, each turn
+**Superseded checkpoints.** With in-forward checkpoints, each turn
 of a conversation that re-renders the end of the last prompt resumes at the
 checkpoint the turn before wrote and writes its own, and the prompt ends and
 finishes that such a turn cannot resume at are skipped (dead checkpoints,
 above). A long conversation therefore leaves a chain of in-forward
 checkpoints, and only the newest two serve its next turn (one that diverges
 inside the last turn resumes at the older). With
-`demote_superseded_state_checkpoints` (`--demote-superseded-state-checkpoints`,
-off by default; it requires in-forward checkpoints and has no effect on the D
-role or without State groups) a finish that publishes an in-forward checkpoint
+`demote_superseded_state_checkpoints` (on with
+`--enable-state-checkpoint-in-forward`; it requires in-forward checkpoints and
+has no effect on the D role or without State groups) a finish that publishes an in-forward checkpoint
 `C(n)` past the page boundary it resumed from, itself an in-forward checkpoint
 `C(n-1)` whose request resumed from an earlier one `C(n-2)`, demotes `C(n-2)`:
 its State entries and the sliding-window blocks behind it, less any block
