@@ -1236,6 +1236,7 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
         draft_backend=None,
         uses_paged_state_verify=False,
         is_inkling=False,
+        qsa_bf16_scratch=None,
         expected_bytes=planned,
     )
     assert target.history_gather_workspace().nbytes == planned
@@ -1265,6 +1266,7 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
+        qsa_bf16_scratch=None,
         expected_bytes=planned + 64,
     )
     assert hybrid_target.history_gather_workspace().nbytes == planned
