@@ -393,6 +393,30 @@ decode-produced state, which those groups keep private anyway. Their other
 unaligned prompt ends still publish a KV tail, although no hit resumes there
 either.
 
+**Short prompt ends.** A prompt too short for a pre-tail checkpoint
+(`PrefillStateCheckpointTokens` is 0: by default a prompt within one chunk
+budget) has no `C` to make its end dead, so the rule above publishes it. With
+`drop_short_prompt_end_checkpoints` (on with
+`--enable-state-checkpoint-in-forward`, P role only) the P role's finish skips
+that end too when it lies inside a page: it publishes the full pages alone,
+like a chunk end (`shortPromptEndIsDropped`). A re-rendered next turn cannot
+resume at that end either; a longer prompt that repeats the whole prompt
+resumes at an earlier checkpoint instead and recomputes the rest of it. A
+page-aligned end keeps its state: it is a chain boundary a longer prompt
+resumes from. The decision reads only the prompt, so it holds whatever the
+cache holds, and nothing before the finish depends on it: the P role
+reserves no copy-in block for its prompt end and never retracts. Such a
+finish publishes no end state, and it marks no input superseded (below): the
+tail it resumed from, if any (a junction's, whose state a junction cut
+published), may still be the deepest checkpoint a prompt extending it
+resumes at. Under write-back the pages it leaves, with no checkpoint at or
+under them, are dead entries an eviction drops instead of writing back. The
+fused role keeps its short prompt ends, and `Validate` refuses the flag
+there: the drop is a P-role policy, chosen from PD measurements. The same
+case exists at the fused first decode, which publishes a short prompt's end
+and moves off it into its copy-in blocks; applying the drop there, decided
+at admission like `promptEndCheckpoint`, is a possible follow-up.
+
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
 `Finishing` and nothing else; after every batch of events,
@@ -472,7 +496,8 @@ state still rank level, since which of them the next turn resumes at depends
 on whether the client sends the reply back as it was generated. A dead finish
 that publishes no end state (above) marks the input all the same: the prompt
 end, or the pre-tail checkpoint the next turn resumes at instead, was
-published or found cached earlier.
+published or found cached earlier. A short prompt end the opt-in drop skips
+(above) is the exception: nothing replaces the input, so it stays unmarked.
 
 **Superseded checkpoints.** With in-forward checkpoints, each turn
 of a conversation that re-renders the end of the last prompt resumes at the
@@ -1103,7 +1128,9 @@ The transfer ACK (`pd::SucceededEvent`) publishes the prompt like a finish —
 its full pages, its partial page as a tail and each State group's prompt-end
 state (§1.2) — and releases request ownership; cached entries remain subject
 to normal eviction. With the in-forward checkpoint a prompt end it covers is
-published like a chunk end instead (§1.2).
+published like a chunk end instead, and with
+`drop_short_prompt_end_checkpoints` so is a short prompt's end inside a page
+(§1.2).
 
 **Host L2: write-back.** With `host_write_policy` `kWriteBack`
 (`--kvstore-write-policy write_back`; this role or the fused one (§3.3), no
