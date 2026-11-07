@@ -126,6 +126,7 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
+    demote_superseded_state_checkpoints: bool = False,
     max_kv_page_num: int = 0,
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
@@ -182,6 +183,12 @@ def make_config(
             State checkpoint is published at a prompt end that checkpoint
             covers (prefill and fused roles) or at a fused finish past the
             prompt end. Requires prefix caching.
+        demote_superseded_state_checkpoints:
+            On with ``--enable-state-checkpoint-in-forward``: a finish that
+            publishes an in-forward State checkpoint demotes the one its
+            conversation published two turns back, unless another request
+            shares it. Requires ``state_checkpoint_in_forward`` outside the
+            decode role.
         max_kv_page_num: Per-local-prefill-batch budget for the sum of
             ``ceil((cached prefix + current chunk) / prefix_granularity)``
             across requests. 0 leaves the budget unbounded. Derived from
@@ -243,6 +250,9 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if demote_superseded_state_checkpoints:
+        # Set only when on, as above.
+        cfg.demote_superseded_state_checkpoints = True
     if checkpoint_retention_requests is not None:
         # Set only when given, as above: an older scheduler wheel keeps its
         # plain LRU by default and refuses an explicit value.
@@ -280,14 +290,53 @@ def should_use_overlap_schedule(
     disable_overlap_schedule: bool,
     disaggregation_mode: str,
 ) -> bool:
-    """Return whether the runtime can use the overlapped scheduler loop."""
+    """Return whether the runtime runs the overlap schedule: a decode step
+    dispatched before the previous one commits, with decode KV reserved for
+    it (``overlap_schedule_depth``)."""
 
     if disable_overlap_schedule:
         return False
     if disaggregation_mode in ("prefill", "encode"):
-        # prefill drain + KV send run only on the non-overlap loop; encode has no LM loop.
+        # The prefill role never decodes locally, so it has no decode step to
+        # run ahead or reserve KV for; its chunks still run ahead of their
+        # commits (resolve_in_flight_depth). Encode has no LM loop.
         return False
     return True
+
+
+def resolve_in_flight_depth(
+    *,
+    disable_overlap_schedule: bool,
+    disaggregation_mode: str,
+    pp_size: int,
+) -> int:
+    """Return the event loop's in-flight depth: how many dispatched forwards
+    may await commit at once (``docs/design/event-loop.md``, Principle 4).
+
+    ``pp_size`` under pipeline parallelism, where the prefill chunk pipeline
+    keeps one forward per stage in flight. At PP=1, 0 with
+    ``disable_overlap_schedule`` (each forward commits in the round that
+    dispatched it) or on an encode rank, which has no LM loop; otherwise 1:
+    the control plane plans the next round, commits the previous forward and
+    polls transfers while the GPU runs the dispatched one. On a role that
+    decodes that is the overlap schedule. The prefill role runs ahead without
+    it (``should_use_overlap_schedule``): its chunks need no decode KV
+    reserved, and the scheduler holds a prompt's remote decode until the
+    final chunk's result has landed.
+
+    Args:
+        disable_overlap_schedule: ``--disable-overlap-schedule``.
+        disaggregation_mode: ``--disaggregation-mode``.
+        pp_size: Pipeline-parallel stages.
+
+    Returns:
+        The in-flight depth.
+    """
+    if pp_size > 1:
+        return pp_size
+    if disable_overlap_schedule or disaggregation_mode == "encode":
+        return 0
+    return 1
 
 
 def resolve_dspark_prefix_replay_tokens(

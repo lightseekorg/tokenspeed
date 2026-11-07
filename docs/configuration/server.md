@@ -439,7 +439,7 @@ Trainer-side contract:
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
-| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. With prefill graphs, the GDN layers of a forward that writes one stay captured; every captured shape shares one float32 scan scratch of (largest prefill-graph token capacity / prefix granularity) recurrent states. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
+| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. With prefill graphs, the GDN layers of a forward that writes one stay captured; every captured shape shares one float32 scan scratch of (largest prefill-graph token capacity / prefix granularity) recurrent states. When a request publishes an in-forward checkpoint past the one it resumed from, which its own predecessor wrote past an earlier one, that earlier checkpoint -- two turns back on the conversation -- is evicted early from the device and host caches, and no new store or eviction write-back copies it to host, unless another request also resumed from it, or acquired or republished it after the conversation's previous turn resumed there, so multi-turn traffic keeps more live prefixes cached. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
@@ -1238,10 +1238,18 @@ Mooncake Store (L3)
 ```
 
 Host L2 and the retraction snapshot pool pack each group's payload independently
-of Device strides. A shared Host parent fits the largest single group payload;
-each group fits as many whole children in it as possible. Empty parents are
-available to every group, including recurrent State; no group has reserved
-capacity.
+of Device strides. A shared Host parent fits the largest single group payload,
+and each group fits as many whole children in it as possible. When that
+payload is a recurrent-state checkpoint, or a replayable sliding-window page
+that Host L2 never stores, the KV pages of every parent leave a gap smaller
+than one page, so the parent may instead round up to a whole number of pages
+of the KV group that stores the most Host bytes per token: those pages then
+fill it without a gap, but every parent of the largest payload gains the same
+bytes as slack. The parent rounds up only when that lowers the Host bytes per
+cached token, assuming one State checkpoint per 8,192 cached tokens (a
+request publishes only a few, so a prefix cache of long prompts holds far
+fewer). Empty parents are available to every group, including recurrent
+State; no group has reserved capacity.
 Mirrored ranks must have the same Host packing; startup refuses local layouts
 that would give the same Host block ID different meanings across ranks.
 
@@ -1307,7 +1315,13 @@ fused role,
 `--kvstore-ratio` (a multiple of this rank's Device LCM block count, 2 by
 default). Host parents use compact payload geometry, so the ratio counts
 parents rather than allocated bytes. Use `--kvstore-size` to request a byte
-budget.
+budget. A parent rounded up to whole KV pages (above) is less than one KV page
+larger than the largest payload, a large share when it holds few pages: with
+Qwen3.8-Flash-Next and FP8 KV it grows 4.3% at attention TP 1 and 2, 16% at
+TP 4 and 39% at TP 8, where the recurrent state keeps splitting across the
+ranks but the two KV heads stop at TP 2. Sizes that count parents (the
+ratios and the derived retraction snapshot pool) pin that much more Host
+memory; the gigabyte sizes keep their byte budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB

@@ -125,6 +125,16 @@ struct SchedulerConfig {
     // unaffected. Requires prefix caching, except on the D role, which never
     // computes a prompt and publishes as ever.
     bool state_checkpoint_in_forward{false};
+    // A finish that publishes an in-forward State checkpoint past the one it
+    // resumed from, itself an in-forward checkpoint whose request resumed from
+    // an earlier one, demotes that earlier one -- two turns back on the
+    // conversation -- unless another request shares it: its State entries and
+    // the sliding-window blocks behind it are dated back, so both tiers evict
+    // them early, and no new store or eviction write-back copies them to the
+    // Host (docs/design/scheduler.md §1.2).
+    // Requires state_checkpoint_in_forward, except on the D role, where it has
+    // no effect; so does a model without State groups.
+    bool demote_superseded_state_checkpoints{false};
     // Under cache pressure, a State checkpoint more than
     // checkpoint_retention_leaf_distance from the newest checkpoint on its
     // branch ranks as if last used this many new requests ago, or at its own
