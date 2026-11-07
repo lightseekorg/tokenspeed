@@ -288,6 +288,7 @@ def _target_prefill_graph() -> prefill_graph_module.PrefillGraph:
         prefix_granularity=128,
         max_num_seqs=MAX_BS,
         chunked_prefill_size=MAX_TOKENS,
+        input_vocab_size=VOCAB,
         vocab_size=VOCAB,
         context_len=MAX_LEN,
         physical_context_len=MAX_LEN,

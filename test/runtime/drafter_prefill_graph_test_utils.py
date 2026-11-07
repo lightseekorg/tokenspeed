@@ -364,6 +364,7 @@ def make_eagle(
         token_to_kv_pool=ToyPool(),
         runtime_states=RuntimeStates(
             req_pool_size=MAX_BS + 1,
+            input_vocab_size=VOCAB,
             vocab_size=VOCAB,
             device=device,
             output_length=spec_num_steps + 1,
