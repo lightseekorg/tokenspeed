@@ -24,6 +24,9 @@ on:
       version_date:
         description: "Nightly version date override, formatted as YYYYMMDD."
         type: string
+      version_suffix:
+        description: "Nightly only: the version_suffix of the manual kernel nightly to pair with (dev1 -> 0.1.1.post20261108.dev1, pinning tokenspeed-kernel 0.1.4.post20261108.dev1)."
+        type: string
 
 permissions:
   contents: read
@@ -59,9 +62,14 @@ jobs:
           REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
           VERSION_DATE: ${{ inputs.version_date }}
+          VERSION_SUFFIX: ${{ inputs.version_suffix }}
         run: |
           if [ "$REPLACE_NIGHTLY" = "true" ] && { [ "$NIGHTLY" != "true" ] || [ "$PUBLISH_GITHUB" != "true" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; }; then
             echo "Replacing nightly assets requires nightly publication from main." >&2
+            exit 1
+          fi
+          if [ -n "$VERSION_SUFFIX" ] && [ "$NIGHTLY" != "true" ]; then
+            echo "version_suffix applies to nightly builds only." >&2
             exit 1
           fi
           echo "nightly=${NIGHTLY}" >> "$GITHUB_OUTPUT"
@@ -81,6 +89,7 @@ jobs:
               TOKENSPEED_KERNEL_BACKEND=cuda \
               TOKENSPEED_KERNEL_NIGHTLY=true \
               TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
+              TOKENSPEED_KERNEL_VERSION_SUFFIX="$VERSION_SUFFIX" \
                 python setup.py --version
             )
           }
@@ -271,7 +280,9 @@ jobs:
           exit 1
 
   check-nightly-rocm:
-    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    # A manual development nightly has no same-suffix ROCm kernel; the scheduled
+    # nightly of its date indexes ROCm.
+    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github) && !inputs.version_suffix
     needs: [build, publish-nightly]
     runs-on: ubuntu-latest
     timeout-minutes: 75

@@ -10,7 +10,9 @@ from pathlib import Path
 import pytest
 import setuptools
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import Version
 from setuptools import build_meta
 
 SETUP_PY = Path(__file__).parents[1] / "python" / "setup.py"
@@ -71,6 +73,54 @@ def test_nightly_version_uses_post_date(monkeypatch) -> None:
     )
 
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260230")
+    with pytest.raises(ValueError):
+        _capture_setup_kwargs(monkeypatch, "cuda")
+
+
+@pytest.mark.parametrize(
+    "suffix,expected",
+    [
+        ("dev1", ".dev1"),
+        (".dev1", ".dev1"),
+        ("-dev_7", ".dev7"),
+        ("DEV", ".dev0"),
+        ("2", ".dev2"),
+        ("dev20261107001", ".dev20261107001"),
+        ("fa4-fix", ".dev0+fa4.fix"),
+        ("Fa4 Fix!", ".dev0+fa4.fix"),
+        ("+exp1", ".dev0+exp1"),
+        ("rc1", ".dev0+rc1"),
+        ("20261107.2", ".dev0+20261107.2"),
+        ("exp.007", ".dev0+exp.7"),
+        ("dev2+fa4_fix", ".dev2+fa4.fix"),
+        ("3+exp", ".dev3+exp"),
+        (".dev0+fa4.fix", ".dev0+fa4.fix"),
+    ],
+)
+def test_nightly_version_suffix_makes_a_development_release(
+    monkeypatch, suffix, expected
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", suffix)
+    version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+    nightly = version.removesuffix(expected)
+    assert nightly.endswith(".post20261108")
+    # A pre-release of that date's nightly: it sorts before the nightly, and a
+    # pin of the nightly does not match it.
+    assert Version(version) < Version(nightly)
+    assert Version(version).is_prerelease
+    assert not SpecifierSet(f"=={nightly}").contains(version, prereleases=True)
+    assert str(Version(version)) == version
+
+
+@pytest.mark.parametrize("suffix", ["+", "dev1+", "+++", "---", "dev1+-"])
+def test_nightly_version_suffix_refuses_an_empty_label(monkeypatch, suffix) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_SUFFIX", suffix)
     with pytest.raises(ValueError):
         _capture_setup_kwargs(monkeypatch, "cuda")
 
