@@ -488,6 +488,40 @@ def test_a_tuple_of_classes_holds_the_patched_classes(package):
     assert methods.METHODS[0] is type(method)
 
 
+def test_a_dict_keyed_by_a_class_finds_the_patched_class(package):
+    package.write(
+        "dispatch",
+        "class Handler:\n    def name(self):\n        return 'old'\n\n"
+        "DISPATCH = {Handler: 'fast'}\n\ndef route(handler):\n"
+        "    return DISPATCH[type(handler)]\n",
+    )
+    dispatch = package.module("dispatch")
+    handler = dispatch.Handler()
+    tracker = package.tracker()
+    package.edit("dispatch", "return 'old'", "return 'new'")
+
+    package.reload_stale(tracker)
+
+    assert dispatch.route(handler) == "fast" and handler.name() == "new"
+
+
+def test_a_removed_enum_member_stays_and_the_rest_of_the_edit_lands(package):
+    package.write(
+        "modes",
+        "import enum\n\nclass Mode(enum.Enum):\n    FAST = 1\n    SLOW = 2\n\n"
+        "def label():\n    return 'old'\n",
+    )
+    modes = package.module("modes")
+    tracker = package.tracker()
+    package.edit("modes", "    SLOW = 2\n", "")
+    package.edit("modes", "return 'old'", "return 'new'")
+
+    report = package.reload_stale(tracker)
+
+    assert modes.label() == "new"
+    assert any(entry.endswith("Mode.SLOW") for entry in report.stale)
+
+
 def test_the_report_names_run_time_state_the_reload_reset(package):
     package.write(
         "config",

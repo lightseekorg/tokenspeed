@@ -573,8 +573,10 @@ class _Patcher:
         if type(value) is list:
             value[:] = [item(element) for element in value]
         elif type(value) is dict:
-            for key, element in list(value.items()):
-                value[key] = item(element)
+            # Keys too: a dict keyed by the module's class looks up the old object.
+            items = [(self._translate(k), item(e)) for k, e in value.items()]
+            value.clear()
+            value.update(items)
         elif type(value) is set:
             elements = {item(element) for element in value}
             value.clear()
@@ -765,7 +767,12 @@ class _Patcher:
                 bound_now is not None and name in bound_before and name not in bound_now
             )
             if deleted or _defined_in_body(member, old, name):
-                delattr(old, name)
+                try:
+                    delattr(old, name)
+                except (AttributeError, TypeError):
+                    # An enum member, for one, cannot be deleted.
+                    self.report.stale.append(f"{_describe(old)}.{name}")
+                    continue
                 self.report.undo.append(
                     functools.partial(_restore_attribute, old, name, member)
                 )
