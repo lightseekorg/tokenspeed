@@ -387,8 +387,11 @@ class _Backend:
     [(0, 1, 1), (0, 4, 4), (3, 4, 4), (0, 1, 4)],
 )
 def test_lm_head_checkpoint_and_logits_follow_model_dtype(
-    device, fused, dtype, rank, tp_size, world_size
+    device, fused, dtype, rank, tp_size, world_size, monkeypatch
 ):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
     if device != "cpu" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     config = _config()
@@ -410,8 +413,8 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     checkpoint = torch.zeros(
         config.vocab_size, config.hidden_size, dtype=torch.bfloat16, device="cpu"
     )
-    checkpoint[start : start + 2, 0] = 1
-    checkpoint[start + 1, 1] = 2**-9
+    checkpoint[start + 3 : start + 5, 0] = 1
+    checkpoint[start + 4, 1] = 2**-9
     adapter.load_weights([("head.weight", checkpoint)])
     local = checkpoint[start : start + head.weight.shape[0]].to(
         device=device, dtype=dtype
@@ -422,7 +425,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     hidden = torch.ones(1, config.hidden_size, dtype=torch.bfloat16, device=device)
     expected = F.linear(hidden.to(dtype), local, bias=None)
     # BF16 rounds the near tie; wider dtypes retain the second token's margin.
-    expected_token = 0 if dtype == torch.bfloat16 else 1
+    expected_token = 3 if dtype == torch.bfloat16 else 4
     assert expected.argmax(-1).item() == expected_token
 
     processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
@@ -443,6 +446,104 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     assert output.next_token_logits.dtype == dtype
     torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
     assert output.next_token_logits.argmax(-1).item() == expected_token
+
+
+@pytest.mark.parametrize("disable_blacklist", [False, True])
+@pytest.mark.parametrize("fuse_argmax", [False, True])
+def test_generation_token_blacklist_precedes_argmax(
+    fuse_argmax, disable_blacklist, monkeypatch
+):
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "disable_deepseek_v41_token_blacklist",
+        disable_blacklist,
+    )
+    config = _config()
+    config.vocab_size = 129280
+    config.hidden_size = 1
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.mapping = _mapping(0, 1, 1)
+    with torch.device("cpu"):
+        adapter.lm_head = adapter.resolve_lm_head(
+            SimpleNamespace(text_config=config), None, ""
+        )
+    blocked = [0, 2, 129262, 129263, 129264]
+    with torch.no_grad():
+        adapter.lm_head.weight.zero_()
+        adapter.lm_head.weight[blocked, 0] = 4
+        adapter.lm_head.weight[3, 0] = 2
+    processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
+    if fuse_argmax:
+        processor.fuse_argmax()
+
+    hidden = torch.ones(1, 1)
+    output = processor(
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        hidden_states=hidden,
+        lm_head=adapter.lm_head,
+        logits_metadata=LogitsMetadata.from_forward_context(
+            _ctx(None, 1, ForwardMode.DECODE)
+        ),
+        aux_hidden_states=None,
+    )
+
+    expected = F.linear(hidden, adapter.lm_head.weight)
+    expected_token = 3
+    if not disable_blacklist:
+        expected[0, blocked] = float("-inf")
+    else:
+        expected_token = 0
+    torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
+    assert output.next_token_logits.argmax(-1).item() == expected_token
+    if fuse_argmax:
+        assert output.next_token_ids.item() == expected_token
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+def test_generation_token_blacklist_uses_global_ids_on_vocab_shards(rank, monkeypatch):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", False
+    )
+    config = _config()
+    config.vocab_size = 129280
+    config.hidden_size = 1
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.mapping = _mapping(rank, 4, 4)
+    with torch.device("cpu"):
+        adapter.lm_head = adapter.resolve_lm_head(
+            SimpleNamespace(text_config=config), None, ""
+        )
+    width = adapter.lm_head.weight.shape[0]
+    start = rank * width
+    blocked = [0, 2, 129262, 129263, 129264]
+    local_blocked = [
+        token_id - start for token_id in blocked if start <= token_id < start + width
+    ]
+    with torch.no_grad():
+        adapter.lm_head.weight.zero_()
+        adapter.lm_head.weight[local_blocked, 0] = 4
+        adapter.lm_head.weight[3, 0] = 2
+    processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
+    # Exercise the real local shard without substituting a four-rank collective.
+    processor.skip_all_gather = True
+
+    hidden = torch.ones(1, 1)
+    output = processor(
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        hidden_states=hidden,
+        lm_head=adapter.lm_head,
+        logits_metadata=LogitsMetadata.from_forward_context(
+            _ctx(None, 1, ForwardMode.DECODE)
+        ),
+        aux_hidden_states=None,
+    )
+
+    expected = F.linear(hidden, adapter.lm_head.weight)
+    expected[0, local_blocked] = float("-inf")
+    torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
+    assert output.next_token_logits.argmax(-1).item() == 3
 
 
 def test_hc_post_rejects_unfinished_reduction():
@@ -2522,6 +2623,9 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
     "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph"]
 )
 def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
     config = _config()
     config.hidden_size = 256
     config.moe_intermediate_size = 256
