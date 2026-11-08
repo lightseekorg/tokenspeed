@@ -902,12 +902,18 @@ class ServerArgs:
             self.kv_parallel_size != 1
             or self.decode_context_parallel_size != 1
             or self.query_context_parallel_size != 1
-            or self.mapping.has_attn_dp
             or self.pipeline_parallel_size != 1
             or self.dp_sampling
         ):
             raise ValueError(
-                "V4.1 adaptive verification requires KVP1/DCP1, attention DP1 and PP1"
+                "V4.1 adaptive verification requires QCP1/KVP1/DCP1 and PP1"
+            )
+        if (
+            self.mapping.attn.has_head_tp
+            or self.mapping.lm_head.tp_size != self.mapping.attn.tp_size
+        ):
+            raise ValueError(
+                "adaptive DSpark requires head and vocabulary groups to follow attention TP"
             )
         if (
             self.grammar_backend != "none"

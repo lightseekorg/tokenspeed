@@ -1434,7 +1434,11 @@ def _assert_adaptive_inputs_and_state(adapter):
     drafter.confidence_scores[1].copy_(torch.tensor([1, -1, 1, 1, 1], device=device))
     drafter.confidence_scores[3].copy_(torch.tensor([1, 1, -1, 1, 1], device=device))
     saved_positions = ib.positions_buf[:12].clone()
+    drafter.prepare_verify_layout((2, 3), num_tokens=5)
+    drafter.set_decode_graph_query_extent(5)
+    ctx.global_num_tokens = [12] * 8
     with drafter.target_forward_context(ctx):
+        assert ctx.global_num_tokens == [5] * 8
         assert ctx.input_num_tokens == 5
         assert ctx.decode_query_indptr.tolist() == [0, 2, 5]
         assert ib.input_ids_buf[:5].tolist() == [0, 1, 6, 7, 8]
@@ -1443,6 +1447,7 @@ def _assert_adaptive_inputs_and_state(adapter):
         rows = torch.tensor([0, 1, 6, 7, 8], device=device)
         torch.testing.assert_close(ib.ngram_hash_ids_buf[:5], original_hashes[rows])
         torch.testing.assert_close(ib.ngram_token_mask_buf[:5], original_mask[rows])
+    assert ctx.global_num_tokens == [12] * 8
     torch.testing.assert_close(ib.input_ids_buf[:12], original)
     torch.testing.assert_close(ib.ngram_hash_ids_buf[:12], original_hashes)
     torch.testing.assert_close(ib.ngram_token_mask_buf[:12], original_mask)
@@ -1461,8 +1466,9 @@ def _assert_adaptive_inputs_and_state(adapter):
         torch.testing.assert_close(drafter.verify_candidates().flatten(), changed)
     torch.testing.assert_close(ib.input_ids_buf[:12], changed)
 
-    # Reordered batches retain each request's prediction, not its old row's.
+    # The allocator publishes the layout for the reordered request rows.
     ctx = prepare(["b", "a"], [3, 1])
+    drafter.prepare_verify_layout((3, 2), num_tokens=5)
     with pytest.raises(RuntimeError, match="target failed"):
         with drafter.target_forward_context(ctx):
             assert ctx.decode_query_indptr.tolist() == [0, 3, 5]
@@ -1484,8 +1490,10 @@ def _assert_adaptive_inputs_and_state(adapter):
     assert torch.isposinf(drafter.confidence_scores[0]).all()
 
     ctx = prepare(["new", "b"], [1, 3])
+    assert torch.isposinf(drafter.confidence_scores[1]).all()
+    drafter.set_decode_graph_query_extent(None)
     with drafter.target_forward_context(ctx):
-        assert ctx.decode_query_indptr.tolist() == [0, 6, 9]
+        assert ctx.decode_query_indptr is None
     drafter.on_target_weights_updated()
     ctx = prepare(["new", "b"], [1, 3])
     with drafter.target_forward_context(ctx):

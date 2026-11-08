@@ -1362,15 +1362,21 @@ class ForwardStepRunner:
                         ]
                     )
             if self._expert_load_rows is not None:
-                # Every rank replays the same padded batch; the live rows are
-                # the DP-gathered live counts (this rank's own without DP).
+                query_tokens = (
+                    self._decode_query_tokens or padded_bs * self.max_tokens_per_req
+                )
+                packed = query_tokens != padded_bs * self.max_tokens_per_req
+                # Packed verification uses one agreed capacity on all ranks.
                 self._expert_load_rows.mark_padded(
-                    padded_global_num_tokens=[padded_bs * self.max_tokens_per_req]
-                    * self.world_size,
+                    padded_global_num_tokens=[query_tokens] * self.world_size,
                     live_global_num_tokens=(
-                        ctx.global_num_tokens
-                        if ctx.global_num_tokens is not None
-                        else [ctx.input_num_tokens] * self.world_size
+                        [query_tokens] * self.world_size
+                        if packed
+                        else (
+                            ctx.global_num_tokens
+                            if ctx.global_num_tokens is not None
+                            else [ctx.input_num_tokens] * self.world_size
+                        )
                     ),
                 )
             with (

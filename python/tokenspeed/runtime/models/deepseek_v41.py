@@ -129,6 +129,9 @@ from tokenspeed.runtime.distributed.comm_ops import (
     token_all_gather_rows,
 )
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
@@ -2112,9 +2115,12 @@ class DeepseekV41DecoderLayer(nn.Module):
             captured = residual.mean(dim=1) if capture_input else None
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
             self.attn(positions, x, ctx, reduce_output=True)
-            if (rows.query_shard is None and self.ffn.owns_ep_communication) or (
-                rows.query_shard is not None and rows.query_shard.total_rows
-            ):
+            # A rank with no CED tail still joins the other DP ranks' MoE.
+            # Ordinary EP gathers/scatters here, just as fused EP dispatches.
+            if (
+                rows.query_shard is None
+                and (self.ffn.owns_ep_communication or self.attn.mapping.attn.has_dp)
+            ) or (rows.query_shard is not None and rows.query_shard.total_rows):
                 self._forward_ffn(
                     x[:0],
                     None if image_mask is None else image_mask[:0],
@@ -2319,7 +2325,24 @@ class DeepseekV41DecoderLayer(nn.Module):
                 ctx=ctx if self.ffn.use_mega_moe else None,
                 comm_manager=self.comm_manager if self.ffn.use_mega_moe else None,
             )
-        x = self.comm_manager.pre_mlp_comm(x, ctx)
+        # DP ranks may mix image and text rows. Carry the routing mask in
+        # the same gather as the activations; keep the wire width 16B aligned.
+        gather_mask = (
+            self.attn.mapping.attn.has_dp
+            and not ctx.all_decode_or_idle
+            and self.ffn.gate.bias_vl is not None
+        )
+        if gather_mask:
+            width = x.shape[1]
+            packed = x.new_zeros((x.shape[0], width + 8))
+            packed[:, :width].copy_(x)
+            if image_mask is not None:
+                packed[:, width].copy_(image_mask)
+            packed = self.comm_manager.pre_mlp_comm(packed, ctx)
+            x = packed[:, :width].contiguous()
+            image_mask = packed[:, width].bool()
+        else:
+            x = self.comm_manager.pre_mlp_comm(x, ctx)
         total, maximum = self.comm_manager.get_num_tokens(ctx)
         all_reduced = self.comm_manager.moe_output_all_reduced(ctx)
         target = None
@@ -2358,6 +2381,18 @@ def _ced_decoder_start(config) -> int:
             "V4.1 CED requires the candidate source to be the last KV owner"
         )
     return start
+
+
+def _exchange_decoder_counts(num_rows: int, world_size: int) -> list[int]:
+    counts = [0] * world_size
+    torch.distributed.all_gather_object(
+        counts,
+        num_rows,
+        group=pg_manager.get_process_group(
+            "gloo", tuple(range(world_size)), name="v41_decoder_counts"
+        ),
+    )
+    return counts
 
 
 @dataclass
@@ -2449,16 +2484,24 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
-        local_fused_ep = (
-            (get_moe_backend().is_gluon_petit() or get_moe_backend().is_mega_moe())
-            and mapping.attn.tp_size
-            == mapping.dense.tp_size
-            == mapping.moe.tp_size
-            == 1
+        local_ep = (
+            mapping.attn.tp_size == mapping.dense.tp_size == mapping.moe.tp_size == 1
         )
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_fused_ep:
+        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_ep:
             raise NotImplementedError(
-                "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
+                "V4.1 requires attention TP == MoE TPxEP or EP with attention/dense/MoE TP1"
+            )
+        if mapping.attn.has_dp and not (
+            get_moe_backend().is_gluon_petit() or get_moe_backend().is_mega_moe()
+        ):
+            if not global_server_args_dict["disable_prefill_graph"]:
+                raise ValueError("V4.1 ordinary DP/EP requires --disable-prefill-graph")
+            # Forward and scheduler threads must not interleave collectives
+            # on the scheduler's shared CPU communicator.
+            pg_manager.init_process_group(
+                tuple(range(mapping.world_size)),
+                backend="gloo",
+                name="v41_decoder_counts",
             )
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
@@ -2583,17 +2626,23 @@ class DeepseekV41Model(nn.Module):
                 pre_mix = torch.empty(
                     (0, self.config.hc_mult), dtype=torch.float32, device=hidden.device
                 )
-                for layer in self.layers:
-                    hidden, pre_mix, _, _ = layer(
-                        hidden,
-                        pre_mix,
-                        positions,
-                        image_mask,
-                        ctx,
-                        pending_post=None,
-                        allow_ffn_reduce_fusion=False,
-                        capture_input=False,
-                    )
+                counts = None
+                for index, layer in enumerate(self.layers):
+                    # Match both eager CED stages on active peers. Idle ranks
+                    # still participate in their expert collectives with zero rows.
+                    if index in (self.ced_decoder_start, self.ced_decoder_start + 1):
+                        counts = self.decoder_collective_counts(ctx, 0)
+                    with report_collective_sizing(ctx, 0, counts):
+                        hidden, pre_mix, _, _ = layer(
+                            hidden,
+                            pre_mix,
+                            positions,
+                            image_mask,
+                            ctx,
+                            pending_post=None,
+                            allow_ffn_reduce_fusion=False,
+                            capture_input=False,
+                        )
             return (
                 self.embed_tokens.weight.new_empty((0, self.config.hidden_size)),
                 None,
@@ -2735,6 +2784,26 @@ class DeepseekV41Model(nn.Module):
         state.hidden, state.pre_mix = h, pre_mix
         return state
 
+    def decoder_collective_counts(
+        self, ctx: ForwardContext, num_rows: int
+    ) -> list[int] | None:
+        """Exchange the CED row counts once, including idle DP ranks.
+
+        Decode does not narrow and uses the scheduler's graph-compatible
+        counts. Eager prefill exchanges host shape metadata, not CUDA data.
+        """
+        if (
+            not self.mapping.attn.has_dp
+            or self.ced_decoder_start >= len(self.layers)
+            or self.layers[self.ced_decoder_start].ffn.owns_ep_communication
+        ):
+            return None
+        if ctx.global_num_tokens is None or ctx.all_decode_or_idle:
+            return ctx.global_num_tokens
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("V4.1 DP prefill requires --disable-prefill-graph")
+        return _exchange_decoder_counts(num_rows, self.mapping.world_size)
+
     def narrowing_forward(self, state: V41RowState, ctx: ForwardContext) -> V41RowState:
         """Run the candidate source layer and narrow to the decoder view.
 
@@ -2760,23 +2829,10 @@ class DeepseekV41Model(nn.Module):
         if state.rows > rows:
             state = state.leading(rows)
         view = backend.decoder_view()
-        # Checked here, in the stage that always runs eagerly: a replayed
-        # encoder graph would skip a check placed before it.
-        if (
-            view.keep_rows is not None
-            and ctx.query_shard is None
-            and ctx.global_num_tokens is not None
-            and not self.layers[start].ffn.owns_ep_communication
-        ):
-            raise NotImplementedError(
-                "V4.1 CED narrowing under attention data parallelism needs the "
-                "narrowed row counts exchanged across ranks"
-            )
+        counts = self.decoder_collective_counts(ctx, view.metadata.positions.numel())
         captured = list(state.captured)
-        # Fused EP exchanges actual local row counts inside its dispatch. The
-        # original DP counts remain valid capacity bounds after CED narrowing;
-        # no host exchange is needed for its routed or rank-local shared experts.
-        with report_collective_sizing(ctx, view.metadata.positions.numel(), None):
+        # Ordinary EP needs the narrowed rows; fused EP exchanges counts itself.
+        with report_collective_sizing(ctx, view.metadata.positions.numel(), counts):
             hidden, pre_mix, pending_post = self._run_layer(
                 self.layers[start],
                 state.hidden,
@@ -2840,7 +2896,8 @@ class DeepseekV41Model(nn.Module):
         pending_post = None
         layers = self.layers[start + 1 :]
         if layers:
-            with report_collective_sizing(ctx, state.rows, None):
+            counts = self.decoder_collective_counts(ctx, state.rows)
+            with report_collective_sizing(ctx, state.rows, counts):
                 for layer in layers:
                     h, pre_mix, pending_post = self._run_layer(
                         layer,

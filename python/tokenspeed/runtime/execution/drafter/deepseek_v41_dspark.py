@@ -313,6 +313,18 @@ class DeepseekV41DSpark(BaseDrafter):
         if self.verify_budget_policy is not None:
             self._active_verify_timing = None
             self._verify_step_id += 1
+            if self.draft_model.mapping.attn.dp_size > 1:
+                # Admission must use global metadata before entering collectives.
+                # An empty, unequal or graph-padded peer makes every rank native.
+                if (
+                    ctx.global_bs is None
+                    or ctx.global_num_decodes is None
+                    or len(ctx.global_bs) != len(self._verification_group)
+                    or len(ctx.global_num_decodes) != len(self._verification_group)
+                    or any(n != padded_bs for n in ctx.global_bs)
+                    or any(n != padded_bs for n in ctx.global_num_decodes)
+                ):
+                    return padded_bs * self.spec_num_tokens
             if not self.verify_budget_policy.admits(
                 batch_size=actual_bs, graph_batch_size=padded_bs
             ):
@@ -388,6 +400,7 @@ class DeepseekV41DSpark(BaseDrafter):
         ib = self.input_buffers
         original = ctx.bs * self.spec_num_tokens
         snapshots = []
+        original_global_num_tokens = ctx.global_num_tokens
         ctx.decode_query_indptr = self._verify_indptr[: ctx.bs + 1]
         try:
             for view in (
@@ -405,6 +418,8 @@ class DeepseekV41DSpark(BaseDrafter):
                     saved.index_select(0, self._verify_rows[:num_tokens])
                 )
             ctx.input_num_tokens = num_tokens
+            if original_global_num_tokens is not None:
+                ctx.global_num_tokens = [num_tokens] * len(original_global_num_tokens)
             backend = ctx.attn_backend
             tables = backend.query_metadata(ForwardMode.DECODE).block_tables
             backend.refresh_decode_metadata(
@@ -420,6 +435,7 @@ class DeepseekV41DSpark(BaseDrafter):
             )
             yield
         finally:
+            ctx.global_num_tokens = original_global_num_tokens
             for view, saved in snapshots:
                 view.copy_(saved)
 
@@ -501,6 +517,83 @@ class DeepseekV41DSpark(BaseDrafter):
         self._verify_policy_ms = policy_ms
         self._verify_collecting = False
 
+    @property
+    def _verification_group(self) -> tuple[int, ...]:
+        mapping = self.draft_model.mapping.attn
+        if mapping.dp_size > 1:
+            # PP1 is required: every attention rank participates in shared MoE.
+            return tuple(range(mapping.world_size))
+        return self.tp_group
+
+    @property
+    def _verification_rank(self) -> int:
+        mapping = self.draft_model.mapping.attn
+        return int(mapping.rank if mapping.dp_size > 1 else mapping.tp_rank)
+
+    def _prepare_dp_verify_budget(self, *, batch_size: int) -> int:
+        """Agree one physical capacity while keeping each DP rank's scores."""
+        full = batch_size * self.spec_num_tokens
+        buffers = self._verify_budget_buffers[batch_size]
+        scores = self.verify_feedback.scores()
+        bounds = self.verify_feedback.context_bounds()
+        packet = torch.full(
+            buffers.packet.shape, float("nan"), dtype=torch.float32, pin_memory=True
+        )
+        if scores is not None and bounds is not None:
+            packet[:2] = torch.tensor(bounds, dtype=torch.float32)
+            packet[2:].copy_(torch.tensor(scores, dtype=torch.float32).flatten())
+        buffers.packet.copy_(packet, non_blocking=True)
+        all_gather_single(
+            buffers.peers.flatten(), buffers.packet, self._verification_group
+        )
+        peers = buffers.peers.cpu().tolist()
+        selected = full
+        collecting = True
+        if all(math.isfinite(value) for peer in peers for value in peer):
+            lower = min(int(peer[0]) for peer in peers)
+            upper = max(int(peer[1]) for peer in peers)
+            tp = int(self.draft_model.mapping.attn.tp_size)
+            # TP replicas own the same requests; count their reward only once.
+            rank_scores = [
+                [
+                    peer[2 + i * self.block_size : 2 + (i + 1) * self.block_size]
+                    for i in range(batch_size)
+                ]
+                for peer in peers[::tp]
+            ]
+            for profile in self._verify_calibrations:
+                if profile.covers(
+                    batch_size=batch_size, min_context=lower, max_context=upper
+                ):
+                    collecting = False
+                    selected = self.verify_budget_policy.select_distributed(
+                        rank_scores,
+                        graph_batch_size=batch_size,
+                        native_step_ms=profile.native_step_ms,
+                        adaptive_step_ms=dict(profile.adaptive_step_ms),
+                        policy_ms=self._verify_policy_ms,
+                    )
+                    break
+            if collecting:
+                region = self._verify_context_region((lower, upper))
+                collector = (
+                    self._verify_collectors.get((batch_size, *region))
+                    if region is not None
+                    else None
+                )
+                if collector is not None:
+                    selected = collector.next_capacity() or full
+        self._verify_collecting = collecting
+        if selected != full:
+            # All ranks select the same capacity; each allocates its local rows.
+            source = buffers.peers[self._verification_rank, 2:].view(
+                batch_size, self.block_size
+            )
+            self.prepare_verify_budget_layout(
+                source, batch_size=batch_size, query_capacity=selected
+            )
+        return selected
+
     def _prepare_calibrated_budget(self, *, actual_bs: int, padded_bs: int) -> int:
         full = padded_bs * self.spec_num_tokens
         if (
@@ -512,6 +605,8 @@ class DeepseekV41DSpark(BaseDrafter):
             return full
         self._poll_verify_feedback()
         buffers = self._verify_budget_buffers[actual_bs]
+        if self.draft_model.mapping.attn.dp_size > 1:
+            return self._prepare_dp_verify_budget(batch_size=actual_bs)
         tp = int(self.draft_model.mapping.attn.tp_size)
         rank = int(self.draft_model.mapping.attn.tp_rank)
         selected = full
@@ -579,7 +674,7 @@ class DeepseekV41DSpark(BaseDrafter):
     def _update_verify_calibration(self) -> None:
         # All ranks consume the same aligned history and install the same
         # profiles. No rank may independently skip the calibration collective.
-        tp = int(self.draft_model.mapping.attn.tp_size)
+        tp = len(self._verification_group)
         for sample in self._aligned_verify_samples:
             region = self._verify_context_region(
                 (sample.min_context, sample.max_context)
@@ -623,7 +718,7 @@ class DeepseekV41DSpark(BaseDrafter):
                     (*self._verify_calibrations, profile), policy_ms=0.0
                 )
                 self._save_verify_calibration()
-                if int(self.draft_model.mapping.attn.tp_rank) == 0:
+                if self._verification_rank == 0:
                     logger.info(
                         f"Adaptive DSpark calibration complete: BS={profile.batch_size}, "
                         f"context=[{profile.min_context}, {profile.max_context}], "
@@ -640,26 +735,32 @@ class DeepseekV41DSpark(BaseDrafter):
             buffers.timing_packet.shape, dtype=torch.float64, pin_memory=True
         )
         for index, sample in enumerate(samples):
+            bounds = (sample.min_context, sample.max_context)
+            if self.draft_model.mapping.attn.dp_size > 1:
+                region = self._verify_context_region(bounds)
+                if region is None:
+                    continue
+                bounds = region
             packet[index].copy_(
                 torch.tensor(
                     [
                         sample.step,
                         sample.batch_size,
                         sample.query_capacity,
-                        sample.min_context,
-                        sample.max_context,
+                        bounds[0],
+                        bounds[1],
                         sample.elapsed_ms,
                     ],
                     dtype=torch.float64,
                 )
             )
         buffers.timing_packet.copy_(packet, non_blocking=True)
-        tp = int(self.draft_model.mapping.attn.tp_size)
+        tp = len(self._verification_group)
         if tp > 1:
             all_gather_single(
                 buffers.timing_peers.flatten(),
                 buffers.timing_packet.flatten(),
-                self.tp_group,
+                self._verification_group,
             )
             peers = buffers.timing_peers.cpu().tolist()
         else:
@@ -694,7 +795,7 @@ class DeepseekV41DSpark(BaseDrafter):
             ),
             peers=torch.empty(
                 (
-                    int(self.draft_model.mapping.attn.tp_size),
+                    len(self._verification_group),
                     2 + graph_bs * self.block_size,
                 ),
                 dtype=torch.float32,
@@ -702,7 +803,7 @@ class DeepseekV41DSpark(BaseDrafter):
             ),
             timing_packet=torch.empty((8, 6), dtype=torch.float64, device=self.device),
             timing_peers=torch.empty(
-                (int(self.draft_model.mapping.attn.tp_size), 8, 6),
+                (len(self._verification_group), 8, 6),
                 dtype=torch.float64,
                 device=self.device,
             ),
@@ -746,8 +847,8 @@ class DeepseekV41DSpark(BaseDrafter):
             process_group_manager,
         )
 
-        tp = int(self.draft_model.mapping.attn.tp_size)
-        rank = int(self.draft_model.mapping.attn.tp_rank)
+        tp = len(self._verification_group)
+        rank = self._verification_rank
         properties = torch.cuda.get_device_properties(self.device)
         hardware = {
             "name": properties.name,
@@ -758,7 +859,7 @@ class DeepseekV41DSpark(BaseDrafter):
             "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         }
         group = (
-            process_group_manager.get_device_process_group(self.tp_group)
+            process_group_manager.get_device_process_group(self._verification_group)
             if tp > 1
             else None
         )
@@ -785,15 +886,17 @@ class DeepseekV41DSpark(BaseDrafter):
                     else []
                 )
                 identity = {
-                    "schema": 1,
+                    "schema": 2,
                     "model": args.model,
                     "revision": args.revision,
                     "model_config": model_config.hf_config.to_dict(),
                     "weights": weights,
                     "devices": devices,
-                    "tp_group": self.tp_group,
+                    "tp_group": self._verification_group,
                     "topology": {
                         "world_size": self.draft_model.mapping.world_size,
+                        "attention_tp": self.draft_model.mapping.attn.tp_size,
+                        "attention_dp": self.draft_model.mapping.attn.dp_size,
                         "moe_tp": self.draft_model.mapping.moe.tp_size,
                         "moe_ep": self.draft_model.mapping.moe.ep_size,
                         "moe_dp": self.draft_model.mapping.moe.dp_size,
@@ -844,7 +947,7 @@ class DeepseekV41DSpark(BaseDrafter):
         if tp > 1:
             payload = [profiles]
             torch.distributed.broadcast_object_list(
-                payload, src=self.tp_group[0], group=group
+                payload, src=self._verification_group[0], group=group
             )
             profiles = payload[0]
         self._cached_verify_profiles = profiles or ()
