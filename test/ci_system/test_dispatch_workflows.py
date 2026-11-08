@@ -1431,6 +1431,7 @@ def test_mi450_sim_uses_bounded_smoke_suite():
     assert task["env"]["MI450_SIM_THREADS_PER_WORKER"] == "2"
     assert 'config["max_ticks"] = 0' in setup_script
     assert "rocm-systems" not in setup_script
+    assert "UV_CACHE_DIR=${UV_CACHE_DIR:-${PIP_CACHE_DIR}/uv}" in setup_script
     assert 'threads_per_emulator="${MI450_SIM_THREADS_PER_WORKER:-2}"' in (
         parallel_script
     )

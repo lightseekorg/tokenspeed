@@ -5,8 +5,10 @@ workflow_stage: unit-test
 triggers:
   - per-commit
   - manual
-import_roots:
-  - tokenspeed-kernel/test
+# Kernel tests never import the runtime (a pre-commit hook checks it).
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
 changed_paths: true
 runner:
   labels:
