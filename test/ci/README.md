@@ -226,20 +226,6 @@ options and test workloads are unchanged. Performance jobs retain the runner's
 Triton cache policy so cold compilation is not newly introduced into measured
 requests.
 
-The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
-tokenizer under
-`.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf`, including the
-request/response database. These artifacts support investigating input,
-output, and speculative acceptance differences alongside timing changes. The
-task measures 16 concurrent 50K-input/500-output requests with TP8/EP1 and
-zero benchmark warmup requests.
-
-The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
-predictions and scoring records under
-`.ci-artifacts/published/kimi-k3-eagle3-aime26`. This retains evidence for accuracy
-misses without changing the full 30-question workload, generation settings, or
-score threshold.
-
 Model jobs load weights from the runner's shared Hugging Face cache
 (`HF_HOME`) and must not pass `--download-dir` into the job's work directory.
 The job cleanup deletes the work directory after every job, so a per-job
