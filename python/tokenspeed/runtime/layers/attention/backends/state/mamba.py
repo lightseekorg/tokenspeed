@@ -292,6 +292,9 @@ class MambaAttnBackend(AttentionBackend):
     # Whether the family's prefill scan stores in-forward State checkpoints
     # (SchedulerConfig::state_checkpoint_in_forward).
     _stores_in_forward_state_checkpoints: bool = False
+    # Whether a chain verify's conv update writes dense q/k/v rows and the
+    # ReplaySSM payload (GDN's q | k | v channels and scalar a/b gates).
+    _verify_conv_writes_rows: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -2018,19 +2021,14 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
-            if self.tree_verify is None and not self._verify_packed_qkv_views:
-                # A chain verifies through the dense MTP kernels (FlashInfer's).
-                mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
-            if (
-                self.tree_verify is None
-                and self.replay_ssm
-                and self._verify_scan_writes_replay
-                and self._verify_packed_qkv_views
-            ):
-                # The selected verify reads projection views; conv also fills the replay payload.
-                conv_replay = self._replay_inputs(
-                    layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
-                )
+            if self.tree_verify is None and self._verify_conv_writes_rows:
+                # A chain's conv update reads the projection view and writes dense
+                # q/k/v rows and the ReplaySSM payload: no pack and no split. The
+                # verify kernels read the gates as projection views.
+                if self.replay_ssm:
+                    conv_replay = self._replay_inputs(
+                        layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
+                    )
                 conv_rows = mixed_qkv.new_empty(mixed_qkv.shape).view(
                     batch_size, draft_token_num, -1
                 )
@@ -2171,7 +2169,7 @@ class MambaAttnBackend(AttentionBackend):
                 and (
                     self._verify_packed_qkv_views
                     or scan_replay is not None
-                    or conv_replay is not None
+                    or conv_rows is not None
                 )
                 or not is_target_verify
                 and self._prefill_supports_strided_qkv()

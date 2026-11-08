@@ -173,10 +173,11 @@ def test_verify_has_no_elementwise_launches(
 
 @pytest.mark.parametrize("steps", [1, 3])
 def test_gdn_backend_reads_projection_views_like_dense_inputs(steps: int) -> None:
-    """Plain decode and chain verify pack the model's row-strided projection
-    views (here with a misaligned ``a``) for FlashInfer's kernels, or hand them
-    to kernels that read by stride: outputs and states match dense inputs bit
-    for bit."""
+    """Plain decode packs the model's row-strided projection views (here with a
+    misaligned ``a``) for FlashInfer's kernel, or hands them to kernels that
+    read by stride; chain verify's conv update writes dense q/k/v rows and the
+    verify reads the gates by stride. Outputs and states match dense inputs
+    bit for bit."""
     from tokenspeed.runtime.layers.attention.backends.state.gdn import GdnAttnBackend
 
     torch.manual_seed(5)
