@@ -24,12 +24,14 @@ import torch
 from tokenspeed_kernel.ops.gemm import (
     has_flashinfer_cute_dsl_nvfp4_a16 as kernel_has_flashinfer_cute_dsl_nvfp4_a16,
 )
+from tokenspeed_kernel.ops.gemm import (
+    interleave_linear_and_gate,
+)
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm import (
     prepare_nvfp4_a16_weights as kernel_prepare_nvfp4_a16_weights,
 )
-from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
-    interleave_linear_and_gate,
+from tokenspeed_kernel.ops.gemm import (
     swizzle_blockscale_2d,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
