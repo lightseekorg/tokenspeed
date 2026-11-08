@@ -22,9 +22,9 @@
 
 Exercise execution modes with all consumers, then each optional consumer alone.
 The same runner entry also commits ordinary hybrid targets without a Qwen4 root.
-A padded replay also sets MegaMoE's live-request counts and restores them, even
-when it fails; the runner arms them only for layouts where every rank stages
-its whole batch.
+A padded replay also marks its filler rows, in MegaMoE's live-request counts and
+the expert load row mask, and restores both, even when it fails; the runner arms
+the counts only for layouts where every rank stages its whole batch.
 """
 
 import os
@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
+from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
 
 
 def _runner(
@@ -277,9 +278,7 @@ def test_failed_execution_does_not_commit_stale_staging(use_graph):
 
 @pytest.mark.parametrize("has_drafter", [False, True])
 @pytest.mark.parametrize("fail_forward", [False, True])
-def test_padded_replay_routes_live_mega_moe_rows_then_restores(
-    fail_forward, has_drafter
-):
+def test_padded_replay_marks_filler_rows_then_restores(fail_forward, has_drafter):
     wrapper, _, _ = _runner(
         use_graph=True,
         has_drafter=has_drafter,
@@ -288,11 +287,16 @@ def test_padded_replay_routes_live_mega_moe_rows_then_restores(
     )
     live_requests = torch.ones(2, dtype=torch.int32)
     wrapper._mega_moe_live_requests = live_requests
+    # One rank's expert load row mask: 4 padded requests of 4 rows each.
+    load_rows = ExpertLoadRowMask(Mapping(rank=0, world_size=1))
+    load_rows.reserve(16, "cpu")
+    wrapper._expert_load_rows = load_rows
+    wrapper.world_size = 1
     seen = []
     replay = wrapper.graphs[4].replay
 
     def recording_replay():
-        seen.append(live_requests.tolist())
+        seen.append((live_requests.tolist(), load_rows.rows(16).tolist()))
         return replay()
 
     wrapper.graphs[4] = SimpleNamespace(replay=recording_replay)
@@ -302,10 +306,12 @@ def test_padded_replay_routes_live_mega_moe_rows_then_restores(
         else nullcontext()
     ):
         _run(wrapper, ForwardMode.DECODE)
-    # MegaMoE routes the rows of the 2 live of 4 padded requests; the replay,
-    # even a failed one, leaves (1, 1) so later eager forwards route every row.
-    assert seen == [[2, 4]]
+    # MegaMoE routes, and the counters count, the rows of the 2 live of 4
+    # padded requests. The replay, even a failed one, restores (1, 1) and the
+    # all-live mask, so later eager forwards route and count every row.
+    assert seen == [([2, 4], [True] * 8 + [False] * 8)]
     assert live_requests.tolist() == [1, 1]
+    assert load_rows.rows(16).tolist() == [True] * 16
 
 
 @pytest.mark.parametrize(

@@ -1359,11 +1359,11 @@ class ForwardStepRunner:
                         graph.replay()
             finally:
                 # Even after a failed replay: later eager forwards must not
-                # skip live rows.
+                # skip live rows, in MegaMoE or in the expert load counters.
                 if live_requests is not None:
                     live_requests.fill_(1)
-            if self._expert_load_rows is not None:
-                self._expert_load_rows.clear()
+                if self._expert_load_rows is not None:
+                    self._expert_load_rows.clear()
 
             result = live_graph_outputs(
                 self.output_buffers[graph_key], bs, self.max_tokens_per_req
