@@ -126,6 +126,10 @@ def select_qsa_sparse_attention_kernel(
         The selected kernel.
     """
 
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        can_use_cute_dsl_fp8_prefill_layout,
+    )
+
     query_width = 1 if max_seqlen_q is None else max_seqlen_q
     supported_tma_gather_layout = False
     if max_seqlen_q is None and sparse_metadata is not None:
@@ -163,6 +167,9 @@ def select_qsa_sparse_attention_kernel(
         and not isinstance(v_scale, torch.Tensor),
         "unscaled_kv": k_scale is None and v_scale is None,
         "supported_tma_gather_layout": supported_tma_gather_layout,
+        "supported_fp8_prefill_layout": can_use_cute_dsl_fp8_prefill_layout(
+            q, k_cache, v_cache, selected_slots, sparse_metadata
+        ),
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     return select_kernel(
@@ -226,7 +233,9 @@ def qsa_sparse_attention(
     The CuTe DSL implementation is preferred for supported uniform decode on
     SM100/SM103/SM107. SM107 BF16 prefill with compatible logical metadata uses
     TMA gather; SM100/SM103 use FlashInfer PrimTS QSA for supported BF16 inputs
-    with logical metadata. Other supported NVIDIA inputs retain FA2.
+    with logical metadata. SM107 FP8 prefill uses native CuTe FP8 Q/P operands
+    for its supported dense geometry; these extra roundings can change outputs.
+    Other supported NVIDIA inputs retain FA2.
     GFX950 uses the Gluon kernel and other AMD GPUs the portable Triton kernel.
     Selection preserves prefill versus decode before adapting ragged inputs to
     independent one-token query rows.
