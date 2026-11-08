@@ -597,7 +597,6 @@ VARIANTS = {
     "router_gemv-rows8": _router_gemv,
     "router_splitk-rows16": _router_splitk,
     "router_with_mm-rows8": lambda: _router_with_mm(8),
-    "router_with_mm-rows16": lambda: _router_with_mm(16),
     "mha_extend_warp_pipelined": _mha_extend_warp_pipelined,
     "mla_prefill_8wave": _mla_prefill_8wave,
     "dsa_persistent_topk": _dsa_persistent_topk,
