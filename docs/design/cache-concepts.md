@@ -257,6 +257,8 @@ the scheduler re-feeds is the retention window itself rather than a second
 declared number. False means an ordinary cached window; the flag changes
 nothing else about the group's geometry.
 
+#### Block tables and exported page IDs
+
 The block tables the scheduler emits are logically *indexed*: row *i* of a
 request's table covers tokens
 `[i * block_granularity, (i + 1) * block_granularity)`. The
@@ -424,10 +426,8 @@ capacity layout without these slots keeps such a forward on its live metadata
 break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
 checkpoint windows at its eager break, over live metadata.
 
-On PD decode admission, a partial leading history block is a landing slot for
-the prefill peer. Installing its private writable block also rewinds the
-reclaimed-prefix frontier to include that slot: the outgoing destination
-table must carry the real block ID, even at logical slot zero.
+For PD landing into a partial history block, follow the
+[block-table export contract](#block-tables-and-exported-page-ids) above.
 
 PD moves exactly one block per state group: `latest_snapshot` is slot 1 of
 the prefill's final state, landing in the decode's slot 1 (its slot 0 stays
