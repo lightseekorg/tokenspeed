@@ -213,6 +213,9 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Appended diagnostic tail: per-token cumulative probability mass, parallel
     # to output_token_logprobs_val. Empty for frames without this diagnostic.
     output_token_cumulative_probs_val: list[list[float]] = []
+    # Cumulative reasoning tokens per request, excluding structural markers.
+    # Appended wire tail: older producers omit it and decode as [].
+    reasoning_tokens: list[int] = []
 
 
 class FlushCacheReqInput(BaseReq, kw_only=True):

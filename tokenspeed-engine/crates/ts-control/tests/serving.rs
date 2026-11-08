@@ -1285,6 +1285,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             multimodal: setup.epd_receive_enabled,
             grammar: setup.grammar,
             reasoning: None,
+            reasoning_usage: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
