@@ -154,3 +154,13 @@ def test_static_schedule_replays_in_cuda_graphs(experts_weights, monkeypatch):
             expected = walked.run(*inputs[b]).clone()
             torch.cuda.synchronize()
             assert torch.equal(static_out[b], expected), (replay, b)
+
+
+def test_run_refuses_a_prefetch_table_the_batch_was_not_prepared_for(
+    experts_weights, monkeypatch
+):
+    static, _ = _engine(experts_weights, (8,), monkeypatch, scheduled=True)
+    x, ids = _routing(8, 400)
+    table = torch.zeros(8, 2, dtype=torch.int64, device="cuda")
+    with pytest.raises(ValueError, match="prepared ahead=False"):
+        static.run(x, ids, ahead=table)

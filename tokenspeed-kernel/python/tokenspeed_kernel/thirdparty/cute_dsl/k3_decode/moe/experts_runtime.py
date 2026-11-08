@@ -243,9 +243,11 @@ class PersistentExperts:
         return self.grids.get(batch, self.grid)
 
     def run(self, x, ids, weights=None, ahead=None):
-        """``ahead``: the next weights' [PREFETCH_ROWS, 2] (address, bytes) table, for
-        batches prepared ``ahead``."""
+        """``ahead``: the next weights' [PREFETCH_ROWS, 2] (address, bytes) table, given
+        exactly for batches prepared ``ahead`` (``self.ahead[batch]``)."""
         batch = x.shape[0]
+        if (ahead is not None) != self.ahead[batch]:
+            raise ValueError(f"B{batch} was prepared ahead={self.ahead[batch]}")
         out, output, workspace, code, box, plan, maps, group = self.prepared[batch]
         output = tensor(weights) if box else output
         source = to_cute(x, 16)
@@ -256,6 +258,6 @@ class PersistentExperts:
         if group is not None and not group[2]:
             self.launch_group(ids, group)
         args = (source, tensor(ids), maps, *self.views[1:], workspace, output)
-        tail = (to_cute(ahead, 16),) if self.ahead.get(batch) else ()
+        tail = () if ahead is None else (to_cute(ahead, 16),)
         code(*args, c.Int32(batch), *self.scalars, *box, *tail, stream(self.device))
         return out
