@@ -6,6 +6,8 @@ triggers:
   - per-commit
   - manual
   - debug
+import_roots:
+  - tokenspeed-kernel/test
 runner:
   labels:
     - amd-mi45x-cpu-test

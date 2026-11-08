@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from process_group_manager import ProcessGroupManager, make_manager
+from runtime_imports import reachable_runtime_paths
 
 try:
     import yaml
@@ -317,6 +318,14 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: optional must be a boolean or a per-label mapping; "
                 f"got {type(optional).__name__}"
             )
+    if "import_roots" in data:
+        roots = data["import_roots"]
+        if (
+            not isinstance(roots, list)
+            or not roots
+            or not all(isinstance(root, str) and root for root in roots)
+        ):
+            raise ValueError(f"{path}: import_roots must be a non-empty string list")
     if "retries" in data:
         retries = data["retries"]
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
@@ -2303,6 +2312,45 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def path_is_unreached(path: str, roots: List[str], reached: frozenset[str]) -> bool:
+    """Whether a changed ``path`` cannot affect a task with ``import_roots``.
+
+    That holds for Markdown, and for runtime sources and runtime tests that
+    are neither under the roots nor imported by them.
+    """
+    if path.endswith(".md"):
+        return True
+    if not path.endswith(".py") or not path.startswith(
+        ("python/tokenspeed/", "test/runtime/")
+    ):
+        return False
+    under_root = any(path == root or path.startswith(f"{root}/") for root in roots)
+    return not under_root and path not in reached
+
+
+def drop_unreached_tasks(
+    include: List[Dict[str, Any]], changed: List[str], repo_root: Path
+) -> List[Dict[str, Any]]:
+    """Drop the entries of tasks that no changed path can affect."""
+    reached_by_config: Dict[str, Optional[tuple]] = {}
+    kept = []
+    for entry in include:
+        config = entry["config"]
+        if config not in reached_by_config:
+            roots = normalize_task(repo_root / config, repo_root).get("import_roots")
+            reached_by_config[config] = (
+                None
+                if roots is None
+                else (roots, reachable_runtime_paths(repo_root, roots))
+            )
+        scope = reached_by_config[config]
+        if scope is None or not all(
+            path_is_unreached(path, *scope) for path in changed
+        ):
+            kept.append(entry)
+    return kept
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "scan":
@@ -2338,6 +2386,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                         and entry.get("workflow_stage") == "kernel-benchmark"
                     )
                 ]
+            # Pull requests only: pushes to main still run every task.
+            if args.trigger == "per-commit" and 0 < len(changed) < 300:
+                matrix["include"] = drop_unreached_tasks(
+                    matrix["include"], changed, repo_root
+                )
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 
