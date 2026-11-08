@@ -62,6 +62,7 @@ VENDOR_PATHS = {
         "test/ci_system/install_deps_rocm.sh",
         "test/ci_system/install_kernel_benchmark_rocm.sh",
         "test/ci_system/kernel_benchmark_ci.py",
+        "test/ci_system/verify_rocm_stack.py",
         "tokenspeed-kernel-amd",
         "tokenspeed-kernel/benchmarks/amd",
         "tokenspeed-kernel/python/requirements/rocm.txt",
