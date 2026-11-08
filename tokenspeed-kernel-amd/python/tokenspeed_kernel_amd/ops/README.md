@@ -630,7 +630,9 @@ quantize the result for `wo_b` (`gluon_grouped_bf16_projection_fp8_gfx1250`).
   contiguous `B` `[G, N, K]`, and returns contiguous BF16 `[M, G, N]`. With
   quantization (`N` divisible by 32) it returns E4M3 codes `[M, G * N]` and
   uint8 UE8M0 scales `[M, G * N / 32]`, bit-identical to quantizing the BF16
-  result with `gluon_quantize_fp8_group32_ue8m0_gfx1250`.
+  result of the same K split with `gluon_quantize_fp8_group32_ue8m0_gfx1250`.
+  Up to 32 rows that split differs from the unquantized form's, so a sum can
+  round to an adjacent BF16 value before it is quantized.
 
 #### Algorithm
 

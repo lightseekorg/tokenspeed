@@ -93,7 +93,6 @@ RUNNER_GROUP_PATHS = {
     **{
         f"test/ci_system/{name}": frozenset({"amd-mi450"})
         for name in (
-            "mi450_rocjitsu_worker_python.sh",
             "mi450_sim_env.sh",
             "mi450_sim_report_digest.py",
             "run_mi450_rocjitsu.sh",

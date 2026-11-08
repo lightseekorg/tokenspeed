@@ -1293,7 +1293,9 @@ def grouped_bf16_projection_quantize_fp8(
         ``[tokens, groups * output_dim / 32]`` of the BF16 projection, as
         ``quantize_fp8(granularity="token_group", group_size=32,
         scale_encoding="ue8m0")`` produces them. A kernel that quantizes in
-        its epilogue is used when one is registered for the geometry.
+        its epilogue is used when one is registered for the geometry; it may
+        split K differently from ``grouped_bf16_projection``, so a BF16 value
+        it quantizes can differ from that projection's by one ulp.
     """
     try:
         kernel = select_kernel(
