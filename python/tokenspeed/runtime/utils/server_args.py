@@ -859,7 +859,7 @@ class ServerArgs:
         self.validate()
 
     def resolve_request_state_seqs(self):
-        """Size per-request decode state for the draft decode warmup.
+        """Sizes per-request decode state for the draft decode warmup.
 
         The warmup decodes one request per attention-TP peer on every DP rank,
         so empty peers never skip the tuning collectives the others enter
@@ -2974,11 +2974,10 @@ class ServerArgs:
             metavar="MAX_NUM_SEQS",
             type=int,
             default=ServerArgs.max_num_seqs,
-            help="Maximum number of sequences to process concurrently. With "
-            "speculative decoding, the server still sizes per-request decode "
-            "state for at least one request per attention-TP peer per DP rank, "
-            "which the draft decode warmup needs, but the scheduler runs at "
-            "most this many.",
+            help="Maximum number of sequences the scheduler runs concurrently. "
+            "With speculative decoding outside prefill-only roles, the server "
+            "sizes per-request decode state for at least one request per "
+            "attention-TP peer per DP rank, which the draft decode warmup needs.",
         )
         parser.add_argument(
             "--max-total-tokens",

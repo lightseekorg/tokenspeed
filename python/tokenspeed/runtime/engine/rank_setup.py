@@ -229,13 +229,13 @@ def request_length_limits(
 
 
 def scheduler_batch_slots(server_args: ServerArgs) -> int:
-    """Requests this rank's scheduler runs at once: --max-num-seqs per
+    """Returns the requests this rank's scheduler runs at once: --max-num-seqs per
     attention-DP rank."""
     return server_args.max_num_seqs // max(server_args.mapping.attn.dp_size, 1)
 
 
 def request_state_slots(server_args: ServerArgs) -> int:
-    """Requests this rank's per-request decode state is sized for:
+    """Returns the requests this rank's per-request decode state is sized for:
     ``ServerArgs.request_state_seqs`` per attention-DP rank, never fewer than
     the scheduler runs."""
     return server_args.request_state_seqs // max(server_args.mapping.attn.dp_size, 1)

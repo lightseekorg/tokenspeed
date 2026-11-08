@@ -2489,13 +2489,13 @@ The startup draft decode uses one request per attention TP rank so that
 sequence-parallel router projections have nonempty, equal local row counts.
 A single-request TP warmup can skip a GEMM on an empty peer while another
 peer waits in distributed tactic selection. The draft remains in the same
-autotune context as the target. Serving batches and graph capture sizes are
-unchanged. TokenSpeed therefore sizes per-request decode state (request
-slots, decode buffers, drafter state, decode graphs) for at least one request
-per attention TP peer on every DP rank: `ServerArgs.request_state_seqs` is
-`max(max_num_seqs, data_parallel_size * attn_tp_size)` for a speculative
-decode service, including with `--disable-autotune` (which disables
-profiling, not startup warmup). The scheduler still runs at most
-`--max-num-seqs` requests, so a smaller cap (one or two requests at TP8)
-only costs the extra slots' memory. Prefill-only roles do not run this draft
-decode warmup and keep `request_state_seqs == max_num_seqs`.
+autotune context as the target. TokenSpeed sizes per-request decode state
+(request slots, decode buffers, drafter state, sampling pools, and decode
+graphs) for at least one request per attention-TP peer on every DP rank: for
+a speculative decode service, `ServerArgs.request_state_seqs` is
+`max(max_num_seqs, data_parallel_size * attn_tp_size)`. This holds with
+`--disable-autotune` too, which disables profiling but not the startup
+warmup. The scheduler still runs at most `--max-num-seqs` requests, so a
+smaller cap costs only the memory of the extra slots and graphs.
+Prefill-only roles do not run this draft decode warmup and keep
+`request_state_seqs == max_num_seqs`.
