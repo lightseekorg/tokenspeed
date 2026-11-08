@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-
 CHECKER = Path(__file__).with_name("verify_rocm_stack.py")
 
 

@@ -20,12 +20,12 @@ def _version_matches(actual: str, expected: str) -> bool:
     return actual == expected or actual.startswith(f"{expected}+")
 
 
-def _require_exact(
-    errors: list[str], distribution: str, expected: str
-) -> None:
+def _require_exact(errors: list[str], distribution: str, expected: str) -> None:
     actual = _installed_version(distribution)
     if actual != expected:
-        errors.append(f"{distribution}: expected {expected}, found {actual or 'missing'}")
+        errors.append(
+            f"{distribution}: expected {expected}, found {actual or 'missing'}"
+        )
 
 
 def _verify_mi450_sdk(uv_version: str, rocm_version: str) -> list[str]:
