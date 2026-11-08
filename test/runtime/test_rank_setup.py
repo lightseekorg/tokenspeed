@@ -109,6 +109,54 @@ def test_an_engine_without_l3_passes_no_prefetch_threshold():
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("role,interval", [("null", 0), ("null", 2), ("prefill", 0)])
+def test_short_prefill_flag_controls_real_scheduler_order(enabled, role, interval):
+    flags = ["--enable-short-prefill-first"] if enabled else []
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--chunked-prefill-size",
+            "64",
+            "--disaggregation-mode",
+            role,
+            "--prefill-decode-interval",
+            str(interval),
+            *flags,
+        ]
+    )
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=ts.AttnKind.Full,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    requests = []
+    for request_id, tokens in [("long", list(range(128))), ("short", [501])]:
+        request = ts.RequestSpec()
+        request.request_id = request_id
+        request.tokens = tokens
+        request.max_new_tokens = 1
+        requests.append(request)
+    scheduler.submit_requests(requests)
+    if role == "prefill":
+        event = ts.ExecutionEvent()
+        for request in requests:
+            event.add_event(ts.PD.BootstrappedEvent(request.request_id))
+        scheduler.advance(event)
+    plan = scheduler.next_execution_plan()
+    assert plan.forward[0].request_ids == (["short", "long"] if enabled else ["long"])
+    assert plan.forward[0].input_lengths == ([1, 63] if enabled else [64])
+
+
 def test_make_config_requires_and_maps_the_host_write_policy():
     fields = dict(
         num_device_pages=32,

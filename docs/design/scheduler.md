@@ -278,6 +278,26 @@ default), the plans are the ones built without the option. The fused role
 does not offer it: there, retraction picks the largest incomplete prefill
 first, and a carried prompt could make the yielding request that victim.
 
+
+**New prompts retain submission order by default.**
+`--enable-short-prefill-first` opts in to ordering by prompt tokens minus
+currently reusable Device or Host prefixes; equal work preserves submission
+order. Resident chunks retain priority. The policy applies to P and fused
+local prefill; D's remote admission and decode ordering are unchanged.
+
+Only the oldest waiting prompt counts successful later first admissions.
+After eight, it receives selection priority; once it starts or leaves, the
+next oldest gets its own allowance. Priority is reevaluated after each
+admission, including within one batch. Failed admissions and resident chunks
+do not count. When chunk yielding is also enabled, carried first admissions
+count toward the same allowance; the bounded carry scan retains FIFO order.
+Priority cannot bypass resource or transfer dependencies, and
+an inadmissible protected prompt does not block other admissible requests.
+
+Both policies share the same admission and execution path. Ranking does not
+reserve pages or replace the admission-time cache check. With the option
+disabled, there are no extra prefix probes for ranking or bypass counts.
+
 ### 1.2 State groups: two slots, natural checkpoints
 
 A State group (a recurrent layer's state, `AttnKind::kState`) keeps no

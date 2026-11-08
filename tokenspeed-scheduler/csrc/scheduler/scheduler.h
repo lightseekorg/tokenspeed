@@ -529,8 +529,8 @@ private:
     // admits holds the head of line, and the holder's operation then moves
     // behind theirs: the completing prefills run first, the incomplete one
     // last.
-    void carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<const WholePrompt> carried,
-                           std::int32_t decode_reserve);
+    void carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                           std::span<const WholePrompt> carried, std::int32_t decode_reserve);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated

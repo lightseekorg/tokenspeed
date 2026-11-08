@@ -423,6 +423,7 @@ class ServerArgs:
     # Decode rounds owed to the running decodes after each prefill round; 0 is
     # off (docs/design/scheduler.md §3.3).
     prefill_decode_interval: int = 0
+    enable_short_prefill_first: bool = False
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -3029,6 +3030,14 @@ class ServerArgs:
             "only what they take. 0 (default) is off; at most half of "
             "--chunked-prefill-size. A decode server ignores it. See "
             "docs/design/scheduler.md section 1.1.",
+        )
+        parser.add_argument(
+            "--enable-short-prefill-first",
+            action="store_true",
+            default=ServerArgs.enable_short_prefill_first,
+            help="Prefer new local prefill requests with less uncached work, with "
+            "oldest-request starvation protection. Off by default; resident "
+            "chunks retain priority. Applies to fused and prefill roles.",
         )
         parser.add_argument(
             "--enable-mixed-batch",

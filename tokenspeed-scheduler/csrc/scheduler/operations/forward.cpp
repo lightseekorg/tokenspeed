@@ -1650,6 +1650,51 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     return true;
 }
 
+namespace {
+
+constexpr std::int32_t kMaxPrefillBypasses = 8;
+
+struct PendingPrefill {
+    Request* request;
+    std::int32_t remaining_tokens;
+};
+
+Request* popShortPrefill(std::vector<PendingPrefill>& pending) {
+    if (pending.empty()) {
+        return nullptr;
+    }
+    // Reevaluate age after every admission, including inside one batch.
+    // min_element preserves submission order for equal work or protected requests.
+    const auto selected =
+        std::min_element(pending.begin(), pending.end(), [](const PendingPrefill& a, const PendingPrefill& b) {
+            const bool aged_a = a.request->GetIf<fsm::Submitted>()->prefill_bypasses >= kMaxPrefillBypasses;
+            const bool aged_b = b.request->GetIf<fsm::Submitted>()->prefill_bypasses >= kMaxPrefillBypasses;
+            if (aged_a != aged_b) {
+                return aged_a;
+            }
+            return !aged_a && a.remaining_tokens < b.remaining_tokens;
+        });
+    Request* request = selected->request;
+    pending.erase(selected);
+    return request;
+}
+
+void recordPrefillBypass(std::span<Request* const> candidates, const Request* admitted) {
+    // Count only for the oldest waiting prompt. Aging every older prompt
+    // together would disable short-work preference after eight admissions.
+    for (Request* older : candidates) {
+        if (older == admitted) {
+            break;
+        }
+        if (auto* waiting = older->GetIf<fsm::Submitted>()) {
+            waiting->prefill_bypasses = std::min(kMaxPrefillBypasses, waiting->prefill_bypasses + 1);
+            break;
+        }
+    }
+}
+
+}  // namespace
+
 std::optional<std::int32_t> Scheduler::wholePromptTokens(Request& request, Request* resident_holder,
                                                          bool has_state_group) {
     const AdmissionMatch match = matchPrefixAtAdmission(&request);
@@ -1740,8 +1785,8 @@ std::vector<Scheduler::WholePrompt> Scheduler::carriedPrompts(std::span<const Wh
     return carried;
 }
 
-void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<const WholePrompt> carried,
-                                  std::int32_t decode_reserve) {
+void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                  std::span<const WholePrompt> carried, std::int32_t decode_reserve) {
     _assert(!build.operations.empty(), "the holder's row is pushed before the prompts it carries");
     const auto holder_row = static_cast<std::ptrdiff_t>(build.operations.size()) - 1;
     for (const WholePrompt& prompt : carried) {
@@ -1759,6 +1804,9 @@ void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build,
         if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget, decode_reserve,
                                                      build.load_backs, build.kv_page_budget, /*yield_tokens=*/0,
                                                      /*must_complete=*/true)) {
+            if (config_.enable_short_prefill_first) {
+                recordPrefillBypass(candidates, request);
+            }
             pushOperation(build, *request, std::move(*admitted));
             request->TrackScheduledForward();
             _assert(!holdsHeadOfLine(*request), "a carried prompt completes in its round");
@@ -1802,13 +1850,47 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                                          std::int32_t decode_reserve) {
     std::optional<std::vector<WholePrompt>> whole_prompts;
     for (const bool resident : {true, false}) {
-        if (!resident && new_prompts_sealed) {
+        if (build.Full(config_.max_batch_size) || build.token_budget <= 0 ||
+            (!resident && (new_prompts_sealed || req_pool_allocator_.AvailableSlots() == 0))) {
             return;
         }
-        for (std::size_t index = 0; index < candidates.size(); ++index) {
-            Request* request = candidates[index];
-            if (build.Full(config_.max_batch_size)) {
+        const bool short_work_first = !resident && config_.enable_short_prefill_first;
+        std::vector<PendingPrefill> pending;
+        if (short_work_first) {
+            pending.reserve(candidates.size());
+            for (Request* request : candidates) {
+                if (!request->Is<fsm::Submitted>() || build.Scheduled(*request)) {
+                    continue;
+                }
+                // Rank only: admission probes again after earlier admissions may evict pages.
+                const auto match = matchPrefixAtAdmission(request);
+                const auto remaining = match.waits_for_eviction_store
+                                           ? std::numeric_limits<std::int32_t>::max()
+                                           : request->PrefillSize() - std::max(match.probe.device.num_common_tokens,
+                                                                               match.probe.host.num_common_tokens);
+                pending.push_back(PendingPrefill{request, remaining});
+            }
+        }
+        auto fifo = candidates;
+        const auto next_request = [&]() -> Request* {
+            if (short_work_first) {
+                return popShortPrefill(pending);
+            }
+            if (fifo.empty()) {
+                return nullptr;
+            }
+            Request* request = fifo.front();
+            fifo = fifo.subspan(1);
+            return request;
+        };
+        while (true) {
+            if (build.Full(config_.max_batch_size) || build.token_budget <= 0 ||
+                (!resident && req_pool_allocator_.AvailableSlots() == 0)) {
                 return;
+            }
+            Request* request = next_request();
+            if (request == nullptr) {
+                break;
             }
             if ((resident ? !request->Is<fsm::Prefilling>() : !request->Is<fsm::Submitted>()) ||
                 build.Scheduled(*request)) {
@@ -1821,7 +1903,12 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             std::int32_t yield_tokens = 0;
             if (config_.prefill_chunk_yield_tokens > 0 &&
                 (resident ? request->UnscheduledPrefillSize() : request->PrefillSize()) > build.token_budget) {
-                const std::size_t from = resident ? 0 : index + 1;
+                // Carry selection keeps submission order, even when this holder was ranked.
+                std::size_t from = 0;
+                if (!resident) {
+                    const auto holder = std::ranges::find(candidates, request);
+                    from = static_cast<std::size_t>(holder - candidates.begin()) + 1;
+                }
                 if (!whole_prompts) {
                     whole_prompts = wholePromptsAfter(candidates, from, build, resident ? request : nullptr);
                 }
@@ -1842,10 +1929,13 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
                                                          decode_reserve, build.load_backs, build.kv_page_budget,
                                                          yield_tokens, /*must_complete=*/false)) {
+                if (short_work_first) {
+                    recordPrefillBypass(candidates, request);
+                }
                 pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
-                    carryWholePrompts(feedback, build, carried, decode_reserve);
+                    carryWholePrompts(feedback, build, candidates, carried, decode_reserve);
                     return;
                 }
             } else if (feedback.admission_failed) {

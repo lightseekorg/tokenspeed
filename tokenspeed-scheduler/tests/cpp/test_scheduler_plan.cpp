@@ -1455,6 +1455,24 @@ TEST_F(PrefillDecodeIntervalSuite, ANewPromptWaitsForTheIntervalsDecodeRounds) {
     EXPECT_EQ(Round(), "D:ab");
 }
 
+TEST_F(PrefillDecodeIntervalSuite, ShortPrefillOrderingResumesAfterTheDecodeInterval) {
+    auto cfg = MakeConfig();
+    cfg.enable_short_prefill_first = true;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("long", 6, /*start=*/100));
+    Submit(MakeRequestSpec("short", 1, /*start=*/200));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"long"}), "P:shortlong");
+    // Both prompts used their interval allowance. The remaining long chunks
+    // run without another decode delay, even after short's first admission.
+    EXPECT_EQ(Round({"long"}), "P:long");
+    EXPECT_EQ(Round({"long"}), "P:long");
+    EXPECT_EQ(Round(), "P:long");
+}
+
 TEST_F(PrefillDecodeIntervalSuite, APromptIsHeldBackAtMostTheIntervalAcrossItsChunks) {
     Submit(MakeRequestSpec("a", 2));
     EXPECT_EQ(Round(), "P:a");
