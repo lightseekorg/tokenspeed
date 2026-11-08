@@ -268,6 +268,38 @@ def _routed_lamport():
     return _compile_gfx950(fn, types, constexprs, 1)
 
 
+def _residual_rmsnorm():
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        iris_lamport_residual_rmsnorm as fn,
+    )
+
+    policy = iris_arch_policy(ArchVersion(9, 5))
+    types = {
+        "input_ptr": "*bf16",
+        "residual_ptr": "*bf16",
+        "weight_ptr": "*bf16",
+        "norm_out_ptr": "*bf16",
+        "residual_out_ptr": "*bf16",
+        "scatter_ptr": "*bf16",
+        "gather_ptr": "*bf16",
+        "heaps": ("i64",) * 8,
+        "rows": "i32",
+    }
+    constexprs = dict(
+        RANK=5,
+        WIDTH=8192,
+        MAX_LOCAL_ROWS=16,
+        EPS=1e-6,
+        CHUNKS=8,
+        ELEMENTS_PER_THREAD=8,
+        NUM_WARPS=16,
+        PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
+        WAIT_STORES=policy.wait_stores,
+    )
+    return _compile_gfx950(fn, types, constexprs, 16, unspecialized=("rows",))
+
+
 def _rows_gemv(rows):
     # The pre-expert projection of one TP8 rank: 512 outputs over K = 8192.
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import decode_gemv
@@ -558,6 +590,7 @@ VARIANTS = {
     "sliding_tail-rows16": lambda: _sliding_tail(16),
     "attntail_lamport": _attntail_lamport,
     "routed_lamport": _routed_lamport,
+    "residual_rmsnorm": _residual_rmsnorm,
     "rows_gemv-rows4": lambda: _rows_gemv(4),
     "moetail_fused-rows8": _moetail_fused,
     "moetail_columns-rows16": _moetail_columns,
