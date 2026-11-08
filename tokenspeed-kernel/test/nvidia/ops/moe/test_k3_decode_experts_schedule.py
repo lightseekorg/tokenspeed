@@ -120,13 +120,10 @@ SEQUENCE = (4, 5, 6, 7, 8, 8, 16, 4, 8, 16, 8, 8, 8, 5)
 
 
 def test_static_schedule_matches_the_metadata_walk(experts_weights, monkeypatch):
-    # B9-64 run the grouped engine on 152 co-resident CTAs, more than a B200 has SMs.
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    sequence = [b for b in SEQUENCE if b <= 8 or sms >= 152]
-    batches = sorted(set(sequence))
+    batches = sorted(set(SEQUENCE))
     walked, _ = _engine(experts_weights, batches, monkeypatch, scheduled=False)
     static, _ = _engine(experts_weights, batches, monkeypatch, scheduled=True)
-    for step, b in enumerate(sequence):
+    for step, b in enumerate(SEQUENCE):
         x, ids = _routing(b, 100 + step)
         expected = walked.run(x, ids).clone()
         actual = static.run(x, ids).clone()

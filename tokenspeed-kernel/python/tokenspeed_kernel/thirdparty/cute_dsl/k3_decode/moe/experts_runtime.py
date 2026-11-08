@@ -163,7 +163,10 @@ class PersistentExperts:
         # one-wave tail; grouped B9-64 on 152.
         grids = "3-4:148,5-6:128,7:132,9-64:152" if self.tp == 8 else ""
         grids += f",65-{WIDE_ROWS}:152"  # wide: every SM
-        self.grids = batch_table(grids)
+        # Cap at the SM count (148 on B200): the whole grid must be co-resident.
+        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.grid = min(self.grid, sms)
+        self.grids = {b: min(grid, sms) for b, grid in batch_table(grids).items()}
         scalars = (beta * linear_beta, 1 / beta, 1 / linear_beta)
         self.scalars = tuple(map(c.Float32, scalars))
         # The experts kernel uses maps 0-1 (L2 promotion on w13); the TP8 B1 cluster
