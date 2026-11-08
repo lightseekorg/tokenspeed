@@ -1541,7 +1541,7 @@ TEST_F(PdSparseDecodeNoPrefixCacheTestSuite, DecodeStepsWriteTheLandedStateInPla
 
 // P role, two concurrent requests with identical prompts, submitted and
 // admitted in the same first plan: neither can read the other's cache, so
-// both compute duplicate pages. RegisterFullBlocks keeps each request on its
+// both compute duplicate pages. P-only publication keeps each request on its
 // own private block instead of re-pointing it to the other's canonical one,
 // so each hand-off row stays the row its own chunk exported. The tight pool
 // fits only "a" and "b"; a third request "c" cannot be admitted while their
@@ -1678,7 +1678,7 @@ protected:
     }
 };
 
-// Guards RegisterFullBlocks keeping a request's blocks instead of re-pointing
+// Guards P-only publication keeping a request's blocks instead of re-pointing
 // the table to a canonical entry: a re-pointed row would share page ids with
 // the other request's row, and a's or b's hand-off row would stop matching the
 // row its own prefill forward exported.

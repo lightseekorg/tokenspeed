@@ -2491,13 +2491,12 @@ protected:
 
 // Two requests prefill the same prompt and both first decodes rotate their
 // State slots behind the prefills. "a" publishes the prompt end first, so
-// "b"'s prompt-end state stays b's own block, now in slot 0. b stops on its
+// "b" shares the canonical prompt-end state, now in slot 0. b stops on its
 // first sampled token: its first decode runs as a padding row and never
 // writes the fresh slot 1. a's second decode lets the published copy go and
-// a long prompt evicts it before b's padded decode lands; b then settles at
-// the prompt end and publishes slot 0, the block its prefill wrote, so the
-// next prompt resumes from the prompt-end state and not from a block no
-// forward wrote.
+// a long prompt pressures the cache, but b keeps the shared checkpoint pinned
+// until its padded decode lands. Its finish publishes slot 0, so the next
+// prompt resumes from the prompt-end state, not an unwritten slot 1.
 TEST_F(PaddedFirstDecodeSuite, AFinishBehindAPaddedFirstDecodePublishesThePromptEndFromSlotZero) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     const std::vector<std::int32_t> prompt = MakeTokens(6);
@@ -2510,7 +2509,7 @@ TEST_F(PaddedFirstDecodeSuite, AFinishBehindAPaddedFirstDecodePublishesThePrompt
     const std::vector<std::int32_t> a_row = StateRow(*batch, "state0", "a");
     const std::vector<std::int32_t> b_row = StateRow(*batch, "state0", "b");
     ASSERT_GT(b_row.at(0), 0) << "b's prompt-end state, rotated into slot 0";
-    ASSERT_NE(b_row.at(0), a_row.at(0)) << "a published the prompt end; b keeps its own block";
+    ASSERT_EQ(b_row.at(0), a_row.at(0)) << "both requests pin the canonical prompt-end checkpoint";
     SendForwardDone("a", {101});
     SendForwardDone("b", {102});
     SendFinish("b");  // its first token reached its limit; its first decode is out
@@ -2529,9 +2528,8 @@ TEST_F(PaddedFirstDecodeSuite, AFinishBehindAPaddedFirstDecodePublishesThePrompt
     next.push_back(77);
     const Resume resume = Probe("next", next);
     EXPECT_EQ(resume.prefix_tokens, 6);
-    ASSERT_NE(resume.state_row.at(0), a_row.at(0)) << "the long prompt evicts a's published prompt end";
     EXPECT_EQ(resume.state_row.at(0), b_row.at(0))
-        << "b publishes the block its prefill wrote, not the fresh slot " << b_row.at(1) << " no forward wrote";
+        << "b publishes the prompt-end checkpoint, not the fresh slot " << b_row.at(1) << " no forward wrote";
 }
 
 // An abort of a finishing request releases its pages without publishing.

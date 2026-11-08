@@ -741,6 +741,15 @@ few pages a request alone can still wait for good, when its hit holds the
 only cache left and its copy of the tail needs a page in a bucket that is
 full.
 
+A request's expired slots and released State input are different from live
+pins: `Admit` releases their table references before evicting those blocks. Once the plan
+selects their reclaim set, a later segment may absorb that set even though
+the table still holds its references during planning. The merge counts each
+physical block once, and minimization keeps or restores the combined set
+whole. This lets a P request rotate past a junction and evict its unpinned
+canonical KV duplicates in the same admission. Another reader's reference,
+or a prefix hit this admission keeps, still prevents reclaim.
+
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
 `total_pages`, validating that subset through
@@ -963,9 +972,11 @@ raise (`--retraction-snapshot-host-gb` / `--retraction-snapshot-ratio`,
 entries and whether copies are in flight). The same site aborts a chosen
 victim whose image its own publication left without room, which the probe does
 not foresee: a tail that publication drops under the per-prior cap takes its
-Host entries along; and under the write-back policy the segment step ranks
-Host victims by what the Device holds, which the publication adds to. The
-split made after the publication can then fall short.
+Host entries along; under the write-back policy the segment step ranks Host
+victims by what the Device holds, which the publication adds to; and under KV
+parallelism a slot the publication re-points to the Device entry already
+holding its key rides the snapshot pool in that entry's bucket, not the one
+the probe counted. The split made after the publication can then fall short.
 Waiting instead would deadlock once every resident needs a page; charging
 worst-case host room at admission would cost concurrency on every request to
 protect against a rare shortfall.
@@ -1084,8 +1095,8 @@ except in the empty-round retraction below. Excluded by state: `Retracted`,
 **Empty-round retraction.** The exemption trusts the admission reserve to cover
 all growth, and a sliding-window group's does not always: it prepays only
 against pages other requests hold at the admission (§1). A page that becomes
-shared after the admission (a later prefix hit on it) frees nothing when it
-slides out, and a sequence still
+shared after the admission (a later prefix hit on it, or publish-time dedup of
+identical prompt pages) frees nothing when it slides out, and a sequence still
 shorter than the window, or a prompt whose next chunk still reads its
 lookback, has nothing to recycle yet. When no resident can be retracted under
 the exemption and the round built nothing — no forward, restore, remote
@@ -1213,11 +1224,12 @@ requests waiting for those results receive no further forward work. Successful
 and failed terminal paths both release the source references, without an extra
 long-lived copy of the tables.
 
-P-role prefix publication keeps the physical source table unchanged while a
-transfer can still read it, even when the prefix index already holds a
-canonical duplicate. Publication uses copied references. Copy-in capacity
-follows the ordinary pre-reserved-block contract; it does not revive the old
-best-effort owner-tail capacity calculation or canonical-tail protection.
+This preservation is limited to P publications while the request owns its
+transfer sources (`CompletedPages::preserve_source_blocks`). Fused and D
+requests use ordinary canonical deduplication once their publication is safe.
+A fused owner that keeps writing past its tail retains the existing copy-in
+rule: register its own tail without taking another owner's canonical block,
+then copy any tail block the index took into its pre-reserved private block.
 
 The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
@@ -1229,10 +1241,9 @@ is the state, no event handler can forget to clear it.
 
 A transfer reads and writes pages through the page IDs its operations
 exported, so while the pin holds, a pinned table loses no block a transfer may
-still address: publication never moves a request onto another request's
-canonical block (a duplicate stays private), and the owner copy-in, the one
-move off a published block, runs only on the fused role, which never
-transfers.
+still address. P publication keeps its source references, including State
+checkpoints, and D publishes its landing table after successful receive.
+The owner-tail copy-in runs only on the fused role, which never transfers.
 
 A pinned request that ends — an abort, or a failed transfer — does not free
 its pages: the transfer may still be reading or writing them. It parks whole in

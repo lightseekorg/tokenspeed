@@ -820,7 +820,14 @@ peer marks that room uncertain and withholds cancellation acknowledgments even
 after its queued and executing calls return. Failure notices may still reach
 the receiver, but cannot release its pages. An uncertain room or an unreachable
 writer can therefore keep the receiver's drain pending indefinitely; stalled
-drains are logged periodically.
+drains are logged periodically. A parked request also keeps operations that
+require a drained engine, such as cache flush, weight replacement and sleep
+with memory release, from completing. Recovery requires verified retirement
+of the writers or transport invalidation that makes further access to these
+registrations impossible; local forwards must also have completed before
+pages are released. A timeout can trigger diagnostics or recovery but cannot
+authorize page reuse; the current protocol provides no forced retirement
+for an uncertain room.
 
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
 admission, and every round the replica agrees on which transfers changed
