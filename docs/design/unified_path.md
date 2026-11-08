@@ -123,6 +123,21 @@ rendezvous or allocate communication state.
 
 ### Ascend context-parallel decode
 
+Ascend native Prefill distinguishes producer rows from core-attention query
+rows. DSA computes all heads for its producer's query rows and returns complete
+output rows; MLA gathers projected Q latents, computes its local heads for all
+queries, and returns head partials. The Prefill plan's `projection_row_counts`
+partitions producer inputs; `query_start`/`query_end` describe the local core
+query span, which is the full span for MLA after its Q-latent gather.
+`CommManager.pre_attn_partition` converts
+the preceding layer's layout to the producer rows without an unnecessary
+gather when partitions already match. `post_attn_complete_rows_norm` converts
+complete rows to the next module's layout and aligns its residual, without
+either ordinary or fused SUM. Partial outputs continue through
+`post_attn_reduce_norm`. Source group order and counts define row ownership;
+tensor shapes alone do not. None of these native Prefill slices declares the
+model query-sharded or enables the CUDA QCP configuration on Ascend.
+
 Ascend DSA context-parallel decode uses one prepared communicator for fused
 TopK selection and LSE merging. Both stages run on the model stream. Its
 context object owns local page metadata only; it creates no auxiliary process

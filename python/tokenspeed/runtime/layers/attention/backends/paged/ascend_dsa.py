@@ -27,6 +27,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.ops.attention.ascend_prefill import (
+    ascend_prefill_kernels,
+    require_dsa_prefill_ops,
+)
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
     ascend_dsa_kernels,
 )
@@ -41,6 +45,7 @@ from tokenspeed.runtime.layers.attention.dcp.ascend import (
     AscendDCPMetadata,
     AscendPrefillCache,
     AscendPrefillPlan,
+    ascend_prefill_store,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
@@ -178,19 +183,23 @@ class AscendDSABackend(DSABackend):
                 )
             if self.num_local_heads * dcp.degree != spec.num_attention_heads:
                 raise ValueError("DSA DCP does not reconstruct all query heads")
-            self._indexer_kernels.require_fused_context_parallel(
-                rank_size=dcp.degree, num_heads=spec.num_attention_heads
-            )
         self._dcp = dcp
         self._prefill_plan: AscendPrefillPlan | None = None
-        self._prefill_runtime = None
+        self._prefill_workspace = None
+        self._prefill_kernels = None
+        self._prefill_peak_buffer_bytes = 0
         self._prefill_group = None
-        self._prefill_slots: torch.Tensor | None = None
         self._prefill_options = None
 
     @property
     def prefill_enabled(self):
         return self._prefill_options is not None
+
+    @property
+    def prefill_plan(self) -> AscendPrefillPlan:
+        if self._prefill_plan is None:
+            raise RuntimeError("Prepare native Prefill metadata before forward")
+        return self._prefill_plan
 
     @property
     def prefill_needs_host_page_table(self):
@@ -225,63 +234,75 @@ class AscendDSABackend(DSABackend):
             self._prefill_group = None
 
     def prepare_prefill(self) -> int:
-        if not self.prefill_enabled or self._prefill_runtime is not None:
+        if not self.prefill_enabled or self._prefill_kernels is not None:
             return 0
         if self.cache_pool is None:
             raise RuntimeError("Bind the DSA cache before preparing Prefill")
         layer_id = min(self.cache_pool.history_group_by_layer())
-        kv = self.cache_pool.get_key_buffer(layer_id)
-        index = self.cache_pool.get_component(layer_id, "dsa_index_k")
-        runtime = self._indexer_kernels.prepare_prefill(
-            kv,
-            index,
+        kernels = ascend_prefill_kernels()
+        kernels.validate_cache(
+            self.cache_pool.get_key_buffer(layer_id),
+            self.cache_pool.get_component(layer_id, "dsa_index_k"),
             ranks=self._dcp.ranks,
             history_group=self._prefill_group,
-            max_current_rows=self._prefill_options.max_current_rows,
-            history_null_rows=self._prefill_options.kv_page_size,
         )
-        self._prefill_runtime = runtime
+        require_dsa_prefill_ops(torch.ops.custom)
+        self._prefill_kernels = kernels
         return 0
 
     def prefetch_prefill_layer(self, layer_id):
-        """Submit history at KDA, or ensure it at the attention entry."""
-        plan = self._prefill_plan
-        if not self.prefill_enabled or plan is None or plan.gather is None:
+        """Submit history at KDA, or ensure the same layer at attention entry."""
+        plan = self.prefill_plan
+        if not self.prefill_enabled or plan.gather is None:
             raise RuntimeError("Prepare DSA Prefill page metadata first")
-        if self._prefill_runtime is None:
-            self.prepare_prefill()
-        runtime = self._prefill_runtime
-        if runtime.layer_id is None:
-            self._prefill_slots = torch.empty(
-                sum(plan.row_counts), dtype=torch.int64, device=plan.page_table.device
-            )
-        runtime.prefetch(
+        if sum(plan.projection_row_counts) > self._prefill_options.max_current_rows:
+            raise ValueError("Prefill rows exceed the prepared token capacity")
+        workspace = self._prefill_workspace
+        if workspace is not None:
+            if workspace.layer_id != layer_id or workspace.batch_key is not plan:
+                raise RuntimeError("Prefill history from another batch/layer is active")
+            return
+        self.prepare_prefill()
+        self._prefill_workspace = self._prefill_kernels.gather_history(
             layer_id,
             self.cache_pool.get_key_buffer(layer_id),
             self.cache_pool.get_component(layer_id, "dsa_index_k"),
+            ranks=self._dcp.ranks,
+            history_group=self._prefill_group,
             batch_key=plan,
-            total_rows=sum(plan.row_counts),
+            total_rows=sum(plan.projection_row_counts),
+            history_null_rows=self._prefill_options.kv_page_size,
             has_history=not plan.cold,
             history_slots=plan.gather.send_slots,
             history_counts=plan.gather.row_counts,
         )
 
-    def start_prefill_index(self, layer_id, index_key):
-        """Enqueue current Index-K as soon as the local projection is ready."""
-        if self._prefill_runtime is None or self._prefill_plan is None:
-            raise RuntimeError("Prepare DSA Prefill before its Index-K projection")
-        self._prefill_runtime.gather_current(
-            layer_id,
-            index_key,
-            width=128,
-            total_rows=sum(self._prefill_plan.row_counts),
+    def prepare_prefill_current(self, layer_id, latent, index_key, slots):
+        self.prefetch_prefill_layer(layer_id)
+        workspace = self._prefill_workspace
+        self._prefill_kernels.gather_current(
+            workspace, latent, index_key, counts=self.prefill_plan.projection_row_counts
         )
+        self._prefill_kernels.prepare_write_slots(workspace, slots)
+
+    def finish_prefill_layer(self, layer_id):
+        workspace = self._prefill_workspace
+        if workspace is None or workspace.layer_id != layer_id:
+            raise RuntimeError("Prefill completion differs from its active layer")
+        self._prefill_kernels.finish(workspace)
+        self._prefill_peak_buffer_bytes = max(
+            self._prefill_peak_buffer_bytes, workspace.peak_buffer_bytes
+        )
+        self._prefill_workspace = None
 
     def close_prefill(self) -> None:
-        if self._prefill_runtime is not None:
-            self._prefill_runtime.close()
-            self._prefill_runtime = None
-        self._prefill_slots = None
+        if self._prefill_kernels is not None:
+            # A rebind/shutdown boundary drains all callers, without binding
+            # successive requests to one historical stream identity.
+            layer_id = min(self.cache_pool.history_group_by_layer())
+            torch.npu.synchronize(self.cache_pool.get_key_buffer(layer_id).device)
+        self._prefill_workspace = None
+        self._prefill_kernels = None
 
     def cache_placement(self, layer) -> CachePlacement | None:
         if self._ascend_placement is None:
@@ -421,6 +442,10 @@ class AscendDSABackend(DSABackend):
             raise ValueError("Fused DSA resources must cover the CP group ranks")
         if not attention_outputs:
             raise ValueError("Fused DSA requires prepared SFA producer outputs")
+        self._indexer_kernels.require_fused_context_parallel(
+            rank_size=self._dcp.degree,
+            num_heads=self._indexer_spec.num_attention_heads,
+        )
         self._fused_group = group
         self._fused_attention_outputs = attention_outputs
 
@@ -769,15 +794,62 @@ class AscendDSABackend(DSABackend):
             else result.transpose(0, 1).contiguous().flatten(1)
         )
 
+    def prefill_store(self, layer):
+        return ascend_prefill_store(
+            self._prefill_workspace,
+            self.prefill_plan,
+            self.cache_placement(layer),
+            kernel_page_size=self.kernel_page_size,
+        )
+
+    def select_prefill_indices(self, query, weights, layer, *, initial, window):
+        spec = self._indexer_spec
+        if initial < 0 or window < 0 or initial + window > spec.index_topk:
+            raise ValueError("Prefill init/local token counts must fit index_topk")
+        plan, workspace = self.prefill_plan, self._prefill_workspace
+        placement = self.cache_placement(layer)
+        local_rows = workspace.source_kv.numel() // spec.kv_cache_dim
+        self._prefill_kernels.patch(
+            workspace,
+            plan.current_direct,
+            plan.patch_slots,
+            width=spec.index_head_dim,
+            block_rows=(
+                self.kernel_page_size
+                if placement is None
+                else placement.block_granularity
+            ),
+            virtual_blocks=(
+                local_rows // self.kernel_page_size
+                if placement is None
+                else placement.virtual_block_count
+            ),
+        )
+        if not query.shape[0]:
+            return torch.empty(
+                (0, spec.index_topk), dtype=torch.int32, device=query.device
+            )
+        return self._indexer_kernels.prefill_index(
+            query,
+            workspace.index.view(-1, self.kernel_page_size, 1, spec.index_head_dim),
+            weights,
+            plan.query_cu,
+            plan.key_cu,
+            plan.index_table,
+            spec.index_topk,
+            initial,
+            window,
+        )
+
     def forward_extend(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        q,
+        k,
+        v,
         layer,
-        out_cache_loc: torch.Tensor,
+        out_cache_loc,
         token_to_kv_pool,
-        bs: int,
+        bs,
         *,
         fused: bool,
         **kwargs,
@@ -785,92 +857,24 @@ class AscendDSABackend(DSABackend):
         self._validate_logit_cap(layer.logit_cap)
         if fused:
             raise ValueError("Native fused decode queries are not Prefill inputs")
-        initial, window = kwargs["index_init_tokens"], kwargs["index_local_tokens"]
-        if (
-            initial < 0
-            or window < 0
-            or initial + window > self._indexer_spec.index_topk
-        ):
-            raise ValueError("Prefill init/local token counts must fit index_topk")
-        head_major_output = kwargs.pop("head_major_output", False)
-        kernels, spec, dcp = self._indexer_kernels, self._indexer_spec, self._dcp
-        placement = self.cache_placement(layer)
-        self.prefetch_prefill_layer(layer.layer_id)
-        plan, runtime = self._prefill_plan, self._prefill_runtime
-        if plan is None or runtime is None:
-            raise RuntimeError(
-                "Prepare DSA Prefill workspace and metadata before forward"
-            )
-        if (
-            q.shape[0] != plan.row_counts[dcp.rank]
-            or q.shape[1] != spec.num_attention_heads
+        plan, workspace = self.prefill_plan, self._prefill_workspace
+        if workspace is None or workspace.layer_id != layer.layer_id:
+            raise RuntimeError("Prepare Prefill current rows before attention")
+        spec = self._indexer_spec
+        if q.shape[:2] != (
+            plan.projection_row_counts[self._dcp.rank],
+            spec.num_attention_heads,
         ):
             raise ValueError(
                 "Prefill needs token-local queries with all attention heads"
             )
-        if placement is None:
-            block_rows, virtual_blocks = (
-                self.kernel_page_size,
-                runtime.local_rows // self.kernel_page_size,
-            )
-        else:
-            block_rows, virtual_blocks = (
-                placement.block_granularity,
-                placement.virtual_block_count,
-            )
-        # Gather both current producers together before index selection.
-        self.start_prefill_index(layer.layer_id, kwargs["index_key"].contiguous())
-        runtime.gather_current(
-            layer.layer_id,
-            kwargs["prefill_latent"].contiguous(),
-            width=spec.kv_cache_dim,
-            total_rows=sum(plan.row_counts),
-        )
-        plan.patch(
-            runtime,
-            layer.layer_id,
-            out_cache_loc,
-            slots_workspace=self._prefill_slots,
-            width=spec.index_head_dim,
-            block_rows=block_rows,
-            virtual_blocks=virtual_blocks,
-        )
-        index_pages = runtime.index.view(
-            -1, self.kernel_page_size, 1, spec.index_head_dim
-        )
-        if q.shape[0]:
-            indices = kernels.prefill_index(
-                kwargs["index_query"],
-                index_pages,
-                kwargs["index_weights"],
-                plan.query_cu,
-                plan.key_cu,
-                plan.index_table,
-                spec.index_topk,
-                initial,
-                window,
-            )
-        else:
-            indices = torch.empty(
-                (0, spec.index_topk), dtype=torch.int32, device=q.device
-            )
-        plan.patch(
-            runtime,
-            layer.layer_id,
-            out_cache_loc,
-            slots_workspace=self._prefill_slots,
-            width=spec.kv_cache_dim,
-            block_rows=block_rows,
-            virtual_blocks=virtual_blocks,
-        )
         if self.step_counter is not None:
             self.step_counter.record_cache()
-        kv_pages = runtime.kv.view(-1, self.kernel_page_size, spec.kv_cache_dim)
         if q.shape[0]:
-            output = kernels.prefill_attention(
+            output = self._indexer_kernels.prefill_attention(
                 q,
-                kv_pages,
-                indices,
+                workspace.kv.view(-1, self.kernel_page_size, spec.kv_cache_dim),
+                kwargs["prefill_indices"],
                 plan.scan_count,
                 plan.page_table,
                 plan.query_seq,
@@ -878,11 +882,10 @@ class AscendDSABackend(DSABackend):
             )
         else:
             output = q.new_empty((q.shape[1], 0, spec.kv_lora_rank))
-        runtime.finish(layer.layer_id)
-        self._prefill_slots = None
+        self.finish_prefill_layer(layer.layer_id)
         return (
             output
-            if head_major_output
+            if kwargs.get("head_major_output", False)
             else output.transpose(0, 1).contiguous().flatten(1)
         )
 

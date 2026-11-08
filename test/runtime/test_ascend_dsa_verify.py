@@ -193,10 +193,6 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missin
         attn_tp_size=degree,
         num_attention_heads=2 * degree,
     )
-    if degree > 1 and missing is not None:
-        with pytest.raises(RuntimeError, match=missing):
-            ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
-        return
     backend = ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
     assert (backend._dcp.degree, backend._dcp.rank, backend._dcp.ranks) == (
         degree,
@@ -204,6 +200,11 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missin
         config.kvp_group,
     )
     if degree > 1:
+        if missing is not None:
+            with pytest.raises(RuntimeError, match=missing):
+                backend.configure_fused_decode(
+                    group="test", ranks=config.kvp_group, attention_outputs={64: ()}
+                )
         spec.attn_tp_size = 1
         with pytest.raises(ValueError, match="complete head-TP group"):
             ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)

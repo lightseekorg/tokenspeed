@@ -25,9 +25,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 import torch
+from tokenspeed_kernel.ops.attention.ascend_prefill import ascend_prefill_kernels
 from tokenspeed_kernel.ops.attention.mla.ascend import (
     ascend_mla_dcp_kernels,
-    prepare_ascend_mla_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.dcp.ascend import (
     AscendDCPMetadata,
     AscendPrefillCache,
     AscendPrefillPlan,
+    ascend_prefill_store,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.registry import register_backend
@@ -124,9 +125,10 @@ class AscendMLABackend(MLAAttnBackend):
         )
         self._current_active: torch.Tensor | None = None
         self._current_local = None
-        self._prefill_runtime = None
+        self._prefill_workspace = None
+        self._prefill_kernels = None
+        self._prefill_peak_buffer_bytes = 0
         self._prefill_group = None
-        self._prefill_slots: torch.Tensor | None = None
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_spans: tuple[tuple[int, int, int], ...] = ()
         self._prefill_pages: torch.Tensor | None = None
@@ -136,6 +138,12 @@ class AscendMLABackend(MLAAttnBackend):
     @property
     def prefill_enabled(self):
         return self._prefill_options is not None
+
+    @property
+    def prefill_plan(self) -> AscendPrefillPlan:
+        if self._prefill_plan is None:
+            raise RuntimeError("Prepare native Prefill metadata before forward")
+        return self._prefill_plan
 
     @property
     def prefill_needs_host_page_table(self):
@@ -176,20 +184,19 @@ class AscendMLABackend(MLAAttnBackend):
             self._prefill_group = None
 
     def prepare_prefill(self) -> int:
-        if not self.prefill_enabled or self._prefill_runtime is not None:
+        if not self.prefill_enabled or self._prefill_kernels is not None:
             return 0
         if self.cache_pool is None:
             raise RuntimeError("Bind the MLA cache before preparing Prefill")
         layer_id = min(self.cache_pool.history_group_by_layer())
-        kv = self.cache_pool.get_key_buffer(layer_id)
-        runtime = prepare_ascend_mla_prefill(
-            kv,
+        kernels = ascend_prefill_kernels()
+        kernels.validate_cache(
+            self.cache_pool.get_key_buffer(layer_id),
+            None,
             ranks=self._dcp.ranks,
             history_group=self._prefill_group,
-            max_current_rows=self._prefill_options.max_current_rows,
-            history_null_rows=self._prefill_options.kv_page_size,
         )
-        self._prefill_runtime = runtime
+        self._prefill_kernels = kernels
         return 0
 
     def _init_prefill_metadata(self, **kwargs):
@@ -233,52 +240,67 @@ class AscendMLABackend(MLAAttnBackend):
         self._prefill_plan = plan
         self._prefill_pages = plan.page_table.long()
         self._prefill_spans = mla_prefill_spans(
-            extends, prefixes, first=plan.row_start, rows=plan.row_end - plan.row_start
+            extends,
+            prefixes,
+            first=plan.query_start,
+            rows=plan.query_end - plan.query_start,
         )
         self.forward_prefill_metadata = metadata
         self.chunked_prefill_metadata = metadata
 
     def prefetch_prefill_layer(self, layer_id):
-        """Submit history at KDA, or ensure it at the attention entry."""
-        plan = self._prefill_plan
-        if not self.prefill_enabled or plan is None or plan.gather is None:
+        """Submit history at KDA, or ensure the same layer at attention entry."""
+        plan = self.prefill_plan
+        if not self.prefill_enabled or plan.gather is None:
             raise RuntimeError("Prepare MLA Prefill page metadata first")
-        if self._prefill_runtime is None:
-            self.prepare_prefill()
-        runtime = self._prefill_runtime
-        if runtime.layer_id is None:
-            self._prefill_slots = torch.empty(
-                sum(plan.row_counts), dtype=torch.int64, device=plan.page_table.device
-            )
-        runtime.prefetch(
+        if sum(plan.projection_row_counts) > self._prefill_options.max_current_rows:
+            raise ValueError("Prefill rows exceed the prepared token capacity")
+        workspace = self._prefill_workspace
+        if workspace is not None:
+            if workspace.layer_id != layer_id or workspace.batch_key is not plan:
+                raise RuntimeError("Prefill history from another batch/layer is active")
+            return
+        self.prepare_prefill()
+        self._prefill_workspace = self._prefill_kernels.gather_history(
             layer_id,
             self.cache_pool.get_key_buffer(layer_id),
             None,
+            ranks=self._dcp.ranks,
+            history_group=self._prefill_group,
             batch_key=plan,
-            total_rows=sum(plan.row_counts),
+            total_rows=sum(plan.projection_row_counts),
+            history_null_rows=self._prefill_options.kv_page_size,
             has_history=not plan.cold,
             history_slots=plan.gather.send_slots,
             history_counts=plan.gather.row_counts,
         )
 
-    def start_prefill_kv(self, layer_id, latent):
-        if self._prefill_runtime is None or self._prefill_plan is None:
-            raise RuntimeError("Prepare MLA Prefill before producing current KV")
-        self._prefill_runtime.gather_current(
-            layer_id, latent, width=576, total_rows=sum(self._prefill_plan.row_counts)
+    def prepare_prefill_current(self, layer_id, latent, index_key, slots):
+        self.prefetch_prefill_layer(layer_id)
+        workspace = self._prefill_workspace
+        self._prefill_kernels.gather_current(
+            workspace, latent, index_key, counts=self.prefill_plan.projection_row_counts
+        )
+        self._prefill_kernels.prepare_write_slots(workspace, slots)
+
+    def gather_prefill_queries(self, query_latent):
+        """Gather projected Q rows over the same owners as current KV."""
+        from tokenspeed.runtime.distributed.comm_ops import token_all_gather
+
+        if self._dcp.degree == 1:
+            return query_latent
+        return token_all_gather(
+            query_latent,
+            group=self._dcp.ranks,
+            scattered_num_tokens=list(self.prefill_plan.projection_row_counts),
         )
 
-    def consume_prefill_kv(self, layer_id, slots):
-        if self._prefill_runtime is None or self._prefill_plan is None:
-            raise RuntimeError("Prepare MLA Prefill before consuming KV")
-        self._prefill_plan.patch(
-            self._prefill_runtime,
-            layer_id,
-            slots,
-            slots_workspace=self._prefill_slots,
-            width=576,
-            block_rows=self._placement.block_granularity,
-            virtual_blocks=self._placement.virtual_block_count,
+    def prefill_store(self, layer):
+        return ascend_prefill_store(
+            self._prefill_workspace,
+            self.prefill_plan,
+            self.cache_placement(layer),
+            kernel_page_size=self.kernel_page_size,
         )
 
     def read_prefill_rows(self, sequence, begin, end):
@@ -286,21 +308,30 @@ class AscendMLABackend(MLAAttnBackend):
         pages = self._prefill_pages[
             sequence, begin // self.kernel_page_size : -(-end // self.kernel_page_size)
         ]
-        cache = self._prefill_runtime.kv.view(-1, self.kernel_page_size, 576)
+        cache = self._prefill_workspace.kv.view(-1, self.kernel_page_size, 576)
         rows = cache.index_select(0, pages).flatten(0, 1)
         return rows[
             begin % self.kernel_page_size : begin % self.kernel_page_size + end - begin
         ]
 
     def finish_prefill_layer(self, layer_id):
-        self._prefill_runtime.finish(layer_id)
-        self._prefill_slots = None
+        workspace = self._prefill_workspace
+        if workspace is None or workspace.layer_id != layer_id:
+            raise RuntimeError("Prefill completion differs from its active layer")
+        self._prefill_kernels.finish(workspace)
+        self._prefill_peak_buffer_bytes = max(
+            self._prefill_peak_buffer_bytes, workspace.peak_buffer_bytes
+        )
+        self._prefill_workspace = None
 
-    def close_prefill(self):
-        if self._prefill_runtime is not None:
-            self._prefill_runtime.close()
-            self._prefill_runtime = None
-        self._prefill_slots = None
+    def close_prefill(self) -> None:
+        if self._prefill_kernels is not None:
+            # A rebind/shutdown boundary drains all callers, without binding
+            # successive requests to one historical stream identity.
+            layer_id = min(self.cache_pool.history_group_by_layer())
+            torch.npu.synchronize(self.cache_pool.get_key_buffer(layer_id).device)
+        self._prefill_workspace = None
+        self._prefill_kernels = None
 
     def configure_runtime(
         self, *, block_granularity, virtual_block_count, shard_count, **kwargs

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU transport checks with only unavailable NPU/collectives substituted."""
+"""Real byte movement with only unavailable NPU/collectives substituted."""
 
 import importlib
 import sys
@@ -30,8 +30,11 @@ import torch.distributed as dist
 
 
 class ExecutionStream:
+    def __init__(self):
+        self.synchronized = False
+
     def synchronize(self):
-        pass
+        self.synchronized = True
 
 
 class NpuDevice:
@@ -41,22 +44,26 @@ class NpuDevice:
     def current_stream(self, device):
         return self.stream
 
+    def is_available(self):
+        return False
+
 
 @pytest.fixture
-def transport_class(monkeypatch):
+def prefill(monkeypatch):
     npu = ModuleType("torch_npu")
     npu.distributed = ModuleType("torch_npu.distributed")
     monkeypatch.setitem(sys.modules, "torch_npu", npu)
     monkeypatch.setitem(sys.modules, "flash_ops", ModuleType("flash_ops"))
     monkeypatch.setattr(torch, "npu", NpuDevice(), raising=False)
-    # CPU lacks stream-aware storage. All byte copies still execute for real.
-    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
-    monkeypatch.setattr(
-        torch.ops.custom, "dsa_cp_patch", lambda *args, **kw: args[3], raising=False
-    )
+
+    def record_stream(tensor, stream):
+        assert stream is torch.npu.current_stream(tensor.device)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
+    monkeypatch.setattr(torch.ops.custom, "dsa_cp_patch", _owner_patch, raising=False)
     module = importlib.import_module("tokenspeed_kernel_npu.ops.prefill")
     monkeypatch.setattr(module, "torch_npu", npu)
-    return module.AscendDSAPrefill, npu.distributed
+    return module, npu.distributed
 
 
 def payload(rows, width, seed):
@@ -75,206 +82,232 @@ def exact(actual, expected):
     )
 
 
+def _owner_patch(
+    current,
+    slots,
+    cache,
+    compact,
+    direct,
+    rows,
+    local_rows,
+    virtual_blocks,
+    send_rows,
+    block_rows,
+    degree,
+    rank,
+    width,
+    *,
+    mapped_slots,
+    gathered_rows,
+):
+    counts = [rows // degree + (r < rows % degree) for r in range(degree)]
+    producer, first = 0, 0
+    for token in range(rows):
+        while token >= first + counts[producer]:
+            first += counts[producer]
+            producer += 1
+        value = current[producer * send_rows + token - first]
+        slot = int(slots[token])
+        block, offset = divmod(slot, block_rows)
+        if 0 < block < virtual_blocks and (block - 1) % degree == rank:
+            local = ((block - 1) // degree + 1) * block_rows + offset
+            if local < local_rows:
+                cache.view(-1, width)[local].copy_(value)
+        destination = int(mapped_slots[token])
+        if (
+            not direct[token]
+            and destination >= block_rows
+            and destination < len(compact)
+        ):
+            compact[destination].copy_(value)
+
+
 @pytest.mark.parametrize(
     "degree,rank,total", [(1, 0, 129), (2, 1, 3), (8, 0, 3), (8, 7, 3)]
 )
 @pytest.mark.parametrize("has_index", [False, True])
-@pytest.mark.parametrize("early", [False, True])
-def test_temporary_packed_history_and_current_keep_exact_bytes(
-    transport_class, monkeypatch, degree, rank, total, has_index, early
+@pytest.mark.parametrize("has_history", [False, True])
+def test_joint_gathers_preserve_exact_planes(
+    prefill, monkeypatch, degree, rank, total, has_index, has_history
 ):
-    cls, collectives = transport_class
+    ops, collective = prefill
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
-    monkeypatch.setattr(
-        dist, "get_process_group_ranks", lambda group: list(range(degree))
-    )
-
-    local_rows, null_rows = 512, 128
-    history_counts = tuple(128 if owner < 2 else 0 for owner in range(degree))
-    cache = [payload(local_rows, 576, 100 + owner) for owner in range(degree)]
-    index = (
-        [payload(local_rows, 128, 200 + owner) for owner in range(degree)]
+    caches = [payload(512, 576, 30 + r) for r in range(degree)]
+    indices = (
+        [payload(512, 128, 70 + r) for r in range(degree)]
         if has_index
-        else None
+        else [None] * degree
     )
-    current_counts = tuple(
-        total // degree + (owner < total % degree) for owner in range(degree)
-    )
-    current_kv = [
-        payload(rows, 576, 300 + owner) for owner, rows in enumerate(current_counts)
-    ]
-    current_index = (
-        [payload(rows, 128, 400 + owner) for owner, rows in enumerate(current_counts)]
-        if has_index
-        else None
-    )
-    width = 704 if has_index else 576
-
-    def packet(kv, ik):
-        return torch.cat((ik, kv), 1) if ik is not None else kv
-
+    history_counts = [2 * (r % 3) for r in range(degree)]
+    slots = [torch.arange(count, dtype=torch.int64) + 128 for count in history_counts]
     history_packets = [
-        packet(
-            cache[owner][128 : 128 + rows],
-            index[owner][128 : 128 + rows] if has_index else None,
+        (
+            torch.cat([indices[r][slots[r]], caches[r][slots[r]]], dim=1)
+            if has_index
+            else caches[r][slots[r]]
         )
-        for owner, rows in enumerate(history_counts)
+        for r in range(degree)
     ]
+    pending = [history_packets] if has_history else []
+    counts = [total // degree + (r < total % degree) for r in range(degree)]
+    current_kv = [payload(count, 576, 100 + r) for r, count in enumerate(counts)]
+    current_index = (
+        [payload(count, 128, 150 + r) for r, count in enumerate(counts)]
+        if has_index
+        else [None] * degree
+    )
     current_packets = [
-        packet(current_kv[owner], current_index[owner] if has_index else None)
-        for owner in range(degree)
+        (
+            torch.cat([current_index[r], current_kv[r]], dim=1)
+            if has_index
+            else current_kv[r]
+        )
+        for r in range(degree)
     ]
+    pending.append(current_packets)
 
     def gather(*, output, input, output_split_sizes, group):
-        pieces = (
-            history_packets
-            if tuple(output_split_sizes) == history_counts
-            else current_packets
-        )
-        exact(input, pieces[rank])
-        output.copy_(torch.cat(pieces))
+        packets = pending.pop(0)
+        exact(input, packets[rank])
+        assert output_split_sizes == [len(packet) for packet in packets]
+        output.copy_(torch.cat(packets))
 
     monkeypatch.setattr(
-        collectives, "all_gather_into_tensor_uneven", gather, raising=False
+        collective, "all_gather_into_tensor_uneven", gather, raising=False
     )
-    runtime = cls(
-        cache[rank].unsqueeze(1),
-        index[rank].unsqueeze(1) if has_index else None,
+    workspace = ops.gather_history(
+        3,
+        caches[rank],
+        indices[rank],
         ranks=tuple(range(degree)),
-        history_group=object(),
-        max_current_rows=total,
-        history_null_rows=null_rows,
+        history_group=None,
+        batch_key=object(),
+        total_rows=total,
+        history_null_rows=128,
+        has_history=has_history,
+        history_slots=slots[rank],
+        history_counts=history_counts,
     )
-    key = object()
-    slots = torch.arange(128, 128 + history_counts[rank], dtype=torch.int64)
-
-    def ensure():
-        runtime.prefetch(
-            3,
-            cache[rank].unsqueeze(1),
-            index[rank].unsqueeze(1) if has_index else None,
-            batch_key=key,
-            total_rows=total,
-            has_history=True,
-            history_slots=slots,
-            history_counts=history_counts,
-        )
-
-    assert runtime.workspace_bytes == 0
-    if early:
-        ensure()
-        old = runtime.kv
-        ensure()
-        assert runtime.kv is old
-    else:
-        ensure()
-    history_rows = null_rows + sum(history_counts)
-    exact(
-        runtime.kv[null_rows:history_rows],
-        torch.cat([c[:, width - 576 :] for c in history_packets]),
-    )
-    if has_index:
+    exact(workspace.kv[:128], torch.zeros((128, 576), dtype=torch.bfloat16))
+    if has_history:
         exact(
-            runtime.index[null_rows:history_rows],
-            torch.cat([c[:, :128] for c in history_packets]),
+            workspace.kv[128 : workspace.history_rows],
+            torch.cat([cache[slot] for cache, slot in zip(caches, slots, strict=True)]),
         )
-        runtime.gather_current(3, current_index[rank], width=128, total_rows=total)
-    runtime.gather_current(3, current_kv[rank], width=576, total_rows=total)
-    for owner, count in enumerate(current_counts):
-        begin = history_rows + owner * runtime._send_rows
-        exact(runtime.kv[begin : begin + count], current_kv[owner])
+    ops.gather_current(workspace, current_kv[rank], current_index[rank], counts=counts)
+    for producer, count in enumerate(counts):
+        begin = workspace.history_rows + producer * workspace.send_rows
+        exact(workspace.kv[begin : begin + count], current_kv[producer])
         if has_index:
-            exact(runtime.index[begin : begin + count], current_index[owner])
-    owned = (history_rows + degree * runtime._send_rows) * width * 2
-    assert runtime.workspace_bytes == owned
-    assert (
-        owned
-        <= runtime.peak_buffer_bytes
-        <= owned
-        + 2
-        * width
-        * max(sum(history_counts) + max(history_counts), total + max(current_counts))
-    )
-    runtime.finish(3)
-    assert runtime.workspace_bytes == 0
-    ensure()
-    runtime.finish(3)
-    runtime.close()
+            exact(workspace.index[begin : begin + count], current_index[producer])
+    ops.finish(workspace)
 
 
-@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
-def test_patch_copies_router_slots_into_owned_native_buffer(
-    transport_class, monkeypatch, slot_dtype
+@pytest.mark.parametrize("rank", [0, 1])
+def test_owner_store_and_compact_patch_share_one_slot_snapshot(
+    prefill, monkeypatch, rank
 ):
-    cls, _ = transport_class
+    ops, collective = prefill
+    monkeypatch.setattr(dist, "get_rank", lambda: rank)
+    current = payload(3, 576, 9)
+    index = payload(3, 128, 13)
+    packets = [
+        torch.cat([index[:2], current[:2]], 1),
+        torch.cat([index[2:], current[2:]], 1),
+    ]
+    monkeypatch.setattr(
+        collective,
+        "all_gather_into_tensor_uneven",
+        lambda **kw: kw["output"].copy_(torch.cat(packets)),
+        raising=False,
+    )
+    cache = torch.zeros((384, 576), dtype=torch.bfloat16)
+    index_cache = torch.zeros((384, 128), dtype=torch.bfloat16)
+    workspace = ops.gather_history(
+        0,
+        cache,
+        index_cache,
+        ranks=(0, 1),
+        history_group=None,
+        batch_key=object(),
+        total_rows=3,
+        history_null_rows=128,
+        has_history=False,
+        history_slots=torch.empty(0, dtype=torch.int64),
+        history_counts=(0, 0),
+    )
+    ops.gather_current(
+        workspace,
+        current[:2] if rank == 0 else current[2:],
+        index[:2] if rank == 0 else index[2:],
+        counts=(2, 1),
+    )
+    slots = torch.tensor([128, 256, 257], dtype=torch.int32)
+    ops.prepare_write_slots(workspace, slots)
+    slots.fill_(0)
+    direct = torch.zeros(3, dtype=torch.uint8)
+    mapped = torch.tensor([128, 129, 130], dtype=torch.int64)
+    for width, values, destination in (
+        (128, index, index_cache),
+        (576, current, cache),
+    ):
+        ops.patch(
+            workspace, direct, mapped, width=width, block_rows=128, virtual_blocks=5
+        )
+        plane = workspace.index if width == 128 else workspace.kv
+        exact(plane[128:131], values)
+        if rank == 0:
+            exact(destination[128:129], values[:1])
+        else:
+            exact(destination[128:130], values[1:])
+        exact(destination[:128], torch.zeros_like(destination[:128]))
+
+
+def test_synchronized_stream_handoff_and_new_pool_read_fresh_bytes(
+    prefill, monkeypatch
+):
+    ops, _ = prefill
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
-    cache = payload(256, 576, 1)
-    runtime = cls(
+    for seed in (10, 11):
+        cache = payload(256, 576, seed)
+        workspace = ops.gather_history(
+            0,
+            cache,
+            None,
+            ranks=(0,),
+            history_group=None,
+            batch_key=object(),
+            total_rows=1,
+            history_null_rows=128,
+            has_history=True,
+            history_slots=torch.tensor([128]),
+            history_counts=(1,),
+        )
+        exact(workspace.kv[128:129], cache[128:129])
+        ops.gather_current(workspace, cache[:1], None, counts=(1,))
+        ops.finish(workspace)
+        torch.npu.stream.synchronize()
+        torch.npu.stream = ExecutionStream()
+
+
+def test_current_plane_geometry_is_validated(prefill, monkeypatch):
+    ops, _ = prefill
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    cache = torch.zeros((256, 576), dtype=torch.bfloat16)
+    workspace = ops.gather_history(
+        0,
         cache,
         None,
         ranks=(0,),
         history_group=None,
-        max_current_rows=2,
-        history_null_rows=128,
-    )
-    runtime.prefetch(
-        1,
-        cache,
-        None,
         batch_key=object(),
-        total_rows=2,
-        has_history=False,
-        history_slots=torch.empty(0, dtype=torch.int64),
-        history_counts=(0,),
-    )
-    runtime.gather_current(1, cache[:2], width=576, total_rows=2)
-    slots = torch.tensor([128, 129], dtype=slot_dtype)
-    workspace = torch.empty(2, dtype=torch.int64)
-    runtime.patch(
-        1,
-        width=576,
-        slots=slots,
-        direct=torch.zeros(2, dtype=torch.uint8),
-        block_rows=128,
-        slots_workspace=workspace,
-        mapped_slots=torch.tensor([128, 129], dtype=torch.int64),
-        virtual_blocks=3,
-    )
-    assert workspace.tolist() == [128, 129]
-    slots.fill_(0)
-    assert workspace.tolist() == [128, 129]
-    runtime.finish(1)
-    runtime.close()
-
-
-def test_history_ensure_rejects_stale_batch_and_different_stream(
-    transport_class, monkeypatch
-):
-    cls, _ = transport_class
-    monkeypatch.setattr(dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [0])
-    cache = payload(256, 576, 1)
-    runtime = cls(
-        cache,
-        None,
-        ranks=(0,),
-        history_group=object(),
-        max_current_rows=1,
-        history_null_rows=128,
-    )
-    key = object()
-    options = dict(
-        batch_key=key,
         total_rows=1,
+        history_null_rows=128,
         has_history=False,
         history_slots=torch.empty(0, dtype=torch.int64),
         history_counts=(0,),
     )
-    runtime.prefetch(1, cache, None, **options)
-    with pytest.raises(RuntimeError, match="different batch/layer"):
-        runtime.prefetch(2, cache, None, **options)
-    with pytest.raises(RuntimeError, match="different batch/layer"):
-        runtime.prefetch(1, cache, None, **(options | {"batch_key": object()}))
-    torch.npu.stream = ExecutionStream()
-    with pytest.raises(RuntimeError, match="original execution stream"):
-        runtime.gather_current(1, cache[:1], width=576, total_rows=1)
+    with pytest.raises(ValueError, match="local token rows"):
+        ops.gather_current(workspace, cache[:2], None, counts=(1,))
+    with pytest.raises(ValueError, match="Index-K"):
+        ops.gather_current(workspace, cache[:1], cache[:1, :128], counts=(1,))

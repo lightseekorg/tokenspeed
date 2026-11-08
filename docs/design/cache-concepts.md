@@ -2311,12 +2311,18 @@ never selects a different Prefill implementation.
 
 A model may submit history gathering at the first preceding KDA layer. The
 attention entry ensures the same batch/layer history exists before consumption.
-An active gather owns its tensors through the final queued read; another batch
-or layer cannot reuse those tensors. Gather, copies, commit, and consumers use
-one fixed execution stream. Synchronous HCCL submissions join their internal
-stream onto it; allocator stream tracking protects temporary storage through
-queued consumers. Finish releases references, and shutdown drains execution
-before destroying the communicator. Only one layer's receive buffers are live;
+An active gather owns one layer's workspace through the final queued read;
+another batch or layer cannot reuse those tensors. Gather, copies, commit, and
+consumers are ordered on that layer's execution stream. Synchronous HCCL joins
+its internal stream onto it; allocator stream tracking protects temporary
+storage through queued consumers. Current KV and Index-K arrive together in
+one submission, and authoritative write slots are snapshotted once for both
+planes. The prologue's prepared latent store writes owner KV and repairs the
+compact view in one native operation; the indexer writes its own Index-K.
+Finish releases the workspace. A later call may use another stream after the
+caller establishes its dependencies; no persistent serving-stream identity or
+warmup phase is retained. Pool rebind and shutdown drain device work before
+releasing old storage or the communicator. Only one layer's receive buffers are live;
 allocation follows actual referenced pages and current rows, not cache capacity.
 The null page and receive alignment are physical overhead.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,

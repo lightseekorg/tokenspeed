@@ -449,6 +449,43 @@ class CommManager:
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )
 
+    def pre_attn_partition(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        *,
+        group: Group,
+        counts: Sequence[int],
+    ) -> torch.Tensor:
+        """Prepare projection rows without gathering an already matching shard."""
+        rank, matches_tp = self._attn_partition(ctx, group, counts)
+        if not (self.needs_pre_attn_all_gather() and matches_tp):
+            hidden_states = self.pre_attn_comm(hidden_states, ctx)
+            if hidden_states.shape[0] != sum(counts):
+                raise ValueError("Attention partition requires the full input rows")
+            begin = sum(counts[:rank])
+            hidden_states = hidden_states[begin : begin + counts[rank]]
+        if hidden_states.shape[0] != counts[rank]:
+            raise ValueError("Attention input rows disagree with their partition")
+        return hidden_states
+
+    def _attn_partition(
+        self, ctx: ForwardContext, group: Group, counts: Sequence[int]
+    ) -> tuple[int, bool]:
+        if (
+            len(group) != len(counts)
+            or len(set(group)) != len(group)
+            or self.mapping.rank not in group
+            or any(rank not in self.mapping.attn.tp_group for rank in group)
+            or any(count < 0 for count in counts)
+            or sum(counts) != sum(self.attn_tp_group_scattered_num_tokens(ctx))
+        ):
+            raise ValueError("Attention partition must cover this TP group's rows")
+        matches_tp = tuple(group) == tuple(self.mapping.attn.tp_group) and list(
+            counts
+        ) == self.attn_tp_group_scattered_num_tokens(ctx)
+        return group.index(self.mapping.rank), matches_tp
+
     def gather_residual(self, residual: torch.Tensor, ctx: ForwardContext):
         """All-gather a residual left scattered by the previous layer's RSAG
         path (e.g. for aux hidden capture); no-op when rows are already full.
@@ -520,17 +557,6 @@ class CommManager:
 
         if self.use_all_reduce(self.is_moe):
             hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
-            # The output residual is expected to have attn_tp_num_tokens.
-            # For first layer, the input residual has attn_tp_num_tokens.
-            # Otherwise, if this layer experiences a RSAG -> AR switch, residual needs allgather.
-            if self.layer_id > 0 and not self.use_all_reduce(self.prev_is_moe):
-                # Keep this residual-producing collective free of early PDL
-                # triggers: the next gated combine-norm may preload its result.
-                residual = token_all_gather(
-                    residual,
-                    group=self.mapping.attn.tp_group,
-                    scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
-                )
         else:
             token_list = self.attn_tp_group_scattered_num_tokens(ctx)
             hidden_states = token_reduce_scatter(
@@ -538,14 +564,46 @@ class CommManager:
                 group=self.mapping.attn.tp_group,
                 scattered_num_tokens=token_list,
             )
-            # The output residual is expected to have scattered_num_tokens.
-            # For first layer, the input residual has attn_tp_num_tokens, so needs slice.
-            # Otherwise, if this layer experiences a AR -> RSAG switch, residual needs slice.
-            if self.layer_id == 0 or self.use_all_reduce(self.prev_is_moe):
-                offset = sum(token_list[: self.mapping.attn.tp_rank])
-                residual = residual[offset : offset + hidden_states.size(0)]
+        return hidden_states, self._post_attn_residual(residual, ctx)
 
-        return hidden_states, residual
+    def _post_attn_residual(self, residual: torch.Tensor, ctx: ForwardContext):
+        input_scattered = self.needs_pre_attn_all_gather()
+        output_scattered = self.mapping.has_attn_tp and not self.use_all_reduce(
+            self.is_moe
+        )
+        if output_scattered and not input_scattered:
+            return self.slice_scattered_rows(residual, ctx)
+        if input_scattered and not output_scattered:
+            return self.gather_scattered_rows(residual, ctx)
+        return residual
+
+    def post_attn_complete_rows_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+        *,
+        group: Group,
+        counts: Sequence[int],
+    ):
+        """Re-layout complete attention rows, align the residual, then normalize.
+
+        These rows already contain every head's contribution: neither ordinary
+        nor fused all-reduce may sum them again.
+        """
+        rank, matches_tp = self._attn_partition(ctx, group, counts)
+        if hidden_states.shape[0] != counts[rank]:
+            raise ValueError("Complete attention rows disagree with their partition")
+        scattered = self.mapping.has_attn_tp and not self.use_all_reduce(self.is_moe)
+        if not (scattered and matches_tp):
+            if len(group) > 1:
+                hidden_states = token_all_gather(
+                    hidden_states, group=group, scattered_num_tokens=list(counts)
+                )
+            if scattered:
+                hidden_states = self.slice_scattered_rows(hidden_states, ctx)
+        residual = self._post_attn_residual(residual, ctx)
+        return self.post_attn_layernorm(hidden_states, residual)
 
     def pre_mlp_comm(self, hidden_states: torch.Tensor, ctx: ForwardContext):
         if self.is_moe:

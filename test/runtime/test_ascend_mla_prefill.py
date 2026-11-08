@@ -91,7 +91,7 @@ def test_bounded_reads_follow_the_mapped_table_without_changing_storage(begin, e
     backend = object.__new__(AscendMLABackend)
     backend.kernel_page_size = 128
     backend._prefill_pages = table
-    backend._prefill_runtime = ReceivePlane(raw)
+    backend._prefill_workspace = ReceivePlane(raw)
     before = raw.clone()
     for sequence in range(2):
         expected = torch.cat([raw[p * 128 : (p + 1) * 128] for p in table[sequence]])
@@ -143,43 +143,27 @@ def test_head_shards_share_full_query_metadata_and_receive_page_addresses(
         for rank in range(degree)
     ]
     for plan in plans:
-        assert (plan.row_start, plan.row_end) == (0, 146)
-        assert sum(plan.row_counts) == 146
+        assert (plan.query_start, plan.query_end) == (0, 146)
+        assert sum(plan.projection_row_counts) == 146
         torch.testing.assert_close(plan.query_cu, torch.tensor([0, 129, 146]))
         torch.testing.assert_close(plan.key_cu, torch.tensor([0, 256, 304]))
         torch.testing.assert_close(plan.page_table, plans[0].page_table)
         assert plan.query_seq.tolist() == [0] * 129 + [1] * 17
 
 
-@dataclass
-class CPUOwnerCommit:
-    """Stand in only for the native NPU byte-copy kernel."""
-
-    current: torch.Tensor
-    cache: torch.Tensor
-
-    def patch(
-        self,
-        layer_id,
-        slots,
-        direct,
-        *,
-        slots_workspace,
-        mapped_slots,
-        width,
-        block_rows,
-        virtual_blocks,
-    ):
-        committed = slots_workspace[: slots.numel()]
-        committed.copy_(slots)
-        slots = committed
-        live = (slots >= block_rows) & (slots < virtual_blocks * block_rows)
-        self.cache.index_copy_(0, slots[live].long(), self.current[live])
+def cpu_gathered_store(store):
+    """Substitute only the unavailable native byte-copy kernel."""
+    live = (store.slots >= store.block_rows) & (
+        store.slots < store.virtual_blocks * store.block_rows
+    )
+    store.cache.index_copy_(
+        0, store.slots[live], store.current[: store.slots.numel()][live]
+    )
 
 
 @pytest.mark.parametrize("prefixes,extends", [([0], [129]), ([127, 255], [3, 2])])
 def test_prefill_commits_router_slots_across_request_and_page_boundaries(
-    prefixes, extends
+    prefixes, extends, monkeypatch
 ):
     from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
         extend_write_locations,
@@ -201,11 +185,40 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
     current = torch.arange(total * 576, dtype=torch.int32).reshape(total, 576)
     cache = torch.full((7 * page, 576), -1, dtype=torch.int32)
     backend = object.__new__(AscendMLABackend)
-    backend._prefill_runtime = CPUOwnerCommit(current, cache)
+    from tokenspeed_kernel.ops.attention import prologue
+    from tokenspeed_kernel.ops.attention.ascend_prefill import PrefillWorkspace
+
+    padded_rows = -(-total // 128) * 128
+    compact = torch.zeros((128 + padded_rows, 576), dtype=current.dtype)
+    compact[128 : 128 + total].copy_(current)
+    backend._prefill_workspace = PrefillWorkspace(
+        layer_id=7,
+        batch_key=None,
+        source_kv=cache,
+        source_index=None,
+        kv=compact,
+        index=None,
+        history_rows=128,
+        send_rows=padded_rows,
+        current_rows=total,
+        ranks=(0,),
+        rank=0,
+        group=None,
+        write_slots=slots[0].long().clone(),
+        peak_buffer_bytes=0,
+    )
+    monkeypatch.setattr(
+        prologue, "select_kernel", lambda *args, **kwargs: cpu_gathered_store
+    )
     from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
 
-    backend._prefill_slots = torch.empty(total, dtype=torch.int64)
     backend._placement = CachePlacement(page, 7, (0,), 0)
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPContext
+
+    backend._dcp = AscendDCPContext(
+        degree=1, rank=0, ranks=(0,), auxiliary_namespace=None
+    )
+    backend.kernel_page_size = page
     backend._prefill_plan = AscendPrefillPlan.build(
         RequestMetadata(torch.tensor(extends), torch.tensor(prefixes), table),
         backend._placement,
@@ -217,7 +230,7 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
         query_partition=(0, total),
         options=AscendPrefillOptions(total, 128),
     )
-    backend.consume_prefill_kv(7, slots[0])
+    prologue.gathered_latent_store(backend.prefill_store(None))
     expected = torch.full_like(cache, -1)
     token = 0
     for req, (prefix, count) in enumerate(zip(prefixes, extends, strict=True)):
@@ -562,7 +575,7 @@ def test_unsupported_mla_cache_keeps_prefix_history_without_transport(
     pool, backend = _prefill_cache_and_backend(monkeypatch, options=None)
     backend.set_cache_pool(pool)
     assert backend.prepare_prefill() == 0
-    assert backend._prefill_slots is None
+    assert backend._prefill_workspace is None
     rows = pool.get_key_buffer(0).view(-1, 576)
     rows[128:255].fill_(7)
     backend._init_prefill_metadata(
@@ -598,8 +611,8 @@ def test_prefill_cache_binding_needs_no_transport_library_or_buffers(monkeypatch
     )
     backend.set_cache_pool(pool)
     assert backend.prefill_enabled
-    assert backend._prefill_runtime is None
-    assert backend._prefill_slots is None
+    assert backend._prefill_workspace is None
+    assert backend._prefill_workspace is None
 
 
 def test_mla_backend_releases_temporary_commit_slots_after_consumption(
@@ -625,7 +638,7 @@ def test_mla_backend_releases_temporary_commit_slots_after_consumption(
     manager.init_process_group((0,), "gloo")
     try:
         backend.set_cache_pool(pool)
-        assert backend._prefill_runtime is None
+        assert backend._prefill_workspace is None
         backend.configure_runtime(
             block_granularity=128,
             virtual_block_count=pool.arena.runtime_contract.virtual_block_counts[
@@ -647,17 +660,22 @@ def test_mla_backend_releases_temporary_commit_slots_after_consumption(
             extend_with_prefix=False,
             query_shard=None,
         )
-        assert backend._prefill_runtime is None
+        assert backend._prefill_workspace is None
         backend.prefetch_prefill_layer(0)
-        assert backend._prefill_slots.numel() == 1
+        assert backend._prefill_workspace.current_rows == 1
         for value in (1, 2):
             if value > 1:
                 backend.prefetch_prefill_layer(0)
             current = torch.full((1, 576), value, dtype=torch.bfloat16, device="npu")
-            backend.start_prefill_kv(0, current)
-            backend.consume_prefill_kv(
-                0, torch.tensor([128], dtype=torch.int32, device="npu")
+            from tokenspeed_kernel.ops.attention.prologue import gathered_latent_store
+
+            from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+            backend.prepare_prefill_current(
+                0, current, None, torch.tensor([128], dtype=torch.int32, device="npu")
             )
+            layer = PagedAttention(1, 576, 1.0, 1, 0, rotary_emb=None, qk_norm=None)
+            gathered_latent_store(backend.prefill_store(layer))
             backend.finish_prefill_layer(0)
             torch.testing.assert_close(
                 pool.get_key_buffer(0).view(-1, 576)[128].cpu(),
@@ -665,12 +683,12 @@ def test_mla_backend_releases_temporary_commit_slots_after_consumption(
                 rtol=0,
                 atol=0,
             )
-            assert backend._prefill_slots is None
-            assert backend._prefill_runtime.workspace_bytes == 0
+            assert backend._prefill_workspace is None
+            assert backend._prefill_workspace is None
     finally:
         backend.close_prefill()
         dist.destroy_process_group()
-    assert backend._prefill_slots is None
+    assert backend._prefill_workspace is None
 
 
 @pytest.mark.parametrize("rows,page_size", [(0, 128), (1, 0), (-1, 128)])

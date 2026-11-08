@@ -126,14 +126,16 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
                 table[request, positions // page].long() * page + positions % page
             ).tolist()
         )
-    for owner, count in enumerate(plans[0].row_counts):
-        start = sum(plans[0].row_counts[:owner])
+    for owner, count in enumerate(plans[0].projection_row_counts):
+        start = sum(plans[0].projection_row_counts[:owner])
         target = history_rows + owner * send_rows
         gathered.view(-1)[target : target + count] = torch.tensor(
             current_values[start : start + count]
         )
-    assert sum(plans[0].row_counts) == sum(extends)
-    assert max(plans[0].row_counts) - min(plans[0].row_counts) <= 1
+    assert sum(plans[0].projection_row_counts) == sum(extends)
+    assert (
+        max(plans[0].projection_row_counts) - min(plans[0].projection_row_counts) <= 1
+    )
     global_sequence = [
         request for request, count in enumerate(extends) for _ in range(count)
     ]
@@ -144,19 +146,19 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
         active_requests = [
             request
             for request, count in enumerate(extends)
-            if sum(extends[:request]) < plan.row_end
-            and sum(extends[: request + 1]) > plan.row_start
+            if sum(extends[:request]) < plan.query_end
+            and sum(extends[: request + 1]) > plan.query_start
             and count
         ]
         expected_sequence = [
             active_requests.index(request)
-            for request in global_sequence[plan.row_start : plan.row_end]
+            for request in global_sequence[plan.query_start : plan.query_end]
         ]
         assert plan.query_seq.tolist() == expected_sequence
         assert plan.scan_count.tolist() == [
-            min(end, 2048) for end in global_ends[plan.row_start : plan.row_end]
+            min(end, 2048) for end in global_ends[plan.query_start : plan.query_end]
         ]
-        assert plan.query_cu[-1] == plan.row_end - plan.row_start
+        assert plan.query_cu[-1] == plan.query_end - plan.query_start
         for compact, request in enumerate(active_requests):
             length = lengths[request]
             positions = torch.arange(length)
@@ -172,15 +174,15 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
         active_requests = [
             request
             for request, count in enumerate(extends)
-            if sum(extends[:request]) < plan.row_end
-            and sum(extends[: request + 1]) > plan.row_start
+            if sum(extends[:request]) < plan.query_end
+            and sum(extends[: request + 1]) > plan.query_start
             and count
         ]
         assert plan.index_table.data_ptr() == plan.page_table.data_ptr()
         for request, qlen, klen in zip(active_requests, q_lens, k_lens):
             offset = sum(extends[:request])
-            start = min(max(plan.row_start - offset, 0), extends[request])
-            end = min(max(plan.row_end - offset, 0), extends[request])
+            start = min(max(plan.query_start - offset, 0), extends[request])
+            end = min(max(plan.query_end - offset, 0), extends[request])
             assert qlen == end - start
             assert klen == prefixes[request] + end
 

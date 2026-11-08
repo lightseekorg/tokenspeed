@@ -127,10 +127,9 @@ class AscendMLAAttention(KimiLinearMLAAttention):
             del rows, expanded, key, partial, lse
         return output.to(query.dtype)
 
-    def _forward_prefill(self, positions, hidden, ctx, comm_manager):
-        backend = ascend_mla_prefill_backend(ctx.attn_backend)
-        plan = backend._prefill_plan
-        if plan is None or hidden.shape[0] != plan.row_counts[backend._dcp.rank]:
+    def _forward_prefill(self, positions, hidden, ctx, *, backend):
+        plan = backend.prefill_plan
+        if hidden.shape[0] != plan.projection_row_counts[backend._dcp.rank]:
             raise ValueError("MLA Prefill hidden rows must follow the TP partition")
         if (
             self.use_output_gate
@@ -156,19 +155,23 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         # Retain Q-latent gathering and local-head projections. KV uses the
         # same execution stream with early history gathering when available.
         backend.prefetch_prefill_layer(self.layer_id)
-        backend.start_prefill_kv(self.layer_id, latent)
-        qnorm = comm_manager.pre_attn_comm(qnorm, ctx)
+        backend.prepare_prefill_current(
+            self.layer_id,
+            latent,
+            None,
+            ctx.attn_backend.padded_write_locations(
+                self.attn_mqa, ctx.forward_mode, sum(plan.projection_row_counts)
+            ),
+        )
+        qnorm = backend.gather_prefill_queries(qnorm)
         query = self.q_b_proj(qnorm)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         if self.q_lora_scale is not None:
             query = query * self.q_lora_scale
-        if query.shape[0] != plan.row_end:
+        if query.shape[0] != plan.query_end:
             raise ValueError("MLA Prefill Q gather must cover the full token span")
-        backend.consume_prefill_kv(
-            self.layer_id,
-            ctx.attn_backend.padded_write_locations(
-                self.attn_mqa, ctx.forward_mode, query.shape[0]
-            ),
-        )
+        from tokenspeed_kernel.ops.attention.prologue import gathered_latent_store
+
+        gathered_latent_store(backend.prefill_store(self.attn_mqa))
         attended = query.new_empty(
             (query.shape[0], self.num_local_heads, self.v_head_dim)
         )
@@ -186,15 +189,27 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         backend.finish_prefill_layer(self.layer_id)
         return self.o_proj(attended.flatten(1))[0]
 
-    def forward(self, positions, hidden_states, ctx, comm_manager, *, projection_out):
-        if (
-            ctx.forward_mode.is_extend_or_mixed()
-            and self.prefill_supported
-            and ascend_mla_prefill_backend(ctx.attn_backend).prefill_enabled
-        ):
-            if projection_out is not None:
-                raise ValueError("MLA Prefill output reduction belongs to CommManager")
-            return self._forward_prefill(positions, hidden_states, ctx, comm_manager)
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        ctx,
+        comm_manager,
+        *,
+        projection_out,
+        prefill_backend=None,
+    ):
+        if ctx.forward_mode.is_extend_or_mixed() and self.prefill_supported:
+            if prefill_backend is None:
+                prefill_backend = ascend_mla_prefill_backend(ctx.attn_backend)
+            if prefill_backend.prefill_enabled:
+                if projection_out is not None:
+                    raise ValueError(
+                        "MLA Prefill output reduction belongs to CommManager"
+                    )
+                return self._forward_prefill(
+                    positions, hidden_states, ctx, backend=prefill_backend
+                )
         if (
             self.fused_decode is not None
             and ctx.forward_mode.is_decode()

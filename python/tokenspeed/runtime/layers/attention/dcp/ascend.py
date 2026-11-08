@@ -130,13 +130,47 @@ class AscendPrefillGatherPlan:
         )
 
 
+def ascend_prefill_store(workspace, plan, placement, *, kernel_page_size):
+    """Describe owner history and compact destinations; the prologue writes."""
+    from tokenspeed_kernel.ops.attention.prologue import GatheredLatentStore
+
+    if workspace is None or workspace.write_slots is None:
+        raise RuntimeError("Prepare current Prefill rows before the latent store")
+    local_rows = workspace.source_kv.numel() // 576
+    return GatheredLatentStore(
+        current=workspace.kv[workspace.history_rows :],
+        slots=workspace.write_slots,
+        cache=workspace.source_kv.view(-1, 576),
+        compact=workspace.kv,
+        direct=plan.current_direct,
+        mapped_slots=plan.patch_slots,
+        virtual_blocks=(
+            local_rows // kernel_page_size
+            if placement is None
+            else placement.virtual_block_count
+        ),
+        send_rows=workspace.send_rows,
+        block_rows=(
+            kernel_page_size if placement is None else placement.block_granularity
+        ),
+        degree=len(workspace.ranks),
+        rank=workspace.rank,
+        history_rows=workspace.history_rows,
+    )
+
+
 @dataclass(frozen=True)
 class AscendPrefillPlan:
-    """Receive-page addresses, causal spans and current-row placement."""
+    """Receive pages and current rows for one native Prefill batch.
 
-    row_counts: list[int]
-    row_start: int
-    row_end: int
+    projection_row_counts partitions producer inputs over cache owners.
+    query_start/query_end describe this rank's attention query span; MLA
+    uses the full span after gathering Q latent, while DSA keeps local queries.
+    """
+
+    projection_row_counts: list[int]
+    query_start: int
+    query_end: int
     page_table: torch.Tensor
     index_table: torch.Tensor
     query_cu: torch.Tensor
@@ -147,29 +181,6 @@ class AscendPrefillPlan:
     cold: bool
     gather: AscendPrefillGatherPlan | None = None
     patch_slots: torch.Tensor | None = None
-
-    def patch(
-        self,
-        runtime,
-        layer_id,
-        slots,
-        *,
-        slots_workspace,
-        width,
-        block_rows,
-        virtual_blocks,
-    ):
-        """Commit on the compute stream using the backend-owned slots."""
-        return runtime.patch(
-            layer_id,
-            slots,
-            self.current_direct,
-            slots_workspace=slots_workspace,
-            mapped_slots=self.patch_slots,
-            width=width,
-            block_rows=block_rows,
-            virtual_blocks=virtual_blocks,
-        )
 
     @classmethod
     def build(

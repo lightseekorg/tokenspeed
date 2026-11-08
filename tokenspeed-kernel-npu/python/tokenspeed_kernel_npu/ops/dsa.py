@@ -28,7 +28,6 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from tokenspeed_kernel_npu._triton import tl, triton
-from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
 
 
 @triton.jit
@@ -267,31 +266,21 @@ class AscendDSAKernels:
         self._attention = getattr(
             torch.ops.custom, "npu_sparse_flash_attention_decode", None
         )
+        self._full_scan_chunks = {}
+
+    def require_decode(self):
+        """Decode preparation owns these dependencies, not Prefill construction."""
+        if self._index is None:
+            self._index = getattr(torch.ops.custom, "npu_lightning_indexer", None)
+        if self._attention is None:
+            self._attention = getattr(
+                torch.ops.custom, "npu_sparse_flash_attention_decode", None
+            )
         if self._index is None or self._attention is None:
             raise RuntimeError(
                 "LongCatDSA needs LightningIndexer and "
                 "SparseFlashAttentionDecode operators"
             )
-        self._full_scan_chunks = {}
-
-    @staticmethod
-    def prepare_prefill(
-        kv_cache,
-        index_cache,
-        *,
-        ranks,
-        history_group,
-        max_current_rows,
-        history_null_rows,
-    ):
-        return AscendDSAPrefill(
-            kv_cache,
-            index_cache,
-            ranks=ranks,
-            history_group=history_group,
-            max_current_rows=max_current_rows,
-            history_null_rows=history_null_rows,
-        )
 
     @staticmethod
     def prefill_metadata(
@@ -614,6 +603,8 @@ class AscendDSAKernels:
         local_tensor = torch.full(
             (query.shape[0],), local, dtype=torch.int32, device=query.device
         )
+        if self._index is None:
+            self.require_decode()
         result, _ = self._index(
             query.contiguous(),
             key,
@@ -651,6 +642,8 @@ class AscendDSAKernels:
         optional = {}
         if visible_lengths is not None:
             optional["visible_lengths"] = visible_lengths
+        if self._index is None:
+            self.require_decode()
         result, values = self._index(
             query.contiguous(),
             key,
@@ -683,6 +676,8 @@ class AscendDSAKernels:
         table,
         scale,
     ):
+        if self._attention is None:
+            self.require_decode()
         output, _, _ = self._attention(
             q,
             key,
@@ -721,6 +716,8 @@ class AscendDSAKernels:
         sparse_mode,
         out=None,
     ):
+        if self._attention is None:
+            self.require_decode()
         operation = self._attention if out is None else self._attention.out
         outputs = (
             {}

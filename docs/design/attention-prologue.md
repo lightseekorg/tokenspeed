@@ -26,6 +26,16 @@ first:
   attention K/V but take the norm step (MiniMax-M3's indexer): the GQA kernels
   with no cache write. Indexers that only rotate call `embedding.rope`.
 
+Ascend's bounded Prefill uses `gathered_latent_store(GatheredLatentStore)`
+after preparing and gathering latent rows. Its descriptor names the padded
+producer rows, authoritative virtual write slots, owner cache and compact
+receive view. The registered native solution writes owner KV and repairs
+compact boundary pages in one operation, without another normalization,
+rotation, gather or latent copy. The backend describes addresses and temporary
+storage; the model calls the prologue store before core attention. Index-K
+remains the indexer's write. Decode's fused native prolog retains its fused
+projection/store operation and writes the same owner-local cache contract.
+
 Head geometry comes from the cache descriptor and the input shapes, and the
 storage format from the cache's rows and planes. No argument restates either.
 Typed holders carry each optional step: `HeadNorm`, `Rotary` (with `MRope`),

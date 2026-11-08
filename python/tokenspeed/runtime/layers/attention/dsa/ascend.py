@@ -29,7 +29,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.dsa import prepare_dsa_resources
-from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_kernels
+from tokenspeed_kernel.ops.attention.dsa.ascend import (
+    ascend_dsa_kernels,
+    supports_fused_dsa_decode,
+)
 from tokenspeed_kernel.ops.attention.prologue import mla_prologue
 from torch import nn
 from torch.nn import functional as F
@@ -516,16 +519,17 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             )
         return index_query, index_key
 
-    def _forward_prefill(self, positions, hidden, ctx):
+    def _forward_prefill(self, positions, hidden, ctx, *, backend=None):
         if self._prefill_weights is None:
             raise RuntimeError("Prepare token-local DSA Prefill weights before forward")
-        backend = ascend_dsa_prefill_backend(ctx.attn_backend)
-        plan = backend._prefill_plan
-        if plan is None or hidden.shape[0] != plan.row_end - plan.row_start:
+        if backend is None:
+            backend = ascend_dsa_prefill_backend(ctx.attn_backend)
+        plan = backend.prefill_plan
+        if hidden.shape[0] != plan.query_end - plan.query_start:
             raise ValueError(
                 "DSA Prefill hidden rows must follow the CP query partition"
             )
-        positions = positions[plan.row_start : plan.row_end]
+        positions = positions[plan.query_start : plan.query_end]
         qb, kc, vc, wo = self._prefill_weights
         indexer = self.indexer
         if hidden.shape[0]:
@@ -585,6 +589,24 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
                 (0, kc.shape[0], self.kv_lora_rank + self.qk_rope_head_dim)
             )
             latent = hidden.new_empty((0, self.kv_lora_rank + self.qk_rope_head_dim))
+        from tokenspeed_kernel.ops.attention.prologue import gathered_latent_store
+
+        backend.prepare_prefill_current(
+            self.layer_id,
+            latent.contiguous(),
+            ik.contiguous(),
+            ctx.attn_backend.padded_write_locations(
+                self.attn_mqa, ctx.forward_mode, sum(plan.projection_row_counts)
+            ),
+        )
+        indices = backend.select_prefill_indices(
+            iq,
+            weights,
+            self.attn_mqa,
+            initial=self.index_init_tokens,
+            window=self.index_local_tokens,
+        )
+        gathered_latent_store(backend.prefill_store(self.attn_mqa))
         output = ctx.attn_backend.forward(
             query,
             None,
@@ -596,12 +618,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             fused=False,
             save_kv_cache=False,
             record_kv_cache=False,
-            index_query=iq,
-            prefill_latent=latent.contiguous(),
-            index_key=ik.contiguous(),
-            index_weights=weights,
-            index_init_tokens=self.index_init_tokens,
-            index_local_tokens=self.index_local_tokens,
+            prefill_indices=indices,
             head_major_output=True,
         )
         if hidden.shape[0] == 0:
@@ -609,13 +626,17 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         projected = torch.bmm(output, vc).transpose(0, 1).contiguous()
         return F.linear(projected.flatten(1), wo)
 
-    def forward(self, positions, hidden_states, ctx, comm_manager):
+    def forward(
+        self, positions, hidden_states, ctx, comm_manager, *, prefill_backend=None
+    ):
         if ctx.forward_mode.is_extend_or_mixed():
             if not self.prefill_enabled:
                 raise RuntimeError(
                     "DSA Prefill weights were disabled for this decode-only model"
                 )
-            return self._forward_prefill(positions, hidden_states, ctx)
+            return self._forward_prefill(
+                positions, hidden_states, ctx, backend=prefill_backend
+            )
         if hidden_states.shape[0] == 0:
             return hidden_states
         if (
@@ -724,6 +745,8 @@ class AscendDSARuntime:
         )
 
         self.layers = tuple(layers)
+        if not all(supports_fused_dsa_decode(layer) for layer in self.layers):
+            raise ValueError("Loaded weights do not meet the native DSA projection ABI")
         self.ranks = tuple(mapping.attn.tp_group)
         if len(self.ranks) != 8 or not self.layers:
             raise ValueError(

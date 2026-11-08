@@ -189,7 +189,9 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     monkeypatch, rows, scale_q
 ):
     """The prologue's KV write alone cannot release a DSA producer step."""
+    from tokenspeed_kernel.ops.attention import prologue as kernel_prologue
     from tokenspeed_kernel.ops.attention.prologue.types import (
+        GatheredLatentStore,
         LatentKVCache,
         MLAPrologueOutput,
     )
@@ -217,16 +219,21 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
 
     @dataclass
     class QuerySpan:
-        row_start: int = 0
-        row_end: int = rows
+        query_start: int = 0
+        query_end: int = rows
+        projection_row_counts: tuple[int, ...] = (rows,)
 
     class CpuIndexWriter(AscendDSABackend):
         # The device SFA/index kernels are unavailable. This leaf writes a real
         # index-cache tensor and publishes when its device work would finish.
-        def __init__(self):
+        def __init__(self, pool):
             self._prefill_options = None
             self._prefill_plan = QuerySpan()
             self.step_counter = None
+            self.pool = pool
+            self.latent = None
+            self.slots = None
+            self.index_key = None
             self.index_cache = torch.zeros(rows, 1, 4, dtype=torch.bfloat16)
             self.counter_before_index = None
             self.query = None
@@ -236,15 +243,40 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         def cache_placement(self, layer):
             return None
 
-        def forward_extend(self, q, k, v, layer, slots, pool, bs, **kwargs):
+        def prepare_prefill_current(self, layer_id, latent, index_key, slots):
+            self.latent = latent
+            self.slots = slots.long()
+            self.index_key = index_key
+
+        def select_prefill_indices(self, query, weights, layer, *, initial, window):
             self.counter_before_index = int(self.step_counter.h_ready_cache_step)
-            self.query = q.clone()
-            self.index_query = kwargs["index_query"].clone()
-            self.index_weights = kwargs["index_weights"].clone()
-            pool.latent.index_copy_(
-                0, slots.long(), kwargs["prefill_latent"].unsqueeze(1)
+            self.index_query = query.clone()
+            self.index_weights = weights.clone()
+            self.index_cache.index_copy_(0, self.slots, self.index_key)
+            return torch.empty(rows, 0, dtype=torch.int32)
+
+        def prefill_store(self, layer):
+            compact = torch.cat((self.latent.new_zeros(128, 8), self.latent))
+            return GatheredLatentStore(
+                current=compact[128:],
+                slots=self.slots,
+                cache=self.pool.latent.view(-1, 8),
+                compact=compact,
+                direct=torch.zeros(rows, dtype=torch.uint8),
+                mapped_slots=torch.full((rows,), -1, dtype=torch.int64),
+                virtual_blocks=rows,
+                send_rows=rows,
+                block_rows=1,
+                degree=1,
+                rank=0,
+                history_rows=128,
             )
-            self.index_cache.index_copy_(0, slots.long(), kwargs["index_key"])
+
+        def forward_extend(self, q, k, v, layer, slots, pool, bs, **kwargs):
+            torch.testing.assert_close(
+                pool.latent.view(-1, 8), self.latent, rtol=0, atol=0
+            )
+            self.query = q.clone()
             self.step_counter.record_cache()
             return q[..., :4].transpose(0, 1).contiguous()
 
@@ -272,7 +304,16 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
             x.float(), (x.shape[-1],), weight.float(), eps
         ).to(x.dtype)
 
+    def cpu_store(store):
+        assert int(leaf.step_counter.h_ready_cache_step) == 0
+        store.cache.index_copy_(0, store.slots, store.current)
+
     monkeypatch.setattr(ascend, "mla_prologue", cpu_prologue)
+    monkeypatch.setattr(
+        kernel_prologue,
+        "select_kernel",
+        lambda *args, **kwargs: cpu_store,
+    )
     monkeypatch.setattr(
         unquant,
         "kernel_mm",
@@ -304,7 +345,8 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     attention.process_weights_after_loading()
     group = "full_history"
     attention.attn_mqa.bind_cache_group(group)
-    leaf = CpuIndexWriter()
+    pool = Pool(torch.zeros(rows, 1, 8, dtype=torch.bfloat16))
+    leaf = CpuIndexWriter(pool)
     router = CacheGroupRouter(
         lambda *args: leaf,
         is_draft=False,
@@ -325,7 +367,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     router._extend_write_locations = {group: torch.arange(rows)}
     counter = CpuStepCounter()
     router.register_step_counter(counter)
-    pool = Pool(torch.zeros(rows, 1, 8, dtype=torch.bfloat16))
     hidden = torch.sin(torch.arange(rows * 8).float()).reshape(rows, 8).bfloat16()
     output = attention(torch.arange(rows), hidden, Context(router, pool), None)
 

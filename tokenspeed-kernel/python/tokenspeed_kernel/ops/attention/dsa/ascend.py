@@ -32,10 +32,44 @@ from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["ascend_dsa_kernels", "ascend_dsa_cp_metadata"]
+__all__ = ["ascend_dsa_kernels", "ascend_dsa_cp_metadata", "supports_fused_dsa_decode"]
 
 platform = current_platform()
 _kernels = None
+
+
+def supports_fused_dsa_decode(layer) -> bool:
+    """Admit the host's CP8 packed projection ABI from the loaded weights."""
+    indexer = layer.indexer
+    if (
+        layer.hidden_size,
+        layer.num_heads,
+        layer.num_local_heads,
+        layer.q_lora_rank,
+        layer.kv_lora_rank,
+        layer.qk_nope_head_dim,
+        layer.qk_rope_head_dim,
+        layer.v_head_dim,
+        indexer.index_n_heads,
+        indexer.index_head_dim,
+    ) != (4096, 64, 8, 1536, 512, 128, 64, 128, 64, 128) or layer.use_output_gate:
+        return False
+    weights = (
+        (layer.q_a_proj.weight, (1536, 4096), torch.bfloat16),
+        (layer.kv_a_proj_with_mqa.weight, (576, 4096), torch.bfloat16),
+        (layer.q_b_proj.weight, (1536, 1536), torch.bfloat16),
+        (indexer.wq_b.weight, (8192, 1536), torch.bfloat16),
+        (indexer.wk.weight, (128, 4096), torch.bfloat16),
+        (indexer.weights_proj.weight, (64, 4096), torch.float32),
+    )
+    if any(
+        value.shape != shape or value.dtype != dtype for value, shape, dtype in weights
+    ):
+        return False
+    return all(
+        rotary is None or (not rotary.is_neox_style and rotary.rotary_dim == 64)
+        for rotary in (layer.rotary_emb, indexer.rotary_emb)
+    )
 
 
 def ascend_dsa_cp_metadata(table, lengths, **kwargs):
@@ -66,6 +100,11 @@ def ascend_dsa_kernels():
     return _kernels
 
 
+def require_ascend_dsa_decode():
+    """Validate ordinary Decode dependencies before serving or graph capture."""
+    ascend_dsa_kernels().require_decode()
+
+
 def ascend_prefill_cache_metadata(*args, **kwargs):
     """Map owner pages and current receives without loading Indexer operators."""
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
@@ -77,7 +116,7 @@ def ascend_prepare_dsa_resources(*, group, rank):
     """Bind operator-owned views of the existing HCCL windows before capture."""
     from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
-    ascend_dsa_kernels()
+    require_ascend_dsa_decode()
     window = torch.ops.custom.dsa_prepare_prolog_window(group, rank)
     try:
         prepared = {
