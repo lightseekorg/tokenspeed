@@ -258,6 +258,34 @@ constexprs alone.
 - Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
   register copy of a pending load waits for the load and serializes the chunks.
 
+### gfx950 weight-only FP8 decode GEMV
+
+`gluon_gemv_a16w8_gfx950` (`gemm/fp16/gemv.py`) computes
+`(x @ w.T) * s` with E4M3 weights and one FP32 scale per weight row.
+
+#### Contract
+
+- `x` is `[M, K]` BF16 or FP16 with unit inner stride and `1 <= M <= 128`;
+  `w` a contiguous `[N, K]` `float8_e4m3fn` matrix with `K` a multiple of 16
+  and at least 64; `s` a contiguous FP32 `[N]`; `out` `[M, N]` in `x`'s dtype
+  with unit inner stride.
+- Each E4M3 value upcasts exactly to `x`'s dtype, products sum in FP32, the
+  row scale multiplies the sum once, and the output rounds once.
+- `gemm.mv_fp8_weight` selects it up to 32 rows, where it measured faster
+  than the BF16 GEMVs on 8192-hidden MLP, output-projection and LM-head
+  shards (MI355X, cold weights); larger calls run as 32-row chunks.
+- One binary per (shape, row bucket 16 / 32 / 64 / 128); `M` is a runtime
+  argument, and a row's bits do not depend on the other rows of its bucket.
+
+#### Algorithm
+
+The dense GEMV's MFMA tile with 16-byte weight loads of 16 E4M3 values. The
+tile's `BLOCK_M` covers every row, so each weight byte is read once; the K
+step shrinks with `BLOCK_M` to keep the activation tile within 32 VGPRs a
+buffer. At most 32 outputs per program, so wide outputs (a vocabulary shard)
+launch several programs per CU. Weights pass through LDS in E4M3 and upcast
+(`v_cvt_scalef32_pk_bf16_fp8`) in the MFMA operand layout.
+
 ### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1

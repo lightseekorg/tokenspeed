@@ -72,6 +72,13 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+`mv_fp8_weight` projects 16-bit rows through a weight-only FP8 weight: E4M3
+with one FP32 scale per output channel, as a 16-bit checkpoint quantizes at
+load. Activations stay 16-bit, so the only roundings past the weight's are
+the FP32 sums' and the output's. The `("gemm", "mv_fp8_weight")` operation
+takes up to `MV_FP8_WEIGHT_MAX_M` rows a launch, larger calls run in chunks of
+that many, and the Torch reference upcasts the weight a chunk at a time.
+
 `mv_weightless_rmsnorm_gated_sigmoid` normalizes, gates and projects one row
 through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
 registered kernel serves it only where the separate gated norm and `mv` select
