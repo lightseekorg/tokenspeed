@@ -358,12 +358,13 @@ class Qwen3ForCausalLM(BaseCausalLM):
         return self.model.get_input_embeddings(input_ids)
 
     def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
+        # Dots keep an encoder's fused qkv_proj from matching v_proj.
         return [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            (".qkv_proj.", ".q_proj.", "q"),
+            (".qkv_proj.", ".k_proj.", "k"),
+            (".qkv_proj.", ".v_proj.", "v"),
+            (".gate_up_proj.", ".gate_proj.", 0),
+            (".gate_up_proj.", ".up_proj.", 1),
         ]
 
     def load_weights(

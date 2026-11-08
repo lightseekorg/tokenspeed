@@ -470,6 +470,9 @@ class HostConfig:
         epd_receive_enabled: An EPD prefill node: requests whose images an encode
             node embeds wait for the embeddings before they are scheduled;
             its first stage receives them (``HostBootstrap.epd_receive``).
+        reasoning: The reasoning parser's structural tags and token markers;
+            used for grammar deferral and reasoning usage, also when grammar
+            constraints are off. None without a supported parser.
         grammar: Grammar-constrained decoding's settings; None with
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
@@ -529,6 +532,7 @@ class HostConfig:
     engine_role: str
     eplb: EplbSettings | None
     epd_receive_enabled: bool
+    reasoning: ReasoningGrammar | None
     grammar: GrammarSettings | None
     eager_grammar: bool
 
@@ -1337,6 +1341,11 @@ class HostBootstrap:
                 ),
                 pg_manager=pg_manager,
             )
+            reasoning = (
+                reasoning_grammar(server_args.reasoning_parser, tokenizer)
+                if server_args.reasoning_parser
+                else None
+            )
             self.config = HostConfig(
                 handshake_address=server_args.zmq_handshake_endpoint(),
                 engine_index=server_args.zmq_engine_index + dp_rank,
@@ -1440,6 +1449,7 @@ class HostBootstrap:
                     )
                     and model_config.is_multimodal_active
                 ),
+                reasoning=reasoning,
                 grammar=(
                     GrammarSettings(
                         tokenizer_info=grammar_tokenizer_info(
@@ -1452,11 +1462,7 @@ class HostBootstrap:
                             server_args.grammar_compile_timeout_secs
                         ),
                         max_retries=int(server_args.grammar_compile_max_retries),
-                        reasoning=(
-                            reasoning_grammar(server_args.reasoning_parser, tokenizer)
-                            if server_args.reasoning_parser
-                            else None
-                        ),
+                        reasoning=reasoning,
                     )
                     if server_args.grammar_backend == "xgrammar"
                     else None

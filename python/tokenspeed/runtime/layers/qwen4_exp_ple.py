@@ -108,6 +108,29 @@ def _nth_prime_after(start: int, count: int) -> int:
     return candidate
 
 
+def _ngram_table_storage_dtype(
+    ple_embed_dtype: str | None,
+    quant_config: QuantizationConfig | None,
+    table_prefix: str,
+) -> torch.dtype | None:
+    """Storage dtype of the n-gram table; ``None`` stores the compute dtype.
+
+    Without an explicit ``ple_embed_dtype`` the table keeps the checkpoint's
+    format: an FP8 table is copied as stored and its per-tensor scale applied
+    at lookup, which reads the same values as dequantizing it at load.
+    """
+    if ple_embed_dtype is None:
+        if quant_config is not None and quant_config.stores_fp8_embedding(table_prefix):
+            return torch.float8_e4m3fn
+        return None
+    if ple_embed_dtype != "float8_e4m3fn":
+        raise ValueError(
+            "Qwen4-Exp ple_embed_dtype supports only 'float8_e4m3fn', "
+            f"got {ple_embed_dtype!r}"
+        )
+    return torch.float8_e4m3fn
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     """Hashed, independently-sharded n-gram embedding used by PLE."""
 
@@ -123,6 +146,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         mapping: Mapping,
         embedding_dim: int,
         ple_layer_index: int,
+        quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -184,22 +208,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisible_by = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab = (total + divisible_by - 1) // divisible_by * divisible_by
-        ple_embed_dtype = getattr(config, "ple_embed_dtype", None)
-        if ple_embed_dtype not in (None, "float8_e4m3fn"):
-            raise ValueError(
-                "Qwen4-Exp ple_embed_dtype supports only 'float8_e4m3fn', "
-                f"got {ple_embed_dtype!r}"
-            )
+        table_prefix = add_prefix("ngram_embedding", prefix)
         offload_embedding = config.ple_offload_embedding
         self.lookup = PLELookup(
             mapping,
             vocab_size=padded_vocab,
             ngram_heads=self.ngram_heads,
             head_dim=self.head_dim,
-            storage_dtype=torch.float8_e4m3fn if ple_embed_dtype else None,
+            storage_dtype=_ngram_table_storage_dtype(
+                config.ple_embed_dtype, quant_config, table_prefix
+            ),
             output_dtype=torch.get_default_dtype(),
             offload=offload_embedding,
-            prefix=add_prefix("ngram_embedding", prefix),
+            prefix=table_prefix,
         )
         if self.ple_layer_index == 0 and offload_embedding:
             weight = self.lookup.ngram_embedding.weight
@@ -386,6 +407,7 @@ class Qwen4ExpPLELayer(nn.Module):
             mapping,
             int(config.ple_embed_dim),
             ple_layer_index,
+            quant_config,
             add_prefix("ple_embedding", prefix),
         )
         # key_proj and value_proj consume the same embeddings; fuse them into

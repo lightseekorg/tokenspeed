@@ -20,7 +20,11 @@
 
 """Real V4.1 fused-decode attention checks on supported CUDA targets."""
 
+import os
+import subprocess
+import sys
 from dataclasses import replace
+from pathlib import Path
 from test.runtime import test_deepseek_v41_cache as cache_test
 from test.runtime.test_deepseek_v41_engram import _mapping
 from test.runtime.test_deepseek_v41_model import (
@@ -37,7 +41,7 @@ from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
     is_flash_mla_fused_decode_available,
 )
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -388,7 +392,11 @@ def test_fused_decode_matches_canonical_and_keeps_prefill_weights(
         _ctx(fused_prefill_backend, 1, ForwardMode.EXTEND),
         reduce_output=True,
     )
-    torch.testing.assert_close(fused_prefill, plain_prefill, rtol=0, atol=0)
+    # Prefill now runs the fused FP8 attention, so it is no longer bitwise equal
+    # to the plain path. Use the same relative-L2 envelope as the decode
+    # comparison above.
+    prefill_delta = (fused_prefill.float() - plain_prefill.float()).norm(dim=-1)
+    assert torch.all(prefill_delta / plain_prefill.float().norm(dim=-1) < 0.055)
     for actual, expected in zip(
         (
             attn.wq_b.weight,
@@ -579,3 +587,141 @@ def test_tp_attention_is_not_prepared_for_fused_decode():
     attn.prepare_fused_decode()
     assert attn.n_local_heads == 32
     assert attn.fused_q_weight is None
+
+
+def test_zeroed_fused_output_has_the_kernels_layout():
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+        zeroed_fused_output,
+    )
+
+    rows, groups = 5, 8
+    q = torch.zeros(rows, 64, 512, dtype=torch.bfloat16)
+    codes, scales = zeroed_fused_output(q, groups, rows)
+    assert codes.dtype == torch.float8_e4m3fn
+    assert codes.shape == (rows, groups, 64 * 512 // groups)
+    assert codes.is_contiguous()
+    assert scales.dtype == torch.int32
+    assert scales.shape == (rows, groups, 64 * 512 // groups // 128)
+    # Rows are the fastest dimension, over storage padded to four rows.
+    assert scales.stride(0) == 1
+    assert scales.stride(1) == (rows + 3) // 4 * 4 * scales.shape[2]
+    assert not codes.view(torch.uint8).any()
+    assert not scales.any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_prefill_support_follows_the_query_group():
+    backend, _ = _real_backend()
+    assert backend.supports_fused_prefill
+    backend.spec = replace(backend.spec, attention_query_group=(0, 1))
+    assert backend.supports_fused_attention
+    assert not backend.supports_fused_prefill
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("guard", ["query_group", "query_shard"])
+def test_fused_prefill_rejects_layouts_it_cannot_serve(guard):
+    backend, tables = _real_backend()
+    meta = cache_test._extend(backend, tables, [3], [0], [0], [3])
+    if guard == "query_group":
+        backend.spec = replace(backend.spec, attention_query_group=(0, 1))
+        key_rows, message = None, "operator query context parallelism"
+    else:
+        # The guard reads only whether key_rows is present.
+        key_rows, message = object(), "model query shard"
+    q = torch.zeros(3, 64, 512, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=message):
+        backend.forward_v41(
+            q,
+            torch.zeros(3, 512, device="cuda", dtype=torch.bfloat16),
+            layer_id=1,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=torch.zeros(64, device="cuda", dtype=torch.float32),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=torch.zeros(1, 64, device="cuda", dtype=torch.float32),
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=8,
+            key_rows=key_rows,
+        )
+
+
+_QUERY_WARMUP_SCRIPT = """
+import sys
+from pathlib import Path
+
+import torch
+from test.runtime.test_deepseek_v41_fused_decode import (
+    _initialize, _load_decode_projections, _mapping, _quant, _supported_config,
+)
+from tokenspeed.runtime.models.deepseek_v41 import (
+    DeepseekV41Attention, _warmup_query_projections, v41_mxfp8_config,
+)
+from tokenspeed_kernel.ops.gemm import fp8_projection
+from tokenspeed_kernel.platform import pdl_enabled
+
+pdl_enabled(True)
+cache, groups = Path(sys.argv[1]), int(sys.argv[2])
+config = _supported_config(groups=groups)
+attentions = []
+with torch.device("cuda"), torch.inference_mode():
+    # Window-only layers precede the first indexer in real checkpoints.
+    for layer_id in (1, 2):
+        attn = DeepseekV41Attention(
+            config, _mapping(0, 1, 1), layer_id, config.num_hidden_layers,
+            v41_mxfp8_config(_quant()), f"layers.{layer_id}.attn", aux_stream=None,
+        )
+        _initialize(attn)
+        _load_decode_projections(attn, seed=layer_id)
+        attn.prepare_fused_decode()
+        assert (attn.fused_q_weight is not None) == (groups == 8)
+        attentions.append(attn)
+    _warmup_query_projections(attentions, 300)
+    compiled = set(cache.rglob("*"))
+    assert compiled, "the warmup compiled nothing into the JIT cache"
+    for attn in attentions:
+        layers = [attn.wq_a_wkv, attn.wq_b]
+        if attn.indexer is not None:
+            layers.append(attn.indexer.wq_b)
+        for tokens in (1, 7, 16, 17, 100, 255, 256, 300):
+            for layer in layers:
+                width = layer.weight.shape[1]
+                codes = torch.zeros(tokens, width, dtype=torch.float8_e4m3fn)
+                scales = torch.zeros(width // 128, (tokens + 3) // 4 * 4,
+                                     dtype=torch.int32).mT[:tokens]
+                layer.quant_method.apply(layer, codes, None, scales, torch.bfloat16)
+            if attn.fused_q_weight is not None:
+                width = attn.fused_q_weight.shape[1]
+                codes = torch.zeros(tokens, width, dtype=torch.float8_e4m3fn)
+                scales = torch.zeros(width // 128, (tokens + 3) // 4 * 4,
+                                     dtype=torch.int32).mT[:tokens]
+                fp8_projection(codes, scales, attn.fused_q_weight,
+                               attn.fused_q_projection_scales, None)
+    torch.cuda.synchronize()
+    new = set(cache.rglob("*")) - compiled
+    assert not new, f"attention-front projections compiled after warmup: {new}"
+"""
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform().is_blackwell),
+    reason="DeepGEMM group-32 projections require Blackwell",
+)
+@pytest.mark.parametrize("groups", [8, 16])
+def test_warmup_covers_every_deep_gemm_front_projection(tmp_path, groups):
+    pytest.importorskip("deep_gemm")
+    cache = tmp_path / "jit"
+    result = subprocess.run(
+        [sys.executable, "-c", _QUERY_WARMUP_SCRIPT, str(cache), str(groups)],
+        env={**os.environ, "DG_JIT_CACHE_DIR": str(cache)},
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

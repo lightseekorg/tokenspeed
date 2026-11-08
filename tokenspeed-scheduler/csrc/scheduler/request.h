@@ -77,17 +77,6 @@ public:
     }
     void NoteRetracted() { ++retraction_count_; }
 
-    // Cancellation follows the request lifetime, through transfer and forward retirement.
-    void DeferPdAbort() {
-        if (pd_abort_ == PdAbort::kNone) {
-            pd_abort_ = PdAbort::kAwaitingTransfer;
-        }
-    }
-    void RetirePdFailure() { pd_abort_ = PdAbort::kAwaitingForward; }
-    void ClearPdAbort() { pd_abort_ = PdAbort::kNone; }
-    bool PdAbortPending() const { return pd_abort_ != PdAbort::kNone; }
-    bool PdFailureRetired() const { return pd_abort_ == PdAbort::kAwaitingForward; }
-
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
     // thrash -- its readmission must take back exactly what the retraction
@@ -338,6 +327,7 @@ public:
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                              [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
                               [](const fsm::Restoring&) -> std::string { return "Restoring"; },
                               [](const fsm::Finishing&) -> std::string { return "Finishing"; },
@@ -347,8 +337,6 @@ public:
     }
 
 private:
-    enum class PdAbort { kNone, kAwaitingTransfer, kAwaitingForward };
-    PdAbort pd_abort_{PdAbort::kNone};
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 

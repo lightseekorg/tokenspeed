@@ -216,14 +216,8 @@ fn a_refused_preallocation_fails_both_sides() {
             Bytes::from_static(manifest),
         ],
     );
-    assert_eq!(
-        next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
-    assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
+    expect_cancelled(&mut pair.prefill, rid, &mut mesh, &group);
+    expect_cancelled(&mut pair.decode, rid, &mut mesh, &group);
     // A late remote decode of the failed room sends nothing.
     pair.send(rid, 5, Vec::new()).unwrap();
     thread::sleep(Duration::from_millis(50));
@@ -266,10 +260,7 @@ fn failure_retires_queued_layerwise_reads_before_releasing_the_room() {
     }
     // The first job waits for its producer; the rest are still queued.
     pair.prefill.abort_room(rid, pair.bootstrap.room);
-    assert_eq!(
-        next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
+    expect_cancelled(&mut pair.prefill, rid, &mut mesh, &group);
     assert!(!pair.prefill.has_in_flight());
     steps.store(1000, std::sync::atomic::Ordering::Release);
     thread::sleep(Duration::from_millis(100));
@@ -292,10 +283,7 @@ fn a_room_no_decode_rank_reaches_times_out() {
     let (mut mesh, group) = single_rank();
 
     pair.prefill.register("lonely", &pair.bootstrap).unwrap();
-    assert_eq!(
-        next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed("lonely".to_owned())
-    );
+    expect_cancelled(&mut pair.prefill, "lonely", &mut mesh, &group);
     // A room still bootstrapping has no destinations to send to: a remote
     // decode of it breaks an invariant.
     pair.prefill
@@ -342,10 +330,7 @@ fn rooms_no_request_claimed_neither_hold_a_sleep_nor_linger() {
     pair.prefill_outbox.restore_registration().unwrap();
     // Unclaimed past the bootstrap timeout, the pre-allocated room is
     // dropped and its Decode rank told.
-    assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
+    expect_cancelled(&mut pair.decode, rid, &mut mesh, &group);
 }
 
 #[test]
@@ -370,10 +355,7 @@ fn an_admission_after_its_request_ended_is_not_sent() {
         ..pair.bootstrap.clone()
     };
     pair.decode.register("lost", &lost).unwrap();
-    assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed("lost".to_owned())
-    );
+    expect_cancelled(&mut pair.decode, "lost", &mut mesh, &group);
     // The admission the loop planned before the failure reaches the outbox
     // only after it: the room stays forgotten, and a sleep proceeds.
     pair.admit("lost");
@@ -411,10 +393,7 @@ fn a_landing_without_its_first_token_fails_the_request() {
         pair.decode.port(),
         StatusMessage::bare(4242, TransferPoll::Success, 0).to_frames(),
     );
-    assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
+    expect_cancelled(&mut pair.decode, rid, &mut mesh, &group);
 }
 
 #[test]
@@ -456,12 +435,6 @@ fn a_conflicting_registration_rejects_its_session() {
             Bytes::from(pair.decode.cache_id()),
         ],
     );
-    assert_eq!(
-        next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
-    assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
+    expect_cancelled(&mut pair.prefill, rid, &mut mesh, &group);
+    expect_cancelled(&mut pair.decode, rid, &mut mesh, &group);
 }

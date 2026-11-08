@@ -618,6 +618,7 @@ class ServerArgs:
     # forward's rows over the attention TP group (1 = off; equals
     # kv_parallel_size when on).
     query_context_parallel_size: int = 1
+    disable_deepseek_v41_token_blacklist: bool = False
     deepseek_v41_attention_query_swa_min_tokens: int = 4096
     deepseek_v41_attention_query_min_tokens: int = 1024
     deepseek_v41_attention_query_parallel_size: int = 1
@@ -2738,12 +2739,16 @@ class ServerArgs:
             self.speculative_algorithm is not None
             and self.disaggregation_mode != "prefill"
             and self.max_num_seqs is not None
+            # Only FlashInfer's distributed tactic selection (NVIDIA) needs
+            # every attention TP peer in lockstep; elsewhere startup tuning
+            # runs no cross-rank collectives, and the draft warmup stays
+            # within the request cap (ModelExecutor.autotune).
+            and current_platform().is_nvidia
         ):
             dp_size = self.mapping.attn.dp_size
             tp_size = self.mapping.attn.tp_size
             # Draft startup uses one request per TP peer, even when tactic
-            # profiling is disabled. Clamping would leave empty tuning peers;
-            # exceeding this capacity would overrun per-request decode state.
+            # profiling is disabled. Fewer would leave empty tuning peers.
             if self.max_num_seqs // dp_size < tp_size:
                 raise ValueError(
                     "Speculative decode warmup requires max_num_seqs // "
@@ -4397,6 +4402,14 @@ class ServerArgs:
             "bits match a TP1 full-K GEMM. attn needs --attn-head-tp-size > 1; "
             "attn+dense also needs --dense-tp-size > 1; both need unquantized "
             "o_proj / down_proj weights.",
+        )
+        parser.add_argument(
+            "--disable-deepseek-v41-token-blacklist",
+            action="store_true",
+            default=ServerArgs.disable_deepseek_v41_token_blacklist,
+            help="Allow DeepSeek V4.1 to generate BOS, PAD, and image "
+            "control/placeholder token IDs 0, 2, and 129262..129264. "
+            "They are masked by default.",
         )
         parser.add_argument(
             "--deepseek-v41-attention-query-swa-min-tokens",

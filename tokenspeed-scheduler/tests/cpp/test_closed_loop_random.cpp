@@ -166,6 +166,9 @@ struct ClosedLoop {
         std::vector<std::int32_t> out;
     };
     std::map<std::string, Live> live;
+    // Ended (aborted or failed) while their transfer may still touch their
+    // pages: the peer reports each transfer stopped some rounds later.
+    std::set<std::string> stopping;
     std::vector<std::vector<std::int32_t>> done;
     std::deque<ExecutionPlan> pending;
     // An unacknowledged cache op: the round its ACK is due, and its kind.
@@ -451,12 +454,22 @@ struct ClosedLoop {
             if (state.transferring && Uniform() < 0.5) {
                 if (Uniform() < 0.1) {
                     events.With(pd::FailedEvent{id});
+                    stopping.insert(id);
                 } else {
                     events.With(pd::SucceededEvent{id});
                 }
                 state.transferring = false;
                 state.finished = true;
                 any = true;
+            }
+        }
+        for (auto it = stopping.begin(); it != stopping.end();) {
+            if (Uniform() < 0.5) {
+                events.With(pd::TransferStoppedEvent{*it});
+                it = stopping.erase(it);
+                any = true;
+            } else {
+                ++it;
             }
         }
         if (any) {
@@ -716,6 +729,9 @@ struct ClosedLoop {
                 }
                 Advance(abort);
                 live.erase(id);
+                if (role != Role::kFused) {
+                    stopping.insert(id);
+                }
                 ++aborts;
             }
             while (static_cast<std::int32_t>(pending.size()) > overlap_depth) {
@@ -749,8 +765,8 @@ struct ClosedLoop {
             const bool has_cache_operation = std::ranges::any_of(plan.Operations(), [](const Operation& operation) {
                 return std::holds_alternative<CacheOperation>(operation);
             });
-            if (live.empty() && (batch == nullptr || batch->request_ids.empty()) && !has_cache_operation &&
-                !plan.remote_decode.has_value() && acks.empty()) {
+            if (live.empty() && stopping.empty() && (batch == nullptr || batch->request_ids.empty()) &&
+                !has_cache_operation && !plan.remote_decode.has_value() && acks.empty()) {
                 return;
             }
             pending.push_back(plan);

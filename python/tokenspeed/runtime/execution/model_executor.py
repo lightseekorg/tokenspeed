@@ -1307,9 +1307,18 @@ class ModelExecutor:
                         # The draft model is reached through the shared speculative
                         # forward, not model_runner.forward above. One request
                         # per attention TP rank keeps sequence-parallel router
-                        # GEMMs nonempty on every peer during distributed tuning.
+                        # GEMMs nonempty on every peer for FlashInfer's lockstep
+                        # distributed tuning; on NVIDIA, server-argument
+                        # validation keeps the request cap at least that large.
+                        # Other platforms tune no cross-rank collectives, so a
+                        # smaller cap bounds the warmup to the decode state.
                         self.forward_step.warmup_decode_path(
-                            batch_sizes=(self.config.attention_tp_size,),
+                            batch_sizes=(
+                                min(
+                                    self.config.attention_tp_size,
+                                    self.forward_step.max_decode_bs,
+                                ),
+                            ),
                             graph_phase=False,
                         )
                 if self._samples_from_vocab_shard:

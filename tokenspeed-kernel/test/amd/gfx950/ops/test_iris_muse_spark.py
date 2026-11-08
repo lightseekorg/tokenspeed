@@ -646,6 +646,29 @@ def _muse_collective_policy_worker(rank, world_size, device):
         )
 
 
+def _muse_pull_warmup_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_pull_twoshot_allreduce,
+    )
+    from utils import assert_no_triton_compile
+
+    # Past the push and Lamport two-shot windows, below the owned-row path:
+    # the producer pull reduces these rows.
+    rows = 179
+    state = _muse_state(rank, device, 192, True)
+    state.warmup_reduce_outputs()
+    with assert_no_triton_compile(iris_pull_twoshot_allreduce):
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        branch.fill_(rank + 1)
+        output = state.reduce_outputs((branch,))[0]
+    torch.testing.assert_close(
+        output,
+        torch.full_like(output, world_size * (world_size + 1) // 2),
+        rtol=0,
+        atol=0,
+    )
+
+
 def _muse_owned_packet_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
         iris_pack_moe_inputs,
@@ -4291,6 +4314,7 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
             partial(_muse_boundary_worker, sharded=True), "nccl", id="boundary_scatter"
         ),
         pytest.param(_muse_collective_policy_worker, "nccl", id="collective_policy"),
+        pytest.param(_muse_pull_warmup_worker, "nccl", id="pull_warmup"),
         pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),

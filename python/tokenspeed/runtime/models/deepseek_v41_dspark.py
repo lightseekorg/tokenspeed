@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_PREFILL_QUERY_TILE,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -129,6 +130,13 @@ class _WindowAttention:
     @property
     def supports_fused_attention(self) -> bool:
         return True
+
+    @property
+    def supports_fused_prefill(self) -> bool:
+        # The drafter runs its window attention as decode rows only, and
+        # forward_v41 below serves the fused path for decode alone. Declaring
+        # prefill support here would raise instead of falling back.
+        return False
 
     def _workspace(self, swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps):
         """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
@@ -486,6 +494,10 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
 
 class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigurator):
     """Strict mtp-only adapter sharing embedding/head with its V4.1 target."""
+
+    # Match the target-only blacklist: proposals stay unmasked; target verify
+    # still rejects them through the target's masked distribution.
+    logits_processor_cls = LogitsProcessor
 
     def configure_target(self, target_model, target_config) -> None:
         """Install the checkpoint's target taps before draft execution exists."""

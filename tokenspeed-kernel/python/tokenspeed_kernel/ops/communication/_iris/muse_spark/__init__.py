@@ -2039,6 +2039,11 @@ class MuseIrisState:
         )
         return output
 
+    def warmup_reduce_outputs(self) -> None:
+        """Compile the two-shot pull that ``reduce_outputs`` takes between
+        the Lamport two-shot and owned-row windows, without running it."""
+        self.reduction.warmup_pull_two_shot(self.gather.output)
+
     def warmup_reduce_scatter_routed_rmsnorm_sum_all_gather(
         self, norm_weight: torch.Tensor, eps: float, weight_offset: float
     ) -> None:

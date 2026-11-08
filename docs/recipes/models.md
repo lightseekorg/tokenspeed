@@ -1164,8 +1164,10 @@ object:
 ```
 
 - `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
-  FP8 to save memory. Omit it to store the table in the model's compute
-  dtype.
+  FP8 to save memory, quantizing a BF16 table per row at load. When omitted,
+  the table keeps the checkpoint's format: checkpoints that ship it in FP8,
+  such as `Qwen/Qwen3.8-Flash-Next-FP8` and `nvidia/Qwen3.8-Flash-Next-NVFP4`,
+  keep it in FP8, and other checkpoints store it in the model's compute dtype.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
   or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
   NVIDIA CUDA and disables it on other platforms.
@@ -1229,6 +1231,12 @@ The B200 and AMD GSM8K CI jobs, the GB300 Slurm 1P1D GSM8K job, and the
 manual 1P1D smoke test use `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
 The 1P1D CI tasks set `MODEL` explicitly so both serving roles and the
 evaluation client select the same checkpoint.
+
+The target LM head masks BOS, PAD, and the image control/placeholder token IDs
+`0, 2, 129262..129264` to `-inf`. The mask applies before ordinary sampling,
+fused argmax, and speculative verification, and to target-side logprob scoring;
+draft-model proposals are unchanged. Pass
+`--disable-deepseek-v41-token-blacklist` to allow these tokens.
 
 DeepSeek V4.1 (`deepseek_v41`) runs on its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows, and the
