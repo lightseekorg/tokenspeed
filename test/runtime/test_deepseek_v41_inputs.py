@@ -987,6 +987,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.runtime_states = runtime
     executor.model_runner = runner
     executor.drafter = None
+    executor._samples_from_vocab_shard = False
     pg = PrefillGraph.__new__(PrefillGraph)
     pg.config = executor.config
     pg.input_buffers = ib

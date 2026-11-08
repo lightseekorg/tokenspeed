@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._scheduling import release_drain, sched_compile_options
+from tokenspeed_kernel_amd._extern import extern_compile_options, release_drain
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     GROUP_SIZE_M,
@@ -455,7 +455,7 @@ def launch_gluon_fp32_router_gemv_gfx950(
         CHUNKS=chunks,
         MULTIPLIER=float(multiplier),
         num_warps=waves,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     return out
 
@@ -654,7 +654,7 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
         MM_BLOCK_N=mm_block_n, MM_BLOCK_K=mm_block_k, MM_WARPS_M=warps_m,
         MM_WARPS_N=warps_n, MM_NUM_BUFFERS=buffers, MM_SPLIT_K=mm_split,
         MM_NUM_XCDS=xcds, num_warps=waves,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),), **sched_compile_options(),
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),), **extern_compile_options(),
     )  # fmt: skip
     return out
 

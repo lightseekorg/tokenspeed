@@ -603,7 +603,7 @@ def test_mla_prefill_8wave_votes_on_maxima_in_compiled_code():
     wave-uniform scalar condition). Compiles for gfx950 without launching.
     """
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla import prefill_8wave
 
     config = prefill_8wave.get_config(
@@ -646,7 +646,7 @@ def test_mla_prefill_8wave_votes_on_maxima_in_compiled_code():
         options=dict(
             num_warps=config.num_warps,
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
-            **sched_compile_options(),
+            **extern_compile_options(),
         ),
     )
     assembly = kernel.asm["amdgcn"]

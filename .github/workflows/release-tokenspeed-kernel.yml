@@ -24,7 +24,7 @@ on:
         required: false
         type: string
       release_candidate:
-        description: "Nightly only: a release candidate number N (or rcN). The build is 0.1.4rcN.post20261108, which sorts below every nightly, so it neither collides with nor shadows the scheduled nightly of that date."
+        description: "Nightly only: a release candidate number N (or rcN). The build is 0.1.4rcN.post20261108, which sorts below every 0.1.4 nightly, so it neither collides with nor shadows the scheduled nightly of that date."
         required: false
         type: string
       cuda_variant:

@@ -168,6 +168,22 @@ def _column_all_gather_worker(rank, world_size, device):
             torch.testing.assert_close(
                 state.gather.run(local), expected, atol=0, rtol=0
             )
+
+    # Packed fp32 words ride the BF16 gather as raw 16-bit halves: negative
+    # zero, NaN payloads and halves equal to the mailbox's empty value (0x8000)
+    # arrive bit for bit.
+    def words(peer):
+        pattern = torch.tensor(
+            # 0x80000000, 0x7FC00001, 0x00008000, 0x80008000, 0x3F800000, ~0.
+            [-(1 << 31), 0x7FC00001, 0x8000, 0x8000 - (1 << 31), 0x3F800000, -1],
+            dtype=torch.int32,
+            device=device,
+        )
+        return (pattern.repeat(7, 6)[:, :32] ^ (peer << 20)).contiguous()
+
+    gathered = state.gather.run(words(rank).view(torch.bfloat16))
+    expected = torch.cat([words(peer) for peer in range(world_size)], dim=-1)
+    assert torch.equal(gathered.view(torch.int32), expected)
     if current_platform().is_cdna4:
         _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device)
 
@@ -1356,7 +1372,7 @@ def _sliding_tail_assembly() -> str:
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
         iris_fused_sliding_attention_twoshot_muse_attntail as fn,
     )
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     pointers = {
         name: kind
@@ -1425,7 +1441,7 @@ def _sliding_tail_assembly() -> str:
             PEER_SIGNAL_STORE_CACHE=".wt",
         ),
         num_warps=4,
-        options=sched_compile_options(),
+        options=extern_compile_options(),
     )
     return kernel.asm["amdgcn"]
 
@@ -1495,7 +1511,7 @@ def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
         iris_fused_sliding_attention_twoshot_muse_attntail as fn,
     )
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     types = {
         "q_ptr": "*fp8e4nv",
@@ -1567,7 +1583,7 @@ def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
         },
         num_warps=4,
         unspecialized=("rows", "gate_stride"),
-        options=sched_compile_options(),
+        options=extern_compile_options(),
     )
     lines = [
         line.strip()
@@ -1714,7 +1730,7 @@ def test_moetail_lamport_codegen(block_m):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
         iris_fused_gemv_lamport_allgather_muse_moetail as fn,
     )
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     types = {
         "x_ptr": "*bf16",
@@ -1754,7 +1770,7 @@ def test_moetail_lamport_codegen(block_m):
         },
         num_warps=16,
         unspecialized=("region", "M"),
-        options=sched_compile_options(),
+        options=extern_compile_options(),
     )
     assembly = kernel.asm["amdgcn"]
     lines = assembly.splitlines()

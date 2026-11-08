@@ -68,6 +68,10 @@ def test_release_candidate_kernel_nightly_makes_a_tokenspeed_release_candidate(
     assert metadata["version"] == version == f"{base_version}rc1.post20261108"
     pins = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
     assert pins == ["tokenspeed-kernel==0.1.4rc1.post20261108"]
+    assert (
+        runpy.run_path(str(project / "python/tokenspeed/version.py"))["__version__"]
+        == version
+    )
 
 
 @pytest.mark.parametrize(

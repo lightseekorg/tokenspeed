@@ -31,8 +31,8 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._scheduling import (
-    sched_compile_options,
+from tokenspeed_kernel_amd._extern import (
+    extern_compile_options,
     sched_group,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon
@@ -3005,7 +3005,7 @@ def launch_gluon_mha_prefill_gfx1250(
             waves_per_eu=config.waves_per_eu,
             llvm_fn_attrs="amdgpu-sched-strategy=coexec",
             enable_fp_fusion=True,
-            **sched_compile_options(),
+            **extern_compile_options(),
         )
     else:
         gluon_mha_prefill_gfx1250[launch_grid](
@@ -3055,7 +3055,7 @@ def launch_gluon_mha_prefill_gfx1250(
             waves_per_eu=config.waves_per_eu,
             llvm_fn_attrs=llvm_fn_attrs,
             enable_fp_fusion=True,
-            **sched_compile_options(),
+            **extern_compile_options(),
         )
     if return_lse:
         return output, lse

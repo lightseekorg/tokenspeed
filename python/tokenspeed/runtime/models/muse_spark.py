@@ -2500,12 +2500,23 @@ class MuseSparkModel(BaseTransformerModel):
         The draft model reads every token's full row in the model dtype (that
         of the token embedding), so each capture is rounded from FP32. When
         each rank holds only its owned rows, only the captured layers gather
-        full rows; the other layers keep the owned-row layout.
+        full rows; the other layers keep the owned-row layout. A forward's
+        capture sink copies each tap into its own storage, rounding as it
+        copies, so on full rows it gets the FP32 residual itself. The sink
+        may run an attention-TP collective here (DFlash gathers its context
+        columns at the last tap), so no borrowed Iris output may be live
+        across a capture.
         """
         if owned_global_rows is None:
-            tap = hidden_states.to(self.embed_tokens.weight.dtype)
             # The final capture (index num_layers + 1) gathers like the last layer's.
             layer = self.layers[min(layer_index, len(self.layers) - 1)]
+            tap = hidden_states
+            # Scattered rows are rounded before the gather, so it moves BF16.
+            if (
+                ctx.target_capture_sink is None
+                or layer.comm_manager.needs_pre_attn_all_gather()
+            ):
+                tap = tap.to(self.embed_tokens.weight.dtype)
             tap = layer.comm_manager.gather_residual(tap, ctx)
         else:
             iris = self.iris_state

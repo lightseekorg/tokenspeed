@@ -1512,7 +1512,7 @@ def test_dsa_persistent_topk_atomics_reach_l2_before_arrival(is_decode) -> None:
     release.
     """
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
     from utils import vmcnt_zero_before_barrier
 
     fn = dsa_topk_backend._dsa_persistent_radix_topk_kernel
@@ -1554,7 +1554,7 @@ def test_dsa_persistent_topk_atomics_reach_l2_before_arrival(is_decode) -> None:
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
         options={
             "num_warps": dsa_topk_backend._PERSISTENT_NUM_WARPS,
-            **sched_compile_options(),
+            **extern_compile_options(),
         },
     )
     # Each pass has one arrival and one pass_done atomic on a scalar address,

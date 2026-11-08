@@ -108,9 +108,12 @@ TokenSpeed** from `main` with `nightly=true`, `publish_github=true`, the same
 `version_date`, and the same `release_candidate`, for example `1`. That
 publishes `tokenspeed==0.1.1rc1.post20261108` with
 `tokenspeed-kernel==0.1.4rc1.post20261108`. A release candidate sorts below
-every nightly: the scheduled nightly still publishes under its own version, and
-any install that a nightly satisfies still gets a nightly, so pin the release
-candidate to install it. Release candidates skip the ROCm index; the scheduled
+every nightly of its release (`0.1.4.post*`): the scheduled nightly still
+publishes under its own version, and any install that such a nightly satisfies
+still gets a nightly, so pin the release candidate to install it. Runs on `main`
+queue behind each other in each workflow, scheduled nightlies (02:00 and 03:00
+UTC) included, so finish a release candidate before 02:00 UTC or start it after
+the scheduled nightlies. Release candidates skip the ROCm index; the scheduled
 nightly of the same date adds ROCm.
 
 ### From source

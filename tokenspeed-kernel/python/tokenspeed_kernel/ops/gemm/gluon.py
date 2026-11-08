@@ -26,9 +26,11 @@ import torch
 from tokenspeed_kernel.ops.gemm import (
     KIMI3_HIDDEN_SIZE,
     KIMI3_QKVFAB_SIZE,
+    MV_FP8_WEIGHT_MAX_M,
     grouped_bf16_projection,
 )
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
+from tokenspeed_kernel.ops.gemm.native import MV_FP8_WEIGHT_SIGNATURES
 from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
@@ -83,10 +85,16 @@ if platform.is_amd:
         supports_gluon_rowcta_bf16_gemv_gfx950 as _supports_rowcta_bf16_gemv,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        launch_gluon_gemv_a16w8_gfx950 as _gemv_a16w8_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         prefers_gluon_gemv_a16w16_gfx950 as _prefers_gemv_a16w16,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        supports_gluon_gemv_a16w8_gfx950 as _supports_gemv_a16w8,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         supports_gluon_gemv_a16w16_gfx950 as _supports_gemv_a16w16,
@@ -607,6 +615,30 @@ if platform.is_amd:
         if out is None:
             out = x.new_empty((x.shape[0], weight.shape[0]))
         return _gemv_a16w16_impl(x, weight, out)
+
+    @register_kernel(
+        "gemm",
+        "mv_fp8_weight",
+        name="gluon_gemv_a16w8_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=MV_FP8_WEIGHT_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "m_max": frozenset({MV_FP8_WEIGHT_MAX_M}),
+            "mnk_problem_filter": frozenset({_supports_gemv_a16w8}),
+        },
+    )
+    def gluon_gemv_a16w8_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """``out = (x @ weight.T) * weight_scale`` with an E4M3 weight read once
+        and one FP32 scale per weight row; 8-32 rows measured 1.1-1.5x faster
+        than the BF16 GEMVs on 8192-hidden decode shapes (MI355X)."""
+        return _gemv_a16w8_impl(x, weight, weight_scale, out)
 
     @register_kernel(
         "gemm",

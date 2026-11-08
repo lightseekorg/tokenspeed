@@ -36,7 +36,7 @@ from monokernel_testing import (  # noqa: E402
     random_mxfp4,
     round_mxfp4,
 )
-from tokenspeed_kernel_amd._scheduling import sched_compile_options  # noqa: E402
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (  # noqa: E402
     preprocess_n16_mxfp4_weights,
@@ -212,7 +212,7 @@ def test_moe_matches_tokenspeed_math():
         None,
         PLAN.key,
         num_warps=8,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     torch.cuda.synchronize()
 

@@ -33,7 +33,7 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 from monokernel_testing import fill  # noqa: E402
-from tokenspeed_kernel_amd._scheduling import sched_compile_options  # noqa: E402
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import (  # noqa: E402
     mailbox,
@@ -129,7 +129,7 @@ def _run(x, residual, inject):
         None,
         plan.key,
         num_warps=8,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     torch.cuda.synchronize()
     logits = []

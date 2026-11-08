@@ -62,6 +62,14 @@ reduce-scatter slots, and other workgroups reduce, all-gather and finish the
 attention boundary. The tail uses its own region, with each workgroup's epoch
 as the stage.
 
+`residual_rmsnorm.py` reduces BF16 rows fused with the residual add and
+RMSNorm, for callers that prepare it per group and width (draft layers). Each
+row has an owner that receives the partials, reduces, and pushes the reduced
+row to every rank. It owns its mailboxes and needs no stage counters: an owner
+restores its scatter markers before it publishes the reduced row, and no rank
+starts its next launch before it has every reduced row, so row counts may
+change between launches.
+
 Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950; its own
 ordinary all-reduces use the same `reduce_ordinary` policy. Its pre-expert
 gather can also route the rows: the Lamport gather, RMSNorm and MXFP4 programs

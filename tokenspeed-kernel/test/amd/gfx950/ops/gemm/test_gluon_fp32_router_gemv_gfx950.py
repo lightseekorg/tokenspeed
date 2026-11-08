@@ -234,7 +234,7 @@ def _compile_splitk(**config):
     ``config`` overrides the 8192 x 256 router's 64-row bucket.
     """
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     fn = gluon_fp32_router_gemv_splitk_gfx950
     pointers = ("x_ptr", "weight_ptr", "out_ptr", "partial_ptr", "counter_ptr")
@@ -264,7 +264,7 @@ def _compile_splitk(**config):
             attrs=attrs,
         ),
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": 4, **sched_compile_options()},
+        options={"num_warps": 4, **extern_compile_options()},
     )
 
 
