@@ -1705,6 +1705,10 @@ class MambaAttnBackend(AttentionBackend):
         # decode-output convention (matches gdn_chunk_prefill's B=1-leading out).
         return core_attn_out.transpose(0, 1)
 
+    def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:
+        """Dtype of the recurrent states the prefill gather hands to the scan."""
+        return cache_dtype
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1819,6 +1823,7 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_states,
                 state_in_blocks,
                 state_out_blocks,
+                dtype=self._prefill_state_dtype(ssm_states.dtype),
             )
             conv_cache_indices = state_out_blocks
             extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
