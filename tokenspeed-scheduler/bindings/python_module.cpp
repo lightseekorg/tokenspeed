@@ -59,13 +59,16 @@ namespace nb = nanobind;
 
 namespace {
 
-nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>> ReadonlyTokenView(const std::vector<std::int32_t>& tokens,
-                                                                          nb::handle owner) {
+const std::int32_t* Int32ViewData(const std::vector<std::int32_t>& values) {
     // NumPy treats a null data pointer as a request for writable storage,
     // even for an empty array. A non-null sentinel preserves read-only views.
     static constexpr std::int32_t empty = 0;
-    const auto* data = tokens.empty() ? &empty : tokens.data();
-    return {data, {tokens.size()}, owner};
+    return values.empty() ? &empty : values.data();
+}
+
+nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>> ReadonlyTokenView(const std::vector<std::int32_t>& tokens,
+                                                                          nb::handle owner) {
+    return {Int32ViewData(tokens), {tokens.size()}, owner};
 }
 
 template <typename Op, typename Cls>
@@ -498,27 +501,39 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  // ForwardBatch alive for the lifetime of each ndarray.
                  auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
                  nb::dict out;
-                 for (auto& [gid, buf] : op.block_tables_contig) {
-                     const std::size_t rows = op.request_ids.size();
-                     tokenspeed::FatalCheck(rows == 0 || buf.size() % rows == 0,
-                                            "block-table buffer must contain complete rows");
-                     const std::size_t columns = rows == 0 ? 0 : buf.size() / rows;
-                     out[nb::str(gid.c_str())] =
-                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, columns}, self);
+                 for (const auto& [gid, table] : op.block_tables) {
+                     const auto& buf = table.AbsoluteRows();
+                     out[nb::str(gid.c_str())] = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                         Int32ViewData(buf), {table.Rows(), table.Columns()}, self);
                  }
                  return out;
              })
+        .def(
+            "block_table_windows",
+            [](nb::handle self) {
+                auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                nb::dict out;
+                for (const auto& [gid, table] : op.block_tables) {
+                    const auto& buf = table.WindowRows();
+                    out[nb::str(gid.c_str())] =
+                        nb::make_tuple(nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                                           Int32ViewData(buf), {table.Rows(), table.WindowColumns()}, self),
+                                       table.Columns());
+                }
+                return out;
+            },
+            "Return read-only row windows and the absolute column count for each group. "
+            "Each window starts at max(pages - window_width, 0); the batch owns its data.")
         .def("block_table_spans",
              [](nb::handle self) {
                  // Zero-copy [rows, 2] int32 (released, pages) views parallel
                  // to block_tables_arrays; `self` keeps the batch alive too.
                  auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
                  nb::dict out;
-                 for (auto& [gid, buf] : op.block_table_spans) {
-                     const std::size_t rows = op.request_ids.size();
-                     tokenspeed::FatalCheck(buf.size() == 2 * rows, "block-table spans must cover every row");
-                     out[nb::str(gid.c_str())] =
-                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, 2}, self);
+                 for (const auto& [gid, table] : op.block_tables) {
+                     const auto& buf = table.Spans();
+                     out[nb::str(gid.c_str())] = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                         Int32ViewData(buf), {table.Rows(), 2}, self);
                  }
                  return out;
              })

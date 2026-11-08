@@ -546,6 +546,7 @@ for the online variant.
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. `auto` uses `low_latency` for decode batches and `normal` for prefill batches. `normal` reads its per-expert receive counts on the host, so it forces eager execution and disables CUDA graphs. |
 | `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
+| `--disable-deepseek-v41-token-blacklist` | Allow DeepSeek V4.1 to generate BOS, PAD, and image control/placeholder token IDs `0, 2, 129262..129264`; these are masked by default. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
@@ -572,11 +573,11 @@ with the logits output.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). |
+| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). The engine also uses its single-token block markers to emit cumulative `reasoning_tokens` in output batches, independently of `--grammar-backend`; parsers without known markers report zero. |
 | `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
 
 Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
-`deepseek_r1`, and `deepseek_v31`. Common tool-call parser values include
+`deepseek_r1`, `deepseek_v31`, and `deepseek_v41`. Common tool-call parser values include
 `kimik2`, `qwen`, `deepseek_v4`, `json`, and `passthrough`. The SMG gateway
 validates the parser names, so use the values accepted by the bundled
 `tokenspeed-smg` package.

@@ -214,8 +214,6 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
 class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
     """Linear method for BF16 activations and packed NVFP4 weights."""
 
-    ignored_checkpoint_params = frozenset({"input_scale"})
-
     def __init__(self, quant_config):
         if not kernel_has_flashinfer_cute_dsl_nvfp4_a16():
             raise RuntimeError(

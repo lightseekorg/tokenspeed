@@ -58,6 +58,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: list[str] | None = None,
         weight_block_size: list[int] = None,
         scale_fmt: str | None = None,
+        modules_to_convert: list[str] | None = None,
     ) -> None:
         if not is_checkpoint_fp8_serialized:
             ignored_layers = (ignored_layers or []) + self.ONLINE_IGNORED_LAYERS
@@ -81,6 +82,10 @@ class Fp8Config(QuantizationConfig):
                 )
         self.weight_block_size = weight_block_size
         self.scale_fmt = scale_fmt.lower() if scale_fmt is not None else None
+        # Non-linear modules the checkpoint quantizes as well, named relative
+        # to their decoder layer (Qwen3.8-Flash-Next-FP8 lists its PLE n-gram
+        # table as "ple.ple_embedding.ngram_embedding").
+        self.modules_to_convert = modules_to_convert or []
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> LinearMethodBase:
         """Select a linear method before its weights are created.
@@ -93,6 +98,12 @@ class Fp8Config(QuantizationConfig):
         from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 
         return Fp8LinearMethod(self)
+
+    def stores_fp8_embedding(self, prefix: str) -> bool:
+        return any(
+            prefix == name or prefix.endswith(f".{name}")
+            for name in self.modules_to_convert
+        )
 
     @classmethod
     def get_name(cls) -> str:
@@ -120,12 +131,14 @@ class Fp8Config(QuantizationConfig):
         )
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
+        modules_to_convert = cls.get_from_keys_or(config, ["modules_to_convert"], None)
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             scale_fmt=scale_fmt,
+            modules_to_convert=modules_to_convert,
         )
 
     def get_scaled_act_names(self) -> list[str]:

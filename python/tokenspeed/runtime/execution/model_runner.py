@@ -346,7 +346,6 @@ class ModelRunner:
         input_embeds: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
-        kv_sync_event: "torch.cuda.Event | None" = None,
         pp_inbound=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
@@ -362,8 +361,6 @@ class ModelRunner:
             kwargs["multimodal_context"] = multimodal_context
         if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
             kwargs["spec_step_idx"] = spec_step_idx
-        if kv_sync_event is not None:
-            kwargs["kv_sync_event"] = kv_sync_event
 
         return self.model.forward(
             ctx,

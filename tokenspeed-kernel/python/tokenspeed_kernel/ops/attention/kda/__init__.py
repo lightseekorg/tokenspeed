@@ -501,6 +501,8 @@ def try_kda_fused_paged_verify(
                 "head_dim": head_dim,
                 "paged_state": True,
                 "recurrent_layout": recurrent_layout,
+                "replay_records": replay_records is not None,
+                "spec_query_len": draft_token_num,
                 "split_producers": split_producers,
                 "store_states": store_states,
             },
@@ -565,6 +567,7 @@ def kda_fused_paged_verify_uses_split_producers(
     traits = {
         "paged_state": True,
         "recurrent_layout": recurrent_layout,
+        "split_producers": True,
         "store_states": store_states,
         "num_heads": num_heads,
         "head_dim": head_dim,
@@ -585,6 +588,53 @@ def kda_fused_paged_verify_uses_split_producers(
     return (
         resolve_kda_batched_replay_commit(dtype, num_heads=num_heads, head_dim=head_dim)
         is not None
+    )
+
+
+def kda_fused_paged_verify_fuses_producers(
+    dtype: torch.dtype,
+    *,
+    recurrent_layout: str,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+) -> bool:
+    """Whether record verify runs its gate and convolution producers inline.
+
+    Args:
+        dtype: Activation dtype used to resolve the registered kernel.
+        recurrent_layout: Committed recurrent-state layout.
+        num_heads: Per-rank KDA head count.
+        head_dim: KDA head width.
+        draft_token_num: Tokens per request window.
+
+    Returns:
+        True when the selected record verify for these windows computes the gate
+        projection and convolution itself, so the caller passes neither
+        ``g_raw`` nor ``conv_qkv``. Records and commit are the same either way.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "paged_state": True,
+        "recurrent_layout": recurrent_layout,
+        "replay_records": True,
+        "spec_query_len": draft_token_num,
+        "store_states": False,
+    }
+    try:
+        kernel = select_kernel(
+            "attention", "kda_fused_paged_verify", signature, traits=traits
+        )
+    except NoKernelFoundError:
+        return False
+    registered = KernelRegistry.get().get_by_name(kernel.name)
+    return (
+        registered is not None
+        and registered.traits.get("split_producers") == frozenset({False})
+        and registered.traits.get("replay_records") == frozenset({True})
     )
 
 
@@ -775,6 +825,7 @@ __all__ = [
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
+    "kda_fused_paged_verify_fuses_producers",
     "kda_fused_paged_verify_uses_split_producers",
     "kda_verify_conv_update",
     "resolve_kda_batched_replay_commit",

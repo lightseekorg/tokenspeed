@@ -257,6 +257,8 @@ the scheduler re-feeds is the retention window itself rather than a second
 declared number. False means an ordinary cached window; the flag changes
 nothing else about the group's geometry.
 
+#### Block tables and exported page IDs
+
 The block tables the scheduler emits are logically *indexed*: row *i* of a
 request's table covers tokens
 `[i * block_granularity, (i + 1) * block_granularity)`. The
@@ -285,11 +287,17 @@ exported row against a fresh resolution.
 
 Operations borrow their scheduled request's tables only until their batch is
 built. A request selected for that build cannot be retracted or scheduled
-again in it. Batch construction resolves rows directly into one owned
-contiguous buffer per group, writing null prefixes and `-1` row padding there.
-No borrowed table escapes into an execution plan. The legacy nested table
-accessor materializes the same padded rows from that buffer on demand; NumPy
-views keep their owning batch alive. Pinned staging remains runtime-owned.
+again in it. Batch construction copies one owned window per row. A group's
+window width is the largest `pages - released` of its rows; each row starts
+at `max(pages - window_width, 0)`. Its `(released, pages)` span and absolute
+column count preserve logical indexing without writing long zero prefixes.
+No borrowed table escapes into an execution plan. The runtime uploads these
+windows and reconstructs absolute rows, including zero holes and `-1`
+padding, with the existing row-expansion kernel; a host mirror is built only
+when requested. The legacy absolute-table accessors materialize a stable,
+thread-safe cached buffer on demand. Copies share the immutable snapshot,
+and NumPy views keep their owning batch alive. Pinned staging remains
+runtime-owned; the scheduler neither allocates nor borrows a Torch buffer.
 
 `CacheBatchMetadata` checks the exported groups, dtype and shape on every
 forward. `TOKENSPEED_VALIDATE_PAGE_IDS=1` additionally scans the IDs against
@@ -427,10 +435,8 @@ capacity layout without these slots keeps such a forward on its live metadata
 break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
 checkpoint windows at its eager break, over live metadata.
 
-On PD decode admission, a partial leading history block is a landing slot for
-the prefill peer. Installing its private writable block also rewinds the
-reclaimed-prefix frontier to include that slot: the outgoing destination
-table must carry the real block ID, even at logical slot zero.
+For PD landing into a partial history block, follow the
+[block-table export contract](#block-tables-and-exported-page-ids) above.
 
 PD moves exactly one block per state group: `latest_snapshot` is slot 1 of
 the prefill's final state, landing in the decode's slot 1 (its slot 0 stays

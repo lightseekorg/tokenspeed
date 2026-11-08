@@ -82,6 +82,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
     _ROUTE_TILE_MAX_M,
     _RouteTileConfig,
+    _select_direct_stage1_prefetch_tiles,
+    _select_direct_stage2_deferred_block_n,
     _select_grouped_moe_config,
     _select_route_tile_config,
 )
@@ -274,13 +276,27 @@ def _select_direct_stage2_tiles(
     num_tokens: int,
     *,
     ep_deferred: bool,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int | None,
+    top_k: int,
 ) -> tuple[int, int]:
     """Return the rocprof-tuned gfx950 ``(BLOCK_N, BLOCK_K)`` pair."""
     if not ep_deferred:
         return _DIRECT_STAGE2_BLOCK_N, _DIRECT_STAGE2_BLOCK_K
     # Wide output tiles amortize deferred expert stores at the largest captured
     # batch; deeper K tiles shorten the four-tile dependency chain at M <= 8.
-    block_n = 32 if num_tokens >= 16 else _DIRECT_STAGE2_BLOCK_N
+    block_n = _select_direct_stage2_deferred_block_n(
+        num_tokens,
+        hidden_dim=hidden_dim,
+        inter_dim=inter_dim,
+        num_local_experts=num_local_experts,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    if block_n is None:
+        block_n = 32 if num_tokens >= 16 else _DIRECT_STAGE2_BLOCK_N
     block_k = 256 if num_tokens <= 8 else _DIRECT_STAGE2_BLOCK_K
     return block_n, block_k
 
@@ -1086,7 +1102,7 @@ def _launch_mxfp4_route_tiles(
             (n_tokens * top_k, out_dim), dtype=torch.bfloat16, device=device
         )
     expanded_idx = torch.empty((n_tokens * top_k,), dtype=torch.int32, device=device)
-    # Routes are grouped by expert (inside the GEMMs up to 16 rows, by the
+    # Routes are grouped by expert (inside stage 1 up to 16 rows, by the
     # descriptor kernels above 16 rows); results retain token/slot order.
     num_local_experts = int(w13_runtime.shape[0])
     block_m = 16
@@ -1097,12 +1113,18 @@ def _launch_mxfp4_route_tiles(
                 "gluon_mxfp4_moe_stage1_route_tiles_gfx950: grouping routes from "
                 f"top-k IDs needs at most {block_m} rows, got {n_tokens}"
             )
-        # Both GEMMs group the routes by expert from the top-k IDs; stage 1
-        # writes the route map into the descriptor argument, and group_count
-        # is an unused placeholder.
-        sorted_routes = topk_ids
-        descriptors = expanded_idx
-        group_count = expanded_idx
+        # Stage 1 groups the routes by expert from the top-k IDs, writes the
+        # route map into its descriptor argument and writes the grouping in
+        # the descriptor kernels' format for stage 2.
+        stage1_routes = topk_ids
+        stage1_descriptors = expanded_idx
+        group_count = torch.empty(1, dtype=torch.int32, device=device)
+        sorted_routes = torch.empty(
+            num_local_experts * block_m, dtype=torch.int32, device=device
+        )
+        descriptors = torch.empty(
+            (num_local_experts, 3), dtype=torch.int32, device=device
+        )
     else:
         max_rows = config.route_capacity
         if n_tokens > max_rows:
@@ -1141,14 +1163,18 @@ def _launch_mxfp4_route_tiles(
             MAX_ROWS=max_rows,
             num_warps=4,
         )
+        stage1_routes = sorted_routes
+        stage1_descriptors = descriptors
     gluon_mxfp4_moe_stage1_route_tiles_gfx950[(2048,)](
         q_hidden,
         q_hidden_scale,
         w13_runtime,
         w13_scale,
+        stage1_routes,
+        stage1_descriptors,
+        group_count,
         sorted_routes,
         descriptors,
-        group_count,
         q_inter,
         q_inter_scale,
         n_tokens,
@@ -1181,8 +1207,8 @@ def _launch_mxfp4_route_tiles(
         sorted_routes,
         descriptors,
         group_count,
+        descriptors.shape[0],
         out,
-        n_tokens,
         INTERMEDIATE=inter_dim,
         OUTPUT=out_dim,
         XS0=q_inter_scale.stride(0),
@@ -1195,10 +1221,6 @@ def _launch_mxfp4_route_tiles(
         BLOCK_K=config.stage2.block_k,
         BLOCK_M=block_m,
         PREFETCH_TILES=config.stage2.prefetch_tiles,
-        ROUTES_FROM_IDS=routes_from_ids,
-        TOPK=top_k,
-        EXPERT_START=expert_start,
-        NUM_EXPERTS=num_local_experts,
         num_warps=config.stage2.num_warps,
     )
     return out, None, expanded_idx
@@ -1415,6 +1437,13 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         top_k,
         expert_start,
         q_inter_scale,
+        prefetch_tiles=_select_direct_stage1_prefetch_tiles(
+            hidden_dim=hidden_dim,
+            inter_dim=inter_dim,
+            num_local_experts=local_experts,
+            num_experts=global_num_experts,
+            top_k=top_k,
+        ),
         BLOCK_N=stage1_block_n,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
@@ -1428,6 +1457,11 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     stage2_block_n, stage2_block_k = _select_direct_stage2_tiles(
         n_tokens,
         ep_deferred=is_ep_deferred,
+        hidden_dim=hidden_dim,
+        inter_dim=inter_dim,
+        num_local_experts=local_experts,
+        num_experts=global_num_experts,
+        top_k=top_k,
     )
     if slot_parallel:
         stage2_block_n = 32 if n_tokens >= 12 else 16

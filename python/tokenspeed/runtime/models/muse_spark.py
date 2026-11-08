@@ -34,8 +34,10 @@ from tokenspeed_kernel.ops.gemm import (
     _use_mv,
     fp32_router_gemv_counters,
     fp32_router_gemv_execute,
+    fp32_router_gemv_execute_with_mm,
     fp32_router_gemv_plan,
     fp32_router_gemv_process_weight,
+    fp32_router_gemv_with_mm_supported,
     mm,
     mv,
     mv_weightless_rmsnorm_gated_sigmoid,
@@ -132,6 +134,8 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
+
+    from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
 
 # Row limit of the generic column gather and the NVLS mailbox.
@@ -408,6 +412,29 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 self.multicast.sentinel,
             )
         return self(x), None
+
+    def forward_rmsnorm(self, x: torch.Tensor, norm: MuseSparkRMSNorm) -> torch.Tensor:
+        """Project, gather and apply ``norm``: full-width normalized BF16 rows.
+
+        Small batches fuse the gather and the norm into one Lamport kernel,
+        which matches ``norm`` on the gathered rows within one BF16 ulp.
+        """
+        iris = self.iris_state
+        if (
+            iris is not None
+            and norm.weight is not None
+            and self.workspace is not None
+            and x.shape[0] <= min(_GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0])
+        ):
+            local_weight = self._local_weight()
+            local = x.new_empty((x.shape[0], local_weight.shape[0]))
+            if iris.can_all_gather_rmsnorm(local, norm.weight):
+                self._project(x, local_weight, local)
+                return iris.all_gather_rmsnorm(
+                    local, norm.weight, norm.eps, norm.weight_offset
+                )
+        rows = self(x)
+        return norm(rows, rows.dtype)
 
     def forward_mxfp4(
         self,
@@ -931,6 +958,55 @@ class MuseSparkAttention(nn.Module):
         )
         return self._project(output)
 
+    def forward_sliding_tail(
+        self,
+        positions: torch.Tensor,
+        normalized: torch.Tensor,
+        ctx: ForwardContext,
+        cache: DecodeKVView,
+        stream: torch.Tensor,
+        post_norm: MuseSparkRMSNorm,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        pre_norm: MuseSparkRMSNorm,
+        iris: MuseIrisState,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sliding decode rows through attention and the attention boundary.
+
+        Projects and prepares the query (writing K/V), then one launch attends,
+        applies the gated norm and o_proj, all-reduces and runs the boundary
+        (MuseIrisState.sliding_attention_boundary). Returns the FP32 residual,
+        router input and pre-expert input. The caller checked
+        can_sliding_attention_boundary.
+        """
+        qkv_gate, _ = self.qkv_proj(normalized)
+        q, k, v, output_gate = qkv_gate.split(
+            (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
+        )
+        prepared = self.attn.prologue(q, k, v, positions, ctx)
+        return iris.sliding_attention_boundary(
+            prepared.q.view(-1, self.num_heads, self.head_dim),
+            cache.k_cache,
+            cache.v_cache,
+            cache.page_table,
+            cache.seq_lens,
+            cache.max_seqlen_k,
+            self.attn.sliding_window_size,
+            self.attn.scaling,
+            output_gate,
+            self.o_proj.weight,
+            stream,
+            post_norm.weight,
+            alpha,
+            beta,
+            pre_norm.weight,
+            self.rms_norm_eps,
+            post_norm.eps,
+            post_norm.weight_offset,
+            pre_norm.eps,
+            pre_norm.weight_offset,
+        )
+
     def _project(self, output: torch.Tensor) -> tuple[torch.Tensor, int | None, int]:
         """Project attended rows; a batch the mailbox serves publishes its partial for the boundary to reduce."""
         if current_platform().is_cdna4:
@@ -1006,6 +1082,26 @@ class PreparedFP32RouterGEMV(nn.Module):
             self.multiplier,
             self.counters,
             enable_pdl,
+        )
+
+    def supports_with_mm(
+        self, x: torch.Tensor, mm_a: torch.Tensor, mm_b: torch.Tensor
+    ) -> bool:
+        """Whether :meth:`forward_with_mm` serves these rows and GEMM."""
+        return self.prepared_weight is not None and fp32_router_gemv_with_mm_supported(
+            self._plan, x, mm_a, mm_b
+        )
+
+    def forward_with_mm(
+        self,
+        x: torch.Tensor,
+        mm_a: torch.Tensor,
+        mm_b: torch.Tensor,
+        mm_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project router rows and write ``mm(mm_a, mm_b)`` to ``mm_out`` in one launch."""
+        return fp32_router_gemv_execute_with_mm(
+            self._plan, x, self.prepared_weight, self.multiplier, mm_a, mm_b, mm_out
         )
 
 
@@ -1503,6 +1599,70 @@ class MuseSparkMoE(nn.Module):
             columns, topk_weights, norm.weight, norm.eps, norm.weight_offset, rows
         )
 
+    def _route_and_quantize_inputs(
+        self, hidden_states: torch.Tensor, router_input: torch.Tensor
+    ) -> (
+        tuple[
+            torch.Tensor,
+            tuple[torch.Tensor, torch.Tensor],
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+        | None
+    ):
+        """Route and quantize decode rows in two launches, or None.
+
+        The router shares a launch with this rank's pre-expert columns, and the
+        top-k shares one with the column gather, RMSNorm and MXFP4
+        quantization. Neither launch has a dependency between its halves, so
+        this replaces four launches with two. Returns the BF16 placeholder
+        rows, the MXFP4 rows, the router logits and the top-k weights and ids.
+        """
+        iris = self.iris_state
+        projection = self.pre_expert_proj
+        norm = self.pre_expert_norm
+        if (
+            iris is None
+            or self.expert_quant_kind != "mxfp4"
+            or not self.experts.supports_prequantized_input
+            or norm.weight is None
+            or projection.workspace is None
+            or hidden_states.shape[0]
+            > min(_GATHER_MXFP4_MAX_ROWS, projection.workspace.shape[0])
+        ):
+            return None
+        weight = projection._local_weight()
+        local = hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]))
+        bias = self.gate.e_score_correction_bias
+        if not (
+            self.gate.supports_with_mm(router_input, hidden_states, weight)
+            and iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
+                local, norm.weight, bias, self.topk
+            )
+        ):
+            return None
+        router_logits = self.gate.forward_with_mm(
+            router_input, hidden_states, weight, local
+        )
+        quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
+            local,
+            norm.weight,
+            norm.eps,
+            norm.weight_offset,
+            router_logits,
+            bias,
+            self.topk,
+            self.route_scale,
+        )
+        return (
+            projection.workspace[: hidden_states.shape[0]],
+            quantized,
+            router_logits,
+            topk_weights,
+            topk_ids,
+        )
+
     def _acquire_route_destination(
         self, num_tokens: int, owned_rows: bool
     ) -> torch.Tensor | None:
@@ -1596,72 +1756,88 @@ class MuseSparkMoE(nn.Module):
         Without ``project`` the combined expert rows are returned unprojected
         for a boundary that applies ``post_expert_proj`` itself.
         """
-        # Without an auxiliary stream (gfx950) the branch runs inline. Otherwise
-        # the graph phase warms the fork serially, so capture never first-touches it.
-        with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
-        ) as fork:
-            norm_weight = self.pre_expert_norm.weight
-            if owned_global_rows is not None:
-                local_rows = hidden_states.shape[0]
-                output = hidden_states.new_empty(
-                    (local_rows, self.pre_expert_proj.output_size)
-                )
-                compressed = self.pre_expert_proj.forward_owned_rows(
-                    hidden_states, output
-                )
-                if (
+        routed = (
+            self._route_and_quantize_inputs(hidden_states, router_input)
+            if owned_global_rows is None
+            else None
+        )
+        if routed is not None:
+            compressed, compressed_quantized, router_logits, topk_weights, topk_ids = (
+                routed
+            )
+            prepared = None
+        else:
+            # Without an auxiliary stream (gfx950) the branch runs inline. Otherwise
+            # the graph phase warms the fork serially, so capture never first-touches it.
+            with self.stream_fork.scope(
+                enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+            ) as fork:
+                norm_weight = self.pre_expert_norm.weight
+                if owned_global_rows is not None:
+                    local_rows = hidden_states.shape[0]
+                    output = hidden_states.new_empty(
+                        (local_rows, self.pre_expert_proj.output_size)
+                    )
+                    compressed = self.pre_expert_proj.forward_owned_rows(
+                        hidden_states, output
+                    )
+                    if (
+                        self.expert_quant_kind == "mxfp4"
+                        and self.experts.supports_prequantized_input
+                    ):
+                        compressed_quantized = rmsnorm_mxfp4_quant(
+                            compressed,
+                            norm_weight,
+                            self.pre_expert_norm.eps,
+                            self.pre_expert_norm.weight_offset,
+                        )
+                    else:
+                        compressed = self.pre_expert_norm(compressed, compressed.dtype)
+                        compressed_quantized = None
+                elif (
                     self.expert_quant_kind == "mxfp4"
                     and self.experts.supports_prequantized_input
+                    and norm_weight is not None
                 ):
-                    compressed_quantized = rmsnorm_mxfp4_quant(
+                    compressed, compressed_quantized = (
+                        self.pre_expert_proj.forward_mxfp4(
+                            hidden_states,
+                            norm_weight,
+                            self.pre_expert_norm.eps,
+                            self.pre_expert_norm.weight_offset,
+                        )
+                    )
+                elif self.expert_quant_kind == "nvfp4":
+                    width = self.pre_expert_proj.output_size
+                    compressed, sentinel = self.pre_expert_proj.forward_with_mailbox(
+                        hidden_states, width & (width - 1) == 0
+                    )
+                    compressed_quantized = rmsnorm_nvfp4_quant(
                         compressed,
                         norm_weight,
                         self.pre_expert_norm.eps,
                         self.pre_expert_norm.weight_offset,
+                        self.experts.w13_input_scale_quant,
+                        sentinel,
+                        pdl_enabled(),
                     )
                 else:
-                    compressed = self.pre_expert_norm(compressed, compressed.dtype)
+                    # MXFP4 kernels dynamically quantize this normalized BF16 row
+                    # into OCP E2M1 values with group-32 E8M0 scales.
+                    compressed = self.pre_expert_proj.forward_rmsnorm(
+                        hidden_states, self.pre_expert_norm
+                    )
                     compressed_quantized = None
-            elif (
-                self.expert_quant_kind == "mxfp4"
-                and self.experts.supports_prequantized_input
-                and norm_weight is not None
-            ):
-                compressed, compressed_quantized = self.pre_expert_proj.forward_mxfp4(
-                    hidden_states,
-                    norm_weight,
-                    self.pre_expert_norm.eps,
-                    self.pre_expert_norm.weight_offset,
-                )
-            elif self.expert_quant_kind == "nvfp4":
-                width = self.pre_expert_proj.output_size
-                compressed, sentinel = self.pre_expert_proj.forward_with_mailbox(
-                    hidden_states, width & (width - 1) == 0
-                )
-                compressed_quantized = rmsnorm_nvfp4_quant(
-                    compressed,
-                    norm_weight,
-                    self.pre_expert_norm.eps,
-                    self.pre_expert_norm.weight_offset,
-                    self.experts.w13_input_scale_quant,
-                    sentinel,
-                    pdl_enabled(),
-                )
-            else:
-                compressed = self.pre_expert_proj(hidden_states)
-                compressed_quantized = None
-                # MXFP4 kernels dynamically quantize this normalized BF16 row
-                # into OCP E2M1 values with group-32 E8M0 scales.
-                compressed = self.pre_expert_norm(compressed, compressed.dtype)
-            with fork.branch():
-                router_logits = self.gate(router_input, pdl_enabled())
-                prepared = (
-                    self.prepared_routing.get(hidden_states.shape[0])
-                    if owned_global_rows is None
-                    else None
-                )
-                topk_weights, topk_ids = self._select_experts(router_logits, prepared)
+                with fork.branch():
+                    router_logits = self.gate(router_input, pdl_enabled())
+                    prepared = (
+                        self.prepared_routing.get(hidden_states.shape[0])
+                        if owned_global_rows is None
+                        else None
+                    )
+                    topk_weights, topk_ids = self._select_experts(
+                        router_logits, prepared
+                    )
         if owned_global_rows is not None:
             iris = self.iris_state
             assert iris is not None
@@ -1840,6 +2016,53 @@ class MuseSparkDecoderLayer(nn.Module):
         )
         self.iris_state: MuseIrisState | None = None
 
+    def _sliding_attention_tail(
+        self,
+        positions: torch.Tensor,
+        attention_input: torch.Tensor,
+        ctx: ForwardContext,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Run sliding decode rows through attention and its boundary in one
+        launch, or return None when that path does not apply."""
+        attn = self.self_attn
+        iris = self.iris_state
+        pre_norm = self.pre_feedforward_layernorm
+        if (
+            iris is None
+            or attn.o_proj.tp_size == 1
+            or attn.o_proj.reduce_results
+            or pre_norm.weight is None
+            or not self.comm_manager.use_all_reduce(self.comm_manager.is_moe)
+            or type(attn.o_proj.quant_method) is not UnquantizedLinearMethod
+        ):
+            return None
+        cache = attn.attn.decode_kv_view(ctx)
+        if cache is None or not iris.can_sliding_attention_boundary(
+            attention_input.shape[0],
+            cache.seq_lens.shape[0],
+            cache.k_cache,
+            cache.max_seqlen_k,
+            attn.attn.sliding_window_size,
+            attn.attn.scaling,
+            attn.o_proj.weight,
+            hidden_states,
+        ):
+            return None
+        alpha, beta = self.post_attention_residual_gate._gate_coefficients()
+        return attn.forward_sliding_tail(
+            positions,
+            attention_input,
+            ctx,
+            cache,
+            hidden_states,
+            self.post_attention_layernorm,
+            alpha,
+            beta,
+            pre_norm,
+            iris,
+        )
+
     def refresh_residual_gates(self) -> None:
         """Re-derive ``(alpha, beta)`` in place so captured graphs read reloaded gates."""
         self.post_attention_residual_gate.refresh_gate()
@@ -1884,42 +2107,51 @@ class MuseSparkDecoderLayer(nn.Module):
                 )
             else:
                 attention_input = self.comm_manager.pre_attn_comm(attention_input, ctx)
-        attention_output, attention_sentinel, attention_ranks = self.self_attn(
-            positions, attention_input, ctx, owned_global_rows if owned_qkvg else None
+        # Sliding decode rows may run attention through its boundary in one launch.
+        fused = (
+            self._sliding_attention_tail(positions, attention_input, ctx, hidden_states)
+            if owned_global_rows is None
+            else None
         )
-        fused = None
-        if owned_global_rows is not None:
-            attention_output = iris.reduce_scatter_owned_rows(attention_output)
-        elif (
-            self.self_attn.o_proj.tp_size > 1
-            and not self.self_attn.o_proj.reduce_results
-            and self.pre_feedforward_layernorm.weight is not None
-            and self.comm_manager.use_all_reduce(self.comm_manager.is_moe)
-        ):
-            iris = self.iris_state
-            pre_norm = self.pre_feedforward_layernorm
-            post_norm = self.post_attention_layernorm
-            alpha, beta = self.post_attention_residual_gate._gate_coefficients()
-            if iris is not None and iris.can_all_reduce_symmetric_boundary(
-                attention_output,
-                hidden_states,
-                post_norm.weight,
-                alpha,
-                beta,
-                pre_norm.weight,
+        if fused is None:
+            attention_output, attention_sentinel, attention_ranks = self.self_attn(
+                positions,
+                attention_input,
+                ctx,
+                owned_global_rows if owned_qkvg else None,
+            )
+            if owned_global_rows is not None:
+                attention_output = iris.reduce_scatter_owned_rows(attention_output)
+            elif (
+                self.self_attn.o_proj.tp_size > 1
+                and not self.self_attn.o_proj.reduce_results
+                and self.pre_feedforward_layernorm.weight is not None
+                and self.comm_manager.use_all_reduce(self.comm_manager.is_moe)
             ):
-                fused = iris.all_reduce_symmetric_boundary(
+                iris = self.iris_state
+                pre_norm = self.pre_feedforward_layernorm
+                post_norm = self.post_attention_layernorm
+                alpha, beta = self.post_attention_residual_gate._gate_coefficients()
+                if iris is not None and iris.can_all_reduce_symmetric_boundary(
                     attention_output,
                     hidden_states,
                     post_norm.weight,
                     alpha,
                     beta,
                     pre_norm.weight,
-                    post_norm.eps,
-                    post_norm.weight_offset,
-                    pre_norm.eps,
-                    pre_norm.weight_offset,
-                )
+                ):
+                    fused = iris.all_reduce_symmetric_boundary(
+                        attention_output,
+                        hidden_states,
+                        post_norm.weight,
+                        alpha,
+                        beta,
+                        pre_norm.weight,
+                        post_norm.eps,
+                        post_norm.weight_offset,
+                        pre_norm.eps,
+                        pre_norm.weight_offset,
+                    )
         if fused is not None:
             hidden_states, router_input, mlp_input = fused
         else:
@@ -2268,12 +2500,23 @@ class MuseSparkModel(BaseTransformerModel):
         The draft model reads every token's full row in the model dtype (that
         of the token embedding), so each capture is rounded from FP32. When
         each rank holds only its owned rows, only the captured layers gather
-        full rows; the other layers keep the owned-row layout.
+        full rows; the other layers keep the owned-row layout. A forward's
+        capture sink copies each tap into its own storage, rounding as it
+        copies, so on full rows it gets the FP32 residual itself. The sink
+        may run an attention-TP collective here (DFlash gathers its context
+        columns at the last tap), so no borrowed Iris output may be live
+        across a capture.
         """
         if owned_global_rows is None:
-            tap = hidden_states.to(self.embed_tokens.weight.dtype)
             # The final capture (index num_layers + 1) gathers like the last layer's.
             layer = self.layers[min(layer_index, len(self.layers) - 1)]
+            tap = hidden_states
+            # Scattered rows are rounded before the gather, so it moves BF16.
+            if (
+                ctx.target_capture_sink is None
+                or layer.comm_manager.needs_pre_attn_all_gather()
+            ):
+                tap = tap.to(self.embed_tokens.weight.dtype)
             tap = layer.comm_manager.gather_residual(tap, ctx)
         else:
             iris = self.iris_state
@@ -2607,6 +2850,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 "Muse communication was prepared below the requested capacity"
             )
         self.model.iris_state = state
+        # Startup might not reduce any payload in the two-shot pull's window.
+        state.warmup_reduce_outputs()
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state

@@ -10,7 +10,9 @@ from pathlib import Path
 import pytest
 import setuptools
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import Version
 from setuptools import build_meta
 
 SETUP_PY = Path(__file__).parents[1] / "python" / "setup.py"
@@ -71,6 +73,72 @@ def test_nightly_version_uses_post_date(monkeypatch) -> None:
     )
 
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260230")
+    with pytest.raises(ValueError):
+        _capture_setup_kwargs(monkeypatch, "cuda")
+
+
+def _release_version(monkeypatch) -> str:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "false")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "release/test")
+    return _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+
+
+@pytest.mark.parametrize(
+    "candidate,expected",
+    [("1", "rc1"), ("rc2", "rc2"), ("RC3", "rc3"), (" 04 ", "rc4")],
+)
+def test_nightly_release_candidate_sorts_below_every_nightly(
+    monkeypatch, candidate, expected
+) -> None:
+    base_version = _release_version(monkeypatch)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", candidate)
+    version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+    assert version == f"{base_version}{expected}.post20261108"
+    assert str(Version(version)) == version
+    # Below the previous day's nightly of this release too, so it shadows none
+    # of them, and the scheduled nightly's == pin does not match it.
+    assert Version(version) < Version(f"{base_version}.post20261107")
+    assert not SpecifierSet(f"=={base_version}.post20261108").contains(
+        version, prereleases=True
+    )
+
+
+def test_scheduled_nightly_with_an_empty_release_candidate(monkeypatch) -> None:
+    base_version = _release_version(monkeypatch)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    # Scheduled runs pass the empty release_candidate input through.
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "")
+    version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+    assert version == f"{base_version}.post20261108"
+
+
+@pytest.mark.parametrize(
+    "candidate", [" ", "rc", "dev1", "fa4-fix", "rc1+fa4", "1.5", "-1", "a1"]
+)
+def test_nightly_release_candidate_must_be_a_number(monkeypatch, candidate) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", candidate)
+    with pytest.raises(ValueError):
+        _capture_setup_kwargs(monkeypatch, "cuda")
+
+
+@pytest.mark.parametrize("branch", ["main", "release/test"])
+def test_release_candidate_is_refused_outside_nightly_builds(
+    monkeypatch, branch
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "false")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", branch)
+    # The release workflow passes the (empty) release candidate to every build.
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "")
+    _capture_setup_kwargs(monkeypatch, "cuda")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "1")
     with pytest.raises(ValueError):
         _capture_setup_kwargs(monkeypatch, "cuda")
 
