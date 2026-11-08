@@ -694,6 +694,7 @@ def test_nvidia_kda_verify_and_decode_registration_traits(
         ("triton_nvidia_kda_paged_prefill", "k_major"),
         ("flashkda_nvidia_kda_paged_prefill", "k_major"),
         ("cutedsl_kda_nvidia_paged_prefill", "v_major"),
+        ("flashinfer_kda_paged_prefill", "v_major"),
     ],
 )
 def test_nvidia_kda_prefill_kernels_declare_native_layout(kernel_name, layout) -> None:

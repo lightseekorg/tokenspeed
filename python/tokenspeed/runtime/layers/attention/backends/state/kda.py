@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
-KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
+KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda", "flashinfer")
 
 
 def resolve_kda_backend(kda_backend: str) -> str:
@@ -78,8 +78,8 @@ def resolve_kda_backend(kda_backend: str) -> str:
     On AMD, the backend policy is ignored and compatible kernels are selected
     using registry priority. On NVIDIA, ``auto`` picks ``cutedsl_kda`` when its
     device-specific implementation is available, ``flashkda`` on SM90+, and
-    ``fla`` otherwise. Explicit CuteDSL selection is validated against device
-    support. Decode is unaffected.
+    ``fla`` otherwise. Explicit CuteDSL and FlashInfer selections are validated
+    against device support. Decode is unaffected.
 
     Args:
         kda_backend: Normalized prefill backend name from the launch arguments.
@@ -107,6 +107,15 @@ def resolve_kda_backend(kda_backend: str) -> str:
         raise ValueError(
             "--kda-backend cutedsl_kda requires an NVIDIA sm_100 or sm_103 device"
         )
+    if kda_backend == "flashinfer":
+        from tokenspeed_kernel.ops.attention.kda.flashinfer import (
+            flashinfer_kda_supported,
+        )
+
+        if not flashinfer_kda_supported():
+            raise ValueError(
+                "--kda-backend flashinfer requires an NVIDIA sm_100 or sm_103 device"
+            )
     return kda_backend
 
 

@@ -1131,17 +1131,36 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
 @requires_cuda
 @pytest.mark.parametrize("prefix", [0, 1024])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_kda_prefill_fused_staging_matches_pytorch(prefix, state_dtype, monkeypatch):
+@pytest.mark.parametrize(
+    ("backend_name", "heads"), [("cutedsl_kda", 4), ("flashinfer", 8)]
+)
+def test_kda_prefill_fused_staging_matches_pytorch(
+    prefix, state_dtype, backend_name, heads, monkeypatch
+):
     """Native KDA outputs and persistent state match the old staging ops."""
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
+    from tokenspeed_kernel.ops.attention.kda.flashinfer import (
+        flashinfer_kda_supported,
+    )
 
-    if not cutedsl_kda_supported():
-        pytest.skip("requires the native CuteDSL KDA prefill package")
+    supported = {
+        "cutedsl_kda": cutedsl_kda_supported,
+        "flashinfer": flashinfer_kda_supported,
+    }[backend_name]
+    if not supported():
+        pytest.skip(f"requires the {backend_name} KDA prefill kernel")
+    # FlashInfer's persistent kernel takes head counts divisible by eight.
+    monkeypatch.setattr(_KDAHarness, "H", heads)
 
     contract = _stub_contract(prefix_granularity=1024, usable_pages=8)
     pools = [
         _StubContractPool(
-            contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
+            contract,
+            "cuda",
+            conv_dim=3 * heads * 128,
+            width=4,
+            num_heads=heads,
+            head_dim=128,
         )
         for _ in range(2)
     ]
@@ -1162,7 +1181,7 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, state_dtype, monkeypa
         gid: [[2 * row + 1, 2 * row + 2]] for row, gid in enumerate(_STATE_GROUPS)
     }
     for harness in harnesses:
-        harness.backend.kda_backend = "cutedsl_kda"
+        harness.backend.kda_backend = backend_name
         harness.extend_metadata(
             tables,
             seq_lens=[prefix + 868],
