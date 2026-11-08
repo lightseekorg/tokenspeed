@@ -2318,8 +2318,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def path_is_ignored(path: str, prefixes: List[str]) -> bool:
-    """Whether a task with ``ignore_changes`` can ignore a changed ``path``:
-    Markdown, or a path under one of the listed directories."""
+    """Return whether ``path`` is Markdown or lies under one of ``prefixes``."""
     return path.endswith(".md") or any(
         path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes
     )
