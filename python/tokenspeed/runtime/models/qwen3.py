@@ -30,7 +30,6 @@ from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 from tokenspeed.runtime.configs.utils import get_rope_theta
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -42,11 +41,13 @@ from tokenspeed.runtime.layers.paged_attention import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
-from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base import (
+    BaseCausalLM,
+    BaseDecoderLayer,
+    BaseTransformerModel,
+)
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.utils import add_prefix, make_layers
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils import add_prefix
 
 
 class Qwen3Attention(nn.Module):
@@ -159,184 +160,49 @@ class Qwen3Attention(nn.Module):
         return output
 
 
-class Qwen3DecoderLayer(nn.Module):
-    def __init__(
-        self,
-        config: Qwen3Config,
-        mapping: Mapping,
-        layer_id: int = 0,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.mapping = mapping
-        if self.mapping.attn.tp_size != self.mapping.dense.tp_size:
-            raise ValueError(
-                "Qwen3 does not use CommManager and assumes attn_tp_size == dense_tp_size"
-            )
-        self.hidden_size = config.hidden_size
-        rope_theta = get_rope_theta(config, 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
-        head_dim = getattr(config, "head_dim", None)
-        self.self_attn = Qwen3Attention(
-            config=config,
+class Qwen3DecoderLayer(BaseDecoderLayer[Qwen3Config]):
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        return Qwen3Attention(
+            config=self.config,
             mapping=self.mapping,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            head_dim=head_dim,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            rms_norm_eps=config.rms_norm_eps,
-            attention_bias=config.attention_bias,
+            hidden_size=self.config.hidden_size,
+            num_heads=self.config.num_attention_heads,
+            num_kv_heads=self.config.num_key_value_heads,
+            layer_id=self.layer_id,
+            rope_theta=get_rope_theta(self.config, 1000000),
+            rope_scaling=getattr(self.config, "rope_scaling", None),
+            head_dim=getattr(self.config, "head_dim", None),
+            max_position_embeddings=getattr(
+                self.config, "max_position_embeddings", 32768
+            ),
+            quant_config=self.quant_config,
+            rms_norm_eps=self.config.rms_norm_eps,
+            attention_bias=self.config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = GatedMLP.tensor_parallel(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            activation=gated_activation(config.hidden_act, swiglu_limit=None),
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+        return GatedMLP.tensor_parallel(
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            activation=gated_activation(self.config.hidden_act, swiglu_limit=None),
             tp_rank=self.mapping.dense.tp_rank,
             tp_size=self.mapping.dense.tp_size,
             tp_group=self.mapping.dense.tp_group,
             reduce_results=False,
             fusions=(),
-            quant_config=quant_config,
+            quant_config=self.quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        residual: torch.Tensor | None,
-        cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        elif (
-            ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
-        ):
-            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        else:
-            hidden_states, residual, *_ = (
-                self.input_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.dense.tp_rank,
-                    self.mapping.dense.tp_group,
-                    hidden_states,
-                    residual,
-                )
-            )
-
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            ctx=ctx,
-            cos_sin=cos_sin,
-        )
-
-        # Fully Connected
-        if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-        else:
-            hidden_states, residual, *_ = (
-                self.post_attention_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.attn.tp_rank,
-                    self.mapping.attn.tp_group,
-                    hidden_states,
-                    residual,
-                )
-            )
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
 
 
-class Qwen3Model(nn.Module):
-    def __init__(
-        self,
-        config: Qwen3Config,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        decoder_layer_type: type[nn.Module] = None,
-    ) -> None:
-        super().__init__()
-        self.mapping = mapping
-        self.config = config
-        self.padding_idx = getattr(config, "pad_token_id", None)
-        self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
-        )
-        decoder_layer_type = decoder_layer_type or Qwen3DecoderLayer
-        self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: decoder_layer_type(
-                config=config,
-                mapping=self.mapping,
-                layer_id=idx,
-                quant_config=quant_config,
-            ),
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+class Qwen3Model(BaseTransformerModel):
+    layer_cls = Qwen3DecoderLayer
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
             return self.embed_tokens(input_ids) * self.config.scale_emb
         return self.embed_tokens(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        ctx: ForwardContext,
-        input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
-        residual = None
-
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                ctx,
-                residual,
-                cos_sin=None,
-            )
-        if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-            hidden_states, _ = self.norm(hidden_states, residual)
-        else:
-            hidden_states, *_ = self.norm.forward_with_allreduce_fusion(
-                self.mapping.dense.tp_rank,
-                self.mapping.dense.tp_group,
-                hidden_states,
-                residual,
-            )
-        return hidden_states, None
 
 
 class Qwen3ForCausalLM(BaseCausalLM):

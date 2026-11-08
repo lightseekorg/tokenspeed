@@ -99,7 +99,7 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             mapping=self.mapping,
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
-            prev_is_moe=self.is_moe_layer,
+            prev_is_moe=self.is_prev_moe_layer,
             dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
@@ -110,6 +110,11 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
     def is_moe_layer(self) -> bool:
 
         return False
+
+    @property
+    def is_prev_moe_layer(self) -> bool:
+
+        return self.is_moe_layer
 
     def resolve_norm(self) -> nn.Module:
 
