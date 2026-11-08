@@ -804,6 +804,10 @@ neither proves that remote writes stopped. A receiver that never advertised
 landing pages can retire locally. Cancelled rooms reject delayed registration
 and manifests; repeated cancellation is safe.
 
+`Failed` precedes `Stopped`, but both may arrive in the same poll when the
+transfer has already retired. Consumers accept either one poll or separate
+polls and keep the pages until the retirement event and local forwards complete.
+
 The prefill control receiver handles cancellation even when no native request
 claimed the room or its scheduler is paused. Unclaimed rooms therefore need
 not wait for the bootstrap timeout after the decode request is cancelled.
