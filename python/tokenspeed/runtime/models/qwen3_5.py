@@ -1418,7 +1418,9 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             prefix=add_prefix("model.language_model", prefix),
         )
 
-    def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
+    def get_stacked_params_mapping(
+        self,
+    ) -> list[tuple[str, str, int | str | tuple[int, ...]]]:
         # Dots keep the vision tower's qkv_proj from matching v_proj.
         return [
             (".qkv_proj.", ".q_proj.", "q"),
