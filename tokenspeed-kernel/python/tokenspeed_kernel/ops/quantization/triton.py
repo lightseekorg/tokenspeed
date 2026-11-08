@@ -1591,7 +1591,8 @@ def _rmsnorm_fp8_group32_ue8m0(
                 << (tl.arange(0, 4) * 8)[None, :],
                 1,
             )
-            word = tl.arange(0, words)
+            # SA grows with the token count; widen before multiplying it.
+            word = tl.arange(0, words).to(tl.int64)
             tl.store(S + word * SA + row, packed, word < K // 128)
         else:
             if LAYOUT == "swizzled":

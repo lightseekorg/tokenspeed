@@ -1190,35 +1190,6 @@ class DeepseekV41Attention(nn.Module):
         else:
             self.wo_b_scales.copy_(prepared)
 
-    def warmup_query_projections(self, max_tokens: int) -> None:
-        """Compile the DeepGEMM attention-front projections up to max_tokens.
-
-        Covers every projection the forward runs on DeepGEMM: the Q
-        up-projection, ``wq_a_wkv`` and the indexer's ``wq_b``.
-        """
-        if self.fused_q_projection_scales is not None:
-            warmup_fp8_projection(
-                self.fused_q_weight, self.fused_q_projection_scales, max_tokens
-            )
-        attn_method = self.wq_a_wkv.quant_method
-        if (
-            isinstance(attn_method, _ReferenceFp8LinearMethod)
-            and attn_method.projection_weight_scales is not None
-        ):
-            warmup_fp8_projection(
-                self.wq_a_wkv.weight,
-                attn_method.projection_weight_scales,
-                max_tokens,
-            )
-        method = None if self.indexer is None else self.indexer.wq_b.quant_method
-        if (
-            isinstance(method, _ReferenceFp8LinearMethod)
-            and method.projection_weight_scales is not None
-        ):
-            warmup_fp8_projection(
-                self.indexer.wq_b.weight, method.projection_weight_scales, max_tokens
-            )
-
     def warmup_output_projections(self, max_tokens: int) -> None:
         """Compile the FP8 wo_a/wo_b kernels for every count up to max_tokens."""
         warmup_fp8_projections(
@@ -1809,6 +1780,34 @@ class DeepseekV41Attention(nn.Module):
                 op=torch.distributed.ReduceOp.SUM,
             )
         return out
+
+
+def _warmup_query_projections(
+    attentions: Iterable[DeepseekV41Attention], max_tokens: int
+) -> None:
+    """Compile each distinct attention-front FP8 projection shape at startup."""
+    warmed = set()
+    for attn in attentions:
+        projections = []
+        if attn.fused_q_projection_scales is not None:
+            projections.append((attn.fused_q_weight, attn.fused_q_projection_scales))
+        # The first layers have no indexer. Canonical Q also runs on DeepGEMM
+        # in mixed/distributed batches and when fused attention is unavailable.
+        layers = [attn.wq_a_wkv, attn.wq_b]
+        if attn.indexer is not None:
+            layers.append(attn.indexer.wq_b)
+        for layer in layers:
+            method = layer.quant_method
+            if (
+                isinstance(method, _ReferenceFp8LinearMethod)
+                and method.projection_weight_scales is not None
+            ):
+                projections.append((layer.weight, method.projection_weight_scales))
+        for weight, scales in projections:
+            key = (weight.device, tuple(weight.shape))
+            if key not in warmed:
+                warmup_fp8_projection(weight, scales, max_tokens)
+                warmed.add(key)
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
@@ -3551,11 +3550,13 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 # choice warms them all.
                 module.warmup_output_projections(_max_forward_tokens())
                 warmed.add(module.wo_b_fp8)
-        for module in self.modules():
-            if isinstance(module, DeepseekV41Attention):
-                # Layers share the Q projection shapes, so one layer warms them all.
-                module.warmup_query_projections(_max_forward_tokens())
-                break
+        attentions = [
+            module
+            for module in self.modules()
+            if isinstance(module, DeepseekV41Attention)
+        ]
+        if attentions:
+            _warmup_query_projections(attentions, _max_forward_tokens())
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()

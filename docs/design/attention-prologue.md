@@ -402,3 +402,8 @@ source rows, so the fused Q RoPE would use other positions. Prepared copies are
 nonpersistent buffers, refreshed in place from the canonical checkpoint after
 weight updates so captured graphs retain their addresses. Cache ownership,
 selection and write ordering are unchanged.
+
+Attention-front FP8 projection warmup visits every layer and deduplicates by
+device and weight shape. The initial window-only layers have no indexer, and
+canonical Q weights remain active when fused attention is unavailable, so
+neither the first layer nor the fused Q copy alone covers every projection.
