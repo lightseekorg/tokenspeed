@@ -83,12 +83,13 @@ class KernelTestSelection:
         self.run_all = False
         self._thirdparty_users: dict[str, set[str]] | None = None
         # Test helper modules, which tests import by their bare names.
-        self.helpers = {
-            path.stem
-            for path in self.test_root.rglob("*.py")
-            if not path.name.startswith("test_")
-            and path.name not in ("conftest.py", "__init__.py")
-        }
+        self.helpers: dict[str, list[Path]] = {}
+        for path in sorted(self.test_root.rglob("*.py")):
+            if not path.name.startswith("test_") and path.name not in (
+                "conftest.py",
+                "__init__.py",
+            ):
+                self.helpers.setdefault(path.stem, []).append(path)
         for path in changed_paths:
             self._add_change(path)
 
@@ -180,13 +181,30 @@ class KernelTestSelection:
             self._thirdparty_users = users
         return self._thirdparty_users
 
-    def test_families(self, test_file: Path) -> set[str] | None:
-        """The families a test file belongs to; None when it loads every kernel."""
-        modules = _imported_modules(test_file)
+    def _import_families(self, file: Path, seen: set[Path]) -> set[str] | None:
+        """The families ``file`` imports, through the test helpers it imports
+        too; None when it loads every kernel."""
+        seen.add(file)
+        modules = _imported_modules(file)
         if any(module.endswith(".load_builtin_kernels") for module in modules):
             return None
         families = {self.module_family(module) for module in modules} - {None}
-        families |= {f"helper/{module}" for module in modules if module in self.helpers}
+        for module in modules:
+            for helper in self.helpers.get(module, []):
+                families.add(f"helper/{module}")
+                if helper in seen:
+                    continue
+                helper_families = self._import_families(helper, seen)
+                if helper_families is None:
+                    return None
+                families |= helper_families
+        return families
+
+    def test_families(self, test_file: Path) -> set[str] | None:
+        """The families a test file belongs to; None when it loads every kernel."""
+        families = self._import_families(test_file.resolve(), set())
+        if families is None:
+            return None
         parts = test_file.resolve().relative_to(self.test_root).parts[:-1]
         if "ops" in parts and parts.index("ops") + 1 < len(parts):
             families.add(parts[parts.index("ops") + 1])

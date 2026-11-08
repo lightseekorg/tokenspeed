@@ -54,6 +54,8 @@ FILES = {
     f"{TESTS}/conftest.py": "",
     f"{TESTS}/utils.py": "",
     f"{TESTS}/asm_checks.py": "",
+    # A helper that reaches a family and another helper.
+    f"{TESTS}/gemm_helpers.py": "import asm_checks\nfrom tokenspeed_kernel.ops.gemm import mm\n",
     f"{TESTS}/ops/test_gemm.py": "from tokenspeed_kernel.ops.gemm import mm\n",
     f"{TESTS}/ops/test_mla.py": "from tokenspeed_kernel.ops.attention.mla import f\n",
     f"{TESTS}/ops/test_attention.py": "from tokenspeed_kernel.ops.attention import f\n",
@@ -62,6 +64,7 @@ FILES = {
     ),
     f"{TESTS}/ops/test_asm.py": "import asm_checks\n",
     f"{TESTS}/nvidia/ops/moe/test_moe.py": "",
+    f"{TESTS}/nvidia/ops/test_gemm_capacity.py": "import gemm_helpers\n",
     f"{TESTS}/test_all.py": (
         "def test():\n"
         "    from tokenspeed_kernel.registry import load_builtin_kernels\n"
@@ -74,6 +77,7 @@ EVERY = {
     "test_sampling",
     "test_asm",
     "test_moe",
+    "test_gemm_capacity",
     "test_all",
 }
 
@@ -89,10 +93,16 @@ def repo(tmp_path: Path) -> Path:
 @pytest.mark.parametrize(
     ("changed", "expected"),
     [
-        (f"{KERNEL}/ops/gemm/triton.py", {"test_gemm", "test_all"}),
-        (f"{KERNEL}/ops/gemm/_cute_dsl/swiglu.py", {"test_gemm", "test_all"}),
+        (
+            f"{KERNEL}/ops/gemm/triton.py",
+            {"test_gemm", "test_gemm_capacity", "test_all"},
+        ),
+        (
+            f"{KERNEL}/ops/gemm/_cute_dsl/swiglu.py",
+            {"test_gemm", "test_gemm_capacity", "test_all"},
+        ),
         # A reviewer widens the tests with a directory (pr_test_scope.py).
-        (f"{KERNEL}/ops/gemm", {"test_gemm", "test_all"}),
+        (f"{KERNEL}/ops/gemm", {"test_gemm", "test_gemm_capacity", "test_all"}),
         (f"{KERNEL}/ops/attention/mla/", {"test_mla", "test_attention", "test_all"}),
         (
             f"{KERNEL}/ops/attention/mla/triton.py",
@@ -107,7 +117,7 @@ def repo(tmp_path: Path) -> Path:
         (f"{KERNEL}/thirdparty/cute_dsl/k.py", {"test_moe", "test_all"}),
         (f"{AMD}/ops/gfx950/moe/fp8.py", {"test_moe", "test_all"}),
         (f"{KERNEL}/numerics/torch/sampling.py", {"test_sampling", "test_all"}),
-        (f"{TESTS}/asm_checks.py", {"test_asm", "test_all"}),
+        (f"{TESTS}/asm_checks.py", {"test_asm", "test_gemm_capacity", "test_all"}),
         (f"{TESTS}/ops/test_gemm.py", {"test_gemm", "test_all"}),
         (f"{TESTS}/ops/bench_gemm.py", {"test_all"}),
         ("python/tokenspeed/runtime/models/qwen3.py\ndocs/x.md", {"test_all"}),
