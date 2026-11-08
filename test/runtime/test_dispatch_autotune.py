@@ -78,6 +78,7 @@ from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
     UnquantizedLinearMethod,
 )
 from tokenspeed.runtime.utils import env as env_module  # noqa: E402
+from tokenspeed.runtime.utils import server_args as server_args_module  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
@@ -328,6 +329,7 @@ class _ProcessGroupManagerDouble:
         return self._group
 
 
+@pytest.mark.parametrize("max_decode_bs", [1, 8])
 @pytest.mark.parametrize("attention_tp_size", [1, 2, 8])
 @pytest.mark.parametrize("chunk_size", [-1, 16, 17])
 @pytest.mark.parametrize("speculative", [False, True])
@@ -343,6 +345,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     failure,
     prefill_only,
     attention_tp_size,
+    max_decode_bs,
 ):
     events = []
     metadata = []
@@ -372,7 +375,8 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             raise RuntimeError("profiling failed")
 
     def draft(*, batch_sizes, graph_phase):
-        assert batch_sizes == (attention_tp_size,)
+        # One request per attention TP peer, within the decode state.
+        assert batch_sizes == (min(attention_tp_size, max_decode_bs),)
         assert tuning_module.is_autotuning() is (
             not disabled and tuning_module._autotuner is not None
         )
@@ -403,7 +407,9 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         ),
         prefill_graph=_PrefillGraphDouble(make_dummy_batch=prefill_batch),
         # Deliberately no capture_bs or graph-enabled flag: neither controls tuning.
-        forward_step=_ForwardStepDouble(warmup_decode_path=draft),
+        forward_step=_ForwardStepDouble(
+            warmup_decode_path=draft, max_decode_bs=max_decode_bs
+        ),
         drafter=object() if speculative else None,
         model_input_kwargs=lambda n, bs, rows: {
             "engram_hash_ids": ngram_history[rows],
@@ -856,12 +862,34 @@ class _ModelConfigDouble:
     quantization: str | None
 
 
+class _VendorPlatform:
+    """The test host's platform reporting another GPU vendor: server
+    arguments read other platform facts as well."""
+
+    def __init__(self, real, *, is_nvidia):
+        self._real = real
+        self.is_nvidia = is_nvidia
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _on_vendor(monkeypatch, *, is_nvidia):
+    real = server_args_module.current_platform()
+    monkeypatch.setattr(
+        server_args_module,
+        "current_platform",
+        lambda: _VendorPlatform(real, is_nvidia=is_nvidia),
+    )
+
+
 @pytest.mark.parametrize("tp,dp,max_num_seqs", [(8, 1, 4), (2, 4, 4), (2, 4, 7)])
 @pytest.mark.parametrize("disable_autotune", [False, True])
 @pytest.mark.parametrize("role", ["null", "decode"])
-def test_speculative_warmup_rejects_capacity_below_attention_tp(
-    tp, dp, max_num_seqs, disable_autotune, role
+def test_speculative_warmup_rejects_capacity_below_attention_tp_on_nvidia(
+    monkeypatch, tp, dp, max_num_seqs, disable_autotune, role
 ):
+    _on_vendor(monkeypatch, is_nvidia=True)
     with pytest.raises(ValueError, match=f"Set --max-num-seqs to at least {tp * dp}"):
         ServerArgs(
             model="x",
@@ -878,11 +906,23 @@ def test_speculative_warmup_rejects_capacity_below_attention_tp(
 
 
 @pytest.mark.parametrize(
-    "tp,dp,max_num_seqs", [(8, 1, 8), (2, 4, 8), (2, 4, 9), (1, 8, 8)]
+    "tp,dp,max_num_seqs,is_nvidia",
+    [
+        (8, 1, 8, True),
+        (2, 4, 8, True),
+        (2, 4, 9, True),
+        (1, 8, 8, True),
+        # Without FlashInfer's lockstep tuning, any cap is kept.
+        (8, 1, 1, False),
+        (8, 1, 4, False),
+        (2, 4, 4, False),
+        (2, 4, 7, False),
+    ],
 )
-def test_speculative_warmup_accepts_capacity_covering_attention_tp(
-    tp, dp, max_num_seqs
+def test_speculative_warmup_accepts_capacity(
+    monkeypatch, tp, dp, max_num_seqs, is_nvidia
 ):
+    _on_vendor(monkeypatch, is_nvidia=is_nvidia)
     args = ServerArgs(
         model="x",
         dtype="bfloat16",

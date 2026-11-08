@@ -2718,12 +2718,16 @@ class ServerArgs:
             self.speculative_algorithm is not None
             and self.disaggregation_mode != "prefill"
             and self.max_num_seqs is not None
+            # Only FlashInfer's distributed tactic selection (NVIDIA) needs
+            # every attention TP peer in lockstep; elsewhere startup tuning
+            # runs no cross-rank collectives, and the draft warmup stays
+            # within the request cap (ModelExecutor.autotune).
+            and current_platform().is_nvidia
         ):
             dp_size = self.mapping.attn.dp_size
             tp_size = self.mapping.attn.tp_size
             # Draft startup uses one request per TP peer, even when tactic
-            # profiling is disabled. Clamping would leave empty tuning peers;
-            # exceeding this capacity would overrun per-request decode state.
+            # profiling is disabled. Fewer would leave empty tuning peers.
             if self.max_num_seqs // dp_size < tp_size:
                 raise ValueError(
                     "Speculative decode warmup requires max_num_seqs // "
