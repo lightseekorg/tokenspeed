@@ -41,10 +41,11 @@ from tokenspeed.runtime.execution.slot_state import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -392,6 +393,47 @@ class SamplingBackend(ABC):
         """``[bs, N]`` accepted path (root first, ``-1`` past it) of the last
         tree verify, as agreed across TP ranks."""
         return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
+
+    def vocab_shard_top_k(self) -> int | None:
+        """Most candidates per row this backend selects from vocabulary shards.
+
+        A backend returning a count reads a ``LogitsProcessorOutput`` whose
+        sampled rows stayed vocab-sharded (``vocab_shard``): it selects each
+        row's best candidates per shard where its route needs no more, and
+        gathers whole rows otherwise. None (the default) reads whole rows
+        only, so the processor gathers them.
+        """
+        return None
+
+    def warmup_vocab_shard_sampling(
+        self,
+        shard: SampledVocabShard,
+        candidates: torch.Tensor,
+        *,
+        draft_q: DraftTreeQ | None,
+        with_vocab_mask: bool,
+    ) -> None:
+        """Compile what ``sample`` and ``verify`` run on vocabulary shards.
+
+        A backend whose ``vocab_shard_top_k`` returns a count overrides it.
+        Startup calls it on every TP rank before serving.
+
+        Args:
+            shard: Shard logits of the processor that feeds this backend,
+                one row per column of ``candidates``.
+            candidates: One request's ``[1, N]`` verify window, in the dtype
+                and width the server verifies.
+            draft_q: The draft q every verify reads, or None when the server
+                verifies without one.
+            with_vocab_mask: Whether the server applies grammar masks.
+
+        Raises:
+            NotImplementedError: This backend reads whole rows only.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} reads whole rows only; it has no "
+            "vocab-shard sampling to warm"
+        )
 
     def reads_only_argmax(self) -> bool:
         """Whether ``sample`` and ``verify`` need nothing of the target logits

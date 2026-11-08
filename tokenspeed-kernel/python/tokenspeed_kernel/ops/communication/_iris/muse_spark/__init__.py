@@ -81,7 +81,7 @@ from tokenspeed_kernel.ops.moe import gather_moe_routes
 from tokenspeed_kernel.platform import current_platform
 
 if current_platform().is_cdna4:
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
         get_config as mha_decode_config,
     )
@@ -150,7 +150,9 @@ class MuseIrisState:
     return borrowed activations. No borrowed producer-buffer or pull-scratch
     view, nor the ready flags guarding it, may be live across an ordinary
     reduction on the group, including one the backend runs for another
-    caller through ProducerAllReduce.reduce_ordinary.
+    caller through ProducerAllReduce.reduce_ordinary, or across a column
+    gather another caller runs through the installed gather (a draft's
+    capture sink gathers its context columns at a layer boundary).
     The generic all-reduce retains its independent-output contract.
     Expert TP and EP use the same owned-row token cutoffs; each owner
     holds ceil(global rows / world size) rows, with padding masked.
@@ -1568,7 +1570,7 @@ class MuseIrisState:
             NUM_STAGES=config.num_stages,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=config.num_warps,
-            **sched_compile_options(),
+            **extern_compile_options(),
         )
         return out_stream, pre_fp32, pre_bf16
 
@@ -1770,8 +1772,8 @@ class MuseIrisState:
             HAS_PRE=pre_weight is not None,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=16,
-            # The GEMV's per-step pin is in the scheduling library.
-            **sched_compile_options(),
+            # The device library of the GEMV's per-step pin (_extern.arithmetic_fence).
+            **extern_compile_options(),
         )
         return out_stream, pre_bf16
 

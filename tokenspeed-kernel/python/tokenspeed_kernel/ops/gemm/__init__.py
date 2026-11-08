@@ -98,6 +98,8 @@ __all__ = [
     "warmup_fp8_projections",
     # MV: small-M dense projection
     "mv",
+    "MV_FP8_WEIGHT_MAX_M",
+    "mv_fp8_weight",
     "mv_weightless_rmsnorm_gated_sigmoid",
     "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
@@ -1942,6 +1944,57 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     ):
         return None
     return split_fp32_weight_bf16x3(weight)
+
+
+# Rows one weight-only FP8 GEMV launch takes; larger calls run in chunks.
+MV_FP8_WEIGHT_MAX_M = 32
+
+
+def mv_fp8_weight(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``(x @ weight.T) * weight_scale`` with a weight-only FP8 weight.
+
+    The weight is E4M3 with one FP32 scale per row (output channel), as a
+    16-bit weight quantizes once at load. Up to ``MV_FP8_WEIGHT_MAX_M`` rows
+    take a registered GEMV that reads the weight once, or the Torch
+    reference, which upcasts the weight in chunks; more rows run as chunks of
+    that many.
+
+    Args:
+        x: ``[M, K]`` 16-bit activations.
+        weight: Contiguous ``[N, K]`` ``float8_e4m3fn`` weight.
+        weight_scale: Contiguous FP32 scale of each weight row, ``N``
+            elements.
+        out: Optional ``[M, N]`` destination in ``x``'s dtype with a unit
+            inner stride.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    m, k = x.shape
+    n = weight.shape[0]
+    if out is None:
+        out = x.new_empty((m, n))
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if m > MV_FP8_WEIGHT_MAX_M:
+        # Each chunk re-reads the weight: past this many rows the one-launch
+        # GEMV measured slower than chunks of it (and than a BF16 GEMM).
+        for start in range(0, m, MV_FP8_WEIGHT_MAX_M):
+            stop = min(start + MV_FP8_WEIGHT_MAX_M, m)
+            mv_fp8_weight(x[start:stop], weight, weight_scale, out[start:stop])
+        return out
+    kernel = select_kernel(
+        "gemm",
+        "mv_fp8_weight",
+        mv_fp8_weight_signature(x.dtype),
+        traits={"m": m, "n": n, "k": k},
+    )
+    return kernel(x, weight, weight_scale, out)
 
 
 def _select_mv_weightless_rmsnorm_gated_sigmoid(
@@ -3927,7 +3980,10 @@ from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     MXFP4_LINEAR_MFMA_LAYOUT,
     prepare_mxfp4_linear_mfma_weight,
 )
-from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv  # noqa: E402
+from tokenspeed_kernel.ops.gemm.native import (  # noqa: E402
+    mv_fp8_weight_signature,
+    torch_decode_gemv,
+)
 from tokenspeed_kernel.ops.gemm.triton import (  # noqa: E402
     MXFP4_LINEAR_LINEAR_LAYOUT,
     MXFP4_LINEAR_SIGNATURE,

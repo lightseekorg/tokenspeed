@@ -21,6 +21,7 @@
 """Logits processing."""
 
 import dataclasses
+import functools
 
 import torch
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
@@ -71,6 +72,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
+from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -392,6 +394,9 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+        # Global token id of this rank's first vocabulary column when the
+        # sampled rows stay vocab-sharded; see keep_sampled_logits_vocab_sharded.
+        self._sampled_shard_start: int | None = None
 
     def require_full_vocab_logits(self) -> None:
         """Turn the fused draft argmax off so every forward returns full-vocab logits.
@@ -419,7 +424,100 @@ class LogitsProcessor(nn.Module):
         vocabulary. Call once after construction and before the first forward.
         Returns None.
         """
+        if self._sampled_shard_start is not None:
+            raise RuntimeError(
+                "the sampled rows already stay vocab-sharded for a sampler that "
+                "selects candidates; it does not read the fused argmax"
+            )
         self.do_argmax = True
+
+    def keep_sampled_logits_vocab_sharded(
+        self, lm_head: VocabParallelEmbedding, top_k: int
+    ) -> bool:
+        """Leave the sampled rows' logits as this rank's vocabulary shard.
+
+        For a sampler that selects each row's best ``top_k`` candidates per
+        vocabulary shard and gathers only those (``SampledVocabShard``):
+        ``forward`` then returns ``next_token_logits=None`` with
+        ``vocab_shard`` set, and skips the whole-row vocab all-gather and the
+        softcap, which the sampler's selection or its own whole-row gather
+        applies. Prompt logprobs still gather whole rows. Call once after
+        construction and before the first forward.
+
+        Args:
+            lm_head: The vocab-parallel head the processor projects through.
+            top_k: Most candidates the sampler selects per row.
+
+        Returns:
+            Whether the head's layout allows it (then it is on): plain TP
+            vocabulary sharding of an unpadded 16-bit head whose token ids are
+            exact in the fp32 the candidates travel in.
+        """
+        from tokenspeed_kernel.ops.sampling import (
+            vocab_shard_topk_supports,
+            vocab_topk_merge_supports,
+        )
+
+        # Plain vocab-parallel heads only (a replicated or absent head has no
+        # vocabulary shard).
+        if not isinstance(lm_head, VocabParallelEmbedding):
+            return False
+        shard = lm_head.shard_indices
+        weight = lm_head.weight
+        if (
+            self.tp_size <= 1
+            or self.skip_all_gather
+            or self.dp_lm_head_tp
+            or self.dp_sampling_enabled
+            or self.do_argmax
+            or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+            or self.config.vocab_size > 2**24
+        ):
+            return False
+        columns = int(shard.num_org_elements)
+        if (
+            int(shard.num_added_elements) != 0
+            or int(shard.num_org_elements_padded) != columns
+            or columns * self.tp_size != self.config.vocab_size
+            or int(shard.org_vocab_start_index) != columns * self.tp_rank
+            or not vocab_shard_topk_supports(weight.dtype, columns, top_k)
+            or not vocab_topk_merge_supports(self.tp_size, top_k)
+        ):
+            return False
+        self._sampled_shard_start = columns * self.tp_rank
+        return True
+
+    def sampled_vocab_shard(
+        self, logits: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> SampledVocabShard:
+        """The sampled rows of this rank's raw head logits, as a vocabulary shard.
+
+        Call it only after ``keep_sampled_logits_vocab_sharded`` turns the
+        shard on.
+
+        Args:
+            logits: ``[rows, shard]`` LM-head GEMM output of this rank.
+            lm_head: The vocab-parallel head that produced them.
+
+        Returns:
+            The shard ``forward`` hands the sampler as ``vocab_shard``.
+        """
+        assert self._sampled_shard_start is not None
+        return SampledVocabShard(
+            logits=logits,
+            vocab_start=self._sampled_shard_start,
+            logit_scale=self.logit_scale,
+            softcap=self.final_logit_softcapping,
+            tp_size=self.tp_size,
+            tp_group=self.tp_group,
+            gather_full=functools.partial(
+                self._finish_logits,
+                lm_head=lm_head,
+                plan=None,
+                lm_head_tp_row_counts=None,
+                require_full_vocab=False,
+            ),
+        )
 
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
@@ -807,16 +905,26 @@ class LogitsProcessor(nn.Module):
                 aux_pruned_states = list(aux_hidden_states)
 
         # Compute logits for the sampled tokens.
-        logits_layout_plan = self._resolve_logits_layout_plan(
-            pruned_states, logits_metadata
-        )
-        sampled_logits = self._get_logits(
-            pruned_states,
-            lm_head,
-            logits_metadata,
-            plan=logits_layout_plan,
-            require_full_vocab=False,
-        )
+        vocab_shard = None
+        if self._sampled_shard_start is not None:
+            # The sampler selects per shard, or gathers whole rows itself
+            # through the same tail as the whole-row path.
+            logits_layout_plan = None
+            sampled_logits = None
+            vocab_shard = self.sampled_vocab_shard(
+                self._project_logits(pruned_states, lm_head, None), lm_head
+            )
+        else:
+            logits_layout_plan = self._resolve_logits_layout_plan(
+                pruned_states, logits_metadata
+            )
+            sampled_logits = self._get_logits(
+                pruned_states,
+                lm_head,
+                logits_metadata,
+                plan=logits_layout_plan,
+                require_full_vocab=False,
+            )
 
         hidden_states_to_store: torch.Tensor | None = None
         if logits_metadata.capture_hidden_mode.need_capture():
@@ -853,6 +961,7 @@ class LogitsProcessor(nn.Module):
             next_token_ids=next_token_ids,
             hidden_states=hidden_states_to_store,
             logits_layout_plan=logits_layout_plan,
+            vocab_shard=vocab_shard,
             input_token_logprobs=input_token_logprobs,
             input_top_logprobs_val=None if input_top is None else input_top[0],
             input_top_logprobs_idx=None if input_top is None else input_top[1],
@@ -1072,6 +1181,48 @@ class LogitsProcessor(nn.Module):
         counts = torch.tensor([rows], dtype=torch.int64, device=hidden_states.device)
         return all_gather(counts, self.tp_group, dim=0).tolist()
 
+    def _project_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """This rank's LM-head GEMM: ``[rows, vocab shard]`` raw logits."""
+        quant_method = getattr(lm_head, "quant_method", None)
+        if should_apply_lm_head_quant_method(lm_head, quant_method):
+            return quant_method.apply(lm_head, hidden_states, embedding_bias)
+        if not hasattr(lm_head, "weight"):
+            # GGUF models
+            return quant_method.apply(lm_head, hidden_states, embedding_bias)
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+            # The weight owner plans with its actual dtype, padding and TP
+            # geometry during construction. The processor must not guess
+            # that geometry or select from the first runtime batch.
+            from tokenspeed.runtime.layers.dense.unquant import (
+                UnquantizedLinearMethod,
+            )
+            from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+                UnquantizedEmbeddingMethod,
+            )
+
+            if not isinstance(
+                quant_method, (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
+            ):
+                raise ValueError(
+                    "Batch-invariant dense logits require a planned unquantized LM-head method"
+                )
+            return quant_method.apply(
+                lm_head, hidden_states.to(lm_head.weight.dtype), embedding_bias
+            )
+        cast_hidden = hidden_states.to(lm_head.weight.dtype)
+        if current_platform().is_amd:
+            return kernel_mm(cast_hidden, lm_head.weight)
+        if self._use_fused_lm_head:
+            return _lm_head_matmul(cast_hidden, lm_head.weight)
+        return torch.matmul(cast_hidden, lm_head.weight.T)
+
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -1123,44 +1274,31 @@ class LogitsProcessor(nn.Module):
                 hidden_states, self.tp_group, lm_head_tp_row_counts
             )
 
-        quant_method = getattr(lm_head, "quant_method", None)
-        if should_apply_lm_head_quant_method(lm_head, quant_method):
-            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
-        elif hasattr(lm_head, "weight"):
-            from tokenspeed.runtime.utils.env import global_server_args_dict
+        logits = self._project_logits(hidden_states, lm_head, embedding_bias)
+        return self._finish_logits(
+            logits,
+            lm_head,
+            plan,
+            lm_head_tp_row_counts,
+            require_full_vocab=require_full_vocab,
+        )
 
-            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-                # The weight owner plans with its actual dtype, padding and TP
-                # geometry during construction. The processor must not guess
-                # that geometry or select from the first runtime batch.
-                from tokenspeed.runtime.layers.dense.unquant import (
-                    UnquantizedLinearMethod,
-                )
-                from tokenspeed.runtime.layers.vocab_parallel_embedding import (
-                    UnquantizedEmbeddingMethod,
-                )
+    def _finish_logits(
+        self,
+        logits: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        plan: LogitsLayoutPlan | None,
+        lm_head_tp_row_counts: list[int] | None,
+        *,
+        require_full_vocab: bool,
+    ) -> torch.Tensor:
+        """Whole scaled, softcapped rows from this rank's raw head logits.
 
-                if not isinstance(
-                    quant_method, (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
-                ):
-                    raise ValueError(
-                        "Batch-invariant dense logits require a planned unquantized LM-head method"
-                    )
-                logits = quant_method.apply(
-                    lm_head, hidden_states.to(lm_head.weight.dtype), embedding_bias
-                )
-            else:
-                cast_hidden = hidden_states.to(lm_head.weight.dtype)
-                if current_platform().is_amd:
-                    logits = kernel_mm(cast_hidden, lm_head.weight)
-                elif self._use_fused_lm_head:
-                    logits = _lm_head_matmul(cast_hidden, lm_head.weight)
-                else:
-                    logits = torch.matmul(cast_hidden, lm_head.weight.T)
-        else:
-            # GGUF models
-            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
-
+        The layout step of ``_get_logits`` after the GEMM: the vocab
+        all-gather (or the DP / LM-head-TP transposes), the slice to the real
+        vocabulary, the scale and the softcap.
+        """
+        dp_sampling = plan is not None
         # With a softcap, the softcap kernel applies the scale after the
         # gathers below: they only move rows, so the result is the same.
         if self.logit_scale is not None and not self.final_logit_softcapping:
