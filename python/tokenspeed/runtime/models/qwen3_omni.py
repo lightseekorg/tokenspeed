@@ -28,8 +28,8 @@ image/audio/video inputs (``use_audio_in_video=False``).
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from typing import Any
 
 import torch
 
@@ -37,12 +37,7 @@ from tokenspeed.runtime.configs.qwen3_vision_config import Qwen3VLVisionConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
-from tokenspeed.runtime.layers.moe import (
-    ExpertCheckpointSchema,
-    build_moe_checkpoint_loader,
-)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.qwen3_audio import Qwen3AudioEncoder
 from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
@@ -59,8 +54,6 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
 )
 from tokenspeed.runtime.utils.env import envs
-
-logger = logging.getLogger(__name__)
 
 
 def _get_thinker_config(config):
@@ -393,112 +386,27 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         name = name.replace(".mlp.2.", ".linear_fc2.")
         return name
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        ignore_suffixes = (
-            ".bias",
-            "_bias",
-            ".k_scale",
-            "_k_scale",
-            ".v_scale",
-            "_v_scale",
-            ".weight_scale",
-            "_weight_scale",
-            ".input_scale",
-            "_input_scale",
-        )
-        params = dict(self.named_parameters(remove_duplicate=False))
-        moe_loader = build_moe_checkpoint_loader(
-            params_dict=params,
-            expert_schema=ExpertCheckpointSchema(
-                gate_proj_name="gate_proj",
-                down_proj_name="down_proj",
-                up_proj_name="up_proj",
-            ),
-            fused_schema=ExpertCheckpointSchema(
-                gate_up_fused_name="gate_up_proj",
-                down_proj_name="down_proj",
-            ),
-            num_experts=self.config.num_experts,
-            ep_rank=self.mapping.moe.ep_rank,
-            ep_size=self.mapping.moe.ep_size,
-        )
-        loaded = set()
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
+    ) -> set[str]:
+        return super().load_weights(self._rename_checkpoint_weights(weights), **kwargs)
 
-        for original_name, loaded_weight in weights:
-            if original_name.startswith(("talker.", "code2wav.")):
+    def _rename_checkpoint_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        for name, loaded_weight in weights:
+            if name.startswith(("talker.", "code2wav.")):
                 continue
-            name = (
-                original_name[len("thinker.") :]
-                if original_name.startswith("thinker.")
-                else original_name
-            )
-
+            name = name.removeprefix("thinker.")
             if name.startswith("visual."):
                 if not self.is_multimodal_active:
                     continue
                 name = self._map_visual_weight(name)
-                if name not in params:
-                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
-                    continue
-                param = params[name]
-                loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, loaded_weight)
-                loaded.add(name)
-                continue
-
-            if name.startswith("audio_tower."):
+            elif name.startswith("audio_tower."):
                 if not self.is_multimodal_active:
                     continue
-                loaded_name = self.audio_tower.load_weight(name, loaded_weight)
-                if loaded_name is None:
-                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
-                else:
-                    loaded.add(f"audio_tower.{loaded_name}")
-                continue
-
-            if "rotary_emb" in name:
-                continue
-            if self.config.tie_word_embeddings and name == "lm_head.weight":
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name or "mlp.experts" in name:
-                    continue
-                mapped_name = name.replace(weight_name, param_name)
-                if mapped_name.endswith(ignore_suffixes) and mapped_name not in params:
-                    break
-                if mapped_name not in params:
-                    break
-                param = params[mapped_name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                loaded.add(mapped_name)
-                break
-            else:
-                if name.endswith((".bias", "_bias")) and name not in params:
-                    continue
-                if moe_loader.matches(name):
-                    loaded.add(moe_loader.load(name, loaded_weight))
-                    continue
-                if moe_loader.is_expert_checkpoint_weight(name):
-                    continue
-                if name.endswith(ignore_suffixes) and name not in params:
-                    continue
-                if name not in params:
-                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
-                    continue
-                param = params[name]
-                loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, loaded_weight)
-                loaded.add(name)
-
-        return loaded
+                name = name.replace("self_attn.out_proj.", "self_attn.proj.")
+            yield name, loaded_weight
 
 
 EntryClass = [Qwen3OmniMoeForConditionalGeneration]

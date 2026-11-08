@@ -353,9 +353,12 @@ nothing, and keeps no token. (Pipeline parallelism serves only the prefill
 role, which neither decodes nor overlaps, so its stages, which do not sample,
 never run a forward behind a stopped request.) The finish checkpoint is thus the state before
 the stop token under every schedule ([Scheduler
-§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)); a finish
-dispatched as a rotating first decode publishes at the prompt end, where the
-prompt-end checkpoint it still holds in slot 0 is the canonical block.
+§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)). A finish
+behind a rotating first decode that ran as a padding row publishes at the
+prompt end from slot 0: slot 1 is the fresh block the padding row never wrote
+(`CompletedPages::state_slot`). Publication may have deduplicated the
+prompt-end state onto another request's canonical checkpoint before the
+rotation; slot 0 then pins that equivalent checkpoint through the finish.
 
 State groups may additionally restrict reusable checkpoints with
 `checkpoint_granularity`: intermediate prefill forwards end on its multiples,
@@ -888,6 +891,11 @@ through a mutable window the allocator hands out
 (`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`;
 the window keeps the table's page ids current when it closes.
 The index never sees a `BlockTable`; the allocator remains its only mutator.
+While P holds transfer sources, `CompletedPages::preserve_source_blocks`
+publishes copied references instead: the request keeps the physical pages
+already exported to its transfers. Ordinary fused/D publication deduplicates;
+an owner that will write past a published tail follows the reserved copy-in
+contract below.
 
 ## The coordinator layer (`csrc/cache/coordinator/`)
 
@@ -1111,7 +1119,8 @@ Its responsibilities:
   publishes successful rows through `CacheHostBlock` after all-owner native
   retirement, before admission can see them. There is no mixed Host/L3 hash
   to special-case.
-  A State group publishes its slot 1 — the state after exactly `T` tokens —
+  A State group publishes the state after exactly `T` tokens (normally slot 1;
+  slot 0 behind a padded first decode, as described above)
   under the same key as the KV at `T` (the chain hash of the last page, or
   `hash@T` for a tail), and only at a point where the owner stops writing it
   (`CompletedPages::publish_state`: a prompt end, a junction cut, finish,

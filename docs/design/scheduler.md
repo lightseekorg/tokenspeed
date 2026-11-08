@@ -741,6 +741,19 @@ few pages a request alone can still wait for good, when its hit holds the
 only cache left and its copy of the tail needs a page in a bucket that is
 full.
 
+A request's expired slots and released State input are different from live
+pins: `Admit` releases their table references before evicting those blocks. Once the plan
+selects their reclaim set, a later segment may absorb that set even though
+the table still holds its references during planning. Segments rejected before
+that selection are reconsidered before any block-by-block fallback: a cached
+rejection is valid only while the selected reclaim blocks remain unchanged.
+Another retry requires newly selected reclaim blocks, so an unchanged pin
+cannot cause an endless scan. The merge counts each physical block once,
+and minimization keeps or restores the combined set whole. This lets a P
+request rotate past a junction and evict its unpinned
+canonical KV duplicates in the same admission. Another reader's reference,
+or a prefix hit this admission keeps, still prevents reclaim.
+
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
 `total_pages`, validating that subset through
@@ -1209,26 +1222,43 @@ prompt whose KV is mid-transfer would strand the decode side.
 While P holds a request, prefix publication uses a copy of its block table.
 Deduplication may redirect that copy to canonical cache blocks, but the real
 request keeps the physical source blocks named by queued layerwise transfers.
-A client abort waits for the transfer terminal event; a failed transfer also
+A client abort waits for the transfer retirement event; a failed transfer also
 waits for outstanding local forward results before freeing its tables. Failed
 requests waiting for those results receive no further forward work. Successful
 and failed terminal paths both release the source references, without an extra
 long-lived copy of the tables.
 
-P-role prefix publication keeps the physical source table unchanged while a
-transfer can still read it, even when the prefix index already holds a
-canonical duplicate. Publication uses copied references. Copy-in capacity
-follows the ordinary pre-reserved-block contract; it does not revive the old
-best-effort owner-tail capacity calculation or canonical-tail protection.
+This preservation is limited to P publications while the request owns its
+transfer sources (`CompletedPages::preserve_source_blocks`). Fused and D
+requests use ordinary canonical deduplication once their publication is safe.
+A fused owner that keeps writing past its tail retains the existing copy-in
+rule: register its own tail without taking another owner's canonical block,
+then copy any tail block the index took into its pre-reserved private block.
 
 The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
 pinned — the peer's decode reads the pages from the first scheduled chunk until
-the PD ACK finishes or aborts the request. On the D role the pin is exactly
-`RemotePrefilling`: the peer's prefill is writing the destination pages, and
-`RemotePrefillDone` ends it by leaving that state. A fused engine never
-transfers. Because the pin is the state, no event handler can forget to clear
-it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
+the PD ACK finishes the request. On the D role the pin is `RemotePrefilling`:
+the peer's prefill is writing the destination pages, and `RemotePrefillDone`
+ends it by leaving that state. A fused engine never transfers. Because the pin
+is the state, no event handler can forget to clear it.
+
+A transfer reads and writes pages through the page IDs its operations
+exported, so while the pin holds, a pinned table loses no block a transfer may
+still address. P publication keeps its source references, including State
+checkpoints, and D publishes its landing table after successful receive.
+The owner-tail copy-in runs only on the fused role, which never transfers.
+
+A pinned request that ends — an abort, or a failed transfer — does not free
+its pages: the transfer may still be reading or writing them. It parks whole in
+`PdTransferring`, which is pinned on both roles, until the transport reports
+`pd::TransferStoppedEvent` once every reader and writer on every rank stopped
+(or the transfer's success lands first), and every outstanding local forward
+result has landed. Observing transport retirement before a local result records
+that fact in `PdTransferring`; a repeated abort preserves it and cannot restart
+the transfer wait. The state owns this record along with the retained resources,
+so leaving it needs no separate abort-marker cleanup. Nothing is scheduled,
+published or retracted from that state.
 
 **Restore: n/a.** Nothing on this role is ever `Retracted`, so the restore
 phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
@@ -1741,6 +1771,6 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
 
 Deferred PD cancellation belongs to the request: it first waits for transfer
 retirement, then for any outstanding local forward. Repeated cancellation
-cannot restart a transfer wait after its terminal event has arrived. Destroying
+cannot restart a transfer wait after its retirement event has arrived. Destroying
 the request destroys this state, so reusing a client request ID cannot inherit
 an old abort.

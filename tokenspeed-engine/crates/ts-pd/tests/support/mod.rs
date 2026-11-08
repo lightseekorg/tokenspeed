@@ -309,6 +309,38 @@ pub(crate) fn next_event(peer: &mut dyn TransferPeer, mesh: &mut Mesh, group: &G
     }
 }
 
+/// Wait for failure and retirement, whether they arrive in one poll or separately.
+pub(crate) fn expect_cancelled(
+    peer: &mut dyn TransferPeer,
+    rid: &str,
+    mesh: &mut Mesh,
+    group: &Group,
+) {
+    let expected = [
+        PdEvent::Failed(rid.to_owned()),
+        PdEvent::Stopped(rid.to_owned()),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    while seen.len() < expected.len() {
+        seen.extend(peer.poll(mesh, group).unwrap());
+        assert!(
+            expected.starts_with(&seen),
+            "unexpected cancellation events: {seen:?}"
+        );
+        if seen == expected {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancellation did not retire: {seen:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(seen, expected);
+    assert!(!peer.has_in_flight());
+}
+
 /// An arena's bytes: a pattern, page by page.
 pub(crate) fn pattern() -> Vec<u8> {
     (0..BYTES).map(|i| (i % 251) as u8 + 1).collect()
