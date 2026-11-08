@@ -317,6 +317,20 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: optional must be a boolean or a per-label mapping; "
                 f"got {type(optional).__name__}"
             )
+    if "ignore_changes" in data:
+        prefixes = data["ignore_changes"]
+        if (
+            not isinstance(prefixes, list)
+            or not prefixes
+            or not all(
+                isinstance(prefix, str) and prefix and not prefix.endswith("/")
+                for prefix in prefixes
+            )
+        ):
+            raise ValueError(
+                f"{path}: ignore_changes must be a non-empty list of paths without "
+                "a trailing slash"
+            )
     if "retries" in data:
         retries = data["retries"]
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
@@ -2303,6 +2317,32 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def path_is_ignored(path: str, prefixes: List[str]) -> bool:
+    """Return whether ``path`` is Markdown or lies under one of ``prefixes``."""
+    return path.endswith(".md") or any(
+        path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes
+    )
+
+
+def drop_unaffected_tasks(
+    include: List[Dict[str, Any]], changed: List[str], repo_root: Path
+) -> List[Dict[str, Any]]:
+    """Drop the entries of tasks whose ``ignore_changes`` covers every change."""
+    prefixes_by_config: Dict[str, Optional[List[str]]] = {}
+    kept = []
+    for entry in include:
+        config = entry["config"]
+        if config not in prefixes_by_config:
+            task = normalize_task(repo_root / config, repo_root)
+            prefixes_by_config[config] = task.get("ignore_changes")
+        prefixes = prefixes_by_config[config]
+        if prefixes is None or not all(
+            path_is_ignored(path, prefixes) for path in changed
+        ):
+            kept.append(entry)
+    return kept
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "scan":
@@ -2338,6 +2378,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                         and entry.get("workflow_stage") == "kernel-benchmark"
                     )
                 ]
+            # Pull requests only: pushes to main still run every task.
+            if args.trigger == "per-commit" and 0 < len(changed) < 300:
+                matrix["include"] = drop_unaffected_tasks(
+                    matrix["include"], changed, repo_root
+                )
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 

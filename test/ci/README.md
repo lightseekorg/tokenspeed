@@ -183,6 +183,20 @@ optional:
   amd-mi355-1gpu: true
 ```
 
+`ignore_changes` lists directories whose changes cannot affect a task. On
+pull requests the scan drops the task when every changed file is Markdown or
+lies under one of them. Pushes to `main` and manual runs keep every task. The
+per-commit kernel unit-test tasks list the runtime sources and runtime tests,
+so a pull request that changes only the runtime skips them. That holds because
+the kernel tests never import the runtime: the `kernel-tests-without-runtime`
+pre-commit hook rejects such an import under `tokenspeed-kernel/test`.
+
+```yaml
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+```
+
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
 `b200v2-<Ngpu>` by default. Set the `TOKENSPEED_B200_RUNNER_LABEL` repository
 variable in GitHub Actions (`Settings` -> `Secrets and variables` -> `Actions`
