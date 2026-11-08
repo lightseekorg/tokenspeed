@@ -23,7 +23,7 @@ from tokenspeed_kernel._triton import libdevice  # noqa.
 
 fast_logf = libdevice.fast_logf
 
-from tokenspeed_kernel.thirdparty.sonic.ops.base import (
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
     gdc_launch_dependents,
     gdc_wait,
     ones_like,

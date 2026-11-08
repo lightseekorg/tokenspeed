@@ -39,7 +39,7 @@ Pins the seams the runtime relies on:
 
 Logits are bf16 unless a test says fp32.
 The kernels and indicator bits are sonic-sampler's, vendored in
-``tokenspeed_kernel.thirdparty.sonic``; ``tokenspeed_kernel.ops.sampling.sonic``
+``tokenspeed_kernel.thirdparty.sonic_sampler``; ``tokenspeed_kernel.ops.sampling.sonic``
 launches them.
 
 Runs both a real vocabulary and a small one whose config falls back to two
@@ -48,6 +48,7 @@ narrow bitonic tiles.
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import os
 import sys
@@ -379,13 +380,28 @@ def test_stochastic_sample_stays_in_top_k_support():
             ), f"step {step} row {i}: {tok} outside top-{k}"
 
 
-def test_min_p_one_collapses_to_argmax():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_min_p_one_collapses_to_argmax(dtype):
+    """min_p = 1.0 keeps only the maximum, also for fp32 logits whose runner-up is within 0.1% of its probability."""
     torch.manual_seed(4)
     backend = _make_backend()
     req = _prepare(backend, [_sp(f"m{i}", min_p=1.0) for i in range(MAX_BS)])
-    logits = _tie_free_logits(MAX_BS)
-    sampled, _ = backend.sample(_logits_output(logits.clone()), _info(req))
-    torch.testing.assert_close(sampled.view(-1).cpu(), logits.argmax(-1).int().cpu())
+    logits = _tie_free_logits(MAX_BS).to(dtype)
+    rows = torch.arange(MAX_BS, device="cuda")
+    top = logits.argmax(-1)
+    if dtype == torch.float32:
+        logits[rows, (top + 1) % VOCAB] = logits[rows, top] - 5e-4
+    offsets = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
+    info = SamplingBatchInfo(
+        req_pool_indices=req,
+        valid_cache_lengths=offsets,
+        vocab_size=VOCAB,
+        device="cuda",
+    )
+    for step in range(32):
+        offsets.fill_(step)
+        sampled, _ = backend.sample(_logits_output(logits.clone()), info)
+        torch.testing.assert_close(sampled.view(-1), top.int())
 
 
 def test_logit_bias_forces_token():
@@ -986,6 +1002,62 @@ def test_fp32_penalized_greedy_is_the_exact_penalized_argmax():
         sampled, _ = backend.sample(_logits_output(logits.clone()), _info(req))
         exact = logits - 0.87 * before - 0.38 * (before > 0).float()
         torch.testing.assert_close(sampled.view(-1), exact.argmax(-1).int())
+
+
+def _kernel_test_utils():
+    """tokenspeed-kernel's test helpers, for ``assert_no_triton_compile``."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(os.path.dirname(root), "tokenspeed-kernel", "test", "utils.py")
+    spec = importlib.util.spec_from_file_location("sonic_kernel_test_utils", path)
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    return utils
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_serving_launches_compile_nothing_after_warm_up(dtype):
+    """Warm-up compiles what every batch size, offset slot pointer and draft width serving launches needs."""
+    from tokenspeed_kernel.thirdparty.sonic_sampler.ops import (
+        multistep,
+        prologue,
+        singular,
+        verify,
+    )
+
+    utils = _kernel_test_utils()
+    backend = _make_backend(REAL_VOCAB)
+    sps = [_sp(f"w{i}", REAL_VOCAB, temperature=0.7, top_p=0.9) for i in range(MAX_BS)]
+    req = _prepare(backend, sps, n=MAX_N)
+    offsets = torch.zeros(POOL + 1, dtype=torch.int64, device="cuda")
+    logits = torch.randn(MAX_BS * MAX_N, REAL_VOCAB, device="cuda").to(dtype)
+    drafts = torch.randint(
+        0, REAL_VOCAB, (MAX_BS, MAX_N), dtype=torch.int32, device="cuda"
+    )
+    # fp32 kernels warm on the first fp32 launch.
+    backend._fused_singular(logits[:1], req[:1], offsets)
+    # The same slots 8 bytes past 16-byte alignment, as a mixed round passes its decode rows.
+    shifted = torch.cat([req[:1], req])[1:]
+    kernels = (
+        prologue.bitpacked_reduction_kernel,
+        singular.cumulative_selection_kernel,
+        multistep.cumulative_unpack_kernel,
+        verify.chain_speculative_verification_kernel,
+    )
+    with utils.assert_no_triton_compile(*kernels):
+        for slots in (req, shifted):
+            for bs in range(1, MAX_BS + 1):
+                backend._fused_singular(logits[:bs], slots[:bs], offsets)
+                backend._fused_multistep(
+                    logits[: bs * MAX_N], slots[:bs], offsets, drafts[:bs]
+                )
+
+
+def test_rejects_a_batch_past_the_int32_row_offsets():
+    """8192 requests of two rows over a 2**18 vocabulary reach 2**32 elements, past the kernels' int32 offsets."""
+    config = _make_config(vocab=1 << 18, max_n=2)
+    config.max_bs = 1 << 13
+    with pytest.raises(ValueError, match="max_bs"):
+        _backend_cls()(config)
 
 
 if __name__ == "__main__":

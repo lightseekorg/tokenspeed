@@ -20,7 +20,7 @@
 
 """sonic-sampler's kernels, launched for the runtime's ``sonic`` sampling backend.
 
-The kernels are vendored in ``tokenspeed_kernel.thirdparty.sonic.ops`` (see the
+The kernels are vendored in ``tokenspeed_kernel.thirdparty.sonic_sampler.ops`` (see the
 package README for the upstream commit and the local changes); this module
 launches them over the backend's slot-indexed state and picks their config
 from a table keyed by vocabulary size class and logits rows, so no server
@@ -44,12 +44,18 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.thirdparty.sonic.core.flags import Indicator
-from tokenspeed_kernel.thirdparty.sonic.ops.base import MAX_K, next_power_of_2
-from tokenspeed_kernel.thirdparty.sonic.ops.multistep import cumulative_unpack_kernel
-from tokenspeed_kernel.thirdparty.sonic.ops.prologue import bitpacked_reduction_kernel
-from tokenspeed_kernel.thirdparty.sonic.ops.singular import cumulative_selection_kernel
-from tokenspeed_kernel.thirdparty.sonic.ops.verify import (
+from tokenspeed_kernel.thirdparty.sonic_sampler.core.flags import Indicator
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import MAX_K, next_power_of_2
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.multistep import (
+    cumulative_unpack_kernel,
+)
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
+    bitpacked_reduction_kernel,
+)
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.singular import (
+    cumulative_selection_kernel,
+)
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.verify import (
     chain_speculative_verification_kernel,
 )
 from torch import Tensor
@@ -59,6 +65,9 @@ _LOGPROB_BLOCK = 8
 
 # Adaptive top-k's scale factor, unread with adaptive top-k off.
 _TOP_K_SCALE = 4
+
+# The kernels keep row * stride offsets into the logits and the scratchpad in int32.
+MAX_OFFSET = 2**31
 
 
 @dataclass(frozen=True)
@@ -147,7 +156,7 @@ class SlotState:
     tensor's first dimension is the slot.
     """
 
-    indicators: Tensor  # [P] uint16 ``Indicator`` bits.
+    indicators: Tensor  # [P] int16 ``Indicator`` bits (at most 0x800).
     temperature: Tensor  # [P].
     top_k: Tensor  # [P] int32, at most ``MAX_K``.
     top_p: Tensor  # [P].
@@ -155,7 +164,7 @@ class SlotState:
     repetition: Tensor  # [P] multiplicative repetition penalty.
     frequency: Tensor  # [P].
     presence: Tensor  # [P].
-    grammar: Tensor  # [P, timesteps, ceil(V / 32)] uint32 bitmask, set bits allowed.
+    grammar: Tensor  # [P, timesteps, ceil(V / 32)] int32 bitmask (xgrammar's), set bits allowed.
     context_counts: Tensor  # [P, V] int32 prompt counts.
     decode_counts: Tensor  # [P, V] int32 counts of drawn tokens.
     logit_bias: Tensor  # [P, V] bf16.
@@ -188,7 +197,7 @@ class SlotState:
                 (2, slots, vocab_size), dtype=torch.int32
             )
             return cls(
-                indicators=torch.zeros(slots, dtype=torch.uint16),
+                indicators=torch.zeros(slots, dtype=torch.int16),
                 temperature=torch.ones(slots, dtype=bf16),
                 top_k=torch.full((slots,), MAX_K, dtype=torch.int32),
                 top_p=torch.ones(slots, dtype=bf16),
@@ -199,7 +208,7 @@ class SlotState:
                 grammar=torch.full(
                     (slots, timesteps, triton.cdiv(vocab_size, 32)),
                     -1,
-                    dtype=torch.uint32,
+                    dtype=torch.int32,
                 ),
                 context_counts=context_counts,
                 decode_counts=decode_counts,
@@ -219,6 +228,16 @@ class SlotState:
             frequency=frequency,
             presence=presence,
         )
+
+
+def _check_offsets(logits: Tensor, scratchpad: Tensor) -> None:
+    """Refuse a launch whose logits or scratchpad rows reach past the kernels' int32 row offsets."""
+    for name, tensor in (("logits", logits), ("scratchpad", scratchpad)):
+        if tensor.shape[0] * tensor.stride(0) > MAX_OFFSET:
+            raise ValueError(
+                f"sonic's {name} span {tensor.shape[0]} rows of stride "
+                f"{tensor.stride(0)}, past its int32 offsets ({MAX_OFFSET} elements)"
+            )
 
 
 def _exact(logits: Tensor) -> bool:
@@ -252,7 +271,12 @@ def sample(
 
     Returns:
         ``tokens``.
+
+    Raises:
+        ValueError: The logits are neither bf16 nor fp32, or a row offset
+            would pass ``MAX_OFFSET``.
     """
+    _check_offsets(logits, scratchpad)
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
@@ -404,7 +428,12 @@ def verify(
         indices: ``[B * (g + 1), MAX_K]`` int32 candidate tokens (scratch).
         config: The launch config (``pick``).
         enable_pdl: Launch with programmatic dependent launch.
+
+    Raises:
+        ValueError: The logits are neither bf16 nor fp32, or a row offset
+            would pass ``MAX_OFFSET``.
     """
+    _check_offsets(logits, scratchpad)
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     batch_size, timesteps = drafted.shape
@@ -546,6 +575,7 @@ def verify(
 
 __all__ = [
     "MAX_K",
+    "MAX_OFFSET",
     "TABLE",
     "Indicator",
     "SlotState",

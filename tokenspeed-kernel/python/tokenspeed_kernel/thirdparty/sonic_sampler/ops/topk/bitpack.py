@@ -20,10 +20,10 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 
 cdiv, jit = triton.cdiv, triton.jit
 
-from tokenspeed_kernel.thirdparty.sonic.ops.encoding import bitpack_block
-from tokenspeed_kernel.thirdparty.sonic.ops.topk.adaptive import radix_bitonic
-from tokenspeed_kernel.thirdparty.sonic.ops.topk.radix import radix_threshold
-from tokenspeed_kernel.thirdparty.sonic.ops.topk.selection import (
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.encoding import bitpack_block
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.adaptive import radix_bitonic
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.radix import radix_threshold
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.selection import (
     bitonic_selection,
     radix_selection,
 )

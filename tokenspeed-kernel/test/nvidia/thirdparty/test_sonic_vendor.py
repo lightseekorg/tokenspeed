@@ -26,14 +26,22 @@ import pathlib
 import sys
 
 import pytest
+import torch
 from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.ops.sampling import sonic
 from tokenspeed_kernel.ops.sampling.sonic import (
+    MAX_OFFSET,
     TABLE,
     configs,
     pick,
     scratchpad_columns,
 )
-from tokenspeed_kernel.thirdparty.sonic.ops import multistep, prologue, singular, verify
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops import (
+    multistep,
+    prologue,
+    singular,
+    verify,
+)
 
 
 def test_kernels_are_tokenspeed_triton_jit_functions():
@@ -76,6 +84,23 @@ def test_the_table_closes_every_class_and_row_range():
 def test_the_scratchpad_holds_the_narrowest_picked_tiles_blocks():
     narrowest = min(c.block_n for c in configs(151936))
     assert scratchpad_columns(151936) == -(-151936 // narrowest) * 128
+
+
+def test_launches_past_the_int32_row_offsets_are_refused():
+    """The kernels keep row offsets in int32, so a launch whose logits reach past 2**31 elements is refused before it runs."""
+    vocab = 1 << 18
+    rows = MAX_OFFSET // vocab + 1
+    logits = torch.empty((rows, vocab), dtype=torch.bfloat16, device="meta")
+    scratchpad = torch.empty((rows, 1), dtype=torch.uint32, device="meta")
+    config = pick(vocab, rows)
+    with pytest.raises(ValueError, match="int32 offsets"):
+        sonic.sample(
+            logits, None, None, None, None, scratchpad, config, enable_pdl=False
+        )
+    with pytest.raises(ValueError, match="int32 offsets"):
+        sonic.verify(
+            logits, None, None, None, None, None, scratchpad, None, None, config, False
+        )
 
 
 if __name__ == "__main__":

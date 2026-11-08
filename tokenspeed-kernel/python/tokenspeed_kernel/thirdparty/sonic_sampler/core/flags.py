@@ -19,7 +19,7 @@ from __future__ import annotations
 from enum import IntFlag, auto, unique
 from operator import lshift
 
-from tokenspeed_kernel.thirdparty.sonic.ops.base import MAX_K
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import MAX_K
 
 # The most top-k log-probabilities a request may ask for.
 MAX_TOP_LP: int = 5

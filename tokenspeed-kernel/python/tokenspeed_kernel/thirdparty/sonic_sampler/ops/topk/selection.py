@@ -20,9 +20,11 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 
 cdiv, jit = triton.cdiv, triton.jit
 
-from tokenspeed_kernel.thirdparty.sonic.ops.base import gdc_launch_dependents
-from tokenspeed_kernel.thirdparty.sonic.ops.encoding import shift_pack
-from tokenspeed_kernel.thirdparty.sonic.ops.topk.bitonic import top_k as bitonic_top_k
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import gdc_launch_dependents
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.encoding import shift_pack
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.bitonic import (
+    top_k as bitonic_top_k,
+)
 
 
 @jit

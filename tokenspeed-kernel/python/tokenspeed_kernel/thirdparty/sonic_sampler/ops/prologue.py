@@ -20,13 +20,13 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 
 cdiv, jit = triton.cdiv, triton.jit
 
-from tokenspeed_kernel.thirdparty.sonic.ops.base import (
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
     gdc_launch_dependents,
     gdc_wait,
     ones_like,
 )
-from tokenspeed_kernel.thirdparty.sonic.ops.encoding import bitpack_scalar
-from tokenspeed_kernel.thirdparty.sonic.ops.topk.bitpack import top_k_reduction
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.encoding import bitpack_scalar
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.bitpack import top_k_reduction
 
 __all__ = ["bitpacked_reduction_kernel"]
 

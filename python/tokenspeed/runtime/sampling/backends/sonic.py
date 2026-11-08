@@ -47,7 +47,7 @@ Not yet supported: DP-sampling, draft trees, top-k output logprobs, EAGLE3
 ``d2t`` cross-vocab.
 
 The kernels and indicator bits are sonic-sampler's, vendored in
-``tokenspeed_kernel.thirdparty.sonic``; ``tokenspeed_kernel.ops.sampling.sonic``
+``tokenspeed_kernel.thirdparty.sonic_sampler``; ``tokenspeed_kernel.ops.sampling.sonic``
 launches them and picks their config per launch from a table (``pick``);
 nothing tunes at startup.
 """
@@ -60,6 +60,7 @@ import torch
 from tokenspeed_kernel.ops.sampling import sonic
 from tokenspeed_kernel.ops.sampling.sonic import (
     MAX_K,
+    MAX_OFFSET,
     Indicator,
     SlotState,
     SonicConfig,
@@ -104,8 +105,9 @@ def _sanitize(sp: SamplingParams) -> tuple[float, int, float, float]:
     greedy early return also pins temperature to 1.0, so the slot's indicator
     is exactly ``GREEDY`` and the kernel skips the temperature pass. ``min_p =
     1.0`` is remapped to 0.999 because ``from_params`` tests the open interval
-    (1.0 would drop the MIN_P bit); the bf16 buffer rounds it back to 1.0,
-    whose pivot = max keeps only max-probability tokens, as requested."""
+    (1.0 would drop the MIN_P bit); the bf16 buffer rounds it back to 1.0
+    and ``_reset_slot`` stores 1.0 in the fp32 row, whose pivot = max keeps
+    only max-probability tokens, as requested."""
 
     if sp.top_k == 1:  # TokenSpeed's greedy encoding
 
@@ -160,6 +162,9 @@ class SonicSamplingBackend(SamplingBackend):
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = False
 
+    # Prompt token counts the runtime never fills: every slot reads zeros.
+    constant_slot_state = ("state.context_counts", "_exact_state.context_counts")
+
     @override
     def __init__(self, config: SamplingBackendConfig) -> None:
 
@@ -187,6 +192,14 @@ class SonicSamplingBackend(SamplingBackend):
 
         # Slot-indexed state, +1 for the padding sentinel; timesteps=n_max serves sample and verify.
         self.pool_rows = config.max_req_pool_size + 1
+
+        # The kernels' row offsets are int32; the largest launch must fit (``sonic.sample`` checks each).
+        if self.max_bs * self.n_max * self.vocab_size > MAX_OFFSET:
+
+            raise ValueError(
+                f"SonicSamplingBackend needs max_bs * draft tokens * vocab_size <= "
+                f"{MAX_OFFSET}, got {self.max_bs} * {self.n_max} * {self.vocab_size}"
+            )
 
         rows = self.max_bs * self.n_max
 
@@ -221,13 +234,16 @@ class SonicSamplingBackend(SamplingBackend):
         )
         self._exact_state = self.state.with_scalars(self.exact_scalars)
 
-        # xgrammar int32 and sonic uint32 share bit semantics; CUDA has no uint32 index_put.
-        self.grammar = self.state.grammar.view(torch.int32)
+        # xgrammar's int32 bitmask layout, scattered per step by ``_scatter_grammar``.
+        self.grammar = self.state.grammar
 
         # fp32 logits compile their own kernels: warmed the first time they arrive.
         self._fp32_warm = False
 
-        self._warmup(torch.bfloat16)
+        # The kernels run on CUDA only; a state built elsewhere (tests) has nothing to compile.
+        if torch.device(self.device).type == "cuda":
+
+            self._warmup(torch.bfloat16)
 
     # ------------------------------------------------------------------ #
     # JIT warm-up
@@ -310,21 +326,23 @@ class SonicSamplingBackend(SamplingBackend):
         )
 
         state = self.state
-        scalars = (
-            temperature,
-            top_p,
-            min_p,
-            float(sp.repetition_penalty),
-            float(sp.frequency_penalty),
-            float(sp.presence_penalty),
-        )
+        # The fp32 row keeps a requested min_p of 1.0 exact; 0.999 only sets the MIN_P bit.
+        exact_min_p = 1.0 if min_p and float(sp.min_p) >= 1.0 else min_p
 
         state.indicators[pool_idx].fill_(int(bits))
         state.top_k[pool_idx].fill_(top_k)
         state.decode_counts[pool_idx].zero_()
 
-        for rows in (self.state, self._exact_state):
+        for rows, row_min_p in ((state, min_p), (self._exact_state, exact_min_p)):
 
+            values = (
+                temperature,
+                top_p,
+                row_min_p,
+                float(sp.repetition_penalty),
+                float(sp.frequency_penalty),
+                float(sp.presence_penalty),
+            )
             for row, value in zip(
                 (
                     rows.temperature,
@@ -334,7 +352,7 @@ class SonicSamplingBackend(SamplingBackend):
                     rows.frequency,
                     rows.presence,
                 ),
-                scalars,
+                values,
                 strict=True,
             ):
 
@@ -391,10 +409,9 @@ class SonicSamplingBackend(SamplingBackend):
     ) -> None:
         """Scatter xgrammar's row-indexed ``[bs*n, W]`` bitmask (row ``i*n+j`` =
         request ``i``, position ``j``) into the slot-indexed ``grammar`` buffer
-        ``[pool_rows, n_max, W]``. xgrammar int32 and sonic uint32 share bit
-        semantics (SET = allowed; token ``t`` -> word ``t//32``, bit ``t%32``), so
-        it's a reinterpret copy through an int32 view (CUDA has no uint32
-        index_put). Captured/graph-safe (same pattern as the draft-probs scatter).
+        ``[pool_rows, n_max, W]``, both int32 with the same bit semantics (SET =
+        allowed; token ``t`` -> word ``t//32``, bit ``t%32``), so it's a plain
+        copy. Captured/graph-safe (same pattern as the draft-probs scatter).
 
         Mixed prefill+decode spec rounds slice the row-indexed mask per request,
         so both halves arrive misaligned (the runtime's mask slicing is the fix).

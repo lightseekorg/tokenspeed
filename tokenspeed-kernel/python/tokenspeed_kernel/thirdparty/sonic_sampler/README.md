@@ -26,7 +26,7 @@ sonic` selects them.
 The vendored sources differ from `src/sonic_sampler` at that commit only by:
 
 - the package path: `sonic_sampler.` imports name
-  `tokenspeed_kernel.thirdparty.sonic`;
+  `tokenspeed_kernel.thirdparty.sonic_sampler`;
 - Triton imports: `from triton import ...`, `triton.language.extra.libdevice`
   and `triton.language.core.builtin` go through `tokenspeed_kernel._triton`,
   so the kernels compile with `tokenspeed-triton`;

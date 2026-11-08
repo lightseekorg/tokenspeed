@@ -1133,7 +1133,7 @@ setup(
             "csrc/include/**/*.cuh",
         ],
         # Vendored sonic-sampler: its license and provenance.
-        "tokenspeed_kernel.thirdparty.sonic": [
+        "tokenspeed_kernel.thirdparty.sonic_sampler": [
             "LICENSE",
             "README.md",
         ],

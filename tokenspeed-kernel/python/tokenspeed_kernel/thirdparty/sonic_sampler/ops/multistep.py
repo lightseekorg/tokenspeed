@@ -23,18 +23,18 @@ from tokenspeed_kernel._triton import libdevice  # noqa.
 
 fast_expf = libdevice.fast_expf
 
-from tokenspeed_kernel.thirdparty.sonic.ops.base import (
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
     cumulative_masking,
     gdc_launch_dependents,
     gdc_wait,
     log_softmax,
 )
-from tokenspeed_kernel.thirdparty.sonic.ops.prologue import (
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
     exact_greedy,
 )
-from tokenspeed_kernel.thirdparty.sonic.ops.singular import greedy_maximum
-from tokenspeed_kernel.thirdparty.sonic.ops.topk.unpack import unpack_top_k
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.singular import greedy_maximum
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.unpack import unpack_top_k
 
 
 @jit

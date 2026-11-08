@@ -20,9 +20,12 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 
 jit = triton.jit
 
-from tokenspeed_kernel.thirdparty.sonic.ops.encoding import encode_block, shift_pack
-from tokenspeed_kernel.thirdparty.sonic.ops.topk.radix import radix_partition
-from tokenspeed_kernel.thirdparty.sonic.ops.topk.selection import (
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.encoding import (
+    encode_block,
+    shift_pack,
+)
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.radix import radix_partition
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.selection import (
     bitonic_selection,
     radix_selection,
 )

@@ -20,7 +20,7 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 
 jit = triton.jit
 
-from tokenspeed_kernel.thirdparty.sonic.ops.encoding import encode_block
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.encoding import encode_block
 
 
 @jit
