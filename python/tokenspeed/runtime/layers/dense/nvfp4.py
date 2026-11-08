@@ -28,6 +28,10 @@ from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm import (
     prepare_nvfp4_a16_weights as kernel_prepare_nvfp4_a16_weights,
 )
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
+    interleave_linear_and_gate,
+    swizzle_blockscale_2d,
+)
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from torch.nn.parameter import Parameter
 
@@ -312,63 +316,3 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
             quant="nvfp4_a16",
             override=layer.override_kernel_name,
         )
-
-
-# -------------------------------------------------------------------------
-# Utilities for FP4 linear method
-# -------------------------------------------------------------------------
-
-
-def swizzle_blockscale_2d(scales):
-    """Swizzle 2D FP8 block scales for CUTLASS."""
-    M, K = scales.shape
-
-    def round_up(x, m):
-        return (x + m - 1) // m * m
-
-    M_padded = round_up(M, 128)
-    K_padded = round_up(K, 4)
-    padded = torch.zeros((M_padded, K_padded), dtype=scales.dtype, device=scales.device)
-    padded[:M, :K] = scales
-    rows, cols = padded.shape
-    padded = padded.reshape(rows // 128, 4, 32, cols // 4, 4)
-    padded = padded.permute((0, 3, 2, 1, 4))
-    return padded.contiguous().reshape(M_padded, K_padded)
-
-
-def interleave_linear_and_gate(
-    tensor: torch.Tensor,
-    group_size: int = 64,
-    dim: int = 0,
-) -> torch.Tensor:
-    """Interleave ``[linear all][gate all]`` as ``[linear chunk][gate chunk]``.
-
-    This matches the FC1 GEMM+SwiGLU preprocessing layout expected by
-    ``cute_dsl_nvfp4_dense_gemm_swiglu_blackwell``.
-    """
-    if tensor.ndim == 0:
-        raise ValueError("expected a tensor with at least one dimension")
-
-    dim = dim % tensor.ndim
-    sizes = tensor.size()
-    dim_size = sizes[dim]
-    if dim_size % (group_size * 2) != 0:
-        raise ValueError(
-            f"dimension {dim} size {dim_size} must be divisible by "
-            f"2 * group_size={2 * group_size}"
-        )
-
-    prev_sizes = sizes[:dim]
-    post_sizes = sizes[dim + 1 :]
-    return (
-        tensor.reshape(
-            *prev_sizes,
-            2,
-            dim_size // (group_size * 2),
-            group_size,
-            *post_sizes,
-        )
-        .transpose(dim, dim + 1)
-        .reshape(*sizes)
-        .contiguous()
-    )
