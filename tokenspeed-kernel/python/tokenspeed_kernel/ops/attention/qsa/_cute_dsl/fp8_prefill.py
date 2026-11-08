@@ -27,7 +27,6 @@ in TokenSpeed. Each CTA owns one query and KV head; no request state is retained
 import math
 
 import cutlass
-import cutlass.utils
 import torch
 from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64, cute
@@ -592,10 +591,32 @@ def launch_fp8_sparse_prefill(
 ) -> torch.Tensor:
     """Launch validated BF16 Q / FP8 KV prefill into the caller's output.
 
-    Slots use the TS 512-block prefix and three fixed tail columns. Slot rows
-    and int64 positions may have arbitrary nonnegative runtime strides. Scale
-    is the attention scale; k_scale and v_scale are scalar cache descales.
-    enable_pdl selects producer waiting and completion signaling. Return out.
+    All tensors must share a CUDA device. The caller validates the geometry,
+    dtypes, and alignment before launch. KV heads must be one or two.
+
+    Args:
+        q: Dense BF16 queries shaped [rows, 12 * kv_heads, 256], aligned to
+            16 bytes.
+        k: Dense E4M3FN key cache shaped [pool_rows, kv_heads, 256], aligned
+            to 16 bytes.
+        v: Dense E4M3FN value cache with the same shape and alignment as k.
+        slots: Int32 physical slots shaped [rows, 2051], aligned to 4 bytes,
+            with contiguous columns and a nonnegative row stride. Columns
+            hold 512 four-token blocks followed by three fixed tail slots.
+            Nonpositive slots contribute no probability mass.
+        positions: Int64 query positions shaped [rows], aligned to 8 bytes,
+            with a nonnegative stride. Each position bounds the visible
+            complete-block prefix and tail slots.
+        out: Caller-owned dense BF16 output shaped like q, aligned to
+            16 bytes, with storage separate from the inputs.
+        scale: Scalar attention scale applied to FP32 query-key scores.
+        k_scale: Scalar key cache descale.
+        v_scale: Scalar value cache descale.
+        enable_pdl: Whether to wait for producers and signal completion
+            through programmatic dependent launch.
+
+    Returns:
+        The supplied out tensor, populated with attention results.
     """
     # TMA gather coordinates and the grid use signed 32-bit row counts.
     # Never derive pool rows from a flattened element count, which can overflow.

@@ -167,7 +167,8 @@ def select_qsa_sparse_attention_kernel(
         and not isinstance(v_scale, torch.Tensor),
         "unscaled_kv": k_scale is None and v_scale is None,
         "supported_tma_gather_layout": supported_tma_gather_layout,
-        "supported_fp8_prefill_layout": can_use_cute_dsl_fp8_prefill_layout(
+        "supported_fp8_prefill_layout": max_seqlen_q is None
+        and can_use_cute_dsl_fp8_prefill_layout(
             q, k_cache, v_cache, selected_slots, sparse_metadata
         ),
     }
