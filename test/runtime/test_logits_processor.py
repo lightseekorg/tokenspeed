@@ -2006,3 +2006,80 @@ def test_dp_head_vocab_gather_bounded_workspace(monkeypatch, rows):
     monkeypatch.setattr(logits_processor_module, "all_gather_single", nccl)
     actual = proc._gather_vocab_logits(x, None, require_full_vocab=False)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("local_dp_rows", [None, slice(1, 3), slice(2, 2)])
+def test_finish_logits_preserves_dp_rows(monkeypatch, local_dp_rows):
+    from transformers import PretrainedConfig
+
+    processor = LogitsProcessor(
+        PretrainedConfig(vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
+    )
+    head = ParallelLMHead(
+        8,
+        2,
+        params_dtype=torch.float32,
+        padding_size=1,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    logits = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+    def collective(output, shard, group):
+        output.copy_(torch.cat((shard, shard + 100), dim=0))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    actual = processor._finish_logits(
+        logits,
+        head,
+        None,
+        None,
+        local_dp_rows=local_dp_rows,
+        require_full_vocab=True,
+    )
+    expected = torch.cat((logits, logits + 100), dim=1)
+    if local_dp_rows is not None:
+        expected = expected[local_dp_rows]
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sampled_vocab_fallback_finishes_all_rows(monkeypatch):
+    from tokenspeed_kernel.ops import sampling
+    from transformers import PretrainedConfig
+
+    processor = LogitsProcessor(
+        PretrainedConfig(vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
+    )
+    head = ParallelLMHead(
+        8,
+        2,
+        params_dtype=torch.bfloat16,
+        padding_size=1,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    # CPU hosts lack the sampler kernels and the second process.
+    monkeypatch.setattr(sampling, "vocab_shard_topk_supports", lambda *args: True)
+    monkeypatch.setattr(sampling, "vocab_topk_merge_supports", lambda *args: True)
+    assert processor.keep_sampled_logits_vocab_sharded(head, top_k=2)
+
+    def collective(output, shard, group):
+        output.copy_(torch.cat((shard, shard + 100), dim=0))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    logits = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    shard = processor.sampled_vocab_shard(logits, head)
+    actual = shard.gather_full(logits)
+    torch.testing.assert_close(actual, torch.cat((logits, logits + 100), dim=1))

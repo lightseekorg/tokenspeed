@@ -535,6 +535,7 @@ class LogitsProcessor(nn.Module):
                 lm_head=lm_head,
                 plan=None,
                 lm_head_tp_row_counts=None,
+                local_dp_rows=None,
                 require_full_vocab=False,
             ),
         )
@@ -1328,6 +1329,7 @@ class LogitsProcessor(nn.Module):
             lm_head,
             plan,
             lm_head_tp_row_counts,
+            local_dp_rows=local_dp_rows,
             require_full_vocab=require_full_vocab,
         )
 
@@ -1338,13 +1340,15 @@ class LogitsProcessor(nn.Module):
         plan: LogitsLayoutPlan | None,
         lm_head_tp_row_counts: list[int] | None,
         *,
+        local_dp_rows: slice | None,
         require_full_vocab: bool,
     ) -> torch.Tensor:
         """Whole scaled, softcapped rows from this rank's raw head logits.
 
         The layout step of ``_get_logits`` after the GEMM: the vocab
         all-gather (or the DP / LM-head-TP transposes), the slice to the real
-        vocabulary, the scale and the softcap.
+        vocabulary, the scale and the softcap. ``local_dp_rows`` preserves
+        the owning DP slot selected before projection; plain TP has no slice.
         """
         dp_sampling = plan is not None
         # With a softcap, the softcap kernel applies the scale after the
