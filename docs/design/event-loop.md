@@ -856,6 +856,9 @@ forward: the KV goes out up to one forward later, as under `early` the
 admission does. A prompt's output on the prefill side waits for its
 transfer, so when the transfer fails its client gets an abort even if its
 token already ended it; a client that aborted the request gets nothing.
+A prompt whose logits held a NaN is aborted as its forward commits, which
+cancels its transfer, and its client gets the `NumericalError` abort once
+that transfer failed.
 A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
