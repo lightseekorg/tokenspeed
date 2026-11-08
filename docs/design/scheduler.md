@@ -1251,8 +1251,10 @@ its pages: the transfer may still be reading or writing them. It parks whole in
 `pd::TransferStoppedEvent` once every reader and writer on every rank stopped
 (or the transfer's success lands first), and every outstanding local forward
 result has landed. Observing transport retirement before a local result records
-that fact on the request; a repeated abort cannot restart the transfer wait.
-Nothing is scheduled, published or retracted from that state.
+that fact in `PdTransferring`; a repeated abort preserves it and cannot restart
+the transfer wait. The state owns this record along with the retained resources,
+so leaving it needs no separate abort-marker cleanup. Nothing is scheduled,
+published or retracted from that state.
 
 **Restore: n/a.** Nothing on this role is ever `Retracted`, so the restore
 phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.

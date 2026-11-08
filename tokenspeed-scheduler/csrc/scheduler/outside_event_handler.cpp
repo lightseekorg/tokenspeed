@@ -57,15 +57,16 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
 
 void Scheduler::handleEvent(const pd::TransferStoppedEvent& event) {
     Request* request = findRequest(event.request_id);
-    if (request != nullptr && request->Is<fsm::PdTransferring>()) {
-        // Transport retirement does not fence this engine's queued forwards.
-        if (request->ResultsInFlight() > 0) {
-            request->RetirePdFailure();
-            return;
-        }
-        request->ClearPdAbort();
-        request->Apply(fsm::TransferStoppedEvent{&coordinator_});
+    fsm::PdTransferring* transferring = request == nullptr ? nullptr : request->GetIf<fsm::PdTransferring>();
+    if (transferring == nullptr) {
+        return;
     }
+    // Transport retirement does not fence this engine's queued forwards.
+    if (request->ResultsInFlight() > 0) {
+        transferring->transfer_stopped = true;
+        return;
+    }
+    request->Apply(fsm::TransferStoppedEvent{&coordinator_});
 }
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
@@ -85,10 +86,6 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     // frontier is final here, so it finishes like any request -- the P's
     // prompt-end state and partial page, the D's final state and tail are
     // published when it settles.
-    if (request->PdAbortPending()) {
-        handleEvent(pd::FailedEvent{event.request_id});
-        return;
-    }
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -102,9 +99,6 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
             throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
         }
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
-        if (request->PdAbortPending()) {
-            handleEvent(pd::FailedEvent{event.request_id});
-        }
         return;
     }
     if (request->Is<fsm::PdTransferring>()) {
@@ -133,8 +127,8 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 
 void Scheduler::settleFinishedRequests() {
     for (const std::unique_ptr<Request>& request : requests_) {
-        if (request->PdFailureRetired() && request->ResultsInFlight() == 0) {
-            request->ClearPdAbort();
+        const auto* transferring = request->GetIf<fsm::PdTransferring>();
+        if (transferring != nullptr && transferring->transfer_stopped && request->ResultsInFlight() == 0) {
             request->Apply(fsm::TransferStoppedEvent{&coordinator_});
             continue;
         }

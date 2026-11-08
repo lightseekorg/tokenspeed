@@ -1798,6 +1798,42 @@ TEST_F(PdTransferParkingTestSuite, SucceededEventReleasesAParkedRequest) {
     ASSERT_FALSE(PlanC().empty());
 }
 
+TEST_F(PdTransferParkingTestSuite, TransportStopsAndForwardResultsAreTrackedPerRequest) {
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
+    ASSERT_EQ(AdmitDuplicatesToCompute().size(), 2u);
+    const std::int32_t active = scheduler_->ActiveLcmBlocks();
+    ASSERT_GT(active, 0);
+    SendAbortEvent("a");
+    SendAbortEvent("b");
+
+    // Only a's transfer stopped; only b's local forward completed.
+    SendTransferStopped("a");
+    SendForwardDone("b");
+    EXPECT_TRUE(scheduler_->PdTransferPinned("a"));
+    EXPECT_TRUE(scheduler_->PdTransferPinned("b"));
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), active);
+    const ExecutionPlan waiting = PlanOnce();
+    EXPECT_EQ(FindRequestIndex(FindForwardBatch(waiting.Operations()), "a"), -1);
+    EXPECT_EQ(FindRequestIndex(FindForwardBatch(waiting.Operations()), "b"), -1);
+
+    // Repeated terminal input preserves a's stop while b still awaits its own.
+    SendPdFailed("a");
+    SendAbortEvent("a");
+    SendForwardDone("a");
+    EXPECT_FALSE(scheduler_->PdTransferPinned("a"));
+    EXPECT_TRUE(scheduler_->PdTransferPinned("b"));
+    EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_LT(scheduler_->ActiveLcmBlocks(), active);
+    const ExecutionPlan after_a = PlanOnce();
+    EXPECT_EQ(FindRequestIndex(FindForwardBatch(after_a.Operations()), "a"), -1);
+    EXPECT_EQ(FindRequestIndex(FindForwardBatch(after_a.Operations()), "b"), -1);
+
+    SendTransferStopped("b");
+    EXPECT_FALSE(scheduler_->PdTransferPinned("b"));
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+}
+
 // Robustness on a request parked in fsm::PdTransferring (P role, aborted while
 // its own local forward was still out, before that forward's result landed):
 // every later event that could end, advance or schedule it is ignored until

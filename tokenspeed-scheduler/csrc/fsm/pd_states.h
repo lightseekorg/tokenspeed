@@ -93,6 +93,8 @@ struct PdTransferring {
     explicit PdTransferring(ForwardResources resources) : resources{std::move(resources)} {}
 
     ForwardResources resources;
+    // A transport stop may arrive before the last local forward result.
+    bool transfer_stopped{false};
 };
 
 }  // namespace fsm
