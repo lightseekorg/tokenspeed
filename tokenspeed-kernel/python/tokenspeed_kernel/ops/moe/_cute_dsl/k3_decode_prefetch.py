@@ -75,7 +75,7 @@ def next_attention_groups(
     ahead, groups = policy.batch_table(EXPERTS_AHEAD), {}
     for batch, spec in policy.batch_table(NEXT_ATTENTION).items():
         cap, carveout = spec if isinstance(spec, tuple) else (spec, None)
-        if batch in served and batch not in ahead and cap:
+        if batch in served and not ahead.get(batch) and cap:
             groups.setdefault((cap * MIB, carveout), []).append(batch)
     return {key: tuple(batches) for key, batches in groups.items()}
 

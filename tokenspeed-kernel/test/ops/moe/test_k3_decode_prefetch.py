@@ -83,15 +83,15 @@ def test_the_ahead_table_drops_ranges_past_its_rows():
 
 def test_next_attention_launches_group_row_counts_by_cap_and_carveout(monkeypatch):
     monkeypatch.setattr(prefetch, "NEXT_ATTENTION", "1:96.100,2-3:96,4-7:64,8:0,16:8")
-    monkeypatch.setattr(prefetch, "EXPERTS_AHEAD", "4-6:16")
-    groups = prefetch.next_attention_groups((1, 2, 3, 5, 7, 8, 32))
-    # Row counts with an in-kernel table take no launch; a zero cap takes none.
+    monkeypatch.setattr(prefetch, "EXPERTS_AHEAD", "4-6:16,5:0")
+    groups = prefetch.next_attention_groups((1, 2, 3, 5, 6, 7, 8, 32))
+    # Row counts with an in-kernel table take no launch; a zero turns either off.
     assert groups == {
         (96 * MIB, 100): (1,),
         (96 * MIB, None): (2, 3),
-        (64 * MIB, None): (7,),
+        (64 * MIB, None): (5, 7),
     }
-    assert prefetch.experts_ahead_caps((1, 5, 6, 8)) == {5: 16 * MIB, 6: 16 * MIB}
+    assert prefetch.experts_ahead_caps((1, 5, 6, 8)) == {6: 16 * MIB}
 
 
 def test_the_served_row_counts_take_one_next_attention_prefetch_each():
