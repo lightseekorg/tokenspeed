@@ -241,9 +241,11 @@ def _weight(tag: str) -> SimpleNamespace:
 
 
 def _decoder(layer_id: int, *, moe: bool):
+    """A decoder layer with a KDA attention, and a MoE block when ``moe``."""
     layer = object.__new__(kimi_k3.KimiLinearDecoderLayer)
     torch.nn.Module.__init__(layer)
     layer.layer_id, layer.is_moe_layer = layer_id, moe
+    _attention(layer, mla=False)
     if not moe:
         return layer
     block = object.__new__(KimiLinearMoE)
@@ -345,6 +347,7 @@ def _bindable(
             norm="final.norm",
             decode_final=None,
             decode_batches=(),
+            decode_chain=None,
         ),
         # Only the attention-binding tests give every layer its attention.
         config=_config(
@@ -369,6 +372,8 @@ def test_binding_hands_each_moe_layer_its_own_weights(monkeypatch):
         beta=4.0,
         linear_beta=25.0,
     )
+    # The forward rejoins the owner's side streams.
+    assert model.model.decode_chain is owner
     for ordinal, layer in enumerate(layers[1:]):
         tag = f"layer{layer.layer_id}"
         assert layer.block_sparse_moe.decode_moe.bound == dict(
@@ -388,6 +393,12 @@ def test_binding_hands_each_moe_layer_its_own_weights(monkeypatch):
             norm_weight=f"{tag}.norm",
             norm_eps=1e-5,
             up_shard=f"{tag}.up",
+            # Layer 1's experts prefetch layer 3's attention; the last one, none.
+            next_attention=(
+                ("layer3.qkvgb.weight", "layer3.f_b.weight", "layer3.o_proj.weight")
+                if ordinal == 0
+                else ()
+            ),
         )
 
 
@@ -541,6 +552,16 @@ def test_other_forwards_keep_the_ordinary_layers(overrides, mode, rows):
     model._forward_decode_chain.assert_not_called()
 
 
+class _ChainOwner:
+    """Records the decode MoE chain owner's side-stream join into an event log."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def join(self):
+        self.log.append(("join",))
+
+
 class _Chain:
     """Records one layer's chain calls into a shared event log; its entry leaves
     ``index`` in the prefix (the previous layer's output) and ``100 + index`` in
@@ -605,6 +626,7 @@ def _chain_model(log, **overrides):
         pp_start_layer=0,
         pp_end_layer=3,
         decode_final=final,
+        decode_chain=_ChainOwner(log),
         layers_to_capture=[],
         eagle3_layers_to_capture=(),
     )
@@ -630,7 +652,48 @@ def test_layer_chain_feeds_each_layer_from_the_previous_feed_forward():
         ("moe1", "leave", "moe1.attn"),
         ("moe1", "publish", "moe1.x"),
         ("final", "ring"),
+        ("join",),
     ]
+
+
+def test_the_ordinary_forward_rejoins_the_moe_chain_after_its_layers(monkeypatch):
+    """With only the MoE chain bound, its layers run inside the ordinary forward.
+
+    The forward rejoins the chain's side streams once, after the last layer.
+    """
+    log = []
+
+    def layer(index):
+        def run(_positions, prefix_sum, _ctx, block_residual):
+            log.append(("layer", index))
+            return prefix_sum, block_residual
+
+        return run
+
+    def closing(prefix_sum, *_args, **_kwargs):
+        log.append(("final",))
+        return prefix_sum
+
+    monkeypatch.setattr(kimi_k3, "_apply_attn_res", closing)
+    model = SimpleNamespace(
+        embed_tokens=lambda ids: torch.zeros(ids.shape[0], HIDDEN),
+        decode_final=None,
+        decode_batches=(),
+        decode_chain=_ChainOwner(log),
+        config=SimpleNamespace(num_hidden_layers=2, attn_res_block_size=2),
+        layers=[layer(0), layer(1)],
+        pp_start_layer=0,
+        pp_end_layer=2,
+        layers_to_capture=[],
+        eagle3_layers_to_capture=(),
+        dflash_aux_stream=None,
+        mapping=SimpleNamespace(is_last_pp_rank=True),
+        output_attn_res_proj=None,
+        output_attn_res_norm=None,
+        norm=None,
+    )
+    _model_forward(model)
+    assert log == [("layer", 0), ("layer", 1), ("join",), ("final",)]
 
 
 def _attention(
@@ -645,21 +708,60 @@ def _attention(
     attn = object.__new__(cls)
     torch.nn.Module.__init__(attn)
     attn.qkv_parallel = attn.output_parallel = None
+    tag = f"layer{layer.layer_id}"
     attn.o_proj = SimpleNamespace(
         supports_fp8_group128_input=fp8_o_proj,
-        weight=SimpleNamespace(dtype=torch.bfloat16, shape=(HIDDEN_SIZE, o_proj_width)),
+        weight=_Stub(
+            f"{tag}.o_proj.weight",
+            dtype=torch.bfloat16,
+            shape=(HIDDEN_SIZE, o_proj_width),
+        ),
     )
     rows = 3648 if mla else 6288
+    name = "qkv_a" if mla else "qkvgb"
     projection = SimpleNamespace(
-        weight=SimpleNamespace(dtype=projection_dtype, shape=(rows, HIDDEN_SIZE))
+        weight=_Stub(
+            f"{tag}.{name}.weight", dtype=projection_dtype, shape=(rows, HIDDEN_SIZE)
+        )
     )
     if mla:
         attn.use_output_gate = True
         attn.fused_qkv_a_proj_with_mqa = projection
+        attn.q_b_proj = _weight(f"{tag}.q_b")
+        attn.w_kc, attn.w_vc = f"{tag}.w_kc", f"{tag}.w_vc"
     else:
         attn.qkvgb_proj = projection
+        attn.f_b_proj = _weight(f"{tag}.f_b")
     layer.self_attn = attn
     return layer
+
+
+class _Stub(str):
+    """A named stand-in weight with the dtype and shape the binding checks."""
+
+    def __new__(cls, name, **_kwargs):
+        return super().__new__(cls, name)
+
+    def __init__(self, _name, *, dtype, shape):
+        self.dtype, self.shape = dtype, shape
+
+
+def test_a_kda_decode_step_reads_its_projections_in_order():
+    attn = _decoder(0, moe=False).self_attn
+    assert attn.decode_weights() == (
+        "layer0.qkvgb.weight",
+        "layer0.f_b.weight",
+        "layer0.o_proj.weight",
+    )
+
+
+def test_an_mla_decode_step_reads_the_absorbed_projections_once_derived():
+    attn = _attention(_decoder(0, moe=False), mla=True).self_attn
+    head = ("layer0.qkv_a.weight", "layer0.q_b.weight")
+    absorbed = ("layer0.w_kc", "layer0.w_vc")
+    assert attn.decode_weights() == (*head, *absorbed, "layer0.o_proj.weight")
+    attn.w_kc = attn.w_vc = None
+    assert attn.decode_weights() == (*head, "layer0.o_proj.weight")
 
 
 def _attention_layers(*, odd_layer=None, **odd):
@@ -693,7 +795,12 @@ def test_binding_gives_every_layer_its_entry_and_exit(monkeypatch):
         )
         assert decoder is layers[i]
         assert kwargs == dict(
-            layer_idx=i, mla=mla, first=i == 0, projection_weight=projection.weight
+            layer_idx=i,
+            mla=mla,
+            first=i == 0,
+            projection_weight=projection.weight,
+            # The MoE layer whose weights the attention prefetches.
+            moe=decoder.block_sparse_moe.decode_moe if i > 0 else None,
         )
         assert decoder.decode_attention.bound == kwargs
     assert attention.closing == dict(
