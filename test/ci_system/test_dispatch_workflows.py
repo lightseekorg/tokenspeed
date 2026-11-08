@@ -1525,8 +1525,8 @@ def test_mi450_sim_pins_one_rocm_nightly():
 
     assert env["ROCM_SDK_VERSION"] == "10.3.0a20261107"
     assert env["ROCM_SYSTEMS_REF"] == "3f917c0d61869b153dae1264e712b414a9343d10"
-    assert env["TORCH_VERSION"] == "2.16.0a0+rocm10.3.0a20261107"
-    assert env["TORCHVISION_VERSION"] == "0.30.0a0+rocm10.3.0a20261107"
+    assert env["TORCH_VERSION"] == "2.14.0+rocm10.3.0a20261107"
+    assert env["TORCHVISION_VERSION"] == "0.29.0+rocm10.3.0a20261107"
 
     # PyTorch requires the exact ROCm SDK build it was built against.
     rocm_build = f"+rocm{env['ROCM_SDK_VERSION']}"

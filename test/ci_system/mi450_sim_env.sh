@@ -7,6 +7,6 @@ export ROCM_SYSTEMS_REF=3f917c0d61869b153dae1264e712b414a9343d10
 
 # PyTorch wheels require the exact ROCm SDK build they were built against.
 export TORCH_INDEX_URL="${ROCM_NIGHTLY_INDEX}"
-export TORCH_VERSION="2.16.0a0+rocm${ROCM_SDK_VERSION}"
-export TORCHVISION_VERSION="0.30.0a0+rocm${ROCM_SDK_VERSION}"
+export TORCH_VERSION="2.14.0+rocm${ROCM_SDK_VERSION}"
+export TORCHVISION_VERSION="0.29.0+rocm${ROCM_SDK_VERSION}"
 export TORCH_DEVICE_PACKAGE="amd-torch-device-gfx1250==${TORCH_VERSION}"
