@@ -24,7 +24,6 @@ import functools
 import itertools
 from typing import Optional, Tuple
 
-import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import error_fn
 
@@ -32,66 +31,11 @@ platform = current_platform()
 
 nvfp4_gemm_swiglu_nvfp4_quant = error_fn
 
-
-def swizzle_blockscale_2d(scales):
-    """Swizzle 2D FP8 block scales for CUTLASS."""
-    M, K = scales.shape
-
-    def round_up(x, m):
-        return (x + m - 1) // m * m
-
-    M_padded = round_up(M, 128)
-    K_padded = round_up(K, 4)
-    padded = torch.zeros((M_padded, K_padded), dtype=scales.dtype, device=scales.device)
-    padded[:M, :K] = scales
-    rows, cols = padded.shape
-    padded = padded.reshape(rows // 128, 4, 32, cols // 4, 4)
-    padded = padded.permute((0, 3, 2, 1, 4))
-    return padded.contiguous().reshape(M_padded, K_padded)
-
-
-def interleave_linear_and_gate(
-    tensor: torch.Tensor,
-    group_size: int = 64,
-    dim: int = 0,
-) -> torch.Tensor:
-    """Interleave ``[linear all][gate all]`` as ``[linear chunk][gate chunk]``.
-
-    This matches the FC1 GEMM+SwiGLU preprocessing layout expected by
-    ``cute_dsl_nvfp4_dense_gemm_swiglu_blackwell``.
-    """
-    if tensor.ndim == 0:
-        raise ValueError("expected a tensor with at least one dimension")
-
-    dim = dim % tensor.ndim
-    sizes = tensor.size()
-    dim_size = sizes[dim]
-    if dim_size % (group_size * 2) != 0:
-        raise ValueError(
-            f"dimension {dim} size {dim_size} must be divisible by "
-            f"2 * group_size={2 * group_size}"
-        )
-
-    prev_sizes = sizes[:dim]
-    post_sizes = sizes[dim + 1 :]
-    return (
-        tensor.reshape(
-            *prev_sizes,
-            2,
-            dim_size // (group_size * 2),
-            group_size,
-            *post_sizes,
-        )
-        .transpose(dim, dim + 1)
-        .reshape(*sizes)
-        .contiguous()
-    )
-
-
 if platform.is_nvidia:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
+    import torch
     from flashinfer.autotuner import (
         AutoTuner,
         ConstraintSpec,

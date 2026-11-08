@@ -39,9 +39,7 @@ def _scale_inv_for(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def test_interleave_linear_and_gate_layout() -> None:
-    from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
-        interleave_linear_and_gate,
-    )
+    from tokenspeed_kernel.ops.gemm import interleave_linear_and_gate
 
     linear = torch.arange(128 * 4, dtype=torch.uint8).reshape(128, 4)
     gate = torch.arange(128 * 4, 256 * 4, dtype=torch.uint8).reshape(128, 4)
@@ -79,10 +77,12 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
     i: int,
 ) -> None:
 
-    from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
+    from tokenspeed_kernel.ops.gemm import (
         interleave_linear_and_gate,
-        nvfp4_gemm_swiglu_nvfp4_quant,
         swizzle_blockscale_2d,
+    )
+    from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
+        nvfp4_gemm_swiglu_nvfp4_quant,
     )
     from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
     from tokenspeed_kernel.registry import load_builtin_kernels

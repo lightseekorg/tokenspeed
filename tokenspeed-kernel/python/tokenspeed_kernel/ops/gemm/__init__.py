@@ -30,7 +30,7 @@ from types import MappingProxyType
 
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
-from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu_layout import (
     interleave_linear_and_gate,
     swizzle_blockscale_2d,
 )
