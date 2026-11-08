@@ -170,12 +170,18 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
 }
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
-    // An event reports the net change since the last drain: a boundary is
-    // published exactly while every child block of it is cached. Mutations
-    // mark boundaries in whatever order the coordinator touches pages, so the
-    // batch is sorted by chain depth: removals leaf-first, then Stored
-    // parent-first, because consumers resolve a Stored event's
-    // parent_block_hash against what they have already received.
+    // An event reports the net change since the last drain, per cache group:
+    // a group's BlockStored for a boundary is out exactly while every block
+    // that group holds for it is cached. So a hybrid model's History group
+    // publishes its whole chain, its State group the boundaries that carry a
+    // checkpoint, and a sliding-window group the boundaries its window still
+    // covers; the block hashes are the boundary's in every group, and the
+    // event's group_idx tells them apart. Mutations mark boundaries in
+    // whatever order the coordinator touches pages, so the batch is sorted
+    // by chain depth: removals leaf-first, then Stored parent-first, because
+    // consumers resolve a Stored event's parent_block_hash against what they
+    // have already received; within one boundary the groups keep their
+    // index order.
     std::vector<std::pair<std::int32_t, KvCacheEvent>> removed;
     std::vector<std::pair<std::int32_t, KvCacheEvent>> stored;
     for (const CacheKey& boundary : std::exchange(kv_event_boundaries_to_reconcile_, {})) {
@@ -187,17 +193,33 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
         // A tail's descriptor carries fewer tokens than a page.
         const auto descriptor_tokens = static_cast<std::int32_t>(event_boundary.stored.token_ids.size());
         const std::int32_t tail_tokens = descriptor_tokens < config_.prefix_granularity ? descriptor_tokens : 0;
-        const CacheCoordinator::BoundaryResidency residency =
-            coordinator_.DeviceBoundaryResidency(boundary, tail_tokens);
-        const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
-        if (complete && !event_boundary.published) {
-            stored.emplace_back(event_boundary.depth, event_boundary.stored);
-        } else if (!complete && event_boundary.published) {
-            removed.emplace_back(event_boundary.depth,
-                                 KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+        bool any_cached = false;
+        for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+            const CacheCoordinator::BoundaryResidency residency =
+                coordinator_.GroupDeviceBoundaryResidency(i, boundary, tail_tokens);
+            any_cached = any_cached || residency != CacheCoordinator::BoundaryResidency::kNone;
+            const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
+            const std::uint64_t bit = std::uint64_t{1} << i;
+            const bool published = (event_boundary.published_groups & bit) != 0;
+            if (complete && !published) {
+                KvBlockStoredEvent event = event_boundary.stored;
+                const CacheGroupSpec& spec = coordinator_.GroupSpec(i);
+                event.group_idx = i;
+                event.attn_kind = spec.attn_kind;
+                event.sliding_window = spec.attn_kind == AttnKind::kSlidingWindow
+                                           ? std::optional<std::int32_t>{spec.sliding_window}
+                                           : std::nullopt;
+                stored.emplace_back(event_boundary.depth, std::move(event));
+            } else if (!complete && published) {
+                removed.emplace_back(event_boundary.depth, KvBlockRemovedEvent{
+                                                               .block_hashes = event_boundary.stored.block_hashes,
+                                                               .group_idx = i,
+                                                           });
+            }
+            event_boundary.published_groups =
+                complete ? event_boundary.published_groups | bit : event_boundary.published_groups & ~bit;
         }
-        event_boundary.published = complete;
-        if (residency == CacheCoordinator::BoundaryResidency::kNone) {
+        if (!any_cached) {
             kv_event_boundaries_.erase(it);
         }
     }

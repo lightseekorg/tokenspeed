@@ -667,14 +667,19 @@ private:
     // DrainKvEvents reconciles each marked boundary against its residency, so
     // the order of evictions and publications inside one admission does not
     // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with a cached child.
+    // with a cached child in some group.
     struct KvEventBoundary {
+        // The descriptor every group's event of this boundary carries; the
+        // drain sets the group fields per group on the copy it emits.
         KvBlockStoredEvent stored;
         // Position in the prefix chain (page index). Consumers resolve a
         // Stored event's parent_block_hash on receipt, so DrainKvEvents
         // orders each batch by depth rather than by mutation order.
         std::int32_t depth{0};
-        bool published{false};
+        // Bit i: group i's BlockStored for this boundary is out (not yet
+        // followed by its BlockRemoved). SchedulerConfig::Validate bounds
+        // the group count by the mask's width when events are on.
+        std::uint64_t published_groups{0};
         bool needs_reconcile{false};
     };
     std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;

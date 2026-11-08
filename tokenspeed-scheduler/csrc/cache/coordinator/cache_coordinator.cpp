@@ -404,6 +404,25 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
 }
 
+CacheCoordinator::BoundaryResidency CacheCoordinator::GroupDeviceBoundaryResidency(std::int32_t i,
+                                                                                   const CacheKey& boundary,
+                                                                                   std::int32_t tail_tokens) const {
+    _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
+    const PrefixCacheIndex& index = GroupPrefixIndex(i);
+    std::int32_t total = 0;
+    std::int32_t cached = 0;
+    CacheKey key = boundary;
+    forEachBoundaryKey(key, tail_tokens, std::views::single(static_cast<std::size_t>(i)),
+                       [&](std::size_t, const CacheKey& group_key) {
+                           ++total;
+                           cached += index.Contains(pool_, group_key) ? 1 : 0;
+                       });
+    if (cached == 0) {
+        return BoundaryResidency::kNone;
+    }
+    return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+}
+
 bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {
     // A probe takes each State group's checkpoint from whichever tier holds
     // it (probeHostSuffix), so every State group must hold one on either.

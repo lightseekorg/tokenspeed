@@ -99,6 +99,16 @@ pub fn offset_endpoint_port(endpoint: &str, dp_rank: i64) -> Result<String, KvEv
 
 /// One round's events as the publisher's payload (`KVEventBatch`): the
 /// time, the events and this rank's attention-DP rank.
+///
+/// An event's slots follow `pd/kv_events.py`, which keeps the field order
+/// of the reference engine's publisher so a consumer reads the cache group
+/// where it expects it: a store is `[tag, block_hashes, parent_block_hash,
+/// token_ids, block_size, lora_id, medium, lora_name, extra_keys, group_idx,
+/// kv_cache_spec_kind, kv_cache_spec_sliding_window]`, a removal `[tag,
+/// block_hashes, medium, group_idx]`. Every slot is written, as msgspec
+/// writes an array-like struct: the adapter and medium fields this engine
+/// does not use ride as nil, and so does the window of a group that has
+/// none.
 pub fn encode_batch(timestamp: f64, events: &[KvEventView], dp_rank: i64) -> Vec<u8> {
     let mut encoder = ts_wire::msgpack::Encoder::new();
     encoder.array_len(3);
@@ -106,7 +116,7 @@ pub fn encode_batch(timestamp: f64, events: &[KvEventView], dp_rank: i64) -> Vec
     encoder.array_len(events.len());
     for event in events {
         if event.stored {
-            encoder.array_len(5);
+            encoder.array_len(12);
             encoder.str("BlockStored");
             hashes(&mut encoder, &event.block_hashes);
             if event.has_parent {
@@ -119,10 +129,22 @@ pub fn encode_batch(timestamp: f64, events: &[KvEventView], dp_rank: i64) -> Vec
                 encoder.int(i64::from(token));
             }
             encoder.int(i64::from(event.block_size));
+            for _ in 0..4 {
+                encoder.nil();
+            }
+            encoder.int(i64::from(event.group_idx));
+            encoder.str(&event.kv_cache_spec_kind);
+            if event.has_sliding_window {
+                encoder.int(i64::from(event.sliding_window));
+            } else {
+                encoder.nil();
+            }
         } else {
-            encoder.array_len(2);
+            encoder.array_len(4);
             encoder.str("BlockRemoved");
             hashes(&mut encoder, &event.block_hashes);
+            encoder.nil();
+            encoder.int(i64::from(event.group_idx));
         }
     }
     encoder.int(dp_rank);

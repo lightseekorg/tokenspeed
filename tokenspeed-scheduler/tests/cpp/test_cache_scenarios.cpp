@@ -1982,27 +1982,35 @@ protected:
         return cfg;
     }
 
-    // The boundaries the feed currently reports as stored, keyed by their
-    // tokens; a drain's events are applied in order (removals first).
-    using Published = std::map<std::vector<std::int32_t>, std::uint64_t>;
+    // The boundaries the feed currently reports as stored, keyed by group
+    // and tokens (every group publishes its own copy of a boundary); a
+    // drain's events are applied in order (removals first).
+    using Published = std::map<std::pair<std::int32_t, std::vector<std::int32_t>>, std::uint64_t>;
     static void Apply(Published& published, const std::vector<KvCacheEvent>& events) {
-        std::map<std::uint64_t, std::vector<std::int32_t>> by_hash;
-        for (const auto& [tokens, hash] : published) {
-            by_hash.emplace(hash, tokens);
+        std::map<std::pair<std::int32_t, std::uint64_t>, std::pair<std::int32_t, std::vector<std::int32_t>>> by_hash;
+        for (const auto& [key, hash] : published) {
+            by_hash.emplace(std::make_pair(key.first, hash), key);
         }
         for (const KvCacheEvent& event : events) {
             if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
                 for (const std::uint64_t hash : removed->block_hashes) {
-                    ASSERT_TRUE(by_hash.contains(hash)) << "a removal names a boundary never stored";
-                    published.erase(by_hash.at(hash));
+                    const auto key = std::make_pair(removed->group_idx, hash);
+                    ASSERT_TRUE(by_hash.contains(key)) << "a removal names a boundary never stored";
+                    published.erase(by_hash.at(key));
                 }
             } else {
                 const auto& stored = std::get<KvBlockStoredEvent>(event);
                 ASSERT_EQ(stored.block_hashes.size(), 1u);
-                ASSERT_TRUE(published.emplace(stored.token_ids, stored.block_hashes.front()).second)
-                    << "a boundary is stored once until it is removed";
+                ASSERT_TRUE(
+                    published.emplace(std::make_pair(stored.group_idx, stored.token_ids), stored.block_hashes.front())
+                        .second)
+                    << "a boundary is stored once per group until it is removed";
             }
         }
+    }
+    // Whether both History groups of this geometry report the boundary stored.
+    static bool HeldByEveryGroup(const Published& published, const std::vector<std::int32_t>& tokens) {
+        return published.contains({0, tokens}) && published.contains({1, tokens});
     }
     static std::size_t NumStored(const std::vector<KvCacheEvent>& events) {
         return static_cast<std::size_t>(std::ranges::count_if(
@@ -2026,7 +2034,7 @@ TEST_F(FusedRetractionKvEventsSuite, RetractionAndRestorePublishWithTheirDescrip
     SendForwardDone("r2", {142});
     CompleteStores(PlanOnce());  // the first decodes publish both prompts' pages
     Apply(published, scheduler_->DrainKvEvents());
-    EXPECT_EQ(published.size(), 4u) << "two prompt pages each";
+    EXPECT_EQ(published.size(), 8u) << "two prompt pages each, in both groups";
     SendForwardDone("r1", {43});
     SendForwardDone("r2", {143});
     CompleteStores(PlanOnce());
@@ -2048,7 +2056,7 @@ TEST_F(FusedRetractionKvEventsSuite, RetractionAndRestorePublishWithTheirDescrip
     const auto missing = [&] {
         std::vector<std::vector<std::int32_t>> result;
         for (const auto& page : r1_pages) {
-            if (!published.contains(page)) {
+            if (!HeldByEveryGroup(published, page)) {
                 result.push_back(page);
             }
         }
@@ -2056,7 +2064,18 @@ TEST_F(FusedRetractionKvEventsSuite, RetractionAndRestorePublishWithTheirDescrip
     };
     const std::vector<std::vector<std::int32_t>> broken = missing();
     ASSERT_FALSE(broken.empty()) << "r2's grant evicted part of r1's published prefix";
-    EXPECT_TRUE(published.contains({142, 143})) << "r2's own decode page was published by the same admission";
+    // The (group, page) copies the restore has to publish again.
+    const auto missing_copies = [&] {
+        std::size_t result = 0;
+        for (const auto& page : r1_pages) {
+            for (const std::int32_t group : {0, 1}) {
+                result += published.contains({group, page}) ? 0 : 1;
+            }
+        }
+        return result;
+    };
+    const std::size_t broken_copies = missing_copies();
+    EXPECT_TRUE(HeldByEveryGroup(published, {142, 143})) << "r2's own decode page was published by the same admission";
     SendForwardDone("r2", {145});  // the decode the grant served
 
     CompleteStores(PlanOnce());
@@ -2081,7 +2100,7 @@ TEST_F(FusedRetractionKvEventsSuite, RetractionAndRestorePublishWithTheirDescrip
     EXPECT_EQ(missing(), broken);
     AckRestores(readmit);
     const std::vector<KvCacheEvent> after_restore = scheduler_->DrainKvEvents();
-    EXPECT_EQ(NumStored(after_restore), broken.size());
+    EXPECT_EQ(NumStored(after_restore), broken_copies) << "one store per group that lost its copy";
     EXPECT_EQ(NumRemoved(after_restore), 0u);
     Apply(published, after_restore);
     EXPECT_TRUE(missing().empty()) << "every page of the restored request is a stored boundary again";

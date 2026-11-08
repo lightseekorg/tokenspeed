@@ -28,6 +28,16 @@ Every rank's Rust control plane drains its scheduler's events and the
 attention-TP group's first rank publishes them over ZMQ (``ts-control``'s
 ``kv_events``). These structs are the payload's schema as a consumer decodes
 it with msgspec; the publisher's encoding matches them byte for byte.
+
+Every cache group publishes its own events for a boundary under the same
+block hashes, and names itself: ``group_idx`` is the scheduler's cache-group
+index, ``kv_cache_spec_kind`` the group's attention kind (``full_attention``,
+``sliding_window`` or ``mamba`` for a recurrent-state group) and
+``kv_cache_spec_sliding_window`` a sliding window's width in tokens. The
+field order is the reference engine publisher's, so a consumer finds the
+group where it already reads it; every slot is written, and the fields
+between ``block_size`` and ``group_idx`` (adapter and medium), which this
+engine does not use, ride as ``None``.
 """
 
 from typing import Any
@@ -62,10 +72,19 @@ class BlockStored(KVCacheEvent):
     parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
+    lora_id: int | None = None
+    medium: str | None = None
+    lora_name: str | None = None
+    extra_keys: list[Any] | None = None
+    group_idx: int | None = None
+    kv_cache_spec_kind: str | None = None
+    kv_cache_spec_sliding_window: int | None = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    medium: str | None = None
+    group_idx: int | None = None
 
 
 class AllBlocksCleared(KVCacheEvent):

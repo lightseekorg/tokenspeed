@@ -1512,13 +1512,17 @@ harmless.
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token
 descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
-descriptor of a boundary with no cached child. A boundary is `BlockStored`
-only while every group holds its child -- the State groups included, whose
-checkpoint exists only at a natural point or the opt-in in-forward
-checkpoint (§1.2) -- so a hybrid model emits `BlockStored` for its prompt
-end and its finish (unless they are dead, §1.2), its junction cuts and the
-in-forward checkpoint's page boundary, never for another interior chunk
-end's chain hash; a tail's
+descriptor of a boundary no group holds a child of. Every group publishes
+its own `BlockStored` for a boundary, under the boundary's block hashes and
+with its `group_idx` and attention kind, exactly while that group holds its
+child: a History group reports its whole chain, a sliding-window group the
+boundaries its window still covers, and a State group -- whose checkpoint
+exists only at a natural point or the opt-in in-forward checkpoint (§1.2) --
+the prompt end and the finish (unless they are dead, §1.2), the junction
+cuts and the in-forward checkpoint's page boundary, never another interior
+chunk end's chain hash. A consumer reads the chain from the History group's
+events and the positions a hybrid model can resume at from the State
+group's. A tail's
 descriptor carries the rows below `T` and the residency check counts a
 tail's blocks from it. A publication registers its newly hashed pages and its
 tail, and every page below them it registers an entry under

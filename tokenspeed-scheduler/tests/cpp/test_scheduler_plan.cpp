@@ -24,10 +24,13 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -332,7 +335,12 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesStoredBlockAndDrainsItOnce) {
     std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
     ASSERT_EQ(events.size(), 1u);
     ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
-    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, spec.tokens);
+    const auto& stored = std::get<KvBlockStoredEvent>(events[0]);
+    EXPECT_EQ(stored.token_ids, spec.tokens);
+    EXPECT_EQ(stored.group_idx, 0);
+    EXPECT_EQ(stored.attn_kind, AttnKind::kFull);
+    EXPECT_FALSE(stored.sliding_window.has_value());
+    EXPECT_EQ(KvCacheSpecKind(stored.attn_kind), "full_attention");
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
@@ -443,19 +451,129 @@ protected:
     }
 };
 
-// A State group has no token span, so a tail boundary's residency must not ask it for a block granularity.
-TEST_F(HybridKvCacheEventTestSuite, DrainsATailBoundaryAlongsideAStateGroup) {
+// Each group publishes the boundaries it holds: the History group its whole
+// chain, the State group only the prompt end, where its checkpoint is. A
+// State group has no token span, so a tail boundary's residency must not ask
+// it for a block granularity.
+TEST_F(HybridKvCacheEventTestSuite, EachGroupPublishesTheBoundariesItHolds) {
     Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3}});
     PlanOnce();
     SendForwardDone("r1", {42});
     SendFinish("r1");
 
-    // Only the prompt end has a state checkpoint, so only the tail [3] is complete; the page [1 2] stays partial.
+    // Parent-first: the History page [1 2], then the tail [3] in both groups.
+    // The page [1 2] holds no checkpoint, so the State group says nothing of it.
     std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
-    ASSERT_EQ(events.size(), 1u);
-    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
-    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, (std::vector<std::int32_t>{3}));
+    ASSERT_EQ(events.size(), 3u);
+    for (const KvCacheEvent& event : events) {
+        ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(event));
+    }
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    const auto& checkpoint = std::get<KvBlockStoredEvent>(events[2]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_EQ(page.group_idx, 0);
+    EXPECT_EQ(page.attn_kind, AttnKind::kFull);
+    EXPECT_FALSE(page.parent_block_hash.has_value());
+    EXPECT_EQ(tail.token_ids, (std::vector<std::int32_t>{3}));
+    EXPECT_EQ(tail.group_idx, 0);
+    EXPECT_EQ(tail.attn_kind, AttnKind::kFull);
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front());
+    EXPECT_EQ(checkpoint.token_ids, (std::vector<std::int32_t>{3})) << "the span the checkpoint closes";
+    EXPECT_EQ(checkpoint.group_idx, 1);
+    EXPECT_EQ(checkpoint.attn_kind, AttnKind::kState);
+    EXPECT_EQ(KvCacheSpecKind(checkpoint.attn_kind), "mamba");
+    EXPECT_FALSE(checkpoint.sliding_window.has_value());
+    EXPECT_EQ(checkpoint.block_hashes, tail.block_hashes) << "the same boundary, told apart by the group";
+    EXPECT_EQ(checkpoint.parent_block_hash, tail.parent_block_hash);
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    // A clear takes every published copy back, group by group, leaf-first.
+    ASSERT_TRUE(scheduler_->ClearCache());
+    std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
+    ASSERT_EQ(removed.size(), 3u);
+    for (const KvCacheEvent& event : removed) {
+        ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(event));
+    }
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, tail.block_hashes);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).group_idx, 0);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[1]).block_hashes, tail.block_hashes);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[1]).group_idx, 1);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[2]).block_hashes, page.block_hashes);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[2]).group_idx, 0);
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+}
+
+// A longer prompt: the History group publishes every page of the chain, the
+// State group one store at the prompt end's page, and a second request that
+// repeats the prompt resumes there.
+TEST_F(HybridKvCacheEventTestSuite, TheHistoryChainIsContinuousAndTheCheckpointClosesItsPage) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3, 4, 5, 6}});
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    SendFinish("r1");
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 4u);
+    std::optional<std::uint64_t> parent;
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto& page = std::get<KvBlockStoredEvent>(events[i]);
+        EXPECT_EQ(page.group_idx, 0);
+        EXPECT_EQ(page.attn_kind, AttnKind::kFull);
+        EXPECT_EQ(page.parent_block_hash, parent) << "page " << i << " chains to the one before";
+        parent = page.block_hashes.front();
+    }
+    const auto& checkpoint = std::get<KvBlockStoredEvent>(events[3]);
+    EXPECT_EQ(checkpoint.group_idx, 1);
+    EXPECT_EQ(checkpoint.attn_kind, AttnKind::kState);
+    EXPECT_EQ(checkpoint.token_ids, (std::vector<std::int32_t>{5, 6}));
+    EXPECT_EQ(checkpoint.block_hashes.front(), *parent) << "the checkpoint closes the last page";
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    // A longer prompt over the same prefix resumes at the published checkpoint.
+    Submit(RequestSpec{.request_id = "again", .tokens = {1, 2, 3, 4, 5, 6, 7, 8}});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6) << "resumes at the checkpoint the State group published";
+}
+
+class WindowKvCacheEventTestSuite : public HybridKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = HybridKvCacheEventTestSuite::MakeConfig();
+        CacheGroupConfig window = cfg.cache_groups.front();
+        window.group_id = "sliding_attention";
+        window.attn_kind = AttnKind::kSlidingWindow;
+        window.sliding_window_tokens = 2;
+        cfg.cache_groups.push_back(std::move(window));
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// A sliding-window group names its window on every store it publishes.
+TEST_F(WindowKvCacheEventTestSuite, AWindowGroupNamesItsWindow) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3, 4}});
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    SendFinish("r1");
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    std::size_t window_stores = 0;
+    for (const KvCacheEvent& event : events) {
+        const auto& stored = std::get<KvBlockStoredEvent>(event);
+        if (stored.attn_kind != AttnKind::kSlidingWindow) {
+            EXPECT_FALSE(stored.sliding_window.has_value());
+            continue;
+        }
+        ++window_stores;
+        EXPECT_EQ(stored.group_idx, 2);
+        EXPECT_EQ(KvCacheSpecKind(stored.attn_kind), "sliding_window");
+        EXPECT_EQ(stored.sliding_window, std::optional<std::int32_t>{2});
+        EXPECT_EQ(stored.block_size, PrefixGranularity());
+    }
+    EXPECT_GE(window_stores, 1u);
 }
 
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
@@ -473,7 +591,7 @@ protected:
     }
 };
 
-TEST_F(MultiGroupKvCacheEventTestSuite, PublishesOneEventAfterAllGroupsCacheBoundary) {
+TEST_F(MultiGroupKvCacheEventTestSuite, PublishesOneEventPerGroupThatCachesTheBoundary) {
     Submit(MakeRequestSpec("r1", 1));
     PlanOnce();
     SendForwardDone("r1", {42});
@@ -481,8 +599,15 @@ TEST_F(MultiGroupKvCacheEventTestSuite, PublishesOneEventAfterAllGroupsCacheBoun
     SendFinish("r1");
 
     std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
-    ASSERT_EQ(events.size(), 1u);
-    EXPECT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    ASSERT_EQ(events.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[1]));
+    const auto& first = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& second = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(first.group_idx, 0);
+    EXPECT_EQ(second.group_idx, 1);
+    EXPECT_EQ(first.block_hashes, second.block_hashes) << "one boundary, one hash, once per group";
+    EXPECT_EQ(first.token_ids, second.token_ids);
 }
 
 class SubpageKvCacheEventTestSuite : public SchedulerKvCacheEventTestSuite {
@@ -690,30 +815,34 @@ protected:
 // against what they have already received, so a child arriving ahead of its
 // parent is dropped.
 TEST_F(SkewedGroupPrefillKvCacheEventTestSuite, RepublishedRunEmitsStoredParentFirst) {
-    // seed publishes a three-boundary chain; the evictions below strip it
-    // from its suffix.
+    // seed publishes a three-boundary chain, once per group; the evictions
+    // below strip it from its suffix.
     RequestSpec seed = MakeRequestSpec("seed", 3);
     RunPrefill(seed, /*ack=*/true);
-    std::vector<std::uint64_t> chain_hashes;
+    std::vector<std::uint64_t> chain_hashes;  // the coarse group's chain
+    std::vector<std::uint64_t> fine_chain;
     for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
         ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(event));
-        chain_hashes.push_back(std::get<KvBlockStoredEvent>(event).block_hashes.front());
+        const auto& stored = std::get<KvBlockStoredEvent>(event);
+        (stored.group_idx == 0 ? fine_chain : chain_hashes).push_back(stored.block_hashes.front());
     }
     ASSERT_EQ(chain_hashes.size(), 3u);
+    EXPECT_EQ(fine_chain, chain_hashes) << "one hash per boundary, in every group";
 
     // filler1's admission evicts across the groups' skewed ranks, taking the
     // chain's fine-group pages and some coarse residues from the back. The
-    // first two boundaries come out partially resident: reported removed,
-    // descriptors kept.
+    // first two boundaries lose their fine-group copies: reported removed
+    // by that group, descriptors kept.
     RunPrefill(MakeRequestSpec("filler1", 2, 100), /*ack=*/true);
-    std::unordered_set<std::uint64_t> removed;
+    std::set<std::pair<std::int32_t, std::uint64_t>> removed;
     for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
         if (std::holds_alternative<KvBlockRemovedEvent>(event)) {
-            removed.insert(std::get<KvBlockRemovedEvent>(event).block_hashes.front());
+            const auto& removal = std::get<KvBlockRemovedEvent>(event);
+            removed.emplace(removal.group_idx, removal.block_hashes.front());
         }
     }
-    EXPECT_TRUE(removed.contains(chain_hashes[0]));
-    EXPECT_TRUE(removed.contains(chain_hashes[1]));
+    EXPECT_TRUE(removed.contains({0, chain_hashes[0]}));
+    EXPECT_TRUE(removed.contains({0, chain_hashes[1]}));
 
     // No drain from here on: the window covers everything below, as one
     // production round covers one admission that evicts and one that
@@ -726,19 +855,32 @@ TEST_F(SkewedGroupPrefillKvCacheEventTestSuite, RepublishedRunEmitsStoredParentF
     dup.tokens = seed.tokens;
     RunPrefill(dup, /*ack=*/false);
 
-    // The drain must order the chain's Stored events parent-first even
-    // though the evictions marked it child-first.
-    std::vector<std::uint64_t> stored_order;
+    // The drain must order each group's Stored events of the chain
+    // parent-first even though the evictions marked it child-first.
+    std::map<std::int32_t, std::vector<std::uint64_t>> stored_order;
     for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
         if (!std::holds_alternative<KvBlockStoredEvent>(event)) {
             continue;
         }
-        const std::uint64_t hash = std::get<KvBlockStoredEvent>(event).block_hashes.front();
+        const auto& stored = std::get<KvBlockStoredEvent>(event);
+        const std::uint64_t hash = stored.block_hashes.front();
         if (std::find(chain_hashes.begin(), chain_hashes.end(), hash) != chain_hashes.end()) {
-            stored_order.push_back(hash);
+            stored_order[stored.group_idx].push_back(hash);
         }
     }
-    EXPECT_EQ(stored_order, chain_hashes);
+    // The fine group lost every copy and republishes the whole chain; the
+    // coarse group republishes what it lost, in chain order.
+    ASSERT_TRUE(stored_order.contains(0));
+    EXPECT_EQ(stored_order.at(0), chain_hashes);
+    for (const auto& [group, order] : stored_order) {
+        std::vector<std::size_t> depths;
+        for (const std::uint64_t hash : order) {
+            depths.push_back(static_cast<std::size_t>(
+                std::distance(chain_hashes.begin(), std::find(chain_hashes.begin(), chain_hashes.end(), hash))));
+        }
+        EXPECT_TRUE(std::ranges::is_sorted(depths)) << "group " << group << " stores parent-first";
+        EXPECT_EQ(std::set(depths.begin(), depths.end()).size(), depths.size()) << "group " << group << " stores once";
+    }
 }
 
 // A full and a sliding group whose window (six tokens over four-token pages)
@@ -768,18 +910,21 @@ protected:
         return cfg;
     }
 
-    // Applies a drain to the boundaries the feed reports stored: a removal
-    // names one stored before, and none is stored twice.
+    // Applies a drain to the boundaries the feed reports stored, per group:
+    // a removal names one its group stored before, and no group stores one
+    // twice.
     void Drain() {
         for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
             if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
                 for (const std::uint64_t hash : removed->block_hashes) {
-                    EXPECT_EQ(stored_.erase(hash), 1u) << "a removal names a boundary never stored";
+                    EXPECT_EQ(stored_.erase({removed->group_idx, hash}), 1u)
+                        << "a removal names a boundary never stored";
                 }
                 continue;
             }
             const auto& stored = std::get<KvBlockStoredEvent>(event);
-            EXPECT_TRUE(stored_.emplace(stored.block_hashes.front(), stored.token_ids).second)
+            EXPECT_TRUE(
+                stored_.emplace(std::make_pair(stored.group_idx, stored.block_hashes.front()), stored.token_ids).second)
                 << "a boundary is stored twice";
         }
     }
@@ -788,11 +933,12 @@ protected:
         Drain();
         return plan;
     }
+    // Whether some group reports the boundary stored.
     bool Stored(const std::vector<std::int32_t>& tokens) const {
         return std::ranges::any_of(stored_, [&tokens](const auto& entry) { return entry.second == tokens; });
     }
 
-    std::map<std::uint64_t, std::vector<std::int32_t>> stored_;
+    std::map<std::pair<std::int32_t, std::uint64_t>, std::vector<std::int32_t>> stored_;
 };
 
 // r = [1..8] is retracted at frontier 11 (plan 5), leaving its published

@@ -96,11 +96,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("block_hashes", &tokenspeed::KvBlockStoredEvent::block_hashes)
         .def_ro("parent_block_hash", &tokenspeed::KvBlockStoredEvent::parent_block_hash)
         .def_ro("token_ids", &tokenspeed::KvBlockStoredEvent::token_ids)
-        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size);
+        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size)
+        .def_ro("group_idx", &tokenspeed::KvBlockStoredEvent::group_idx)
+        .def_prop_ro("kv_cache_spec_kind",
+                     [](const tokenspeed::KvBlockStoredEvent& event) {
+                         return std::string(tokenspeed::KvCacheSpecKind(event.attn_kind));
+                     })
+        .def_ro("kv_cache_spec_sliding_window", &tokenspeed::KvBlockStoredEvent::sliding_window);
 
     nb::class_<tokenspeed::KvBlockRemovedEvent>(kv_event, "BlockRemoved")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockRemovedEvent&) { return "BlockRemoved"; })
-        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes);
+        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes)
+        .def_ro("group_idx", &tokenspeed::KvBlockRemovedEvent::group_idx);
 
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 

@@ -1483,16 +1483,19 @@ Its responsibilities:
   rank even when no Host checkpoint remains below it.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
-  prefix event. Whether a scheduler-level boundary is fully, partially, or not
-  resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
-  the group indexes), so the scheduler keeps no residency counters of its own
-  — only the token descriptor the event carries and whether that event is
-  currently out. A mutation only marks its boundary for reconcile;
-  `DrainKvEvents` reconciles each marked boundary against its residency and
-  reports the net change (published exactly while fully resident), then drops
-  descriptors of boundaries with no cached child. Nothing is decided
-  mid-`Admit`, so one admission may evict a boundary's last cached copy and
-  then store the request's own copy without any ordering hazard.
+  prefix event per group. Whether a group holds a scheduler-level boundary
+  fully, partially, or not at all is the coordinator's answer
+  (`GroupDeviceBoundaryResidency`, read off the group's index), so the
+  scheduler keeps no residency counters of its own — only the token
+  descriptor the event carries and which groups' events are currently out.
+  A mutation only marks its boundary for reconcile; `DrainKvEvents`
+  reconciles each marked boundary against every group's residency and
+  reports the net change per group (a group's `BlockStored` is out exactly
+  while that group holds the boundary; the event names the group and its
+  attention kind, the block hashes are the boundary's in every group), then
+  drops descriptors of boundaries no group holds a child of. Nothing is
+  decided mid-`Admit`, so one admission may evict a boundary's last cached
+  copy and then store the request's own copy without any ordering hazard.
   Admission may pre-hash prompt pages beyond the computed prefix. An early
   junction or retraction tail uses the parent hash at its published frontier,
   even when the request's hash memo already contains later pages.

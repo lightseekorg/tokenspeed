@@ -58,11 +58,122 @@ def test_kv_event_batch_msgpack_shape_is_dynamo_compatible() -> None:
 
     decoded = msgspec.msgpack.decode(payload)
 
+    # Every slot of the reference publisher's layout is written; the ones
+    # this engine does not fill ride as None.
     assert decoded == [
         1.5,
         [
-            ["BlockStored", [123], None, [1, 2], 2],
-            ["BlockRemoved", [123]],
+            [
+                "BlockStored",
+                [123],
+                None,
+                [1, 2],
+                2,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+            ["BlockRemoved", [123], None, None],
         ],
         2,
     ]
+
+
+def test_kv_events_name_their_cache_group() -> None:
+    """A hybrid model's groups publish the same boundary each under its own
+    group: the History chain, the State checkpoint (``mamba``) and the window;
+    the group slots sit after four unused ones, where the reference consumer
+    reads them."""
+    payload = msgspec.msgpack.encode(
+        KVEventBatch(
+            ts=1.5,
+            events=[
+                BlockStored(
+                    block_hashes=[123],
+                    parent_block_hash=None,
+                    token_ids=[1, 2],
+                    block_size=2,
+                    group_idx=0,
+                    kv_cache_spec_kind="full_attention",
+                ),
+                BlockStored(
+                    block_hashes=[123],
+                    parent_block_hash=None,
+                    token_ids=[1, 2],
+                    block_size=2,
+                    group_idx=1,
+                    kv_cache_spec_kind="mamba",
+                ),
+                BlockStored(
+                    block_hashes=[123],
+                    parent_block_hash=None,
+                    token_ids=[1, 2],
+                    block_size=2,
+                    group_idx=2,
+                    kv_cache_spec_kind="sliding_window",
+                    kv_cache_spec_sliding_window=512,
+                ),
+                BlockRemoved(block_hashes=[123], group_idx=1),
+            ],
+            attn_dp_rank=0,
+        )
+    )
+
+    decoded = msgspec.msgpack.decode(payload)
+
+    assert decoded == [
+        1.5,
+        [
+            [
+                "BlockStored",
+                [123],
+                None,
+                [1, 2],
+                2,
+                None,
+                None,
+                None,
+                None,
+                0,
+                "full_attention",
+                None,
+            ],
+            [
+                "BlockStored",
+                [123],
+                None,
+                [1, 2],
+                2,
+                None,
+                None,
+                None,
+                None,
+                1,
+                "mamba",
+                None,
+            ],
+            [
+                "BlockStored",
+                [123],
+                None,
+                [1, 2],
+                2,
+                None,
+                None,
+                None,
+                None,
+                2,
+                "sliding_window",
+                512,
+            ],
+            ["BlockRemoved", [123], None, 1],
+        ],
+        0,
+    ]
+    typed = msgspec.msgpack.decode(payload, type=KVEventBatch)
+    assert [event.group_idx for event in typed.events] == [0, 1, 2, 1]
+    assert typed.events[2].kv_cache_spec_sliding_window == 512

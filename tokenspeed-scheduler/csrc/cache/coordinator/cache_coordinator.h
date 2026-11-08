@@ -946,6 +946,13 @@ public:
     // content hash identify the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
+    // The same for one group: the keys group i holds for the boundary
+    // (ForEachBoundaryKey restricted to it) against its Device entries. A
+    // State group has one key, a checkpoint boundary's; a replayable group
+    // has none and reads kNone.
+    BoundaryResidency GroupDeviceBoundaryResidency(std::int32_t i, const CacheKey& boundary,
+                                                   std::int32_t tail_tokens) const;
+    const CacheGroupSpec& GroupSpec(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Spec(); }
     // Whether every State group caches its checkpoint published under the
     // chain hash content_hash, on the Device or the Host, as the probe takes
     // each from whichever tier holds it (false for a model without State
