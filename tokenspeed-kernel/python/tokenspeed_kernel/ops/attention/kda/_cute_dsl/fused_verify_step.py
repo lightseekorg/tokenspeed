@@ -625,6 +625,40 @@ def fused_verify_step_supported(
     )
 
 
+def _check_records(
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
+    batch: int,
+    correction_cache: torch.Tensor,
+) -> None:
+    """Raise ValueError unless the replay records are laid out as the kernel reads them.
+
+    The metadata must be dense INT64 ``[batch, 3]`` and the stamps dense INT64
+    ``[slots, capacity, 2]``, both on the cache's device.
+    """
+    if (record_metadata is None) != (record_stamps is None):
+        raise ValueError("record metadata and stamps must be supplied together")
+    if record_metadata is None:
+        return
+    if record_metadata.shape != (batch, 3) or record_stamps.shape != (
+        correction_cache.shape[0],
+        correction_cache.shape[2],
+        2,
+    ):
+        raise ValueError(
+            "replay metadata needs [batch, 3] and stamps [slots, capacity, 2]"
+        )
+    if any(
+        x.dtype != torch.int64
+        or not x.is_contiguous()
+        or x.device != correction_cache.device
+        for x in (record_metadata, record_stamps)
+    ):
+        raise ValueError(
+            "replay metadata and stamps must be contiguous INT64 on the input device"
+        )
+
+
 def fused_verify_step(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -686,7 +720,9 @@ def fused_verify_step(
         ``out``.
 
     Raises:
-        ValueError: If ``fused_verify_step_supported`` rejects the inputs.
+        ValueError: If ``fused_verify_step_supported`` rejects the inputs, or
+            the record metadata and stamps are not dense INT64 views of the
+            record layout.
     """
     if mixed_qkv.shape[0] == 0:
         return out
@@ -705,6 +741,9 @@ def fused_verify_step(
         lower_bound,
     ):
         raise ValueError("CuTe DSL fused KDA verify step cannot address these inputs")
+    _check_records(
+        record_metadata, record_stamps, state_indices.shape[0], correction_cache
+    )
     bounded = lower_bound is not None
     kernel = _compile(
         num_heads,
