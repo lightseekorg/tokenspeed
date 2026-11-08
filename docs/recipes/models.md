@@ -1164,8 +1164,10 @@ object:
 ```
 
 - `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
-  FP8 to save memory. Omit it to store the table in the model's compute
-  dtype.
+  FP8 to save memory, quantizing a BF16 table per row at load. When omitted,
+  the table keeps the checkpoint's format: checkpoints that ship it in FP8,
+  such as `Qwen/Qwen3.8-Flash-Next-FP8` and `nvidia/Qwen3.8-Flash-Next-NVFP4`,
+  keep it in FP8, and other checkpoints store it in the model's compute dtype.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
   or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
   NVIDIA CUDA and disables it on other platforms.
