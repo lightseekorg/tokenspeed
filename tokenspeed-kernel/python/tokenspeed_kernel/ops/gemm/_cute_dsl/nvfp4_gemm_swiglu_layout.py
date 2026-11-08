@@ -25,7 +25,7 @@ from __future__ import annotations
 import torch
 
 
-def swizzle_blockscale_2d(scales):
+def swizzle_blockscale_2d(scales: torch.Tensor) -> torch.Tensor:
     """Swizzle 2D FP8 block scales for CUTLASS."""
     M, K = scales.shape
 
