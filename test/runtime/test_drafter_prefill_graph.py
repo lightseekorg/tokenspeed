@@ -342,7 +342,7 @@ def test_the_prefill_graph_reports_the_rows_a_full_capture_stores(taps) -> None:
     graph._reserve_outputs(prefill_graph_module._output_spec(outputs))
 
     processor = LogitsProcessor(
-        config=PretrainedConfig(vocab_size=VOCAB), dp_lm_head_tp=False
+        attn_tp_size=1, config=PretrainedConfig(vocab_size=VOCAB), dp_lm_head_tp=False
     )
     stored = processor(
         input_ids=None,

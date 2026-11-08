@@ -130,6 +130,7 @@ def test_loaded_output_vocabulary_matches_runtime(actual, expected, tp_size):
     )
     model.logits_processor = LogitsProcessor(
         PretrainedConfig(vocab_size=actual),
+        attn_tp_size=tp_size,
         tp_rank=0,
         tp_size=tp_size,
         tp_group=tuple(range(tp_size)),

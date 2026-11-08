@@ -825,6 +825,7 @@ def test_scaled_softcapped_tp_logits_match_scaling_before_the_gather(
             model_type="test", vocab_size=64, final_logit_softcapping=softcap
         )
         proc = LogitsProcessor(
+            attn_tp_size=2,
             config=config,
             skip_all_gather=False,
             do_argmax=False,
@@ -874,6 +875,7 @@ def test_a_forward_whose_taps_went_to_the_sink_returns_no_capture(
     from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
     processor = LogitsProcessor(
+        attn_tp_size=1,
         config=SimpleNamespace(model_type="test", vocab_size=4),
         skip_all_gather=True,
         do_argmax=False,
