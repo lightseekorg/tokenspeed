@@ -3008,7 +3008,7 @@ class _DeepseekV41LogitsProcessor(LogitsProcessor):
     def _project_logits(
         self,
         hidden_states: torch.Tensor,
-        lm_head: VocabParallelEmbedding,
+        lm_head: VocabParallelEmbedding | ReplicatedLinear,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         # V4.1 has no logit softcap. Masking this rank's raw head shard covers
