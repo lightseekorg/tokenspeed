@@ -26,6 +26,30 @@ import torch
 
 
 def reference(q, k, v, slots, positions, ids, *, attention_scale, k_scale, v_scale):
+    """Evaluate selected rows with explicit Q/P FP8 rounding and FP32 accumulation.
+
+    Uses per-head maxabs/448 Q scales and 128-token online-softmax tiles with
+    FP8-rounded probabilities. The caller configures IEEE matmul precision;
+    this function does not change global precision settings.
+
+    Args:
+        q: Queries [rows, 12 * kv_heads, 256], converted to FP32 before quantizing.
+        k: Key-cache values [cache_slots, kv_heads, 256].
+        v: Value-cache values with the same shape as k.
+        slots: Physical slots [rows, 2051]. Complete four-token blocks occupy
+            the prefix (up to 2048 entries); up to three causal tail tokens
+            occupy columns starting at 2048. Nonpositive slots are masked.
+        positions: Zero-based query positions [rows], bounding each row's
+            complete-block prefix and tail; negative positions give empty rows.
+        ids: One-dimensional indices of the query rows to evaluate, in output order.
+        attention_scale: Scalar multiplier for query-key scores.
+        k_scale: Scalar key-cache descale applied to scores.
+        v_scale: Scalar value-cache descale applied to the normalized output.
+
+    Returns:
+        FP32 attention values [len(ids), 12 * kv_heads, 256], with zero for
+        fully masked rows. Final BF16 rounding is left to the caller.
+    """
     kv_heads = k.shape[1]
     queries = q[ids].float().reshape(len(ids), kv_heads, 12, 256)
     selected, pos = slots[ids], positions[ids]

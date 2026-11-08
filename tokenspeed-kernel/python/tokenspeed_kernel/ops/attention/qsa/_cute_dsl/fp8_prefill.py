@@ -61,7 +61,15 @@ _SWIZZLE_ROWS = 8
 
 
 class _Fp8SparsePrefill:
+    """FP8 attention for 256-wide heads, with twelve Q heads per KV head.
+
+    Each CTA owns one query/KV head and processes 128-token tiles with sixteen
+    padded head columns. Shared memory holds separate 32 KiB K/V stages and
+    4 KiB Q/P operands; TMEM holds the FP32 QK and PV fragments.
+    """
+
     def __init__(self, kv_heads: int, pdl: bool):
+        """Fix the KV-head count and PDL policy for this compiled specialization."""
         self.kv_heads: int = kv_heads
         self.pdl: bool = pdl
 
@@ -83,6 +91,12 @@ class _Fp8SparsePrefill:
         vs: Float32,
         stream: CUstream,
     ):
+        """Build runtime tensor maps and launch one CTA per query/KV head.
+
+        Row counts, metadata strides and scales remain runtime inputs. ``scale``
+        is the attention scale times log2(e); ``ks`` and ``vs`` are KV descales.
+        The launch writes the supplied output on ``stream`` without changing Q/K/V.
+        """
         dk = tmap.create_tensor_map_tiled(
             global_address=k.iterator.toint(),
             dtype=Float8E4M3FN,
@@ -113,6 +127,7 @@ class _Fp8SparsePrefill:
 
     @cute.jit
     def vector(self, base, offset, size: cutlass.Constexpr):
+        """View shared FP8 bytes at an offset aligned to ``size``, without copying."""
         return cute.make_tensor(
             cute.make_ptr(
                 Float8E4M3FN,
@@ -134,6 +149,12 @@ class _Fp8SparsePrefill:
         tid: Int32,
         plane: cutlass.Constexpr,
     ):
+        """Collectively enqueue a 128-token gather into the selected shared plane.
+
+        Arm ``barrier`` for one K/V stage; nonpositive slots are zero-filled.
+        The caller issues K then V, waiting on phases 0 then 1 each iteration,
+        and must finish the plane's previous MMA reads before reusing it.
+        """
         if tid == 0:
             prims.mbarrier_arrive_expect_tx(barrier, Int32(_KV_STAGE_BYTES))
         cute.arch.sync_threads()
@@ -175,6 +196,11 @@ class _Fp8SparsePrefill:
         complete: Int32,
         count: Int32,
     ):
+        """Read a compact token's physical slot, or return -1 beyond ``count``.
+
+        The first ``complete`` tokens read prefix columns directly; remaining
+        tokens read tail columns starting at 2048. ``stride`` counts int32 slots.
+        """
         slot = Int64(-1)
         if token < count:
             column = token if token < complete else 2048 + token - complete
@@ -205,6 +231,12 @@ class _Fp8SparsePrefill:
         ks: Float32,
         vs: Float32,
     ):
+        """Compute one query/KV head with FP8 QK/PV and FP32 online softmax.
+
+        Overlap alternating K/V gathers with QK/PV MMA, then write BF16 output;
+        fully masked rows produce zero. PDL waits precede input reads and the
+        completion signal follows output stores and TMEM release.
+        """
         row, group, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         lane = tid % 32
