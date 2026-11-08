@@ -477,6 +477,7 @@ fn output_slim() {
     );
     assert_eq!(rows[0].output_token_logprobs, [-0.5, -1.25]);
     assert!(rows[0].output_token_cumulative_probs.is_empty());
+    assert_eq!(rows[0].reasoning_tokens, 0);
     assert_eq!(
         (rows[1].finish_reason, rows[1].completion_tokens),
         (Some("stop"), 9)
@@ -523,6 +524,7 @@ fn no_tail() -> BatchTokenIDOutSlim {
         output_token_logprobs_val: vec![],
         output_token_logprobs_idx: vec![],
         output_token_cumulative_probs_val: vec![],
+        reasoning_tokens: vec![],
         engine_index: 0,
         num_running: 0,
         num_waiting: 0,
@@ -584,6 +586,7 @@ fn output_slim_tail() {
         output_top_logprobs_val: vec![vec![vec![-0.25, -3.0]], vec![]],
         output_top_logprobs_idx: vec![vec![vec![7, 1]], vec![]],
         output_token_cumulative_probs_val: vec![vec![0.75], vec![]],
+        reasoning_tokens: vec![1, 0],
         ..no_tail()
     };
     let frames = fixture("output_slim_tail");
@@ -600,6 +603,12 @@ fn output_slim_tail() {
     assert_eq!(rows[0].accept_draft_tokens, Some(1.5));
     assert_eq!(rows[0].output_token_cumulative_probs, [0.75]);
     assert!(rows[1].output_token_cumulative_probs.is_empty());
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.reasoning_tokens)
+            .collect::<Vec<_>>(),
+        [1, 0]
+    );
     assert_eq!(
         rows[0].input_token_logprobs,
         Some((&[None, Some(-1.0), Some(-2.5)][..], &[1, 2, 3][..]))

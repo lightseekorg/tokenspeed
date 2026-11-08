@@ -572,11 +572,11 @@ with the logits output.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). |
+| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). The engine also uses its single-token block markers to emit cumulative `reasoning_tokens` in output batches, independently of `--grammar-backend`; parsers without known markers report zero. |
 | `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
 
 Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
-`deepseek_r1`, and `deepseek_v31`. Common tool-call parser values include
+`deepseek_r1`, `deepseek_v31`, and `deepseek_v41`. Common tool-call parser values include
 `kimik2`, `qwen`, `deepseek_v4`, `json`, and `passthrough`. The SMG gateway
 validates the parser names, so use the values accepted by the bundled
 `tokenspeed-smg` package.

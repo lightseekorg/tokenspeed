@@ -408,6 +408,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             multimodal: false,
             grammar: false,
             reasoning: None,
+            reasoning_usage: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
