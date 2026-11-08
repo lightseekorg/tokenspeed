@@ -27,10 +27,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from itertools import accumulate
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_cp_metadata
+from tokenspeed_kernel.ops.attention.dsa import dsa_cp_metadata
 
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 
@@ -56,7 +57,7 @@ class AscendPrefillCache:
 
 
 @dataclass(frozen=True)
-class AscendPrefillGatherPlan:
+class PrefillGatherMetadata:
     """Compact batch pages from the scheduler's existing host table, once per batch."""
 
     table: torch.Tensor
@@ -160,7 +161,7 @@ def ascend_prefill_store(workspace, plan, placement, *, kernel_page_size):
 
 
 @dataclass(frozen=True)
-class AscendPrefillPlan:
+class PrefillCacheMetadata:
     """Receive pages and current rows for one native Prefill batch.
 
     projection_row_counts partitions producer inputs over cache owners.
@@ -172,15 +173,10 @@ class AscendPrefillPlan:
     query_start: int
     query_end: int
     page_table: torch.Tensor
-    index_table: torch.Tensor
-    query_cu: torch.Tensor
-    key_cu: torch.Tensor
-    query_seq: torch.Tensor
-    scan_count: torch.Tensor
     current_direct: torch.Tensor
-    cold: bool
-    gather: AscendPrefillGatherPlan | None = None
-    patch_slots: torch.Tensor | None = None
+    has_history: bool
+    history_gather: PrefillGatherMetadata
+    patch_slots: torch.Tensor
 
     @classmethod
     def build(
@@ -191,7 +187,6 @@ class AscendPrefillPlan:
         degree,
         rank,
         page_size,
-        topk,
         local_cache_pages,
         query_partition=None,
         page_table_cpu=None,
@@ -225,7 +220,7 @@ class AscendPrefillPlan:
             offset += extent
         table = metadata.page_table
         per_block = 1 if placement is None else placement.block_granularity // page_size
-        gather = AscendPrefillGatherPlan.build(
+        gather = PrefillGatherMetadata.build(
             table if table.device.type == "cpu" else page_table_cpu,
             extends,
             prefixes,
@@ -276,66 +271,27 @@ class AscendPrefillPlan:
                 tail_page = history_pages + (owner * send_rows + offset) // page_size
                 mapped[req] = torch.where(alias, tail_page, mapped[req]).int()
                 token = torch.arange(cumulative[req], cumulative[req + 1])
-                if patch_slots is not None:
-                    position = prefix[req] + token - cumulative[req]
-                    page = gather.table[req, position // page_size].long()
-                    patch_slots[token] = torch.where(
-                        page > 0, page * page_size + position % page_size, -1
-                    )
+                position = prefix[req] + token - cumulative[req]
+                page = gather.table[req, position // page_size].long()
+                patch_slots[token] = torch.where(
+                    page > 0, page * page_size + position % page_size, -1
+                )
                 direct[cumulative[req] : cumulative[req + 1]] = location(token)[2].to(
                     torch.uint8
                 )
-            ends = (
-                (first + count - cumulative[:-1])
-                .clamp_min(0)
-                .minimum(cumulative[1:] - cumulative[:-1])
-            )
-            qcu = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.int64),
-                    (cumulative[1:] - first).clamp(0, count),
-                )
-            )
-            kcu = torch.cat(
-                (torch.zeros(1, dtype=torch.int64), (prefix + ends).cumsum(0))
-            )
-            token = torch.arange(first, first + count)
-            sequence = torch.searchsorted(cumulative[1:], token, right=True)
-            scan = (prefix[sequence] + token - cumulative[sequence] + 1).clamp_max(topk)
-            sequence, scan = sequence.int(), scan.int()
             active_mask = (
                 (cumulative[:-1] < first + count)
                 & (cumulative[1:] > first)
                 & (cumulative[1:] > cumulative[:-1])
             )
             mapped = mapped[active_mask]
-            sequence = (active_mask.int().cumsum(0)[sequence.long()] - 1).int()
-            qcu = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.int64),
-                    (torch.diff(qcu)[active_mask]).cumsum(0),
-                )
-            )
-            kcu = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.int64),
-                    (torch.diff(kcu)[active_mask]).cumsum(0),
-                )
-            )
 
         else:
-            from tokenspeed_kernel.ops.attention.dsa.ascend import (
-                ascend_prefill_cache_metadata,
+            from tokenspeed_kernel.ops.attention.ascend_prefill import (
+                prefill_cache_layout,
             )
 
-            (
-                mapped,
-                qcu,
-                kcu,
-                sequence,
-                scan,
-                direct,
-            ) = ascend_prefill_cache_metadata(
+            mapped, direct = prefill_cache_layout(
                 table,
                 metadata.cum_extend_seq_lens,
                 metadata.extend_prefix_lens,
@@ -347,7 +303,6 @@ class AscendPrefillPlan:
                 local_pages=local_cache_pages,
                 send_rows=send_rows,
                 page_size=page_size,
-                topk=topk,
                 active_requests=active,
                 history_table=gather.table,
                 patch_slots=patch_slots,
@@ -358,16 +313,67 @@ class AscendPrefillPlan:
             first,
             first + count,
             mapped,
-            mapped,
-            qcu,
-            kcu,
-            sequence,
-            scan,
             direct,
-            not any(prefixes),
+            any(prefixes),
             gather,
             patch_slots,
         )
+
+
+@dataclass(frozen=True)
+class DSAPrefillQueryMetadata:
+    """Causal query rows consumed only by the DSA indexer and sparse core."""
+
+    query_cu: torch.Tensor
+    key_cu: torch.Tensor
+    query_seq: torch.Tensor
+    scan_count: torch.Tensor
+
+    @classmethod
+    def build(cls, metadata, layout, *, topk):
+        first, end = layout.query_start, layout.query_end
+        rows = end - first
+        extends = metadata.extend_seq_lens_cpu.tolist()
+        cumulative_cpu = torch.tensor(
+            list(accumulate(extends, initial=0)), dtype=torch.int64
+        )
+        active = (cumulative_cpu[:-1] < end) & (cumulative_cpu[1:] > first)
+        active &= cumulative_cpu[1:] > cumulative_cpu[:-1]
+        if metadata.page_table.device.type != "cpu":
+            from tokenspeed_kernel.ops.attention.dsa import dsa_prefill_query_metadata
+
+            return cls(
+                *dsa_prefill_query_metadata(
+                    metadata.cum_extend_seq_lens,
+                    metadata.extend_prefix_lens,
+                    first=first,
+                    rows=rows,
+                    topk=topk,
+                    active_requests=int(active.sum()),
+                )
+            )
+        cumulative = metadata.cum_extend_seq_lens.long()
+        prefix = metadata.extend_prefix_lens.long()
+        ends = (
+            (end - cumulative[:-1])
+            .clamp_min(0)
+            .minimum(cumulative[1:] - cumulative[:-1])
+        )
+        qcu = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), (cumulative[1:] - first).clamp(0, rows))
+        )
+        kcu = torch.cat((torch.zeros(1, dtype=torch.int64), (prefix + ends).cumsum(0)))
+        token = torch.arange(first, end)
+        sequence = torch.searchsorted(cumulative[1:], token, right=True)
+        scan = (prefix[sequence] + token - cumulative[sequence] + 1).clamp_max(topk)
+        sequence = (active.int().cumsum(0)[sequence] - 1).int()
+        qcu = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), torch.diff(qcu)[active].cumsum(0))
+        )
+        kcu = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), torch.diff(kcu)[active].cumsum(0))
+        )
+        return cls(qcu, kcu, sequence, scan.int())
 
 
 class AscendDCPContext:
@@ -786,7 +792,7 @@ class AscendDCPMetadata:
             self.seq_lens if query_group_size > 1 else None,
         )
         index = self._indexer_metadata
-        ascend_dsa_cp_metadata(
+        dsa_cp_metadata(
             page_table,
             seq_lens,
             page_size=page_size,

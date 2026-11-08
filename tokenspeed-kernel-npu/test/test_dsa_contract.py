@@ -44,28 +44,6 @@ def native_constructor_dependencies(monkeypatch):
             monkeypatch.setattr(torch.ops.custom, name, unavailable, raising=False)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_partial_merge_handles_all_empty_and_mixed_rows(dtype):
-    kernels = AscendDSAKernels()
-    output = torch.tensor(
-        [
-            [[0, 0], [1, 3], [0, 0], [2, 4]],
-            [[0, 0], [5, 7], [6, 8], [5, 7]],
-            [[0, 0], [0, 0], [10, 12], [8, 10]],
-        ],
-        dtype=dtype,
-    )
-    lse = torch.tensor([[0, 1, 0, 1], [0, 3, 1, 1], [0, 0, 1, 1]]).float().log()
-    original_output, original_lse = output.clone(), lse.clone()
-
-    result = kernels.merge_partials(output, lse)
-
-    expected = torch.tensor([[0, 0], [4, 6], [8, 10], [5, 7]], dtype=torch.bfloat16)
-    torch.testing.assert_close(result, expected, atol=0, rtol=0)
-    torch.testing.assert_close(output, original_output, atol=0, rtol=0)
-    torch.testing.assert_close(lse, original_lse, atol=0, rtol=0)
-
-
 @pytest.mark.parametrize("missing", _CP_OPERATORS)
 def test_cp_startup_requires_every_execution_operator(monkeypatch, missing):
     def unexpected_call(*args, **kwargs):

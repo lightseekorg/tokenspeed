@@ -49,11 +49,87 @@ class PrefillWorkspace:
         )
 
 
-def ascend_prefill_kernels():
-    # This fixed packed layout belongs to the Ascend backend, not a portable op.
-    from tokenspeed_kernel_npu.ops import prefill
+def validate_prefill_cache(kv_cache, index_cache, *, ranks, history_group):
+    """Validate the bound pool and native dependency once."""
+    from tokenspeed_kernel_npu.ops.prefill import validate_cache
 
-    return prefill
+    return validate_cache(
+        kv_cache, index_cache, ranks=ranks, history_group=history_group
+    )
+
+
+def gather_prefill_history(
+    layer_id,
+    kv_cache,
+    index_cache,
+    *,
+    ranks,
+    history_group,
+    batch_key,
+    total_rows,
+    history_null_rows,
+    has_history,
+    history_slots,
+    history_counts,
+):
+    """Allocate referenced pages and current rows; submit history once."""
+    from tokenspeed_kernel_npu.ops.prefill import gather_history
+
+    return gather_history(
+        layer_id,
+        kv_cache,
+        index_cache,
+        ranks=ranks,
+        history_group=history_group,
+        batch_key=batch_key,
+        total_rows=total_rows,
+        history_null_rows=history_null_rows,
+        has_history=has_history,
+        history_slots=history_slots,
+        history_counts=history_counts,
+    )
+
+
+def gather_prefill_current(workspace, kv, index_key, *, counts):
+    """Gather the already-ready current planes in one packet."""
+    from tokenspeed_kernel_npu.ops.prefill import gather_current
+
+    return gather_current(workspace, kv, index_key, counts=counts)
+
+
+def snapshot_prefill_write_slots(workspace, slots):
+    """Snapshot authoritative slots once for both cache planes."""
+    from tokenspeed_kernel_npu.ops.prefill import prepare_write_slots
+
+    return prepare_write_slots(workspace, slots)
+
+
+def finish_prefill_workspace(workspace):
+    """Protect queued consumers before the backend releases the workspace."""
+    from tokenspeed_kernel_npu.ops.prefill import finish
+
+    return finish(workspace)
+
+
+def store_gathered_index_keys(
+    workspace, direct, mapped_slots, *, block_rows, virtual_blocks
+):
+    """Store Index-K owner rows and update non-aliasing compact workspace pages."""
+    from tokenspeed_kernel.selection import select_kernel
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    kernel = select_kernel(
+        "attention",
+        "dsa_gathered_index_store",
+        format_signature(index_keys=dense_tensor_format(workspace.index.dtype)),
+    )
+    return kernel(
+        workspace,
+        direct,
+        mapped_slots,
+        block_rows=block_rows,
+        virtual_blocks=virtual_blocks,
+    )
 
 
 DSA_PREFILL_SCHEMAS = {
@@ -83,3 +159,49 @@ def require_dsa_prefill_ops(custom_ops):
                 )
         schemas[name] = actual
     return schemas
+
+
+def prefill_cache_layout(
+    table,
+    cumulative,
+    prefixes,
+    *,
+    first,
+    rows,
+    total,
+    per_block,
+    degree,
+    local_pages,
+    send_rows,
+    page_size,
+    active_requests,
+    history_table=None,
+    patch_slots=None,
+    history_pages=None,
+):
+    """Build common compact Prefill pages and current-row write mappings."""
+    from tokenspeed_kernel.selection import select_kernel
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    kernel = select_kernel(
+        "attention",
+        "prefill_cache_layout",
+        format_signature(input=dense_tensor_format(table.dtype)),
+    )
+    return kernel(
+        table,
+        cumulative,
+        prefixes,
+        first=first,
+        rows=rows,
+        total=total,
+        per_block=per_block,
+        degree=degree,
+        local_pages=local_pages,
+        send_rows=send_rows,
+        page_size=page_size,
+        active_requests=active_requests,
+        history_table=history_table,
+        patch_slots=patch_slots,
+        history_pages=history_pages,
+    )

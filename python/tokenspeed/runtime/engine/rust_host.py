@@ -1597,6 +1597,7 @@ class HostBootstrap:
         if self._memory_sampler is not None:
             self._memory_sampler.stop()
             self._memory_sampler = None
+        self._device.shutdown_attention()
         self._device.shutdown_cache()
 
 

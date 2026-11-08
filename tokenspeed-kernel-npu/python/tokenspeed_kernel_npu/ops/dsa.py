@@ -69,16 +69,27 @@ def _current_page(token, seq_start, seq_end, prefix, total, degree, PAGE: tl.con
     return owner, page_start - owner_start, direct
 
 
-@triton.jit
-def _prefill_metadata(
+@triton.jit(
+    do_not_specialize=[
+        "batch",
+        "columns",
+        "table_stride",
+        "first",
+        "rows",
+        "total",
+        "per_block",
+        "degree",
+        "local_pages",
+        "send_rows",
+        "history_pages",
+        "table_tiles",
+    ]
+)
+def _prefill_cache_layout(
     Table,
     Cum,
     Prefix,
     OutTable,
-    QCu,
-    KCu,
-    QuerySeq,
-    Scan,
     Direct,
     HistoryTable,
     PatchSlots,
@@ -94,8 +105,6 @@ def _prefill_metadata(
     send_rows,
     history_pages,
     table_tiles,
-    query_tiles,
-    TOPK: tl.constexpr,
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
     PACKED_HISTORY: tl.constexpr,
@@ -123,7 +132,9 @@ def _prefill_metadata(
             )
             page_seen += candidate_active.to(tl.int32)
         page_id = tl.load(
-            Table + page_req * table_stride + page_col, page_col < columns, other=0
+            Table + page_req.to(tl.int64) * table_stride + page_col,
+            page_col < columns,
+            other=0,
         ).to(tl.int64)
         page_block = page_id // per_block
         page_positive = tl.maximum(page_block - 1, 0)
@@ -132,7 +143,7 @@ def _prefill_metadata(
         page_mapped = tl.where(page_block > 0, page_owner * local_pages + page_local, 0)
         if PACKED_HISTORY:
             page_mapped = tl.load(
-                HistoryTable + page_req * columns + page_col,
+                HistoryTable + page_req.to(tl.int64) * columns + page_col,
                 page_col < columns,
                 other=0,
             ).to(tl.int64)
@@ -146,55 +157,12 @@ def _prefill_metadata(
         tail_page = history_pages + (tail_owner * send_rows + tail_row) // PAGE
         page_mapped = tl.where(page_direct, tail_page, page_mapped)
         tl.store(
-            OutTable + page_compact * columns + page_col,
+            OutTable + page_compact.to(tl.int64) * columns + page_col,
             page_mapped,
             page_col < columns,
         )
-    elif pid == table_tiles:
-        cu_destination = tl.full((), 1, tl.int32)
-        cu_key_total = tl.full((), 0, tl.int64)
-        for cu_req in range(batch):
-            cu_start = tl.load(Cum + cu_req).to(tl.int64)
-            cu_end = tl.load(Cum + cu_req + 1).to(tl.int64)
-            cu_prefix = tl.load(Prefix + cu_req).to(tl.int64)
-            cu_active = (
-                (cu_start < first + rows) & (cu_end > first) & (cu_end > cu_start)
-            )
-            if cu_active:
-                cu_local_end = tl.minimum(
-                    tl.maximum(first + rows - cu_start, 0), cu_end - cu_start
-                )
-                cu_key_total += cu_prefix + cu_local_end
-                tl.store(
-                    QCu + cu_destination,
-                    tl.minimum(tl.maximum(cu_end - first, 0), rows),
-                )
-                tl.store(KCu + cu_destination, cu_key_total)
-                cu_destination += 1
-        tl.store(QCu, 0)
-        tl.store(KCu, 0)
-    elif pid <= table_tiles + query_tiles:
-        query_local = (pid - table_tiles - 1) * BLOCK + off
-        query_token = first + query_local
-        query_request = tl.full((BLOCK,), 0, tl.int32)
-        query_length = tl.full((BLOCK,), 0, tl.int64)
-        query_seen = tl.full((), 0, tl.int32)
-        for seq_req in range(batch):
-            seq_start = tl.load(Cum + seq_req).to(tl.int64)
-            seq_end = tl.load(Cum + seq_req + 1).to(tl.int64)
-            seq_prefix = tl.load(Prefix + seq_req).to(tl.int64)
-            seq_match = (query_token >= seq_start) & (query_token < seq_end)
-            query_request = tl.where(seq_match, query_seen, query_request)
-            query_seen += (
-                (seq_start < first + rows) & (seq_end > first) & (seq_end > seq_start)
-            ).to(tl.int32)
-            query_length = tl.where(
-                seq_match, seq_prefix + query_token - seq_start + 1, query_length
-            )
-        tl.store(QuerySeq + query_local, query_request, query_local < rows)
-        tl.store(Scan + query_local, tl.minimum(query_length, TOPK), query_local < rows)
     else:
-        current_token = (pid - table_tiles - query_tiles - 1) * BLOCK + off
+        current_token = (pid - table_tiles).to(tl.int64) * BLOCK + off
         current_direct = tl.full((BLOCK,), False, tl.int1)
         patch_slot = tl.full((BLOCK,), -1, tl.int64)
         for current_req in range(batch):
@@ -223,7 +191,9 @@ def _prefill_metadata(
                 )
                 position = current_prefix + current_token - current_start
                 page = tl.load(
-                    HistoryTable + current_req * columns + position // PAGE,
+                    HistoryTable
+                    + current_req.to(tl.int64) * columns
+                    + position // PAGE,
                     matches,
                     other=0,
                 ).to(tl.int64)
@@ -233,6 +203,67 @@ def _prefill_metadata(
         tl.store(Direct + current_token, current_direct, current_token < total)
         if PACKED_HISTORY:
             tl.store(PatchSlots + current_token, patch_slot, current_token < total)
+
+
+@triton.jit(do_not_specialize=["batch", "first", "rows"])
+def _dsa_prefill_query_metadata(
+    Cum,
+    Prefix,
+    QCu,
+    KCu,
+    QuerySeq,
+    Scan,
+    batch,
+    first,
+    rows,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    off = tl.arange(0, BLOCK)
+    if pid == 0:
+        cu_destination = tl.full((), 1, tl.int32)
+        cu_key_total = tl.full((), 0, tl.int64)
+        for cu_req in range(batch):
+            cu_start = tl.load(Cum + cu_req).to(tl.int64)
+            cu_end = tl.load(Cum + cu_req + 1).to(tl.int64)
+            cu_prefix = tl.load(Prefix + cu_req).to(tl.int64)
+            cu_active = (
+                (cu_start < first + rows) & (cu_end > first) & (cu_end > cu_start)
+            )
+            if cu_active:
+                cu_local_end = tl.minimum(
+                    tl.maximum(first + rows - cu_start, 0), cu_end - cu_start
+                )
+                cu_key_total += cu_prefix + cu_local_end
+                tl.store(
+                    QCu + cu_destination,
+                    tl.minimum(tl.maximum(cu_end - first, 0), rows),
+                )
+                tl.store(KCu + cu_destination, cu_key_total)
+                cu_destination += 1
+        tl.store(QCu, 0)
+        tl.store(KCu, 0)
+    else:
+        query_local = (pid - 1).to(tl.int64) * BLOCK + off
+        query_token = first + query_local
+        query_request = tl.full((BLOCK,), 0, tl.int32)
+        query_length = tl.full((BLOCK,), 0, tl.int64)
+        query_seen = tl.full((), 0, tl.int32)
+        for seq_req in range(batch):
+            seq_start = tl.load(Cum + seq_req).to(tl.int64)
+            seq_end = tl.load(Cum + seq_req + 1).to(tl.int64)
+            seq_prefix = tl.load(Prefix + seq_req).to(tl.int64)
+            seq_match = (query_token >= seq_start) & (query_token < seq_end)
+            query_request = tl.where(seq_match, query_seen, query_request)
+            query_seen += (
+                (seq_start < first + rows) & (seq_end > first) & (seq_end > seq_start)
+            ).to(tl.int32)
+            query_length = tl.where(
+                seq_match, seq_prefix + query_token - seq_start + 1, query_length
+            )
+        tl.store(QuerySeq + query_local, query_request, query_local < rows)
+        tl.store(Scan + query_local, tl.minimum(query_length, TOPK), query_local < rows)
 
 
 def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
@@ -253,6 +284,98 @@ def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
     if tail.shape[-1] == 0:
         return rotated
     return torch.cat((rotated, tail), dim=-1)
+
+
+def prefill_cache_layout(
+    table,
+    cumulative,
+    prefixes,
+    *,
+    first,
+    rows,
+    total,
+    per_block,
+    degree,
+    local_pages,
+    send_rows,
+    page_size,
+    active_requests,
+    history_table=None,
+    patch_slots=None,
+    history_pages=None,
+):
+    """Plan final history/current addresses from existing device metadata."""
+    batch, columns = table.shape
+    if history_table is not None and (
+        history_table.shape != table.shape
+        or history_table.dtype != torch.int32
+        or history_table.device != table.device
+        or not history_table.is_contiguous()
+        or patch_slots is None
+        or patch_slots.shape != (total,)
+        or patch_slots.dtype != torch.int64
+        or patch_slots.device != table.device
+        or not patch_slots.is_contiguous()
+        or history_pages is None
+        or history_pages < 1
+    ):
+        raise ValueError("Invalid compact Prefill page table or patch slots")
+    mapped = torch.empty(
+        (active_requests, columns), dtype=torch.int32, device=table.device
+    )
+    direct = torch.empty(total, dtype=torch.uint8, device=table.device)
+    block = 256
+    table_tiles = active_requests * triton.cdiv(columns, block)
+    _prefill_cache_layout[(table_tiles + triton.cdiv(total, block),)](
+        table,
+        cumulative,
+        prefixes,
+        mapped,
+        direct,
+        history_table if history_table is not None else table,
+        patch_slots if patch_slots is not None else direct,
+        batch,
+        columns,
+        table.stride(0),
+        first,
+        rows,
+        total,
+        per_block,
+        degree,
+        local_pages,
+        send_rows,
+        degree * local_pages if history_pages is None else history_pages,
+        table_tiles,
+        PAGE=page_size,
+        BLOCK=block,
+        PACKED_HISTORY=history_table is not None,
+    )
+    return mapped, direct
+
+
+def dsa_prefill_query_metadata(
+    cumulative, prefixes, *, first, rows, topk, active_requests
+):
+    """Build DSA-only cumulative lengths, request IDs and causal scan counts."""
+    qcu = torch.empty(active_requests + 1, dtype=torch.int64, device=cumulative.device)
+    kcu = torch.empty_like(qcu)
+    sequence = torch.empty(rows, dtype=torch.int32, device=cumulative.device)
+    scan = torch.empty_like(sequence)
+    block = 256
+    _dsa_prefill_query_metadata[(1 + triton.cdiv(rows, block),)](
+        cumulative,
+        prefixes,
+        qcu,
+        kcu,
+        sequence,
+        scan,
+        prefixes.numel(),
+        first,
+        rows,
+        TOPK=topk,
+        BLOCK=block,
+    )
+    return qcu, kcu, sequence, scan
 
 
 class AscendDSAKernels:
@@ -281,85 +404,6 @@ class AscendDSAKernels:
                 "LongCatDSA needs LightningIndexer and "
                 "SparseFlashAttentionDecode operators"
             )
-
-    @staticmethod
-    def prefill_metadata(
-        table,
-        cumulative,
-        prefixes,
-        *,
-        first,
-        rows,
-        total,
-        per_block,
-        degree,
-        local_pages,
-        send_rows,
-        page_size,
-        topk,
-        active_requests,
-        history_table=None,
-        patch_slots=None,
-        history_pages=None,
-    ):
-        """Plan final history/current addresses from existing device metadata."""
-        batch, columns = table.shape
-        if history_table is not None and (
-            history_table.shape != table.shape
-            or history_table.dtype != torch.int32
-            or history_table.device != table.device
-            or not history_table.is_contiguous()
-            or patch_slots is None
-            or patch_slots.shape != (total,)
-            or patch_slots.dtype != torch.int64
-            or patch_slots.device != table.device
-            or not patch_slots.is_contiguous()
-            or history_pages is None
-            or history_pages < 1
-        ):
-            raise ValueError("Invalid compact Prefill page table or patch slots")
-        mapped = torch.empty(
-            (active_requests, columns), dtype=torch.int32, device=table.device
-        )
-        qcu = torch.empty(active_requests + 1, dtype=torch.int64, device=table.device)
-        kcu = torch.empty_like(qcu)
-        sequence = torch.empty(rows, dtype=torch.int32, device=table.device)
-        scan = torch.empty_like(sequence)
-        direct = torch.empty(total, dtype=torch.uint8, device=table.device)
-        block = 256
-        table_tiles = active_requests * triton.cdiv(columns, block)
-        query_tiles = triton.cdiv(rows, block)
-        _prefill_metadata[(table_tiles + 1 + query_tiles + triton.cdiv(total, block),)](
-            table,
-            cumulative,
-            prefixes,
-            mapped,
-            qcu,
-            kcu,
-            sequence,
-            scan,
-            direct,
-            history_table if history_table is not None else table,
-            patch_slots if patch_slots is not None else direct,
-            batch,
-            columns,
-            table.stride(0),
-            first,
-            rows,
-            total,
-            per_block,
-            degree,
-            local_pages,
-            send_rows,
-            degree * local_pages if history_pages is None else history_pages,
-            table_tiles,
-            query_tiles,
-            TOPK=topk,
-            PAGE=page_size,
-            BLOCK=block,
-            PACKED_HISTORY=history_table is not None,
-        )
-        return mapped, qcu, kcu, sequence, scan, direct
 
     def prefill_index(
         self,
@@ -488,17 +532,6 @@ class AscendDSAKernels:
         from tokenspeed_kernel_npu.ops.dcp_tensors import select_local_topk
 
         return select_local_topk(indices, positions, rank=rank)
-
-    def merge_partials(self, output, lse):
-        """Merge normalized O[P,N,D] with natural-log LSE[P,N].
-
-        Callers must zero O for every empty shard (LSE=-inf) before exchange.
-        All-empty rows use finite equal merge weights and return zero; other
-        rows retain their LSE weights. Return BF16 output with shape [N,D].
-        """
-        from tokenspeed_kernel_npu.ops.mla_dcp import merge_dcp_partials
-
-        return merge_dcp_partials(output, lse)
 
     def merge_topk_fused(self, indices, values, *, group, rank_size):
         return torch.ops.custom.npu_dcp_merge_topk(

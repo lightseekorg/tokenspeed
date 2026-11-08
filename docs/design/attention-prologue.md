@@ -375,6 +375,15 @@ local heads, consumes gathered KV history and current rows, and retains the
 existing output reduction. Indexer-K and KV share one BF16 transport packet
 per phase; gathering and cache commit preserve their bits.
 
+Shared Prefill cache metadata describes the projection-row partition, compact
+page table, history gather and current-row store mappings. DSA builds its own
+causal query lengths, request IDs and scan counts for the indexer and sparse
+core. MLA keeps its sequence spans without constructing TopK metadata.
+Backend forward metadata, temporary layer tensors and model-level native
+communication resources have separate owners and lifetimes. Named compute
+APIs dispatch through the kernel registry; gathers and slot snapshots expose
+their data-movement roles directly.
+
 The preceding KDA segment may submit history gathering. The attention entry
 ensures it if absent. Receive and packet tensors are temporary and follow actual
 batch page geometry; fixed gather workspaces are not part of the model cache.
@@ -390,6 +399,13 @@ in the same order when publishing the cache pool, before any forward or
 decode graph capture. A forward never creates a process group; an idle DP
 rank still participates in startup. Temporary tensor ownership ends after
 the final consumer, while the process-group manager retains the communicator.
+
+Cache binding validates native Prefill dependencies and geometry. Its ordinary
+tensor workspace needs no separate prepare/close protocol: reset tracks queued
+consumers and drops the active layer's references. Fused Decode retains native
+communication state across cache rebinds. At host shutdown, after the forward
+thread stops, captured graphs are released before the model's
+`release_attention_runtime` hook; process groups remain alive through release.
 
 ### V4.1 fused decode attention
 

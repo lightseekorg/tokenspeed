@@ -27,15 +27,6 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
 
 
-def ascend_mla_dcp_kernels():
-    """Return the Ascend packed MLA partial/merge and graph-length adapter."""
-    if not current_platform().is_npu:
-        raise RuntimeError("Ascend MLA DCP kernels require an NPU platform")
-    from tokenspeed_kernel_npu.ops import mla_dcp
-
-    return mla_dcp
-
-
 def supports_fused_mla_decode(layer) -> bool:
     """Whether loaded weights meet the prepared native MLA projection ABI."""
     if (
@@ -219,6 +210,13 @@ def ascend_prepare_mla_resources(*, group, rank, heads, rank_size):
     )
 
 
+def ascend_mla_decode_partial(query, cache, table, binding, scale):
+    """Run owner-local FIA and return token-major output plus natural-log LSE."""
+    from tokenspeed_kernel_npu.ops.mla_dcp import mla_partial
+
+    return mla_partial(query, cache, table, binding, scale)
+
+
 if current_platform().is_npu:
     register_kernel(
         "attention",
@@ -229,6 +227,16 @@ if current_platform().is_npu:
         signatures=[format_signature()],
         priority=Priority.PERFORMANT,
     )(ascend_prepare_mla_resources)
+
+    register_kernel(
+        "attention",
+        "mla_decode_partial",
+        name="ascend_mla_decode_partial",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures("input", "dense", {torch.bfloat16}),
+        priority=Priority.PERFORMANT,
+    )(ascend_mla_decode_partial)
 
     from tokenspeed_kernel_npu.ops.mla import (
         mla_decode_with_kvcache as _mla_decode_with_kvcache,

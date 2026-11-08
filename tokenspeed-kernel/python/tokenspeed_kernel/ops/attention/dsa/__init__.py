@@ -1808,6 +1808,296 @@ def dsa_plan(
         )
 
 
+def _call_native_attention(mode, value, *args, **kwargs):
+    # Each public operation owns its input/output contract; provider adaptation
+    # and optional native dependencies stay behind the registry boundary.
+    kernel = select_kernel(
+        "attention",
+        mode,
+        format_signature(input=dense_tensor_format(value.dtype)),
+    )
+    return kernel(value, *args, **kwargs)
+
+
+def store_index_keys(x, cache, locations):
+    """Index-K rows at owner-local cache slots."""
+    return _call_native_attention("store_index_keys", x, cache, locations)
+
+
+def dsa_local_topk(
+    query, key, weights, q_ends, kv_lengths, table, topk, initial, local
+):
+    """Decode TopK offsets and live chunk hints for each query."""
+    return _call_native_attention(
+        "dsa_local_topk",
+        query,
+        key,
+        weights,
+        q_ends,
+        kv_lengths,
+        table,
+        topk,
+        initial,
+        local,
+    )
+
+
+def dsa_local_topk_candidates(
+    query,
+    key,
+    weights,
+    q_ends,
+    kv_lengths,
+    table,
+    topk,
+    initial_counts,
+    local_counts,
+    *,
+    sparse_mode,
+    visible_lengths=None,
+):
+    """Owner-local TopK offsets and scores with causal bounds."""
+    return _call_native_attention(
+        "dsa_local_topk_candidates",
+        query,
+        key,
+        weights,
+        q_ends,
+        kv_lengths,
+        table,
+        topk,
+        initial_counts,
+        local_counts,
+        sparse_mode=sparse_mode,
+        visible_lengths=visible_lengths,
+    )
+
+
+def dsa_gathered_prefill_topk(
+    query, key, weights, query_cu, key_cu, table, topk, initial_tokens, window_tokens
+):
+    """Prefill TopK offsets over gathered Index-K pages."""
+    return _call_native_attention(
+        "dsa_gathered_prefill_topk",
+        query,
+        key,
+        weights,
+        query_cu,
+        key_cu,
+        table,
+        topk,
+        initial_tokens,
+        window_tokens,
+    )
+
+
+def dsa_gathered_prefill_attention(
+    query, pages, indices, scan_count, table, query_seq, scale
+):
+    """Prefill attention over gathered latent pages; return head-major output."""
+    return _call_native_attention(
+        "dsa_gathered_prefill_attention",
+        query,
+        pages,
+        indices,
+        scan_count,
+        table,
+        query_seq,
+        scale,
+    )
+
+
+def dsa_select_local_topk(indices, positions, rank):
+    """Map exchanged TopK positions to this owner; return local indices and counts."""
+    return _call_native_attention("dsa_select_local_topk", indices, positions, rank)
+
+
+def merge_dsa_topk(indices, values, *, group, rank_size):
+    """Exchange owner candidates and merge TopK using prepared native communication."""
+    return _call_native_attention(
+        "merge_dsa_topk", indices, values, group=group, rank_size=rank_size
+    )
+
+
+def merge_dsa_lse(output, maximum, total, *, group, rank_size):
+    """Merge attention partials using prepared native communication."""
+    return _call_native_attention(
+        "merge_dsa_lse", output, maximum, total, group=group, rank_size=rank_size
+    )
+
+
+def dsa_project_output_partial(output, w_vc, w_o):
+    """Project latent attention through value and output weights."""
+    return _call_native_attention("dsa_project_output_partial", output, w_vc, w_o)
+
+
+def dsa_fused_prologue(
+    x,
+    down,
+    gamma_q,
+    gamma_kv,
+    gamma_index,
+    score_weight,
+    qb,
+    uk,
+    window,
+    kv_cache,
+    index_cache,
+    slots,
+    *,
+    eps_q,
+    eps_kv,
+    eps_index,
+    positions,
+    cos_sin,
+    rotary_mode,
+    out,
+):
+    """Project queries, exchange heads and store owner KV and Index-K."""
+    return _call_native_attention(
+        "dsa_fused_prologue",
+        x,
+        down,
+        gamma_q,
+        gamma_kv,
+        gamma_index,
+        score_weight,
+        qb,
+        uk,
+        window,
+        kv_cache,
+        index_cache,
+        slots,
+        eps_q=eps_q,
+        eps_kv=eps_kv,
+        eps_index=eps_index,
+        positions=positions,
+        cos_sin=cos_sin,
+        rotary_mode=rotary_mode,
+        out=out,
+    )
+
+
+def prepare_dsa_projection_weight(value):
+    """Prepare an independent NZ projection weight without changing coefficients."""
+    return _call_native_attention("prepare_dsa_projection_weight", value)
+
+
+def dsa_sparse_decode(
+    q, qr, key, indices, valid_chunks, q_ends, kv_lengths, table, scale
+):
+    """Attend selected local KV slots; return token-major output."""
+    return _call_native_attention(
+        "dsa_sparse_decode",
+        q,
+        qr,
+        key,
+        indices,
+        valid_chunks,
+        q_ends,
+        kv_lengths,
+        table,
+        scale,
+    )
+
+
+def dsa_sparse_decode_partial(
+    packed_query,
+    key,
+    indices,
+    valid_chunks,
+    q_ends,
+    kv_lengths,
+    table,
+    scale,
+    *,
+    sparse_mode,
+    out=None,
+):
+    """Attend owner KV pages; return output, softmax maximum and sum."""
+    return _call_native_attention(
+        "dsa_sparse_decode_partial",
+        packed_query,
+        key,
+        indices,
+        valid_chunks,
+        q_ends,
+        kv_lengths,
+        table,
+        scale,
+        sparse_mode=sparse_mode,
+        out=out,
+    )
+
+
+def dsa_cp_metadata(
+    table,
+    lengths,
+    *,
+    page_size,
+    block_granularity,
+    virtual_block_count,
+    degree,
+    rank,
+    initial_tokens,
+    window_tokens,
+    query_width,
+    query_group_size,
+    slots,
+    out,
+    local_lengths,
+    initial_counts,
+    window_counts,
+    query_ends,
+    index_table,
+    index_lengths,
+    index_initial_counts,
+    index_query_ends,
+    local_slots,
+):
+    """Refresh caller-owned causal page tables, lengths and owner write slots."""
+    return _call_native_attention(
+        "dsa_cp_metadata",
+        table,
+        lengths,
+        page_size=page_size,
+        block_granularity=block_granularity,
+        virtual_block_count=virtual_block_count,
+        degree=degree,
+        rank=rank,
+        initial_tokens=initial_tokens,
+        window_tokens=window_tokens,
+        query_width=query_width,
+        query_group_size=query_group_size,
+        slots=slots,
+        out=out,
+        local_lengths=local_lengths,
+        initial_counts=initial_counts,
+        window_counts=window_counts,
+        query_ends=query_ends,
+        index_table=index_table,
+        index_lengths=index_lengths,
+        index_initial_counts=index_initial_counts,
+        index_query_ends=index_query_ends,
+        local_slots=local_slots,
+    )
+
+
+def dsa_prefill_query_metadata(
+    cumulative, prefixes, *, first, rows, topk, active_requests
+):
+    """Build DSA-only cumulative lengths, query request IDs and scan counts."""
+    return _call_native_attention(
+        "dsa_prefill_query_metadata",
+        cumulative,
+        prefixes,
+        first=first,
+        rows=rows,
+        topk=topk,
+        active_requests=active_requests,
+    )
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsa.cuda  # noqa: E402,F401
@@ -1824,6 +2114,21 @@ if current_platform().is_npu:
 # isort: on
 
 __all__ = [
+    "store_index_keys",
+    "dsa_local_topk",
+    "dsa_local_topk_candidates",
+    "dsa_gathered_prefill_topk",
+    "dsa_gathered_prefill_attention",
+    "dsa_select_local_topk",
+    "merge_dsa_topk",
+    "merge_dsa_lse",
+    "dsa_project_output_partial",
+    "dsa_fused_prologue",
+    "prepare_dsa_projection_weight",
+    "dsa_sparse_decode",
+    "dsa_sparse_decode_partial",
+    "dsa_cp_metadata",
+    "dsa_prefill_query_metadata",
     "CANDIDATE_LENS_CPU_FEATURE",
     "INDEX_CANDIDATE_PAGES_FEATURE",
     "INDEX_K_WORKSPACE_ROWS_FEATURE",

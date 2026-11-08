@@ -675,6 +675,18 @@ class DeviceHandle:
             )
         return l2.poll_results()
 
+    def shutdown_attention(self) -> None:
+        """Release captured graphs before model-owned native attention resources.
+
+        The host calls this after the forward thread has stopped and before
+        process groups are destroyed; cache rebind keeps these resources alive.
+        """
+        self._executor.release_graphs()
+        self._executor.model_runner.release_attention_runtime()
+        draft = self._executor.draft_model_runner
+        if draft is not None:
+            draft.release_attention_runtime()
+
     def shutdown_cache(self) -> None:
         """Close the Host cache (the L2 tier and the snapshot pool), once the
         forward thread has stopped, having finished a drafter's pending

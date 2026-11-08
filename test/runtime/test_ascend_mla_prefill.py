@@ -31,7 +31,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
 )
 from tokenspeed.runtime.layers.attention.dcp.ascend import (
     AscendPrefillOptions,
-    AscendPrefillPlan,
+    PrefillCacheMetadata,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.mla.ascend import AscendMLAAttention
@@ -119,7 +119,7 @@ class RequestMetadata:
 
 @pytest.mark.parametrize("degree", [1, 2, 8, 16])
 @pytest.mark.parametrize("page_size", [64, 128])
-def test_head_shards_share_full_query_metadata_and_receive_page_addresses(
+def test_head_shards_share_full_query_range_and_receive_page_addresses(
     degree, page_size
 ):
     metadata = RequestMetadata(
@@ -129,13 +129,12 @@ def test_head_shards_share_full_query_metadata_and_receive_page_addresses(
     )
     placement = CachePlacement(128, 9, tuple(range(degree)), 0)
     plans = [
-        AscendPrefillPlan.build(
+        PrefillCacheMetadata.build(
             metadata,
             placement,
             degree=degree,
             rank=rank,
             page_size=page_size,
-            topk=1,
             local_cache_pages=32,
             query_partition=(0, 146),
             options=AscendPrefillOptions(146, 128),
@@ -145,10 +144,7 @@ def test_head_shards_share_full_query_metadata_and_receive_page_addresses(
     for plan in plans:
         assert (plan.query_start, plan.query_end) == (0, 146)
         assert sum(plan.projection_row_counts) == 146
-        torch.testing.assert_close(plan.query_cu, torch.tensor([0, 129, 146]))
-        torch.testing.assert_close(plan.key_cu, torch.tensor([0, 256, 304]))
         torch.testing.assert_close(plan.page_table, plans[0].page_table)
-        assert plan.query_seq.tolist() == [0] * 129 + [1] * 17
 
 
 def cpu_gathered_store(store):
@@ -219,13 +215,12 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
         degree=1, rank=0, ranks=(0,), auxiliary_namespace=None
     )
     backend.kernel_page_size = page
-    backend._prefill_plan = AscendPrefillPlan.build(
+    backend._prefill_cache_metadata = PrefillCacheMetadata.build(
         RequestMetadata(torch.tensor(extends), torch.tensor(prefixes), table),
         backend._placement,
         degree=1,
         rank=0,
         page_size=page,
-        topk=1,
         local_cache_pages=7,
         query_partition=(0, total),
         options=AscendPrefillOptions(total, 128),
@@ -574,7 +569,6 @@ def test_unsupported_mla_cache_keeps_prefix_history_without_transport(
     monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
     pool, backend = _prefill_cache_and_backend(monkeypatch, options=None)
     backend.set_cache_pool(pool)
-    assert backend.prepare_prefill() == 0
     assert backend._prefill_workspace is None
     rows = pool.get_key_buffer(0).view(-1, 576)
     rows[128:255].fill_(7)
@@ -684,9 +678,8 @@ def test_mla_backend_releases_temporary_commit_slots_after_consumption(
                 atol=0,
             )
             assert backend._prefill_workspace is None
-            assert backend._prefill_workspace is None
     finally:
-        backend.close_prefill()
+        backend.reset_prefill_workspace()
         dist.destroy_process_group()
     assert backend._prefill_workspace is None
 
@@ -710,13 +703,12 @@ def test_bounded_prefill_counts_all_requests_and_compacts_owner_pages(
     options = AscendPrefillOptions(20, kv_page_size=128)
     placement = CachePlacement(128, 33, tuple(range(degree)), 0)
     plans = [
-        AscendPrefillPlan.build(
+        PrefillCacheMetadata.build(
             metadata,
             placement,
             degree=degree,
             rank=rank,
             page_size=page_size,
-            topk=1,
             local_cache_pages=64,
             query_partition=(0, 20),
             options=options,
@@ -724,13 +716,13 @@ def test_bounded_prefill_counts_all_requests_and_compacts_owner_pages(
         for rank in range(degree)
     ]
     for plan in plans:
-        assert plan.gather is not None
-        assert sum(plan.gather.row_counts) <= 3 * 128
-        assert plan.gather.table[0, 0] == plan.gather.table[1, 0]
+        assert plan.history_gather is not None
+        assert sum(plan.history_gather.row_counts) <= 3 * 128
+        assert plan.history_gather.table[0, 0] == plan.history_gather.table[1, 0]
         expected = []
         for req, (prefix, count) in enumerate([(127, 3), (63, 17)]):
             expected.extend(
-                int(plan.gather.table[req, pos // page_size]) * page_size
+                int(plan.history_gather.table[req, pos // page_size]) * page_size
                 + pos % page_size
                 for pos in range(prefix, prefix + count)
             )
@@ -740,7 +732,7 @@ def test_bounded_prefill_counts_all_requests_and_compacts_owner_pages(
         table[0, : -(-130 // page_size)].tolist()
         + table[1, : -(-80 // page_size)].tolist()
     )
-    assert sum(plans[0].gather.row_counts) == len(requested) * page_size
+    assert sum(plans[0].history_gather.row_counts) == len(requested) * page_size
 
 
 def test_mla_merge_packs_true_partials_and_uses_prepared_producer(monkeypatch):

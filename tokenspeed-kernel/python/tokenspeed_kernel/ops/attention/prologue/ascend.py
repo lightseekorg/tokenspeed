@@ -42,3 +42,25 @@ if current_platform().is_npu:
         from tokenspeed_kernel_npu.ops.prefill import store_gathered_latent
 
         store_gathered_latent(store)
+
+    @register_kernel(
+        "attention",
+        "dsa_gathered_index_store",
+        name="ascend_dsa_gathered_index_store",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(index_keys=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )
+    def ascend_dsa_gathered_index_store(
+        workspace, direct, mapped_slots, *, block_rows, virtual_blocks
+    ):
+        from tokenspeed_kernel_npu.ops.prefill import store_gathered_index_keys
+
+        return store_gathered_index_keys(
+            workspace,
+            direct,
+            mapped_slots,
+            block_rows=block_rows,
+            virtual_blocks=virtual_blocks,
+        )

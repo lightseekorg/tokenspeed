@@ -251,9 +251,33 @@ def test_owner_store_and_compact_patch_share_one_slot_snapshot(
         (128, index, index_cache),
         (576, current, cache),
     ):
-        ops.patch(
-            workspace, direct, mapped, width=width, block_rows=128, virtual_blocks=5
-        )
+        if width == 128:
+            ops.store_gathered_index_keys(
+                workspace,
+                direct,
+                mapped,
+                block_rows=128,
+                virtual_blocks=5,
+            )
+        else:
+            from tokenspeed_kernel.ops.attention.prologue import GatheredLatentStore
+
+            ops.store_gathered_latent(
+                GatheredLatentStore(
+                    current=workspace.kv[workspace.history_rows :],
+                    slots=workspace.write_slots,
+                    cache=workspace.source_kv,
+                    compact=workspace.kv,
+                    direct=direct,
+                    mapped_slots=mapped,
+                    virtual_blocks=5,
+                    send_rows=workspace.send_rows,
+                    block_rows=128,
+                    degree=2,
+                    rank=rank,
+                    history_rows=workspace.history_rows,
+                )
+            )
         plane = workspace.index if width == 128 else workspace.kv
         exact(plane[128:131], values)
         if rank == 0:

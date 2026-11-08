@@ -28,9 +28,13 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.attention.dsa import prepare_dsa_resources
+from tokenspeed_kernel.ops.attention.dsa import (
+    dsa_fused_prologue,
+    dsa_project_output_partial,
+    prepare_dsa_projection_weight,
+    prepare_dsa_resources,
+)
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
-    ascend_dsa_kernels,
     supports_fused_dsa_decode,
 )
 from tokenspeed_kernel.ops.attention.prologue import mla_prologue
@@ -45,14 +49,18 @@ from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
     ascend_dsa_prefill_backend,
     prepare_ascend_dsa_cp_metadata,
 )
-from tokenspeed.runtime.layers.layernorm import RMSNorm
-from tokenspeed.runtime.layers.linear import ColumnParallelLinear, ReplicatedLinear
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
-from tokenspeed.runtime.models.deepseek_v3 import (
-    DeepseekV3AttentionMLA,
+from tokenspeed.runtime.layers.attention.mla.weights import (
     _prepare_mla_kv_b_proj_weights,
 )
+from tokenspeed.runtime.layers.layernorm import RMSNorm
+from tokenspeed.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.rotary_embedding import get_rope, yarn_get_mscale
 from tokenspeed.runtime.utils import add_prefix
 
 
@@ -107,17 +115,17 @@ def pack_score_fp32(weight):
 
 
 class FusedDSADecode:
-    def __init__(self, layer, *, rank, group, eps_q, eps_kv):
+    def __init__(self, layer, *, rank, group, eps_q, eps_kv, owner=None):
         if layer.num_local_heads != 8 or layer.indexer.index_n_heads != 64:
             raise ValueError(
                 "Fused projections require eight local and 64 global heads"
             )
+        self.owner = owner
         self.rank = rank
         self.layer_id = layer.layer_id
         self.attention_layer = layer.attn_mqa
         self.initial_tokens = layer.index_init_tokens
         self.window_tokens = layer.index_local_tokens
-        self.kernels = ascend_dsa_kernels()
         self.eps_q, self.eps_kv = eps_q, eps_kv
         self.eps_index = layer.indexer.k_norm.variance_epsilon
 
@@ -131,7 +139,7 @@ class FusedDSADecode:
         if layer.scale_q_lora:
             qb = qb * math.sqrt(layer.hidden_size / layer.q_lora_rank)
         iqb = layer.indexer.wq_b.weight.detach().cpu().view(64, 128, 1536)
-        self.qb = self.kernels.prepare_projection_weight(
+        self.qb = prepare_dsa_projection_weight(
             pack_qb_panels(torch.cat((qb, iqb), 1).reshape(20480, 1536)).npu()
         )
         down = torch.cat(
@@ -142,7 +150,7 @@ class FusedDSADecode:
             ),
             0,
         )
-        self.down = self.kernels.prepare_projection_weight(
+        self.down = prepare_dsa_projection_weight(
             pack_down_qa_panels(down.detach().cpu()).npu()
         )
         self.uk = gathered(layer.w_kc)
@@ -185,6 +193,12 @@ class FusedDSADecode:
         }
 
     def prolog(self, hidden, positions, ctx):
+        if self.owner is not None:
+            self.owner.bind_backend(ctx.attn_backend)
+        stream = torch.npu.current_stream()
+        hidden.record_stream(stream)
+        if positions is not None:
+            positions.record_stream(stream)
         if self.window is None:
             raise RuntimeError("Initialize DSA transport before forward/capture")
         query, index_query, score = self.outputs[hidden.shape[0]]
@@ -217,7 +231,7 @@ class FusedDSADecode:
             positions = positions.to(dtype=torch.int64).contiguous()
         else:
             positions = None
-        self.kernels.fused_prolog(
+        dsa_fused_prologue(
             hidden.contiguous(),
             self.down,
             self.gamma_q,
@@ -241,7 +255,7 @@ class FusedDSADecode:
         return query, index_query, score
 
     def output_projection(self, output):
-        return self.kernels.output_projection_partial(output, self.w_vc, self.w_o)
+        return dsa_project_output_partial(output, self.w_vc, self.w_o)
 
 
 class AscendDSAIndexer(nn.Module):
@@ -299,10 +313,9 @@ class AscendDSAIndexer(nn.Module):
         )
 
 
-class AscendDSAAttention(DeepseekV3AttentionMLA):
+class AscendDSAAttention(nn.Module):
     """DSA projections and attention with one independent indexer per layer."""
 
-    _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
     rope_is_neox_style = False
 
     def __init__(
@@ -323,78 +336,112 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         layer_id: int | None = None,
         prefix: str = "",
         reduce_attn_results: bool = True,
-        alt_stream: torch.cuda.Stream | None = None,
         *,
         lora_norm_eps: float,
-        independent_selection: bool,
         prefill_enabled: bool,
-        separate_mla_projections: bool,
     ) -> None:
-        if not independent_selection:
-            raise ValueError("Ascend DSA requires independent per-layer selection")
-        self.use_output_gate = bool(getattr(config, "mla_use_output_gate", False))
-        self.scale_q_lora = bool(getattr(config, "mla_scale_q_lora", False))
-        self.scale_kv_lora = bool(getattr(config, "mla_scale_kv_lora", False))
-        self.separate_mla_projections = bool(separate_mla_projections)
-        if self.use_output_gate:
-            raise ValueError("Native DSA requires no output gate")
-        if not separate_mla_projections:
-            raise ValueError("Native DSA requires separate checkpoint projections")
-        super().__init__(
-            config=config,
-            mapping=mapping,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            qk_nope_head_dim=qk_nope_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            q_lora_rank=q_lora_rank,
-            kv_lora_rank=kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            layer_id=layer_id,
-            prefix=prefix,
-            reduce_attn_results=reduce_attn_results,
-            alt_stream=alt_stream,
-            skip_rope=bool(getattr(config, "mla_use_nope", False)),
-        )
+        super().__init__()
         if mapping.attn.has_head_tp:
             raise NotImplementedError(
-                "Ascend DSA does not yet implement the head-TP token exchange"
+                "Ascend DSA does not implement the head-TP token exchange"
             )
         if q_lora_rank is None:
             raise ValueError("Ascend DSA requires q_lora_rank")
+        self.use_output_gate = bool(getattr(config, "mla_use_output_gate", False))
+        if self.use_output_gate:
+            raise ValueError("Native DSA requires no output gate")
+        self.mapping = mapping
+        self.layer_id = layer_id
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.scale_q_lora = bool(getattr(config, "mla_scale_q_lora", False))
+        self.scale_kv_lora = bool(getattr(config, "mla_scale_kv_lora", False))
+        parallel = mapping.attn
+        if num_heads % parallel.head_tp_size:
+            raise ValueError("DSA heads must divide the attention TP group")
+        self.num_local_heads = num_heads // parallel.head_tp_size
+        self.q_a_proj = ReplicatedLinear(
+            hidden_size,
+            q_lora_rank,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("q_a_proj", prefix),
+        )
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            hidden_size,
+            kv_lora_rank + qk_rope_head_dim,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+        )
+        self.q_b_proj = ColumnParallelLinear(
+            q_lora_rank,
+            num_heads * self.qk_head_dim,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            tp_rank=parallel.head_tp_rank,
+            tp_size=parallel.head_tp_size,
+            tp_group=parallel.head_tp_group,
+            prefix=add_prefix("q_b_proj", prefix),
+        )
+        self.kv_b_proj = ColumnParallelLinear(
+            kv_lora_rank,
+            num_heads * (qk_nope_head_dim + v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+            tp_rank=parallel.head_tp_rank,
+            tp_size=parallel.head_tp_size,
+            tp_group=parallel.head_tp_group,
+            prefix=add_prefix("kv_b_proj", prefix),
+        )
+        self.o_proj = RowParallelLinear(
+            num_heads * v_head_dim,
+            hidden_size,
+            bias=False,
+            reduce_results=reduce_attn_results,
+            quant_config=quant_config,
+            tp_rank=parallel.head_tp_rank,
+            tp_size=parallel.head_tp_size,
+            tp_group=parallel.head_tp_group,
+            prefix=add_prefix("o_proj", prefix),
+        )
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=lora_norm_eps)
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=lora_norm_eps)
-        if self.separate_mla_projections:
-            del self.fused_qkv_a_proj_with_mqa
-            qk_dim = qk_nope_head_dim + qk_rope_head_dim
-            self.q_a_proj = ReplicatedLinear(
-                hidden_size,
-                q_lora_rank,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                prefix=add_prefix("q_a_proj", prefix),
+        self.scaling = self.qk_head_dim**-0.5
+        self.rotary_emb = None
+        if not bool(getattr(config, "mla_use_nope", False)):
+            if rope_scaling:
+                rope_scaling = {**rope_scaling, "rope_type": "deepseek_yarn"}
+                mscale = yarn_get_mscale(
+                    rope_scaling["factor"],
+                    float(rope_scaling.get("mscale_all_dim", False)),
+                )
+                self.scaling *= mscale * mscale
+            self.rotary_emb = get_rope(
+                qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=False,
             )
-            self.kv_a_proj_with_mqa = ReplicatedLinear(
-                hidden_size,
-                kv_lora_rank + qk_rope_head_dim,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                prefix=add_prefix("kv_a_proj_with_mqa", prefix),
-            )
-            self.q_b_proj = ColumnParallelLinear(
-                q_lora_rank,
-                num_heads * qk_dim,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                tp_rank=mapping.attn.head_tp_rank,
-                tp_size=mapping.attn.head_tp_size,
-                tp_group=mapping.attn.head_tp_group,
-                prefix=add_prefix("q_b_proj", prefix),
-            )
+        self.attn_mqa = PagedAttention(
+            self.num_local_heads,
+            kv_lora_rank + qk_rope_head_dim,
+            self.scaling,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            v_head_dim=kv_lora_rank,
+            rotary_emb=self.rotary_emb,
+            qk_norm=None,
+        )
+        self.w_kc = self.w_vc = None
         self.index_topk = int(config.index_topk)
         self.index_init_tokens = int(config.index_init_tokens)
         self.index_local_tokens = int(config.index_local_tokens)
@@ -524,7 +571,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             raise RuntimeError("Prepare token-local DSA Prefill weights before forward")
         if backend is None:
             backend = ascend_dsa_prefill_backend(ctx.attn_backend)
-        plan = backend.prefill_plan
+        plan = backend.prefill_cache_metadata
         if hidden.shape[0] != plan.query_end - plan.query_start:
             raise ValueError(
                 "DSA Prefill hidden rows must follow the CP query partition"
@@ -719,23 +766,6 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         return self.o_proj(projected.flatten(1))[0]
 
 
-class _RuntimeDSADecode(FusedDSADecode):
-    """Bind shared HCCL views around the unchanged host DSA computation."""
-
-    def __init__(self, layer, *, rank, group, eps_q, eps_kv, owner):
-        super().__init__(layer, rank=rank, group=group, eps_q=eps_q, eps_kv=eps_kv)
-        self.owner = owner
-
-    def prolog(self, hidden, positions, ctx):
-        self.owner.bind_backend(ctx.attn_backend)
-        stream = torch.npu.current_stream()
-        hidden.record_stream(stream)
-        if positions is not None and positions.dtype in (torch.int32, torch.int64):
-            positions = positions.to(dtype=torch.int64).contiguous()
-            positions.record_stream(stream)
-        return super().prolog(hidden, positions, ctx)
-
-
 class AscendDSARuntime:
     """Prepare native DSA once before profiling; retain it across cache rebinds."""
 
@@ -770,7 +800,7 @@ class AscendDSARuntime:
             torch.npu.synchronize()
             dist.barrier(group=cpu_group)
             for layer in self.layers:
-                runtime = _RuntimeDSADecode(
+                runtime = FusedDSADecode(
                     layer,
                     rank=rank,
                     group=pg.get_device_process_group(self.ranks),

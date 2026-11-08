@@ -208,11 +208,14 @@ def prepare_write_slots(workspace, slots):
     slots.record_stream(torch.npu.current_stream(slots.device))
 
 
-def patch(workspace, direct, mapped_slots, *, width, block_rows, virtual_blocks):
-    """Store current owner rows and repair non-aliasing compact pages."""
+def store_gathered_index_keys(
+    workspace, direct, mapped_slots, *, block_rows, virtual_blocks
+):
+    """Store current Index-K owner rows and update non-aliasing compact pages."""
+    width = 128
     if workspace.write_slots is None:
         raise RuntimeError("Prepare Prefill write slots before storing")
-    if width not in (128, 576) or (width == 128 and workspace.index is None):
+    if workspace.index is None:
         raise ValueError("Prefill patch requires an available cache plane")
     if (
         direct.dtype != torch.uint8
@@ -228,12 +231,8 @@ def patch(workspace, direct, mapped_slots, *, width, block_rows, virtual_blocks)
         or (workspace.source_kv.numel() // 576) % block_rows
     ):
         raise ValueError("Prefill update has incompatible slots or layout")
-    target, cache = (
-        (workspace.index, workspace.source_index)
-        if width == 128
-        else (workspace.kv, workspace.source_kv)
-    )
-    _patch_plane(
+    target, cache = workspace.index, workspace.source_index
+    _store_gathered_rows(
         target[workspace.history_rows :],
         workspace.write_slots,
         cache,
@@ -251,7 +250,7 @@ def patch(workspace, direct, mapped_slots, *, width, block_rows, virtual_blocks)
     return target
 
 
-def _patch_plane(
+def _store_gathered_rows(
     current,
     slots,
     cache,
@@ -291,7 +290,7 @@ def _patch_plane(
 
 def store_gathered_latent(store):
     """The prologue's native store; Index-K uses the same physical primitive."""
-    _patch_plane(
+    _store_gathered_rows(
         store.current,
         store.slots,
         store.cache,

@@ -28,9 +28,11 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.mla import (
     mla_prefill,
-    prepare_mla_prolog,
+    prepare_mla_prologue_weights,
     prepare_mla_resources,
 )
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
@@ -128,7 +130,7 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         return output.to(query.dtype)
 
     def _forward_prefill(self, positions, hidden, ctx, *, backend):
-        plan = backend.prefill_plan
+        plan = backend.prefill_cache_metadata
         if hidden.shape[0] != plan.projection_row_counts[backend._dcp.rank]:
             raise ValueError("MLA Prefill hidden rows must follow the TP partition")
         if (
@@ -243,8 +245,25 @@ class FusedMLADecode:
 
     def __init__(self, layer, *, owner, group, rank):
         self.layer, self.owner, self.rank = layer, owner, rank
-        self.prolog, self.weights, self.attention, self.merge = prepare_mla_prolog(
-            layer, group=group
+        self.prologue = select_kernel(
+            "attention",
+            "mla_fused_prolog",
+            format_signature(x=dense_tensor_format(layer.q_b_proj.weight.dtype)),
+        )
+        self.prologue_weights = prepare_mla_prologue_weights(
+            layer,
+            group=group,
+            prologue=self.prologue,
+        )
+        self.decode_partial = select_kernel(
+            "attention",
+            "mla_fused_attention",
+            format_signature(query=dense_tensor_format(torch.bfloat16)),
+        )
+        self.merge_partials = select_kernel(
+            "attention",
+            "mla_fused_merge",
+            format_signature(output=dense_tensor_format(torch.float32)),
         )
         device = layer.q_b_proj.weight.device
         self.outputs = {
@@ -298,7 +317,7 @@ class FusedMLADecode:
         locations = ctx.attn_backend.write_locations(layer.attn_mqa, ctx.forward_mode)
         slots = backend.prepare_prolog_metadata(locations)
         cache = ctx.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 576)
-        if self.weights["rotary_mode"]:
+        if self.prologue_weights["rotary_mode"]:
             positions = positions.to(dtype=torch.int64).contiguous()
         else:
             positions = nope_positions
@@ -306,9 +325,9 @@ class FusedMLADecode:
         hidden.record_stream(stream)
         slots.record_stream(stream)
         positions.record_stream(stream)
-        self.prolog(
+        self.prologue(
             hidden,
-            weights=self.weights,
+            weights=self.prologue_weights,
             rank=self.rank,
             window=self.owner.window,
             query=query,
@@ -322,7 +341,7 @@ class FusedMLADecode:
         if local is None:
             raise RuntimeError("MLA decode metadata was not refreshed")
         table, lengths, visible = local
-        partial, lse = self.attention(
+        partial, lse = self.decode_partial(
             query,
             cache=cache.view(-1, backend.kernel_page_size, 1, 576),
             table=table,
@@ -332,7 +351,7 @@ class FusedMLADecode:
             lse=self.attention_outputs[rows][1],
         )
         producer, maximum, total = self.owner.outputs[rows]
-        result = self.merge(
+        result = self.merge_partials(
             partial,
             lse=lse,
             visible=visible,

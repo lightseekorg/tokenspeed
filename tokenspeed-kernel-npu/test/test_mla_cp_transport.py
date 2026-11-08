@@ -71,7 +71,8 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
     """Uneven/empty owners, shared pages, both planes and mapped commits."""
     from tokenspeed.runtime.layers.attention.dcp.ascend import (
         AscendPrefillOptions,
-        AscendPrefillPlan,
+        DSAPrefillQueryMetadata,
+        PrefillCacheMetadata,
         ascend_prefill_store,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
@@ -133,17 +134,16 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                 "degree": degree,
                 "rank": rank,
                 "page_size": page,
-                "topk": 1,
                 "local_cache_pages": local_rows // page,
                 "options": capacity,
                 "query_partition": (0, rows),
             }
-            cpu_plan = AscendPrefillPlan.build(
+            cpu_plan = PrefillCacheMetadata.build(
                 PrefillMetadata(lengths, past, table), placement, **kwargs
             )
             if case == 16:
-                assert cpu_plan.gather.row_counts == (10 * page, 20 * page)
-            plan = AscendPrefillPlan.build(
+                assert cpu_plan.history_gather.row_counts == (10 * page, 20 * page)
+            plan = PrefillCacheMetadata.build(
                 PrefillMetadata(lengths, past, table.npu()),
                 placement,
                 page_table_cpu=table,
@@ -151,17 +151,26 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
             )
             for name in (
                 "page_table",
-                "index_table",
-                "query_cu",
-                "key_cu",
-                "query_seq",
-                "scan_count",
                 "current_direct",
                 "patch_slots",
             ):
                 torch.testing.assert_close(
                     getattr(plan, name).cpu(), getattr(cpu_plan, name), rtol=0, atol=0
                 )
+            if has_index:
+                cpu_query = DSAPrefillQueryMetadata.build(
+                    PrefillMetadata(lengths, past, table), cpu_plan, topk=2048
+                )
+                query = DSAPrefillQueryMetadata.build(
+                    PrefillMetadata(lengths, past, table.npu()), plan, topk=2048
+                )
+                for name in ("query_cu", "key_cu", "query_seq", "scan_count"):
+                    torch.testing.assert_close(
+                        getattr(query, name).cpu(),
+                        getattr(cpu_query, name),
+                        rtol=0,
+                        atol=0,
+                    )
             histories = [
                 bits(local_rows, 31000 + ranks[0] * 1000 + case * 31 + peer)
                 for peer in range(degree)
@@ -192,8 +201,8 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                 total_rows=rows,
                 history_null_rows=capacity.kv_page_size,
                 has_history=any(prefixes),
-                history_slots=plan.gather.send_slots,
-                history_counts=plan.gather.row_counts,
+                history_slots=plan.history_gather.send_slots,
+                history_counts=plan.history_gather.row_counts,
             )
             planes = [(576, runtime.kv, cache)]
             if has_index:
@@ -222,11 +231,10 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                     gathered_latent_store(store)
                     del store
                 else:
-                    prefill.patch(
+                    prefill.store_gathered_index_keys(
                         runtime,
                         plan.current_direct,
                         plan.patch_slots,
-                        width=width,
                         block_rows=128,
                         virtual_blocks=degree * 31 + 1,
                     )
@@ -267,7 +275,7 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                     "case": case,
                     "page_size": page,
                     "index_plane": has_index,
-                    "owner_counts": plan.gather.row_counts,
+                    "owner_counts": plan.history_gather.row_counts,
                     "rows": rows,
                 }
             )

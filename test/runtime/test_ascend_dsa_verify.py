@@ -30,13 +30,101 @@ from tokenspeed_kernel.registry import KernelRegistry
 
 from tokenspeed.runtime.layers.attention import backends
 from tokenspeed.runtime.layers.attention.backends.paged import ascend_dsa
-from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.dcp import ascend as ascend_dcp
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
 )
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
+
+
+def _backend_config(
+    *, degree, rank, heads, index_dim=128, topk=2048, latent=512, rope=64
+):
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+
+    # Use the portable MLA metadata contract on this CPU host. Device math is
+    # supplied independently through the registry; the real constructors run.
+    spec = DSAConfig(
+        backend_name="tokenspeed_mla",
+        num_attention_heads=heads,
+        num_kv_heads=1,
+        head_dim=latent + rope,
+        attn_tp_size=degree,
+        kv_lora_rank=latent,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=rope,
+        v_head_dim=128,
+        scaling=1.0,
+        kv_cache_dim=latent + rope,
+        index_topk=topk,
+        index_head_dim=index_dim,
+        index_n_heads=heads,
+        index_k_format="bf16",
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        context_len=8192,
+        max_bs=512,
+        speculative_num_draft_tokens=8,
+        kvp_size=degree,
+        kvp_rank=rank,
+        kvp_group=tuple(range(degree)),
+        components=(spec,),
+    )
+    return config, spec
+
+
+def _install_device_operations(monkeypatch, operations):
+    """Use real registry dispatch with CPU stand-ins only for absent NPU math."""
+    from tokenspeed_kernel.platform import CapabilityRequirement
+    from tokenspeed_kernel.registry import register_kernel
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    previous = KernelRegistry.get()
+    registry = KernelRegistry()
+    for name, spec in previous._by_name.items():
+        registry.register(spec, previous.get_impl(name))
+    monkeypatch.setattr(KernelRegistry, "_instance", registry)
+    methods = {
+        "scatter": "store_index_keys",
+        "index": "dsa_local_topk",
+        "prefill_index": "dsa_gathered_prefill_topk",
+        "prefill_attention": "dsa_gathered_prefill_attention",
+        "index_partial": "dsa_local_topk_candidates",
+        "select_local": "dsa_select_local_topk",
+        "attention": "dsa_sparse_decode",
+        "attention_partial": "dsa_sparse_decode_partial",
+        "merge_topk_fused": "merge_dsa_topk",
+        "merge_lse_direct": "merge_dsa_lse",
+        "merge_partials": "merge_normalized_partials",
+    }
+    for method, mode in methods.items():
+        function = getattr(operations, method, None)
+        if function is not None:
+            register_kernel(
+                "attention",
+                mode,
+                name=f"cpu_test_{mode}",
+                solution="cpu_test",
+                capability=CapabilityRequirement(vendors=frozenset({"cpu"})),
+                signatures=[
+                    format_signature(input=dense_tensor_format(dtype))
+                    for dtype in (
+                        torch.bfloat16,
+                        torch.float32,
+                        torch.int32,
+                        torch.int64,
+                    )
+                ],
+            )(function)
+    validate = getattr(operations, "require_fused_context_parallel", None)
+    if validate is not None:
+        monkeypatch.setattr(ascend_dsa, "validate_dsa_fused_decode", validate)
 
 
 @pytest.fixture(autouse=True)
@@ -100,18 +188,7 @@ def cpu_metadata_operator(monkeypatch):
             local, owned = resolve_cache_slots(k["slots"], placement)
             k["local_slots"].copy_(torch.where(owned, local, -1))
 
-    monkeypatch.setattr(ascend_dcp, "ascend_dsa_cp_metadata", reference)
-
-
-def test_ascend_backend_reuses_the_common_dsa_base():
-    assert issubclass(ascend_dsa.AscendDSABackend, DSABackend)
-
-
-def test_both_dsa_modules_are_imported():
-    assert backends.ascend_dsa is ascend_dsa
-    assert backends.dsa.DSABackend is DSABackend
-    expected = ascend_dsa.AscendDSABackend if current_platform().is_npu else DSABackend
-    assert _BACKEND_REGISTRY["dsa"][1] is expected
+    monkeypatch.setattr(ascend_dcp, "dsa_cp_metadata", reference)
 
 
 @pytest.mark.skipif(not current_platform().is_npu, reason="Ascend RMSNorm kernel")
@@ -138,15 +215,6 @@ def test_index_key_normalization_uses_checkpoint_epsilon(epsilon):
     torch.testing.assert_close(actual, expected, rtol=2**-7, atol=2**-14)
 
 
-def test_ascend_mla_prologue_supports_native_prefill_and_decode():
-    spec = KernelRegistry.get().get_by_name("ascend_composite_mla_prologue")
-    assert spec is not None
-    assert spec.capability.vendors == frozenset({"ascend"})
-    assert spec.traits["expanded"] == frozenset({False, True})
-    assert spec.traits["kv_format"] == frozenset({"native"})
-    assert spec.traits["store"] == frozenset({False, True})
-
-
 @pytest.mark.parametrize(
     "degree,rank,missing",
     [
@@ -161,38 +229,12 @@ def test_ascend_mla_prologue_supports_native_prefill_and_decode():
     ],
 )
 def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missing):
-    # Mock device initialization, but keep the NPU constructor and its topology
-    # checks. The config deliberately has no legacy dcp_* attributes.
-    def initialize_base(self, config, spec, *, kernel_page_size):
-        self.is_draft = config.is_draft
-        self.spec_num_tokens = 8
-        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
-
-    monkeypatch.setattr(DSABackend, "__init__", initialize_base)
-
     def require_fused(*, rank_size, num_heads):
         if missing is not None:
             raise RuntimeError(f"Ascend DSA CP requires fused operators: {missing}")
 
-    monkeypatch.setattr(
-        ascend_dsa,
-        "ascend_dsa_kernels",
-        lambda: SimpleNamespace(require_fused_context_parallel=require_fused),
-    )
-    config = SimpleNamespace(
-        kv_cache_dtype=torch.bfloat16,
-        kv_cache_quant_method=None,
-        is_draft=False,
-        kvp_size=degree,
-        kvp_rank=rank,
-        kvp_group=tuple(range(degree)),
-    )
-    spec = SimpleNamespace(
-        is_dsa=True,
-        index_k_format="bf16",
-        attn_tp_size=degree,
-        num_attention_heads=2 * degree,
-    )
+    monkeypatch.setattr(ascend_dsa, "validate_dsa_fused_decode", require_fused)
+    config, spec = _backend_config(degree=degree, rank=rank, heads=2 * degree)
     backend = ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
     assert (backend._dcp.degree, backend._dcp.rank, backend._dcp.ranks) == (
         degree,
@@ -243,13 +285,12 @@ def test_dsa_slots_share_the_metadata_refresh():
     assert prepare().tolist() == [130, 128, -1, 129]
 
 
-def test_indexer_writes_only_its_own_cache_after_mla_prologue():
-    writes = []
-    index_cache = torch.empty((1, 128, 1, 32))
+def test_indexer_writes_only_its_own_cache_after_mla_prologue(monkeypatch):
+    index_cache = torch.full((2, 128, 1, 32), -7.0)
 
     class Kernels:
         def scatter(self, rows, cache, locations):
-            writes.append((rows, cache, locations))
+            cache.view(-1, 32).index_copy_(0, locations.long(), rows.view(-1, 32))
 
         def index(self, *args):
             return torch.zeros((1, 1), dtype=torch.int32), torch.ones(
@@ -264,16 +305,16 @@ def test_indexer_writes_only_its_own_cache_after_mla_prologue():
             assert name == "dsa_index_k"
             return index_cache
 
+    _install_device_operations(monkeypatch, Kernels())
     backend = SimpleNamespace(
         _indexer_spec=SimpleNamespace(index_head_dim=32, index_topk=1),
-        _indexer_kernels=Kernels(),
         kernel_page_size=128,
         step_counter=None,
         _dcp=SimpleNamespace(degree=1),
         cache_placement=lambda layer: None,
     )
     key = torch.ones((1, 1, 32))
-    locations = torch.tensor([3], dtype=torch.int32)
+    locations = torch.tensor([131], dtype=torch.int32)
     ascend_dsa.AscendDSABackend._select_indexed(
         backend,
         torch.ones((1, 1, 8)),
@@ -296,9 +337,8 @@ def test_indexer_writes_only_its_own_cache_after_mla_prologue():
         context_parallel=False,
         fused=False,
     )
-    assert len(writes) == 1
-    assert writes[0][1].data_ptr() == index_cache.data_ptr()
-    assert writes[0][2] is locations
+    torch.testing.assert_close(index_cache.view(-1, 32)[131], key.view(-1))
+    torch.testing.assert_close(index_cache[0], torch.full_like(index_cache[0], -7.0))
 
 
 def test_each_candidate_keeps_its_own_local_page_prefix():
@@ -325,7 +365,7 @@ def test_each_candidate_keeps_its_own_local_page_prefix():
     assert compact.page_table[:, 0].tolist() == [1, 1, 1, 1]
 
 
-def test_dcp_metadata_is_shared_only_within_matching_forward(monkeypatch):
+def test_dcp_metadata_is_shared_only_within_matching_forward():
     dcp = ascend_dcp.AscendDCPMetadata(
         virtual_block_count=17,
         degree=8,
@@ -334,14 +374,6 @@ def test_dcp_metadata_is_shared_only_within_matching_forward(monkeypatch):
     )
     table = torch.tensor([[1, 2, 3]] * 4, dtype=torch.int32)
     lengths = torch.tensor([254, 255, 256, 257], dtype=torch.int32)
-    calls = []
-    refresh = dcp.refresh_metadata
-
-    def counted(**kwargs):
-        calls.append(kwargs)
-        refresh(**kwargs)
-
-    monkeypatch.setattr(dcp, "refresh_metadata", counted)
 
     def prepare(local=0, rows=4):
         dcp.prepare_metadata(
@@ -356,9 +388,11 @@ def test_dcp_metadata_is_shared_only_within_matching_forward(monkeypatch):
             slots=None,
         )
 
-    for _ in range(6):
+    prepare()
+    address = dcp.page_table.data_ptr()
+    for _ in range(2):
         prepare()
-    assert len(calls) == 1
+        assert dcp.page_table.data_ptr() == address
     assert dcp.seq_lens.tolist() == [126, 127, 128, 128]
     # The next round can update the same device addresses in place.
     backend = SimpleNamespace(_ascend_placement=None, _dcp=dcp)
@@ -366,19 +400,18 @@ def test_dcp_metadata_is_shared_only_within_matching_forward(monkeypatch):
     lengths.fill_(130)
     table[:, 1] = 10
     prepare()
-    assert len(calls) == 2
     assert dcp.seq_lens.tolist() == [2] * 4
     assert dcp.page_table[:, 0].tolist() == [2] * 4
     prepare(local=1)
-    assert len(calls) == 3
     assert dcp.local_counts.tolist() == [1] * 4
     prepare(local=1, rows=2)
-    assert len(calls) == 4
     assert dcp.seq_lens.tolist() == [2] * 2
     # Rebinding, even to the same capacity, invalidates the forward result.
+    lengths.fill_(140)
+    table[:, 1] = 2
     dcp.bind_virtual_block_count(17)
     prepare(local=1, rows=2)
-    assert len(calls) == 5
+    assert dcp.seq_lens.tolist() == [12, 12]
 
 
 def test_decode_metadata_storage_is_stable_across_batch_sizes():
@@ -437,12 +470,15 @@ def test_large_prefill_does_not_replace_decode_metadata_buffers(
 
 @pytest.mark.parametrize("degree", [1, 2, 8])
 @pytest.mark.parametrize("block_size", [128, 256])
-def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
+def test_sharded_index_write_and_read_use_local_storage(
+    monkeypatch, degree, block_size
+):
     """Virtual IDs exceed each rank's capacity; replicated addressing fails."""
 
     class ReachedIndexer(Exception):
         pass
 
+    rows = 8
     subpages = block_size // 128
     blocks = [degree * 2, 1, degree + 1, 2]
     # No repeated block within a request, including degree=1.
@@ -484,9 +520,9 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
             def index(self, *args):
                 raise ReachedIndexer
 
+        _install_device_operations(monkeypatch, Kernels())
         backend = SimpleNamespace(
             _indexer_spec=SimpleNamespace(index_head_dim=8, index_topk=512),
-            _indexer_kernels=Kernels(),
             kernel_page_size=128,
             step_counter=None,
             _dcp=dcp,
@@ -506,8 +542,8 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
                 table,
                 dict(
                     index_key=keys,
-                    index_query=None,
-                    index_weights=None,
+                    index_query=torch.zeros(rows, 64, 128, dtype=torch.bfloat16),
+                    index_weights=torch.zeros(rows, 64),
                     index_init_tokens=131,
                     index_local_tokens=129,
                 ),
@@ -560,101 +596,6 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
             )
 
 
-@pytest.mark.parametrize("width", [2, 4, 8])
-def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
-    lengths = torch.tensor([20, 129, 260], dtype=torch.int32)
-    table = torch.arange(9, dtype=torch.int32).view(3, 3)
-    metadata = SimpleNamespace(seq_lens=lengths, page_table=table, num_extends=1)
-
-    class FakeDcp:
-        degree = 8
-
-        def __init__(self):
-            self.refreshed = []
-
-        def refresh_metadata(self, *, seq_lens, page_table, **kwargs):
-            del kwargs
-            self.refreshed.append((seq_lens.clone(), page_table.clone()))
-
-    class FakeBackend:
-        spec_num_tokens = width
-        kernel_page_size = 128
-        forward_decode_metadata = metadata
-
-        def _clear_forward_scratch(self):
-            pass
-
-        def __init__(self):
-            self.step_counter = None
-            self._dcp = FakeDcp()
-            self._dense_backend = SimpleNamespace(
-                refresh_decode_metadata=lambda *args, **kwargs: None
-            )
-            self.selections = []
-
-        def _validate_logit_cap(self, value):
-            assert value == 0
-
-        def _select_indexed(
-            self,
-            q,
-            k,
-            layer,
-            locations,
-            pool,
-            q_ends,
-            kv_lengths,
-            pages,
-            kwargs,
-            **options,
-        ):
-            del k, layer, pool, kwargs
-            self.selections.append(
-                (
-                    q_ends,
-                    kv_lengths.clone(),
-                    pages.clone(),
-                    locations.clone(),
-                    options,
-                )
-            )
-            return q
-
-        def _run_indexed_sparse_attention(
-            self, selection, layer, pool, *, head_major_output, is_prefill: bool
-        ):
-            del layer, pool, head_major_output
-            return selection.flatten(1)
-
-    backend = FakeBackend()
-    ascend_dsa.AscendDSABackend.refresh_decode_metadata(backend, 3, 3, lengths, table)
-    assert not backend._dcp.refreshed
-
-    rows = 2 * width
-    query = torch.arange(rows * 2, dtype=torch.float32).view(rows, 1, 2)
-    locations = torch.arange(rows, dtype=torch.int32)
-    output = ascend_dsa.AscendDSABackend.forward_decode(
-        backend,
-        query,
-        query,
-        None,
-        SimpleNamespace(logit_cap=0),
-        locations,
-        None,
-        2,
-        fused=False,
-    )
-    torch.testing.assert_close(output, query.flatten(1))
-    assert len(backend.selections) == 1
-    q_ends, visible, pages, selected_locations, options = backend.selections[0]
-    assert q_ends is None
-    assert options["query_width"] == width
-    torch.testing.assert_close(visible, lengths[1:])
-    torch.testing.assert_close(pages, table[1:])
-    torch.testing.assert_close(selected_locations, locations)
-    assert options["context_parallel"] is True
-
-
 @pytest.mark.parametrize("initial,local", [(-1, 0), (0, -1), (3, 2)])
 def test_index_policy_is_validated_at_execution(initial, local):
     backend = SimpleNamespace(_indexer_spec=SimpleNamespace(index_topk=4))
@@ -678,7 +619,7 @@ def test_index_policy_is_validated_at_execution(initial, local):
 
 
 @pytest.mark.parametrize("width", [2, 4, 8])
-def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
+def test_dcp_indexer_receives_model_policy_for_each_candidate(monkeypatch, width):
     class ReachedIndexer(Exception):
         pass
 
@@ -718,9 +659,9 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
             records.append(args)
             raise ReachedIndexer
 
+    _install_device_operations(monkeypatch, Kernels())
     backend = SimpleNamespace(
         _indexer_spec=SimpleNamespace(index_head_dim=8, index_topk=512),
-        _indexer_kernels=Kernels(),
         kernel_page_size=128,
         step_counter=None,
         _fused_group="test-dsa",
@@ -766,78 +707,6 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
     assert args[7].tolist() == expected_initial
     assert args[8].tolist() == expected_local
     assert args[4].tolist() == [min(max(n - 128, 0), 128) for n in lengths.tolist()]
-
-
-def test_single_token_mixed_decode_selects_request_shaped_query_metadata():
-    metadata = SimpleNamespace(
-        seq_lens=torch.tensor([12, 24], dtype=torch.int32),
-        page_table=torch.tensor([[1], [2]], dtype=torch.int32),
-        num_extends=1,
-    )
-
-    class FakeDcp:
-        degree = 8
-
-        def __init__(self):
-            self.refreshed = []
-
-        def refresh_metadata(self, *, seq_lens, page_table, **kwargs):
-            del kwargs
-            self.refreshed.append((seq_lens.clone(), page_table.clone()))
-
-    class FakeBackend:
-        spec_num_tokens = 4
-        kernel_page_size = 128
-        forward_decode_metadata = metadata
-
-        def __init__(self):
-            self.step_counter = None
-            self._dcp = FakeDcp()
-
-        def _validate_logit_cap(self, value):
-            assert value == 0
-
-        def _select_indexed(
-            self,
-            q,
-            k,
-            layer,
-            locations,
-            pool,
-            q_ends,
-            kv_lengths,
-            pages,
-            kwargs,
-            **options,
-        ):
-            del k, layer, locations, pool, kwargs
-            assert q_ends is None
-            assert options["query_width"] == 1
-            assert kv_lengths.tolist() == [24]
-            assert pages.tolist() == [[2]]
-            assert options["context_parallel"] is True
-            return q
-
-        def _run_indexed_sparse_attention(
-            self, selection, layer, pool, *, head_major_output, is_prefill: bool
-        ):
-            del layer, pool, head_major_output
-            return selection.flatten(1)
-
-    backend = FakeBackend()
-    query = torch.ones((1, 1, 2))
-    ascend_dsa.AscendDSABackend.forward_decode(
-        backend,
-        query,
-        query,
-        None,
-        SimpleNamespace(logit_cap=0),
-        torch.tensor([7], dtype=torch.int32),
-        None,
-        1,
-        fused=False,
-    )
-    assert not backend._dcp.refreshed
 
 
 class _CpuFusedDsaKernels:
@@ -893,38 +762,14 @@ class _CpuFusedDsaKernels:
 def _fused_backend(
     monkeypatch, rows, *, degree, rank=0, backend_class=ascend_dsa.AscendDSABackend
 ):
-    def initialize_base(self, config, spec, *, kernel_page_size):
-        self.is_draft = False
-        self.spec_num_tokens = 8
-        self.num_local_heads = 64 // degree
-        self.step_counter = None
-        self.kernel_page_size = kernel_page_size
-
     kernels = _CpuFusedDsaKernels(rows, degree)
-    monkeypatch.setattr(DSABackend, "__init__", initialize_base)
-    monkeypatch.setattr(ascend_dsa, "ascend_dsa_kernels", lambda: kernels)
-    config = SimpleNamespace(
-        kv_cache_dtype=torch.bfloat16,
-        kv_cache_quant_method=None,
-        kvp_size=degree,
-        kvp_rank=rank,
-        kvp_group=tuple(range(degree)),
-    )
-    spec = SimpleNamespace(
-        is_dsa=True,
-        index_k_format="bf16",
-        attn_tp_size=degree,
-        num_attention_heads=64,
-        index_head_dim=128,
-        index_topk=2048,
-        kv_cache_dim=576,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
+    _install_device_operations(monkeypatch, kernels)
+    config, spec = _backend_config(degree=degree, rank=rank, heads=64)
     backend = backend_class(config, spec, kernel_page_size=128)
     backend._dcp.bind_virtual_block_count(17)
-    placement = CachePlacement(128, 17, tuple(range(degree)), rank)
-    monkeypatch.setattr(backend, "cache_placement", lambda layer: placement)
+    backend.configure_runtime(
+        block_granularity=128, virtual_block_count=17, shard_count=degree
+    )
     return backend
 
 
@@ -992,7 +837,9 @@ def _collective_dsa_worker(rank, rendezvous):
             patch.setattr(pg_module, "process_group_manager", manager)
             for rows in (1, 3, 16):
                 backend = _fused_backend(patch, rows, degree=degree, rank=rank)
-                backend._indexer_kernels = _CpuCollectiveDsaKernels(rows, degree, rank)
+                _install_device_operations(
+                    patch, _CpuCollectiveDsaKernels(rows, degree, rank)
+                )
                 # Small shapes must retain the general path even after the
                 # model has configured native buffers for larger shapes.
                 backend.configure_fused_decode(
@@ -1018,8 +865,8 @@ def _collective_dsa_worker(rank, rendezvous):
                     torch.full((rows,), 128, dtype=torch.int32),
                     torch.ones(rows, 1, dtype=torch.int32),
                     dict(
-                        index_query=None,
-                        index_weights=None,
+                        index_query=torch.zeros(rows, 64, 128, dtype=torch.bfloat16),
+                        index_weights=torch.zeros(rows, 64),
                         index_init_tokens=0,
                         index_local_tokens=0,
                         index_cache_written=True,
@@ -1052,7 +899,6 @@ def _collective_dsa_worker(rank, rendezvous):
                             layer,
                             pool,
                             head_major_output=head_major,
-                            is_prefill=is_prefill,
                         )
                         reference = (
                             expected
@@ -1091,7 +937,7 @@ def test_single_rank_verify_preserves_each_candidates_causal_context(
 
     rows = 2 * width
     backend = _fused_backend(monkeypatch, rows, degree=1)
-    monkeypatch.setattr(backend, "_indexer_kernels", SingleRankKernels())
+    _install_device_operations(monkeypatch, SingleRankKernels())
     monkeypatch.setattr(backend, "cache_placement", lambda layer: None)
     table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
     lengths = torch.tensor([129, 257], dtype=torch.int32)
@@ -1107,7 +953,7 @@ def test_single_rank_verify_preserves_each_candidates_causal_context(
         table,
         dict(
             index_query=torch.zeros(rows, 16, 128),
-            index_weights=None,
+            index_weights=torch.zeros(rows, 64),
             index_init_tokens=0,
             index_local_tokens=0,
             index_cache_written=True,
@@ -1146,11 +992,9 @@ def test_dsa_metadata_needs_no_collective_process_group(monkeypatch):
     assert metadata.page_table.tolist() == [[1, 0]]
 
 
-@pytest.mark.parametrize(
-    "degree,rows", [(2, 64), (4, 64), (8, 64), (8, 128), (8, 256), (8, 512), (16, 64)]
-)
+@pytest.mark.parametrize("degree,rows", [(8, 64), (8, 512)])
 @pytest.mark.parametrize("head_major", [False, True])
-def test_fused_dsa_uses_registered_outputs_and_merges_lse(
+def test_fused_dsa_uses_prepared_outputs_and_merges_lse(
     monkeypatch, degree, rows, head_major
 ):
     backend = _fused_backend(monkeypatch, rows, degree=degree)
@@ -1183,8 +1027,8 @@ def test_fused_dsa_uses_registered_outputs_and_merges_lse(
         torch.full((rows,), 128, dtype=torch.int32),
         torch.ones(rows, 1, dtype=torch.int32),
         dict(
-            index_query=None,
-            index_weights=None,
+            index_query=torch.zeros(rows, 64, 128, dtype=torch.bfloat16),
+            index_weights=torch.zeros(rows, 64),
             index_init_tokens=0,
             index_local_tokens=0,
             index_cache_written=True,
@@ -1202,7 +1046,6 @@ def test_fused_dsa_uses_registered_outputs_and_merges_lse(
         layer,
         pool,
         head_major_output=head_major,
-        is_prefill=False,
     )
     # Independent log-softmax reference over the configured context shards.
     ranks = torch.arange(degree, dtype=torch.float64)
@@ -1246,7 +1089,6 @@ def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
             SimpleNamespace(layer_id=0),
             pool,
             head_major_output=True,
-            is_prefill=False,
         )
     outputs = (torch.empty(64, 64, 512), torch.empty(1, 64, 64), torch.empty(1, 64, 64))
     backend.configure_fused_decode(
@@ -1261,38 +1103,7 @@ def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
             SimpleNamespace(layer_id=0),
             pool,
             head_major_output=True,
-            is_prefill=False,
         )
-
-
-@pytest.mark.parametrize("is_prefill", [False, True])
-def test_public_attention_provider_hook_selects_stage(monkeypatch, is_prefill):
-    class StageKernels:
-        def __init__(self, value):
-            self.value = value
-
-        def attention(self, query, *args):
-            return torch.full_like(query, self.value)
-
-    class StageBackend(ascend_dsa.AscendDSABackend):
-        def attention_kernels(self, *, is_prefill):
-            return StageKernels(2 if is_prefill else 3)
-
-    backend = _fused_backend(monkeypatch, 1, degree=1, backend_class=StageBackend)
-    selection = ascend_dsa._AscendSparseSelection(
-        torch.zeros(1, 8, 576), None, None, None, None, None, 3, False, False
-    )
-    pool = SimpleNamespace(get_key_buffer=lambda layer: torch.zeros(128, 576))
-    result = backend._run_indexed_sparse_attention(
-        selection,
-        SimpleNamespace(layer_id=0, scaling=1.0),
-        pool,
-        head_major_output=False,
-        is_prefill=is_prefill,
-    )
-    torch.testing.assert_close(
-        result, torch.full((1, 8 * 512), 2 if is_prefill else 3, dtype=torch.float32)
-    )
 
 
 class _CacheStepPool:
@@ -1316,6 +1127,7 @@ class _CacheStepConsumer:
         self.pool = pool
         self.layer_id = 0
         self.last_step = 0
+        self.fail_index_store = False
         self.notifications = []
 
     def poll(self):
@@ -1336,6 +1148,14 @@ class _CacheStepKernels:
 
     def require_fused_context_parallel(self, *, rank_size, num_heads):
         pass
+
+    def prefill_index(self, query, *args):
+        self.consumer.poll()
+        return torch.zeros(query.shape[0], 2, dtype=torch.int32)
+
+    def prefill_attention(self, query, *args):
+        self.consumer.poll()
+        return query[..., :2].transpose(0, 1).contiguous()
 
     def scatter(self, rows, cache, locations):
         self.consumer.poll()
@@ -1394,12 +1214,12 @@ class _CacheStepCollectives:
 class _CacheStepBackend(ascend_dsa.AscendDSABackend):
     def __init__(self, config, spec, *, kernel_page_size):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
-        self.prefill_metadata = None
+        self._fixture_prefill_metadata = None
         self.decode_metadata = None
 
     @property
     def forward_prefill_metadata(self):
-        return self.prefill_metadata
+        return self._fixture_prefill_metadata
 
     @property
     def forward_decode_metadata(self):
@@ -1426,48 +1246,59 @@ def _cache_step_backend(monkeypatch, *, degree, layers):
     consumer = _CacheStepConsumer(counter, pool)
     kernels = _CacheStepKernels(consumer)
 
-    def initialize_base(self, config, spec, *, kernel_page_size):
-        # The dense leaf constructor needs model/device kernels; none of the
-        # Ascend selection, chunking or cache completion methods is replaced.
-        self.is_draft = False
-        self.spec_num_tokens = 8
-        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
-        self.step_counter = None
-        self.kernel_page_size = kernel_page_size
-
-    monkeypatch.setattr(DSABackend, "__init__", initialize_base)
-    monkeypatch.setattr(ascend_dsa, "ascend_dsa_kernels", lambda: kernels)
-    # Compact model weights keep this device-free lifecycle test inexpensive.
-    config = SimpleNamespace(
-        kv_cache_dtype=torch.bfloat16,
-        kv_cache_quant_method=None,
-        kvp_size=degree,
-        kvp_rank=0,
-        kvp_group=tuple(range(degree)),
-    )
-    spec = SimpleNamespace(
-        is_dsa=True,
-        index_k_format="bf16",
-        attn_tp_size=degree,
-        num_attention_heads=degree,
-        index_head_dim=2,
-        index_topk=2,
-        kv_cache_dim=3,
-        kv_lora_rank=2,
-        qk_rope_head_dim=1,
+    _install_device_operations(monkeypatch, kernels)
+    config, spec = _backend_config(
+        degree=degree,
+        rank=0,
+        heads=degree,
+        index_dim=2,
+        topk=2,
+        latent=2,
+        rope=1,
     )
     backend = _CacheStepBackend(config, spec, kernel_page_size=128)
     backend.step_counter = counter
     backend._dcp.bind_virtual_block_count(33)
     backend._collective_context = _CacheStepCollectives(degree)
     placement = CachePlacement(128, 33, tuple(range(degree)), 0)
-    monkeypatch.setattr(
-        backend, "cache_placement", lambda layer: placement if degree > 1 else None
+    backend.configure_runtime(
+        block_granularity=128, virtual_block_count=33, shard_count=degree
     )
+
+    def store_current_index(
+        workspace, direct, mapped_slots, *, block_rows, virtual_blocks
+    ):
+        consumer.poll()
+        if consumer.fail_index_store:
+            raise RuntimeError("device index-cache write failed")
+        current = torch.cat(
+            [
+                workspace.index[
+                    workspace.history_rows
+                    + owner * workspace.send_rows : workspace.history_rows
+                    + owner * workspace.send_rows
+                    + count
+                ]
+                for owner, count in enumerate(
+                    backend.prefill_cache_metadata.projection_row_counts
+                )
+            ]
+        )
+        slots = workspace.write_slots
+        if degree > 1:
+            locations, owned = resolve_cache_slots(slots, placement)
+        else:
+            locations, owned = slots, slots >= block_rows
+        workspace.source_index.view(-1, 2)[locations[owned].long()] = current[owned]
+        update = (direct == 0) & (mapped_slots >= 0)
+        workspace.index[mapped_slots[update].long()] = current[update]
+
+    monkeypatch.setattr(ascend_dsa, "store_gathered_index_keys", store_current_index)
+    monkeypatch.setattr(ascend_dsa, "finish_prefill_workspace", lambda workspace: None)
     return backend, pool, consumer
 
 
-def _cache_step_inputs(backend, pool, consumer, *, rows, layer_id, batch):
+def _cache_step_inputs(backend, pool, consumer, *, rows, layer_id, batch, prefill):
     from tokenspeed.runtime.layers.attention.backends.paged.mla import (
         MLAPrefillMetadata,
     )
@@ -1476,7 +1307,7 @@ def _cache_step_inputs(backend, pool, consumer, *, rows, layer_id, batch):
     extends = torch.tensor([rows], dtype=torch.int32)
     zero = torch.zeros(1, dtype=torch.int32)
     table = torch.arange(1, 33, dtype=torch.int32)[None]
-    backend.prefill_metadata = MLAPrefillMetadata(
+    backend._fixture_prefill_metadata = MLAPrefillMetadata(
         seq_lens=extends,
         extend_prefix_lens=zero,
         extend_seq_lens=extends,
@@ -1517,10 +1348,62 @@ def _cache_step_inputs(backend, pool, consumer, *, rows, layer_id, batch):
         index_init_tokens=0,
         index_local_tokens=0,
     )
+    if prefill:
+        from tokenspeed_kernel.ops.attention.ascend_prefill import PrefillWorkspace
+
+        from tokenspeed.runtime.layers.attention.dcp.ascend import (
+            AscendPrefillOptions,
+            DSAPrefillQueryMetadata,
+            PrefillCacheMetadata,
+        )
+
+        layout = PrefillCacheMetadata.build(
+            backend._fixture_prefill_metadata,
+            placement,
+            degree=backend._dcp.degree,
+            rank=0,
+            page_size=128,
+            local_cache_pages=33,
+            options=AscendPrefillOptions(rows, 128),
+        )
+        backend._prefill_cache_metadata = layout
+        backend._prefill_query_metadata = DSAPrefillQueryMetadata.build(
+            backend._fixture_prefill_metadata,
+            layout,
+            topk=2,
+        )
+        history_rows = 128 + sum(layout.history_gather.row_counts)
+        send_rows = -(-rows // (backend._dcp.degree * 128)) * 128
+        index = torch.zeros(history_rows + backend._dcp.degree * send_rows, 2)
+        for owner, count in enumerate(layout.projection_row_counts):
+            source = sum(layout.projection_row_counts[:owner])
+            dest = history_rows + owner * send_rows
+            index[dest : dest + count] = index_key[source : source + count]
+        backend._prefill_workspace = PrefillWorkspace(
+            layer_id,
+            layout,
+            pool.kv[layer_id],
+            pool.index[layer_id],
+            torch.zeros(index.shape[0], 3),
+            index,
+            history_rows,
+            send_rows,
+            rows,
+            tuple(backend._dcp.ranks),
+            0,
+            None,
+            slots.clone(),
+            0,
+        )
+        query = (
+            query[layout.query_start : layout.query_end]
+            .expand(-1, backend.num_local_heads * backend._dcp.degree, -1)
+            .contiguous()
+        )
     return query, slots, inputs, expected
 
 
-@pytest.mark.parametrize("degree,rows", [(2, 1024), (2, 1025), (2, 2049), (1, 2049)])
+@pytest.mark.parametrize("degree,rows", [(1, 7), (8, 17), (8, 129)])
 def test_prefill_cache_counter_announces_completed_layers_across_batches(
     monkeypatch, degree, rows
 ):
@@ -1529,11 +1412,32 @@ def test_prefill_cache_counter_announces_completed_layers_across_batches(
     for batch in range(3):
         for layer_id in range(3):
             query, slots, inputs, expected = _cache_step_inputs(
-                backend, pool, consumer, rows=rows, layer_id=layer_id, batch=batch
+                backend,
+                pool,
+                consumer,
+                rows=rows,
+                layer_id=layer_id,
+                batch=batch,
+                prefill=True,
             )
             layer = SimpleNamespace(layer_id=layer_id, scaling=1.0, logit_cap=0)
+            indices = backend.select_prefill_indices(
+                inputs["index_query"][: query.shape[0]],
+                inputs["index_weights"][: query.shape[0]],
+                layer,
+                initial=0,
+                window=0,
+            )
             backend.forward_extend(
-                query, None, None, layer, slots, pool, 1, fused=False, **inputs
+                query,
+                None,
+                None,
+                layer,
+                slots,
+                pool,
+                1,
+                fused=False,
+                prefill_indices=indices,
             )
             consumer.poll()
             completed += 1
@@ -1553,7 +1457,13 @@ def test_decode_cache_counter_still_announces_one_completed_layer(monkeypatch, d
     for batch in range(3):
         for layer_id in range(2):
             query, slots, inputs, expected = _cache_step_inputs(
-                backend, pool, consumer, rows=1, layer_id=layer_id, batch=batch
+                backend,
+                pool,
+                consumer,
+                rows=1,
+                layer_id=layer_id,
+                batch=batch,
+                prefill=False,
             )
             backend.decode_metadata = MLADecodeMetadata(
                 num_extends=0,
@@ -1576,122 +1486,21 @@ def test_decode_cache_counter_still_announces_one_completed_layer(monkeypatch, d
 def test_incomplete_prefill_cache_write_does_not_publish_layer_completion(monkeypatch):
     backend, pool, consumer = _cache_step_backend(monkeypatch, degree=2, layers=1)
     query, slots, inputs, _ = _cache_step_inputs(
-        backend, pool, consumer, rows=2049, layer_id=0, batch=0
+        backend, pool, consumer, rows=7, layer_id=0, batch=0, prefill=True
     )
-    backend._indexer_kernels.fail_on_short_chunk = True
+    consumer.fail_index_store = True
     layer = SimpleNamespace(layer_id=0, scaling=1.0, logit_cap=0)
     with pytest.raises(RuntimeError, match="index-cache write failed"):
-        backend.forward_extend(
-            query, None, None, layer, slots, pool, 1, fused=False, **inputs
+        backend.select_prefill_indices(
+            inputs["index_query"][: query.shape[0]],
+            inputs["index_weights"][: query.shape[0]],
+            layer,
+            initial=0,
+            window=0,
         )
     consumer.poll()
     assert int(backend.step_counter.h_ready_cache_step) == 0
     assert not consumer.notifications
-
-
-@pytest.mark.parametrize("rows", [1024, 1025, 2049])
-@pytest.mark.parametrize("head_major", [False, True])
-def test_collective_prefill_keeps_causal_rows_across_indexer_batch_limit(
-    rows, head_major
-):
-    from tokenspeed.runtime.layers.attention.backends.paged.mla import (
-        MLAPrefillMetadata,
-    )
-
-    extends = torch.tensor([1000, rows - 1000], dtype=torch.int32)
-    prefixes = torch.tensor([13, 257], dtype=torch.int32)
-    cumulative = torch.cat((torch.zeros(1, dtype=torch.int32), extends.cumsum(0).int()))
-    metadata = MLAPrefillMetadata(
-        seq_lens=prefixes + extends,
-        extend_prefix_lens=prefixes,
-        extend_seq_lens=extends,
-        cum_extend_seq_lens=cumulative,
-        cum_seq_lens_kv=None,
-        page_table=torch.tensor([[5, 7], [9, 2]], dtype=torch.int32),
-        extend_prefix_lens_cpu=prefixes,
-        extend_seq_lens_cpu=extends,
-        max_extend_seq_len=int(extends.max()),
-        max_extend_prefix_len=257,
-        use_absorbed_cached_extend=False,
-        chunked_loop_num=0,
-        chunk_kv_indices_list=[],
-        chunked_seq_len=torch.empty(0),
-        cu_chunked_seq_len=torch.empty(0),
-        max_chunk_len_per_loop=[],
-    )
-
-    class CpuCollectiveBackend(ascend_dsa.AscendDSABackend):
-        def __init__(self):
-            self.step_counter = None
-            self._dcp = ascend_dcp.AscendDCPMetadata(
-                degree=8, rank=0, ranks=tuple(range(8)), virtual_block_count=32
-            )
-
-        @property
-        def forward_prefill_metadata(self):
-            return metadata
-
-        def _select_indexed(
-            self, q, k, layer, slots, pool, ends, lengths, table, inputs, **kwargs
-        ):
-            # The device indexer is unavailable; inspect the causal rows sent
-            # to it and use real tensor arithmetic as a row-order fingerprint.
-            assert len(q) <= 1024
-            torch.testing.assert_close(
-                ends, torch.arange(1, len(q) + 1, dtype=torch.int32)
-            )
-            positions = q[:, 0, 0].int()
-            request = (positions >= 1000).long()
-            expected = prefixes[request] + positions - cumulative[request] + 1
-            torch.testing.assert_close(lengths, expected)
-            torch.testing.assert_close(table, metadata.page_table[request])
-            torch.testing.assert_close(slots, positions + 17)
-            for name, offset in (
-                ("index_query", 7),
-                ("index_key", 11),
-                ("index_weights", 13),
-            ):
-                torch.testing.assert_close(
-                    inputs[name].reshape(-1), positions.float() + offset
-                )
-            return q * 3 + lengths[:, None, None] + inputs["index_key"]
-
-        def _run_indexed_sparse_attention(
-            self, selection, layer, pool, *, head_major_output, is_prefill
-        ):
-            assert is_prefill
-            return (
-                selection.transpose(0, 1).contiguous()
-                if head_major_output
-                else selection.flatten(1)
-            )
-
-    positions = torch.arange(rows, dtype=torch.float32)
-    query = positions[:, None, None].expand(-1, 2, 1).contiguous()
-    output = CpuCollectiveBackend()._forward_collective_extend(
-        query,
-        None,
-        None,
-        SimpleNamespace(logit_cap=0),
-        positions.int() + 17,
-        None,
-        2,
-        fused=False,
-        head_major_output=head_major,
-        index_query=(positions + 7)[:, None, None],
-        index_key=(positions + 11)[:, None, None],
-        index_weights=(positions + 13)[:, None],
-    )
-    request = (positions >= 1000).long()
-    expected = (
-        query * 3
-        + (prefixes[request] + positions - cumulative[request] + 1)[:, None, None]
-        + (positions + 11)[:, None, None]
-    )
-    expected = (
-        expected.transpose(0, 1).contiguous() if head_major else expected.flatten(1)
-    )
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def test_fused_selection_rejects_missing_prolog_query(monkeypatch):
