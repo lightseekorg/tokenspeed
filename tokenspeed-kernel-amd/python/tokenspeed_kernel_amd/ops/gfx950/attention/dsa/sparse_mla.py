@@ -28,7 +28,7 @@ from threading import Lock
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._scheduling import release_drain, sched_compile_options
+from tokenspeed_kernel_amd._extern import extern_compile_options, release_drain
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
@@ -3042,7 +3042,7 @@ def _dsa_persistent_radix_topk(
         TOPK=topk,
         BLOCK_N=block_n,
         num_warps=_PERSISTENT_NUM_WARPS,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     return out, lens_out
 

@@ -20,48 +20,75 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""AMD scheduling and wave-level intrinsics from an external LLVM library.
+"""AMD intrinsics Gluon does not expose, from external LLVM IR libraries.
 
-For a plain scheduling barrier use ``gl.amd.hint.sched_barrier()``; this
-library covers the intrinsics Gluon does not expose.
+Each category is one library, ``_intrinsics/_<category>.ll``: ``arith``
+holds floating-point arithmetic controls, ``isched`` instruction scheduling
+hints, ``sync`` memory synchronization and ``wave`` wave-level operations.
+Kernels calling any function here launch
+with :func:`extern_compile_options`. For a plain scheduling barrier use
+``gl.amd.hint.sched_barrier()``.
 """
 
 from pathlib import Path
 
 from tokenspeed_kernel_amd._triton import tl
 
-_SCHED_LIBRARY_NAME = "tokenspeed_sched"
-_READFIRSTLANE_SYMBOL = "__tokenspeed_sched_readfirstlane_i32"
-_SCHED_LIBRARY_PATH = str(Path(__file__).with_name("sched_barrier.ll"))
+_INTRINSICS_DIRECTORY = Path(__file__).with_name("_intrinsics")
+
+# Library name -> LLVM IR file of one category.
+_LIBRARIES = {
+    f"tokenspeed_{category}": str(_INTRINSICS_DIRECTORY / f"_{category}.ll")
+    for category in ("arith", "isched", "sync", "wave")
+}
 
 
-def sched_compile_options() -> dict:
-    """Return launch options for kernels using this library's intrinsics.
+def extern_compile_options() -> dict:
+    """Return launch options for kernels using this module's intrinsics.
 
-    Merge ``extern_libs`` with any other device libraries required by the
-    caller. Triton keys compiled kernels on the library contents.
+    Every library is listed: Triton links only those a kernel calls into and
+    keys compiled kernels on the contents of all of them. Merge
+    ``extern_libs`` with any other device libraries required by the caller.
     """
-    return {"extern_libs": {_SCHED_LIBRARY_NAME: _SCHED_LIBRARY_PATH}}
+    return {"extern_libs": dict(_LIBRARIES)}
+
+
+def _call(category, function, args, arg_types, ret_type, is_pure, _semantic):
+    # Triton links a library into a kernel only when the kernel calls a
+    # symbol containing the library name, hence the symbol prefix.
+    library = f"tokenspeed_{category}"
+    return tl.core.extern_elementwise(
+        library,
+        _LIBRARIES[library],
+        args,
+        {arg_types: (f"__{library}_{function}", ret_type)},
+        is_pure=is_pure,
+        _semantic=_semantic,
+    )
+
+
+# Floating-point arithmetic (_arith.ll).
 
 
 @tl.core.extern
-def wave_uniform_i32(value, _semantic):
-    """Return lane 0's int32 ``value``, marking it wave-uniform (in an SGPR).
-
-    Emits ``llvm.amdgcn.readfirstlane``. Unlike an inline-asm
-    ``v_readfirstlane_b32``, the backend sees the instruction and inserts the
-    wait states needed after a VALU write of its source; the inline-asm form
-    can read a stale VGPR on gfx950. Launch with :func:`sched_compile_options`.
+def arithmetic_fence(value, _semantic):
+    """Return the FP32 ``value`` as one LLVM must treat as new
+    (``llvm.arithmetic.fence``; no instruction): arithmetic on the result is
+    neither merged with the same arithmetic on ``value`` nor reassociated
+    across this point. Launch with :func:`extern_compile_options`.
     """
-    return tl.core.extern_elementwise(
-        _SCHED_LIBRARY_NAME,
-        _SCHED_LIBRARY_PATH,
+    return _call(
+        "arith",
+        "fence_f32",
         [value],
-        {(tl.int32,): (_READFIRSTLANE_SYMBOL, tl.int32)},
+        (tl.float32,),
+        tl.float32,
         is_pure=True,
         _semantic=_semantic,
     )
 
+
+# Instruction scheduling (_isched.ll).
 
 # Instruction classes of ``llvm.amdgcn.sched.group.barrier`` masks.
 _SCHED_GROUP_CLASSES = {
@@ -109,18 +136,23 @@ def sched_group(mask, size, _semantic):
     A sequence of these after a region's instructions pins their interleave.
     Direct-to-LDS ``buffer_load ... lds`` matches ``"vmem"`` but not
     ``"vmem_read"``. Only the (mask, size) pairs defined in
-    ``sched_barrier.ll`` exist. Launch with :func:`sched_compile_options`.
+    ``_intrinsics/_isched.ll`` exist. Launch with
+    :func:`extern_compile_options`.
     """
     mask = _sched_group_mask(mask)
     size = tl.core._unwrap_if_constexpr(size)
-    return tl.core.extern_elementwise(
-        _SCHED_LIBRARY_NAME,
-        _SCHED_LIBRARY_PATH,
+    return _call(
+        "isched",
+        f"group_barrier_{mask}_{size}",
         [],
-        {(): (f"__tokenspeed_sched_group_barrier_{mask}_{size}", tl.int32)},
+        (),
+        tl.int32,
         is_pure=False,
         _semantic=_semantic,
     )
+
+
+# Memory synchronization (_sync.ll).
 
 
 @tl.core.extern
@@ -131,30 +163,38 @@ def release_drain(_semantic):
     Only this wave's operations are waited for: follow it with
     ``gl.barrier()`` when every wave's stores must land before one thread
     publishes. Loads the wave issued earlier are waited for too (one
-    in-order counter). Launch with :func:`sched_compile_options`.
+    in-order counter). Launch with :func:`extern_compile_options`.
     """
-    return tl.core.extern_elementwise(
-        _SCHED_LIBRARY_NAME,
-        _SCHED_LIBRARY_PATH,
+    return _call(
+        "sync",
+        "release_drain",
         [],
-        {(): ("__tokenspeed_sched_release_drain", tl.int32)},
+        (),
+        tl.int32,
         is_pure=False,
         _semantic=_semantic,
     )
 
 
+# Wave-level operations (_wave.ll).
+
+
 @tl.core.extern
-def arithmetic_fence(value, _semantic):
-    """Return the FP32 ``value`` as one LLVM must treat as new
-    (``llvm.arithmetic.fence``; no instruction): arithmetic on the result is
-    neither merged with the same arithmetic on ``value`` nor reassociated
-    across this point. Launch with :func:`sched_compile_options`.
+def wave_uniform_i32(value, _semantic):
+    """Return lane 0's int32 ``value``, marking it wave-uniform (in an SGPR).
+
+    Emits ``llvm.amdgcn.readfirstlane``. Unlike an inline-asm
+    ``v_readfirstlane_b32``, the backend sees the instruction and inserts the
+    wait states needed after a VALU write of its source; the inline-asm form
+    can read a stale VGPR on gfx950. Launch with
+    :func:`extern_compile_options`.
     """
-    return tl.core.extern_elementwise(
-        _SCHED_LIBRARY_NAME,
-        _SCHED_LIBRARY_PATH,
+    return _call(
+        "wave",
+        "readfirstlane_i32",
         [value],
-        {(tl.float32,): ("__tokenspeed_sched_arithmetic_fence_f32", tl.float32)},
+        (tl.int32,),
+        tl.int32,
         is_pure=True,
         _semantic=_semantic,
     )
@@ -166,13 +206,14 @@ def wave_all_equal(a, b, _semantic):
     wave, else 0, as an int32 tensor whose value is the same across the
     wave (in an SGPR, so a branch on it is a scalar branch). One compare
     into a lane mask (``llvm.amdgcn.ballot``) tested against the active
-    lanes. Launch with :func:`sched_compile_options`.
+    lanes. Launch with :func:`extern_compile_options`.
     """
-    return tl.core.extern_elementwise(
-        _SCHED_LIBRARY_NAME,
-        _SCHED_LIBRARY_PATH,
+    return _call(
+        "wave",
+        "all_equal_f32",
         [a, b],
-        {(tl.float32, tl.float32): ("__tokenspeed_sched_wave_all_equal_f32", tl.int32)},
+        (tl.float32, tl.float32),
+        tl.int32,
         is_pure=False,
         _semantic=_semantic,
     )

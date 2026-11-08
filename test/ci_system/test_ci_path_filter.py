@@ -99,7 +99,7 @@ def test_shared_paths_require_every_group(path):
     "path",
     [
         "tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py",
-        "tokenspeed-kernel/test/amd/test_scheduling.py",
+        "tokenspeed-kernel/test/amd/test_extern.py",
         "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/_triton.py",
         "tokenspeed-kernel-amd/pyproject.toml",
         "tokenspeed-kernel/python/requirements/rocm.txt",
