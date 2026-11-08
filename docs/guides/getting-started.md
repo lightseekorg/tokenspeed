@@ -102,6 +102,17 @@ does not need the kernel workflow's CUDA build-variant inputs. To install a
 replacement of an already installed version, add `--no-cache-dir --force-reinstall`
 to the corresponding pinned installation command above.
 
+To publish a release candidate without touching the scheduled nightly of its
+date, run **Build and Release tokenspeed-kernel** and then **Build and Release
+TokenSpeed** from `main` with `nightly=true`, `publish_github=true`, the same
+`version_date`, and the same `release_candidate`, for example `1`. That
+publishes `tokenspeed==0.1.1rc1.post20261108` with
+`tokenspeed-kernel==0.1.4rc1.post20261108`. A release candidate sorts below
+every nightly: the scheduled nightly still publishes under its own version, and
+any install that a nightly satisfies still gets a nightly, so pin the release
+candidate to install it. Release candidates skip the ROCm index; the scheduled
+nightly of the same date adds ROCm.
+
 ### From source
 
 For H100/H200 with CUDA Toolkit 12.9, use the
