@@ -568,7 +568,8 @@ compatible fallback instead of importing CUDA IPC handles across hosts.
 | `--eplb-rebalance-layers-per-chunk` | MoE layers whose experts move in one scheduling round; required with `--enable-eplb`, `1..num MoE layers`. Fewer layers per chunk bound the per-round stall. |
 
 All of these apply only to models that opt in to expert placement
-(LongCat-Flash); other models refuse them at startup. See
+(LongCat-Flash; Kimi-K3 on its attention-DP MegaMoE path with a `static`
+dispatch and no load recording); other models refuse them at startup. See
 [static expert placement](../serving/parallelism.md#static-expert-placement-with-redundant-experts)
 for the record → place → route flow and the two dispatch flavors, and
 [dynamic expert rebalancing](../serving/parallelism.md#dynamic-expert-rebalancing)

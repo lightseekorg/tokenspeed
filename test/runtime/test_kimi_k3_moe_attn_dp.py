@@ -415,6 +415,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         routed_hidden=width,
         top_k=2,
         topk=topk,
+        expert_dispatch_info=None,
         experts=SimpleNamespace(
             plan={"weight_dtype": "nvfp4" if nvfp4 else "unquant"},
             w13_input_scale_quant=quant_scale,
@@ -632,6 +633,7 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
         stream_fork=SimpleNamespace(scope=scope),
         topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),
+        expert_dispatch_info=None,
         gate=mock.Mock(return_value=torch.zeros(rows, 2)),
         routed_expert_down_proj=mock.Mock(return_value=(latent, None)),
         experts=SimpleNamespace(
