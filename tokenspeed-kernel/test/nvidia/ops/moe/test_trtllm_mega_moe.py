@@ -20,7 +20,8 @@
 
 """NVFP4 MegaMoE SiTU correctness at K3 geometry, including EP and graph replay.
 
-Run directly with torchrun; WORLD_SIZE=16 uses all 896 K3 experts.
+Run directly with torchrun: the ranks hold K3's 896 experts, with redundant
+slots when WORLD_SIZE does not divide them (WORLD_SIZE=20: 900 slots, 45 per rank).
 Pass --autotune to sweep all tactics before checking eager and graph results.
 Pass --intermediate-size 3072 for the full K3 shape. Pytest uses 192.
 """
@@ -64,7 +65,9 @@ from tokenspeed_kernel.ops.tuning import (  # noqa: E402
 
 HIDDEN = 3584
 INTERMEDIATE = 192
-LOCAL_EXPERTS = 56
+LOCAL_EXPERTS = (
+    -(-896 // int(os.environ["WORLD_SIZE"])) if "WORLD_SIZE" in os.environ else 56
+)
 TOP_K = 16
 
 

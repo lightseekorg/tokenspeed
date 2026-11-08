@@ -23,14 +23,16 @@ completed barrier from a slower CTA. Bulk FC2 stores wait for destination
 writes to complete before the tail publishes output readiness.
 
 Autotuning includes N64, N128 and N256 token tiles. The small-capacity OFF
-policy below is specific to K3 SiTU on SM100/SM103 EP16: 896 experts, hidden 3584,
-intermediate 3072, top-k 16, beta 4 and linear beta 25. It uses the regimes
-observed in the SM103 autotune sweep. These optimizations use the shared
+policy below is specific to K3 SiTU experts on SM100/SM103: hidden 3584,
+intermediate 3072, top-k 16, beta 4 and linear beta 25, at any EP size
+(including EP sizes that hold redundant expert slots). It uses the regimes
+observed in the SM103 autotune sweep at EP16. These optimizations use the shared
 Blackwell kernel implementation. The active CTA count comes from the device;
-it is not fixed to an SM103 SM count. Hardware validation covers this K3 shape
-on SM100 and SM103. The SM100 paired OFF sweep covers capacities 1 through 2048.
-The measured latency gains are stable at capacities 1 through 64.
-Other shapes retain the original policy.
+it is not fixed to an SM103 SM count. Hardware validation covers EP16 on SM100
+and SM103, and EP20 with 900 slots (45 per rank) on SM103. The SM100 paired OFF
+sweep covers capacities 1 through 2048. The measured latency gains are stable at
+capacities 1 through 64; at 45 experts per rank the policy also shortens the MoE
+layer at capacity 64. Other shapes retain the original policy.
 Explicit tactics retain priority. All entries use epi_warps and flag_batch 1.
 
 | Tokens per rank (power-of-two capacity) | Tile N | Group hint | Scheduler |
@@ -39,7 +41,7 @@ Explicit tactics retain priority. All entries use epi_warps and flag_batch 1.
 | 2 through 32 | 64 | 1024 | atomic_counter |
 | 64 | 128 | 512 | atomic_counter |
 
-For that same K3 shape, capacities 4 through 32 reduce BF16 top-k outputs on
+For those K3 experts, capacities 4 through 32 reduce BF16 top-k outputs on
 the dispatch workers after the existing tail acquire. This preserves the
 original FP32 accumulation order and BF16 rounding. Other capacities retain
 the standalone reduction. The kernel receives an explicit reduction flag.
@@ -52,13 +54,14 @@ and graph capture do not add these backup copies. The GPU correctness test
 starts with producer views and an empty tuning cache. Its torchrun entry
 requires an explicit intermediate size; use 3072 for full K3 geometry.
 
-For the same K3 SM100/SM103 EP16 shape, capacities 1, 2 and 64 use two BF16 hidden
+For the same K3 SM100/SM103 experts, capacities 1, 2 and 64 use two BF16 hidden
 elements per reduction worker. This increases reduction parallelism while
 preserving the original FP32 top-k accumulation order. Fused capacities 4
 through 32 and other shapes keep eight elements per worker. Both kernel
 constructors receive the worker width explicitly, and the cache key includes it.
 
-For the same K3 SM100/SM103 EP16 shape, capacities 1, 2 and 4 read the small peer
+For the K3 SM100/SM103 EP16 shape only (56 experts per rank;
+`Sm100MegaMoEKernel.supports_dense_routing`), capacities 1, 2 and 4 read the small peer
 routing-ID table and build the original receive counts and metadata locally.
 The caller supplies one capacity bound for all EP ranks. Unused token rows
 contain -1 IDs. The IDs use the existing symmetric input allocation, so

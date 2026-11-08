@@ -111,12 +111,11 @@ class MegaMoEWorkspace:
         self.world = dist.get_world_size(group)
         self.device_capability = torch.cuda.get_device_capability()
         # The small-token kernel policies and default tactics below were
-        # measured on this one shape (Kimi-K3 EP16 on SM100/SM103); every
-        # other shape keeps the established configuration.
-        self.k3_ep16_blackwell = (
+        # measured on Kimi-K3 experts on SM100/SM103 (at EP16, and with 45
+        # experts per rank); they depend on the expert shape, not on the EP
+        # size. Every other shape keeps the established configuration.
+        self.k3_blackwell = (
             self.device_capability in ((10, 0), (10, 3))
-            and self.world == 16
-            and num_experts == 896
             and hidden == 3584
             and intermediate == 3072
             and top_k == 16
@@ -211,9 +210,9 @@ class MegaMoEWorkspace:
     def _make_kernel(self, capacity: int, tactic: tuple):
         tile_n, group_hint, scheduler, token_back, flag_batch = tactic
         # The small-token policies below were swept up to 64 tokens per rank
-        # on the K3 EP16 shape; larger capacities keep the established
+        # on the K3 shapes; larger capacities keep the established
         # configuration.
-        small_token = self.k3_ep16_blackwell and capacity <= 64
+        small_token = self.k3_blackwell and capacity <= 64
         # Reduce the top-k terms in the kernel tail where a second launch
         # costs more than the reduction itself. Below this band the dispatch
         # warps are too few workers; above it a dedicated grid is faster.
@@ -224,10 +223,28 @@ class MegaMoEWorkspace:
         # worker fewer hidden elements so the reduction spreads over more
         # threads. The fused tail does not use the standalone reducer.
         bf16_hidden_per_thread = 2 if small_token and not fuse_bf16_reduce else 8
+        static_expert_shape = (
+            self.num_experts // self.world,
+            2 * self.intermediate,
+            self.hidden,
+        )
+        combine_format = CombineFormat.parse("bf16")
         # With at most a few tokens per rank, dispatch scans every peer's
-        # top-k id table directly instead of the counter protocol. The
-        # collective caller supplies one capacity for all EP ranks.
-        dense_routing = small_token and capacity <= 4 and token_back == "epi_warps"
+        # top-k id table directly instead of the counter protocol, where the
+        # kernel implements it. The collective caller supplies one capacity
+        # for all EP ranks.
+        dense_routing = small_token and Sm100MegaMoEKernel.supports_dense_routing(
+            world_size=self.world,
+            num_topk=self.top_k,
+            hidden=self.hidden,
+            static_expert_shape=static_expert_shape,
+            max_tokens_per_rank=capacity,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
+            token_back_mode=token_back,
+            combine_format=combine_format,
+            fc2_output_dtype=cutlass.BFloat16,
+        )
         return Sm100MegaMoEKernel(
             mma_tiler_mnk=(256, tile_n, 256),
             cluster_shape_mnk=(2, 1, 1),
@@ -236,11 +253,7 @@ class MegaMoEWorkspace:
             token_padding_block=64,
             sf_padding_block=128,
             load_balance_mode=scheduler,
-            static_expert_shape=(
-                self.num_experts // self.world,
-                2 * self.intermediate,
-                self.hidden,
-            ),
+            static_expert_shape=static_expert_shape,
             force_static_sched=True,
             clc_bundle_size=None,
             num_sched_stages=None,
@@ -255,7 +268,7 @@ class MegaMoEWorkspace:
             fuse_bf16_reduce=fuse_bf16_reduce,
             bf16_hidden_per_thread=bf16_hidden_per_thread,
             dense_routing=dense_routing,
-            combine_format=CombineFormat.parse("bf16"),
+            combine_format=combine_format,
             non_ubulk_fc2_store=token_back != "epi_warps",
             in_kernel_fc2_reduce=False,
             token_back_mode=token_back,
@@ -497,7 +510,7 @@ class MegaMoERunner(TunableRunner):
         if tactic is None or tactic == -1:
             if capacity <= 1024:
                 tactic = (128, 512, "static", "epi_warps", 1)
-                if self.workspace.k3_ep16_blackwell and capacity <= 64:
+                if self.workspace.k3_blackwell and capacity <= 64:
                     # Use the small-capacity regimes found by the full sweep.
                     if capacity == 1:
                         tactic = (64, 512, "static", "epi_warps", 1)
