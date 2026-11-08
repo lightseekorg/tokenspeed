@@ -154,6 +154,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
@@ -2988,10 +2989,56 @@ def _image_mask_from_spans(
     return mask
 
 
+class _DeepseekV41LogitsProcessor(LogitsProcessor):
+    """Keep V4.1 control and image-placeholder tokens out of generated text."""
+
+    _token_blacklist = (0, 2, 129262, 129263, 129264)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._blocked_token_ids = (
+            ()
+            if global_server_args_dict["disable_deepseek_v41_token_blacklist"]
+            else self._token_blacklist
+        )
+        self._blocked_token_indices: dict[
+            tuple[torch.device, int], torch.Tensor | None
+        ] = {}
+
+    def _project_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # V4.1 has no logit softcap. Masking this rank's raw head shard covers
+        # full-vocab gather, vocab-sharded sampling and distributed argmax alike.
+        logits = super()._project_logits(hidden_states, lm_head, embedding_bias)
+        key = (logits.device, logits.shape[-1])
+        if key not in self._blocked_token_indices:
+            width = logits.shape[-1]
+            start = self.tp_rank * width
+            local_ids = [
+                token_id - start
+                for token_id in self._blocked_token_ids
+                if start <= token_id < start + width
+            ]
+            self._blocked_token_indices[key] = (
+                torch.tensor(local_ids, dtype=torch.int64, device=logits.device)
+                if local_ids
+                else None
+            )
+        indices = self._blocked_token_indices[key]
+        if indices is not None:
+            logits.index_fill_(-1, indices, float("-inf"))
+        return logits
+
+
 class DeepseekV41ForCausalLM(BaseCausalLM):
     """V4.1 language and vision model with strict checkpoint coverage."""
 
     model_cls = DeepseekV41Model
+    logits_processor_cls = _DeepseekV41LogitsProcessor
 
     def __init__(
         self,

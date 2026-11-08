@@ -159,6 +159,7 @@ class BaseCausalLM(nn.Module):
     """
 
     model_cls: type[BaseTransformerModel]
+    logits_processor_cls: ClassVar[type[LogitsProcessor]] = LogitsProcessor
     # Whether the model's MoE layers route through the process-global expert
     # placement (redundant replicas, load counters; ``moe/expert_location.py``)
     # and its loader fills every placed slot. ``build_expert_placement``
@@ -309,7 +310,7 @@ class BaseCausalLM(nn.Module):
 
     def resolve_logits_processor(self, config: PretrainedConfig) -> LogitsProcessor:
 
-        return LogitsProcessor(
+        return self.logits_processor_cls(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             tp_rank=self.mapping.lm_head.tp_rank,
