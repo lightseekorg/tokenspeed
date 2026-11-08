@@ -37,7 +37,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers import vocab_parallel_topk as topk_module  # noqa: E402
+from tokenspeed.runtime.layers import sampled_vocab_shard as shard_module  # noqa: E402
 from tokenspeed.runtime.layers.vocab_parallel_topk import (  # noqa: E402
     VocabParallelTopK,
 )
@@ -47,8 +47,11 @@ def _selector(lm_head, tp_size: int, top_k: int, max_rows: int, vocab_size: int)
     """A planned selector, with the radix probe left out."""
     selector = VocabParallelTopK.__new__(VocabParallelTopK)
     selector.lm_head = lm_head
+    selector.fp8_weight = None
     selector.tp_size = tp_size
-    selector.tp_group = None
+    # Two ranks: no backend prepares a column gather for it, so the pairs
+    # take the resident all_gather_single the tests stand in for.
+    selector.tp_group = (0, 1)
     selector.vocab_size = vocab_size
     selector.top_k = top_k
     selector.max_rows = max_rows
@@ -59,6 +62,24 @@ def _selector(lm_head, tp_size: int, top_k: int, max_rows: int, vocab_size: int)
     selector._shard_seq_lens = None
     selector._gather_buffers = None
     return selector
+
+
+#: The merge after the gather is a GPU kernel.
+_needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU merge")
+
+
+def _gather_with_peers(peer_packed: torch.Tensor, calls: list | None = None):
+    """An all_gather_single standing in for the group: this rank's packed
+    pairs, then every peer's (``peer_packed`` repeated), rank-major."""
+
+    def fake_all_gather_single(out, src, group):
+        if calls is not None:
+            calls.append(src.clone())
+        rows = src.shape[0]
+        out[:rows].copy_(src)
+        out[rows:].copy_(peer_packed.repeat(out.shape[0] // rows - 1, 1))
+
+    return fake_all_gather_single
 
 
 #: The real quant method refuses to construct off Blackwell.
@@ -120,6 +141,7 @@ def test_a_padded_or_offset_shard_declines_the_shard_local_topk() -> None:
         softcapping=None,
         skip_all_gather=False,
         dp_sampling_enabled=False,
+        fp8_weight=None,
     ).enabled
 
     for broken in (
@@ -140,6 +162,7 @@ def test_a_padded_or_offset_shard_declines_the_shard_local_topk() -> None:
             softcapping=None,
             skip_all_gather=False,
             dp_sampling_enabled=False,
+            fp8_weight=None,
         ).enabled
 
 
@@ -179,6 +202,31 @@ def test_shard_logits_matmuls_an_unquantized_head() -> None:
     )
 
 
+@_needs_gpu
+def test_an_fp8_head_copy_projects_through_its_dequantized_rows() -> None:
+    """A draft's weight-only FP8 copy of the head replaces the head's GEMM."""
+    from tokenspeed.runtime.layers.dense.fp8_weight_only import (
+        quantize_fp8_weight_rows,
+    )
+
+    torch.manual_seed(14)
+    rows, hidden, shard = 7, 256, 300
+    weight = torch.randn(shard, hidden, device="cuda", dtype=torch.bfloat16)
+    q, scale = quantize_fp8_weight_rows(weight)
+    selector = _selector(
+        SimpleNamespace(weight=weight, quant_method=None), 2, 4, 8, 2 * shard
+    )
+    selector.fp8_weight = (q, scale)
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    dequantized = q.double() * scale.double()[:, None]
+    torch.testing.assert_close(
+        selector._shard_logits(hidden_states),
+        (hidden_states.double() @ dequantized.T).bfloat16(),
+        rtol=2**-7,
+        atol=1e-3,
+    )
+
+
 @_needs_nvfp4
 def test_a_quantized_head_picks_candidates_through_the_padding_slice(
     monkeypatch,
@@ -186,10 +234,10 @@ def test_a_quantized_head_picks_candidates_through_the_padding_slice(
     """The whole path on a quantized head: apply, slice, gather, select."""
     torch.manual_seed(13)
     rows, hidden, shard, pad, top_k, tp_size = 3, 6, 20, 4, 4, 2
-    hidden_states = torch.randn(rows, hidden)
+    hidden_states = torch.randn(rows, hidden, device="cuda")
     # apply() answers over the padded partition; only the first `shard`
     # columns are real token ids, so the slice is what keeps ids meaningful.
-    padded = torch.randn(rows, shard + pad)
+    padded = torch.randn(rows, shard + pad, device="cuda")
     padded[:, shard:] = 1e4  # would win every slot if the slice were dropped
 
     head = _nvfp4_head(shard, hidden, padded)
@@ -198,15 +246,13 @@ def test_a_quantized_head_picks_candidates_through_the_padding_slice(
     )
     selector = _selector(head, tp_size, top_k, 2 * rows, shard * tp_size)
 
-    peer = torch.full((rows, shard), -1e4)
+    peer = torch.full((rows, shard), -1e4, device="cuda")
     peer_values, peer_ids = torch.topk(peer, top_k, dim=-1, sorted=False)
     peer_packed = torch.cat((peer_values, (peer_ids + shard).float()), dim=-1)
 
-    def fake_all_gather(out, src, group):
-        out[: src.shape[0]].copy_(src)
-        out[src.shape[0] :].copy_(peer_packed)
-
-    monkeypatch.setattr(topk_module, "all_gather_single", fake_all_gather)
+    monkeypatch.setattr(
+        shard_module, "all_gather_single", _gather_with_peers(peer_packed)
+    )
     candidate_ids, _ = selector(hidden_states)
 
     # Every winner is a real token of this shard, never one of the pad columns
@@ -217,14 +263,15 @@ def test_a_quantized_head_picks_candidates_through_the_padding_slice(
     assert sorted(got.flatten().tolist()) == sorted(want.flatten().tolist())
 
 
+@_needs_gpu
 def test_shard_local_topk_picks_what_a_whole_vocabulary_topk_would(
     monkeypatch,
 ) -> None:
     """Two shard-local top-ks must agree with one top-k over the vocabulary."""
     torch.manual_seed(7)
     rows, hidden, vocab, top_k, tp_size = 3, 6, 40, 4, 2
-    weight = torch.randn(vocab, hidden)
-    hidden_states = torch.randn(rows, hidden)
+    weight = torch.randn(vocab, hidden, device="cuda")
+    hidden_states = torch.randn(rows, hidden, device="cuda")
     shard = vocab // tp_size
 
     head = SimpleNamespace(
@@ -241,13 +288,9 @@ def test_shard_local_topk_picks_what_a_whole_vocabulary_topk_would(
     peer_packed = torch.cat((peer_values, (peer_ids + shard).float()), dim=-1)
 
     calls = []
-
-    def fake_all_gather(out, src, group):
-        calls.append(src.shape)
-        out[: src.shape[0]].copy_(src)
-        out[src.shape[0] :].copy_(peer_packed)
-
-    monkeypatch.setattr(topk_module, "all_gather_single", fake_all_gather)
+    monkeypatch.setattr(
+        shard_module, "all_gather_single", _gather_with_peers(peer_packed, calls)
+    )
     candidate_ids, values = selector(hidden_states)
 
     expected = torch.topk(torch.matmul(hidden_states, weight.T), top_k, dim=-1)
@@ -255,15 +298,16 @@ def test_shard_local_topk_picks_what_a_whole_vocabulary_topk_would(
     assert candidate_ids.tolist() == expected.indices.tolist()
     torch.testing.assert_close(values, expected.values.float())
     # One collective carrying both halves, not one per half.
-    assert calls == [(rows, 2 * top_k)]
+    assert [tuple(call.shape) for call in calls] == [(rows, 2 * top_k)]
 
 
+@_needs_gpu
 def test_a_later_rank_packs_global_ids_beside_its_values(monkeypatch) -> None:
     """Rank 1 ships its shard-local winners as global token ids in fp32."""
     torch.manual_seed(5)
     rows, hidden, shard, top_k = 3, 6, 20, 4
-    weight = torch.randn(shard, hidden)
-    hidden_states = torch.randn(rows, hidden)
+    weight = torch.randn(shard, hidden, device="cuda")
+    hidden_states = torch.randn(rows, hidden, device="cuda")
     head = SimpleNamespace(
         weight=weight,
         quant_method=None,
@@ -273,17 +317,70 @@ def test_a_later_rank_packs_global_ids_beside_its_values(monkeypatch) -> None:
     )
     selector = _selector(head, 2, top_k, rows, 2 * shard)
     sent = []
-
-    def fake_all_gather(out, src, group):
-        sent.append(src.clone())
-        out.zero_()
-
-    monkeypatch.setattr(topk_module, "all_gather_single", fake_all_gather)
+    monkeypatch.setattr(
+        shard_module,
+        "all_gather_single",
+        _gather_with_peers(torch.zeros(rows, 2 * top_k, device=weight.device), sent),
+    )
     selector(hidden_states)
 
     values, ids = torch.topk(hidden_states @ weight.T, top_k, dim=-1, sorted=False)
     assert torch.equal(sent[0][:, :top_k], values)
     assert torch.equal(sent[0][:, top_k:], (ids + shard).float())
+
+
+@_needs_gpu
+@pytest.mark.parametrize("top_k", [16, 10])
+@pytest.mark.parametrize("logit_scale, softcapping", [(None, None), (0.18, 20.0)])
+def test_a_bf16_shard_ships_its_best_scaled_logits_lowest_column_first(
+    monkeypatch, top_k, logit_scale, softcapping
+) -> None:
+    """On a TP8 shard of a 202048-token vocabulary, one launch scales the
+    logits and keeps the shard's best (lowest column first among equal
+    values); the merge returns the row's best of every rank, softcapped."""
+    torch.manual_seed(9)
+    rows, hidden, shard = 14, 64, 25256
+    weight = torch.randn(shard, hidden, device="cuda", dtype=torch.bfloat16)
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    head = SimpleNamespace(
+        weight=weight,
+        quant_method=None,
+        shard_indices=SimpleNamespace(
+            num_org_elements=shard, org_vocab_start_index=3 * shard
+        ),
+    )
+    selector = _selector(head, 8, top_k, rows, 8 * shard)
+    selector.logit_scale = logit_scale
+    selector.softcapping = softcapping
+    # Every peer's candidates lose to this rank's.
+    peer = torch.cat(
+        (
+            torch.full((rows, top_k), -1e4, device="cuda"),
+            torch.zeros(rows, top_k, device="cuda"),
+        ),
+        dim=-1,
+    )
+    sent = []
+    monkeypatch.setattr(
+        shard_module, "all_gather_single", _gather_with_peers(peer, sent)
+    )
+
+    candidate_ids, values = selector(hidden_states)
+
+    logits = hidden_states @ weight.T
+    if logit_scale is not None:
+        logits = logits * logit_scale  # BF16, as the in-place scale rounds
+    order = torch.sort(logits.float(), dim=-1, descending=True, stable=True)
+    best, columns = order.values[:, :top_k], order.indices[:, :top_k]
+    ((pairs,),) = (sent,)
+    assert torch.equal(pairs[:, :top_k], best)
+    assert torch.equal(pairs[:, top_k:], (columns + 3 * shard).float())
+    assert torch.equal(candidate_ids, columns + 3 * shard)
+    if softcapping is None:
+        assert torch.equal(values, best)
+    else:
+        capped = (2 * torch.sigmoid(2 * (best / softcapping)) - 1) * softcapping
+        torch.testing.assert_close(values, capped, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

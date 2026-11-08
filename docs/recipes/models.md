@@ -79,6 +79,7 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
     --kvstore-ratio 0.0 \
     --speculative-algorithm DFLASH \
     --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+    --speculative-draft-model-quantization fp8_weight_only \
     --speculative-num-steps 7 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
@@ -89,6 +90,10 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
 
 `--max-model-len 1048576` keeps the checkpoint's native context, which agentic
 workloads with long cached prefixes need; prefix caching is on by default.
+
+`--speculative-draft-model-quantization fp8_weight_only` streams the draft's
+MLP, `o_proj` and LM-head weights in FP8 with one scale per output row, which
+shortens each draft step at unchanged acceptance.
 
 With MXFP4 experts at MoE TP8 and EP1, startup also builds a column-split copy
 of the expert down-projection weights for prefill. The copy holds one more set

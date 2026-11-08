@@ -150,7 +150,9 @@ class MuseIrisState:
     return borrowed activations. No borrowed producer-buffer or pull-scratch
     view, nor the ready flags guarding it, may be live across an ordinary
     reduction on the group, including one the backend runs for another
-    caller through ProducerAllReduce.reduce_ordinary.
+    caller through ProducerAllReduce.reduce_ordinary, or across a column
+    gather another caller runs through the installed gather (a draft's
+    capture sink gathers its context columns at a layer boundary).
     The generic all-reduce retains its independent-output contract.
     Expert TP and EP use the same owned-row token cutoffs; each owner
     holds ceil(global rows / world size) rows, with padding masked.

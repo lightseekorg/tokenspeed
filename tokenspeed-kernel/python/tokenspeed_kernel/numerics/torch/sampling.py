@@ -491,3 +491,66 @@ def torch_top_k_top_p_support(
             torch.tensor(min_p, device=logits.device)
         )
     return set(top_ids[keep].int().cpu().tolist())
+
+
+@register_kernel(
+    "sampling",
+    "vocab_shard_topk",
+    name="torch_vocab_shard_topk",
+    solution="torch",
+    signatures=format_signatures("logits", "dense", {torch.bfloat16, torch.float16}),
+    priority=Priority.REFERENCE,
+)
+def torch_vocab_shard_topk(
+    logits: torch.Tensor,
+    k: int,
+    logit_scale: float | None,
+    vocab_start: int,
+    out: torch.Tensor,
+    *,
+    softcap: float | None,
+    vocab_mask: torch.Tensor | None,
+) -> None:
+    """Reference ``vocab_shard_topk``: a stable descending sort, so equal
+    values keep the lowest column first."""
+    scaled = logits if logit_scale is None else logits * logit_scale
+    if softcap is not None:
+        # Rounded to the logits' dtype, as the logits processor writes it.
+        scaled = (softcap * torch.tanh(scaled.float() / softcap)).to(logits.dtype)
+    scaled = scaled.float()
+    if vocab_mask is not None:
+        tokens = vocab_start + torch.arange(scaled.shape[1], device=scaled.device)
+        words = vocab_mask[:, tokens // 32]
+        allowed = (words >> (tokens % 32).to(words.dtype)) & 1
+        scaled = scaled.masked_fill(allowed == 0, float("-inf"))
+    order = torch.sort(scaled, dim=-1, descending=True, stable=True).indices[:, :k]
+    out[:, :k] = torch.gather(scaled, 1, order)
+    out[:, k:] = (order + vocab_start).float()
+
+
+@register_kernel(
+    "sampling",
+    "vocab_topk_merge",
+    name="torch_vocab_topk_merge",
+    solution="torch",
+    signatures=format_signatures("pairs", "dense", {torch.float32}),
+    priority=Priority.REFERENCE,
+)
+def torch_vocab_topk_merge(
+    pairs: torch.Tensor,
+    k: int,
+    softcap: float | None,
+    ids_out: torch.Tensor,
+    values_out: torch.Tensor,
+) -> None:
+    """Reference ``vocab_topk_merge``: a stable descending sort over the
+    rank-major candidates, so equal values keep the lowest slot first."""
+    ranks, rows, _ = pairs.shape
+    values = pairs[:, :, :k].transpose(0, 1).reshape(rows, ranks * k)
+    ids = pairs[:, :, k:].transpose(0, 1).reshape(rows, ranks * k)
+    order = torch.sort(values, dim=-1, descending=True, stable=True).indices[:, :k]
+    kept = torch.gather(values, 1, order)
+    if softcap is not None:
+        kept = softcap * torch.tanh(kept / softcap)
+    ids_out.copy_(torch.gather(ids, 1, order).to(ids_out.dtype))
+    values_out.copy_(kept)

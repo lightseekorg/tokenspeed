@@ -240,8 +240,8 @@ class BaseDrafter:
 
         Called by ``ModelExecutor`` with the context the target is about to
         run under. A drafter that wants work done while the target runs
-        attaches it to ``ctx`` here (DFLASH attaches its incremental capture
-        sink, ``ctx.target_capture_sink``); the context is per forward, so
+        attaches it to ``ctx`` here (DFLASH attaches its capture sink,
+        ``ctx.target_capture_sink``); the context is per forward, so
         nothing attached outlives the round. The default needs nothing.
 
         Args:

@@ -287,11 +287,11 @@ def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeyp
     dflash = DFlash.__new__(DFlash)
     rebuilt = []
     dflash._init_fused_kv_helper = lambda: rebuilt.append("fused_kv")
-    dflash._init_incremental_proj = lambda: rebuilt.append("incremental_proj")
+    dflash._init_context_taps = lambda: rebuilt.append("context_taps")
     dflash.set_cache_pool("real")
     assert dflash.token_to_kv_pool == "real"
     assert _dflash_fused_kv._cached_kv_ptrs == {}
-    assert rebuilt == ["fused_kv", "incremental_proj"]
+    assert rebuilt == ["fused_kv", "context_taps"]
 
     # Only the last pipeline stage owns the draft context cache.
     producer = DSparkContextProducer.__new__(DSparkContextProducer)

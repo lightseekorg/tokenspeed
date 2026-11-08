@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
     gumbel_sample_from_pools_generic,
+    gumbel_sample_top_k_top_p_from_candidates,
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
     gumbel_sample_top_p_parallel_from_pools,
@@ -44,10 +45,12 @@ from tokenspeed_kernel.ops.sampling.triton import (
     verify_chain_target_sampled,
     verify_rows_no_filter_from_pools,
     verify_rows_no_filter_scratch_shape,
+    verify_rows_top_k_top_p_from_candidates,
     verify_rows_top_k_top_p_from_pools,
     verify_tree,
 )
 
+from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
     SamplingBackend,
@@ -55,14 +58,14 @@ from tokenspeed.runtime.sampling.backends.base import (
     SpeculativeSamplingPools,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
 from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
     from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
 
@@ -80,6 +83,8 @@ _COMPACT_GUMBEL_VOCAB_MAX = 32768
 _TOP_K_TOP_P_SMALL_BLOCK_SIZE = 1024
 _TOP_K_TOP_P_TUNED_VOCAB_MAX = 32768
 _TOP_K_TOP_P_PAD = 128
+# The candidate count of a batch whose finite top_k all fit in it.
+_TOP_K_TOP_P_SMALL_PAD = 64
 _TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE = 1024
 _TOP_P_PARALLEL_SAMPLE_ATTEMPTS = 3
 _TOP_P_PARALLEL_VERIFY_ATTEMPTS = 4
@@ -119,6 +124,7 @@ class TritonSamplingBackend(SamplingBackend):
         super().__init__(config)
         self._init_triton_pool_state(config)
         self._init_triton_buffers(config)
+        self._init_vocab_shard_buffers(config)
         self._sample_route = _SAMPLE_ROUTE_GUMBEL_GENERIC
         self._top_k_top_p_pad = _TOP_K_TOP_P_PAD
         # Route/pad aggregate only the batch's sampling-params mix, so they
@@ -126,6 +132,151 @@ class TritonSamplingBackend(SamplingBackend):
         # membership moves; a steady decode batch pays nothing here.
         self._route_cache: tuple[int, int] | None = None
         self._route_cache_epoch: int | None = None
+
+    def _init_vocab_shard_buffers(self, config: SamplingBackendConfig) -> None:
+        """Scratch of the top-k routes' selection from vocabulary shards.
+
+        Under TP the top-k routes read only each row's best ``top_k_pad``
+        logits, so they select them per vocabulary shard and gather those
+        (``SampledVocabShard.top_k``) instead of the whole rows. Every
+        reader of whole rows must then be off: output logprobs and
+        cumulative probabilities read them, and NaN detection checks them.
+        """
+        tp_size = 1 if config.tp_group is None else len(config.tp_group)
+        self._vocab_shard_top_k: int | None = None
+        self._vocab_shard_staged: torch.Tensor | None = None
+        self._vocab_shard_landing: torch.Tensor | None = None
+        self._vocab_shard_ids: torch.Tensor | None = None
+        self._vocab_shard_values: torch.Tensor | None = None
+        if (
+            tp_size <= 1
+            or config.enable_output_logprobs
+            or config.enable_output_cumulative_probs
+            or config.enable_nan_detection
+        ):
+            return
+        k = _TOP_K_TOP_P_PAD
+        rows = max(config.max_bs * config.max_draft_tokens_per_req, config.max_bs, 1)
+        self._vocab_shard_top_k = k
+        self._vocab_shard_staged = torch.empty(
+            (rows * 2 * k,), dtype=torch.float32, device=config.device
+        )
+        self._vocab_shard_landing = torch.empty(
+            (tp_size * rows * 2 * k,), dtype=torch.float32, device=config.device
+        )
+        self._vocab_shard_ids = torch.empty(
+            (rows * k,), dtype=torch.int32, device=config.device
+        )
+        self._vocab_shard_values = torch.empty(
+            (rows * k,), dtype=torch.float32, device=config.device
+        )
+
+    def vocab_shard_top_k(self) -> int | None:
+        return self._vocab_shard_top_k
+
+    def warmup_vocab_shard_sampling(
+        self,
+        shard: SampledVocabShard,
+        candidates: torch.Tensor,
+        *,
+        draft_q: DraftTreeQ | None,
+        with_vocab_mask: bool,
+    ) -> None:
+        """Compile ``sample`` and ``verify`` from vocabulary shards before serving.
+
+        The candidate count is a compile-time parameter of the shard
+        selection, its gather and the sampling kernels. Graph capture records
+        the top-k routes at 128 candidates only, but an eager step whose
+        finite top_k all fit in 64 selects 64 (``_select_top_k_top_p_pad``).
+        The warmup samples and verifies the padding slot at each count, with
+        and without a vocabulary mask when the server applies one.
+        """
+        device = shard.logits.device
+        num_tokens_per_req = candidates.shape[1]
+        masks: list[torch.Tensor | None] = [None]
+        if with_vocab_mask:
+            # Every token allowed, in the int32 bitmask layout of the grammar.
+            words = (self.config.vocab_size + 31) // 32
+            masks.append(
+                torch.full(
+                    (num_tokens_per_req, words), -1, dtype=torch.int32, device=device
+                )
+            )
+        valid_cache_lengths = torch.zeros(
+            (self.config.max_req_pool_size + 1,), dtype=torch.int32, device=device
+        )
+
+        def info(mask: torch.Tensor | None, rows: int) -> SamplingBatchInfo:
+            return SamplingBatchInfo(
+                req_pool_indices=torch.zeros((1,), dtype=torch.int64, device=device),
+                valid_cache_lengths=valid_cache_lengths,
+                vocab_mask=None if mask is None else mask[:rows],
+                draft_q=draft_q,
+                vocab_size=self.config.vocab_size,
+                device=device,
+            )
+
+        saved = (self._sample_route, self._top_k_top_p_pad)
+        self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K
+        for pad in (_TOP_K_TOP_P_SMALL_PAD, _TOP_K_TOP_P_PAD):
+            self._top_k_top_p_pad = pad
+            for mask in masks:
+                self.sample(
+                    LogitsProcessorOutput(
+                        next_token_logits=None, vocab_shard=shard.rows(slice(0, 1))
+                    ),
+                    info(mask, 1),
+                )
+                self.verify(
+                    LogitsProcessorOutput(next_token_logits=None, vocab_shard=shard),
+                    info(mask, num_tokens_per_req),
+                    candidates,
+                    tree=None,
+                )
+        self._sample_route, self._top_k_top_p_pad = saved
+
+    def _selects_from_vocab_shard(self, logits_output: LogitsProcessorOutput) -> bool:
+        """Whether this step's route selects candidates per vocabulary shard."""
+        return logits_output.vocab_shard is not None and self._sample_route in (
+            _SAMPLE_ROUTE_GUMBEL_TOP_K,
+            _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+        )
+
+    def _vocab_shard_candidates(
+        self, shard: SampledVocabShard, vocab_mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each row's sorted ``top_k_pad`` best (ids, logits) over the vocabulary.
+
+        The list stage 1 and the stage-2 merge keep from the whole row, so
+        the presorted kernels sample and verify bitwise as the
+        whole-row route does.
+        """
+        assert self._vocab_shard_staged is not None
+        assert self._vocab_shard_landing is not None
+        assert self._vocab_shard_ids is not None
+        assert self._vocab_shard_values is not None
+        rows = shard.logits.shape[0]
+        k = self._top_k_top_p_pad
+        ids = self._vocab_shard_ids[: rows * k].view(rows, k)
+        values = self._vocab_shard_values[: rows * k].view(rows, k)
+        shard.top_k(
+            k,
+            None if vocab_mask is None else vocab_mask[:rows],
+            self._vocab_shard_staged[: rows * 2 * k].view(rows, 2 * k),
+            self._vocab_shard_landing[: shard.tp_size * rows * 2 * k].view(
+                shard.tp_size * rows, 2 * k
+            ),
+            ids,
+            values,
+        )
+        return ids, values
+
+    @staticmethod
+    def _whole_logits(logits_output: LogitsProcessorOutput) -> torch.Tensor:
+        """The sampled rows' whole logits, gathering a vocabulary shard."""
+        if logits_output.vocab_shard is not None:
+            return logits_output.vocab_shard.full_logits()
+        return logits_output.next_token_logits
 
     def _init_triton_pool_state(self, config: SamplingBackendConfig) -> None:
         pool_rows = config.max_req_pool_size + 1
@@ -383,8 +534,8 @@ class TritonSamplingBackend(SamplingBackend):
             for sp in sampling_params_list
             if int(sp.top_k) != _TOP_K_DISABLED
         ]
-        if finite_top_ks and max(finite_top_ks) <= 64:
-            return 64
+        if finite_top_ks and max(finite_top_ks) <= _TOP_K_TOP_P_SMALL_PAD:
+            return _TOP_K_TOP_P_SMALL_PAD
         return _TOP_K_TOP_P_PAD
 
     def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
@@ -472,8 +623,10 @@ class TritonSamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._selects_from_vocab_shard(logits_output):
+            return self._sample_from_vocab_shard(logits_output, sampling_info)
         logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
+            self._whole_logits(logits_output), self.config.enable_nan_detection
         )
 
         if sampling_info.vocab_mask is not None:
@@ -573,17 +726,68 @@ class TritonSamplingBackend(SamplingBackend):
 
         return sampled, self._ones_buf[: logits.shape[0]]
 
+    def _sample_from_vocab_shard(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``sample`` of the top-k routes on vocab-sharded logits."""
+        shard = logits_output.vocab_shard
+        assert shard is not None
+        ids, values = self._vocab_shard_candidates(shard, sampling_info.vocab_mask)
+        offsets_pool = self._prepare_sampling_offsets(sampling_info)
+        bs = ids.shape[0]
+        req_pool_indices = self._req_pool_indices_for_kernels(
+            sampling_info.req_pool_indices, bs
+        )
+        sampled = gumbel_sample_top_k_top_p_from_candidates(
+            ids,
+            values,
+            req_pool_indices,
+            self._temperature_pool,
+            self._top_k_pool,
+            self._top_p_pool,
+            self._seed_pool,
+            offsets_pool,
+            self._gumbel_out[:bs],
+            vocab_size=self.config.vocab_size,
+            num_tokens_per_req=1,
+        )
+        self.maybe_broadcast(sampled)
+        return sampled, self._ones_buf[:bs]
+
     def _sample_verify_targets(
         self,
-        logits: torch.Tensor,
+        logits: torch.Tensor | None,
+        selected: tuple[torch.Tensor, torch.Tensor] | None,
         req_pool_indices: torch.Tensor,
         pools: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         offsets_pool: torch.Tensor,
         rows: int,
         num_tokens_per_req: int,
     ) -> torch.Tensor:
-        """The target's pick per verify row: a Gumbel sample keyed by (seed, position)."""
+        """The target's pick per verify row: a Gumbel sample keyed by (seed, position).
+
+        ``selected`` holds each row's presorted best candidates when the
+        top-k routes selected them from vocabulary shards; ``logits`` holds
+        the whole rows otherwise.
+        """
         temperature, top_k, top_p, seed = pools
+        if selected is not None:
+            return gumbel_sample_top_k_top_p_from_candidates(
+                selected[0],
+                selected[1],
+                req_pool_indices,
+                temperature,
+                top_k,
+                top_p,
+                seed,
+                offsets_pool,
+                self._gumbel_verify_out[:rows],
+                vocab_size=self.config.vocab_size,
+                num_tokens_per_req=num_tokens_per_req,
+            )
+        assert logits is not None
         if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
             if logits.shape[1] <= _COMPACT_GUMBEL_VOCAB_MAX:
                 target_sampled = gumbel_sample_from_pools_compact(
@@ -684,7 +888,8 @@ class TritonSamplingBackend(SamplingBackend):
 
     def _sample_tree_targets(
         self,
-        logits: torch.Tensor,
+        logits: torch.Tensor | None,
+        selected: tuple[torch.Tensor, torch.Tensor] | None,
         req_pool_indices: torch.Tensor,
         offsets_pool: torch.Tensor,
         tree: TreeVerifyBatch,
@@ -706,12 +911,15 @@ class TritonSamplingBackend(SamplingBackend):
             self._seed_pool[row_pool],
         )
         offsets = offsets_pool[row_pool] + tree.depths.reshape(-1)
-        row_ids = torch.arange(rows, dtype=torch.int32, device=logits.device)
-        return self._sample_verify_targets(logits, row_ids, pools, offsets, rows, 1)
+        row_ids = torch.arange(rows, dtype=torch.int32, device=offsets.device)
+        return self._sample_verify_targets(
+            logits, selected, row_ids, pools, offsets, rows, 1
+        )
 
     def _verify_rows_with_draft_q(
         self,
-        logits: torch.Tensor,
+        logits: torch.Tensor | None,
+        selected: tuple[torch.Tensor, torch.Tensor] | None,
         req_pool_indices: torch.Tensor,
         offsets_pool: torch.Tensor,
         candidates: torch.Tensor,
@@ -736,7 +944,27 @@ class TritonSamplingBackend(SamplingBackend):
             )
         row_accept = self._row_accept[:rows]
         row_token = self._row_token[:rows]
-        if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
+        if selected is not None:
+            verify_rows_top_k_top_p_from_candidates(
+                selected[0],
+                selected[1],
+                req_pool_indices,
+                self._temperature_pool,
+                self._top_k_pool,
+                self._top_p_pool,
+                self._seed_pool,
+                offsets_pool,
+                candidates,
+                draft_q.q,
+                draft_q.q_ids,
+                draft_q.slot,
+                draft_q.pos,
+                row_accept,
+                row_token,
+                vocab_size=self.config.vocab_size,
+                num_tokens_per_req=num_tokens_per_req,
+            )
+        elif self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
             assert self._no_filter_verify_scores is not None
             assert self._no_filter_verify_ids is not None
             verify_rows_no_filter_from_pools(
@@ -800,15 +1028,22 @@ class TritonSamplingBackend(SamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        )
-
-        if sampling_info.vocab_mask is not None:
-            sampling_info.apply_vocab_mask(
-                logits=logits,
-                vocab_mask=sampling_info.vocab_mask,
+        logits = selected = None
+        if self._selects_from_vocab_shard(logits_output):
+            # The top-k routes read each row's presorted best candidates only;
+            # the shard selection applies the vocabulary mask itself.
+            selected = self._vocab_shard_candidates(
+                logits_output.vocab_shard, sampling_info.vocab_mask
             )
+        else:
+            logits = nan_guard_logits(
+                self._whole_logits(logits_output), self.config.enable_nan_detection
+            )
+            if sampling_info.vocab_mask is not None:
+                sampling_info.apply_vocab_mask(
+                    logits=logits,
+                    vocab_mask=sampling_info.vocab_mask,
+                )
 
         # Greedy verifies through the same pool route (top_k=1); see sample().
         offsets_pool = self._prepare_sampling_offsets(sampling_info)
@@ -817,7 +1052,7 @@ class TritonSamplingBackend(SamplingBackend):
         )
         if tree is not None:
             target_sampled = self._sample_tree_targets(
-                logits, req_pool_indices, offsets_pool, tree, bs
+                logits, selected, req_pool_indices, offsets_pool, tree, bs
             )
             # The accepted path rides in accept_index so the TP broadcast below carries it.
             verify_tree(
@@ -835,6 +1070,7 @@ class TritonSamplingBackend(SamplingBackend):
         ):
             row_accept, row_token = self._verify_rows_with_draft_q(
                 logits,
+                selected,
                 req_pool_indices,
                 offsets_pool,
                 candidates,
@@ -856,6 +1092,7 @@ class TritonSamplingBackend(SamplingBackend):
             # own keyed draw at that position.
             target_sampled = self._sample_verify_targets(
                 logits,
+                selected,
                 req_pool_indices,
                 (
                     self._temperature_pool,

@@ -52,7 +52,12 @@ class TargetCaptureSink(Protocol):
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
         """Consume capture ``capture_idx`` (the draft's positional tap index)
         for the forward's ``[num_tokens, hidden]`` rows, gathered across
-        attention TP."""
+        attention TP. The rows may be wider than the draft's dtype (a target
+        with an FP32 residual hands it over as is) and are valid only in
+        stream order at this call: the sink copies what it keeps. The sink
+        may run a collective on the attention TP group (DFLASH gathers its
+        context columns at the last tap), so the target must hold no
+        borrowed collective output live across this call."""
 
 
 class DraftNarrowing(Protocol):
@@ -201,8 +206,8 @@ class ForwardContext:
     # ``gather_ids`` live rows; its presence is the narrowing flag.
     draft_narrowing: DraftNarrowing | None = None
     # The drafter's consumer of this target forward's captured taps, attached
-    # by the drafter (prepare_target_forward) for the rounds it overlaps with
-    # the target; None means the taps are only collected in aux_hidden_states.
+    # by the drafter (prepare_target_forward) on the decode rounds whose taps
+    # it consumes; None means the taps are only collected in aux_hidden_states.
     # While attached, the forward returns no hidden capture: the sink has
     # every tap.
     target_capture_sink: TargetCaptureSink | None = None
