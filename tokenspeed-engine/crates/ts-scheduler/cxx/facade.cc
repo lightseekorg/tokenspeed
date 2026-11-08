@@ -224,31 +224,10 @@ CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::
     };
 }
 
-rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler) {
-    rust::Vec<KvEventView> views;
-    for (auto& event : scheduler.DrainKvEvents()) {
-        KvEventView view{};
-        if (auto* stored = std::get_if<tokenspeed::KvBlockStoredEvent>(&event)) {
-            view.stored = true;
-            for (auto hash : stored->block_hashes) view.block_hashes.push_back(hash);
-            view.has_parent = stored->parent_block_hash.has_value();
-            view.parent_block_hash = stored->parent_block_hash.value_or(0);
-            for (auto token : stored->token_ids) view.token_ids.push_back(token);
-            view.block_size = stored->block_size;
-            view.group_idx = stored->group_idx;
-            const std::string_view kind = tokenspeed::KvCacheSpecKind(stored->attn_kind);
-            view.kv_cache_spec_kind = rust::String(kind.data(), kind.size());
-            view.has_sliding_window = stored->sliding_window.has_value();
-            view.sliding_window = stored->sliding_window.value_or(0);
-        } else {
-            const auto& removed = std::get<tokenspeed::KvBlockRemovedEvent>(event);
-            view.stored = false;
-            for (auto hash : removed.block_hashes) view.block_hashes.push_back(hash);
-            view.group_idx = removed.group_idx;
-        }
-        views.push_back(std::move(view));
-    }
-    return views;
+rust::Slice<const std::uint8_t> drain_kv_event_frame(tokenspeed::Scheduler& scheduler, double timestamp,
+                                                    std::int64_t dp_rank) {
+    const std::span<const std::uint8_t> frame = scheduler.DrainKvEventFrame(timestamp, dp_rank);
+    return rust::Slice<const std::uint8_t>(frame.data(), frame.size());
 }
 
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id) {

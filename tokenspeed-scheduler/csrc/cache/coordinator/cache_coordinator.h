@@ -946,12 +946,6 @@ public:
     // content hash identify the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
-    // The same for one group: the keys group i holds for the boundary
-    // (ForEachBoundaryKey restricted to it) against its Device entries. A
-    // State group has one key, a checkpoint boundary's; a replayable group
-    // has none and reads kNone.
-    BoundaryResidency GroupDeviceBoundaryResidency(std::int32_t i, const CacheKey& boundary,
-                                                   std::int32_t tail_tokens) const;
     const CacheGroupSpec& GroupSpec(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Spec(); }
     // Whether every State group caches its checkpoint published under the
     // chain hash content_hash, on the Device or the Host, as the probe takes
@@ -1207,6 +1201,11 @@ private:
     // The one source for cacheCompletedBlocksForGroup,
     // PublishedDataSlotsAfter and FirstPublishedPage.
     std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
+    // The same ranges as bounds only: range(first_block, past_end_block,
+    // boundary_kind, state_point) per range, no keys built. The State group's
+    // one range is its slot, flagged state_point.
+    template <typename Range>
+    void forEachCompletedRange(std::size_t group_index, const CompletedPages& completed, Range&& range) const;
     // The key of table slot `block` of a History group at a publication point:
     // its page's chain hash below the full pages, the tail hash from there on.
     CacheKey historyBlockKey(std::size_t group_index, const CompletedPages& completed, std::int32_t block) const;

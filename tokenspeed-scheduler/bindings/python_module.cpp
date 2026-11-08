@@ -30,6 +30,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -102,12 +103,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                      [](const tokenspeed::KvBlockStoredEvent& event) {
                          return std::string(tokenspeed::KvCacheSpecKind(event.attn_kind));
                      })
-        .def_ro("kv_cache_spec_sliding_window", &tokenspeed::KvBlockStoredEvent::sliding_window);
+        .def_ro("kv_cache_spec_sliding_window", &tokenspeed::KvBlockStoredEvent::sliding_window)
+        .def_ro("group_mask", &tokenspeed::KvBlockStoredEvent::group_mask);
 
     nb::class_<tokenspeed::KvBlockRemovedEvent>(kv_event, "BlockRemoved")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockRemovedEvent&) { return "BlockRemoved"; })
         .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes)
-        .def_ro("group_idx", &tokenspeed::KvBlockRemovedEvent::group_idx);
+        .def_ro("group_idx", &tokenspeed::KvBlockRemovedEvent::group_idx)
+        .def_ro("group_mask", &tokenspeed::KvBlockRemovedEvent::group_mask);
 
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 
@@ -698,6 +701,15 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  }
                  return result;
              })
+        .def(
+            "drain_kv_event_frame",
+            [](tokenspeed::Scheduler& scheduler, double timestamp, std::int64_t dp_rank) {
+                const std::span<const std::uint8_t> frame = scheduler.DrainKvEventFrame(timestamp, dp_rank);
+                return nb::bytes(reinterpret_cast<const char*>(frame.data()), frame.size());
+            },
+            nb::arg("timestamp") = 0.0, nb::arg("dp_rank") = 0,
+            "The publisher's msgpack batch since the previous drain ([timestamp, events, attn_dp_rank]); empty "
+            "bytes when nothing changed.")
         .def("bootstrapping_size", &tokenspeed::Scheduler::BootstrappingSize,
              "Count requests waiting for their PD bootstrap handshake.")
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize,

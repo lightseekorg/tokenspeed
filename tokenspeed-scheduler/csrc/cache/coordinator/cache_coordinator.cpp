@@ -404,25 +404,6 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
 }
 
-CacheCoordinator::BoundaryResidency CacheCoordinator::GroupDeviceBoundaryResidency(std::int32_t i,
-                                                                                   const CacheKey& boundary,
-                                                                                   std::int32_t tail_tokens) const {
-    _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
-    const PrefixCacheIndex& index = GroupPrefixIndex(i);
-    std::int32_t total = 0;
-    std::int32_t cached = 0;
-    CacheKey key = boundary;
-    forEachBoundaryKey(key, tail_tokens, std::views::single(static_cast<std::size_t>(i)),
-                       [&](std::size_t, const CacheKey& group_key) {
-                           ++total;
-                           cached += index.Contains(pool_, group_key) ? 1 : 0;
-                       });
-    if (cached == 0) {
-        return BoundaryResidency::kNone;
-    }
-    return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
-}
-
 bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {
     // A probe takes each State group's checkpoint from whichever tier holds
     // it (probeHostSuffix), so every State group must hold one on either.
@@ -2528,11 +2509,11 @@ CacheKey CacheCoordinator::historyBlockKey(std::size_t group_index, const Comple
                     .page_offset = block - full_blocks};
 }
 
-std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRanges(
-    std::size_t group_index, const CompletedPages& completed) const {
-    std::vector<PublishedRange> ranges;
+template <typename Range>
+void CacheCoordinator::forEachCompletedRange(std::size_t group_index, const CompletedPages& completed,
+                                             Range&& range) const {
     if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
-        return ranges;
+        return;
     }
     const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(group_index));
     const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
@@ -2542,71 +2523,80 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         completed.tail && completed.owner_tail != OwnerTail::kKept
             ? TailBlocksFor(static_cast<std::int32_t>(group_index), completed.tail->tail_tokens)
             : 0;
-    const auto history_range = [&](std::int32_t first_block, std::int32_t past_end_block) {
-        PublishedRange range{.first_cache_block = first_block, .boundary_kind = completed.boundary_kind};
-        for (std::int32_t block = first_block; block < past_end_block; ++block) {
-            range.keys.push_back(historyBlockKey(group_index, completed, block));
-        }
-        return range;
-    };
     if (groups_[group_index].Matcher().IsPrefixClosed()) {
         // The new full pages and the tail's blocks are one contiguous run.
         const std::int32_t first_block = completed.first_new_prefix_page * pages_per_prefix_hash;
         const std::int32_t past_end_block = hashed_prefix_pages * pages_per_prefix_hash + tail_blocks;
         if (past_end_block > first_block) {
-            ranges.push_back(history_range(first_block, past_end_block));
+            range(first_block, past_end_block, completed.boundary_kind, /*state_point=*/false);
         }
-        return ranges;
+        return;
     }
     if (GroupIsState(group_index)) {
         // A natural checkpoint: the state the forward that ended at this
         // point wrote (slot 1, or slot 0 behind a padded first decode), keyed
         // like the point itself.
         if (!completed.publish_state || completed.prefix_hashes.empty() && !completed.tail) {
-            return ranges;
+            return;
         }
         const std::int32_t boundary_tokens =
             hashed_prefix_pages * prefix_granularity_ + (completed.tail ? completed.tail->tail_tokens : 0);
         if (boundary_tokens % groups_[group_index].Spec().checkpoint_granularity != 0) {
-            return ranges;
+            return;
         }
-        const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();
-        ranges.push_back(PublishedRange{
-            .first_cache_block = completed.state_slot,
-            .keys = {CacheKey{.group_id = groups_[group_index].Id(), .content_hash = hash, .page_offset = 0}},
-            .boundary_kind = completed.boundary_kind,
-        });
-        return ranges;
+        range(completed.state_slot, completed.state_slot + 1, completed.boundary_kind, /*state_point=*/true);
+        return;
     }
     // The in-forward checkpoint can precede the newest page boundary. Publish
     // its own window before the request reclaims the blocks behind its frontier.
     // That window is an endpoint's, like the checkpoint, even when a chunk end
     // publishes it.
-    std::vector<std::int32_t> boundaries;
+    std::array<std::int32_t, 3> boundaries{};
+    std::size_t num_boundaries = 0;
     if (completed.state_checkpoint_pages > 0) {
-        boundaries.push_back(completed.state_checkpoint_pages * prefix_granularity_);
+        boundaries[num_boundaries++] = completed.state_checkpoint_pages * prefix_granularity_;
     }
     if (completed.first_new_prefix_page < hashed_prefix_pages) {
         const std::int32_t boundary_tokens = hashed_prefix_pages * prefix_granularity_;
-        if (boundaries.empty() || boundaries.back() != boundary_tokens) {
-            boundaries.push_back(boundary_tokens);
+        if (num_boundaries == 0 || boundaries[num_boundaries - 1] != boundary_tokens) {
+            boundaries[num_boundaries++] = boundary_tokens;
         }
     }
     if (tail_blocks > 0) {
-        boundaries.push_back(hashed_prefix_pages * prefix_granularity_ + completed.tail->tail_tokens);
+        boundaries[num_boundaries++] = hashed_prefix_pages * prefix_granularity_ + completed.tail->tail_tokens;
     }
     const std::int32_t state_checkpoint_tokens = completed.state_checkpoint_pages * prefix_granularity_;
-    for (const std::int32_t boundary_tokens : boundaries) {
+    for (std::size_t b = 0; b < num_boundaries; ++b) {
+        const std::int32_t boundary_tokens = boundaries[b];
         const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(group_index), boundary_tokens);
         if (window.first >= window.past_end) {
             continue;
         }
-        PublishedRange range = history_range(window.first, window.past_end);
-        if (state_checkpoint_tokens > 0 && boundary_tokens == state_checkpoint_tokens) {
-            range.boundary_kind = CacheBoundaryKind::kEndpoint;
-        }
-        ranges.push_back(std::move(range));
+        const CacheBoundaryKind kind = state_checkpoint_tokens > 0 && boundary_tokens == state_checkpoint_tokens
+                                           ? CacheBoundaryKind::kEndpoint
+                                           : completed.boundary_kind;
+        range(window.first, window.past_end, kind, /*state_point=*/false);
     }
+}
+
+std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRanges(
+    std::size_t group_index, const CompletedPages& completed) const {
+    std::vector<PublishedRange> ranges;
+    forEachCompletedRange(
+        group_index, completed,
+        [&](std::int32_t first_block, std::int32_t past_end_block, CacheBoundaryKind kind, bool state_point) {
+            PublishedRange range{.first_cache_block = first_block, .boundary_kind = kind};
+            if (state_point) {
+                const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();
+                range.keys.push_back(
+                    CacheKey{.group_id = groups_[group_index].Id(), .content_hash = hash, .page_offset = 0});
+            } else {
+                for (std::int32_t block = first_block; block < past_end_block; ++block) {
+                    range.keys.push_back(historyBlockKey(group_index, completed, block));
+                }
+            }
+            ranges.push_back(std::move(range));
+        });
     return ranges;
 }
 
@@ -2682,15 +2672,16 @@ std::int32_t CacheCoordinator::FirstPublishedPage(const CompletedPages& complete
     const auto hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
     std::int32_t first_page = completed.first_new_prefix_page;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        for (const PublishedRange& range : completedBlockRanges(i, completed)) {
-            // A State group's one key is the point itself: the deepest page
-            // unless a tail is published. A history group's run starts at
-            // slot first_cache_block.
-            const std::int32_t page = GroupIsState(i)
-                                          ? hashed_prefix_pages - (completed.tail ? 0 : 1)
-                                          : range.first_cache_block / BlocksPerBoundary(static_cast<std::int32_t>(i));
-            first_page = std::min(first_page, page);
-        }
+        // A State group's one key is the point itself: the deepest page
+        // unless a tail is published. A history group's run starts at
+        // slot first_cache_block. The walk builds no keys: this runs on
+        // every publication with KV events on.
+        forEachCompletedRange(
+            i, completed, [&](std::int32_t first_block, std::int32_t, CacheBoundaryKind, bool state_point) {
+                const std::int32_t page = state_point ? hashed_prefix_pages - (completed.tail ? 0 : 1)
+                                                      : first_block / BlocksPerBoundary(static_cast<std::int32_t>(i));
+                first_page = std::min(first_page, page);
+            });
     }
     // The block an in-forward State checkpoint publishes under its page adds
     // no page: the chunk that wrote it started on a page boundary at least

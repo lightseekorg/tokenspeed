@@ -1511,18 +1511,24 @@ harmless.
 
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token
-descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
-descriptor of a boundary no group holds a child of. Every group publishes
-its own `BlockStored` for a boundary, under the boundary's block hashes and
-with its `group_idx` and attention kind, exactly while that group holds its
-child: a History group reports its whole chain, a sliding-window group the
-boundaries its window still covers, and a State group -- whose checkpoint
-exists only at a natural point or the opt-in in-forward checkpoint (§1.2) --
-the prompt end and the finish (unless they are dead, §1.2), the junction
-cuts and the in-forward checkpoint's page boundary, never another interior
-chunk end's chain hash. A consumer reads the chain from the History group's
-events and the positions a hybrid model can resume at from the State
-group's. A tail's
+descriptor in the ledger (`registerKvEventPrefixPages`), and the drain drops
+the descriptor of a boundary no group holds a block of. A boundary publishes
+once: a `BlockStored` under its block hashes when a group newly holds it,
+carrying `group_mask`, the groups that hold it (bit i for cache group i),
+with `group_idx` and the attention kind of the lowest newly holding group;
+a `BlockRemoved` carrying the groups that dropped it. So a History group
+holds its whole chain, a sliding-window group the boundaries its window
+still covers, and a State group -- whose checkpoint exists only at a natural
+point or the opt-in in-forward checkpoint (§1.2) -- the prompt end and the
+finish (unless they are dead, §1.2), the junction cuts and the in-forward
+checkpoint's page boundary, never another interior chunk end's chain hash.
+A consumer that reads one group per event sees the History chain; one that
+reads the mask sees the positions a hybrid model can resume at. The drain
+encodes straight into a frame the ledger reuses (`DrainKvEventFrame`), the
+control plane copies it into a bounded ring and a publisher thread sends it:
+a plan step allocates nothing for events and never waits on a socket; a
+ring that is full drops its oldest frame, whose skipped sequence number
+tells the relay to resync. A tail's
 descriptor carries the rows below `T` and the residency check counts a
 tail's blocks from it. A publication registers its newly hashed pages and its
 tail, and every page below them it registers an entry under

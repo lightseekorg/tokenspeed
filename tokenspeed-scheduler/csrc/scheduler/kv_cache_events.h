@@ -31,12 +31,14 @@
 
 namespace tokenspeed {
 
-// Every cache group publishes its own events for a boundary, under the same
-// block hashes: a hybrid model's History group reports its whole chain, its
-// State group the boundaries that hold a checkpoint, a sliding-window group
-// the boundaries its window still covers. A consumer tells the groups apart
-// by group_idx (the scheduler's cache-group index) and reads what each one
-// means from the group's attention kind.
+// One event per boundary: a BlockStored when a cache group newly holds the
+// boundary, carrying group_mask, the groups that hold it after the drain (bit
+// i for cache group i), and a BlockRemoved when groups dropped it, carrying
+// the dropped groups. group_idx, the kind and the window name the lowest
+// group the event is about, so a consumer that reads one group per event
+// (the reference engine's shape) sees that group's store or removal; a
+// consumer that reads the mask sees the hybrid model's History chain, its
+// State checkpoints and its sliding windows under the same block hashes.
 struct KvBlockStoredEvent {
     std::vector<std::uint64_t> block_hashes;
     std::optional<std::uint64_t> parent_block_hash;
@@ -46,11 +48,15 @@ struct KvBlockStoredEvent {
     AttnKind attn_kind{AttnKind::kFull};
     // The window's tokens for a kSlidingWindow group, none otherwise.
     std::optional<std::int32_t> sliding_window;
+    // The groups that hold the boundary after this event, bit i for group i.
+    std::uint64_t group_mask{0};
 };
 
 struct KvBlockRemovedEvent {
     std::vector<std::uint64_t> block_hashes;
     std::int32_t group_idx{0};
+    // The groups that dropped the boundary, bit i for group i.
+    std::uint64_t group_mask{0};
 };
 
 using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent>;

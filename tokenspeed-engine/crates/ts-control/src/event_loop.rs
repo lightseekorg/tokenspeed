@@ -74,7 +74,7 @@ use crate::{
     eplb::{self, InternalOp, SlotMoves},
     grammar::{self as grammar_cache, GrammarKey, Grammars, InvalidGrammar, Lookup},
     ingress::{self, Admission, Admitted, IngressLimits},
-    kv_events::KvEventPublisher,
+    kv_events::{self, KvEventPublisher},
     l3::{L3Error, Tier},
     output::{
         CommitStats, Committed, ForwardResult, HistoryRows, HistorySeeds, InputLogprobPlan,
@@ -740,11 +740,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .advance(&events)
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
         }
-        // One drain per round, after its last scheduler mutation.
+        // One drain per round, after its last scheduler mutation: the
+        // scheduler encodes the frame, the publisher thread sends it.
         if self.config.kv_events {
-            let drained = self.scheduler.drain_kv_events();
+            let dp_rank = self.kv_events.as_ref().map_or(0, KvEventPublisher::dp_rank);
+            let frame = self
+                .scheduler
+                .drain_kv_event_frame(kv_events::now_timestamp(), dp_rank);
             if let Some(publisher) = &self.kv_events {
-                publisher.publish(&drained);
+                publisher.publish(frame);
             }
         }
         if !released.is_empty() {

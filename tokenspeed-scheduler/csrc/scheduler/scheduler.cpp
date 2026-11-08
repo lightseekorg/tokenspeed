@@ -77,16 +77,6 @@ SchedulerConfig validated(SchedulerConfig config) {
     return config;
 }
 
-CacheKey eventKey(const CacheKey& key) {
-    // External events describe one scheduler-level boundary. Fold every
-    // group/child offset behind that boundary into the same accounting key.
-    return CacheKey{
-        .namespace_id = key.namespace_id,
-        .group_id = 0,
-        .content_hash = key.content_hash,
-    };
-}
-
 }  // namespace
 
 Scheduler::Scheduler(SchedulerConfig config)
@@ -114,8 +104,22 @@ Scheduler::Scheduler(SchedulerConfig config)
     max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
-        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation) {
-            markKvEventBoundaryForReconcile(eventKey(key));
+        // The ledger sizes its slab to the Device cache: a boundary is tracked
+        // only while some group holds a block of it, one block per page.
+        std::vector<KvEventLedger::GroupKind> kinds;
+        std::size_t capacity = 0;
+        for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+            const CacheGroupSpec& spec = coordinator_.GroupSpec(i);
+            kinds.push_back(KvEventLedger::GroupKind{
+                .attn_kind = spec.attn_kind,
+                .sliding_window = spec.attn_kind == AttnKind::kSlidingWindow ? spec.sliding_window : 0,
+            });
+            capacity += static_cast<std::size_t>(config_.cache_groups[static_cast<std::size_t>(i)].total_pages);
+        }
+        kv_events_.emplace(std::move(kinds), config_.prefix_granularity, capacity + 64);
+        kv_event_blocks_scratch_.assign(static_cast<std::size_t>(coordinator_.NumGroups()), 0);
+        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
+            kv_events_->Mutate(key.content_hash, key.group_id, mutation == CacheCoordinator::CacheMutation::kStored);
         });
     }
 
@@ -169,71 +173,24 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
     return static_cast<std::size_t>(std::distance(cache_group_ids_.begin(), it));
 }
 
+std::span<const std::uint8_t> Scheduler::DrainKvEventFrame(double timestamp, std::int64_t dp_rank) {
+    // An event reports the net change since the last drain per boundary: a
+    // store with the mask of the groups that hold it once a group newly
+    // holds it, a removal with the mask of the groups that dropped it. The
+    // ledger kept the residency as the coordinator moved pages, so the drain
+    // reads bits and writes the frame: no index query, nothing allocated in
+    // steady state. A hybrid model's History group thus publishes its whole
+    // chain, its State group the boundaries that carry a checkpoint, a
+    // sliding-window group the boundaries its window still covers, each
+    // boundary once, under its block hashes.
+    if (!kv_events_) {
+        return {};
+    }
+    return kv_events_->Drain(timestamp, dp_rank);
+}
+
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
-    // An event reports the net change since the last drain, per cache group:
-    // a group's BlockStored for a boundary is out exactly while every block
-    // that group holds for it is cached. So a hybrid model's History group
-    // publishes its whole chain, its State group the boundaries that carry a
-    // checkpoint, and a sliding-window group the boundaries its window still
-    // covers; the block hashes are the boundary's in every group, and the
-    // event's group_idx tells them apart. Mutations mark boundaries in
-    // whatever order the coordinator touches pages, so the batch is sorted
-    // by chain depth: removals leaf-first, then Stored parent-first, because
-    // consumers resolve a Stored event's parent_block_hash against what they
-    // have already received; within one boundary the groups keep their
-    // index order.
-    std::vector<std::pair<std::int32_t, KvCacheEvent>> removed;
-    std::vector<std::pair<std::int32_t, KvCacheEvent>> stored;
-    for (const CacheKey& boundary : std::exchange(kv_event_boundaries_to_reconcile_, {})) {
-        const auto it = kv_event_boundaries_.find(boundary);
-        FatalCheck(it != kv_event_boundaries_.end(),
-                   "KV event boundary marked for reconcile lost its token descriptor");
-        KvEventBoundary& event_boundary = it->second;
-        event_boundary.needs_reconcile = false;
-        // A tail's descriptor carries fewer tokens than a page.
-        const auto descriptor_tokens = static_cast<std::int32_t>(event_boundary.stored.token_ids.size());
-        const std::int32_t tail_tokens = descriptor_tokens < config_.prefix_granularity ? descriptor_tokens : 0;
-        bool any_cached = false;
-        for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
-            const CacheCoordinator::BoundaryResidency residency =
-                coordinator_.GroupDeviceBoundaryResidency(i, boundary, tail_tokens);
-            any_cached = any_cached || residency != CacheCoordinator::BoundaryResidency::kNone;
-            const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
-            const std::uint64_t bit = std::uint64_t{1} << i;
-            const bool published = (event_boundary.published_groups & bit) != 0;
-            if (complete && !published) {
-                KvBlockStoredEvent event = event_boundary.stored;
-                const CacheGroupSpec& spec = coordinator_.GroupSpec(i);
-                event.group_idx = i;
-                event.attn_kind = spec.attn_kind;
-                event.sliding_window = spec.attn_kind == AttnKind::kSlidingWindow
-                                           ? std::optional<std::int32_t>{spec.sliding_window}
-                                           : std::nullopt;
-                stored.emplace_back(event_boundary.depth, std::move(event));
-            } else if (!complete && published) {
-                removed.emplace_back(event_boundary.depth, KvBlockRemovedEvent{
-                                                               .block_hashes = event_boundary.stored.block_hashes,
-                                                               .group_idx = i,
-                                                           });
-            }
-            event_boundary.published_groups =
-                complete ? event_boundary.published_groups | bit : event_boundary.published_groups & ~bit;
-        }
-        if (!any_cached) {
-            kv_event_boundaries_.erase(it);
-        }
-    }
-    std::stable_sort(removed.begin(), removed.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    std::stable_sort(stored.begin(), stored.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    std::vector<KvCacheEvent> events;
-    events.reserve(removed.size() + stored.size());
-    for (auto& [depth, event] : removed) {
-        events.push_back(std::move(event));
-    }
-    for (auto& [depth, event] : stored) {
-        events.push_back(std::move(event));
-    }
-    return events;
+    return KvEventLedger::DecodeFrame(DrainKvEventFrame(0.0, 0));
 }
 
 bool Scheduler::ClearL1Cache() {
@@ -295,28 +252,32 @@ void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std
     }
     _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
-    const std::vector<std::span<const std::int32_t>> token_pages =
-        request.PrefixPages(first_page, static_cast<std::int32_t>(prefix_hashes.size()));
+    if (static_cast<std::size_t>(first_page) == prefix_hashes.size()) {
+        return;
+    }
     const std::span<const std::uint64_t> block_hashes = request.KvEventBlockHashes(prefix_hashes.size());
 
     for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
-        const std::span<const std::int32_t> tokens = token_pages[i - static_cast<std::size_t>(first_page)];
-        CacheKey key{.content_hash = prefix_hashes[i]};
+        // The page's tokens, a view into the request (no page list is built).
+        const std::span<const std::int32_t> tokens =
+            request.TokenSlice(static_cast<std::int32_t>(i) * config_.prefix_granularity, config_.prefix_granularity);
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[i - 1]};
-        KvBlockStoredEvent event{
-            .block_hashes = {block_hashes[i]},
-            .parent_block_hash = parent_hash,
-            .token_ids = std::vector<std::int32_t>(tokens.begin(), tokens.end()),
-            .block_size = config_.prefix_granularity,
-        };
-        const auto [it, inserted] = kv_event_boundaries_.try_emplace(
-            key, KvEventBoundary{.stored = std::move(event), .depth = static_cast<std::int32_t>(i)});
-        FatalCheck(inserted || (it->second.stored.block_hashes.front() == block_hashes[i] &&
-                                it->second.depth == static_cast<std::int32_t>(i)),
-                   "one cache content hash mapped to different KV event blocks");
-        // The next drain drops the descriptor if the publication never lands.
-        markKvEventBoundaryForReconcile(key);
+        kvEventBlocksPerGroup(/*tail_tokens=*/0, kv_event_blocks_scratch_);
+        kv_events_->Register(prefix_hashes[i], block_hashes[i], parent_hash, tokens, static_cast<std::int32_t>(i),
+                             kv_event_blocks_scratch_);
+    }
+}
+
+void Scheduler::kvEventBlocksPerGroup(std::int32_t tail_tokens, std::vector<std::int32_t>& out) const {
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        std::int32_t blocks = 0;
+        if (!coordinator_.GroupIsReplayable(i)) {
+            blocks = tail_tokens > 0 ? coordinator_.TailBlocksFor(i, tail_tokens) -
+                                           coordinator_.FirstTailBlockNeeded(i, tail_tokens)
+                                     : coordinator_.BlocksPerBoundary(i);
+        }
+        out[static_cast<std::size_t>(i)] = blocks;
     }
 }
 
@@ -347,10 +308,10 @@ std::vector<std::int32_t> Scheduler::kvEventTailsOf(const RetractionImage& image
             }
             // A published slot's boundary is on the Device, so it has its
             // descriptor; one with fewer tokens than a page is a tail's.
-            const auto it = kv_event_boundaries_.find(eventKey(slot.key));
-            FatalCheck(it != kv_event_boundaries_.end(), "an imaged published slot has no KV event descriptor");
-            const auto tail_tokens = static_cast<std::int32_t>(it->second.stored.token_ids.size());
-            const std::int32_t boundary = it->second.depth * config_.prefix_granularity + tail_tokens;
+            const std::optional<KvEventLedger::Descriptor> descriptor = kv_events_->Find(slot.key.content_hash);
+            FatalCheck(descriptor.has_value(), "an imaged published slot has no KV event descriptor");
+            const std::int32_t tail_tokens = descriptor->tokens;
+            const std::int32_t boundary = descriptor->depth * config_.prefix_granularity + tail_tokens;
             if (tail_tokens < config_.prefix_granularity && std::ranges::find(tails, boundary) == tails.end()) {
                 tails.push_back(boundary);
             }
@@ -384,30 +345,9 @@ void Scheduler::registerKvEventTail(Request& request, std::span<const std::strin
         full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[full_pages - 1]};
     const std::span<const std::int32_t> tail_tokens =
         request.TokenSlice(full_pages * config_.prefix_granularity, tail.tail_tokens);
-    const CacheKey key{.content_hash = tail.hash};
-    KvBlockStoredEvent event{
-        .block_hashes = {HashKvBlock(tail_tokens, parent_hash)},
-        .parent_block_hash = parent_hash,
-        .token_ids = std::vector<std::int32_t>(tail_tokens.begin(), tail_tokens.end()),
-        .block_size = config_.prefix_granularity,
-    };
-    const auto [it, inserted] =
-        kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event), .depth = full_pages});
-    FatalCheck(inserted || (it->second.stored.block_hashes.front() == HashKvBlock(tail_tokens, parent_hash) &&
-                            it->second.depth == full_pages),
-               "one cache content hash mapped to different KV event blocks");
-    markKvEventBoundaryForReconcile(key);
-}
-
-void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
-    // Descriptors are erased only by DrainKvEvents, so every cache mutation of
-    // a registered boundary finds one here.
-    const auto it = kv_event_boundaries_.find(boundary);
-    FatalCheck(it != kv_event_boundaries_.end(), "cache mutation on a KV event boundary with no token descriptor");
-    if (!it->second.needs_reconcile) {
-        it->second.needs_reconcile = true;
-        kv_event_boundaries_to_reconcile_.push_back(boundary);
-    }
+    kvEventBlocksPerGroup(tail.tail_tokens, kv_event_blocks_scratch_);
+    kv_events_->Register(tail.hash, HashKvBlock(tail_tokens, parent_hash), parent_hash, tail_tokens, full_pages,
+                         kv_event_blocks_scratch_);
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {

@@ -382,35 +382,6 @@ mod ffi {
         empty_lcm_blocks: i32,
     }
 
-    /// A prefix-cache mutation (`KvBlockStoredEvent` / `KvBlockRemovedEvent`).
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct KvEventView {
-        /// Blocks were stored; else removed.
-        stored: bool,
-        /// The blocks' hashes, in chain order.
-        block_hashes: Vec<u64>,
-        /// Stored: the chain's parent has a hash.
-        has_parent: bool,
-        /// Stored: the parent's hash, when `has_parent`.
-        parent_block_hash: u64,
-        /// Stored: the blocks' tokens.
-        token_ids: Vec<i32>,
-        /// Stored: tokens per block.
-        block_size: i32,
-        /// The cache group the event belongs to (the scheduler's group
-        /// index); every group publishes its own events under the same
-        /// block hashes.
-        group_idx: i32,
-        /// Stored: the group's attention kind as the wire spells it
-        /// (`full_attention`, `sliding_window`, `mamba`).
-        kv_cache_spec_kind: String,
-        /// Stored: the group is a sliding window, and `sliding_window` is
-        /// its width in tokens.
-        has_sliding_window: bool,
-        /// Stored: the window's tokens, when `has_sliding_window`.
-        sliding_window: i32,
-    }
-
     /// One cache group's page counts.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CacheGroupPages {
@@ -448,7 +419,11 @@ mod ffi {
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
-        fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
+        fn drain_kv_event_frame(
+            scheduler: Pin<&mut Scheduler>,
+            timestamp: f64,
+            dp_rank: i64,
+        ) -> &[u8];
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
@@ -474,7 +449,7 @@ mod ffi {
 
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefixHitView, RequestSpec,
+    ForwardBatchView, ForwardEvent, ForwardEventKind, PrefixHitView, RequestSpec,
     SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView,
     StorageOpKind, StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
@@ -668,10 +643,12 @@ impl Scheduler {
         ffi::prefix_hit_stats(self.get())
     }
 
-    /// The prefix-cache mutations since the last drain, in order; empty
-    /// unless the scheduler was configured to record them.
-    pub fn drain_kv_events(&mut self) -> Vec<KvEventView> {
-        ffi::drain_kv_events(self.pinned())
+    /// The KV-event publisher's batch since the last drain, encoded for the
+    /// wire (`[timestamp, events, attn_dp_rank]` as `pd/kv_events.py` lays
+    /// it out); empty when nothing changed or the scheduler was not
+    /// configured to record events. The bytes live until the next drain.
+    pub fn drain_kv_event_frame(&mut self, timestamp: f64, dp_rank: i64) -> &[u8] {
+        ffi::drain_kv_event_frame(self.pinned(), timestamp, dp_rank)
     }
 
     /// Drop the Device L1 and Host L2 prefix indexes (the public flush).

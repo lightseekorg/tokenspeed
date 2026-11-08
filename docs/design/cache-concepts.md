@@ -1482,18 +1482,22 @@ Its responsibilities:
   tiers: history needed by a Device checkpoint retains its ordinary eviction
   rank even when no Host checkpoint remains below it.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
-  insertions/removals; the scheduler folds them into one externally visible
-  prefix event per group. Whether a group holds a scheduler-level boundary
-  fully, partially, or not at all is the coordinator's answer
-  (`GroupDeviceBoundaryResidency`, read off the group's index), so the
-  scheduler keeps no residency counters of its own — only the token
-  descriptor the event carries and which groups' events are currently out.
-  A mutation only marks its boundary for reconcile; `DrainKvEvents`
-  reconciles each marked boundary against every group's residency and
-  reports the net change per group (a group's `BlockStored` is out exactly
-  while that group holds the boundary; the event names the group and its
-  attention kind, the block hashes are the boundary's in every group), then
-  drops descriptors of boundaries no group holds a child of. Nothing is
+  insertions/removals; the scheduler's KV-event ledger (`KvEventLedger`)
+  folds them into one externally visible prefix event per boundary. The
+  ledger keeps, per tracked boundary and per group, how many of the group's
+  Device entries for it are indexed, moved by the sink as pages are stored
+  and evicted, so a group holds a boundary exactly while that count reaches
+  the group's block count for it (a State group's one checkpoint block, a
+  window group's blocks of the tail it needs); the coordinator's index is
+  never queried for residency. A mutation only moves its counts and marks
+  the boundary; `DrainKvEventFrame` reads the marked boundaries' masks and
+  writes the net change since the previous drain into one reused msgpack
+  frame: a `BlockStored` carrying the mask of the groups that hold the
+  boundary when a group newly holds it, a `BlockRemoved` carrying the groups
+  that dropped it (the block hashes are the boundary's in every group;
+  `group_idx` and the attention kind name the lowest group the event is
+  about), then drops the descriptors of boundaries no group holds a block of.
+  A store and a removal of one boundary inside one plan cancel. Nothing is
   decided mid-`Admit`, so one admission may evict a boundary's last cached
   copy and then store the request's own copy without any ordering hazard.
   Admission may pre-hash prompt pages beyond the computed prefix. An early

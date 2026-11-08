@@ -29,12 +29,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <initializer_list>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
@@ -3024,22 +3026,28 @@ protected:
         return cfg;
     }
 
-    // Applies the feed to the boundaries it reports stored, per group: a
-    // removal names one its group stored before, and no group stores one
-    // twice.
+    // Applies the feed to the boundaries it reports held, by hash: a store
+    // adds at least one group to the boundary's mask, a removal drops only
+    // groups the mask holds.
     void Drain() {
         for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
             if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
                 for (const std::uint64_t hash : removed->block_hashes) {
-                    EXPECT_EQ(stored_.erase({removed->group_idx, hash}), 1u)
-                        << "a removal names a boundary never stored";
+                    const auto it = stored_.find(hash);
+                    ASSERT_NE(it, stored_.end()) << "a removal names a boundary never stored";
+                    EXPECT_EQ(it->second.first & removed->group_mask, removed->group_mask)
+                        << "a removal drops a group that held the boundary";
+                    it->second.first &= ~removed->group_mask;
+                    if (it->second.first == 0) {
+                        stored_.erase(it);
+                    }
                 }
                 continue;
             }
             const auto& stored = std::get<KvBlockStoredEvent>(event);
-            EXPECT_TRUE(
-                stored_.emplace(std::make_pair(stored.group_idx, stored.block_hashes.front()), stored.token_ids).second)
-                << "a boundary is stored twice";
+            auto& entry = stored_[stored.block_hashes.front()];
+            EXPECT_NE(stored.group_mask & ~entry.first, 0u) << "a store adds a group that holds the boundary";
+            entry = {stored.group_mask, stored.token_ids};
         }
     }
     ExecutionPlan PlanAndDrain() {
@@ -3049,12 +3057,13 @@ protected:
     }
     // Whether some group reports the boundary stored.
     bool Stored(const std::vector<std::int32_t>& tokens) const {
-        return std::ranges::any_of(stored_, [&tokens](const auto& entry) { return entry.second == tokens; });
+        return std::ranges::any_of(stored_, [&tokens](const auto& entry) { return entry.second.second == tokens; });
     }
-    // Whether group i reports it stored (the History group is 0, the State group 1).
+    // Whether group i holds it (the History group is 0, the State group 1).
     bool StoredBy(std::int32_t group, const std::vector<std::int32_t>& tokens) const {
-        return std::ranges::any_of(
-            stored_, [&](const auto& entry) { return entry.first.first == group && entry.second == tokens; });
+        return std::ranges::any_of(stored_, [&](const auto& entry) {
+            return (entry.second.first >> group & 1u) != 0 && entry.second.second == tokens;
+        });
     }
     // Plans 1 to 3: r's prefill, its first decode (the tail at 7 and the
     // checkpoint at 7, which rotates into slot 0) and the knob's retraction
@@ -3082,7 +3091,8 @@ protected:
         return false;
     }
 
-    std::map<std::pair<std::int32_t, std::uint64_t>, std::vector<std::int32_t>> stored_;
+    // By block hash: the groups that hold the boundary, and its tokens.
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::vector<std::int32_t>>> stored_;
 };
 
 // Under write-through a prompt admitted before r's image lands evicts r's
@@ -4751,49 +4761,44 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASessionResumedFromHostIsNotCopiedA
 }
 
 // KV events keep the Device's view: a written-back boundary is removed when it
-// leaves the Device, and its Host publication reports nothing. Each group
-// publishes what it holds of s1's boundaries: the full group its five pages
-// and the tail [21 22], every State group the tail alone, where its
-// checkpoint is.
+// leaves the Device, and its Host publication reports nothing. Each of s1's
+// boundaries publishes once with the groups that hold it: the full group
+// alone on its five pages, the full group and every State group on the tail
+// [21 22], where the checkpoints are.
 TEST_P(StateCheckpointPrefillHostShardSuite, KvEventsKeepDeviceSemantics) {
     kv_events_ = true;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     CompleteSession("s1", MakeTokens(22));
     const std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
-    ASSERT_EQ(stored.size(), 9u) << "six full-group boundaries and three checkpoints at the tail";
-    std::set<std::pair<std::int32_t, std::uint64_t>> stored_keys;
+    ASSERT_EQ(stored.size(), 6u) << "five pages and the tail, each once";
+    std::map<std::uint64_t, std::uint64_t> stored_masks;  // hash -> the groups that hold it
     std::optional<std::uint64_t> parent;
-    std::optional<std::uint64_t> tail_hash;
     for (const KvCacheEvent& event : stored) {
         ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(event));
         const auto& block = std::get<KvBlockStoredEvent>(event);
-        EXPECT_TRUE(stored_keys.emplace(block.group_idx, block.block_hashes.front()).second);
-        if (block.attn_kind == AttnKind::kState) {
-            EXPECT_EQ(block.token_ids, (std::vector<std::int32_t>{21, 22}));
-            EXPECT_EQ(block.block_hashes.front(), tail_hash) << "the checkpoint closes the tail";
-            continue;
-        }
+        EXPECT_TRUE(stored_masks.emplace(block.block_hashes.front(), block.group_mask).second);
         EXPECT_EQ(block.group_idx, 0);
+        EXPECT_EQ(block.attn_kind, AttnKind::kFull);
         EXPECT_EQ(block.parent_block_hash, parent) << "the full group's chain is continuous";
         parent = block.block_hashes.front();
-        tail_hash = parent;
     }
-    EXPECT_EQ(std::ranges::count_if(stored,
-                                    [](const KvCacheEvent& event) {
-                                        return std::get<KvBlockStoredEvent>(event).attn_kind == AttnKind::kState;
-                                    }),
-              3);
+    const auto& tail = std::get<KvBlockStoredEvent>(stored.back());
+    EXPECT_EQ(tail.token_ids, (std::vector<std::int32_t>{21, 22}));
+    EXPECT_EQ(std::popcount(tail.group_mask), 4) << "the full group and the three State groups hold the tail";
+    for (const KvCacheEvent& event : std::span(stored).first(5)) {
+        EXPECT_EQ(std::get<KvBlockStoredEvent>(event).group_mask, 0b1u) << "a page holds no checkpoint";
+    }
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     SendBootstrapped("f1");
     const ExecutionPlan plan = PlanOnce();
     ASSERT_EQ(ExtractCacheOpsOfKind<WriteBackBatch>(plan).size(), 1u);
-    std::set<std::pair<std::int32_t, std::uint64_t>> removed_keys;
+    std::map<std::uint64_t, std::uint64_t> removed_masks;
     for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
         ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(event));
         const auto& block = std::get<KvBlockRemovedEvent>(event);
-        EXPECT_TRUE(removed_keys.emplace(block.group_idx, block.block_hashes.front()).second);
+        removed_masks[block.block_hashes.front()] |= block.group_mask;
     }
-    EXPECT_EQ(removed_keys, stored_keys) << "every group takes back what it published";
+    EXPECT_EQ(removed_masks, stored_masks) << "every group takes back what it published";
     AckWriteBacks(plan);
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
