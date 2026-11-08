@@ -157,9 +157,9 @@ def _nightly_release_candidate() -> str:
 
     TOKENSPEED_KERNEL_RELEASE_CANDIDATE=N (or rcN) builds 0.1.4rcN.post20261108
     instead of that date's nightly 0.1.4.post20261108. A release candidate sorts
-    below every nightly, so it neither collides with the scheduled nightly of
-    its date nor shadows any nightly: an install that a nightly satisfies still
-    gets the nightly.
+    below every 0.1.4 nightly, so it neither collides with the scheduled nightly
+    of its date nor shadows a nightly of its release: an install that such a
+    nightly satisfies still gets the nightly.
 
     Raises:
         ValueError: If the value is set but is not a release-candidate number.

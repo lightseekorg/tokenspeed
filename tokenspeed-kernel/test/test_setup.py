@@ -98,12 +98,23 @@ def test_nightly_release_candidate_sorts_below_every_nightly(
     version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
     assert version == f"{base_version}{expected}.post20261108"
     assert str(Version(version)) == version
-    # Below the previous day's nightly too, so it shadows no nightly, and the
-    # scheduled nightly's == pin does not match it.
+    # Below the previous day's nightly of this release too, so it shadows none
+    # of them, and the scheduled nightly's == pin does not match it.
     assert Version(version) < Version(f"{base_version}.post20261107")
     assert not SpecifierSet(f"=={base_version}.post20261108").contains(
         version, prereleases=True
     )
+
+
+def test_scheduled_nightly_with_an_empty_release_candidate(monkeypatch) -> None:
+    base_version = _release_version(monkeypatch)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20261108")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    # Scheduled runs pass the empty release_candidate input through.
+    monkeypatch.setenv("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "")
+    version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+    assert version == f"{base_version}.post20261108"
 
 
 @pytest.mark.parametrize(
