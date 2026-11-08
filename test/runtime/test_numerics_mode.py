@@ -726,30 +726,21 @@ def test_failed_policy_registration_restores_imported_views():
 
 
 @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
-@pytest.mark.parametrize("order", ["blockwise", "blockwise-direct"])
-def test_explicit_blockwise_order_is_preserved(numerics, order):
-    from tokenspeed.runtime.utils.server_args import prepare_server_args
-
-    args = prepare_server_args(
-        ["--model", "x", "--numerics", numerics, "--logprob-order", order]
-    )
-    assert args.logprob_order == order
-
-
 @pytest.mark.parametrize(
     "order",
     ["blockwise", "blockwise-direct", "blockwise-16384", "blockwise-direct-16384"],
 )
-@pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
-def test_explicit_trainer_logprob_block_order_survives_resolution(order, numerics):
+@pytest.mark.parametrize("entrypoint", ["constructor", "cli"])
+def test_explicit_blockwise_order_is_preserved(numerics, order, entrypoint):
     from tokenspeed.runtime.utils.server_args import prepare_server_args
 
-    args = ServerArgs(model="x", numerics=numerics, logprob_order=order)
+    if entrypoint == "cli":
+        args = prepare_server_args(
+            ["--model", "x", "--numerics", numerics, "--logprob-order", order]
+        )
+    else:
+        args = ServerArgs(model="x", numerics=numerics, logprob_order=order)
     assert args.logprob_order == order
-    cli = prepare_server_args(
-        ["--model", "x", "--numerics", numerics, "--logprob-order", order]
-    )
-    assert cli.logprob_order == order
 
 
 if __name__ == "__main__":

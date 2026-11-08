@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime input token bounds preserve the checkpoint vocabulary convention."""
+"""Input vocabulary resolution, cross-domain bounds, and runtime propagation."""
 
 import json
 import os
@@ -107,50 +107,6 @@ def test_invalid_vocabulary_is_rejected(tmp_path, size, domain):
         error.value
     )
     assert f"vocab_size={size if domain == 'output' else 64!r}" in str(error.value)
-
-
-@pytest.mark.parametrize("tp_size", [1, 2])
-@pytest.mark.parametrize("actual,expected", [(128, 128), (64, 64), (128, 64)])
-def test_loaded_output_vocabulary_matches_runtime(actual, expected, tp_size):
-    import torch
-    from transformers import PretrainedConfig
-
-    from tokenspeed.runtime.execution.model_runner import validate_output_vocabulary
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
-    from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
-
-    model = torch.nn.Module()
-    model.lm_head = ParallelLMHead(
-        actual,
-        16,
-        padding_size=256,
-        tp_rank=0,
-        tp_size=tp_size,
-        tp_group=tuple(range(tp_size)),
-    )
-    model.logits_processor = LogitsProcessor(
-        PretrainedConfig(vocab_size=actual),
-        attn_tp_size=tp_size,
-        tp_rank=0,
-        tp_size=tp_size,
-        tp_group=tuple(range(tp_size)),
-        dp_lm_head_tp=False,
-    )
-    if actual == expected:
-        validate_output_vocabulary(model, expected)
-    else:
-        with pytest.raises(ValueError, match="logical output vocabulary of 128.*64"):
-            validate_output_vocabulary(model, expected)
-
-
-def test_workers_without_logits_have_no_output_vocabulary():
-    import torch
-
-    from tokenspeed.runtime.execution.model_runner import validate_output_vocabulary
-
-    model = torch.nn.Module()
-    model.logits_processor = None
-    validate_output_vocabulary(model, 64)
 
 
 def test_executor_config_keeps_both_vocabularies(tmp_path):

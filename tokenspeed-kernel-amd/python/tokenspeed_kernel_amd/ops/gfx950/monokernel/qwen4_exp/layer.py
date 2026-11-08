@@ -49,7 +49,7 @@ import functools
 from dataclasses import dataclass, replace
 
 import torch
-from tokenspeed_kernel_amd._scheduling import sched_compile_options
+from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
     mailbox,
@@ -891,8 +891,8 @@ def launch_gluon_qwen4_exp_delta_layer_gfx950(
         trace_buf,
         plan.key,
         num_warps=NUM_WARPS,
-        # The device library of _scheduling.wave_uniform_i32 (moe.py).
-        **sched_compile_options(),
+        # The device library of _extern.wave_uniform_i32 (moe.py).
+        **extern_compile_options(),
     )
 
 
@@ -1089,8 +1089,8 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
         live_plan(plan, catch_up).key,
         advance_step,
         num_warps=NUM_WARPS,
-        # The device library of _scheduling.wave_uniform_i32 (moe.py).
-        **sched_compile_options(),
+        # The device library of _extern.wave_uniform_i32 (moe.py).
+        **extern_compile_options(),
     )
 
 

@@ -159,6 +159,7 @@ class DFlash2(DFlash):
             softcapping=processor.final_logit_softcapping,
             skip_all_gather=processor.skip_all_gather,
             dp_sampling_enabled=processor.dp_sampling_enabled,
+            fp8_weight=self.model.fp8_head,
         )
 
     def _compute_candidates(

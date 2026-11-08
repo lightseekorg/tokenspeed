@@ -98,13 +98,17 @@ __all__ = [
     "warmup_fp8_projections",
     # MV: small-M dense projection
     "mv",
+    "MV_FP8_WEIGHT_MAX_M",
+    "mv_fp8_weight",
     "mv_weightless_rmsnorm_gated_sigmoid",
     "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
     "fp32_router_gemv",
     "fp32_router_gemv_counters",
     "fp32_router_gemv_execute",
+    "fp32_router_gemv_execute_with_mm",
     "fp32_router_gemv_plan",
+    "fp32_router_gemv_with_mm_supported",
     "fp32_router_gemv_process_weight",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
@@ -1747,9 +1751,9 @@ def dsv4_linear_fp32(
 # activations first. A layer that keeps the weight split from
 # :func:`mv_weight_split` passes it to :func:`mv`, and the
 # registry can then run the product on BF16 tensor cores
-# (``triton_bf16x3_gemm_fp32``). From 17 to 96 rows, for weights of up to 256
-# rows (a multiple of 4) with K a multiple of 512 up to 8192, the registry runs
-# it on CUDA cores from the FP32 weight instead, with or without the split
+# (``triton_bf16x3_gemm_fp32``). Without a split, from 17 to 96 rows, for
+# weights of up to 256 rows (a multiple of 4) with K a multiple of 512 up to
+# 8192, the registry runs it on CUDA cores from the FP32 weight
 # (``gluon_simt_gemm_fp32``).
 
 # Registry signature of each served (x dtype, weight dtype) pair.
@@ -1940,6 +1944,57 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     ):
         return None
     return split_fp32_weight_bf16x3(weight)
+
+
+# Rows one weight-only FP8 GEMV launch takes; larger calls run in chunks.
+MV_FP8_WEIGHT_MAX_M = 32
+
+
+def mv_fp8_weight(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``(x @ weight.T) * weight_scale`` with a weight-only FP8 weight.
+
+    The weight is E4M3 with one FP32 scale per row (output channel), as a
+    16-bit weight quantizes once at load. Up to ``MV_FP8_WEIGHT_MAX_M`` rows
+    take a registered GEMV that reads the weight once, or the Torch
+    reference, which upcasts the weight in chunks; more rows run as chunks of
+    that many.
+
+    Args:
+        x: ``[M, K]`` 16-bit activations.
+        weight: Contiguous ``[N, K]`` ``float8_e4m3fn`` weight.
+        weight_scale: Contiguous FP32 scale of each weight row, ``N``
+            elements.
+        out: Optional ``[M, N]`` destination in ``x``'s dtype with a unit
+            inner stride.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    m, k = x.shape
+    n = weight.shape[0]
+    if out is None:
+        out = x.new_empty((m, n))
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if m > MV_FP8_WEIGHT_MAX_M:
+        # Each chunk re-reads the weight: past this many rows the one-launch
+        # GEMV measured slower than chunks of it (and than a BF16 GEMM).
+        for start in range(0, m, MV_FP8_WEIGHT_MAX_M):
+            stop = min(start + MV_FP8_WEIGHT_MAX_M, m)
+            mv_fp8_weight(x[start:stop], weight, weight_scale, out[start:stop])
+        return out
+    kernel = select_kernel(
+        "gemm",
+        "mv_fp8_weight",
+        mv_fp8_weight_signature(x.dtype),
+        traits={"m": m, "n": n, "k": k},
+    )
+    return kernel(x, weight, weight_scale, out)
 
 
 def _select_mv_weightless_rmsnorm_gated_sigmoid(
@@ -3925,7 +3980,10 @@ from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     MXFP4_LINEAR_MFMA_LAYOUT,
     prepare_mxfp4_linear_mfma_weight,
 )
-from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv  # noqa: E402
+from tokenspeed_kernel.ops.gemm.native import (  # noqa: E402
+    mv_fp8_weight_signature,
+    torch_decode_gemv,
+)
 from tokenspeed_kernel.ops.gemm.triton import (  # noqa: E402
     MXFP4_LINEAR_LINEAR_LAYOUT,
     MXFP4_LINEAR_SIGNATURE,
@@ -3975,6 +4033,7 @@ class _FP32RouterGEMVPlan:
     hidden_size: int
     output_size: int
     dtype: torch.dtype
+    batch_invariant: bool
 
 
 def fp32_router_gemv_plan(
@@ -4019,6 +4078,7 @@ def fp32_router_gemv_plan(
         hidden_size=hidden_size,
         output_size=output_size,
         dtype=dtype,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -4090,3 +4150,126 @@ def fp32_router_gemv_execute(
         counters,
         enable_pdl,
     )
+
+
+def _select_fp32_router_gemv_with_mm(
+    plan: _FP32RouterGEMVPlan,
+    x: torch.Tensor,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+) -> SelectedKernel | None:
+    """Select the launch that runs the router next to a decode GEMM, or None."""
+    if (
+        plan.batch_invariant
+        or x.ndim != 2
+        or x.shape[1] != plan.hidden_size
+        or x.dtype != plan.dtype
+        or not x.is_contiguous()
+        or not x.is_cuda
+        or mm_a.ndim != 2
+        or mm_b.ndim != 2
+        or mm_a.shape != (x.shape[0], mm_b.shape[1])
+        or not mm_a.is_contiguous()
+        or not mm_b.is_contiguous()
+        or mm_a.device != x.device
+        or mm_b.device != x.device
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return None
+    rows, (mm_n, mm_k) = x.shape[0], mm_b.shape
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "prepared_fp32_router_gemv_with_mm",
+            dense_format_signature(
+                ("x", "weight", "mm_a", "mm_b"),
+                (x.dtype, plan.dtype, mm_a.dtype, mm_b.dtype),
+            ),
+            traits={
+                "m": rows,
+                "n": mm_n,
+                "k": mm_k,
+                "router_n": plan.output_size,
+                "router_k": plan.hidden_size,
+            },
+        )
+    except NoKernelFoundError:
+        return None
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name(kernel.name)
+    # The launch reads the plan's prepared weight and writes the bits mm would
+    # write, so it only stands in where both match.
+    if (
+        spec is None
+        or spec.weight_preprocessor is not plan.weight_preprocessor
+        or not _use_mv(mm_a, mm_b)
+        or _select_mv(rows, mm_n, mm_k, True, mm_a.dtype, mm_b.dtype, False)
+        is not registry.get_impl("gluon_mm_a16w16_decode_gfx950")
+    ):
+        return None
+    return kernel
+
+
+def fp32_router_gemv_with_mm_supported(
+    plan: object,
+    x: torch.Tensor,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+) -> bool:
+    """Return whether :func:`fp32_router_gemv_execute_with_mm` serves these operands.
+
+    Args:
+        plan: Opaque router GEMV plan.
+        x: FP32 router rows.
+        mm_a: ``[rows, K]`` activations of the independent GEMM.
+        mm_b: ``[N, K]`` weight of the independent GEMM.
+
+    Returns:
+        ``True`` when one launch can run the router and ``mm(mm_a, mm_b)``.
+    """
+    return (
+        _select_fp32_router_gemv_with_mm(
+            _require_fp32_router_gemv_plan(plan), x, mm_a, mm_b
+        )
+        is not None
+    )
+
+
+def fp32_router_gemv_execute_with_mm(
+    plan: object,
+    x: torch.Tensor,
+    prepared_weight: torch.Tensor,
+    multiplier: float,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+    mm_out: torch.Tensor,
+) -> torch.Tensor:
+    """Project router rows and compute an independent GEMM in one launch.
+
+    Where :func:`fp32_router_gemv_with_mm_supported` holds, the two share a
+    launch instead of paying a kernel boundary each. ``mm_out`` receives
+    ``mm(mm_a, mm_b)`` bit for bit; the router runs its split-K GEMM at every
+    supported row count, so its logits may differ from the plan's single-row
+    GEMV in the last bits.
+
+    Args:
+        plan: Opaque router GEMV plan.
+        x: Contiguous FP32 router rows.
+        prepared_weight: Result of :func:`fp32_router_gemv_process_weight`.
+        multiplier: Scale applied to the router logits.
+        mm_a: Contiguous ``[rows, K]`` BF16 activations.
+        mm_b: Contiguous ``[N, K]`` BF16 weight.
+        mm_out: ``[rows, N]`` BF16 destination.
+
+    Returns:
+        FP32 router logits in ``[rows, outputs]`` layout.
+    """
+    typed_plan = _require_fp32_router_gemv_plan(plan)
+    kernel = _select_fp32_router_gemv_with_mm(typed_plan, x, mm_a, mm_b)
+    if kernel is None:
+        raise ValueError(
+            "fp32_router_gemv_execute_with_mm needs supported operands "
+            "(see fp32_router_gemv_with_mm_supported), got router rows "
+            f"{tuple(x.shape)} and a {tuple(mm_b.shape)} GEMM"
+        )
+    return kernel(x, prepared_weight, multiplier, mm_a, mm_b, mm_out)

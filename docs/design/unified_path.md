@@ -1751,8 +1751,8 @@ them. This responsibility is fixed at construction, not inferred from a
 per-round readiness flag. The producer enqueues writes before the drafter on
 the same stream; failures propagate instead of selecting a fallback writer.
 The common block drafter always updates accepted-prefix lengths, but only
-projects/writes context when no producer is configured. Its optional auxiliary-stream writer is disabled for a forward with
-this producer, avoiding a second writer or a missing stream dependency.
+projects/writes context when no producer is configured. Its capture sink
+is not armed for a forward with this producer, avoiding a second writer.
 The final PD readiness barrier remains after the whole proposal call, since
 proposal execution can write the same draft fields after context injection.
 
@@ -1765,15 +1765,20 @@ seam is `BaseDrafter.prepare_target_forward(ctx)`, called right before the
 target runs: the drafter decides under its own gate whether this round
 qualifies and attaches what it needs; a fresh context per round means
 nothing outlives it, and a model that sees no attachment does nothing.
-DFLASH is the one user: its incremental projection attaches
+DFLASH is the one user: on decode-only rounds it attaches
 `ctx.target_capture_sink`, the target hands each captured tap to
-`on_target_capture` as it is produced, and the sink accumulates the
-draft's `fc` projection on the aux stream so the draft KV is written under
-the target's remaining layers. The arming gate is the same
-`_overlap_allowed` the drafter's `run` decides the overlap path by, so a
-round can never be armed on one side and drained on the other. These hooks
-consume the target's capture configuration; they do not change the tap
-selection or output layout.
+`on_target_capture` as it is produced, and the sink copies it (rounding a
+wider residual once) into its columns of one tap block. The last tap runs
+the same context projection and KV write as the drafter's `run` would on
+the concatenated taps, inline on the forward's stream: `fc` is split by
+output columns across attention TP, so the projection reads 1/TP of the
+weight and gathers the columns in order with the target's own
+collectives. No auxiliary stream is involved, so a capture point must
+hold no borrowed collective output the gather could overwrite. `run`
+writes the context itself only for a round the sink did not take, and
+refuses one it armed but never saw complete. These hooks consume the
+target's capture configuration; they do not change the tap selection or
+output layout.
 
 The reverse direction rides on the context as well: a target that captures
 its taps on a row subset reports it as ctx.captured_rows
@@ -2356,8 +2361,10 @@ Principle 5).
   signature conformance.
 * `test/runtime/execution/test_draft_target_wiring.py` — the drafter's
   target-forward hook: DFLASH arms its capture sink on the context only
-  under its overlap gate (not on mixed rounds, not in graph warmup), the
-  sink folds the taps into the projection and writes the KV once; the
+  on decode-only, non-idle rounds, the sink concatenates the taps and
+  writes the context once at the last tap
+  (`test_dflash_context_projection.py`: bit for bit what the projection of
+  the concatenated taps writes, with `fc` split across attention TP); the
   executor calls the hook before the target forward
   (`test_model_executor_cache_state.py`); the target hands taps to the
   forward's sink in concat order (`test_dspark_config.py`).

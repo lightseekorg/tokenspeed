@@ -25,7 +25,7 @@ from __future__ import annotations
 import functools
 import inspect
 from collections.abc import Callable, Iterable
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 from torch import nn
@@ -44,6 +44,9 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 )
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 from tokenspeed.runtime.utils import add_prefix
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.moe import MoECheckpointLoader
 
 
 def _record_loaded_names(load_weights: Callable) -> Callable:
@@ -433,13 +436,18 @@ class BaseCausalLM(nn.Module):
 
     # Weight loading.
 
-    def get_stacked_params_mapping(self) -> list[tuple[str, str, str]]:
+    def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
 
         return []
 
     def get_skip_weight_names(self) -> list[str]:
 
         return ["rotary_emb.inv_freq"]
+
+    def get_expert_checkpoint_loader(self) -> MoECheckpointLoader | None:
+        """The loader for this rank's routed experts, or None without experts."""
+
+        return None
 
     @_record_loaded_names
     def load_weights(
@@ -454,11 +462,20 @@ class BaseCausalLM(nn.Module):
         stacked_params_mapping = self.get_stacked_params_mapping()
         skip_patterns = self.get_skip_weight_names()
         params_dict: dict[str, nn.Parameter] = dict(self.named_parameters())
+        expert_loader = self.get_expert_checkpoint_loader()
         loaded: set[str] = set()
 
         for name, loaded_weight in weights:
 
             if any(pattern in name for pattern in skip_patterns):
+                continue
+
+            if expert_loader is not None and expert_loader.is_expert_checkpoint_weight(
+                name
+            ):
+                # Experts this rank does not match belong to another EP rank.
+                if expert_loader.matches(name):
+                    loaded.add(expert_loader.load(name, loaded_weight))
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
