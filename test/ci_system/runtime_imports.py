@@ -24,10 +24,7 @@ def runtime_imports(path: Path) -> set[str]:
     """Runtime modules that any import statement in ``path`` names, including
     imports inside functions. A name after ``from ... import`` counts too, since
     it may be a submodule."""
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, UnicodeDecodeError):
-        return set()
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     modules = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -51,10 +48,17 @@ def reachable_runtime_paths(repo_root: Path, roots: Iterable[str]) -> frozenset[
         the file exists, so a deleted module that is still imported counts.
         Importing a module also runs its parent packages' ``__init__.py``.
         Modules imported by name at run time (``importlib``) are not followed.
+
+    Raises:
+        ValueError: A root does not exist.
+        SyntaxError: A file on the way does not parse.
     """
     pending = set()
     for root in roots:
         path = repo_root / root
+        # A missing root would reach nothing and silently drop its task.
+        if not path.exists():
+            raise ValueError(f"import root does not exist: {root}")
         files = sorted(path.rglob("*.py")) if path.is_dir() else [path]
         for file in files:
             pending |= runtime_imports(file)

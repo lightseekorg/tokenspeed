@@ -323,9 +323,15 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         if (
             not isinstance(roots, list)
             or not roots
-            or not all(isinstance(root, str) and root for root in roots)
+            or not all(
+                isinstance(root, str) and root and not root.endswith("/")
+                for root in roots
+            )
         ):
-            raise ValueError(f"{path}: import_roots must be a non-empty string list")
+            raise ValueError(
+                f"{path}: import_roots must be a non-empty list of paths without "
+                "a trailing slash"
+            )
     if "retries" in data:
         retries = data["retries"]
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:

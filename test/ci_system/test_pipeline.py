@@ -1380,6 +1380,11 @@ _RUNTIME_FILES = {
             ["kernel", "other"],
         ),
         ("python/tokenspeed/unreached.py\n", "post-submit", ["kernel", "other"]),
+        (
+            "\n".join(f"python/tokenspeed/unreached{i}.py" for i in range(300)),
+            "per-commit",
+            ["kernel", "other"],
+        ),
     ],
 )
 def test_scan_drops_tasks_whose_import_roots_miss_every_change(
@@ -1404,7 +1409,23 @@ def test_scan_drops_tasks_whose_import_roots_miss_every_change(
     assert [entry["name"] for entry in matrix["include"]] == expected
 
 
-@pytest.mark.parametrize("roots", ["[]", "tokenspeed-kernel/test", "['']"])
+def test_scan_fails_on_a_missing_import_root(tmp_path, monkeypatch):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    roots = "import_roots:\n  - tokenspeed-kernel/tests\n"
+    _write_task_yaml(root, "kernel.yaml", _default_body("kernel", ["b200-1gpu"], roots))
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text("python/tokenspeed/a.py\n")
+    argv = ["scan", "--repo-root", str(tmp_path), "--trigger", "per-commit"]
+    argv += ["--changed-files", str(changed_file)]
+    with pytest.raises(ValueError, match="import root does not exist"):
+        pipeline.main(argv)
+
+
+@pytest.mark.parametrize(
+    "roots", ["[]", "tokenspeed-kernel/test", "['']", "[tokenspeed-kernel/test/]"]
+)
 def test_validate_task_rejects_malformed_import_roots(tmp_path, roots):
     body = _default_body("ut-a", ["b300-1gpu"], extra=f"import_roots: {roots}\n")
     path = _write_task_yaml(tmp_path, "bad.yaml", body)
