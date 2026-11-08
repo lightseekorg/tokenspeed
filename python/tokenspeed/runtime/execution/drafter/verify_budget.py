@@ -74,17 +74,53 @@ class VerifyBudgetPolicy:
         overhead. Missing measurements or non-finite feedback retain full width.
         Full width denotes native execution, not the adaptive full-width graph.
         """
-        bs = len(scores)
+        return self.select_distributed(
+            (scores,),
+            graph_batch_size=graph_batch_size,
+            native_step_ms=native_step_ms,
+            adaptive_step_ms=adaptive_step_ms,
+            policy_ms=policy_ms,
+        )
+
+    def select_distributed(
+        self,
+        rank_scores: Sequence[Sequence[Sequence[float]]],
+        *,
+        graph_batch_size: int | None,
+        native_step_ms: float,
+        adaptive_step_ms: Mapping[int, float],
+        policy_ms: float,
+    ) -> int:
+        """Choose a common per-rank capacity using the sum of rank rewards.
+
+        Each rank allocates its own capacity among its own requests. Costs must
+        measure the synchronized distributed step, not isolated rank execution.
+        Unequal local batches are ineligible for this uniform-capacity graph.
+        """
+        if not rank_scores:
+            raise ValueError("distributed verification requires rank scores")
+        bs = len(rank_scores[0])
+        if any(len(scores) != bs for scores in rank_scores):
+            raise ValueError("distributed verification requires equal local batches")
         full = bs * self.verify_width
         if not self.admits(batch_size=bs, graph_batch_size=graph_batch_size):
             return full
-        if any(len(row) != self.verify_width - 1 for row in scores):
+        if any(
+            len(row) != self.verify_width - 1
+            for scores in rank_scores
+            for row in scores
+        ):
             raise ValueError("confidence width must match the draft window")
         if not math.isfinite(native_step_ms) or native_step_ms <= 0:
             return full
         if not math.isfinite(policy_ms) or policy_ms < 0:
             raise ValueError("policy cost must be finite and nonnegative")
-        if any(not math.isfinite(v) for row in scores for v in row):
+        if any(
+            not math.isfinite(v)
+            for scores in rank_scores
+            for row in scores
+            for v in row
+        ):
             return full
         for q, cost in adaptive_step_ms.items():
             if type(q) is not int or not bs <= q <= full:
@@ -94,18 +130,20 @@ class VerifyBudgetPolicy:
             if not math.isfinite(cost) or cost <= 0:
                 raise ValueError("adaptive step costs must be finite and positive")
 
-        gains = []
-        for row in scores:
-            survival = 1.0
-            for score in row:
-                # Stable sigmoid without overflow at either end.
-                exp = math.exp(-abs(score))
-                survival *= 1 / (1 + exp) if score >= 0 else exp / (1 + exp)
-                gains.append(survival)
-        gains.sort(reverse=True)
-        rewards = [float(bs)]
-        for gain in gains:
-            rewards.append(rewards[-1] + gain)
+        rewards = [float(bs * len(rank_scores))] * (full - bs + 1)
+        for scores in rank_scores:
+            gains = []
+            for row in scores:
+                survival = 1.0
+                for score in row:
+                    exp = math.exp(-abs(score))
+                    survival *= 1 / (1 + exp) if score >= 0 else exp / (1 + exp)
+                    gains.append(survival)
+            gains.sort(reverse=True)
+            reward = 0.0
+            for index, gain in enumerate(gains, 1):
+                reward += gain
+                rewards[index] += reward
         native_rate = rewards[-1] / native_step_ms
         best_q = full
         best_rate = native_rate * (1 + self.min_gain)
