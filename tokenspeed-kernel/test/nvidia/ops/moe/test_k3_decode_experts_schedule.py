@@ -54,9 +54,7 @@ BETA, LINEAR_BETA = 4.0, 25.0
 @pytest.fixture(scope="module")
 def experts_weights():
     """One TP8 rank's MXFP4 experts in the serving layout the decode chain reads."""
-    from tokenspeed_kernel.ops.moe.flashinfer import (
-        flashinfer_trtllm_mxfp4_situ_moe_weights,
-    )
+    from tokenspeed_kernel.ops.moe import flashinfer
 
     g = torch.Generator(device="cuda").manual_seed(7)
 
@@ -77,13 +75,16 @@ def experts_weights():
         swiglu_arg=None,
         swiglu_beta=None,
     )
-    flashinfer_trtllm_mxfp4_situ_moe_weights({}, layer)
+    flashinfer.flashinfer_trtllm_mxfp4_situ_moe_weights({}, layer)
     return layer
 
 
 def _engine(weights, batches, monkeypatch, *, scheduled):
-    """Experts prepared for ``batches`` (B<=8 and B>8 keep separate workspaces, as
-    the chain does), with or without the static schedule and claimed FC2 jobs."""
+    """Experts prepared for ``batches``, with or without the static schedule.
+
+    B<=8 and B>8 keep separate workspaces, as the chain does; without the static
+    schedule the FC2 jobs are not claimed either.
+    """
     from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe import experts_runtime
 
     if not scheduled:
@@ -120,8 +121,8 @@ SEQUENCE = (4, 5, 6, 7, 8, 8, 16, 4, 8, 16, 8, 8, 8, 5)
 
 def test_static_schedule_matches_the_metadata_walk(experts_weights, monkeypatch):
     batches = sorted(set(SEQUENCE))
-    walked, walked_out = _engine(experts_weights, batches, monkeypatch, scheduled=False)
-    static, static_out = _engine(experts_weights, batches, monkeypatch, scheduled=True)
+    walked, _ = _engine(experts_weights, batches, monkeypatch, scheduled=False)
+    static, _ = _engine(experts_weights, batches, monkeypatch, scheduled=True)
     for step, b in enumerate(SEQUENCE):
         x, ids = _routing(b, 100 + step)
         expected = walked.run(x, ids).clone()
