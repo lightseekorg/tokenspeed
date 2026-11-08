@@ -71,7 +71,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
@@ -212,7 +212,7 @@ class LogitsMetadata:
     # (query context parallelism); None when they are the whole forward. It
     # selects the row-selection path (gathers over the TP group or local
     # indexing), so every constructor names it.
-    query_shard: QueryShardPlan | None = dataclasses.field(kw_only=True)
+    query_shard: QueryShardInputs | None = dataclasses.field(kw_only=True)
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     gather_ids: torch.Tensor | None = None
     logits_rows_selected: bool = False
@@ -249,7 +249,11 @@ class LogitsMetadata:
             gather_ids=ctx.gather_ids,
             logits_rows_selected=ctx.logits_rows_selected,
             input_logprob_rows=ctx.input_logprob_rows,
-            query_shard=ctx.query_shard,
+            query_shard=(
+                ctx.attn_backend.require_query_shard_inputs()
+                if ctx.query_shard is not None
+                else None
+            ),
             all_decode_or_idle=ctx.all_decode_or_idle,
             global_num_tokens=ctx.global_num_tokens,
             collective_global_num_tokens=ctx.collective_global_num_tokens,
@@ -851,12 +855,15 @@ class LogitsProcessor(nn.Module):
         capture is the selected ``[bs, hidden]`` rows (the aux taps', when the
         model has them), whole on every rank.
         """
+        if (
+            logits_metadata.logits_rows_selected
+            and logits_metadata.input_logprob_rows is not None
+        ):
+            raise ValueError("selected logits rows cannot provide input logprobs")
         shard = self._query_shard(logits_metadata)
         # Cache-only chunks may have no logits rows. DP heads still join
         # their peers' exchange, and every layout retains the empty taps.
         if logits_metadata.logits_rows_selected and hidden_states.shape[0] == 0:
-            if logits_metadata.input_logprob_rows is not None:
-                raise ValueError("selected logits rows cannot provide input logprobs")
             capture = None
             if logits_metadata.capture_hidden_mode.need_capture():
                 capture = (
@@ -1015,7 +1022,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=None if input_top is None else input_top[1],
         )
 
-    def _query_shard(self, logits_metadata: LogitsMetadata) -> QueryShardPlan | None:
+    def _query_shard(self, logits_metadata: LogitsMetadata) -> QueryShardInputs | None:
         """The forward's query shard when ``hidden_states`` are a shard.
 
         The shard's collectives (the sampled-row gather, the gather of the
@@ -1048,7 +1055,7 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
-        shard: QueryShardPlan | None,
+        shard: QueryShardInputs | None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Logprob of each named prompt row's next token, position-chunked.
 

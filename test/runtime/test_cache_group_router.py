@@ -30,6 +30,7 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs, QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
@@ -629,6 +630,53 @@ class TestCacheGroupRouterTest:
             SWA: base,
             "linear_attention_0": torch.ones((bs, 2), dtype=torch.int32),
         }
+
+    @pytest.mark.parametrize("next_forward", ["extend", "decode"])
+    def test_query_inputs_are_forward_wide_and_cleared(self, next_forward):
+        router, leaves = self._router()
+        assert len(leaves) == 2
+        with pytest.raises(RuntimeError, match="no prepared query shard inputs"):
+            router.require_query_shard_inputs()
+        lengths = torch.tensor([5, 4], dtype=torch.int32)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        inputs = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=9, input_lengths=[5, 4], size=2, rank=0
+            ),
+            input_lengths=[5, 4],
+            device="cpu",
+        )
+        kwargs = dict(
+            bs=2,
+            num_extends=2,
+            req_pool_indices=torch.arange(2),
+            seq_lens=prefix + lengths,
+            forward_mode=ForwardMode.EXTEND,
+            block_tables=self._tables(),
+            block_tables_cpu=self._tables(),
+            extend_seq_lens=lengths,
+            extend_seq_lens_cpu=lengths,
+            extend_prefix_lens=prefix,
+            extend_prefix_lens_cpu=prefix,
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=prefix + lengths,
+            extend_with_prefix=True,
+        )
+        router.init_forward_metadata(**kwargs, query_shard=inputs)
+        assert router.require_query_shard_inputs() is inputs
+        if next_forward == "extend":
+            router.init_forward_metadata(**kwargs, query_shard=None)
+        else:
+            router.refresh_decode_metadata(
+                2,
+                2,
+                torch.arange(2),
+                prefix + lengths,
+                forward_mode=ForwardMode.DECODE,
+                block_tables=self._tables(),
+            )
+        with pytest.raises(RuntimeError, match="no prepared query shard inputs"):
+            router.require_query_shard_inputs()
 
     def test_window_support_is_forwarded_from_the_leaves(self):
         router, leaves = self._router()

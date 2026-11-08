@@ -4087,7 +4087,10 @@ def test_model_qcp_ced_communication_and_outputs(
 ):
     from tokenspeed.runtime.distributed import comm_ops
     from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     total = sum(lengths)
     ends = [p + n for p, n in zip(prefixes, lengths)]
@@ -4111,8 +4114,12 @@ def test_model_qcp_ced_communication_and_outputs(
         with torch.device("meta"):
             model = DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu")
         backend = _backend("cpu", 2)
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cpu",
         )
         meta = _extend(
             backend,
@@ -4133,7 +4140,7 @@ def test_model_qcp_ced_communication_and_outputs(
             num_decodes=0,
             decode_width=1,
         )
-        ctx.query_shard = plan
+        ctx.query_shard = plan.plan
         ctx.collective_num_tokens = view.metadata.positions.numel()
         local = backend.prefill_query_shard()
         for layer_id in (2, 20, 24):
@@ -4141,7 +4148,7 @@ def test_model_qcp_ced_communication_and_outputs(
             ffn_ctx = layer._ffn_context(ctx)
             wanted = plan.row_counts if layer_id < 20 else local.decoder_plan.row_counts
             assert layer.comm_manager.scattered_num_tokens(ffn_ctx) == list(wanted)
-            assert ctx.query_shard is plan
+            assert ctx.query_shard is plan.plan
             assert ctx.collective_num_tokens == view.metadata.positions.numel()
         full_hidden = torch.arange(view.metadata.positions.numel() * config.hidden_size)
         full_hidden = (
@@ -4177,7 +4184,7 @@ def test_model_qcp_ced_communication_and_outputs(
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.shape[0] == sum(complete)
         assert captured is None and ctx.logits_rows_selected
-        assert ctx.query_shard is plan
+        assert ctx.query_shard is plan.plan
 
         # CPU tests replace only the unavailable distributed collective.
         # Include empty owners and open chunks with no sampled output.
@@ -4216,7 +4223,10 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("launch with torchrun --nproc_per_node=4")
     from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     kvp_size = 4
     rank = int(os.environ["RANK"])
@@ -4326,11 +4336,14 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
             ):
                 backend.cache_pool.arena.buffer.zero_()
                 plan = (
-                    QueryShardPlan.from_forward(
-                        total_tokens=length,
+                    QueryShardInputs.from_plan(
+                        plan=QueryShardPlan.from_forward(
+                            total_tokens=length,
+                            input_lengths=[length],
+                            size=4,
+                            rank=rank,
+                        ),
                         input_lengths=[length],
-                        size=4,
-                        rank=rank,
                         device=device,
                     )
                     if sharded
@@ -4346,7 +4359,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                     query_shard=plan,
                 )
                 ctx = _ctx(backend, length, ForwardMode.EXTEND)
-                ctx.query_shard = plan
+                ctx.query_shard = None if plan is None else plan.plan
                 rows = plan.local_row_ids if plan is not None else slice(None)
                 result, _ = adapter.model(
                     ids[rows],

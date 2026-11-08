@@ -38,7 +38,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     current_forward_ctx,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     reject_query_shard,
@@ -164,7 +164,7 @@ class MSAAttnBackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
         page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):

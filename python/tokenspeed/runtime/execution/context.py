@@ -113,7 +113,7 @@ class InputLogprobRows:
     ``rows_per_rank`` is the plan's row count on every rank of the group,
     the split of the activation gather that puts the whole plan's rows on
     every rank, and ``gathered_to_rows`` puts the gathered rows (rank by
-    rank) back in row order (``QueryShardPlan.split_rows``); without a shard
+    rank) back in row order (``QueryShardInputs.split_rows``); without a shard
     both must be passed explicitly as ``None`` and ``rows`` are already the
     whole plan's. All index
     tensors are int64 on the device. ``chunk_tokens``
@@ -176,7 +176,8 @@ class ForwardContext:
     # The rows this rank computes of a sharded extend forward (its zigzag
     # segments of every request); None means every rank computes every row. ``input_num_tokens``
     # and ``global_num_tokens`` keep the scheduler's full-chunk meaning, the
-    # model's row axis is the shard.
+    # model's row axis is the shard. Only host counts live here; row-index
+    # tensors belong to InputBuffers and the attention metadata.
     query_shard: QueryShardPlan | None = None
     # Models that need specific collective sizing (e.g. draft models whose
     # first-step forward narrows activations) report these via

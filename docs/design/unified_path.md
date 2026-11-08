@@ -46,8 +46,8 @@ and leaf (`backends/paged/base.py`) alike: `extend_seq_lens`,
 `extend_seq_lens_cpu`, `extend_prefix_lens`, `extend_prefix_lens_cpu` are
 plain `torch.Tensor` (`[>= num_extends]` entries; empty, never `None`, when
 there are no extend requests) and `extend_with_prefix` is a plain `bool`, and `query_shard` is the forward's
-`QueryShardPlan` (which rows of the span this rank computes under query
-context parallelism: host integers and the staged row-index tensors) or `None` when every rank computes
+`QueryShardInputs` (the staged per-forward row indices and their tensor-free
+`QueryShardPlan`) or `None` when every rank computes
 every row.
 Runner-facing nodes additionally take two host-only facts the scheduler
 knows and only V4.1 plans from: `extend_replay_lens_cpu` (how many leading
@@ -2041,18 +2041,18 @@ still join every history collective.
 A contiguous split of the chunk would hand whole requests to single ranks
 and serialize the group-by-group history gathers behind whichever rank owns
 the group's rows. A rank's rows are ascending span rows but not one range:
-the model's rows are `input_ids_buf[plan.local_row_ids]`,
-`positions_buf[plan.local_row_ids]` and the same rows of every per-row
+the model's rows are `input_ids_buf[inputs.local_row_ids]`,
+`positions_buf[inputs.local_row_ids]` and the same rows of every per-row
 input; per-request inputs keep the whole batch; a pipeline stage's boundary
 bundle carries shard rows. The collectives over the shard group concatenate
-the ranks' rows rank by rank (*gather order*, `plan.span_to_gather_cpu`), with
+the ranks' rows rank by rank (*gather order*, `inputs.span_to_gather_cpu`), with
 the per-rank counts `plan.row_counts` as the `CommManager` row tables: a leg
 that only moves or sums rows (the dense and MoE legs, the head exchanges,
 the embedding's id gather and row reduce-scatter) works in that order
 unchanged, and whoever reads gathered rows by their span position — the KV
 and index-K writes by slot, the n-gram hash, the sampled and prompt rows of
-the exit — puts them in span order first (`plan.to_span_order`, or the
-`RowSplit` of `plan.split_rows`), one `index_select` of bytes. `ctx.input_num_tokens` and
+the exit — puts them in span order first (`inputs.to_span_order`, or the
+`RowSplit` of `inputs.split_rows`), one `index_select` of bytes. `ctx.input_num_tokens` and
 `global_num_tokens` keep the scheduler's full-chunk meaning: only collective
 sizing (`CommManager`) reads them, a model reads its rows from its tensors or
 `ctx.query_shard`.
@@ -2060,16 +2060,32 @@ sizing (`CommManager`) reads them, a model reads its rows from its tensors or
 Plugin API 4 replaces the contiguous query-shard contract with per-request
 zigzag rows. Plugins must declare support for API 4 after migrating their
 row-layout and request-history consumers; API 3 adapters are incompatible.
-`QueryShardPlan.from_forward` requires an explicit `device` for its row
-indices (use `device="cpu"` for host-only plans).
+`QueryShardPlan.from_forward` computes only Python counts and takes no device.
+`ForwardContext.query_shard` contains that immutable, tensor-free layout; count
+consumers such as communication sizing and vocabulary embeddings read it directly.
+`InputBuffers.prepare_query_shard` stages `QueryShardInputs` once per forward:
+one packed int64 upload, pinned when the device supports it, with six device views. Fresh storage
+keeps an earlier forward's asynchronous readers valid while the next is prepared.
 The CPU permutation tables are `span_to_gather_cpu` and `gather_to_span_cpu`;
 their target-device copies are `span_to_gather` and `gather_to_span`.
+
+Tensor consumers use the existing input and attention channels. `HiddenStateDrafter`
+reads the staged `InputBuffers.query_shard` into the shared `HiddenDraftInput`
+for Eagle and MTP; their contexts carry only its `plan`. Extend metadata
+receives those same inputs, and QCP backends expose them through
+`require_query_shard_inputs()`. The router retains these forward-wide inputs
+independently of its cache-group leaves and clears them on decode; the executor
+also clears its staged inputs when a fully cached prefill has no rows.
+`LogitsMetadata.from_forward_context` reads this
+backend accessor, so model, logits-exit and drafter forward signatures do not
+carry another QCP argument. V4.1 retains both encoder and narrowed CED inputs in
+attention metadata, and puts only their counts in FFN contexts.
 
 Adapter migration: a query shard no longer exposes a contiguous range
 (`local_slice`, `local_start`, `local_end`). Use `local_row_ids` for device
 row selection and `local_row_ids_cpu` for host planning. Consumers of
 `RequestTokenHistoryView` must use the full request layout together with
-`ctx.query_shard`; `row_offset` cannot represent a zigzag shard. Upgrade
+the backend's `QueryShardInputs`; `row_offset` cannot represent a zigzag shard. Upgrade
 adapters that rely on those fields together with the runtime. A row gather
 returns rank-major rows, so position-dependent consumers must restore span
 order before reading them; span-order partials must be put in gather order
@@ -2101,7 +2117,7 @@ The contract a model (in tree or a plugin) implements:
   the span for its vocab shard, sums the shards, and reduce-scatters the rows
   back (the same bytes as the replicated all-reduce). A model passes the
   shard explicitly; the default (`None`) is the replicated lookup.
-* `PagedAttention.latent_prologue(..., key_rows=QueryShardGather(ctx.query_shard,
+* `PagedAttention.latent_prologue(..., key_rows=QueryShardGather(ctx.attn_backend.require_query_shard_inputs(),
   mapping.attn.qcp_group))` (through `DeepseekV3AttentionMLA.forward_absorb_qkv_proj`
   automatically): the prologue rotates the local rows without a cache
   (`mla_prologue(cache=None)`), all-gathers the rotated latent with the
@@ -2193,14 +2209,14 @@ The contract a model (in tree or a plugin) implements:
   local `w_vc`); GLM-5's sparse prefill runs it in tree. A rank whose shard
   is empty calls it like every other rank — the core's history gathers are
   collectives — and projects nothing.
-* The model exit hands the logits processor the shard's rows with the plan
+* The model exit hands the logits processor the shard's rows with staged inputs
   on `LogitsMetadata.query_shard` (`BaseCausalLM.exit_logits` is that one
   call; a model with its own exit does the same). The shard is a parameter
   of the processor's row selection: it scores the planned prompt rows
   first, then selects the sampled rows — `hidden_states[gather_ids]` on
   whole rows, `gather_sampled_rows` over the group on a shard (one
   byte-preserving all-gather, `token_all_gather_rows`, with
-  `sampled_rows_per_rank`, then `plan.sampled_to_request` back to request
+  `sampled_rows_per_rank`, then `inputs.sampled_to_request` back to request
   order) — and runs the LM
   head on the batch's `[bs, hidden]` rows, so the vocab all-gather is the
   TP one. The group of both gathers is the processor's TP group: the LM
@@ -2221,7 +2237,7 @@ The contract a model (in tree or a plugin) implements:
   multi-depth `Mtp` drafter read the shard's rows of the shifted prefill
   ids and positions, chain the shard's hidden rows, and carry the plan on
   their context; `Mtp` sums its cross-chunk stash of target hiddens over
-  the group, one owner per row). The plan derives `local_sampled_index`
+  the group, one owner per row). Input staging derives `local_sampled_index`
   from each request's last row; QCP consumers read it directly instead of
   passing full-layout gather ids into a shard-local selector. It is used by
   `gather_sampled_rows` and by any model that narrows to its live rows
@@ -2235,7 +2251,7 @@ The contract a model (in tree or a plugin) implements:
   its shard, as indices into it, with the per-rank counts (`rows_per_rank`)
   and the index that restores plan order after the gather
   (`gathered_to_rows`): host arithmetic over the shard's row tables
-  (`QueryShardPlan.split_rows` — the one row split of the plan, the same
+  (`QueryShardInputs.split_rows` — the one row split of the plan, the same
   that splits the sampled rows). Scoring a row needs its full-vocabulary
   logits, and
   the head is vocab-sharded over the group: every rank must hold every
@@ -2397,7 +2413,8 @@ Principle 5).
 * `grep -rn "ENABLE_CP\|CP_METADATA" python/` must stay empty — the
   module-global context-parallel switch and its process-wide metadata holder
   were deleted; a parallel layout is a `Mapping` fact from an explicit server
-  argument and per-forward row metadata rides `ForwardContext`.
+  argument and per-forward row counts ride `ForwardContext`; index tensors live in
+  `InputBuffers` and attention metadata.
 * Every `init_forward_metadata` signature carries `query_shard` with no
   default (`test_unified_decode_path.py` binds it on every runner-facing node
   and leaf; leaves also take `page_table_cpu`), and

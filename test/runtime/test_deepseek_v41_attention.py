@@ -460,7 +460,10 @@ def test_compressor_query_shards_preserve_pairs_and_tails(
     from test.runtime.test_deepseek_v41_cache import _backend, _extend, _tables
 
     from tokenspeed.runtime.distributed import comm_ops
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
     from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 
     torch.manual_seed(832)
@@ -502,11 +505,11 @@ def test_compressor_query_shards_preserve_pairs_and_tails(
         )
         if initial_tail is not None:
             backend.cache_pool.compressor_tail(owner).copy_(initial_tail)
-        plan = QueryShardPlan.from_forward(
-            total_tokens=sum(lengths),
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=sum(lengths), input_lengths=lengths, size=4, rank=rank
+            ),
             input_lengths=lengths,
-            size=4,
-            rank=rank,
             device="cpu",
         )
         calls = []
@@ -557,7 +560,10 @@ def test_attention_model_query_shards(monkeypatch, layer, lengths):
 
     from tokenspeed.runtime.distributed import comm_ops
     from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
     from tokenspeed.runtime.layers.attention.backends.specific import (
         deepseek_v41 as impl,
     )
@@ -628,12 +634,16 @@ def test_attention_model_query_shards(monkeypatch, layer, lengths):
         attention.load_state_dict(reference_attention.state_dict())
         backend = _backend("cuda", 2)
         backend.cache_pool.arena.buffer.copy_(before)
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cuda"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cuda",
         )
         local_meta = prepare(backend, plan)
         ctx = _ctx(backend, total, ForwardMode.EXTEND)
-        ctx.query_shard = plan
+        ctx.query_shard = plan.plan
         row_plan = v41._row_plan(layer, 20, ctx)
 
         def gather_projection(payload, group, counts, backend=None):

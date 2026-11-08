@@ -31,6 +31,7 @@ import torch
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.query_shard import (
+    QueryShardInputs,
     QueryShardPlan,
     scatter_count,
     zigzag_segment_lengths,
@@ -41,13 +42,13 @@ RUNTIME = (
 )
 
 
-def _plans(total: int, lengths: list[int], size: int) -> list[QueryShardPlan]:
+def _plans(total: int, lengths: list[int], size: int) -> list[QueryShardInputs]:
     return [
-        QueryShardPlan.from_forward(
-            total_tokens=total,
+        QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=size, rank=rank
+            ),
             input_lengths=lengths,
-            size=size,
-            rank=rank,
             device="cpu",
         )
         for rank in range(size)
@@ -275,7 +276,7 @@ def test_the_sampled_rows_take_the_same_split_as_any_rows():
 
 
 def test_rows_for_collective_names_the_shard_or_the_sampled_rows():
-    plan = _plans(12, [5, 7], 4)[1]
+    plan = _plans(12, [5, 7], 4)[1].plan
     assert plan.rows_for_collective(None) == plan.row_counts
     assert plan.rows_for_collective(12) == plan.row_counts
     assert plan.rows_for_collective(2) == plan.sampled_rows_per_rank
@@ -285,12 +286,20 @@ def test_rows_for_collective_names_the_shard_or_the_sampled_rows():
 
 def test_plan_rejects_inconsistent_inputs():
     with pytest.raises(ValueError, match="sum to"):
-        QueryShardPlan.from_forward(
-            total_tokens=5, input_lengths=[2, 2], size=2, rank=0, device="cpu"
+        QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=5, input_lengths=[2, 2], size=2, rank=0
+            ),
+            input_lengths=[2, 2],
+            device="cpu",
         )
     with pytest.raises(ValueError, match="outside"):
-        QueryShardPlan.from_forward(
-            total_tokens=2, input_lengths=[2], size=2, rank=2, device="cpu"
+        QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=2, input_lengths=[2], size=2, rank=2
+            ),
+            input_lengths=[2],
+            device="cpu",
         )
 
 
@@ -349,8 +358,12 @@ def test_the_model_exit_hands_the_processor_the_shard_and_its_plan():
     from tokenspeed.runtime.models.base import causal_lm
 
     lengths = [4, 1, 5]
-    plan = QueryShardPlan.from_forward(
-        total_tokens=10, input_lengths=lengths, size=4, rank=1, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=10, input_lengths=lengths, size=4, rank=1
+        ),
+        input_lengths=lengths,
+        device="cpu",
     )
     shard = torch.arange(plan.local_rows * 2, dtype=torch.float32).reshape(-1, 2)
     seen = {}
@@ -364,8 +377,15 @@ def test_the_model_exit_hands_the_processor_the_shard_and_its_plan():
     model.logits_processor = Processor()
     model.lm_head = object()
     rows = object()
+    from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
+        DSABackend,
+        DSAQueryShardMetadata,
+    )
+
+    backend = DSABackend.__new__(DSABackend)
+    backend.query_shard_metadata = DSAQueryShardMetadata(plan=plan, groups=())
     ctx = ForwardContext(
-        attn_backend=None,
+        attn_backend=backend,
         token_to_kv_pool=None,
         bs=3,
         num_extends=3,
@@ -373,7 +393,7 @@ def test_the_model_exit_hands_the_processor_the_shard_and_its_plan():
         forward_mode=ForwardMode.EXTEND,
         output_layout=None,
         gather_ids=torch.cumsum(torch.tensor(lengths), 0) - 1,
-        query_shard=plan,
+        query_shard=plan.plan,
         input_logprob_rows=rows,
     )
     out = model.exit_logits(None, shard, None, ctx)
@@ -405,8 +425,12 @@ def test_the_executor_hands_the_model_its_shard_of_the_row_inputs():
         has_request_token_history=True,
         request_token_history_view=lambda **kw: views.update(kw) or "view",
     )
-    plan = QueryShardPlan.from_forward(
-        total_tokens=10, input_lengths=[4, 1, 5], size=2, rank=1, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=10, input_lengths=[4, 1, 5], size=2, rank=1
+        ),
+        input_lengths=[4, 1, 5],
+        device="cpu",
     )
     kwargs = executor._model_input_kwargs(10, 3, plan.local_row_ids)
     assert torch.equal(kwargs["engram_hash_ids"], history[plan.local_row_ids])
@@ -446,8 +470,12 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     # The draft's final hidden rows on every rank: row r of the span is r.
     hidden = torch.arange(total, dtype=torch.float32).unsqueeze(1)
     plans = [
-        QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
+        QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cpu",
         )
         for rank in range(4)
     ]
@@ -458,8 +486,12 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     assert gathered.flatten().tolist() == [4, 3, 9]
     gathered_by_rank = {}
     for rank in range(4):
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cpu",
         )
         draft_input = SimpleNamespace(
             num_extends=3,
@@ -506,11 +538,14 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
     owned tail rows -- equals the replicated layout's."""
     from types import SimpleNamespace
 
+    from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.drafter import mtp
     from tokenspeed.runtime.execution.forward_batch_info import (
         CaptureHiddenMode,
         ForwardMode,
     )
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 
     lengths = [4, 1, 5]
     total, bs, steps, k, hidden = sum(lengths), 3, 3, 4, 2
@@ -541,6 +576,7 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
             input_lengths_buf=torch.tensor(lengths, dtype=torch.int32),
             positions_buf=torch.arange(1000, 1000 + total),
             req_pool_indices_buf=torch.tensor([2, 0, 1]),
+            query_shard=plan,
         )
         drafter._stash_tokens_buf = torch.zeros(bs, k - 1, dtype=torch.int32)
         drafter._stash_hidden_buf = old_tail.clone()[torch.tensor([1, 2, 0])]
@@ -554,23 +590,32 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
         )
         return drafter
 
-    def draft_input(plan):
+    def run_drafter(drafter, plan):
         shard = target_hidden[plan.local_row_ids] if plan is not None else target_hidden
-        return mtp.HiddenDraftInput(
+        # Enter through the shared runner: the context carries counts, while
+        # draft row selection must use the inputs staged on the input buffers.
+        ctx = ForwardContext(
+            attn_backend=None,
+            token_to_kv_pool=None,
+            bs=bs,
             input_num_tokens=total,
             num_extends=bs,
             forward_mode=ForwardMode.EXTEND,
-            base_model_output=sampled,
-            accept_lengths=torch.ones(bs, dtype=torch.int64),
-            base_out_hidden_states=shard,
-            query_shard=plan,
+            output_layout=ForwardOutputLayout(bs, bs, 0, 1),
+            query_shard=None if plan is None else plan.plan,
+        )
+        return drafter.run(
+            ctx,
+            LogitsProcessorOutput(next_token_logits=None, hidden_states=shard),
+            sampled,
+            torch.ones(bs, dtype=torch.int64),
         )
 
     # The replicated reference: whole-span ids per depth and the full stash.
     forwards = []
     reference = make_drafter(None)
     monkeypatch.setattr(mtp, "all_reduce", lambda t, g: pytest.fail("no shard"))
-    reference_next = reference.draft(draft_input(None))
+    reference_next = run_drafter(reference, None)
     reference_ids = [f["input_ids"].clone() for f in forwards]
     reference_stash = reference._stash_hidden_buf.clone()
     assert len(reference_ids) == steps
@@ -578,8 +623,12 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
 
     contributions = {}
     for rank in range(4):
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cpu",
         )
         forwards = []
         drafter = make_drafter(plan)
@@ -590,7 +639,7 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
             "all_reduce",
             lambda t, g, r=rank: contributions.setdefault(r, t.clone()),
         )
-        next_tokens = drafter.draft(draft_input(plan))
+        next_tokens = run_drafter(drafter, plan)
         assert torch.equal(next_tokens, reference_next)
         assert len(forwards) == steps
         for d, call in enumerate(forwards):
@@ -599,7 +648,7 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
                 call["positions"], torch.arange(1000, 1000 + total)[plan.local_row_ids]
             )
             ctx = call["ctx"]
-            assert ctx.query_shard is plan and ctx.gather_ids.tolist() == rows
+            assert ctx.query_shard is plan.plan and ctx.gather_ids.tolist() == rows
             assert ctx.capture_hidden_mode is CaptureHiddenMode.FULL
             assert call["captured_hidden_states"].shape[0] == plan.local_rows
             torch.testing.assert_close(

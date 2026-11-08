@@ -68,7 +68,10 @@ from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
 from tokenspeed.runtime.execution.prefill_graph import (  # noqa: E402
     get_prefill_token_buckets,
 )
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan  # noqa: E402
+from tokenspeed.runtime.execution.query_shard import (  # noqa: E402
+    QueryShardInputs,
+    QueryShardPlan,
+)
 from tokenspeed.runtime.execution.workspace import (  # noqa: E402
     reset_workspace_pools,
     workspace_pool,
@@ -256,6 +259,7 @@ class _InputBuffersDouble:
         self.max_bs = max_bs
         self.max_num_tokens = max_num_tokens
         self._on_fill_dummy = on_fill_dummy
+        self.query_shard: QueryShardInputs | None = None
 
     def fill_dummy_decode_buffers(self, *, batch_size, total_tokens):
         self._on_fill_dummy(batch_size=batch_size, total_tokens=total_tokens)
@@ -476,8 +480,12 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     """The dummy extend carries the engine's shard plan (make_dummy_batch),
     and the target forward sees this rank's rows of the span -- ids,
     positions and the per-row model inputs -- as a real sharded extend does."""
-    plan = QueryShardPlan.from_forward(
-        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2
+        ),
+        input_lengths=[4, 4, 4, 4],
+        device="cpu",
     )
     # Every request is four rows, one per zigzag segment of the first four:
     # rank 2 computes the third row of each.
@@ -507,13 +515,14 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
             on_fill_dummy=lambda **kwargs: None,
         ),
         prefill_graph=_PrefillGraphDouble(
-            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=plan)
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=plan.plan)
         ),
         forward_step=_ForwardStepDouble(),
         drafter=None,
         model_input_kwargs=lambda n, bs, rows: {"rows": rows, "span": n},
         events=events,
     )
+    executor.input_buffers.query_shard = plan
     monkeypatch.setattr(executor_module, "pg_manager", pg_manager)
     # The group is a stand-in, so the tuning collectives it would drive are
     # recorded rather than run; the tuning window itself stays real.

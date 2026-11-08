@@ -40,7 +40,7 @@ from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.layers.attention.backends.base import (
     DecodeKVView,
     reject_query_shard,
@@ -254,7 +254,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
         page_table_cpu: torch.Tensor | None,
         **kwargs,
     ) -> None:

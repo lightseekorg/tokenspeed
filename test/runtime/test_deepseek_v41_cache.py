@@ -3499,7 +3499,10 @@ def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
 def test_prefill_query_shards_preserve_ced_rows(
     size, lengths, prefixes, replays, prompts
 ):
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     backend = _backend("cpu", 2)
     total = sum(lengths)
@@ -3514,11 +3517,11 @@ def test_prefill_query_shards_preserve_ced_rows(
     actual_samples = []
     counts = None
     for rank in range(size):
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total,
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=size, rank=rank
+            ),
             input_lengths=lengths,
-            size=size,
-            rank=rank,
             device="cpu",
         )
         meta = _extend(
@@ -3552,7 +3555,7 @@ def test_prefill_query_shards_preserve_ced_rows(
         torch.testing.assert_close(local.sampled_rows, sample_indices)
         local_sample_ids = local.decoder_plan.local_sampled_index
         actual_samples.append(rows[local_sample_ids])
-        assert local.decoder_plan.rows_for_collective(None) == (
+        assert local.decoder_plan.plan.rows_for_collective(None) == (
             local.decoder_plan.row_counts
         )
         if counts is not None:
@@ -3575,11 +3578,18 @@ def test_prefill_query_shards_preserve_ced_rows(
 
 
 def test_prefill_query_shard_is_planned_per_forward():
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     backend = _backend("cpu", 2)
-    plan = QueryShardPlan.from_forward(
-        total_tokens=257, input_lengths=[257], size=4, rank=3, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=257, input_lengths=[257], size=4, rank=3
+        ),
+        input_lengths=[257],
+        device="cpu",
     )
     _extend(backend, _tables("cpu"), [257], [0], [0], [257], query_shard=plan)
     local = backend.prefill_query_shard()
@@ -3594,7 +3604,10 @@ def test_prefill_query_shard_is_planned_per_forward():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_prefill_query_shard_planning_does_not_sync_the_host():
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     # Metadata preparation runs on the forward thread; a pageable upload of
     # the row maps would wait for the round in flight.
@@ -3606,8 +3619,12 @@ def test_prefill_query_shard_planning_does_not_sync_the_host():
     device_zeros = zeros.cuda()
     pool_indices = torch.arange(2, device="cuda")
     tables_cpu = {gid: table.cpu() for gid, table in tables.items()}
-    plan = QueryShardPlan.from_forward(
-        total_tokens=260, input_lengths=[257, 3], size=4, rank=3, device="cuda"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=260, input_lengths=[257, 3], size=4, rank=3
+        ),
+        input_lengths=[257, 3],
+        device="cuda",
     )
     torch.cuda.synchronize()
     previous = torch.cuda.get_sync_debug_mode()
@@ -3645,7 +3662,10 @@ def test_prefill_query_shard_planning_does_not_sync_the_host():
 @pytest.mark.parametrize("case", ["prefix", "replay", "empty_rank", "ced"])
 @pytest.mark.parametrize("fused_rope", [False, True])
 def test_gpu_sharded_swa_preserves_output_and_cache(monkeypatch, case, fused_rope):
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
     from tokenspeed.runtime.layers.attention.backends.specific import (
         deepseek_v41 as impl,
     )
@@ -3713,11 +3733,11 @@ def test_gpu_sharded_swa_preserves_output_and_cache(monkeypatch, case, fused_rop
         backend = _backend("cuda", 2)
         backend.cache_pool.arena.buffer.copy_(before)
         local_meta = prepare(backend)
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total,
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=query_lengths, size=4, rank=rank
+            ),
             input_lengths=query_lengths,
-            size=4,
-            rank=rank,
             device="cuda",
         )
         calls = []
@@ -3766,7 +3786,10 @@ def test_gpu_sharded_swa_preserves_output_and_cache(monkeypatch, case, fused_rop
 def test_gpu_model_qcp_preserves_global_selections(
     monkeypatch, ced, lengths, prefixes, complete
 ):
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
     from tokenspeed.runtime.layers.attention.backends.specific import (
         deepseek_v41 as impl,
     )
@@ -3880,8 +3903,12 @@ def test_gpu_model_qcp_preserves_global_selections(
     for rank in range(4):
         backend = _backend("cuda", 2)
         backend.cache_pool.arena.buffer.copy_(before)
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cuda"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cuda",
         )
         local_meta = _extend(
             backend, tables, lengths, prefixes, [0, 0], prompts, query_shard=plan
@@ -3939,15 +3966,18 @@ def test_gpu_model_qcp_preserves_global_selections(
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_model_qcp_metadata_keeps_full_cache_coordinates(rank):
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     backend = _backend("cpu", 2)
     lengths = [257, 3]
-    plan = QueryShardPlan.from_forward(
-        total_tokens=sum(lengths),
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=sum(lengths), input_lengths=lengths, size=4, rank=rank
+        ),
         input_lengths=lengths,
-        size=4,
-        rank=rank,
         device="cpu",
     )
     meta = _extend(

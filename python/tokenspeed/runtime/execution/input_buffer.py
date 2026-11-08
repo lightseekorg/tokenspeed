@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,7 @@ from tokenspeed_kernel.ops.metadata.ngram import NGramHashParams, prepare_ngram_
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs, QueryShardPlan
 from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -59,6 +61,7 @@ class InputBuffers:
         reads_state_checkpoints: bool = False,
     ):
         self.device = device
+        self.query_shard: QueryShardInputs | None = None
         # Whether the scheduler may give extend rows in-forward State
         # checkpoints (--enable-state-checkpoint-in-forward), so the batch
         # carries extend_state_checkpoint_lens (a scheduler build without the
@@ -132,6 +135,27 @@ class InputBuffers:
         # State checkpoint, 0 for none.
         self.extend_state_checkpoint_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
+
+    def prepare_query_shard(
+        self, *, plan: QueryShardPlan | None, input_lengths: Sequence[int]
+    ) -> QueryShardInputs | None:
+        """Stage this forward's query indices, or clear them for unsharded rows.
+
+        Args:
+            plan: This forward's host layout, or None for replicated rows.
+            input_lengths: New-token counts in request order.
+
+        Returns:
+            The staged inputs shared with attention metadata and draft inputs.
+        """
+        self.query_shard = (
+            None
+            if plan is None
+            else QueryShardInputs.from_plan(
+                plan=plan, input_lengths=input_lengths, device=self.device
+            )
+        )
+        return self.query_shard
 
     def prepare_request_token_history_inputs(
         self,

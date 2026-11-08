@@ -56,7 +56,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.model_loader.weight_utils import (
     K_CACHE_SCALE_SUFFIXES,
@@ -78,11 +78,11 @@ class QueryShardGather:
     stays independent of the query shard.
 
     Attributes:
-        plan: The forward's shard plan (``ctx.query_shard``).
+        plan: The forward's staged query shard inputs from attention metadata.
         group: The query-context-parallel group (``mapping.attn.qcp_group``).
     """
 
-    plan: QueryShardPlan
+    plan: QueryShardInputs
     group: tuple[int, ...]
 
     def __post_init__(self) -> None:

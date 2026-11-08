@@ -45,7 +45,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -212,7 +212,7 @@ class DSAQueryShardMetadata:
             and attends only the groups it has query rows in.
     """
 
-    plan: QueryShardPlan
+    plan: QueryShardInputs
     groups: tuple[QueryShardHistoryGroup, ...]
 
 
@@ -1024,7 +1024,7 @@ class DSABackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
         page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
@@ -1162,7 +1162,7 @@ class DSABackend(PagedAttentionBackend):
 
     def _plan_query_shard(
         self,
-        plan: QueryShardPlan,
+        plan: QueryShardInputs,
         *,
         num_extends: int,
         page_table: torch.Tensor,
@@ -1239,6 +1239,9 @@ class DSABackend(PagedAttentionBackend):
             row_base += rows
             first = last + 1
         return DSAQueryShardMetadata(plan=plan, groups=tuple(groups))
+
+    def require_query_shard_inputs(self) -> QueryShardInputs:
+        return self.require_query_shard_metadata().plan
 
     def require_query_shard_metadata(self) -> DSAQueryShardMetadata:
         """The sharded extend arm's plan for the current forward."""

@@ -62,7 +62,7 @@ from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import QueryShardInputs
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
         TreeDraftInputs,
         TreeVerifyInputs,
@@ -445,6 +445,10 @@ class AttentionBackend(CachePoolBinding, ABC):
             f"{type(self).__name__} must implement init_cuda_graph_state"
         )
 
+    def require_query_shard_inputs(self) -> QueryShardInputs:
+        """Return the prepared query indices for this forward, or reject it."""
+        raise RuntimeError("this backend has no prepared query shard inputs")
+
     def init_forward_metadata(
         self,
         bs: int,
@@ -461,7 +465,7 @@ class AttentionBackend(CachePoolBinding, ABC):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
         **kwargs,
     ) -> None:
         """Build metadata for an extend / mixed (or idle warmup) forward.
@@ -852,7 +856,7 @@ class AttentionBackend(CachePoolBinding, ABC):
         raise NotImplementedError()
 
 
-def reject_query_shard(query_shard: QueryShardPlan | None, node: str) -> None:
+def reject_query_shard(query_shard: QueryShardInputs | None, node: str) -> None:
     """Fail loud when a forward shards its query rows over a node that attends
     every row.
 

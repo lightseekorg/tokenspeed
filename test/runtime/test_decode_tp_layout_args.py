@@ -348,10 +348,17 @@ class TestModuleRefusals:
         assert sharded.attn_mqa.tp_q_head_num == 8
         # The exchange follows the forward: a sharded extend exchanges, a
         # replicated decode step (no shard) does not.
-        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+        from tokenspeed.runtime.execution.query_shard import (
+            QueryShardInputs,
+            QueryShardPlan,
+        )
 
-        plan = QueryShardPlan.from_forward(
-            total_tokens=6, input_lengths=[4, 2], size=4, rank=1, device="cpu"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=6, input_lengths=[4, 2], size=4, rank=1
+            ),
+            input_lengths=[4, 2],
+            device="cpu",
         )
         extend = SimpleNamespace(query_shard=plan)
         decode = SimpleNamespace(query_shard=None)
@@ -375,7 +382,10 @@ class TestModuleRefusals:
         shard is empty calls it like every other rank, through both value
         hooks; only an idle attention-DP rank (no rows, no shard) skips the
         core. Nothing is projected for zero rows either way."""
-        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+        from tokenspeed.runtime.execution.query_shard import (
+            QueryShardInputs,
+            QueryShardPlan,
+        )
 
         attn = self._attention(
             Mapping(rank=3, world_size=4, attn_tp_size=4, attn_qcp_size=4)
@@ -396,8 +406,12 @@ class TestModuleRefusals:
         del attn.attn_mqa
         attn.attn_mqa = Core()
         # Rank 3 holds no rows of the 3-row span.
-        plan = QueryShardPlan.from_forward(
-            total_tokens=3, input_lengths=[3], size=4, rank=3, device="cpu"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=3, input_lengths=[3], size=4, rank=3
+            ),
+            input_lengths=[3],
+            device="cpu",
         )
         assert plan.local_rows == 0
         ctx = SimpleNamespace(
@@ -443,7 +457,10 @@ class TestModuleRefusals:
         a whole-span extend because the head-sharded kv_b_proj cannot expand
         every head's K/V."""
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+        from tokenspeed.runtime.execution.query_shard import (
+            QueryShardInputs,
+            QueryShardPlan,
+        )
 
         def ctx(**overrides):
             fields = dict(
@@ -486,8 +503,12 @@ class TestModuleRefusals:
                 attn_head_tp_size=4,
             )
         )
-        plan = QueryShardPlan.from_forward(
-            total_tokens=3, input_lengths=[3], size=4, rank=0, device="cpu"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=3, input_lengths=[3], size=4, rank=0
+            ),
+            input_lengths=[3],
+            device="cpu",
         )
         with pytest.raises(RuntimeError, match="cannot take a query shard"):
             sharded(positions, hidden, ctx(query_shard=plan), comm_manager=None)

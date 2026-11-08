@@ -41,10 +41,10 @@ or sums rows works in that order unchanged; whoever reads gathered rows by
 their batch-global position (a KV write by slot, the n-gram hash, the sampled
 rows of the model exit) puts them back into span order first
 (``to_span_order``), and whoever reduce-scatters span-order rows puts them
-into gather order (``to_gather_order``). The plan is built once per forward
-from the request lengths: host integers plus one staged copy of the
-row-index tensors on the device. It rides ``ForwardContext.query_shard`` and
-the attention backend's extend metadata.
+into gather order (``to_gather_order``). The tensor-free plan rides
+``ForwardContext.query_shard``. InputBuffers
+stages the permutations once per forward as ``QueryShardInputs``, shared by
+the attention backend's extend metadata and draft inputs.
 """
 
 from __future__ import annotations
@@ -85,11 +85,10 @@ def zigzag_segment_lengths(length: int, size: int) -> list[int]:
 
     The first segments are one row longer when ``length`` does not divide
     evenly; segment ``j`` belongs to rank ``j`` for ``j < size`` and to rank
-    ``2 * size - 1 - j`` otherwise. Uses the same CPU segment calculation
+    ``2 * size - 1 - j`` otherwise. Uses the same host segment calculation
     as ``QueryShardPlan.from_forward``, for a single request.
     """
-    lengths = torch.tensor([length], dtype=torch.int64)
-    return _segment_lengths(lengths, 2 * size)[0].tolist()
+    return scatter_count(length, 2 * size)
 
 
 @dataclass(frozen=True)
@@ -115,53 +114,19 @@ def _exclusive_cumsum(values: torch.Tensor) -> torch.Tensor:
     return torch.cumsum(values, dim=0) - values
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class QueryShardPlan:
-    """Which rows of one extend forward this rank computes.
+    """Tensor-free layout of one forward's per-request query shards.
 
-    Attributes:
-        size: Ranks of the query-context-parallel group.
-        rank: This rank's position in that group.
-        row_counts: Rows every rank owns.
-        span_to_gather_cpu: ``[total_rows]`` host int64: the span rows in gather
-            order, every rank's rows (ascending) concatenated rank by rank.
-        gather_to_span_cpu: ``[total_rows]`` host int64: the inverse of
-            ``span_to_gather_cpu``, retained for ``split_rows`` to reuse without
-            rebuilding it or reading the device copy back.
-        local_rows_per_request: This rank's rows of every request.
-        sampled_rows_per_rank: How many of the forward's sampled rows (the
-            last row of every request, ``cumsum(input_lengths) - 1``) every
-            rank holds.
-        local_row_ids: ``[local_rows]`` int64 on the forward's device: this
-            rank's span rows, ascending. Index any per-row span buffer with
-            it to get the shard's rows.
-        gather_to_span: ``[total_rows]`` int64 on the device: puts rows in
-            gather order back in span order (``to_span_order``).
-        span_to_gather: ``[total_rows]`` int64 on the device:
-            ``span_to_gather_cpu`` (``to_gather_order``).
-        local_index_of_row: ``[total_rows]`` int64 on the device: a span
-            row's index among this rank's rows, ``-1`` on another rank.
-        local_sampled_index: ``[local_sampled_rows]`` int64 on the device:
-            this rank's sampled rows as indices into its shard rows, derived
-            from the last row of each request. QCP consumers select these
-            directly instead of indexing the shard with full-layout gather ids.
-        sampled_to_request: ``[sampled_rows_total]`` int64 on the device: puts
-            the gathered sampled rows (gather order) in request order.
+    Counts describe the full span and sampled rows in collective rank order;
+    ``local_rows_per_request`` describes this rank in request order.
     """
 
     size: int
     rank: int
     row_counts: tuple[int, ...]
-    span_to_gather_cpu: torch.Tensor
-    gather_to_span_cpu: torch.Tensor
     local_rows_per_request: tuple[int, ...]
-    sampled_rows_per_rank: tuple[int, ...]
-    local_row_ids: torch.Tensor
-    gather_to_span: torch.Tensor
-    span_to_gather: torch.Tensor
-    local_index_of_row: torch.Tensor
-    local_sampled_index: torch.Tensor
-    sampled_to_request: torch.Tensor
+    sampled_rows_per_rank: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.size < 1 or not 0 <= self.rank < self.size:
@@ -170,15 +135,18 @@ class QueryShardPlan:
             )
         if len(self.row_counts) != self.size:
             raise ValueError("query shard row_counts must name every rank")
-        if len(self.sampled_rows_per_rank) != self.size:
+        if self.sampled_rows_per_rank and len(self.sampled_rows_per_rank) != self.size:
             raise ValueError("query shard sampled_rows_per_rank must name every rank")
-        if any(count < 0 for count in self.row_counts) or any(
-            count < 0 for count in self.sampled_rows_per_rank
+        if any(
+            count < 0
+            for count in (
+                *self.row_counts,
+                *self.local_rows_per_request,
+                *self.sampled_rows_per_rank,
+            )
         ):
             raise ValueError("query shard row counts are non-negative")
-        if self.span_to_gather_cpu.shape != (sum(self.row_counts),):
-            raise ValueError("query shard span_to_gather_cpu must name every span row")
-        if sum(self.local_rows_per_request) != self.row_counts[self.rank]:
+        if sum(self.local_rows_per_request) != self.local_rows:
             raise ValueError(
                 "query shard local_rows_per_request must sum to this rank's rows"
             )
@@ -191,21 +159,181 @@ class QueryShardPlan:
         input_lengths: Sequence[int],
         size: int,
         rank: int,
-        device: torch.device | str,
     ) -> QueryShardPlan:
-        """Plan the shard of a forward from its per-request input lengths.
+        """Compute host counts from positive request lengths, without tensors.
 
         Args:
-            total_tokens: Rows of the packed extend span, ``sum(input_lengths)``.
-            input_lengths: New-token count of every request, request order.
-            size: Ranks of the query-context-parallel group.
+            total_tokens: Rows in the packed extend span.
+            input_lengths: New-token counts in request order; empty for idle.
+            size: Number of query-context-parallel ranks.
             rank: This rank's position in the group.
-            device: Explicit target for row-index tensors (the forward's device);
-                they are staged with one non-blocking copy.
 
         Returns:
-            The plan every rank of the group derives identically.
+            The immutable layout; device indices are staged by InputBuffers.
         """
+        if size < 1 or not 0 <= rank < size:
+            raise ValueError(f"query shard rank {rank} is outside a group of {size}")
+        lengths = tuple(int(length) for length in input_lengths)
+        if any(length <= 0 for length in lengths):
+            raise ValueError("query shard input lengths must be positive")
+        if sum(lengths) != total_tokens:
+            raise ValueError(
+                f"query shard: input lengths sum to {sum(lengths)}, not {total_tokens} rows"
+            )
+        counts = [0] * size
+        sampled = [0] * size
+        local_counts = []
+        for length in lengths:
+            segments = zigzag_segment_lengths(length, size)
+            for owner in range(size):
+                count = segments[owner] + segments[2 * size - 1 - owner]
+                counts[owner] += count
+                if owner == rank:
+                    local_counts.append(count)
+            last_segment = min(length, 2 * size) - 1
+            sampled[min(last_segment, 2 * size - 1 - last_segment)] += 1
+        return cls(size, rank, tuple(counts), tuple(local_counts), tuple(sampled))
+
+    @property
+    def total_rows(self) -> int:
+        return sum(self.row_counts)
+
+    @property
+    def local_rows(self) -> int:
+        return self.row_counts[self.rank]
+
+    @property
+    def sampled_rows_total(self) -> int:
+        return sum(self.sampled_rows_per_rank)
+
+    @property
+    def local_sampled_rows(self) -> int:
+        return (
+            self.sampled_rows_per_rank[self.rank] if self.sampled_rows_per_rank else 0
+        )
+
+    @property
+    def max_rows(self) -> int:
+        return max(self.row_counts)
+
+    @property
+    def all_equal(self) -> bool:
+        return len(set(self.row_counts)) == 1
+
+    def rows_for_collective(self, num_tokens: int | None) -> tuple[int, ...]:
+        """Per-rank row counts of the rows a collective moves.
+
+        A model that reports a collective sizing (``report_collective_sizing``)
+        has narrowed its rows to the sampled rows (a draft's first step keeps
+        one live row per request); otherwise the rows are the shard.
+
+        Args:
+            num_tokens: ``ctx.collective_num_tokens``: ``None`` for the shard
+                rows, the batch-global sampled-row count after a narrowing.
+
+        Returns:
+            The per-rank table the collectives split by.
+
+        Raises:
+            ValueError: ``num_tokens`` names neither the shard nor the
+                sampled rows.
+        """
+        if num_tokens is None or num_tokens == self.total_rows:
+            return self.row_counts
+        if num_tokens == self.sampled_rows_total:
+            return self.sampled_rows_per_rank
+        raise ValueError(
+            f"query shard: a collective over {num_tokens} rows matches neither "
+            f"the {self.total_rows} shard rows nor the {self.sampled_rows_total} "
+            "sampled rows"
+        )
+
+
+@dataclass(frozen=True, eq=False)
+class QueryShardInputs:
+    """Per-forward permutation buffers, owned by inputs and attention metadata.
+
+    ``span_to_gather_cpu`` lists span rows in collective rank order;
+    ``gather_to_span_cpu`` is its inverse. Their device copies reorder payloads.
+    ``local_row_ids`` selects this rank's rows, while ``local_index_of_row``
+    maps span rows to local rows (-1 for a peer's row). ``local_sampled_index``
+    selects local sampled rows and ``sampled_to_request`` restores request order.
+    All six device indices share one staged allocation.
+    """
+
+    plan: QueryShardPlan
+    span_to_gather_cpu: torch.Tensor
+    gather_to_span_cpu: torch.Tensor
+    local_row_ids: torch.Tensor
+    gather_to_span: torch.Tensor
+    span_to_gather: torch.Tensor
+    local_index_of_row: torch.Tensor
+    local_sampled_index: torch.Tensor
+    sampled_to_request: torch.Tensor
+
+    @property
+    def size(self) -> int:
+        return self.plan.size
+
+    @property
+    def rank(self) -> int:
+        return self.plan.rank
+
+    @property
+    def row_counts(self) -> tuple[int, ...]:
+        return self.plan.row_counts
+
+    @property
+    def local_rows_per_request(self) -> tuple[int, ...]:
+        return self.plan.local_rows_per_request
+
+    @property
+    def sampled_rows_per_rank(self) -> tuple[int, ...]:
+        return self.plan.sampled_rows_per_rank
+
+    @property
+    def total_rows(self) -> int:
+        return self.plan.total_rows
+
+    @property
+    def local_rows(self) -> int:
+        return self.plan.local_rows
+
+    @property
+    def max_rows(self) -> int:
+        return self.plan.max_rows
+
+    @property
+    def all_equal(self) -> bool:
+        return self.plan.all_equal
+
+    @property
+    def local_sampled_rows(self) -> int:
+        return self.plan.local_sampled_rows
+
+    @property
+    def sampled_rows_total(self) -> int:
+        return self.plan.sampled_rows_total
+
+    @classmethod
+    def from_plan(
+        cls,
+        *,
+        plan: QueryShardPlan,
+        input_lengths: Sequence[int],
+        device: torch.device | str,
+    ) -> QueryShardInputs:
+        """Stage a layout's indices in one packed, nonblocking device copy.
+
+        Args:
+            plan: Tensor-free layout for these request lengths.
+            input_lengths: New-token counts in request order.
+            device: Target device for all row-selection indices.
+
+        Returns:
+            Host permutations and device views of the packed indices.
+        """
+        size, rank, total_tokens = plan.size, plan.rank, plan.total_rows
         lengths = torch.tensor(
             [int(length) for length in input_lengths], dtype=torch.int64
         )
@@ -228,6 +356,12 @@ class QueryShardPlan:
         own = torch.stack((ranks, segments - 1 - ranks), dim=1)  # [N, 2]
         per_rank_lens = seg_lens[:, own]  # [bs, N, 2]
         row_counts = per_rank_lens.sum(dim=(0, 2))
+        if (
+            tuple(row_counts.tolist()) != plan.row_counts
+            or tuple(per_rank_lens[:, rank].sum(dim=1).tolist())
+            != plan.local_rows_per_request
+        ):
+            raise ValueError("query shard plan does not match input lengths")
         order = (
             torch.arange(bs).view(1, bs, 1) * segments + own.view(size, 1, 2)
         ).reshape(-1)
@@ -239,6 +373,7 @@ class QueryShardPlan:
             output_size=total_tokens,
         ) + torch.arange(total_tokens, dtype=torch.int64)
         return cls._from_layout(
+            plan=plan,
             size=size,
             rank=rank,
             row_counts=row_counts,
@@ -252,6 +387,7 @@ class QueryShardPlan:
     def _from_layout(
         cls,
         *,
+        plan: QueryShardPlan | None,
         size: int,
         rank: int,
         row_counts: torch.Tensor,
@@ -259,7 +395,7 @@ class QueryShardPlan:
         lengths: torch.Tensor,
         sampled_rows: torch.Tensor,
         device: torch.device | str,
-    ) -> QueryShardPlan:
+    ) -> QueryShardInputs:
         total_tokens = rank_major_rows.numel()
         gather_to_span = _inverse(rank_major_rows)
         first = int(row_counts[:rank].sum())
@@ -267,14 +403,26 @@ class QueryShardPlan:
         local_row_ids = rank_major_rows[first : first + local_rows]
         local_index_of_row = torch.full((total_tokens,), -1, dtype=torch.int64)
         local_index_of_row[local_row_ids] = torch.arange(local_rows, dtype=torch.int64)
-        local_ends = torch.searchsorted(local_row_ids, torch.cumsum(lengths, dim=0))
-        local_counts = torch.diff(local_ends, prepend=torch.zeros(1, dtype=torch.int64))
         sampled = _split(
             sampled_rows,
             gather_to_span=gather_to_span,
             row_counts=row_counts,
             rank=rank,
         )
+        if plan is None:
+            local_ends = torch.searchsorted(local_row_ids, torch.cumsum(lengths, dim=0))
+            local_counts = torch.diff(
+                local_ends, prepend=torch.zeros(1, dtype=torch.int64)
+            )
+            plan = QueryShardPlan(
+                size=size,
+                rank=rank,
+                row_counts=tuple(row_counts.tolist()),
+                local_rows_per_request=tuple(local_counts.tolist()),
+                sampled_rows_per_rank=sampled.rows_per_rank,
+            )
+        elif sampled.rows_per_rank != plan.sampled_rows_per_rank:
+            raise ValueError("query shard plan does not match input lengths")
         host = (
             local_row_ids,
             gather_to_span,
@@ -290,13 +438,9 @@ class QueryShardPlan:
         staged = staged.to(device, non_blocking=True)
         views = torch.split(staged, [t.shape[0] for t in host])
         return cls(
-            size=size,
-            rank=rank,
-            row_counts=tuple(int(count) for count in row_counts),
+            plan=plan,
             span_to_gather_cpu=rank_major_rows,
             gather_to_span_cpu=gather_to_span,
-            local_rows_per_request=tuple(int(count) for count in local_counts),
-            sampled_rows_per_rank=sampled.rows_per_rank,
             local_row_ids=views[0],
             gather_to_span=views[1],
             span_to_gather=views[2],
@@ -311,7 +455,7 @@ class QueryShardPlan:
         *,
         input_lengths: Sequence[int],
         sampled_rows: torch.Tensor,
-    ) -> QueryShardPlan:
+    ) -> QueryShardInputs:
         """Retain span rows without moving them between ranks.
 
         Args:
@@ -329,6 +473,7 @@ class QueryShardPlan:
         if bool((lengths < 0).any()) or int(lengths.sum()) != rows.numel():
             raise ValueError("retained request lengths must cover the retained rows")
         return self._from_layout(
+            plan=None,
             size=self.size,
             rank=self.rank,
             row_counts=torch.tensor(split.rows_per_rank, dtype=torch.int64),
@@ -346,26 +491,10 @@ class QueryShardPlan:
         return int(bounds[0]), int(bounds[1])
 
     @property
-    def total_rows(self) -> int:
-        return sum(self.row_counts)
-
-    @property
-    def local_rows(self) -> int:
-        return self.row_counts[self.rank]
-
-    @property
     def local_row_ids_cpu(self) -> torch.Tensor:
         """This rank's span rows, ascending, on the host."""
         first = sum(self.row_counts[: self.rank])
         return self.span_to_gather_cpu[first : first + self.local_rows]
-
-    @property
-    def sampled_rows_total(self) -> int:
-        return sum(self.sampled_rows_per_rank)
-
-    @property
-    def local_sampled_rows(self) -> int:
-        return self.sampled_rows_per_rank[self.rank]
 
     def split_rows(self, rows: torch.Tensor) -> RowSplit:
         """Where each of ``rows`` lives: the split a collective over them needs.
@@ -410,34 +539,6 @@ class QueryShardPlan:
             )
         return span.index_select(0, self.span_to_gather)
 
-    def rows_for_collective(self, num_tokens: int | None) -> tuple[int, ...]:
-        """Per-rank row counts of the rows a collective moves.
-
-        A model that reports a collective sizing (``report_collective_sizing``)
-        has narrowed its rows to the sampled rows (a draft's first step keeps
-        one live row per request); otherwise the rows are the shard.
-
-        Args:
-            num_tokens: ``ctx.collective_num_tokens``: ``None`` for the shard
-                rows, the batch-global sampled-row count after a narrowing.
-
-        Returns:
-            The per-rank table the collectives split by.
-
-        Raises:
-            ValueError: ``num_tokens`` names neither the shard nor the
-                sampled rows.
-        """
-        if num_tokens is None or num_tokens == self.total_rows:
-            return self.row_counts
-        if num_tokens == self.sampled_rows_total:
-            return self.sampled_rows_per_rank
-        raise ValueError(
-            f"query shard: a collective over {num_tokens} rows matches neither "
-            f"the {self.total_rows} shard rows nor the {self.sampled_rows_total} "
-            "sampled rows"
-        )
-
 
 def _inverse(permutation: torch.Tensor) -> torch.Tensor:
     inverse = torch.empty_like(permutation)
@@ -452,7 +553,7 @@ def _split(
     row_counts: torch.Tensor,
     rank: int,
 ) -> RowSplit:
-    """``QueryShardPlan.split_rows`` over the plan's host tables."""
+    """``QueryShardInputs.split_rows`` over the plan's host tables."""
     if rows.dim() != 1 or rows.device.type != "cpu":
         raise ValueError("query shard: rows must be a 1-D host tensor")
     total = gather_to_span.shape[0]
@@ -482,6 +583,7 @@ def _split(
 
 __all__ = [
     "QueryShardPlan",
+    "QueryShardInputs",
     "RowSplit",
     "scatter_count",
     "zigzag_segment_lengths",

@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import QueryShardInputs
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -457,7 +457,7 @@ class HiddenDraftInput:
     # The target's DSA top-k selection, for a draft head that shares it.
     dsa_topk: DsaTopKState = (None, None)
     # The target forward's query shard, which the draft's extend rows follow.
-    query_shard: QueryShardPlan | None = None
+    query_shard: QueryShardInputs | None = None
 
 
 class HiddenStateDrafter(BaseDrafter):
@@ -525,6 +525,6 @@ class HiddenStateDrafter(BaseDrafter):
             global_bs=base_ctx.global_bs,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
             dsa_topk=self._target_dsa_topk(base_ctx),
-            query_shard=base_ctx.query_shard,
+            query_shard=self.input_buffers.query_shard,
         )
         return self.draft(draft_input)

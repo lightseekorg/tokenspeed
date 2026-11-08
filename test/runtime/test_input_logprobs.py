@@ -62,7 +62,8 @@ def _staging_executor(monkeypatch, *, shifted_ids: list[int], vocab_size: int = 
     executor.runtime_states = SimpleNamespace(vocab_size=vocab_size)
     executor.config = SimpleNamespace(input_logprob_chunk_tokens=3)
     executor.input_buffers = SimpleNamespace(
-        shifted_prefill_ids_buf=torch.tensor(shifted_ids, dtype=torch.int32)
+        query_shard=None,
+        shifted_prefill_ids_buf=torch.tensor(shifted_ids, dtype=torch.int32),
     )
     executor.nan_guard = NanGuard(max_bs=4, device="cpu")
     executor.nan_guard.reset(4)
@@ -77,10 +78,10 @@ def test_executor_expands_the_plan_into_rows_targets_and_slots(monkeypatch):
     # Two extend slots: rows 0..2 (slot 0) and 3..5 (slot 1) of a 6-row forward.
     shifted = [11, 12, 13, 21, 22, 23]
     executor = _staging_executor(monkeypatch, shifted_ids=shifted)
-    assert executor._input_logprob_rows(None, 2, 6, None) is None
+    assert executor._input_logprob_rows(None, 2, 6) is None
 
     plan = InputLogprobPlan(row_starts=(0, 4), counts=(3, 2), position_starts=(5, 0))
-    staged = executor._input_logprob_rows(plan, 2, 6, None)
+    staged = executor._input_logprob_rows(plan, 2, 6)
     assert staged.rows.tolist() == [0, 1, 2, 4, 5]
     assert staged.targets.tolist() == [11, 12, 13, 22, 23]
     assert staged.slots.tolist() == [0, 0, 0, 1, 1]
@@ -95,13 +96,13 @@ def test_executor_expands_the_plan_into_rows_targets_and_slots(monkeypatch):
     plan = InputLogprobPlan(
         row_starts=(0, 4), counts=(3, 2), position_starts=(5, 0), top_k=4
     )
-    assert executor._input_logprob_rows(plan, 2, 6, None).top_k == 4
+    assert executor._input_logprob_rows(plan, 2, 6).top_k == 4
 
     # A slot without rows contributes nothing and shifts no other slot.
     plan = InputLogprobPlan(
         row_starts=(0, 0, 3), counts=(2, 0, 1), position_starts=(0, 0, 7)
     )
-    staged = executor._input_logprob_rows(plan, 3, 6, None)
+    staged = executor._input_logprob_rows(plan, 3, 6)
     assert staged.rows.tolist() == [0, 1, 3]
     assert staged.slots.tolist() == [0, 0, 2]
 
@@ -110,7 +111,6 @@ def test_executor_expands_the_plan_into_rows_targets_and_slots(monkeypatch):
             InputLogprobPlan(row_starts=(4,), counts=(3,), position_starts=(0,)),
             1,
             6,
-            None,
         )
 
 
@@ -120,7 +120,7 @@ def test_executor_flags_an_out_of_vocab_target_instead_of_scoring_it(monkeypatch
     only so the gather cannot fault."""
     executor = _staging_executor(monkeypatch, shifted_ids=[1, 9, 2, 3], vocab_size=8)
     plan = InputLogprobPlan(row_starts=(0, 2), counts=(2, 2), position_starts=(0, 0))
-    staged = executor._input_logprob_rows(plan, 2, 4, None)
+    staged = executor._input_logprob_rows(plan, 2, 4)
     assert staged.targets.tolist() == [1, 7, 2, 3]
     assert executor.nan_guard.flags.tolist() == [1, 0, 0, 0]
 
@@ -132,7 +132,10 @@ def test_executor_stages_a_shards_rows_of_the_plan(monkeypatch):
     every row once the activations are gathered) and the target audit runs
     over the whole plan on every rank, so the NaN flags agree across the
     group."""
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     # Two requests of 4 and 6 rows over four ranks, one row per zigzag
     # segment: rank 0 holds rows 0, 4, rank 1 rows 1, 5, rank 2 rows 2, 6, 9,
@@ -143,13 +146,18 @@ def test_executor_stages_a_shards_rows_of_the_plan(monkeypatch):
     plans = {}
     for rank in range(4):
         executor = _staging_executor(monkeypatch, shifted_ids=shifted, vocab_size=200)
-        shard = QueryShardPlan.from_forward(
-            total_tokens=10, input_lengths=[4, 6], size=4, rank=rank, device="cpu"
+        shard = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=10, input_lengths=[4, 6], size=4, rank=rank
+            ),
+            input_lengths=[4, 6],
+            device="cpu",
         )
         plan = InputLogprobPlan(
             row_starts=(1, 4), counts=(3, 4), position_starts=(1, 0)
         )
-        staged = executor._input_logprob_rows(plan, 2, 10, shard)
+        executor.input_buffers.query_shard = shard
+        staged = executor._input_logprob_rows(plan, 2, 10)
         plans[rank] = staged
         assert staged.rows_per_rank == (1, 2, 2, 2)
         # The gather returns rows 4, 1, 5, 2, 6, 3, 7 (rank by rank).

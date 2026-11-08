@@ -87,7 +87,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -277,7 +277,7 @@ def _sharded_tail_contribution(
     shard: torch.Tensor,
     lengths: torch.Tensor,
     width: int,
-    plan: QueryShardPlan,
+    plan: QueryShardInputs,
 ) -> torch.Tensor:
     """This rank's part of the per-request tail rows when ``shard`` holds
     only the rows ``plan`` assigns it: the tail rows inside the shard, read
@@ -639,7 +639,7 @@ class Mtp(HiddenStateDrafter):
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
-                query_shard=plan,
+                query_shard=None if plan is None else plan.plan,
             )
 
             with nvtx_range("draft_extend_forward", color="red"):
