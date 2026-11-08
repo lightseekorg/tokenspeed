@@ -120,13 +120,10 @@ SEQUENCE = (4, 5, 6, 7, 8, 8, 16, 4, 8, 16, 8, 8, 8, 5)
 
 
 def test_static_schedule_matches_the_metadata_walk(experts_weights, monkeypatch):
-    # B9-64 run the grouped engine on 152 co-resident CTAs, more than a B200 has SMs.
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    sequence = [b for b in SEQUENCE if b <= 8 or sms >= 152]
-    batches = sorted(set(sequence))
+    batches = sorted(set(SEQUENCE))
     walked, _ = _engine(experts_weights, batches, monkeypatch, scheduled=False)
     static, _ = _engine(experts_weights, batches, monkeypatch, scheduled=True)
-    for step, b in enumerate(sequence):
+    for step, b in enumerate(SEQUENCE):
         x, ids = _routing(b, 100 + step)
         expected = walked.run(x, ids).clone()
         actual = static.run(x, ids).clone()
@@ -168,3 +165,15 @@ def test_run_refuses_a_prefetch_table_the_batch_was_not_prepared_for(
     table = torch.zeros(8, 2, dtype=torch.int64, device="cuda")
     with pytest.raises(ValueError, match="prepared ahead=False"):
         static.run(x, ids, ahead=table)
+
+
+def test_grids_too_small_to_rearm_every_counter_are_rejected(
+    experts_weights, monkeypatch
+):
+    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe import experts_runtime
+
+    engine, _ = _engine(experts_weights, (), monkeypatch, scheduled=True)
+    engine.grids[4] = 79
+    out = torch.empty(4 * TOP_K, LATENT, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="cannot re-arm 160 counters"):
+        engine.prepare(4, experts_runtime.scratch(8, torch.device("cuda")), out)

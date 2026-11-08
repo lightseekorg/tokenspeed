@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from types import SimpleNamespace
@@ -37,15 +38,17 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-pytest.importorskip(
-    "tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess",
+# Skip per test, not per module: a file that collects nothing fails the suite.
+HAS_AMD_KERNELS = importlib.util.find_spec("tokenspeed_kernel_amd") is not None
+pytestmark = pytest.mark.skipif(
+    not HAS_AMD_KERNELS,
     reason="tokenspeed-kernel-amd is required for packed FP8 MoE integration tests",
 )
-
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (  # noqa: E402
-    _copy_packed_fp8_shard,
-    pack_fp8_weight_n16k32,
-)
+if HAS_AMD_KERNELS:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (
+        _copy_packed_fp8_shard,
+        pack_fp8_weight_n16k32,
+    )
 
 
 def _plan(**changes: object) -> dict:

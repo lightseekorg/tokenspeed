@@ -30,6 +30,10 @@ from types import MappingProxyType
 
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu_layout import (
+    interleave_linear_and_gate,
+    swizzle_blockscale_2d,
+)
 from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
     flashinfer_fp8_blockscale_quantize_prepacked,
 )
@@ -85,6 +89,9 @@ __all__ = [
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "prepare_nvfp4_a16_weights",
+    # NVFP4 GEMM+SwiGLU weight layout
+    "interleave_linear_and_gate",
+    "swizzle_blockscale_2d",
     # DeepSeek V4.1 projections
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
