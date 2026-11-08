@@ -23,17 +23,14 @@
 from __future__ import annotations
 
 import torch
+from torch import nn
 
-from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
-from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     MoECheckpointLoader,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.models.qwen3 import (
     Qwen3DecoderLayer,
     Qwen3ForCausalLM,
@@ -48,147 +45,52 @@ from tokenspeed.runtime.utils import add_prefix
 
 
 class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
-    def __init__(
-        self,
-        config: Qwen3MoeConfig,
-        mapping: Mapping,
-        layer_id: int = 0,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            config=config,
-            mapping=mapping,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-        if _is_moe_layer(layer_id, config):
-            self.mlp = Qwen3_5MoeSparseMoeBlock(
-                config=config,
+    @property
+    def is_moe_layer(self) -> bool:
+        return _is_moe_layer(self.layer_id, self.config)
+
+    @property
+    def is_prev_moe_layer(self) -> bool:
+        return _is_moe_layer(self.layer_id - 1, self.config)
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+        if self.is_moe_layer:
+            return Qwen3_5MoeSparseMoeBlock(
+                config=self.config,
                 mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
+                quant_config=self.quant_config,
+                layer_index=self.layer_id,
                 prefix=add_prefix("mlp", prefix),
             )
-        else:
-            self.mlp = Qwen3_5MoeMLP(
-                parallelism="dense",
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=add_prefix("mlp", prefix),
-            )
-        is_moe = isinstance(self.mlp, Qwen3_5MoeSparseMoeBlock)
-        self.comm_manager = CommManager(
+        return Qwen3_5MoeMLP(
+            parallelism="dense",
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            hidden_act=self.config.hidden_act,
             mapping=self.mapping,
-            layer_id=layer_id,
-            is_moe=is_moe,
-            prev_is_moe=_is_moe_layer(layer_id - 1, config),
-            dense_batch_invariant=False,
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            query_sharded=False,
+            quant_config=self.quant_config,
+            reduce_results=False,
+            prefix=add_prefix("mlp", prefix),
         )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        residual: torch.Tensor | None,
-        cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-                cos_sin=cos_sin,
-            )
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
-
-        hidden_states, residual = self.forward_mlp(hidden_states, residual, ctx)
-        return hidden_states, residual
 
     def forward_mlp(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         ctx: ForwardContext,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(self.mlp, Qwen3_5MoeSparseMoeBlock):
-            num_global_tokens, max_num_tokens_per_gpu = (
-                self.mlp.comm_manager.get_num_tokens(ctx)
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        if not self.is_moe_layer:
+            return super().forward_mlp(
+                hidden_states, residual, ctx, num_global_tokens, max_num_tokens_per_gpu
             )
-            hidden_states = self.mlp(
-                hidden_states,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-                ctx,
-            )
-            return hidden_states, residual
-
-        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
-        )
-        return hidden_states, residual
+        # The MoE block runs its own communication.
+        return self.mlp(hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx)
 
 
 class Qwen3MoeModel(Qwen3Model):
-    def __init__(
-        self,
-        config: Qwen3MoeConfig,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            config=config,
-            mapping=mapping,
-            quant_config=quant_config,
-            prefix=prefix,
-            decoder_layer_type=Qwen3MoeDecoderLayer,
-        )
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        ctx: ForwardContext,
-        input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
-        residual = None
-
-        for layer in self.layers:
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                ctx,
-                residual,
-                cos_sin=None,
-            )
-
-        if not ctx.forward_mode.is_idle():
-            hidden_states, _ = layer.comm_manager.final_norm(
-                hidden_states, residual, ctx, self.norm
-            )
-        return hidden_states, None
+    layer_cls = Qwen3MoeDecoderLayer
 
 
 class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
