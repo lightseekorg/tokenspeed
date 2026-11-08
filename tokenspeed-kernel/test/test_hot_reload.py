@@ -719,17 +719,19 @@ def run(x):
 """
 
 BARE_GLUON = """
-from tokenspeed_kernel._triton import gl, gluon
+from tokenspeed_kernel._triton import gl, gluon, triton
 
 @gluon.jit
-def _add(x_ptr, n, BLOCK: gl.constexpr):
-    layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+def _add(x_ptr, n, BLOCK: gl.constexpr, WARP: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1], [WARP], [4], [0])
     offsets = gl.arange(0, BLOCK, layout=layout)
     mask = offsets < n
     gl.store(x_ptr + offsets, gl.load(x_ptr + offsets, mask=mask) + 1.0, mask=mask)
 
 def run(x):
-    _add[(1,)](x, x.numel(), BLOCK=256, num_warps=4)
+    # The layout spans one warp, 64 threads on AMD and 32 on NVIDIA.
+    warp = triton.runtime.driver.active.get_current_target().warp_size
+    _add[(1,)](x, x.numel(), BLOCK=256, WARP=warp, num_warps=4)
     return x
 """
 
