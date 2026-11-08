@@ -718,11 +718,14 @@ int32 `(live, padded)` request pair from `mega_moe_live_requests`. Staging
 writes codes and scales for every row, but each row at or past
 `num_tokens * live // padded` gets expert id -1 and weight 0. MegaMoE's
 dispatch and combine skip negative ids, so such a row's output is zero, or
-the fused shared expert's output alone. The pair is (1, 1), which routes
-every row, except during a padded decode-graph replay (the padding contract
-in `docs/design/unified_path.md`). The share is right only when each rank
-stages its attention-DP group's whole padded batch, not a TP shard of it.
-The kernel reads the counts at launch, so new values do not recompile it.
+the fused shared expert's output alone. The share is right only when each
+rank stages its attention-DP group's whole padded batch, not a TP shard of
+it. The pair is (1, 1), which routes every row, except during a padded
+decode-graph replay under attention TP 1 or attention TP equal to the MoE
+TP x EP size, the layouts that give whole batches (the padding contract in
+`docs/design/unified_path.md`). Under other layouts, such as Qwen3.5's
+DP4/TP2/EP8, it stays (1, 1). The kernel reads the counts at launch, so new
+values do not recompile it.
 
 ## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
 

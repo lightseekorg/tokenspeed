@@ -471,10 +471,13 @@ its DSpark drafter's block rows, where a row mask would need one per row
 count. The share is right only when each rank's MegaMoE input is its
 attention-DP group's whole padded batch: request-major, the same number of
 rows per request, the filler requests last. Attention TP 1 and rows
-replicated over attention TP (attention TP == MoE TPxEP), the only layouts
-DeepSeek V4.1 admits with MegaMoE, give that. A reduce-scatter shard
-(`moe_input_row_segments`) holds its group's live rows unevenly, so a model
-that runs DeepGEMM MegaMoE in a decode graph must stage whole batches.
+replicated over attention TP (attention TP == MoE TPxEP) give that; they are
+the only layouts DeepSeek V4.1 admits with MegaMoE. Any other attention TP,
+such as Qwen3.5's DP4/TP2/EP8, reduce-scatters each group's rows into shards
+(`moe_input_row_segments`) that hold its live rows unevenly. The runner
+therefore writes the pair only under the first two layouts
+(`mega_moe_stages_whole_batches`); under the others it stays (1, 1) and
+MegaMoE routes every row.
 
 ### Pointer-stable per-bs views from one builder
 

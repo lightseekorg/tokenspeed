@@ -293,7 +293,8 @@ def mega_moe_live_requests(device: torch.device | str) -> torch.Tensor:
     TP 1 and rows replicated over attention TP (attention TP == MoE TPxEP)
     give that layout; they are the only layouts DeepSeek V4.1 admits with
     MegaMoE. A reduce-scatter shard of the batch does not: the live rows fall
-    unevenly across the shards.
+    unevenly across the shards. Under such a layout (Qwen3.5's DP4/TP2/EP8)
+    the runner leaves the pair at (1, 1), so every row is routed.
 
     Args:
         device: The device the pair is created on by the first call; later

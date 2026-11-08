@@ -23,7 +23,8 @@
 Exercise execution modes with all consumers, then each optional consumer alone.
 The same runner entry also commits ordinary hybrid targets without a Qwen4 root.
 A padded replay also sets MegaMoE's live-request counts and restores them, even
-when it fails.
+when it fails; the runner arms them only for layouts where every rank stages
+its whole batch.
 """
 
 import os
@@ -40,8 +41,12 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.forward_step import (
+    ForwardStepRunner,
+    mega_moe_stages_whole_batches,
+)
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
@@ -301,6 +306,43 @@ def test_padded_replay_routes_live_mega_moe_rows_then_restores(
     # even a failed one, leaves (1, 1) so later eager forwards route every row.
     assert seen == [[2, 4]]
     assert live_requests.tolist() == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "attn_tp_size,moe_ep_size,whole_batches",
+    [
+        # DeepSeek V4.1 admits MegaMoE with attention TP == MoE TP x EP (the
+        # attention all-reduce leaves every rank its group's whole batch) or
+        # with attention TP 1 (also Qwen3.5's DP8/TP1/EP8).
+        (4, 4, True),
+        (8, 8, True),
+        (1, 4, True),
+        (1, 8, True),
+        # Qwen3.5 MegaMoE under DP4/TP2/EP8 and DP2/TP4/EP8 stages
+        # reduce-scatter shards with uneven live rows: route every row.
+        (2, 8, False),
+        (4, 8, False),
+    ],
+)
+def test_mega_moe_counts_are_armed_only_for_whole_batch_layouts(
+    attn_tp_size, moe_ep_size, whole_batches
+):
+    world_size = max(attn_tp_size, moe_ep_size)
+    mapping = Mapping(
+        rank=0,
+        world_size=world_size,
+        attn_tp_size=attn_tp_size,
+        attn_dp_size=world_size // attn_tp_size,
+        moe_tp_size=1,
+        moe_ep_size=moe_ep_size,
+    )
+    assert (
+        mega_moe_stages_whole_batches(
+            attention_tp_size=mapping.attn.tp_size,
+            moe_tp_ep_size=mapping.moe.tp_ep_size,
+        )
+        is whole_batches
+    )
 
 
 if __name__ == "__main__":
