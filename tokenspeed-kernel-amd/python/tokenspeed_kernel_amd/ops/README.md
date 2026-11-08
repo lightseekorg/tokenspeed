@@ -49,7 +49,7 @@ skew and regress performance even when the generated kernel remains correct.
 ### Inline asm
 
 Prefer Gluon ops, then LLVM intrinsics through an extern `.ll` library (such
-as `_scheduling.py`), over inline asm. The compiler inserts the wait states
+as `_extern.py`), over inline asm. The compiler inserts the wait states
 between dependent instructions and protects live registers only for
 instructions it can see. It doesn't look inside an asm block. Use inline asm
 only where neither exists, and follow these rules:

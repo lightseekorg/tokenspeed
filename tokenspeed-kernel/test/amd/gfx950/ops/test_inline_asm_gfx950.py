@@ -68,9 +68,9 @@ def _peer_signal_store():
 
 
 def _sched_options():
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
-    return sched_compile_options()
+    return extern_compile_options()
 
 
 # ---------------------------------------------------------------------------
