@@ -629,8 +629,10 @@ them only when the loop holds no request, in-flight forward or open cache op.
 
 **Pause and memory release** (`control`). A pause in `abort` mode aborts what
 runs, `wait` lets it finish; both stop admissions and answer once the
-scheduler drained. `keep` freezes everything and answers at once: a frozen
-round commits what is dispatched and still joins the attention-DP agreement
+scheduler drained, including requests parked for PD retirement: both the
+transfer and local forwards must finish even if the output already ended.
+`keep` freezes everything and answers at once: a frozen round commits what is
+dispatched and still joins the attention-DP agreement
 (an idle forward when a peer runs one, but not while memory is released: the
 weights are unmapped; idle forwards count toward the expert rebalance like
 real ones, so the ranks' rebalances stay in step). It plans like any round,

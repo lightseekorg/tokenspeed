@@ -205,6 +205,9 @@ private:
         // rules passed over, tried again block by block.
         bool blocks_alone = false;
         std::size_t next_passed_over = 0;
+        bool reclaim_selection_changed = false;
+        std::vector<VictimCandidate> retry_segments;
+        std::size_t next_retry_segment = 0;
         const bool fits = eviction_plan_.SelectUntilFits(shape_need_, blocks_needed_, pair_need_, [&] {
             while (true) {
                 std::optional<VictimCandidate> candidate = eviction_plan_.Next(request_reclaim_candidates_);
@@ -242,6 +245,19 @@ private:
                         }
                     }
                     candidate = deferred_shared_pages_[next_deferred_shared_page++];
+                }
+                if (!candidate && !blocks_alone && next_retry_segment == retry_segments.size() &&
+                    reclaim_selection_changed) {
+                    // A reclaim selected after a rejected segment can make that
+                    // segment evictable. Retry a fixed batch before block fallback;
+                    // another pass requires a newly selected reclaim block.
+                    reclaim_selection_changed = false;
+                    unevictable_locations_.clear();
+                    retry_segments = std::exchange(passed_over_, {});
+                    next_retry_segment = 0;
+                }
+                if (!candidate && next_retry_segment < retry_segments.size()) {
+                    candidate = retry_segments[next_retry_segment++];
                 }
                 if (!candidate && evicts_blocks_past_segments_ && next_passed_over < passed_over_.size()) {
                     blocks_alone = true;
@@ -491,6 +507,7 @@ private:
                     if (it == set_member_by_location_.end()) {
                         eviction_plan_.Remove(member.group_id, member.location);
                         set_member_by_location_.emplace(member.location, std::pair{set_index, j});
+                        reclaim_selection_changed = reclaim_selection_changed || member.is_request_reclaim;
                         continue;
                     }
                     // The set holding the block now, through the sets that took
@@ -977,16 +994,16 @@ private:
     // The selected segments by the tree node each starts at: every Device block
     // of that node's subtree, in post-order.
     std::pmr::unordered_map<const BoundaryTree::Node*, std::size_t> segment_at_{&scratch_};
-    // Blocks that, tried as candidates, would expand to a set found unable
-    // to leave this pass (a member in use or kept): skipped at once.
+    // Blocks that expand to a set found unable to leave under the current
+    // reclaim selection: skipped until a retry invalidates that decision.
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> unevictable_locations_{&scratch_};
     // Pages two or more Device checkpoint boundaries depend on, passed over
     // while candidates last, oldest first: tried again once they run out.
     std::vector<VictimCandidate> deferred_shared_pages_;
     // Candidates no segment rule let leave (a set member in use or kept, or a
     // shared page still shared once the candidates ran out), in the order
-    // they were passed over: tried again block by block once the shared pages
-    // run out too.
+    // they were passed over: retried as segments after reclaim selection
+    // changes, then block by block if the admission permits it.
     std::vector<VictimCandidate> passed_over_;
     // Per tree node: how many checkpoint boundaries at or under it have every
     // Device checkpoint in a selected set, counted once the candidates run out.

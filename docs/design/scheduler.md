@@ -744,9 +744,13 @@ full.
 A request's expired slots and released State input are different from live
 pins: `Admit` releases their table references before evicting those blocks. Once the plan
 selects their reclaim set, a later segment may absorb that set even though
-the table still holds its references during planning. The merge counts each
-physical block once, and minimization keeps or restores the combined set
-whole. This lets a P request rotate past a junction and evict its unpinned
+the table still holds its references during planning. Segments rejected before
+that selection are reconsidered before any block-by-block fallback: a cached
+rejection is valid only while the selected reclaim blocks remain unchanged.
+Another retry requires newly selected reclaim blocks, so an unchanged pin
+cannot cause an endless scan. The merge counts each physical block once,
+and minimization keeps or restores the combined set whole. This lets a P
+request rotate past a junction and evict its unpinned
 canonical KV duplicates in the same admission. Another reader's reference,
 or a prefix hit this admission keeps, still prevents reclaim.
 

@@ -1838,14 +1838,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .is_none_or(|transfer| !transfer.has_in_flight())
     }
 
-    /// The local scheduler drained and no forward or cancelled embedding
-    /// receive can still finish a request.
+    /// The local scheduler, including parked PD transfers, drained and no
+    /// forward or cancelled embedding receive can still finish a request.
     fn drained(&self) -> bool {
         let sizes = self.scheduler.sizes();
         if sizes.waiting != 0
             || sizes.decoding != 0
             || sizes.prefilling != 0
             || sizes.retracted != 0
+            || sizes.pd_transfer != 0
         {
             return false;
         }

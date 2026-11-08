@@ -417,8 +417,8 @@ struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Tracked requests: rid, room, bootstrapped.
-    tracked: Vec<(String, u64, bool)>,
+    /// Tracked requests: rid, room, bootstrapped, failure reported.
+    tracked: Vec<(String, u64, bool, bool)>,
 }
 
 impl TransferPeer for FakePeer {
@@ -432,7 +432,8 @@ impl TransferPeer for FakePeer {
                 .or_default()
                 .decode_registered = true;
         }
-        self.tracked.push((rid.to_owned(), bootstrap.room, false));
+        self.tracked
+            .push((rid.to_owned(), bootstrap.room, false, false));
         Ok(())
     }
 
@@ -450,10 +451,10 @@ impl TransferPeer for FakePeer {
             let prefill_ranks = wire.prefill_ranks;
             self.tracked
                 .iter()
-                .map(|(_, room, bootstrapped)| {
+                .map(|(_, room, bootstrapped, _)| {
                     let room = wire.rooms.entry(*room).or_default();
                     let poll = if room.fails
-                        || (room.cancel_pending && !room.hold_cancel)
+                        || room.cancel_pending
                         || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
                     {
                         TransferPoll::Failed
@@ -493,42 +494,49 @@ impl TransferPeer for FakePeer {
         let mut wire = self.wire.lock().unwrap();
         let mut events = Vec::new();
         let mut agreed = agreed.into_iter();
-        self.tracked.retain_mut(|(rid, room, bootstrapped)| {
-            let poll = agreed.next().expect("one state per tracked request");
-            let room = wire.rooms.entry(*room).or_default();
-            match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
-                TransferPoll::Failed => {
-                    // The peer engine sees the failure only on the wire. Its
-                    // transfer stops at once.
-                    room.fails = true;
-                    events.push(PdEvent::Failed(rid.clone()));
-                    events.push(PdEvent::Stopped(rid.clone()));
-                    false
+        self.tracked
+            .retain_mut(|(rid, room, bootstrapped, failed)| {
+                let poll = agreed.next().expect("one state per tracked request");
+                let room = wire.rooms.entry(*room).or_default();
+                match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
+                    TransferPoll::Failed => {
+                        // Failure ends the output before held writes retire.
+                        room.fails = true;
+                        if !*failed {
+                            events.push(PdEvent::Failed(rid.clone()));
+                            *failed = true;
+                        }
+                        if room.hold_cancel {
+                            true
+                        } else {
+                            events.push(PdEvent::Stopped(rid.clone()));
+                            false
+                        }
+                    }
+                    TransferPoll::Bootstrapped if !*bootstrapped => {
+                        *bootstrapped = true;
+                        events.push(PdEvent::Bootstrapped(rid.clone()));
+                        true
+                    }
+                    TransferPoll::Success => {
+                        events.push(match role {
+                            Role::Prefill => PdEvent::Succeeded(rid.clone()),
+                            _ => PdEvent::RemotePrefillDone(RemotePrefill {
+                                rid: rid.clone(),
+                                bootstrap_token: room.sent.expect("sent with the KV"),
+                                cached_tokens: 0,
+                                bootstrap_logprob: None,
+                                spec_candidate_ids: None,
+                                request_pool_index: room
+                                    .preallocated
+                                    .expect("admitted before the KV moved"),
+                            }),
+                        });
+                        false
+                    }
+                    _ => true,
                 }
-                TransferPoll::Bootstrapped if !*bootstrapped => {
-                    *bootstrapped = true;
-                    events.push(PdEvent::Bootstrapped(rid.clone()));
-                    true
-                }
-                TransferPoll::Success => {
-                    events.push(match role {
-                        Role::Prefill => PdEvent::Succeeded(rid.clone()),
-                        _ => PdEvent::RemotePrefillDone(RemotePrefill {
-                            rid: rid.clone(),
-                            bootstrap_token: room.sent.expect("sent with the KV"),
-                            cached_tokens: 0,
-                            bootstrap_logprob: None,
-                            spec_candidate_ids: None,
-                            request_pool_index: room
-                                .preallocated
-                                .expect("admitted before the KV moved"),
-                        }),
-                    });
-                    false
-                }
-                _ => true,
-            }
-        });
+            });
         Ok(events)
     }
 
@@ -541,7 +549,7 @@ impl TransferPeer for FakePeer {
     fn abort_room(&mut self, _: &str, _: u64) {}
 
     fn cancel(&mut self, rid: &str) {
-        if let Some((_, room, _)) = self.tracked.iter().find(|(id, _, _)| id == rid) {
+        if let Some((_, room, _, _)) = self.tracked.iter().find(|(id, _, _, _)| id == rid) {
             self.wire
                 .lock()
                 .unwrap()
@@ -3491,6 +3499,15 @@ fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abort_pause_waits_for_pd_retirement_before_releasing_memory() {
+    assert_pause_waits_for_pd_retirement("abort").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_pause_waits_for_failed_pd_retirement_before_releasing_memory() {
+    assert_pause_waits_for_pd_retirement("wait").await;
+}
+
+async fn assert_pause_waits_for_pd_retirement(mode: &str) {
     let wire = Arc::new(Mutex::new(Wire {
         prefill_ranks: 2,
         ..Wire::default()
@@ -3536,23 +3553,47 @@ async fn an_abort_pause_waits_for_pd_retirement_before_releasing_memory() {
     .await
     .expect("decode allocated its KV landing pages");
 
-    let paused = control(&decode, pause("abort"));
+    let paused = control(&decode, pause(mode));
     tokio::pin!(paused);
+    if mode == "wait" {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut paused)
+                .await
+                .is_err()
+        );
+        wire.lock().unwrap().rooms.get_mut(&70).unwrap().fails = true;
+    }
+    let chunks = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            response = &mut paused => panic!("pause completed before PD retirement: {response:?}"),
+            chunks = collect(stream) => chunks,
+        }
+    })
+    .await
+    .expect("Failed ends the output while Stopped is withheld");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut paused)
             .await
             .is_err()
     );
-    assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
-    for rank in 0..decode.ranks.len() {
-        assert!(
-            decode.released_on(rank).is_empty(),
-            "pages released before the peer retired"
-        );
+    if mode == "abort" {
+        assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
     }
+    // Failed may already forget the request's output state; the scheduler's
+    // transfer pin must still prevent its pages from being flushed.
+    assert_eq!(
+        control(
+            &decode,
+            ControlRequest::FlushCache(FlushCacheReqInput {
+                rid: None,
+                http_worker_ipc: None,
+            })
+        )
+        .await,
+        [("FlushCacheReqOutput", false)]
+    );
     wire.lock().unwrap().rooms.get_mut(&70).unwrap().hold_cancel = false;
     assert_eq!(paused.await, [("PauseSchedulerReqOutput", true)]);
-    let chunks = collect(stream).await;
     assert!(tokens(&chunks).is_empty());
     assert_eq!(
         chunks.last().unwrap().finish_reason.as_deref(),

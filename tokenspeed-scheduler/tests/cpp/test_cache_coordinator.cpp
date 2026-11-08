@@ -1553,12 +1553,15 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
 }
 
 TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalPrefix) {
-    for (const auto [allow_block_eviction, state_groups] :
-         {std::pair{false, 1}, std::pair{true, 1}, std::pair{false, 3}, std::pair{true, 3}}) {
+    for (const auto [reverse_access_order, allow_block_eviction, state_groups] :
+         {std::tuple{false, false, 1}, std::tuple{false, true, 1}, std::tuple{false, false, 3},
+          std::tuple{false, true, 3}, std::tuple{true, false, 1}, std::tuple{true, true, 1}, std::tuple{true, false, 3},
+          std::tuple{true, true, 3}}) {
+        SCOPED_TRACE(reverse_access_order);
         SCOPED_TRACE(allow_block_eviction);
         SCOPED_TRACE(state_groups);
         const auto num_groups = static_cast<std::size_t>(state_groups + 1);
-        const auto capacity = 5 + 2 * state_groups;
+        const auto capacity = 5 + 2 * state_groups + (reverse_access_order ? 2 + 2 * state_groups : 0);
         const std::vector<std::int32_t> packing(num_groups, 1);
         BlockPool pool(capacity, packing);
         BlockPool host_pool(capacity, packing);
@@ -1575,6 +1578,21 @@ TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalP
                                      /*copy_in_point=*/std::nullopt, std::nullopt, allow_block_eviction,
                                      /*session_id=*/{});
         };
+
+        // A live older request can publish its KV under its admission epoch
+        // after a newer request publishes State, reversing their eviction order.
+        std::vector<BlockTable> older(num_groups);
+        std::optional<std::uint64_t> older_epoch;
+        if (reverse_access_order) {
+            std::vector<GroupDemand> older_demands{{.table = &older[0], .extent = DenseGrowth{8}}};
+            for (std::size_t group = 1; group < num_groups; ++group) {
+                older_demands.push_back(
+                    {.table = &older[group], .extent = StateStep{.kind = StateStep::Kind::kRotate}});
+            }
+            auto admission = admit(older_demands, RequestProgress{});
+            ASSERT_TRUE(admission);
+            older_epoch = admission->access_epoch;
+        }
 
         // The prefix has KV but no State checkpoint, so P must recompute it.
         std::vector<BlockTable> publisher(num_groups);
@@ -1605,6 +1623,14 @@ TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalP
                                        .num_computed_tokens = 8};
         ASSERT_TRUE(admit(demands, junction));
         ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+        if (older_epoch) {
+            coordinator.CacheCompletedBlocks(
+                older,
+                RequestProgress{
+                    .completed_pages = CompletedPages{.prefix_hashes = prefix, .preserve_source_blocks = true},
+                    .num_computed_tokens = 8},
+                *older_epoch);
+        }
         const auto sources = BlockTableLcmBlockIds(tables[0]);
         const CacheBlockLocation input_location = tables[1].Blocks()[0]->Location();
         const auto evictions_before = coordinator.DeviceEvictions();
@@ -1626,7 +1652,8 @@ TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalP
 
         // Releasing the input pays for State rotation, but the next KV block
         // also needs the canonical prefix to leave. Its subtree must absorb
-        // the input already selected for reclaim, not reject it as pinned.
+        // the input selected for reclaim, including when this segment was
+        // already rejected before that selection.
         ASSERT_TRUE(admit(demands, next_chunk));
         const auto after = BlockTableLcmBlockIds(tables[0]);
         ASSERT_EQ(after.size(), sources.size() + 1);
@@ -1653,6 +1680,7 @@ TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalP
         EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
         EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator).empty());
         coordinator.Free(tables);
+        coordinator.Free(older);
     }
 }
 
