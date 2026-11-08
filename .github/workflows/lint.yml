@@ -91,6 +91,9 @@ jobs:
           python -m pip install "pytest>=9" packaging cryptography pyyaml
           python -m pytest -q test/ci_system/test_weekly_release.py
 
+      - name: Test branch cleanup
+        run: node --test .github/scripts/cleanup-branches.test.js
+
       - name: Install scheduler C++ lint tools
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
