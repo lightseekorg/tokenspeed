@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.gfx950._xcd import _remap_xcd
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _dense16_mm_launch_metadata,
 )
@@ -106,26 +107,6 @@ def _dense16_mediumm_launch_metadata(grid, kernel, args):
             args["addend_a_ptr"].element_size() + args["addend_b_ptr"].element_size()
         )
     return metadata
-
-
-@gluon.jit
-def _remap_xcd(pid, num_programs, NUM_XCDS: gl.constexpr):
-    # Hardware dispatches program i to XCD i % NUM_XCDS; give each XCD a
-    # contiguous range of program ids instead.
-    pids_per_xcd = (num_programs + NUM_XCDS - 1) // NUM_XCDS
-    tall_xcds = num_programs % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = (
-            tall_xcds * pids_per_xcd
-            + (xcd - tall_xcds) * (pids_per_xcd - 1)
-            + local_pid
-        )
-    return pid
 
 
 @gluon.jit
@@ -1598,14 +1579,16 @@ def launch_gluon_mm_a16w16_medium_gfx950(
     return C
 
 
-# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4 and Qwen3.8-Flash-Next TP2
+# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4/TP8 and Qwen3.8-Flash-Next TP2
 # decode shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
 # uses the config of the smallest bucket covering its M, so M stays a runtime
 # argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
 # WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every
-# K tile of a program. Only buckets that beat torch.mm by at least 4% are
-# listed; the rest keep the torch path.
-DECODE_M_BUCKETS = (4, 8, 16, 32, 64)
+# K tile of a program. Only buckets that beat torch.mm by at least 4% at the
+# row counts their model sends are listed, except where an entry notes
+# otherwise; the rest keep the torch path. The 128 and 256 buckets were swept
+# inside capture_session, as serving captures.
+DECODE_M_BUCKETS = (4, 8, 16, 32, 64, 128, 256)
 _DECODE_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
 ] = {
@@ -1623,17 +1606,46 @@ _DECODE_CONFIGS: dict[
         16: (32, 32, 256, 2, 2, 3, 1, 8),
         32: (32, 32, 256, 2, 2, 3, 1, 8),
     },
-    # All K tiles in flight per output tile.
+    # 8192-hidden projections at TP8 (to 2048, 1280 and 256 columns) at 8 and
+    # 16 rows: split K four or eight ways to occupy the CUs. Each beat
+    # hipBLASLt in cold-weight graph replay on MI355X. The GEMV is faster at 8
+    # rows on the first two but slower at 16, and its 5-16 row bucket would
+    # take both.
+    (2048, 8192): {
+        8: (32, 32, 256, 2, 2, 3, 4, 1),
+        16: (32, 32, 256, 2, 2, 3, 4, 1),
+    },
+    (1280, 8192): {
+        8: (32, 32, 256, 2, 2, 3, 4, 1),
+        16: (32, 32, 256, 2, 2, 3, 4, 1),
+    },
+    (256, 8192): {
+        8: (16, 16, 512, 2, 2, 4, 4, 8),
+        16: (32, 16, 256, 2, 2, 4, 8, 1),
+    },
+    # Muse TP8 attention output. All K tiles in flight per output tile; from 17
+    # rows (speculative verify) one tile covers every row of a bucket.
     (8192, 1024): {
         4: (16, 32, 256, 2, 2, 4, 1, 8),
         8: (16, 32, 256, 2, 2, 4, 1, 8),
         16: (16, 32, 256, 2, 2, 4, 1, 8),
+        32: (32, 32, 256, 2, 2, 4, 1, 1),
+        64: (64, 32, 256, 2, 2, 3, 1, 1),
     },
-    # Split K four ways to occupy the CUs.
+    # Muse TP8 pre-expert projection. Split K four ways to occupy the CUs, and
+    # eight ways with 32-row tiles from 17 rows; past 64 rows the extra row
+    # tiles fill the CUs, so K splits four ways again. The 128 and 256 buckets
+    # serve speculative verify batches of up to 21 requests (172 rows). The 256
+    # bucket only breaks even at 129-136 rows, of which verify sends only 136
+    # (17 requests of 8 rows), and is faster from 144 rows.
     (512, 8192): {
         4: (16, 16, 512, 2, 2, 4, 4, 8),
         8: (16, 16, 512, 2, 2, 4, 4, 8),
         16: (16, 16, 512, 2, 2, 4, 4, 8),
+        32: (32, 16, 256, 2, 2, 4, 8, 1),
+        64: (32, 32, 256, 2, 2, 4, 8, 8),
+        128: (32, 32, 256, 2, 2, 3, 4, 1),
+        256: (64, 32, 256, 2, 2, 3, 4, 1),
     },
     # o_proj
     (7168, 1536): {
@@ -1900,7 +1912,98 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     return C
 
 
-_GROUPED_M_BUCKETS = DECODE_M_BUCKETS + (128,)
+# Full-K 16x16 tiles over 512-deep K with three buffers. Every output runs its
+# 16x16x32 MFMAs over K in order whatever the tile shape, so a column shard of
+# a split-K-1 decode GEMM equals the replicated GEMM's columns bitwise. The
+# depth was the fastest of 256, 512 and 1024 at 8-16 rows x 1024 x 4096 in
+# graph replay on MI355X.
+_COLUMN_SHARD_BLOCK_K = 512
+_COLUMN_SHARD_BUFFERS = 3
+
+
+def supports_gluon_mm_a16w16_column_shard_gfx950(
+    M: int, N: int, shard_n: int, K: int
+) -> bool:
+    """Whether a shard_n-column shard of the [M, N, K] decode GEMM is bitwise its columns.
+
+    The full decode GEMM must have a measured split-K-1 config, so its per-output
+    reduction is the shard's.
+    """
+    config = _choose_decode_config(M, N, K)
+    return (
+        config is not None
+        and config[6] == 1
+        and shard_n % 16 == 0
+        and K % _COLUMN_SHARD_BLOCK_K == 0
+        and K // _COLUMN_SHARD_BLOCK_K >= _COLUMN_SHARD_BUFFERS
+    )
+
+
+def launch_gluon_mm_a16w16_column_shard_gfx950(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Compute ``A @ B.T`` for a column shard ``B`` of a replicated decode GEMM weight.
+
+    Args:
+        A: Contiguous BF16/FP16 activation ``[M, K]``.
+        B: Contiguous weight rows ``[shard_n, K]`` with ``A``'s dtype, such as
+            one rank's rows of the replicated ``[N, K]`` weight.
+        out: ``[M, shard_n]`` destination in ``A``'s dtype with unit inner stride.
+
+    Returns:
+        ``out``; each column equals the replicated decode GEMM's column bitwise
+        when ``supports_gluon_mm_a16w16_column_shard_gfx950`` holds.
+    """
+    M, K = A.shape
+    shard_n = B.shape[0]
+    if not A.is_contiguous() or not B.is_contiguous() or B.shape[1] != K:
+        raise ValueError(
+            f"column-shard GEMM needs contiguous A [M, K] and B [shard_n, K], got "
+            f"{tuple(A.shape)=} {tuple(B.shape)=}"
+        )
+    if out.shape != (M, shard_n) or out.dtype != A.dtype or out.stride(1) != 1:
+        raise ValueError(
+            f"column-shard GEMM needs a unit-stride [{M}, {shard_n}] {A.dtype} out, "
+            f"got {tuple(out.shape)} {out.dtype} stride {out.stride()}"
+        )
+    gluon_mm_a16w16_medium_gfx950[(triton.cdiv(M, 16) * triton.cdiv(shard_n, 16),)](
+        A,
+        B,
+        out,
+        out,
+        out,
+        out,
+        out,
+        M,
+        shard_n,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=16,
+        BLOCK_N=16,
+        BLOCK_K=_COLUMN_SHARD_BLOCK_K,
+        WARPS_M=2,
+        WARPS_N=2,
+        NUM_BUFFERS=_COLUMN_SHARD_BUFFERS,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=1,
+        NUM_XCDS=1,
+        num_warps=4,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return out
+
+
+_GROUPED_M_BUCKETS = (4, 8, 16, 32, 64, 128)
 # Grouped decode GEMMs keyed by (groups, N, K), then M bucket; same tuple
 # layout as _DECODE_CONFIGS. Swept under graph replay on MI350X.
 _GROUPED_DECODE_CONFIGS: dict[

@@ -20,16 +20,8 @@
 ; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 ; SOFTWARE.
 
-; Through the intrinsic (not inline asm) the backend inserts the wait states a
-; preceding VALU write of the source VGPR needs, and folds the move away when
-; the value is already in an SGPR.
-declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
-
-define i32 @__tokenspeed_sched_readfirstlane_i32(i32 %x) alwaysinline {
-entry:
-  %r = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %x)
-  ret i32 %r
-}
+; Instruction scheduling hints. Every function is named __tokenspeed_isched_*
+; so that Triton links this file only into kernels calling one (_extern.py).
 
 ; sched_group_barrier(mask, size, 0): the next `size` instructions of class
 ; `mask` in the region above form one group (IGroupLP). The operands are
@@ -37,35 +29,35 @@ entry:
 declare void @llvm.amdgcn.sched.group.barrier(i32 immarg, i32 immarg, i32 immarg)
 
 ; One MFMA.
-define i32 @__tokenspeed_sched_group_barrier_8_1() alwaysinline {
+define i32 @__tokenspeed_isched_group_barrier_8_1() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 8, i32 1, i32 0)
   ret i32 0
 }
 
 ; Four VALU instructions.
-define i32 @__tokenspeed_sched_group_barrier_2_4() alwaysinline {
+define i32 @__tokenspeed_isched_group_barrier_2_4() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 2, i32 4, i32 0)
   ret i32 0
 }
 
 ; Three VMEM instructions.
-define i32 @__tokenspeed_sched_group_barrier_16_3() alwaysinline {
+define i32 @__tokenspeed_isched_group_barrier_16_3() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 16, i32 3, i32 0)
   ret i32 0
 }
 
 ; Two transcendental instructions.
-define i32 @__tokenspeed_sched_group_barrier_1024_2() alwaysinline {
+define i32 @__tokenspeed_isched_group_barrier_1024_2() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 1024, i32 2, i32 0)
   ret i32 0
 }
 
 ; One LDS read.
-define i32 @__tokenspeed_sched_group_barrier_256_1() alwaysinline {
+define i32 @__tokenspeed_isched_group_barrier_256_1() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 256, i32 1, i32 0)
   ret i32 0

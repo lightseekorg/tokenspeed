@@ -30,6 +30,16 @@ prepared variants using the existing shape and topology policies. Different
 staging geometries have separate synchronization buffers because their workgroup
 IDs cover different element ranges. Triton RSAG remains independent.
 
+A model can also install its prepared `ProducerAllReduce` as a group's ordinary
+all-reduce. The backend then reduces caller-owned BF16 tensors in place through
+`reduce_ordinary`: Lamport windows directly, the TP4 push window with a copy
+back, and other payloads up to a measured per-group-size limit through the
+producer buffer and the generic pull. Past the limit they fall back to RCCL.
+Results never borrow state storage, but ordinary reductions write the producer
+buffer and pull scratch, so no borrowed producer-buffer or pull-scratch view,
+nor the ready flags guarding it, may be live across an ordinary reduction on
+the group.
+
 Model preparation, dispatch, and fusions live in `kimi_k3/` and
 `muse_spark/`. General collectives live in `all_reduce.py`,
 `reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
@@ -44,11 +54,44 @@ and the receiver polls until no marker remains, restores the markers, and
 advances a three-stage counter. Fusions sharing the one-shot mailbox keep its
 per-512-element stage counters; the TP8 two-shot owns its mailboxes and
 counters.
+The TP8 two-shot's phases are device functions taking the stage, so a fused
+kernel that produces the partials itself reuses its mailbox layout and
+reduction. Muse's sliding attention tail does this: in one launch, attention
+splits compute the rows, o_proj senders push straight into the
+reduce-scatter slots, and other workgroups reduce, all-gather and finish the
+attention boundary. The tail uses its own region, with each workgroup's epoch
+as the stage.
 
-Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
+`residual_rmsnorm.py` reduces BF16 rows fused with the residual add and
+RMSNorm, for callers that prepare it per group and width (draft layers). Each
+row has an owner that receives the partials, reduces, and pushes the reduced
+row to every rank. It owns its mailboxes and needs no stage counters: an owner
+restores its scatter markers before it publishes the reduced row, and no rank
+starts its next launch before it has every reduced row, so row counts may
+change between launches.
+
+Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950; its own
+ordinary all-reduces use the same `reduce_ordinary` policy. Its pre-expert
+gather can also route the rows: the Lamport gather, RMSNorm and MXFP4 programs
+share one launch with independent per-row top-k programs. Both
 topologies keep the same global token cutoffs for Lamport, push, pull, and
 owned-row paths. Owned rows use ceil(global rows / world size), with padded
 rows masked; QKVG exchange derives each rank's head widths from the group size.
+With expert TP8 (EP1), batches whose routes outgrow the Lamport two-shot
+all-reduce (44 rows) and stay below the owned-row cutoff reduce-scatter each
+token's raw routes onto its owner through the owned-row route staging,
+normalize them there, and gather the 8x smaller sums through the Lamport
+one-shot mailbox. With Muse's output-column-split down copy, owned-row batches
+instead gather the sorted MXFP4 intermediate slices, and ranks add their FP32
+partial sums of squares in rank order for the routed RMSNorm. Per-program flags
+pair the same tokens on every rank in each phase; each kernel exits after
+peers finish reading its symmetric buffers.
+
+Batches below the reduce-scatter range complete their routes column-owned in
+one launch, with its own mailboxes and per-(token, owner) stages: rank q sums
+the partials of columns [512q, 512q + 512) of every route and publishes them
+with their partial sums of squares, then every rank normalizes, weights,
+and sums all columns.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:

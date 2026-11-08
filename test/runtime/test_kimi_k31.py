@@ -225,10 +225,6 @@ def test_kvp_launch_passes_the_full_attention_dcp_check(tmp_path) -> None:
     )
 
 
-# Named prefill buckets: the aggregated role's opt-in to the DSA padded prefill graph.
-_NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
-
-
 @pytest.mark.parametrize(
     "launch, is_draft, admitted",
     [
@@ -256,55 +252,42 @@ _NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
             False,
             False,
         ),
-        ({"disaggregation_mode": "decode", **_NAMED_BUCKETS}, False, False),
-        # Opt-in only: naming no buckets stays eager, and a cap alone names none.
-        ({"disaggregation_mode": "null"}, False, False),
         (
-            {"disaggregation_mode": "null", "prefill_graph_max_tokens": 4096},
+            {
+                "disaggregation_mode": "decode",
+                "prefill_graph_capture_sizes": [256, 1024, 4096],
+            },
             False,
             False,
         ),
-        # Named buckets admit it; no transfer step counter, so the interval cannot veto.
-        ({"disaggregation_mode": "null", **_NAMED_BUCKETS}, False, True),
+        # Admitted by default, with or without named buckets or a cap.
+        ({"disaggregation_mode": "null"}, False, True),
+        (
+            {"disaggregation_mode": "null", "prefill_graph_max_tokens": 4096},
+            False,
+            True,
+        ),
         (
             {
                 "disaggregation_mode": "null",
-                "disaggregation_layerwise_interval": 1,
-                **_NAMED_BUCKETS,
+                "prefill_graph_capture_sizes": [256, 1024, 4096],
             },
             False,
             True,
         ),
+        # No transfer step counter, so the interval cannot veto.
+        (
+            {"disaggregation_mode": "null", "disaggregation_layerwise_interval": 1},
+            False,
+            True,
+        ),
         # A MIXED round would replay with decode rows in the narrowed break.
-        (
-            {
-                "disaggregation_mode": "null",
-                "enable_mixed_batch": True,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        ({"disaggregation_mode": "null", **_NAMED_BUCKETS}, True, False),
-        (
-            {
-                "disaggregation_mode": "null",
-                "disable_prefill_graph": True,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        (
-            {
-                "disaggregation_mode": "null",
-                "pipeline_parallel_size": 2,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        ({"disaggregation_mode": "encode", **_NAMED_BUCKETS}, False, False),
+        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, False),
+        ({"disaggregation_mode": "null"}, True, False),
+        # --disable-prefill-graph turns it off.
+        ({"disaggregation_mode": "null", "disable_prefill_graph": True}, False, False),
+        ({"disaggregation_mode": "null", "pipeline_parallel_size": 2}, False, False),
+        ({"disaggregation_mode": "encode"}, False, False),
     ],
 )
 def test_dsa_padded_prefill_replay_is_admitted_on_the_prefill_and_aggregated_roles(
@@ -330,17 +313,14 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
 
     model_config = _load_k31_model_config(tmp_path)
     server_args = ServerArgs(model=str(tmp_path))
-    # The launch defaults keep the aggregated role eager.
+    # The launch defaults admit the aggregated role.
     assert server_args.disaggregation_mode == "null"
     assert server_args.disaggregation_layerwise_interval == 1
     assert server_args.prefill_graph_capture_sizes is None
     assert server_args.enable_mixed_batch is False
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
-    assert spec["padded_prefill_replay"] is False
-    # Named buckets opt in; the disable flag or a mixed batch opts back out.
-    server_args.prefill_graph_capture_sizes = [256, 4096]
-    spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
+    # The disable flag or a mixed batch turns it off.
     server_args.disable_prefill_graph = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
@@ -349,8 +329,7 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
     server_args.enable_mixed_batch = False
-    server_args.prefill_graph_capture_sizes = None
-    # The prefill role keeps its layerwise condition and needs no named buckets.
+    # The prefill role keeps its layerwise condition.
     server_args.disaggregation_mode = "prefill"
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
@@ -1057,6 +1036,57 @@ def test_the_fused_key_and_head_weight_projection_matches_the_two_gemms(
     # Bitwise numerics project every row in one GEMM up front.
     eager = bitwise(hidden, q_lora, positions)
     assert eager.query_proj is None and eager.query.shape == (37, 32, 128)
+
+
+@requires_gpu
+def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
+    """One GEMM over ``q_norm`` for ``q_b_proj`` and the indexer's ``wq_b``
+    gives the two projections, keeps tracking in-place loads into either
+    parameter, and is skipped under bitwise numerics."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.manual_seed(0)
+    attention = _indexer_attention(index_topk=2048)
+    with torch.no_grad():
+        for linear in (attention.q_b_proj, attention.indexer.wq_b):
+            linear.weight.normal_(0.0, 0.05)
+    q_norm = torch.randn(37, 128, device="cuda", dtype=torch.bfloat16)
+    want_q = attention.q_b_proj(q_norm)[0].float()
+    want_index = attention.indexer._project_query(q_norm).float()
+
+    attention.fuse_query_projections()
+    fused = attention.q_b_wq_b_weight
+    rows = attention.q_b_proj.weight.shape[0]
+    assert fused.shape == (rows + 32 * 128, 128)
+    got_q, got_index = mm(q_norm, fused).split((rows, 32 * 128), dim=-1)
+    torch.testing.assert_close(got_q.float(), want_q, rtol=2**-7, atol=1e-5)
+    torch.testing.assert_close(
+        got_index.float().view(37, 32, 128), want_index, rtol=2**-7, atol=1e-5
+    )
+
+    with torch.no_grad():
+        attention.q_b_proj.weight.normal_(0.0, 0.05)
+        attention.indexer.wq_b.weight.normal_(0.0, 0.05)
+    got_q, got_index = mm(q_norm, fused).split((rows, 32 * 128), dim=-1)
+    torch.testing.assert_close(
+        got_q.float(),
+        q_norm.float() @ attention.q_b_proj.weight.float().T,
+        atol=2e-3,
+        rtol=1.6e-2,
+    )
+    torch.testing.assert_close(
+        got_index.float(),
+        q_norm.float() @ attention.indexer.wq_b.weight.float().T,
+        atol=2e-3,
+        rtol=1.6e-2,
+    )
+
+    bitwise = _indexer_attention(index_topk=2048)
+    monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
+    bitwise.fuse_query_projections()
+    assert bitwise.q_b_wq_b_weight is None
 
 
 def _separable_keys(num_tokens: int, bad: torch.Tensor, device):
@@ -2113,6 +2143,7 @@ def _prefill_then_decode_twice(
 
 
 @requires_gpu
+@pytest.mark.parametrize("fused_query", [False, True])
 @pytest.mark.parametrize(
     "kv_cache_dtype, spec_width, fraction",
     [
@@ -2124,7 +2155,7 @@ def _prefill_then_decode_twice(
     ],
 )
 def test_k31_attention_matches_dense_mla_and_replays_in_a_decode_graph(
-    monkeypatch, kv_cache_dtype, spec_width, fraction
+    monkeypatch, kv_cache_dtype, spec_width, fraction, fused_query
 ) -> None:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -2140,6 +2171,9 @@ def test_k31_attention_matches_dense_mla_and_replays_in_a_decode_graph(
         kvp_size=1,
         kvp_rank=0,
     )
+    if fused_query:
+        attention.fuse_query_projections()
+        assert attention.q_b_wq_b_weight is not None
     prompt = 40
     hidden = torch.randn(
         prompt + 2 * spec_width, 256, device="cuda", dtype=torch.bfloat16

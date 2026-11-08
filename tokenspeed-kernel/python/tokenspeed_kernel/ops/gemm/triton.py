@@ -424,7 +424,13 @@ register_kernel(
         "k_max": frozenset({8192}),
         "weight_split": frozenset({True}),
     },
-    priority=Priority.SPECIALIZED,
+    # Above gluon_simt_gemm_fp32, which also takes split weights of up to 256
+    # rows from 17 to 96 rows. On GB200 (N 256, CUDA graphs of 49 calls over
+    # cold weights) this kernel was 1.3x to 3.2x faster at every row count for
+    # K from 5120 to 8192 and from 32 rows for K 3072 and 4096; the CUDA-core
+    # kernel was up to 1.5x faster below 32 rows there and below 48 rows at K
+    # 2048. Beam's router (K 5120) is the only caller that keeps a split.
+    priority=Priority.SPECIALIZED + 2,
     weight_preprocessor=split_fp32_weight_bf16x3,
 )(triton_bf16x3_gemm_fp32)
 
@@ -437,9 +443,9 @@ register_kernel(
 # Registry dispatch: rowcta owns BF16 M == 1 and the FP32 row-CTA kernel
 # owns narrow FP32-weight projections with M <= 16 (FP32 or BF16 activations).
 # From 17 rows, BF16 activations against an FP32 weight take
-# gluon_simt_gemm_fp32 up to 96 rows and, with a weight split,
-# triton_bf16x3_gemm_fp32, where their registrations match. Torch handles
-# the shapes that no registered kernel takes.
+# triton_bf16x3_gemm_fp32 with a weight split and gluon_simt_gemm_fp32 up to
+# 96 rows without one, where their registrations match. Torch handles the
+# shapes that no registered kernel takes.
 _BF16_SIG = frozenset(
     {
         format_signature(

@@ -351,6 +351,7 @@ def test_an_override_this_platform_cannot_run_raises(monkeypatch):
                     scales=None,
                     slots=slots(tokens, 256, seed=16),
                 ),
+                query_dtype=q.dtype,
                 return_kv=False,
                 override="triton_gqa_prologue",
                 solution=None,

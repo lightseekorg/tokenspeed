@@ -43,9 +43,6 @@ from tokenspeed.runtime.layers.paged_attention import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from tokenspeed.runtime.model_loader.weight_utils import (
-    default_weight_loader,
-)
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, make_layers
@@ -360,9 +357,8 @@ class Qwen3ForCausalLM(BaseCausalLM):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
+    def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
+        return [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
@@ -370,49 +366,13 @@ class Qwen3ForCausalLM(BaseCausalLM):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        """
-        'model.layers.0.self_attn.q_norm.weight',
-        'model.layers.0.self_attn.k_norm.weight',
-        'model.layers.0.self_attn.qkv_proj.weight',
-        'model.layers.0.self_attn.o_proj.weight',
-        'model.layers.0.mlp.gate_up_proj.weight',
-        'model.layers.0.mlp.down_proj.weight',
-        'model.layers.0.input_layernorm.weight',
-        'model.layers.0.post_attention_layernorm.weight'
-        """
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "Embedding" in self.config.name_or_path:
-                name = add_prefix(name, "model")
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
+    ) -> set[str]:
+        # Qwen3-Embedding checkpoints omit the backbone's model prefix.
+        if "Embedding" in self.config.name_or_path:
+            weights = ((add_prefix(name, "model"), w) for name, w in weights)
+        return super().load_weights(weights, **kwargs)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

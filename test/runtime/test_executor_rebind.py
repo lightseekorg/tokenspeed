@@ -203,6 +203,8 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     seen = []
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
+    # A drafter's own prefill graph does not wait for the extend-graph switch.
+    executor.config = SimpleNamespace(enable_drafter_prefill_graph=False)
     executor.forward_step = SimpleNamespace(
         disable=False,
         stream="stream",
@@ -246,6 +248,7 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
     )
     executor.drafter = SimpleNamespace(
         release_prefill_graph=lambda: order.append("drafter"),
+        release_extend_graphs=lambda: order.append("drafter extend"),
         release_round_graphs=lambda: order.append("drafter rounds"),
     )
     monkeypatch.setattr(
@@ -263,6 +266,7 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
         "decode",
         "prefill",
         "drafter",
+        "drafter extend",
         "drafter rounds",
         ("unfreeze", "cuda"),
         "collect",
@@ -283,11 +287,11 @@ def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeyp
     dflash = DFlash.__new__(DFlash)
     rebuilt = []
     dflash._init_fused_kv_helper = lambda: rebuilt.append("fused_kv")
-    dflash._init_incremental_proj = lambda: rebuilt.append("incremental_proj")
+    dflash._init_context_taps = lambda: rebuilt.append("context_taps")
     dflash.set_cache_pool("real")
     assert dflash.token_to_kv_pool == "real"
     assert _dflash_fused_kv._cached_kv_ptrs == {}
-    assert rebuilt == ["fused_kv", "incremental_proj"]
+    assert rebuilt == ["fused_kv", "context_taps"]
 
     # Only the last pipeline stage owns the draft context cache.
     producer = DSparkContextProducer.__new__(DSparkContextProducer)

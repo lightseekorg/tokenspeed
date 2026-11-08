@@ -26,7 +26,7 @@ cannot be enabled together.
 ## Model-wide QCP
 
 On the PD prefill role, `--query-context-parallel-size` shards each extend
-forward's packed rows contiguously over attention TP (`QueryShardPlan`), from
+forward's rows in per-request zigzag order over attention TP (`QueryShardPlan`), from
 the embedding through the final norm. Attention heads stay replicated, so a
 rank attends its own rows with every head against the complete history and
 no partial attention is merged. Backend metadata, positions and cache
@@ -34,17 +34,18 @@ coordinates always describe the complete span; only compute rows are local.
 
 - Cache production uses the complete span. Compressor projections and SWA
   rows are gathered before pooling and cache writes, so every rank writes the
-  same rows (owner-masked under KVP). A rank boundary is never a cache prefix
+  same rows (owner-masked under KVP). Gathered rows are restored to span
+  order before compressor pairing, SWA planning, or cache writes. A rank boundary is never a cache prefix
   or a compressor pairing boundary.
 - CED narrowing keeps each retained row on the rank that owned it in the
-  encoder: the decoder's per-rank row counts follow the encoder shard
-  boundaries, without redistribution. The backend plans these row maps once
+  encoder: the decoder plan retains the original row owners and gathers
+  selected rows back into canonical order, without redistribution. The backend plans these row maps once
   per forward from host spans.
 - Ranks without local rows still join every collective: projection and SWA
   gathers, KVP history gathers, Engram and MoE.
 - Engram gathers hash IDs and reduce-scatters the table contributions back to
   local rows. The output gathers only the sampled rows. With DSpark it also
-  gathers the retained CED taps in rank order, so the drafter writes the
+  restores gathered CED taps to span order, so the drafter writes the
   replicated SWA-window fields from complete rows.
 
 KVP is either 1 (replicated KV) or equal to QCP, in which case every rank
