@@ -236,6 +236,10 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
 
     assert isinstance(model.model.layers[0].mlp, GatedMLP)
     assert isinstance(model.model.layers[3].mlp, MiniMaxM3SparseMoeBlock)
+    layers = model.model.layers
+    assert [layer.comm_manager.is_moe for layer in layers] == [False] * 3 + [True]
+    # Layer 3 follows a dense layer, so it opens on the dense layout.
+    assert [layer.comm_manager.prev_is_moe for layer in layers] == [False] * 4
     experts = model.model.layers[3].mlp.experts
     assert experts.w13_weight.shape == (8, 64, 128)
     assert experts.w13_weight_scale_inv.dtype == torch.uint8
