@@ -64,16 +64,26 @@ def populate_torch_stack(
     write_distribution(root, "amd-torch-device-gfx1250", torch_version)
 
 
-def test_torch_accepts_a_local_rocm_version_for_a_public_version_pin(tmp_path):
-    populate_torch_stack(
-        tmp_path,
-        "2.14.0+rocm10.3.0a20261107",
-        "0.29.0+rocm10.3.0a20261107",
-    )
+@pytest.mark.parametrize("installed_tag", ["rocm7.2", "rocm7.1", "cpu"])
+def test_torch_reuses_only_the_pinned_build(tmp_path, installed_tag):
+    populate_torch_stack(tmp_path, f"2.14.0+{installed_tag}", f"0.29.0+{installed_tag}")
+
+    result = run_checker(tmp_path, "torch", "2.14.0+rocm7.2", "0.29.0+rocm7.2", "")
+
+    assert (result.returncode == 0) == (installed_tag == "rocm7.2"), result.stderr
+    if result.returncode:
+        expected = f"torch: expected 2.14.0+rocm7.2, found 2.14.0+{installed_tag}"
+        assert expected in result.stderr
+
+
+def test_torch_rejects_a_public_version_pin(tmp_path):
+    populate_torch_stack(tmp_path, "2.14.0+rocm7.2", "0.29.0+rocm7.2")
 
     result = run_checker(tmp_path, "torch", "2.14.0", "0.29.0", "")
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 1
+    for pin in ("torch: pin 2.14.0", "torchvision: pin 0.29.0"):
+        assert f"{pin} must include the local build tag" in result.stderr
 
 
 def test_torch_requires_an_exact_local_version_and_device_package(tmp_path):

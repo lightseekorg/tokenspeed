@@ -6,8 +6,10 @@ set -e
 # ============================================================
 GFX_ARCH=${GFX_ARCH:-gfx950}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
-TORCH_VERSION=${TORCH_VERSION:-2.14.0}
-TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.29.0}
+# Torch pins carry the local build tag of the wheels on TORCH_INDEX_URL; keep
+# them in sync so the reuse check in Step 3 only accepts builds for this ROCm.
+TORCH_VERSION=${TORCH_VERSION:-2.14.0+rocm7.2}
+TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.29.0+rocm7.2}
 TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/rocm7.2}
 TORCH_DEVICE_PACKAGE=${TORCH_DEVICE_PACKAGE:-}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

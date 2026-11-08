@@ -14,12 +14,6 @@ def _installed_version(distribution: str) -> str | None:
         return None
 
 
-def _version_matches(actual: str, expected: str) -> bool:
-    if "+" in expected:
-        return actual == expected
-    return actual == expected or actual.startswith(f"{expected}+")
-
-
 def _require_exact(errors: list[str], distribution: str, expected: str) -> None:
     actual = _installed_version(distribution)
     if actual != expected:
@@ -58,13 +52,21 @@ def _verify_torch(
         ("torch", torch_version),
         ("torchvision", torchvision_version),
     ):
+        # A public version such as 2.14.0 is shared by the ROCm, CUDA, and CPU
+        # builds, so only the local tag (+rocm7.2) identifies the stack.
+        if "+" not in expected:
+            errors.append(
+                f"{module_name}: pin {expected} must include the local build "
+                "tag, such as +rocm7.2"
+            )
+            continue
         try:
             module = importlib.import_module(module_name)
         except Exception as exc:
             errors.append(f"{module_name}: import failed: {exc}")
             continue
         actual = getattr(module, "__version__", "")
-        if not _version_matches(actual, expected):
+        if actual != expected:
             errors.append(f"{module_name}: expected {expected}, found {actual}")
 
     if device_requirement:
