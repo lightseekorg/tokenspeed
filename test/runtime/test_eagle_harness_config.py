@@ -21,7 +21,6 @@
 """EAGLE-Harness server arguments: the trees and chains it serves and the
 settings it refuses."""
 
-import json
 import os
 import sys
 import tempfile
@@ -37,18 +36,12 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=2, suite="runtime-1gpu")
 
-from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
-    EagleHarnessConfig,
     _routes_experts,
     chain_table_width,
     chain_width_table,
-    check_chain_cost_domain,
     decode_graph_floors,
     first_rank_value,
-)
-from tokenspeed.runtime.execution.drafter.eagle_harness.cost import (
-    measured_batch_sizes,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -184,71 +177,6 @@ class TestEagleHarnessConfig:
                 table(**measured)
             assert table(**measured, speculative_chain_width_table="9:4") == [(9, 4)]
             assert table(**measured, max_num_seqs=8) == []
-
-    def test_a_cap_below_the_warmup_passes_the_drafter_load_check_it_starts_with(
-        self, tmp_path
-    ):
-        """At a --max-num-seqs below one request per attention-TP peer, the
-        decode state holds the warmup's requests, but rounds still run at most
-        the cap: the drafter-load check accepts the cost data that startup
-        accepted."""
-        model_dir = tmp_path / "model"
-        model_dir.mkdir()
-        (model_dir / "config.json").write_text(
-            json.dumps(
-                dict(
-                    model_type="qwen3",
-                    architectures=["Qwen3ForCausalLM"],
-                    torch_dtype="bfloat16",
-                    vocab_size=128,
-                    hidden_size=64,
-                    intermediate_size=128,
-                    num_hidden_layers=2,
-                    num_attention_heads=8,
-                    num_key_value_heads=8,
-                    head_dim=8,
-                    max_position_embeddings=256,
-                    eos_token_id=2,
-                )
-            )
-        )
-        cost_dir = tmp_path / "data" / "cost"
-        (cost_dir / "bs_1").mkdir(parents=True)
-        # Startup validation accepts cost data measured at the cap alone.
-        sa = ServerArgs(
-            model=str(model_dir),
-            speculative_algorithm="EAGLE4",
-            speculative_eagle_topk=1,
-            speculative_num_steps=15,
-            speculative_num_draft_tokens=16,
-            dtype="bfloat16",
-            max_model_len=256,
-            world_size=8,
-            attn_tp_size=8,
-            speculative_exec_mode=0,
-            speculative_data_path=str(tmp_path / "data"),
-            speculative_compute_intensity="chain_intensity",
-            max_num_seqs=1,
-        )
-        assert (sa.max_num_seqs, sa.request_state_seqs) == (1, 8)
-        harness = EagleHarnessConfig.from_server_args(
-            sa,
-            ModelConfig(
-                model_path=sa.model,
-                trust_remote_code=False,
-                model_override_args="{}",
-                server_args=sa,
-                dtype=sa.dtype,
-                context_length=sa.max_model_len,
-            ),
-        )
-        # The check the drafter runs when it loads the cost data.
-        check_chain_cost_domain(
-            measured_batch_sizes(str(cost_dir)),
-            harness.chain_width_table,
-            harness.max_requests,
-            str(cost_dir),
-        )
 
     def test_decode_graph_floors(self):
         """Each decode graph's floor: the live batches replaying it are those

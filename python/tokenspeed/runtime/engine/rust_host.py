@@ -87,8 +87,6 @@ from tokenspeed.runtime.engine.rank_setup import (
     maybe_warm_cupti_for_graph_capture,
     rank_process_title,
     request_length_limits,
-    request_state_slots,
-    scheduler_batch_slots,
     scheduler_config_from_args,
 )
 from tokenspeed.runtime.engine.scheduler_utils import (
@@ -1202,7 +1200,8 @@ class HostBootstrap:
                 if kv_events
                 else None
             )
-            max_batch_size = scheduler_batch_slots(server_args)
+            # The scheduler's request slots are per attention-DP rank.
+            max_batch_size = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
             device = build_device_side(
                 server_args=server_args,
                 model_config=model_config,
@@ -1214,7 +1213,6 @@ class HostBootstrap:
                 overlap_schedule_depth=overlap_schedule_depth,
                 decode_input_tokens=decode_input_tokens,
                 max_batch_size=max_batch_size,
-                request_slots=request_state_slots(server_args),
                 kv_transfer_builder=functools.partial(
                     build_host_peer, outbox=pd_outbox
                 ),

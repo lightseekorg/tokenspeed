@@ -108,7 +108,7 @@ def worker_main(rank: int, world_size: int, port: int, attn_tp: int) -> None:
     global_server_args_dict["chunked_prefill_size"] = rows * world_size
     global_server_args_dict["max_prefill_tokens"] = rows * world_size
     global_server_args_dict["max_model_len"] = 4096
-    global_server_args_dict["request_state_seqs"] = rows
+    global_server_args_dict["max_num_seqs"] = rows
     global_server_args_dict["batch_invariant_collectives"] = True
     global_server_args_dict["force_deterministic_rsag"] = False
     try:

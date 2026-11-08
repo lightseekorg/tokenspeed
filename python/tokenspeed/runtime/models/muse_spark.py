@@ -3176,7 +3176,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         )
         decode_rows = max(
             int(global_server_args_dict["max_cudagraph_capture_size"] or 0),
-            int(global_server_args_dict["request_state_seqs"] or 0),
+            int(global_server_args_dict["max_num_seqs"] or 0),
         )
         if global_server_args_dict["speculative_algorithm"]:
             decode_rows *= int(global_server_args_dict["speculative_num_draft_tokens"])

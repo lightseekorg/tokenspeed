@@ -442,7 +442,7 @@ Trainer-side contract:
 | --- | --- |
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
-| `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. With speculative decoding outside prefill-only roles, TokenSpeed still sizes per-request decode state for at least one request per attention-TP peer on each DP rank, which the draft decode warmup needs. |
+| `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--prefill-chunk-yield-tokens` | Prefill servers: the room, in tokens, a prefill chunk that cannot finish its prompt makes for bootstrapped prompts waiting behind it that fit whole (counted past their prefix hit), so they run complete in the same forward instead of waiting for the long prompt's chunk to pass. The chunk ends on an earlier page and gives up fewer than N plus one page, only while such prompts wait and only what they take, so the long prompt keeps about half of every round or more. `0` (default) is off; at most half of `--chunked-prefill-size`; a decode server ignores it ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
@@ -780,15 +780,15 @@ overflow) proposes a junk token and records the sentinel for that row, so
 verify rejects the token and samples from the full target. It never raises a
 device error.
 
-Memory: the recorded distributions take `(S + 2) x num_draft_tokens x vocab_size
-x 4` bytes (`--speculative-num-draft-tokens` fp32 rows per request-pool slot),
-plus a batch-ordered gather buffer of `S x num_draft_tokens x vocab_size x 4`
-bytes on the verifier. `S` is the number of requests TokenSpeed sizes decode
-state for: `--max-num-seqs`, or one request per attention-TP peer on each DP
-rank if that is more. 80 requests at 4 draft tokens over a 129K vocabulary cost
-about 330 MB in total. On CUDA, when the CUDA-graph memory reserve is on, the
-runtime charges both to it as startup residue, out of the KV-cache budget.
-Otherwise they come out of the `--gpu-memory-utilization` headroom.
+Memory: the recorded distributions take
+`(max_num_seqs + 2) x num_draft_tokens x vocab_size x 4` bytes
+(`--speculative-num-draft-tokens` fp32 rows per request-pool slot), plus a
+batch-ordered gather buffer of `max_num_seqs x num_draft_tokens x vocab_size x
+4` bytes on the verifier. 80 requests at 4 draft tokens over a 129K
+vocabulary cost about 330 MB in total. On CUDA, when the CUDA-graph memory
+reserve is on, the runtime charges both to it as startup residue, out of the
+KV-cache budget. Otherwise they come out of the `--gpu-memory-utilization`
+headroom.
 
 #### DFLASH with a DFlash2 draft
 
@@ -809,10 +809,10 @@ probability `min(1, p'(x) / q(x))` and on rejection samples from
 request's temperature, top-k and top-p, the one the Triton backend serves.
 
 - Memory: `q` reuses the draft-tree q tables (`RuntimeStates.future_draft_q`),
-  `(S + 2) x (num_draft_tokens - 1) x K x 8` bytes (`S` as above) plus two int32
-  rows of `num_draft_tokens` per slot. That is under 1 MB at 512 slots, 8 draft
-  tokens and `K = 16`. No dense per-vocab rows, no gather buffer, and the draft
-  head keeps its shard-local top-K.
+  `(max_num_seqs + 2) x (num_draft_tokens - 1) x K x 8` bytes plus two int32
+  rows of `num_draft_tokens` per slot. That is under 1 MB at 512 slots, 8
+  draft tokens and `K = 16`. No dense per-vocab rows, no gather buffer, and
+  the draft head keeps its shard-local top-K.
 - No proposal: a fresh admission, a PD landing and a forced single-token
   verify record no `q`. Their drafts are checked by the target-only rule,
   which keeps a draft exactly when it equals the target's own draw at that

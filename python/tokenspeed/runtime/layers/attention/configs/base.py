@@ -336,7 +336,7 @@ def model_wide_kwargs(
         kv_cache_mxfp8=kv_cache_mxfp8,
         kv_cache_quant_method=server_args.kv_cache_quant_method,
         context_len=model_config.context_len + server_args.spec_context_pad,
-        max_bs=server_args.request_state_seqs
+        max_bs=server_args.max_num_seqs
         // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,

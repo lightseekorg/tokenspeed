@@ -148,7 +148,7 @@ class TritonRSAGBackend:
         else:
             max_attn_tp_num_tokens = max_prefill_tokens + max_model_len
         max_decode_bs = (
-            global_server_args_dict["request_state_seqs"] or 0
+            global_server_args_dict["max_num_seqs"] or 0
         ) // mapping.attn.dp_size
         decode_tokens_per_req = (
             global_server_args_dict["speculative_num_draft_tokens"]

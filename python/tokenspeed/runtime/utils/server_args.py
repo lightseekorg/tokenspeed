@@ -821,12 +821,6 @@ class ServerArgs:
     _speculative_widths_explicit: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
-    # Requests the per-request decode state (request slots, decode buffers,
-    # drafter state, decode graphs) is sized for, across attention-DP ranks.
-    # It is max_num_seqs, raised to one request per attention-TP peer per DP
-    # rank where the draft decode warmup runs (resolve_request_state_seqs).
-    # The scheduler still admits at most max_num_seqs.
-    request_state_seqs: int = dataclasses.field(default=0, init=False)
 
     @property
     def spec_context_pad(self) -> int:
@@ -854,31 +848,8 @@ class ServerArgs:
         self.resolve_communication()
         self.resolve_numerics()
         self.resolve_disaggregation()
-        self.resolve_request_state_seqs()
         self.validate_output_cumulative_probs()
         self.validate()
-
-    def resolve_request_state_seqs(self):
-        """Size per-request decode state for the draft decode warmup.
-
-        The warmup decodes one request per attention-TP peer on every DP rank,
-        so empty peers never skip the tuning collectives the others enter
-        (ModelExecutor.autotune). A smaller --max-num-seqs still caps the
-        requests the scheduler runs; only the state is sized for the warmup.
-        """
-        self.request_state_seqs = self.max_num_seqs
-        if (
-            self.speculative_algorithm is not None
-            and self.disaggregation_mode != "prefill"
-        ):
-            warmup_seqs = self.mapping.attn.dp_size * self.mapping.attn.tp_size
-            if self.max_num_seqs < warmup_seqs:
-                logger.info(
-                    f"Sizing per-request decode state for {warmup_seqs} requests "
-                    "(one per attention-TP peer for the draft decode warmup); "
-                    f"the scheduler runs at most --max-num-seqs {self.max_num_seqs}"
-                )
-                self.request_state_seqs = warmup_seqs
 
     def validate_output_cumulative_probs(self):
         from tokenspeed.runtime.utils.env import envs
@@ -2743,6 +2714,24 @@ class ServerArgs:
 
         self.validate_model_update_options()
 
+        if (
+            self.speculative_algorithm is not None
+            and self.disaggregation_mode != "prefill"
+            and self.max_num_seqs is not None
+        ):
+            dp_size = self.mapping.attn.dp_size
+            tp_size = self.mapping.attn.tp_size
+            # Draft startup uses one request per TP peer, even when tactic
+            # profiling is disabled. Clamping would leave empty tuning peers;
+            # exceeding this capacity would overrun per-request decode state.
+            if self.max_num_seqs // dp_size < tp_size:
+                raise ValueError(
+                    "Speculative decode warmup requires max_num_seqs // "
+                    "data_parallel_size >= attn_tp_size, got "
+                    f"{self.max_num_seqs} // {dp_size} < {tp_size}. "
+                    f"Set --max-num-seqs to at least {dp_size * tp_size}."
+                )
+
         if self.mapping.has_attn_dp:
             if self.chunked_prefill_size > self.max_prefill_tokens:
                 raise ValueError(
@@ -2966,11 +2955,7 @@ class ServerArgs:
             metavar="MAX_NUM_SEQS",
             type=int,
             default=ServerArgs.max_num_seqs,
-            help="Maximum number of sequences to process concurrently. With "
-            "speculative decoding, the server still sizes per-request decode "
-            "state for at least one request per attention-TP peer per DP rank, "
-            "which the draft decode warmup needs, but the scheduler runs at "
-            "most this many.",
+            help="Maximum number of sequences to process concurrently.",
         )
         parser.add_argument(
             "--max-total-tokens",

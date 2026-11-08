@@ -75,9 +75,7 @@ global_server_args_dict: dict = {
     "enable_allreduce_fusion": ServerArgs.enable_allreduce_fusion,
     "max_prefill_tokens": ServerArgs.max_prefill_tokens,
     "max_model_len": ServerArgs.max_model_len,
-    # Per-request decode state sizing (ServerArgs.request_state_seqs), not
-    # the scheduler's --max-num-seqs.
-    "request_state_seqs": ServerArgs.request_state_seqs,
+    "max_num_seqs": ServerArgs.max_num_seqs,
     "moe_backend": ServerArgs.moe_backend,
     "moe_cutlass_fused_finalize": ServerArgs.moe_cutlass_fused_finalize,
     "moe_mxfp4_fp8_activation": ServerArgs.moe_mxfp4_fp8_activation,
@@ -146,7 +144,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "enable_allreduce_fusion": server_args.enable_allreduce_fusion,
             "max_prefill_tokens": server_args.max_prefill_tokens,
             "max_model_len": server_args.max_model_len,
-            "request_state_seqs": server_args.request_state_seqs,
+            "max_num_seqs": server_args.max_num_seqs,
             "moe_backend": server_args.moe_backend,
             "moe_cutlass_fused_finalize": server_args.moe_cutlass_fused_finalize,
             "moe_mxfp4_fp8_activation": server_args.moe_mxfp4_fp8_activation,

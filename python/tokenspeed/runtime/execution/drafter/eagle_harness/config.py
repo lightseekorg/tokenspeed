@@ -158,8 +158,7 @@ class EagleHarnessConfig:
     eos_token_id: int | None
     # Chain verify width per live batch size, exec modes 0/1; empty: the confidence rule decides.
     chain_width_table: ChainWidthTable
-    # --max-num-seqs: the most live requests of a round. The startup draft
-    # decode warmup, which can exceed it (request_state_seqs), begins no round.
+    # --max-num-seqs: the most live requests of a round.
     max_requests: int
     # (padded batch, floor) per decode graph: it serves floor + 1 to padded batch live requests.
     decode_graph_floors: tuple[tuple[int, int], ...]
@@ -202,7 +201,7 @@ def decode_graph_floors(server_args: ServerArgs) -> tuple[tuple[int, int], ...]:
     ladder = get_batch_sizes_to_capture(
         DecodeLadderArgs(
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
-            max_num_seqs=server_args.request_state_seqs,
+            max_num_seqs=server_args.max_num_seqs,
             data_parallel_size=dp_size,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
