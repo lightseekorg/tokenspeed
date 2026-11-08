@@ -23,7 +23,6 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from process_group_manager import ProcessGroupManager, make_manager
-from runtime_imports import reachable_runtime_paths
 
 try:
     import yaml
@@ -318,18 +317,18 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: optional must be a boolean or a per-label mapping; "
                 f"got {type(optional).__name__}"
             )
-    if "import_roots" in data:
-        roots = data["import_roots"]
+    if "ignore_changes" in data:
+        prefixes = data["ignore_changes"]
         if (
-            not isinstance(roots, list)
-            or not roots
+            not isinstance(prefixes, list)
+            or not prefixes
             or not all(
-                isinstance(root, str) and root and not root.endswith("/")
-                for root in roots
+                isinstance(prefix, str) and prefix and not prefix.endswith("/")
+                for prefix in prefixes
             )
         ):
             raise ValueError(
-                f"{path}: import_roots must be a non-empty list of paths without "
+                f"{path}: ignore_changes must be a non-empty list of paths without "
                 "a trailing slash"
             )
     if "retries" in data:
@@ -2318,40 +2317,28 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def path_is_unreached(path: str, roots: List[str], reached: frozenset[str]) -> bool:
-    """Whether a changed ``path`` cannot affect a task with ``import_roots``.
-
-    That holds for Markdown, and for runtime sources and runtime tests that
-    are neither under the roots nor imported by them.
-    """
-    if path.endswith(".md"):
-        return True
-    if not path.endswith(".py") or not path.startswith(
-        ("python/tokenspeed/", "test/runtime/")
-    ):
-        return False
-    under_root = any(path == root or path.startswith(f"{root}/") for root in roots)
-    return not under_root and path not in reached
+def path_is_ignored(path: str, prefixes: List[str]) -> bool:
+    """Whether a task with ``ignore_changes`` can ignore a changed ``path``:
+    Markdown, or a path under one of the listed directories."""
+    return path.endswith(".md") or any(
+        path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes
+    )
 
 
-def drop_unreached_tasks(
+def drop_unaffected_tasks(
     include: List[Dict[str, Any]], changed: List[str], repo_root: Path
 ) -> List[Dict[str, Any]]:
-    """Drop the entries of tasks that no changed path can affect."""
-    reached_by_config: Dict[str, Optional[tuple]] = {}
+    """Drop the entries of tasks whose ``ignore_changes`` covers every change."""
+    prefixes_by_config: Dict[str, Optional[List[str]]] = {}
     kept = []
     for entry in include:
         config = entry["config"]
-        if config not in reached_by_config:
-            roots = normalize_task(repo_root / config, repo_root).get("import_roots")
-            reached_by_config[config] = (
-                None
-                if roots is None
-                else (roots, reachable_runtime_paths(repo_root, roots))
-            )
-        scope = reached_by_config[config]
-        if scope is None or not all(
-            path_is_unreached(path, *scope) for path in changed
+        if config not in prefixes_by_config:
+            task = normalize_task(repo_root / config, repo_root)
+            prefixes_by_config[config] = task.get("ignore_changes")
+        prefixes = prefixes_by_config[config]
+        if prefixes is None or not all(
+            path_is_ignored(path, prefixes) for path in changed
         ):
             kept.append(entry)
     return kept
@@ -2394,7 +2381,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 ]
             # Pull requests only: pushes to main still run every task.
             if args.trigger == "per-commit" and 0 < len(changed) < 300:
-                matrix["include"] = drop_unreached_tasks(
+                matrix["include"] = drop_unaffected_tasks(
                     matrix["include"], changed, repo_root
                 )
         print(json.dumps(matrix, separators=(",", ":")))

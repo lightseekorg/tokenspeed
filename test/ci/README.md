@@ -183,20 +183,18 @@ optional:
   amd-mi355-1gpu: true
 ```
 
-`import_roots` lists repository paths (Python files or directories) whose
-imports bound the runtime code a task exercises. On pull requests the scan
-drops the task when every changed file is Markdown, or a Python file under
-`python/tokenspeed/` or `test/runtime/` that is neither under a root nor
-imported from the roots, directly or through other runtime modules. Importing
-a module counts its parent packages' `__init__.py`; modules loaded by name
-through `importlib` are not followed. Pushes to `main` and manual runs keep
-every task. The per-commit kernel unit-test tasks declare
-`tokenspeed-kernel/test`, so a pull request that changes only runtime modules
-the kernel tests never import skips them.
+`ignore_changes` lists directories whose changes cannot affect a task. On
+pull requests the scan drops the task when every changed file is Markdown or
+lies under one of them. Pushes to `main` and manual runs keep every task. The
+per-commit kernel unit-test tasks list the runtime sources and runtime tests,
+so a pull request that changes only the runtime skips them. That holds because
+the kernel tests never import the runtime: the `kernel-tests-without-runtime`
+pre-commit hook rejects such an import under `tokenspeed-kernel/test`.
 
 ```yaml
-import_roots:
-  - tokenspeed-kernel/test
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
 ```
 
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to

@@ -1332,73 +1332,46 @@ def test_scan_runs_only_kernel_benchmarks_for_suite_only_changes(
     assert [entry["name"] for entry in matrix["include"]] == expected
 
 
-_RUNTIME_FILES = {
-    "python/tokenspeed/__init__.py": "",
-    # Imported lazily inside a function.
-    "python/tokenspeed/lazy.py": "def f():\n    from tokenspeed.leaf import x\n",
-    "python/tokenspeed/leaf.py": "x = 1\n",
-    # Imported only by its package's __init__.py.
-    "python/tokenspeed/pkg/__init__.py": "import tokenspeed.via_init\n",
-    "python/tokenspeed/pkg/mod.py": "",
-    "python/tokenspeed/via_init.py": "",
-    "python/tokenspeed/unreached.py": "",
-    "tokenspeed-kernel/test/test_kernel.py": (
-        "import tokenspeed_kernel\n"
-        "import tokenspeed.pkg.mod\n"
-        "import tokenspeed.deleted\n"
-        "def test():\n"
-        "    from tokenspeed.lazy import f\n"
-    ),
-}
-
-
 @pytest.mark.parametrize(
     ("changed", "trigger", "expected"),
     [
-        ("python/tokenspeed/unreached.py\n", "per-commit", ["other"]),
+        ("python/tokenspeed/runtime/a.py\n", "per-commit", ["other"]),
         (
-            "python/tokenspeed/unreached.py\ntest/runtime/test_x.py\ndocs/x.md\n",
+            "python/tokenspeed/runtime/a.py\ntest/runtime/test_a.py\ndocs/a.md\n",
             "per-commit",
             ["other"],
         ),
-        ("python/tokenspeed/leaf.py\n", "per-commit", ["kernel", "other"]),
-        ("python/tokenspeed/via_init.py\n", "per-commit", ["kernel", "other"]),
-        ("python/tokenspeed/deleted.py\n", "per-commit", ["kernel", "other"]),
+        ("python/tokenspeed/data.json\n", "per-commit", ["other"]),
         (
-            "tokenspeed-kernel/test/test_kernel.py\n",
+            "python/tokenspeed/runtime/a.py\ntokenspeed-kernel/python/a.py\n",
             "per-commit",
             ["kernel", "other"],
         ),
+        ("python/tokenspeed_extra/a.py\n", "per-commit", ["kernel", "other"]),
         (
-            "python/tokenspeed/unreached.py\npython/tokenspeed/data.json\n",
+            "python/tokenspeed/runtime/a.py\ntest/ci_system/pipeline.py\n",
             "per-commit",
             ["kernel", "other"],
         ),
+        ("python/tokenspeed/runtime/a.py\n", "post-submit", ["kernel", "other"]),
         (
-            "python/tokenspeed/unreached.py\ntest/ci_system/pipeline.py\n",
-            "per-commit",
-            ["kernel", "other"],
-        ),
-        ("python/tokenspeed/unreached.py\n", "post-submit", ["kernel", "other"]),
-        (
-            "\n".join(f"python/tokenspeed/unreached{i}.py" for i in range(300)),
+            "\n".join(f"python/tokenspeed/runtime/{i}.py" for i in range(300)),
             "per-commit",
             ["kernel", "other"],
         ),
     ],
 )
-def test_scan_drops_tasks_whose_import_roots_miss_every_change(
+def test_scan_drops_tasks_whose_ignored_paths_cover_every_change(
     changed, trigger, expected, tmp_path, capsys, monkeypatch
 ):
     monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
     monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
-    for name, text in _RUNTIME_FILES.items():
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_text(text)
     root = tmp_path / "test/ci"
     root.mkdir(parents=True)
-    roots = "import_roots:\n  - tokenspeed-kernel/test\n"
-    _write_task_yaml(root, "kernel.yaml", _default_body("kernel", ["b200-1gpu"], roots))
+    ignored = "ignore_changes:\n  - python/tokenspeed\n  - test/runtime\n"
+    _write_task_yaml(
+        root, "kernel.yaml", _default_body("kernel", ["b200-1gpu"], ignored)
+    )
     _write_task_yaml(root, "other.yaml", _default_body("other", ["b200-1gpu"]))
     changed_file = tmp_path / "changed.txt"
     changed_file.write_text(changed)
@@ -1409,29 +1382,15 @@ def test_scan_drops_tasks_whose_import_roots_miss_every_change(
     assert [entry["name"] for entry in matrix["include"]] == expected
 
 
-def test_scan_fails_on_a_missing_import_root(tmp_path, monkeypatch):
-    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
-    root = tmp_path / "test/ci"
-    root.mkdir(parents=True)
-    roots = "import_roots:\n  - tokenspeed-kernel/tests\n"
-    _write_task_yaml(root, "kernel.yaml", _default_body("kernel", ["b200-1gpu"], roots))
-    changed_file = tmp_path / "changed.txt"
-    changed_file.write_text("python/tokenspeed/a.py\n")
-    argv = ["scan", "--repo-root", str(tmp_path), "--trigger", "per-commit"]
-    argv += ["--changed-files", str(changed_file)]
-    with pytest.raises(ValueError, match="import root does not exist"):
-        pipeline.main(argv)
-
-
 @pytest.mark.parametrize(
-    "roots", ["[]", "tokenspeed-kernel/test", "['']", "[tokenspeed-kernel/test/]"]
+    "prefixes", ["[]", "python/tokenspeed", "['']", "[python/tokenspeed/]"]
 )
-def test_validate_task_rejects_malformed_import_roots(tmp_path, roots):
-    body = _default_body("ut-a", ["b300-1gpu"], extra=f"import_roots: {roots}\n")
+def test_validate_task_rejects_malformed_ignore_changes(tmp_path, prefixes):
+    body = _default_body("ut-a", ["b300-1gpu"], extra=f"ignore_changes: {prefixes}\n")
     path = _write_task_yaml(tmp_path, "bad.yaml", body)
     import yaml as _yaml
 
-    with pytest.raises(ValueError, match=r"import_roots must be"):
+    with pytest.raises(ValueError, match=r"ignore_changes must be"):
         validate_task(_yaml.safe_load(path.read_text()), path)
 
 
