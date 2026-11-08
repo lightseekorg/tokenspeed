@@ -48,7 +48,7 @@ Routing (M3 and :func:`moe.routing`) and the block output are as in
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._scheduling import wave_uniform_i32
+from tokenspeed_kernel_amd._extern import wave_uniform_i32
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import bf16, mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement

@@ -60,7 +60,7 @@ Thus every M4 rank reads its weights the same way.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._scheduling import wave_uniform_i32
+from tokenspeed_kernel_amd._extern import wave_uniform_i32
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement

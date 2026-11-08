@@ -628,7 +628,7 @@ def test_sliding_split_stores_reach_l2_before_arrival() -> None:
     vmcnt(0) before the barrier preceding the counter atomic.
     """
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+    from tokenspeed_kernel_amd._extern import extern_compile_options
     from utils import vmcnt_zero_before_barrier
 
     fn = decode._mha_decode_sliding_split_atomic
@@ -678,7 +678,7 @@ def test_sliding_split_stores_reach_l2_before_arrival() -> None:
             fn, signature, constexprs=constexprs, attrs=attrs
         ),
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": 4, **sched_compile_options()},
+        options={"num_warps": 4, **extern_compile_options()},
     )
     arrivals = vmcnt_zero_before_barrier(
         kernel.asm["amdgcn"],
