@@ -206,6 +206,8 @@ class PersistentExperts:
         grouped = pregrouped(self.tp, batch)
         listed = listed and batch > 64
         args: tuple = (batch, self.grid_for(batch), self.device.index, mode)
+        if args[1] < 80:  # each CTA re-arms two of the 160 grid counters
+            raise RuntimeError(f"B{batch}: {args[1]} CTAs cannot re-arm 160 counters")
         ahead = ahead and (batch > 8 or streamed(batch))  # the stream() producer
         args += (streamed(batch), grouped, stealing(batch), listed, ahead)
         args += (static(batch), dynamic(batch))

@@ -165,3 +165,15 @@ def test_run_refuses_a_prefetch_table_the_batch_was_not_prepared_for(
     table = torch.zeros(8, 2, dtype=torch.int64, device="cuda")
     with pytest.raises(ValueError, match="prepared ahead=False"):
         static.run(x, ids, ahead=table)
+
+
+def test_grids_too_small_to_rearm_every_counter_are_rejected(
+    experts_weights, monkeypatch
+):
+    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe import experts_runtime
+
+    engine, _ = _engine(experts_weights, (), monkeypatch, scheduled=True)
+    engine.grids[4] = 79
+    out = torch.empty(4 * TOP_K, LATENT, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="cannot re-arm 160 counters"):
+        engine.prepare(4, experts_runtime.scratch(8, torch.device("cuda")), out)
