@@ -413,7 +413,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     checkpoint = torch.zeros(
         config.vocab_size, config.hidden_size, dtype=torch.bfloat16, device="cpu"
     )
-    checkpoint[start + 3, 0] = 1
+    checkpoint[start + 3 : start + 5, 0] = 1
     checkpoint[start + 4, 1] = 2**-9
     adapter.load_weights([("head.weight", checkpoint)])
     local = checkpoint[start : start + head.weight.shape[0]].to(
@@ -2623,6 +2623,9 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
     "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph"]
 )
 def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
     config = _config()
     config.hidden_size = 256
     config.moe_intermediate_size = 256
