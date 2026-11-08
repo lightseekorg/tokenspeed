@@ -1347,7 +1347,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         // The fake device fills bitmasks from the committed matcher state,
         // as the eager path does.
         eager_grammar: setup.grammar,
-        prefill_delay: setup.prefill_delay.clone(),
+        prefill_delay: setup.prefill_delay,
     }
 }
 
