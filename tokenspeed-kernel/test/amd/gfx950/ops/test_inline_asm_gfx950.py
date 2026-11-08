@@ -36,7 +36,8 @@ every compiled variant here is checked for:
 
 Compiles without a GPU, at 8 rows and at 16 where a 16-row launch compiles a
 different variant (the few-row GEMV at 4, the largest row count it serves).
-Inline asm main already had is listed apart (``INLINE_ASM_ON_MAIN``).
+Inline asm that existed before this gate is listed separately in
+``INLINE_ASM_ON_MAIN``.
 """
 
 import importlib
@@ -619,7 +620,7 @@ def _compiled(name):
 # support that would retire it). A helper not listed here fails the gate.
 _AMD = "tokenspeed_kernel_amd.ops.gfx950."
 INLINE_ASM = {}
-# Inline asm that main already has, which the kernels above compile in.
+# Inline asm that existed before this gate, which the kernels above compile in.
 INLINE_ASM_ON_MAIN = {
     "_keep_in_cluster": (
         _AMD + "attention._common:_keep_in_cluster",
