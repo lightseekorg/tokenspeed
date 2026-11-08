@@ -337,3 +337,8 @@ This installs the Python registry and Ascend Triton provider and skips CUDA
 compilation. Install a compatible Torch/TorchNPU stack first. The
 `tokenspeed-kernel-npu` package and its native operator dependencies are separate
 installations.
+
+Shared modules may define GPU kernels during import. The Ascend Triton adapter
+accepts Gluon JIT and constexpr helper decorators without loading the GPU
+provider; calling these decorated functions still raises an explicit error.
+Capability selection must exclude them on Ascend.
