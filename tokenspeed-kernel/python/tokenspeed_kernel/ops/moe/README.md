@@ -623,8 +623,8 @@ decode step through the chain (`KimiK3DecodeAttention`). The model checks that
 the attention has no attention-side parallel communication, no FP8 o-projection
 input, and an output gate on MLA; `attention_supports()` in
 `_cute_dsl/k3_decode_support.py` checks the projections the kernels serve
-(BF16, this model's TP8 KDA and MLA input projections, and a 1536-wide
-o-projection shard). Each layer then does the following:
+(BF16, this model's TP8 KDA, MLA and Kimi-K3.1 DSA input projections, and a
+1536-wide o-projection shard). Each layer then does the following:
 
 1. Add the previous feed-forward output to the residual prefix and mix it
    with the block snapshots (AttnRes), reading a MoE layer's output row
@@ -635,13 +635,22 @@ o-projection shard). Each layer then does the following:
    split-K (each CTA of a cluster sums a K slice, reduced over distributed
    shared memory). A weight that is not contiguous and 32-byte aligned, or
    strided or misaligned activations or outputs, take the cluster split-K at
-   every row count. Both multiply BF16, accumulate in FP32 and round the
+   every row count. Both multiply BF16, accumulate in FP32, and round the
    output once to BF16; only the order in which they sum the K partials
    differs, so their outputs can differ by one BF16 rounding step. Both
    compile when the layer is bound, before graph capture.
+   A Kimi-K3.1 DSA layer's projection also carries its indexer's `wk` and
+   `weights_proj` rows, which read the same attention input:
+   `[q_a | kv_a | gate | wk | weights_proj]`, 3808 rows per rank. The model
+   packs that weight once when it binds the chain (`pack_decode_projection`);
+   the parameters become views of its rows, so no weight is duplicated and
+   every other path reads the same values. The cluster split-K takes the MLA
+   tactics at 3808 rows (not yet swept).
 3. Run the attention core as usual, through the attention's `o_proj_input`
    (Kimi-K3.1's DSA layers select their indexer's top-k there, as in their
-   `forward`).
+   `forward`, with the index keys and head weights read from the packed
+   projection instead of the indexer's own GEMM; only the order in which
+   those 160 columns sum their K partials differs).
 4. Multiply by this rank's o-projection shard and multicast the partial;
    a consumer kernel sums the partials, updates the prefix, and applies the
    post-attention AttnRes. Above 32 rows each rank sums its column share and

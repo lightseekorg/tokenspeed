@@ -22,9 +22,9 @@
 
 Up to 16 rows the projection runs the warp split-K and above 16 rows the cluster
 split-K, which also takes a weight, activations or outputs the warp split-K cannot.
-Both multiply BF16, accumulate in FP32 and round once to BF16; only the order in
-which the K partials are summed differs. One TP8 rank's KDA and MLA shards run on
-one GPU.
+Both multiply BF16, accumulate in FP32, and round once to BF16; only the order in
+which the K partials are summed differs. One TP8 rank's KDA, MLA and Kimi-K3.1 DSA
+shards run on one GPU.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import (
+    DSA_ROWS,
     HIDDEN,
     KDA_ROWS,
     MLA_ROWS,
@@ -117,7 +118,9 @@ def _assert_fp32_sum_rounded_once(out, x, weight):
     assert (error <= bound).all(), f"error reaches {worst:.3f} of the bound"
 
 
-@pytest.fixture(scope="module", params=(KDA_ROWS, MLA_ROWS), ids=("kda", "mla"))
+@pytest.fixture(
+    scope="module", params=(KDA_ROWS, MLA_ROWS, DSA_ROWS), ids=("kda", "mla", "dsa")
+)
 def projection(request):
     """One rank's input projection, bound at all warp and three cluster row counts."""
     weight = _randn(request.param, HIDDEN, std=0.02, seed=request.param)
