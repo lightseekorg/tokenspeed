@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.attention import dsv41
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
     DeepseekV41DSpark,
@@ -659,8 +660,19 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     ctx.bs, ctx.num_extends = 2, 0
     ctx.output_layout = ForwardOutputLayout(0, 0, 2, 5)
 
+    confidence_features = torch.empty(
+        2, model.block_size, config.hidden_size, dtype=torch.bfloat16, device="cuda:0"
+    )
+
     def forward():
-        return model.forward_backbone(bonus, starts, history, pool, ctx)
+        return model.forward_backbone(
+            bonus,
+            starts,
+            history,
+            pool,
+            ctx,
+            confidence_hidden_out=confidence_features,
+        )
 
     with torch.inference_mode():
         for _ in range(3):
@@ -672,13 +684,31 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
             starts.fill_(position)
             history.copy_(_history_slots(starts, 128, 64))
             expected = forward()
+            expected_features = confidence_features.clone()
+            ordinary = model.forward_backbone(bonus, starts, history, pool, ctx)
+            torch.testing.assert_close(ordinary, expected, rtol=0, atol=0)
+            values = expected_features.float()
+            normalized = (
+                values
+                * torch.rsqrt(
+                    values.square().mean(-1, keepdim=True) + model.norm.variance_epsilon
+                )
+                * model.norm.weight.float()
+            ).to(expected.dtype)
+            torch.testing.assert_close(expected, normalized)
             graph.replay()
+            torch.testing.assert_close(
+                confidence_features, expected_features, rtol=0, atol=0
+            )
             torch.testing.assert_close(captured, expected, rtol=0, atol=0)
             assert torch.isfinite(captured).all()
         graph.reset()
+    with monkeypatch.context() as adaptive:
+        adaptive.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", True)
+        _assert_adaptive_inputs_and_state(adapter)
+        _assert_drafts_follow_their_rows(adapter, windows, pool)
 
 
-@torch.inference_mode()
 @torch.inference_mode()
 def _assert_drafts_follow_their_rows(adapter, windows, pool):
     """Permuting a decode batch permutes its drafts: no row reads another's state.
@@ -690,6 +720,7 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
     the first another row's anchor -- a single-request batch never sees that.
     """
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
     width, block, n = 6, 5, 3
     ib = InputBuffers(n, 1024, 8, device="cuda:0")
@@ -704,7 +735,13 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         ),
         attn_backend=None,
         token_to_kv_pool=None,
-        runtime_states=None,
+        runtime_states=RuntimeStates(
+            8,
+            adapter.model.config.vocab_size,
+            adapter.model.config.vocab_size,
+            width,
+            device="cuda:0",
+        ),
         input_buffers=ib,
         vocab_size=adapter.model.config.vocab_size,
     )
@@ -733,14 +770,20 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         0, adapter.model.config.vocab_size, (n, width), device="cuda:0"
     ).to(torch.int32)
 
-    def run(order):
+    def run(order, *, packed=False):
+        lengths = [accepts[i] if packed else width for i in order]
         positions = torch.cat(
-            [torch.arange(starts[i], starts[i] + width, device="cuda:0") for i in order]
+            [
+                torch.arange(starts[i], starts[i] + length, device="cuda:0")
+                for i, length in zip(order, lengths, strict=True)
+            ]
         )
         meta = SimpleNamespace(
             positions=positions,
             swa_write_slots=_paged_slots(positions, 64),
-            request_indices=torch.arange(n, device="cuda:0").repeat_interleave(width),
+            request_indices=torch.arange(n, device="cuda:0").repeat_interleave(
+                torch.tensor(lengths, device="cuda:0")
+            ),
         )
         backend = SimpleNamespace(
             query_metadata=lambda mode: meta,
@@ -750,25 +793,101 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
                 None,
             ),
         )
-        ctx = _ctx(None, n * width, ForwardMode.DECODE)
+        ctx = _ctx(None, sum(lengths), ForwardMode.DECODE)
+        if packed:
+            ctx.decode_query_indptr = torch.tensor(
+                [0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda:0"
+            )
         ctx.bs, ctx.num_extends = n, 0
         ctx.output_layout = ForwardOutputLayout(0, 0, n, width)
         ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
         windows.zero_()
-        return drafter.run(
+        slots = torch.tensor([i + 1 for i in order], device="cuda:0")
+        ib.state_write_req_pool_indices_buf[:n].copy_(slots)
+        result = drafter.run(
             base_ctx=ctx,
             logits_output=SimpleNamespace(
-                hidden_states=hidden[order].reshape(-1, drafter.hidden_width)
+                hidden_states=torch.cat(
+                    [
+                        hidden[i, :length]
+                        for i, length in zip(order, lengths, strict=True)
+                    ]
+                )
             ),
             output_tokens=tokens[order].reshape(-1),
             accept_lengths=torch.tensor(
                 [accepts[i] for i in order], device="cuda:0", dtype=torch.int32
             ),
         ).clone()
+        if drafter.confidence_scores is not None:
+            expected = adapter.model.confidence_logits(
+                drafter.confidence_features[:n], result[:, :-1]
+            )
+            torch.testing.assert_close(
+                drafter.confidence_scores.index_select(0, slots),
+                expected,
+                rtol=0,
+                atol=0,
+            )
+        return result
 
     forward = run([0, 1, 2])
+    forward_scores = (
+        None
+        if drafter.confidence_scores is None
+        else drafter.confidence_scores[1:4].clone()
+    )
+    # Dropping unverified suffix rows must preserve the next draft exactly:
+    # the anchor, bonus and accepted context are unchanged.
+    torch.testing.assert_close(run([0, 1, 2], packed=True), forward, rtol=0, atol=0)
+    torch.testing.assert_close(
+        run([2, 0, 1], packed=True), forward[[2, 0, 1]], rtol=0, atol=0
+    )
     rotated = run([2, 0, 1])
     torch.testing.assert_close(rotated, forward[[2, 0, 1]], rtol=0, atol=0)
+    if forward_scores is not None:
+        torch.testing.assert_close(
+            drafter.confidence_scores[1:4], forward_scores, rtol=0, atol=0
+        )
+    if forward_scores is not None:
+        from test.runtime.test_deepseek_v41_cache import _tables, _verify_backend
+
+        # Exercise packed target metadata using the real draft candidates.
+        assert torch.isfinite(forward_scores).all()
+        drafter.prepare_verify_layout((1,) * n, num_tokens=n)
+        drafter.set_decode_graph_query_extent(n)
+        backend = _verify_backend("cuda:0", n, width)
+        slots = torch.tensor([1, 2, 3], device="cuda:0")
+        ib.req_pool_indices_buf[:n].copy_(slots)
+        ib.seq_lens_buf[:n].copy_(
+            torch.tensor([position + width for position in starts], device="cuda:0")
+        )
+        ib.input_ids_buf[: n * width].copy_(forward.flatten())
+        backend.refresh_decode_metadata(
+            n,
+            n,
+            slots,
+            ib.seq_lens_buf[:n],
+            forward_mode=ForwardMode.DECODE,
+            # This check only prepares metadata; it never writes target KV.
+            block_tables={
+                key: torch.cat((table, torch.zeros_like(table[:1])))
+                for key, table in _tables("cuda:0").items()
+            },
+            for_graph_replay=False,
+        )
+        ib.positions_buf[: n * width].copy_(
+            backend.query_metadata(ForwardMode.DECODE).positions
+        )
+        ctx = _ctx(backend, n * width, ForwardMode.DECODE)
+        ctx.bs = n
+        ctx.output_layout = ForwardOutputLayout(0, 0, n, width)
+        with drafter.target_forward_context(ctx):
+            assert ctx.input_num_tokens == n
+            assert ctx.decode_query_indptr.tolist() == [0, 1, 2, 3]
+            torch.testing.assert_close(ib.input_ids_buf[:n], forward[:, 0])
+        torch.testing.assert_close(ib.input_ids_buf[: n * width], forward.flatten())
+        drafter.set_decode_graph_query_extent(None)
     # The requests differ, so identical drafts would mean the rows collapsed.
     assert not torch.equal(forward[0], forward[1])
     assert not torch.equal(forward[1], forward[2])
@@ -1195,3 +1314,628 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
         == adapter.model.markov_projection.weight.shape[0]
     )
     assert adapter.checkpoint_load_report["loaded"] > 0
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_v41_confidence_uses_predecessor_embeddings_and_fp32(monkeypatch, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA/ROCm")
+    config = _draft_config()
+    _loader_model(monkeypatch, config, 0, "cpu")
+    adapter = DeepseekV41ForCausalLMDSpark(
+        SimpleNamespace(text_config=config), _mapping(0, 4, 4), _quant()
+    )
+    model = adapter.model
+    model.markov_embedding.to(device)
+    model.confidence_projection.to(device)
+    with torch.no_grad():
+        model.markov_embedding.weight.zero_()
+        model.markov_embedding.weight[:, 0].copy_(
+            torch.arange(config.vocab_size, device=device)
+        )
+        model.confidence_projection.weight.zero_()
+        model.confidence_projection.weight[0, 0] = 0.25
+        model.confidence_projection.weight[0, config.hidden_size] = -0.5
+    hidden = torch.zeros(
+        2,
+        config.dspark_block_size,
+        config.hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    hidden[..., 0] = 2
+    previous = torch.arange(10, device=device).view(2, 5)
+    expected = 0.5 - 0.5 * previous.float()
+    score = model.confidence_logits(hidden, previous)
+    assert score.dtype == torch.float32
+    torch.testing.assert_close(score, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="aligned block"):
+        model.confidence_logits(hidden, previous[:, :-1])
+    if device == "cuda":
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                model.confidence_logits(hidden, previous)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = model.confidence_logits(hidden, previous)
+        previous.add_(1)
+        graph.replay()
+        torch.testing.assert_close(
+            captured, 0.5 - 0.5 * previous.float(), rtol=0, atol=0
+        )
+        graph.reset()
+
+
+@torch.inference_mode()
+def _assert_adaptive_inputs_and_state(adapter):
+    from test.runtime.test_deepseek_v41_cache import _tables, _verify_backend
+    from test.runtime.test_deepseek_v41_engram import _config, _Tokenizer
+
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.models.deepseek_v41_engram import EngramHashState
+
+    device, width = "cuda:0", 6
+    ib = InputBuffers(2, 1024, 4, device=device)
+    hash_state = EngramHashState(_config(), _Tokenizer(), device)
+    ib.init_ngram_buffers(3, hash_state.input_parameters, len(_Tokenizer()))
+    original_hashes = torch.arange(
+        ib.ngram_hash_ids_buf[:12].numel(),
+        device=device,
+        dtype=ib.ngram_hash_ids_buf.dtype,
+    ).reshape_as(ib.ngram_hash_ids_buf[:12])
+    original_mask = torch.arange(12, device=device) % 2 == 0
+    state = RuntimeStates(4, 128, 128, width, device=device)
+    backend = _verify_backend(device, 2, width)
+    tables = _tables(device)
+    drafter = DeepseekV41DSpark(
+        spec_num_tokens=width,
+        spec_num_steps=5,
+        draft_model_runner=SimpleNamespace(
+            model=adapter, mapping=adapter.mapping, device=device
+        ),
+        attn_backend=backend,
+        token_to_kv_pool=backend.cache_pool,
+        runtime_states=state,
+        input_buffers=ib,
+        vocab_size=128,
+    )
+    drafter.wire_target(adapter)
+    original = torch.arange(12, device=device, dtype=ib.input_ids_buf.dtype)
+
+    def prepare(ids, slots):
+        drafter.prepare_request_state(ids, slots, 0)
+        ib.req_pool_indices_buf[:2].copy_(torch.tensor(slots, device=device))
+        ib.input_ids_buf[:12].copy_(original)
+        ib.ngram_hash_ids_buf[:12].copy_(original_hashes)
+        ib.ngram_token_mask_buf[:12].copy_(original_mask)
+        ib.seq_lens_buf[:2].copy_(torch.tensor([18, 30], device=device))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            ib.req_pool_indices_buf[:2],
+            ib.seq_lens_buf[:2],
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
+            for_graph_replay=False,
+        )
+        ib.positions_buf[:12].copy_(
+            backend.query_metadata(ForwardMode.DECODE).positions
+        )
+        ctx = _ctx(backend, 12, ForwardMode.DECODE)
+        ctx.bs = 2
+        ctx.output_layout = ForwardOutputLayout(0, 0, 2, width)
+        return ctx
+
+    ctx = prepare(["a", "b"], [1, 3])
+    drafter.confidence_scores[1].copy_(torch.tensor([1, -1, 1, 1, 1], device=device))
+    drafter.confidence_scores[3].copy_(torch.tensor([1, 1, -1, 1, 1], device=device))
+    saved_positions = ib.positions_buf[:12].clone()
+    with drafter.target_forward_context(ctx):
+        assert ctx.input_num_tokens == 5
+        assert ctx.decode_query_indptr.tolist() == [0, 2, 5]
+        assert ib.input_ids_buf[:5].tolist() == [0, 1, 6, 7, 8]
+        assert ib.positions_buf[:5].tolist() == [12, 13, 24, 25, 26]
+        torch.testing.assert_close(drafter.verify_candidates().flatten(), original)
+        rows = torch.tensor([0, 1, 6, 7, 8], device=device)
+        torch.testing.assert_close(ib.ngram_hash_ids_buf[:5], original_hashes[rows])
+        torch.testing.assert_close(ib.ngram_token_mask_buf[:5], original_mask[rows])
+    torch.testing.assert_close(ib.input_ids_buf[:12], original)
+    torch.testing.assert_close(ib.ngram_hash_ids_buf[:12], original_hashes)
+    torch.testing.assert_close(ib.ngram_token_mask_buf[:12], original_mask)
+    torch.testing.assert_close(ib.positions_buf[:12], saved_positions)
+
+    # Reusing a layout still reads this round's inputs, not the saved
+    # candidates from the preceding round.
+    ctx = prepare(["a", "b"], [1, 3])
+    changed = original.flip(0)
+    ib.input_ids_buf[:12].copy_(changed)
+    with drafter.target_forward_context(ctx):
+        assert ctx.decode_query_indptr.tolist() == [0, 2, 5]
+        torch.testing.assert_close(
+            ib.input_ids_buf[:5], changed[torch.tensor([0, 1, 6, 7, 8], device=device)]
+        )
+        torch.testing.assert_close(drafter.verify_candidates().flatten(), changed)
+    torch.testing.assert_close(ib.input_ids_buf[:12], changed)
+
+    # Reordered batches retain each request's prediction, not its old row's.
+    ctx = prepare(["b", "a"], [3, 1])
+    with pytest.raises(RuntimeError, match="target failed"):
+        with drafter.target_forward_context(ctx):
+            assert ctx.decode_query_indptr.tolist() == [0, 3, 5]
+            raise RuntimeError("target failed")
+    torch.testing.assert_close(ib.input_ids_buf[:12], original)
+    torch.testing.assert_close(ib.ngram_hash_ids_buf[:12], original_hashes)
+    torch.testing.assert_close(ib.ngram_token_mask_buf[:12], original_mask)
+
+    image = torch.empty(drafter.slot_state_bytes(), dtype=torch.uint8, device=device)
+    stream = torch.cuda.current_stream()
+    drafter.export_slot_state(1, image, stream, request_id="a")
+    drafter.import_slot_state(2, image, stream, request_id="a")
+    drafter.prepare_request_state(["a"], [2], 0)
+    torch.testing.assert_close(
+        drafter.confidence_scores[2], drafter.confidence_scores[1]
+    )
+    drafter.export_slot_state(1, image, stream, request_id="unprepared")
+    drafter.import_slot_state(0, image, stream, request_id="unprepared")
+    assert torch.isposinf(drafter.confidence_scores[0]).all()
+
+    ctx = prepare(["new", "b"], [1, 3])
+    with drafter.target_forward_context(ctx):
+        assert ctx.decode_query_indptr.tolist() == [0, 6, 9]
+    drafter.on_target_weights_updated()
+    ctx = prepare(["new", "b"], [1, 3])
+    with drafter.target_forward_context(ctx):
+        assert ctx.decode_query_indptr is None
+        assert ctx.input_num_tokens == 12
+
+    # Full-capacity execution must not reuse the previous packed layout.
+    ctx = prepare(["a", "b"], [1, 3])
+    drafter.set_decode_graph_query_extent(12)
+    with drafter.target_forward_context(ctx):
+        assert ctx.decode_query_indptr is None
+        assert drafter._verify_candidates is None
+        torch.testing.assert_close(ib.input_ids_buf[:12], original)
+        torch.testing.assert_close(
+            backend.query_metadata(ForwardMode.DECODE).positions, saved_positions
+        )
+    drafter.set_decode_graph_query_extent(None)
+
+    # One captured six-row forward must serve different live CSR layouts,
+    # preserve fresh candidates, and restore full scheduler-width inputs.
+    ctx = prepare(["a", "b"], [1, 3])
+    drafter.prepare_verify_layout((2, 3), num_tokens=6)
+    drafter.set_decode_graph_query_extent(6)
+
+    def packed_step():
+        with drafter.target_forward_context(ctx):
+            return (
+                ib.input_ids_buf[:6].clone(),
+                ib.ngram_hash_ids_buf[:6].clone(),
+                backend.query_metadata(ForwardMode.DECODE).positions.clone(),
+                drafter.verify_candidates().clone(),
+            )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            packed_step()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = packed_step()
+    for counts in ((3, 2), (1, 5), (2, 3)):
+        changed = original + sum(counts)
+        ib.input_ids_buf[:12].copy_(changed)
+        drafter.prepare_verify_layout(counts, num_tokens=6)
+        graph.replay()
+        live = sum(counts)
+        indices = torch.tensor(
+            [r * width + c for r, n in enumerate(counts) for c in range(n)],
+            device=device,
+        )
+        torch.testing.assert_close(captured[0][:live], changed[indices])
+        torch.testing.assert_close(captured[1][:live], original_hashes[indices])
+        torch.testing.assert_close(captured[2][:live], saved_positions[indices])
+        torch.testing.assert_close(captured[3].flatten(), changed)
+        torch.testing.assert_close(ib.input_ids_buf[:12], changed)
+        torch.testing.assert_close(ib.ngram_hash_ids_buf[:12], original_hashes)
+    graph.reset()
+    drafter.set_decode_graph_query_extent(None)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (None, None),
+        ("speculative_algorithm", "EAGLE3"),
+        ("sampling_backend", "flashinfer"),
+        ("disable_prefill_graph", False),
+        ("kv_parallel_size", 2),
+        ("decode_context_parallel_size", 2),
+        ("query_context_parallel_size", 2),
+        ("pipeline_parallel_size", 2),
+        ("dp_sampling", True),
+        ("grammar_backend", "xgrammar"),
+        ("enable_output_logprobs", True),
+        ("enable_output_cumulative_probs", True),
+        ("enable_speculative_sampling", True),
+        ("speculative_eagle_topk", 2),
+        ("synthetic_acceptance_length", 2.5),
+        ("synthetic_acceptance_length", 4),
+        ("enforce_eager", True),
+        ("disable_sampling_tp_sync", True),
+    ],
+)
+def test_adaptive_v41_launch_contract(field, value):
+    args = ServerArgs.__new__(ServerArgs)
+    args.enable_dsv41_adaptive_dspark = True
+    args.speculative_algorithm = "DSPARK"
+    args.sampling_backend = "greedy"
+    args.enforce_eager = False
+    args.disable_prefill_graph = True
+    args.grammar_backend = "none"
+    args.mapping = _mapping(0, 1, 1)
+    if field is not None:
+        setattr(args, field, value)
+        with pytest.raises(ValueError):
+            args.validate_dsv41_adaptive_dspark()
+    else:
+        args.validate_dsv41_adaptive_dspark()
+    # With no opt-in, existing launch configurations incur no new restrictions.
+    args.enable_dsv41_adaptive_dspark = False
+    args.validate_dsv41_adaptive_dspark()
+
+
+@pytest.mark.parametrize(
+    "bs,capacity", [(32, 128), (32, 144), (32, 192), (16, 64), (4, 16)]
+)
+def test_verify_graph_token_capacity(bs, capacity):
+    drafter = object.__new__(DeepseekV41DSpark)
+    drafter.device = torch.device("cpu")
+    drafter.spec_num_tokens = 6
+    drafter.adaptive_min_batch_size = 1
+    drafter.confidence_scores = torch.empty(1)
+    drafter.verify_graph_token_step = 16
+    drafter._verify_rows = torch.empty(bs * 6, dtype=torch.int64)
+    drafter._verify_indptr = torch.empty(bs + 1, dtype=torch.int64)
+    drafter._verify_layout_counts = None
+    drafter.prepare_decode_graph_token_capture_layout(bs=bs, query_tokens=capacity)
+    assert drafter._verify_indptr[bs].item() == capacity
+    assert all(1 <= n <= 6 for n in drafter._verify_layout_counts)
+    assert capacity in drafter.decode_graph_query_capacities(bs)
+
+
+@pytest.mark.parametrize("actual,padded", [(0, 32), (29, 32), (16, 16)])
+def test_small_or_padded_batches_keep_full_verification(actual, padded):
+    from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
+
+    drafter = object.__new__(DeepseekV41DSpark)
+    drafter.spec_num_tokens = 6
+    drafter._verify_step_id = 0
+    drafter._active_verify_timing = None
+    drafter.verify_budget_policy = VerifyBudgetPolicy(True, 32, 6, 0.02)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=actual,
+        num_extends=0,
+        input_num_tokens=actual * 6,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, actual, 6),
+    )
+    assert (
+        drafter.prepare_decode_graph_token_layout(
+            ctx, actual_bs=actual, padded_bs=padded
+        )
+        == padded * 6
+    )
+    drafter.verify_budget_policy = None
+    assert (
+        drafter.prepare_decode_graph_token_layout(
+            ctx, actual_bs=actual, padded_bs=padded
+        )
+        == padded * 6
+    )
+
+
+def test_fine_verify_graph_capture_plan_and_keys():
+    from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+
+    drafter = object.__new__(DeepseekV41DSpark)
+    drafter.device = torch.device("cpu")
+    drafter.spec_num_tokens = 6
+    drafter.adaptive_min_batch_size = 1
+    drafter.verify_budget_policy = None
+    drafter.confidence_scores = torch.empty(1)
+    drafter.verify_graph_token_step = 8
+    runner = object.__new__(ForwardStepRunner)
+    runner.disable = False
+    runner.capture_bs = [1, 8, 16, 32]
+    runner.sampling_backend = None
+    runner.max_tokens_per_req = 6
+    runner.drafter = drafter
+    plan = runner.capture_plan
+    for bs in runner.capture_bs:
+        capacities = [
+            runner._split_query_variant(v, bs)[1]
+            for v, ladder in plan.items()
+            if bs in ladder
+        ]
+        assert sorted(capacities) == list(drafter.decode_graph_query_capacities(bs))
+    runner.graphs = {(v, bs): object() for v, ladder in plan.items() for bs in ladder}
+    runner._decode_query_tokens = 152
+    key = runner._cuda_graph_key(32)
+    assert runner._split_query_variant(key[0], key[1]) == ("default", 152)
+    runner._decode_query_tokens = 192
+    assert runner._cuda_graph_key(32) == ("default", 32)
+
+
+@pytest.fixture(autouse=True)
+def adaptive_test_small_batches(monkeypatch):
+    # Small model fixtures exercise the adaptive path; serving defaults to 32.
+    monkeypatch.setitem(global_server_args_dict, "dsv41_dspark_min_batch_size", 1)
+
+
+@pytest.mark.parametrize("minimum", [0, -1, True, 1.5])
+def test_invalid_adaptive_minimum_batch_size(minimum):
+    args = ServerArgs(model="unused", disaggregation_mode="null")
+    args.dsv41_dspark_min_batch_size = minimum
+    with pytest.raises(ValueError, match="minimum batch size"):
+        args.validate_dsv41_adaptive_dspark()
+
+
+def test_budget_switch_validation_is_repeatable():
+    args = ServerArgs.__new__(ServerArgs)
+    args.enable_dsv41_adaptive_dspark = True
+    args.speculative_algorithm = "DSPARK"
+    args.sampling_backend = "greedy"
+    args.disable_prefill_graph = True
+    args.grammar_backend = "none"
+    args.mapping = _mapping(0, 1, 1)
+    args.validate_dsv41_adaptive_dspark()
+    args.validate_dsv41_adaptive_dspark()
+    assert args.enable_dsv41_adaptive_dspark is True
+    assert args.dsv41_dspark_min_batch_size == 32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@torch.inference_mode()
+def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch):
+    from tokenspeed_kernel.ops.attention.dsv41 import verify_layout
+
+    from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
+
+    drafter = object.__new__(DeepseekV41DSpark)
+    from tokenspeed.runtime.execution.drafter.verify_calibration import (
+        VerifyCalibration,
+    )
+    from tokenspeed.runtime.execution.drafter.verify_feedback import VerifyFeedback
+    from tokenspeed.runtime.execution.model_runner import ModelRunner
+
+    tp = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    mapping = _mapping(rank, tp, tp)
+    if tp > 1:
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager,
+        )
+
+        process_group_manager.init_distributed(
+            mapping,
+            distributed_init_method="env://",
+            backend="nccl",
+            timeout=120,
+            device_id=torch.device("cuda", int(os.environ["LOCAL_RANK"])),
+        )
+        process_group_manager.init_process_group(mapping.attn.tp_group, backend="nccl")
+    drafter.draft_model = Mock(spec=ModelRunner)
+    drafter.draft_model.mapping = mapping
+    drafter.tp_group = mapping.attn.tp_group
+    drafter.verify_feedback = VerifyFeedback(draft_width=5)
+    drafter._pending_verify_feedback = []
+    drafter._verify_step_id = 0
+    drafter._verify_timing_epoch = 0
+    drafter._active_verify_timing = None
+    drafter._verify_step_samples = []
+    drafter._aligned_verify_samples = ()
+    drafter._verify_collecting = True
+    drafter._verify_cache_initialized = True
+    drafter._verify_cache = None
+    drafter._cached_verify_profiles = ()
+    drafter._verify_collectors = {}
+    drafter._verify_calibrations = ()
+    drafter._verify_policy_ms = None
+    drafter.device = "cuda"
+    drafter.spec_num_tokens = 6
+    drafter.block_size = 5
+    drafter.adaptive_min_batch_size = 4
+    drafter.verify_budget_policy = VerifyBudgetPolicy(True, 4, 6, 0.02)
+    drafter.confidence_scores = torch.empty(1, device="cuda")
+    drafter.verify_graph_token_step = 4
+    drafter._verify_rows = torch.empty(24, dtype=torch.int64, device="cuda")
+    drafter._verify_indptr = torch.empty(5, dtype=torch.int64, device="cuda")
+    drafter._verify_layout_counts = None
+    drafter._verify_budget_graphs = {}
+    drafter._verify_budget_buffers = {}
+    stream = torch.cuda.Stream()
+    pool = torch.cuda.graph_pool_handle()
+    drafter.capture_round_graphs(2, stream=stream, pool=pool)
+    assert not drafter._verify_budget_graphs
+    drafter.capture_round_graphs(4, stream=stream, pool=pool)
+    graphs = dict(drafter._verify_budget_graphs)
+    drafter.capture_round_graphs(4, stream=stream, pool=pool)
+    assert drafter._verify_budget_graphs == graphs
+    scores = torch.randn(4, 5, device="cuda")
+    for capacity in (20, 4, 12, 8, 16, 12):
+        scores.neg_()
+        drafter.prepare_verify_budget_layout(
+            scores, batch_size=4, query_capacity=capacity
+        )
+        rows = torch.empty(capacity, dtype=torch.int64, device="cuda")
+        indptr = torch.empty(5, dtype=torch.int64, device="cuda")
+        counts = torch.empty(4, dtype=torch.int64, device="cuda")
+        valid = torch.empty((), dtype=torch.bool, device="cuda")
+        verify_layout(
+            scores,
+            query_capacity=capacity,
+            rows_out=rows,
+            indptr_out=indptr,
+            counts_out=counts,
+            valid_out=valid,
+        )
+        torch.testing.assert_close(
+            drafter._verify_rows[:capacity], rows, atol=0, rtol=0
+        )
+        torch.testing.assert_close(drafter._verify_indptr, indptr, atol=0, rtol=0)
+    assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 24
+    profile = VerifyCalibration(4, 100, 200, 6, 10.0, ((12, 1.0),), 3)
+    drafter.install_verify_calibration((profile,), policy_ms=0.0)
+    assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 24
+    ids, slots = ["a", "b", "c", "d"], [0, 1, 2, 3]
+    drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    drafter.verify_feedback.publish(
+        drafter.verify_feedback.snapshot(),
+        [[0.0 if rank == 0 else -1000.0] * 5] * 4,
+        context_lengths=[120 if rank == 0 else 10000] * 4,
+    )
+    for _ in range(2):
+        drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 12
+    assert drafter._verify_indptr.tolist() == [0, 3, 6, 9, 12]
+    assert drafter._verify_budget_buffers[4].valid.item()
+    assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=8) == 48
+    profile = VerifyCalibration(4, 100, 125, 6, 10.0, ((12, 1.0),), 3)
+    drafter.install_verify_calibration((profile,), policy_ms=0.0)
+    assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 24
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    drafter.input_buffers = InputBuffers(4, 24, 0, device="cuda")
+    drafter.input_buffers.req_pool_indices_buf[:4].copy_(torch.arange(4, device="cuda"))
+    drafter.input_buffers.seq_lens_buf[:4].fill_(120)
+    drafter.confidence_scores = torch.zeros((4, 5), device="cuda")
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=4,
+        num_extends=0,
+        input_num_tokens=24,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 4, 6),
+    )
+    assert (
+        drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4) == 24
+    )
+    drafter.confidence_scores.add_(1)
+    drafter.finish_round(ctx, graph_bs=4)
+    torch.cuda.synchronize()
+    drafter._poll_verify_feedback()
+    assert len(drafter._verify_step_samples) == 1
+    sample = drafter._verify_step_samples[0]
+    assert (sample.step, sample.batch_size, sample.query_capacity) == (1, 4, 24)
+    assert (sample.min_context, sample.max_context) == (120, 120)
+    assert sample.elapsed_ms > 0
+    drafter._synchronize_verify_samples(drafter._verify_budget_buffers[4])
+    assert len(drafter._aligned_verify_samples) == 1
+    aligned = drafter._aligned_verify_samples[0]
+    assert (aligned.step, aligned.batch_size, aligned.query_capacity) == (1, 4, 24)
+    assert aligned.elapsed_ms >= sample.elapsed_ms
+    # Padded rounds do not contribute measurements for an exact-BS profile.
+    assert (
+        drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=8) == 48
+    )
+    assert drafter._active_verify_timing is None
+    drafter.finish_round(ctx, graph_bs=8)
+    assert not drafter._pending_verify_feedback
+    # Aligned real-step metadata drives the same collector on every rank.
+    # Synthetic durations test the installation/probing protocol, not speed.
+    from tokenspeed.runtime.execution.drafter.verify_calibration import VerifyStepSample
+
+    drafter._verify_calibrations = ()
+    drafter._verify_collecting = True
+    for tier, capacity in enumerate((24, 20, 16, 12, 8, 4)):
+        drafter._aligned_verify_samples = tuple(
+            VerifyStepSample(
+                100 + tier * 10 + index,
+                4,
+                capacity,
+                120,
+                120,
+                1000.0 if index < 2 else float(capacity),
+            )
+            for index in range(10)
+        )
+        drafter._update_verify_calibration()
+        if tier == 0:
+            assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 20
+            assert drafter._verify_collecting
+    assert len(drafter._verify_calibrations) == 1
+    automatic = drafter._verify_calibrations[0]
+    assert automatic.native_step_ms == 24.0
+    assert automatic.sample_count == 8
+    assert automatic.adaptive_step_ms == tuple(
+        (q, float(q)) for q in (4, 8, 12, 16, 20)
+    )
+    assert not drafter._verify_collecting
+    # Rebuilding graphs invalidates already queued timing and score feedback.
+    drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
+    drafter.finish_round(ctx, graph_bs=4)
+    old_snapshot = drafter.verify_feedback.snapshot()
+    drafter.release_round_graphs()
+    torch.cuda.synchronize()
+    drafter._poll_verify_feedback()
+    assert not drafter._verify_step_samples
+    assert drafter.verify_feedback.snapshot() == ()
+    drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    drafter.verify_feedback.publish(
+        old_snapshot, [[0.0] * 5] * 4, context_lengths=[120] * 4
+    )
+    for _ in range(2):
+        drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    assert drafter.verify_feedback.scores() is None
+    assert drafter.verify_feedback.context_bounds() is None
+    assert not drafter._verify_budget_graphs
+    assert not drafter._verify_budget_buffers
+    with pytest.raises(ValueError, match="not prepared"):
+        drafter.prepare_verify_budget_layout(scores, batch_size=4, query_capacity=12)
+
+    # Re-capture restores completed regions without recalibration.
+    drafter.capture_round_graphs(4, stream=stream, pool=pool)
+    assert drafter._verify_calibrations == (automatic,)
+
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    runner = Mock(spec=ModelRunner)
+    runner.server_args = prepare_server_args(["--model", str(tmp_path / "checkpoint")])
+    runner.model_config = Mock(spec=ModelConfig)
+    runner.model_config.hf_config = PretrainedConfig(hidden_size=128)
+    drafter.draft_model_runner = runner
+    drafter._verify_cache_initialized = False
+    drafter._initialize_verify_cache()
+    if rank == 0:
+        assert drafter._verify_cache is not None
+    drafter._save_verify_calibration()
+    drafter._cached_verify_profiles = ()
+    drafter._verify_calibrations = ()
+    drafter._verify_cache_initialized = False
+    drafter._restore_verify_calibration(4)
+    assert drafter._verify_calibrations == (automatic,)
+    assert not drafter._verify_collecting
+    drafter.on_target_weights_updated()
+    assert not drafter._verify_calibrations
+    assert not drafter._cached_verify_profiles
+    assert drafter._verify_cache is None
+    assert drafter._verify_collecting
+
+    if tp > 1:
+        torch.distributed.destroy_process_group()

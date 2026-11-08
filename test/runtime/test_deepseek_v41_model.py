@@ -2620,7 +2620,7 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph"]
+    "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph", "packed"]
 )
 def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode):
     monkeypatch.setitem(
@@ -2726,6 +2726,9 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     assert decoded.shape == (1, 256) and torch.isfinite(decoded).all()
     if execution_mode == "eager":
         return
+    if execution_mode == "packed":
+        _assert_packed_verify_rounds(adapter)
+        return
     if execution_mode == "prefill":
         _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables)
         return
@@ -2777,6 +2780,154 @@ def _assert_fp8_wo_a_matches_checkpoint(attn, a_codes, a_scales, b_codes, b_scal
         _dequantize_checkpoint(b_codes, b_scales).double().T
     )
     torch.testing.assert_close(actual.double(), expected, rtol=2**-8, atol=1e-3)
+
+
+@torch.inference_mode()
+def _assert_packed_verify_rounds(adapter):
+    """Real target layers across shortened windows and rejected suffixes.
+
+    Acceptance is supplied deliberately to exercise boundary cases; this is a
+    target/cache equivalence test, not an autonomous speculative serving loop.
+    """
+    from test.runtime.test_deepseek_v41_cache import _verify_backend
+
+    device, width = "cuda:0", 4
+    backend = _verify_backend(device, 2, width)
+    backend.cache_pool.arena.buffer.zero_()
+    tables = _tables(device)
+    model = adapter.model
+    vocab = len(_Tokenizer())
+    histories = [list(range(12)), [i % vocab for i in range(20, 33)]]
+
+    def inputs(candidates):
+        ids, previous = [], []
+        for history, row in zip(histories, candidates, strict=True):
+            combined = history + row
+            for column, token in enumerate(row):
+                position = len(history) + column
+                ids.append(token)
+                previous.append(
+                    [
+                        combined[position - back] if position >= back else -1
+                        for back in (1, 2, 3)
+                    ]
+                )
+        return (torch.tensor(ids, device=device), torch.tensor(previous, device=device))
+
+    prompt_ids = torch.tensor(histories[0] + histories[1], device=device)
+    prompt_previous = torch.tensor(
+        [
+            [row[i - back] if i >= back else -1 for back in (1, 2, 3)]
+            for row in histories
+            for i in range(len(row))
+        ],
+        device=device,
+    )
+    lengths = [len(row) for row in histories]
+    meta = _extend(backend, tables, lengths, [0, 0], [0, 1], lengths)
+    ctx = _ctx(backend, len(prompt_ids), ForwardMode.EXTEND)
+    ctx.bs = ctx.num_extends = 2
+    ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
+    mask = torch.ones_like(prompt_ids, dtype=torch.bool)
+    model(
+        prompt_ids,
+        meta.positions,
+        ctx,
+        None,
+        None,
+        engram_hash_ids=model.engram_hash(prompt_ids, prompt_previous, mask),
+        engram_token_mask=mask,
+        image_mask=None,
+    )
+    arena = backend.cache_pool.arena.buffer
+    caches = [arena.clone(), arena.clone()]
+
+    for step, (selected, accepted) in enumerate(
+        [
+            ([2, 3], [1, 2]),
+            ([4, 1], [3, 1]),
+            ([1, 4], [1, 3]),
+        ]
+    ):
+        candidates = [
+            [(40 + step * 12 + request * 4 + i) % vocab for i in range(width)]
+            for request in range(2)
+        ]
+        ids, previous = inputs(candidates)
+        kept = torch.tensor(
+            [r * width + col for r in range(2) for col in range(selected[r])],
+            device=device,
+        )
+        outputs = []
+        for packed in (False, True):
+            arena.copy_(caches[int(packed)])
+            rows = kept if packed else torch.arange(2 * width, device=device)
+            offsets = (
+                torch.tensor([0, selected[0], sum(selected)], device=device)
+                if packed
+                else None
+            )
+            backend.refresh_decode_metadata(
+                2,
+                2,
+                torch.tensor([0, 1], device=device),
+                torch.tensor([len(row) + width for row in histories], device=device),
+                num_tokens=len(rows),
+                decode_query_indptr=offsets,
+                forward_mode=ForwardMode.DECODE,
+                block_tables=tables,
+                for_graph_replay=False,
+            )
+            meta = backend.query_metadata(ForwardMode.DECODE)
+            ctx = _ctx(backend, len(rows), ForwardMode.DECODE)
+            ctx.bs = 2
+            ctx.output_layout = ForwardOutputLayout(0, 0, 2, width)
+            ctx.decode_query_indptr = offsets
+            mask = torch.ones_like(rows, dtype=torch.bool)
+            hidden, _ = model(
+                ids[rows],
+                meta.positions,
+                ctx,
+                None,
+                None,
+                engram_hash_ids=model.engram_hash(ids[rows], previous[rows], mask),
+                engram_token_mask=mask,
+                image_mask=None,
+            )
+            outputs.append(hidden.clone())
+            caches[int(packed)].copy_(arena)
+        torch.testing.assert_close(outputs[1], outputs[0][kept])
+        processor = adapter.resolve_logits_processor(
+            SimpleNamespace(text_config=model.config)
+        )
+        logits = []
+        for hidden in outputs:
+            logits.append(
+                processor(
+                    input_ids=torch.zeros(
+                        len(hidden), dtype=torch.int64, device=device
+                    ),
+                    hidden_states=hidden,
+                    lm_head=adapter.lm_head,
+                    logits_metadata=LogitsMetadata.from_forward_context(
+                        _ctx(None, len(hidden), ForwardMode.DECODE)
+                    ),
+                    aux_hidden_states=None,
+                ).next_token_logits.clone()
+            )
+        reference, actual = logits[0][kept], logits[1]
+        torch.testing.assert_close(actual, reference, rtol=1.6e-2, atol=1e-4)
+        torch.testing.assert_close(
+            actual.argmax(-1), reference.argmax(-1), rtol=0, atol=0
+        )
+        error = actual.float() - reference.float()
+        print(
+            f"packed round={step} rows={len(kept)} "
+            f"logit_max_abs={error.abs().max().item():.6g} "
+            f"logit_rmse={error.square().mean().sqrt().item():.6g}"
+        )
+        for request, count in enumerate(accepted):
+            histories[request].extend(candidates[request][:count])
 
 
 @torch.inference_mode()

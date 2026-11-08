@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -296,6 +296,44 @@ class BaseDrafter:
         Args:
             ctx: The target forward's context.
         """
+
+    def decode_graph_query_widths(self) -> tuple[int, ...]:
+        """Physical query widths captured per request-capacity bucket."""
+        return (self.spec_num_tokens,)
+
+    def prepare_decode_graph_layout(
+        self, ctx: ForwardContext, *, actual_bs: int, padded_bs: int
+    ) -> int:
+        """Publish live query layout before replay; return a captured width."""
+        return self.spec_num_tokens
+
+    def prepare_decode_graph_capture_layout(self, *, bs: int, query_width: int) -> None:
+        """Publish placeholder query boundaries before graph warmup/capture."""
+
+    def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
+        """Physical target row capacities for one request-capacity bucket."""
+        return tuple(bs * width for width in self.decode_graph_query_widths())
+
+    def prepare_decode_graph_token_layout(
+        self, ctx: ForwardContext, *, actual_bs: int, padded_bs: int
+    ) -> int:
+        return padded_bs * self.prepare_decode_graph_layout(
+            ctx, actual_bs=actual_bs, padded_bs=padded_bs
+        )
+
+    def prepare_decode_graph_token_capture_layout(
+        self, *, bs: int, query_tokens: int
+    ) -> None:
+        if query_tokens % bs:
+            raise ValueError("uniform verify Graph needs an integral query width")
+        self.prepare_decode_graph_capture_layout(bs=bs, query_width=query_tokens // bs)
+
+    def set_decode_graph_query_extent(self, num_tokens: int | None) -> None:
+        """Select physical target extent for capture; None restores eager policy."""
+
+    def target_forward_context(self, ctx: ForwardContext) -> AbstractContextManager:
+        """Lend temporary model inputs; restore them before sampling and commit."""
+        return nullcontext()
 
     def on_target_weights_updated(self) -> None:
         """Refresh draft-side state derived from shared target weights.

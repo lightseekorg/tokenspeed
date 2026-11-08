@@ -440,13 +440,22 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 )
 
     def forward_backbone(
-        self, bonus_token_ids, start_pos, history_slots, cache_pool, ctx
+        self,
+        bonus_token_ids,
+        start_pos,
+        history_slots,
+        cache_pool,
+        ctx,
+        *,
+        confidence_hidden_out: torch.Tensor | None = None,
     ):
         """Return normalized [batch, proposals, hidden] for a fixed DSpark block.
 
         ``history_slots`` addresses positions ``start_pos-127..start_pos`` in
         every stage's window; the anchor row at ``start_pos`` was written as a
-        verify row before this call.
+        verify row before this call. Optional ``confidence_hidden_out`` captures
+        the HC-combined features before final normalization for the checkpoint
+        confidence head; the returned drafting features remain normalized.
         """
         batch = bonus_token_ids.numel()
         # Every stage's window field shares the SWA page geometry, so the
@@ -487,9 +496,47 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             )
         if pending_post is not None:
             h = pending_post.finish(h)
-        return _norm(v41_hc_pre(h, pre_mix), self.norm).reshape(
-            batch, self.block_size, -1
+        combined = v41_hc_pre(h, pre_mix)
+        features = combined.reshape(batch, self.block_size, -1)
+        if confidence_hidden_out is not None:
+            if (
+                confidence_hidden_out.shape != features.shape
+                or confidence_hidden_out.dtype != combined.dtype
+                or confidence_hidden_out.device != combined.device
+            ):
+                raise ValueError(
+                    "DSpark confidence capture must match pre-norm features"
+                )
+            confidence_hidden_out.copy_(features)
+        return _norm(combined, self.norm).reshape(batch, self.block_size, -1)
+
+    def confidence_logits(
+        self, hidden_before_norm: torch.Tensor, previous_token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the checkpoint's FP32 confidence scores, without calibration.
+
+        Features are [batch, block, hidden] from ``confidence_hidden_out``.
+        Predecessor IDs are [batch, block]: anchor followed by all sampled draft
+        tokens except the last. They address the replicated Markov embedding,
+        so this projection needs no vocabulary gather. The scores are raw logits,
+        not normalized token probabilities or permission to bypass verification.
+        """
+        if (
+            hidden_before_norm.ndim != 3
+            or hidden_before_norm.shape[1:]
+            != (self.block_size, self.config.hidden_size)
+            or previous_token_ids.shape != hidden_before_norm.shape[:2]
+            or previous_token_ids.dtype not in (torch.int32, torch.int64)
+            or previous_token_ids.device != hidden_before_norm.device
+        ):
+            raise ValueError(
+                "DSpark confidence requires aligned block features and predecessor IDs"
+            )
+        markov = self.markov_embedding(previous_token_ids)
+        features = torch.cat(
+            (hidden_before_norm, markov.to(hidden_before_norm.dtype)), dim=-1
         )
+        return self.confidence_projection(features.float()).squeeze(-1)
 
 
 class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigurator):

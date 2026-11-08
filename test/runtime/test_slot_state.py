@@ -789,3 +789,42 @@ def test_sampling_offsets_recompute_after_restore_to_another_slot(cls):
     frontier[8] = 1025
     restored.extend_lengths = None
     assert backend._prepare_sampling_offsets(restored)[8].item() == 1026
+
+
+def _v41_confidence_drafter(monkeypatch):
+    from test.runtime.test_deepseek_v41_dspark import _draft_config
+    from test.runtime.test_deepseek_v41_model import _loader_model, _mapping, _quant
+
+    from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+        DeepseekV41DSpark,
+    )
+    from tokenspeed.runtime.models.deepseek_v41_dspark import (
+        DeepseekV41ForCausalLMDSpark,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    config = _draft_config()
+    _loader_model(monkeypatch, config, 0, "cpu")
+    mapping = _mapping(0, 4, 4)
+    model = DeepseekV41ForCausalLMDSpark(
+        SimpleNamespace(text_config=config), mapping, _quant()
+    )
+    monkeypatch.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", True)
+    states = RuntimeStates(
+        MAX_REQ_POOL_SIZE, config.vocab_size, config.vocab_size, 6, device="cpu"
+    )
+    return DeepseekV41DSpark(
+        spec_num_tokens=6,
+        spec_num_steps=5,
+        draft_model_runner=SimpleNamespace(model=model, mapping=mapping, device="cpu"),
+        attn_backend=None,
+        token_to_kv_pool=None,
+        runtime_states=states,
+        input_buffers=_input_buffers(),
+        vocab_size=config.vocab_size,
+    )
+
+
+def test_v41_confidence_slot_state_is_complete(monkeypatch):
+    drafter = _v41_confidence_drafter(monkeypatch)
+    _assert_slot_state_complete(drafter, exporter=drafter, slot_domains={POOL_ROWS})

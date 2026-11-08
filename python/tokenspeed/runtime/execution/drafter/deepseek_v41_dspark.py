@@ -32,13 +32,33 @@ transfer and L2 therefore carry the draft state with the KV.
 
 from __future__ import annotations
 
+import math
+import os
+from contextlib import contextmanager
+from dataclasses import dataclass
+from importlib import metadata
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
+from tokenspeed.runtime.execution.drafter.verify_calibration import (
+    VerifyCalibration,
+    VerifyCalibrationCache,
+    VerifyCalibrationCollector,
+    VerifyStepSample,
+    align_verify_samples,
+    calibration_source_fingerprint,
+)
+from tokenspeed.runtime.execution.drafter.verify_feedback import (
+    FeedbackSnapshot,
+    VerifyFeedback,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -52,6 +72,7 @@ from tokenspeed.runtime.models.deepseek_v41_dspark_heads import (
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import validate_block_widths
 
@@ -63,6 +84,36 @@ if TYPE_CHECKING:
 
 
 logger = get_colorful_logger(__name__)
+
+
+@dataclass
+class _VerifyBudgetBuffers:
+    scores: torch.Tensor
+    counts: torch.Tensor
+    valid: torch.Tensor
+    packet: torch.Tensor
+    peers: torch.Tensor
+    timing_packet: torch.Tensor
+    timing_peers: torch.Tensor
+
+
+@dataclass
+class _VerifyStepTiming:
+    step: int
+    epoch: int
+    batch_size: int
+    query_capacity: int
+    start: torch.cuda.Event
+    end: torch.cuda.Event
+
+
+@dataclass
+class _PendingVerifyFeedback:
+    ready: torch.cuda.Event
+    scores: torch.Tensor
+    contexts: torch.Tensor
+    snapshot: tuple[FeedbackSnapshot, ...]
+    timing: _VerifyStepTiming | None
 
 
 class DeepseekV41DSpark(BaseDrafter):
@@ -118,6 +169,276 @@ class DeepseekV41DSpark(BaseDrafter):
             self.device,
         )
 
+        self.adaptive_min_batch_size = global_server_args_dict.get(
+            "dsv41_dspark_min_batch_size", 32
+        )
+        self.verify_graph_token_step: int | None = None
+        self._verify_calibrations: tuple[VerifyCalibration, ...] = ()
+        self._verify_policy_ms: float | None = None
+        self.verify_budget_policy: VerifyBudgetPolicy | None = None
+        if global_server_args_dict.get("enable_dsv41_adaptive_dspark", False):
+            self.verify_budget_policy = VerifyBudgetPolicy(
+                enabled=True,
+                min_batch_size=self.adaptive_min_batch_size,
+                verify_width=self.spec_num_tokens,
+                min_gain=0.02,
+            )
+            self.verify_graph_token_step = 16
+        self.verify_feedback = (
+            VerifyFeedback(draft_width=self.block_size)
+            if self.verify_budget_policy is not None
+            else None
+        )
+        self._verify_budget_buffers: dict[int, _VerifyBudgetBuffers] = {}
+        self._verify_budget_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._pending_verify_feedback: list[_PendingVerifyFeedback] = []
+        self._verify_step_id = 0
+        self._verify_timing_epoch = 0
+        self._active_verify_timing: _VerifyStepTiming | None = None
+        self._verify_step_samples: list[VerifyStepSample] = []
+        self._aligned_verify_samples: tuple[VerifyStepSample, ...] = ()
+        self._verify_collecting = True
+        self._verify_cache_initialized = False
+        self._verify_cache: VerifyCalibrationCache | None = None
+        self._cached_verify_profiles: tuple[VerifyCalibration, ...] = ()
+        self._verify_collectors: dict[
+            tuple[int, int, int], VerifyCalibrationCollector
+        ] = {}
+        self.confidence_scores: torch.Tensor | None = None
+        self.confidence_features: torch.Tensor | None = None
+        self._confidence_request_ids: list[object | None] = []
+        self._verify_candidates: torch.Tensor | None = None
+        self._graph_query_tokens: int | None = None
+        self._verify_layout_counts: tuple[int, ...] | None = None
+        self._verify_rows: torch.Tensor | None = None
+        self._verify_indptr: torch.Tensor | None = None
+        if self.verify_budget_policy is not None:
+            if runtime_states is None:
+                raise ValueError("adaptive V4.1 DSpark requires runtime request state")
+            slots = runtime_states.future_input_map.shape[0]
+            self.confidence_scores = torch.full(
+                (slots, self.block_size),
+                float("inf"),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._confidence_request_ids = [None] * slots
+            # Stable storage: a captured packed forward reads these same
+            # addresses even when the next batch has different query boundaries.
+            self._verify_rows = torch.empty(
+                max_bs * self.spec_num_tokens, dtype=torch.int64, device=self.device
+            )
+            self._verify_indptr = torch.empty(
+                max_bs + 1, dtype=torch.int64, device=self.device
+            )
+            self.confidence_features = torch.empty(
+                max_bs,
+                self.block_size,
+                self.model.hidden_size,
+                # Norm weights can be FP32 while the draft activations are BF16.
+                dtype=self.model.embed_tokens.weight.dtype,
+                device=self.device,
+            )
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        return [] if self.confidence_scores is None else [self.confidence_scores[slot]]
+
+    def export_slot_state(self, slot, out, stream, *, request_id: str) -> None:
+        if (
+            self.confidence_scores is not None
+            and self._confidence_request_ids[slot] != request_id
+        ):
+            from tokenspeed.runtime.execution.slot_state import pack_slot_rows
+
+            pack_slot_rows(
+                [torch.full_like(self.confidence_scores[slot], float("inf"))],
+                out,
+                stream,
+            )
+        else:
+            super().export_slot_state(slot, out, stream, request_id=request_id)
+
+    def import_slot_state(self, slot, src, stream, *, request_id: str) -> None:
+        super().import_slot_state(slot, src, stream, request_id=request_id)
+        if self.verify_feedback is not None:
+            self.verify_feedback.invalidate()
+        if self.confidence_scores is not None:
+            self._confidence_request_ids[slot] = request_id
+
+    def on_target_weights_updated(self) -> None:
+        # A hot reload must not reuse or overwrite the boot checkpoint's costs.
+        self._verify_cache = None
+        self._cached_verify_profiles = ()
+        self._verify_cache_initialized = True
+        self._verify_calibrations = ()
+        self._verify_collectors.clear()
+        self._verify_collecting = True
+        self._verify_timing_epoch += 1
+        self._active_verify_timing = None
+        self._verify_step_samples.clear()
+        self._aligned_verify_samples = ()
+        if self.verify_feedback is not None:
+            self.verify_feedback.invalidate()
+        if self.confidence_scores is not None:
+            self.confidence_scores.fill_(float("inf"))
+
+    def verify_candidates(self) -> torch.Tensor:
+        if self._verify_candidates is None:
+            raise RuntimeError("packed verification has no original candidate window")
+        return self._verify_candidates
+
+    def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
+        if bs < self.adaptive_min_batch_size:
+            return (bs * self.spec_num_tokens,)
+        if self.confidence_scores is None or self.verify_graph_token_step is None:
+            return super().decode_graph_query_capacities(bs)
+        step = min(bs, self.verify_graph_token_step)
+        full = bs * self.spec_num_tokens
+        return tuple(dict.fromkeys((*range(bs, full, step), full)))
+
+    def prepare_decode_graph_token_capture_layout(
+        self, *, bs: int, query_tokens: int
+    ) -> None:
+        if self.confidence_scores is None or self.verify_graph_token_step is None:
+            return super().prepare_decode_graph_token_capture_layout(
+                bs=bs, query_tokens=query_tokens
+            )
+        width, extra = divmod(query_tokens, bs)
+        counts = (width + 1,) * extra + (width,) * (bs - extra)
+        self.prepare_verify_layout(counts, num_tokens=query_tokens)
+
+    def prepare_decode_graph_token_layout(
+        self, ctx: ForwardContext, *, actual_bs: int, padded_bs: int
+    ) -> int:
+        if self.verify_budget_policy is not None:
+            self._active_verify_timing = None
+            self._verify_step_id += 1
+            if not self.verify_budget_policy.admits(
+                batch_size=actual_bs, graph_batch_size=padded_bs
+            ):
+                return padded_bs * self.spec_num_tokens
+            if self._verify_collecting and actual_bs in self._verify_budget_buffers:
+                self._poll_verify_feedback()
+                self._synchronize_verify_samples(self._verify_budget_buffers[actual_bs])
+                self._update_verify_calibration()
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
+            capacity = self._prepare_calibrated_budget(
+                actual_bs=actual_bs, padded_bs=padded_bs
+            )
+            self._active_verify_timing = _VerifyStepTiming(
+                self._verify_step_id,
+                self._verify_timing_epoch,
+                actual_bs,
+                capacity,
+                start,
+                torch.cuda.Event(enable_timing=True),
+            )
+            return capacity
+        return padded_bs * self.spec_num_tokens
+
+    def set_decode_graph_query_extent(self, num_tokens: int | None) -> None:
+        self._graph_query_tokens = (
+            num_tokens if self.confidence_scores is not None else None
+        )
+
+    def prepare_verify_layout(
+        self, counts: tuple[int, ...], *, num_tokens: int
+    ) -> None:
+        """Publish row indices and CSR in place before a packed forward.
+
+        num_tokens is the physical query extent, including graph padding.
+        Padded rows read harmless input row zero; attention masks them using CSR.
+        """
+        if self._verify_rows is None or self._verify_indptr is None:
+            raise RuntimeError("adaptive verification is disabled")
+        if not counts or len(counts) + 1 > self._verify_indptr.numel():
+            raise ValueError("invalid verification batch size")
+        if any(n < 1 or n > self.spec_num_tokens for n in counts):
+            raise ValueError(
+                "verification counts must include an anchor and fit the draft"
+            )
+        if not sum(counts) <= num_tokens <= len(counts) * self.spec_num_tokens:
+            raise ValueError(
+                "physical verification extent does not cover the live rows"
+            )
+        if counts != self._verify_layout_counts:
+            rows = [
+                r * self.spec_num_tokens + c
+                for r, n in enumerate(counts)
+                for c in range(n)
+            ]
+            starts = [0]
+            for n in counts:
+                starts.append(starts[-1] + n)
+            self._verify_rows.zero_()
+            self._verify_rows[: len(rows)].copy_(
+                torch.tensor(rows, dtype=torch.int64, device=self.device)
+            )
+            self._verify_indptr[: len(starts)].copy_(
+                torch.tensor(starts, dtype=torch.int64, device=self.device)
+            )
+            self._verify_layout_counts = counts
+
+    @contextmanager
+    def packed_target_forward_context(self, ctx: ForwardContext, *, num_tokens: int):
+        """Graph-capturable packing/restoration with previously published CSR."""
+        if self._verify_rows is None or self._verify_indptr is None:
+            raise RuntimeError("adaptive verification is disabled")
+        ib = self.input_buffers
+        original = ctx.bs * self.spec_num_tokens
+        snapshots = []
+        ctx.decode_query_indptr = self._verify_indptr[: ctx.bs + 1]
+        try:
+            for view in (
+                ib.input_ids_buf[:original],
+                ib.positions_buf[:original],
+                *ib.ngram_model_kwargs(original).values(),
+            ):
+                saved = view.clone()
+                snapshots.append((view, saved))
+                if len(snapshots) == 1:
+                    self._verify_candidates = saved.reshape(
+                        ctx.bs, self.spec_num_tokens
+                    )
+                view[:num_tokens].copy_(
+                    saved.index_select(0, self._verify_rows[:num_tokens])
+                )
+            ctx.input_num_tokens = num_tokens
+            backend = ctx.attn_backend
+            tables = backend.query_metadata(ForwardMode.DECODE).block_tables
+            backend.refresh_decode_metadata(
+                ctx.bs,
+                ctx.bs,
+                ib.req_pool_indices_buf[: ctx.bs],
+                ib.seq_lens_buf[: ctx.bs],
+                forward_mode=ForwardMode.DECODE,
+                block_tables=tables,
+                num_tokens=num_tokens,
+                decode_query_indptr=ctx.decode_query_indptr,
+                for_graph_replay=torch.cuda.is_current_stream_capturing(),
+            )
+            yield
+        finally:
+            for view, saved in snapshots:
+                view.copy_(saved)
+
+    @contextmanager
+    def target_forward_context(self, ctx: ForwardContext):
+        self._verify_candidates = None
+        if self._graph_query_tokens is not None and ctx.num_extends == 0:
+            if self._graph_query_tokens == ctx.bs * self.spec_num_tokens:
+                yield
+                return
+            with self.packed_target_forward_context(
+                ctx, num_tokens=self._graph_query_tokens
+            ):
+                yield
+            return
+        # Uncaptured forwards retain native verification; only the prepared
+        # token-capacity graph path may shorten target work.
+        yield
+
     def idle_forward_global_num_tokens(
         self,
         global_num_tokens: list[int],
@@ -142,8 +463,536 @@ class DeepseekV41DSpark(BaseDrafter):
         request_pool_indices: list[int],
         num_extends: int,
     ) -> None:
-        """Window pages are scheduler-owned; nothing to refresh per round."""
-        del request_ids, request_pool_indices, num_extends
+        """Reset predictions for new request identities; KV remains scheduler-owned."""
+        if self.verify_feedback is not None:
+            self._poll_verify_feedback()
+            self.verify_feedback.prepare(
+                request_ids, request_pool_indices, num_extends=num_extends
+            )
+        if self.confidence_scores is None:
+            return
+        for row, (request, slot) in enumerate(
+            zip(request_ids, request_pool_indices, strict=True)
+        ):
+            if row < num_extends or self._confidence_request_ids[slot] != request:
+                self.confidence_scores[slot].fill_(float("inf"))
+            self._confidence_request_ids[slot] = request
+
+    def install_verify_calibration(
+        self, profiles: tuple[VerifyCalibration, ...], *, policy_ms: float
+    ) -> None:
+        """Install rank-consistent startup measurements, never a serving-time file."""
+        if self.verify_budget_policy is None:
+            raise ValueError("verification budget mode is disabled")
+        if not math.isfinite(policy_ms) or policy_ms < 0:
+            raise ValueError("policy overhead must be finite and nonnegative")
+        for index, profile in enumerate(profiles):
+            if profile.verify_width != self.spec_num_tokens:
+                raise ValueError("calibration verify width does not match the model")
+            for capacity, _ in profile.adaptive_step_ms:
+                if (profile.batch_size, capacity) not in self._verify_budget_graphs:
+                    raise ValueError("calibration refers to an uncaptured allocation")
+            for previous in profiles[:index]:
+                if previous.batch_size == profile.batch_size and max(
+                    previous.min_context, profile.min_context
+                ) <= min(previous.max_context, profile.max_context):
+                    raise ValueError("ambiguous calibration context coverage")
+        self._verify_calibrations = tuple(profiles)
+        self._verify_policy_ms = policy_ms
+        self._verify_collecting = False
+
+    def _prepare_calibrated_budget(self, *, actual_bs: int, padded_bs: int) -> int:
+        full = padded_bs * self.spec_num_tokens
+        if (
+            not self.verify_budget_policy.admits(
+                batch_size=actual_bs, graph_batch_size=padded_bs
+            )
+            or actual_bs not in self._verify_budget_buffers
+        ):
+            return full
+        self._poll_verify_feedback()
+        buffers = self._verify_budget_buffers[actual_bs]
+        tp = int(self.draft_model.mapping.attn.tp_size)
+        rank = int(self.draft_model.mapping.attn.tp_rank)
+        selected = full
+        collecting = True
+        scores = None
+        if rank == 0:
+            scores = self.verify_feedback.scores()
+            bounds = self.verify_feedback.context_bounds()
+            if scores is not None and bounds is not None:
+                for profile in self._verify_calibrations:
+                    if profile.covers(
+                        batch_size=actual_bs,
+                        min_context=bounds[0],
+                        max_context=bounds[1],
+                    ):
+                        collecting = False
+                        selected = self.verify_budget_policy.select(
+                            scores,
+                            graph_batch_size=padded_bs,
+                            native_step_ms=profile.native_step_ms,
+                            adaptive_step_ms=dict(profile.adaptive_step_ms),
+                            policy_ms=self._verify_policy_ms,
+                        )
+                        break
+                if collecting:
+                    region = self._verify_context_region(bounds)
+                    if region is not None:
+                        collector = self._verify_collectors.get((actual_bs, *region))
+                        if collector is not None:
+                            selected = collector.next_capacity() or full
+        # One authoritative packet aligns graph choice and allocation scores.
+        # All TP ranks participate even when their local async feedback is late.
+        packet = torch.zeros(buffers.packet.shape, dtype=torch.float32, pin_memory=True)
+        packet[0] = selected
+        packet[1] = int(collecting)
+        if rank == 0 and selected != full:
+            packet[2:].copy_(torch.tensor(scores, dtype=torch.float32).flatten())
+        buffers.packet.copy_(packet, non_blocking=True)
+        if tp > 1:
+            all_gather_single(buffers.peers.flatten(), buffers.packet, self.tp_group)
+            selected_value, collecting_value = buffers.peers[0, :2].tolist()
+            selected = int(selected_value)
+            collecting = bool(collecting_value)
+            source = buffers.peers[0, 2:].view(actual_bs, self.block_size)
+        else:
+            source = buffers.packet[2:].view(actual_bs, self.block_size)
+        self._verify_collecting = collecting
+        if selected != full:
+            self.prepare_verify_budget_layout(
+                source, batch_size=actual_bs, query_capacity=selected
+            )
+        return selected
+
+    @staticmethod
+    def _verify_context_region(bounds: tuple[int, int]) -> tuple[int, int] | None:
+        # Do not fit one cost to a batch spanning different context regions.
+        # Fixed nonoverlapping ranges make profile lookup and cache validation
+        # unambiguous; crossing a boundary falls back until the batch fits again.
+        lo, hi = bounds
+        step = 16384
+        lower = ((lo - 1) // step) * step + 1
+        upper = lower + step - 1
+        return (lower, upper) if 1 <= lo <= hi <= upper else None
+
+    def _update_verify_calibration(self) -> None:
+        # All ranks consume the same aligned history and install the same
+        # profiles. No rank may independently skip the calibration collective.
+        tp = int(self.draft_model.mapping.attn.tp_size)
+        for sample in self._aligned_verify_samples:
+            region = self._verify_context_region(
+                (sample.min_context, sample.max_context)
+            )
+            if region is None or sample.batch_size not in self._verify_budget_buffers:
+                continue
+            if any(
+                profile.covers(
+                    batch_size=sample.batch_size,
+                    min_context=sample.min_context,
+                    max_context=sample.max_context,
+                )
+                for profile in self._verify_calibrations
+            ):
+                continue
+            key = (sample.batch_size, *region)
+            collector = self._verify_collectors.get(key)
+            if collector is None:
+                collector = VerifyCalibrationCollector(
+                    batch_size=sample.batch_size,
+                    verify_width=self.spec_num_tokens,
+                    context_bounds=region,
+                    capacities=self.decode_graph_query_capacities(sample.batch_size),
+                    world_size=tp,
+                    minimum_samples=8,
+                    warmup_samples=2,
+                )
+                self._verify_collectors[key] = collector
+            # The alignment step already verified every rank and reduced max.
+            collector.observe(
+                step=sample.step,
+                query_capacity=sample.query_capacity,
+                context_bounds=(sample.min_context, sample.max_context),
+                rank_steps=[sample.step] * tp,
+                rank_ms=[sample.elapsed_ms] * tp,
+            )
+            profile = collector.result()
+            if profile is not None:
+                # Complete-step timings already include policy/packet overhead.
+                self.install_verify_calibration(
+                    (*self._verify_calibrations, profile), policy_ms=0.0
+                )
+                self._save_verify_calibration()
+                if int(self.draft_model.mapping.attn.tp_rank) == 0:
+                    logger.info(
+                        f"Adaptive DSpark calibration complete: BS={profile.batch_size}, "
+                        f"context=[{profile.min_context}, {profile.max_context}], "
+                        f"samples_per_capacity={profile.sample_count}, "
+                        f"full_step_ms={profile.native_step_ms:.3f}, "
+                        f"adaptive_step_ms={dict(profile.adaptive_step_ms)}"
+                    )
+
+    def _synchronize_verify_samples(self, buffers: _VerifyBudgetBuffers) -> None:
+        # Calibration only: never equate each rank's latest completion with the
+        # same step. A short history accommodates asynchronous completion skew.
+        samples = self._verify_step_samples[-buffers.timing_packet.shape[0] :]
+        packet = torch.zeros(
+            buffers.timing_packet.shape, dtype=torch.float64, pin_memory=True
+        )
+        for index, sample in enumerate(samples):
+            packet[index].copy_(
+                torch.tensor(
+                    [
+                        sample.step,
+                        sample.batch_size,
+                        sample.query_capacity,
+                        sample.min_context,
+                        sample.max_context,
+                        sample.elapsed_ms,
+                    ],
+                    dtype=torch.float64,
+                )
+            )
+        buffers.timing_packet.copy_(packet, non_blocking=True)
+        tp = int(self.draft_model.mapping.attn.tp_size)
+        if tp > 1:
+            all_gather_single(
+                buffers.timing_peers.flatten(),
+                buffers.timing_packet.flatten(),
+                self.tp_group,
+            )
+            peers = buffers.timing_peers.cpu().tolist()
+        else:
+            peers = [packet.tolist()]
+        histories = []
+        for peer in peers:
+            history = []
+            for row in peer:
+                if not all(math.isfinite(value) for value in row):
+                    continue
+                if row[5] <= 0 or any(value != int(value) for value in row[:5]):
+                    continue
+                history.append(VerifyStepSample(*(int(v) for v in row[:5]), row[5]))
+            histories.append(history)
+        self._aligned_verify_samples = align_verify_samples(histories)
+
+    def capture_round_graphs(
+        self, graph_bs: int, *, stream: torch.cuda.Stream, pool: tuple[int, int]
+    ) -> None:
+        if self.verify_budget_policy is None or graph_bs < self.adaptive_min_batch_size:
+            return
+        if graph_bs in self._verify_budget_buffers:
+            return
+        buffers = _VerifyBudgetBuffers(
+            scores=torch.zeros(
+                (graph_bs, self.block_size), dtype=torch.float32, device=self.device
+            ),
+            counts=torch.empty(graph_bs, dtype=torch.int64, device=self.device),
+            valid=torch.empty((), dtype=torch.bool, device=self.device),
+            packet=torch.empty(
+                2 + graph_bs * self.block_size, dtype=torch.float32, device=self.device
+            ),
+            peers=torch.empty(
+                (
+                    int(self.draft_model.mapping.attn.tp_size),
+                    2 + graph_bs * self.block_size,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            timing_packet=torch.empty((8, 6), dtype=torch.float64, device=self.device),
+            timing_peers=torch.empty(
+                (int(self.draft_model.mapping.attn.tp_size), 8, 6),
+                dtype=torch.float64,
+                device=self.device,
+            ),
+        )
+        self._verify_budget_buffers[graph_bs] = buffers
+        for capacity in self.decode_graph_query_capacities(graph_bs):
+            if capacity == graph_bs * self.spec_num_tokens:
+                continue
+
+            def allocate() -> None:
+                dsv41.verify_layout(
+                    buffers.scores,
+                    query_capacity=capacity,
+                    rows_out=self._verify_rows[:capacity],
+                    indptr_out=self._verify_indptr[: graph_bs + 1],
+                    counts_out=buffers.counts,
+                    valid_out=buffers.valid,
+                )
+
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    allocate()
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                allocate()
+            self._verify_budget_graphs[(graph_bs, capacity)] = graph
+        self._verify_layout_counts = None
+        self._restore_verify_calibration(graph_bs)
+
+    def _initialize_verify_cache(self) -> None:
+        if self._verify_cache_initialized:
+            return
+        self._verify_cache_initialized = True
+        import tokenspeed_engine
+        import tokenspeed_kernel
+
+        import tokenspeed
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager,
+        )
+
+        tp = int(self.draft_model.mapping.attn.tp_size)
+        rank = int(self.draft_model.mapping.attn.tp_rank)
+        properties = torch.cuda.get_device_properties(self.device)
+        hardware = {
+            "name": properties.name,
+            "architecture": (properties.major, properties.minor),
+            "memory": properties.total_memory,
+            "multiprocessors": properties.multi_processor_count,
+            "uuid": str(properties.uuid),
+            "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        }
+        group = (
+            process_group_manager.get_device_process_group(self.tp_group)
+            if tp > 1
+            else None
+        )
+        devices = [hardware]
+        if tp > 1:
+            devices = [None] * tp
+            torch.distributed.all_gather_object(devices, hardware, group=group)
+        profiles = None
+        if rank == 0:
+            try:
+                args = self.draft_model_runner.server_args
+                model_config = self.draft_model_runner.model_config
+                checkpoint = Path(args.model)
+                weights = (
+                    [
+                        (
+                            str(path.relative_to(checkpoint)),
+                            path.stat().st_size,
+                            path.stat().st_mtime_ns,
+                        )
+                        for path in sorted(checkpoint.glob("**/*.safetensors"))
+                    ]
+                    if checkpoint.is_dir()
+                    else []
+                )
+                identity = {
+                    "schema": 1,
+                    "model": args.model,
+                    "revision": args.revision,
+                    "model_config": model_config.hf_config.to_dict(),
+                    "weights": weights,
+                    "devices": devices,
+                    "tp_group": self.tp_group,
+                    "topology": {
+                        "world_size": self.draft_model.mapping.world_size,
+                        "moe_tp": self.draft_model.mapping.moe.tp_size,
+                        "moe_ep": self.draft_model.mapping.moe.ep_size,
+                        "moe_dp": self.draft_model.mapping.moe.dp_size,
+                    },
+                    "runtime": {
+                        k: v
+                        for k, v in global_server_args_dict.items()
+                        if k != "mapping"
+                    },
+                    "dtype": args.dtype,
+                    "quantization": args.quantization,
+                    "draft_moe_backend": args.draft_moe_backend,
+                    "graph_step": self.verify_graph_token_step,
+                    "verify_width": self.spec_num_tokens,
+                    "calibration": {"context_step": 16384, "warmup": 2, "samples": 8},
+                    "software": calibration_source_fingerprint(
+                        [
+                            Path(tokenspeed.__file__).parent,
+                            Path(tokenspeed_kernel.__file__).parent,
+                            Path(tokenspeed_engine.__file__).parent,
+                        ]
+                    ),
+                    "packages": sorted(
+                        (d.metadata["Name"], d.version)
+                        for d in metadata.distributions()
+                        if d.metadata["Name"]
+                    ),
+                    "cuda": torch.version.cuda,
+                    "environment": {
+                        k: v
+                        for k, v in os.environ.items()
+                        if k.startswith(("TOKENSPEED_", "NCCL_", "CUDA_"))
+                    },
+                }
+                cache_home = Path(
+                    os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+                )
+                self._verify_cache = VerifyCalibrationCache(
+                    cache_home / "tokenspeed" / "adaptive-dspark",
+                    identity=identity,
+                )
+                profiles = self._verify_cache.load()
+            except (OSError, ValueError, TypeError) as error:
+                self._verify_cache = None
+                logger.warning(
+                    f"Adaptive DSpark calibration cache unavailable: {error}"
+                )
+        if tp > 1:
+            payload = [profiles]
+            torch.distributed.broadcast_object_list(
+                payload, src=self.tp_group[0], group=group
+            )
+            profiles = payload[0]
+        self._cached_verify_profiles = profiles or ()
+
+    def _restore_verify_calibration(self, graph_bs: int) -> None:
+        self._initialize_verify_cache()
+        candidates = tuple(
+            profile
+            for profile in self._cached_verify_profiles
+            if profile.batch_size == graph_bs
+            and profile.verify_width == self.spec_num_tokens
+            and profile.sample_count >= 8
+            and {q for q, _ in profile.adaptive_step_ms}
+            == set(self.decode_graph_query_capacities(graph_bs))
+            - {graph_bs * self.spec_num_tokens}
+        )
+        if candidates:
+            self.install_verify_calibration(
+                (*self._verify_calibrations, *candidates), policy_ms=0.0
+            )
+            logger.info(
+                f"Adaptive DSpark loaded {len(candidates)} calibration regions for BS={graph_bs}"
+            )
+
+    def _save_verify_calibration(self) -> None:
+        self._cached_verify_profiles = self._verify_calibrations
+        if self._verify_cache is not None:
+            try:
+                # Happens only on profile completion, before the timed forward.
+                self._verify_cache.save(self._verify_calibrations)
+            except OSError as error:
+                logger.warning(
+                    f"Adaptive DSpark could not persist calibration: {error}"
+                )
+                self._verify_cache = None
+
+    def release_round_graphs(self) -> None:
+        # Pending D2H copies retain their buffers until completion. Invalidate
+        # their request epochs so they cannot seed a rebuilt execution graph.
+        if self.verify_feedback is not None:
+            self.verify_feedback.invalidate()
+        self._verify_calibrations = ()
+        self._verify_policy_ms = None
+        self._verify_timing_epoch += 1
+        self._active_verify_timing = None
+        self._verify_step_samples.clear()
+        self._aligned_verify_samples = ()
+        self._verify_collectors.clear()
+        self._verify_collecting = True
+        self._verify_budget_graphs.clear()
+        self._verify_budget_buffers.clear()
+
+    def prepare_verify_budget_layout(
+        self, scores: torch.Tensor, *, batch_size: int, query_capacity: int
+    ) -> None:
+        """Replay a startup-prepared allocation; never capture on the serving path.
+
+        The budget owner must have validated the feedback and agreed on capacity
+        across ranks. The validity flag remains available for diagnostics.
+        """
+        graph = self._verify_budget_graphs.get((batch_size, query_capacity))
+        if graph is None:
+            raise ValueError("verification allocation graph was not prepared")
+        buffers = self._verify_budget_buffers[batch_size]
+        if (
+            scores.shape != buffers.scores.shape
+            or scores.dtype != torch.float32
+            or scores.device != buffers.scores.device
+        ):
+            raise ValueError("confidence scores do not match the prepared allocation")
+        buffers.scores.copy_(scores)
+        graph.replay()
+        self._verify_layout_counts = None
+
+    def _poll_verify_feedback(self) -> None:
+        if self.verify_feedback is None:
+            return
+        while self._pending_verify_feedback:
+            pending = self._pending_verify_feedback[0]
+            if not pending.ready.query():
+                break
+            self._pending_verify_feedback.pop(0)
+            lengths = pending.contexts.tolist()
+            if lengths and all(length > 0 for length in lengths):
+                self.verify_feedback.publish(
+                    pending.snapshot, pending.scores.tolist(), context_lengths=lengths
+                )
+                timing = pending.timing
+                if timing is not None and timing.epoch == self._verify_timing_epoch:
+                    elapsed = timing.start.elapsed_time(timing.end)
+                    if math.isfinite(elapsed) and elapsed > 0:
+                        self._verify_step_samples.append(
+                            VerifyStepSample(
+                                timing.step,
+                                timing.batch_size,
+                                timing.query_capacity,
+                                min(lengths),
+                                max(lengths),
+                                elapsed,
+                            )
+                        )
+                        # Keep enough history for asynchronous rank alignment,
+                        # without retaining unbounded per-step measurements.
+                        del self._verify_step_samples[:-64]
+
+    def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
+        # Runs on the forward thread, outside capture, after draft writes.
+        # Do not wait for feedback; a busy copy queue means native fallback.
+        timing = self._active_verify_timing
+        self._active_verify_timing = None
+        if timing is not None:
+            if ctx.num_extends or timing.batch_size != ctx.bs or graph_bs != ctx.bs:
+                timing = None
+            else:
+                # Same stream as graph replay and output copies. The ready
+                # event below guarantees both timing events have completed.
+                timing.end.record()
+        if (
+            self.verify_feedback is None
+            or ctx.num_extends
+            or graph_bs != ctx.bs
+            or ctx.bs < self.adaptive_min_batch_size
+        ):
+            return
+        self._poll_verify_feedback()
+        if len(self._pending_verify_feedback) >= 3:
+            return
+        snapshot = self.verify_feedback.snapshot()
+        if len(snapshot) != ctx.bs:
+            raise RuntimeError("verification feedback does not match the active batch")
+        slots = self.input_buffers.req_pool_indices_buf[: ctx.bs]
+        scores = self.confidence_scores.index_select(0, slots)
+        host = torch.empty(
+            scores.shape, dtype=scores.dtype, device="cpu", pin_memory=True
+        )
+        host.copy_(scores, non_blocking=True)
+        contexts = torch.empty(
+            ctx.bs,
+            dtype=self.input_buffers.seq_lens_buf.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        contexts.copy_(self.input_buffers.seq_lens_buf[: ctx.bs], non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._pending_verify_feedback.append(
+            _PendingVerifyFeedback(event, host, contexts, snapshot, timing)
+        )
 
     def _draft_decode_rows(
         self,
@@ -194,11 +1043,28 @@ class DeepseekV41DSpark(BaseDrafter):
         history_slots, _ = backend.window_slots(
             V41_SWA_GROUP_ID,
             start_pos,
-            meta.request_indices[: num_decodes * width : width],
+            (
+                meta.request_indices[: num_decodes * width : width]
+                if base_ctx.decode_query_indptr is None
+                else meta.request_indices.index_select(
+                    0, base_ctx.decode_query_indptr[:-1].to(torch.int64)
+                )
+            ),
         )
         bonus = next_tokens[num_extends:, 0]
+        capture = (
+            None
+            if self.confidence_features is None
+            or num_decodes < self.adaptive_min_batch_size
+            else self.confidence_features[:num_decodes]
+        )
         draft_hidden = self.model.forward_backbone(
-            bonus, start_pos, history_slots, pool, draft_ctx
+            bonus,
+            start_pos,
+            history_slots,
+            pool,
+            draft_ctx,
+            confidence_hidden_out=capture,
         )
         local_logits = self.model.local_base_logits(draft_hidden, self.lm_head.weight)
         # The greedy step's shard offsets come from the Markov projection, so
@@ -221,6 +1087,14 @@ class DeepseekV41DSpark(BaseDrafter):
             self.partials,
             next_tokens[num_extends:, 1:],
         )
+        if capture is not None:
+            scores = self.model.confidence_logits(
+                capture, next_tokens[num_extends:, :-1]
+            )
+            slots = self.input_buffers.state_write_req_pool_indices_buf[
+                num_extends : base_ctx.bs
+            ]
+            self.confidence_scores.index_copy_(0, slots, scores)
 
     @nvtx_range("drafter:dspark", color="purple")
     def run(
@@ -249,7 +1123,11 @@ class DeepseekV41DSpark(BaseDrafter):
         view = backend.decoder_view()
         prefill_tokens = 0 if view.prefill is None else view.prefill.positions.numel()
         num_decodes = base_ctx.bs - num_extends
-        decode_tokens = num_decodes * self.spec_num_tokens
+        decode_tokens = (
+            num_decodes * self.spec_num_tokens
+            if base_ctx.decode_query_indptr is None
+            else view.metadata.positions.numel() - prefill_tokens
+        )
         rows = prefill_tokens + decode_tokens
         if rows > hidden_states.shape[0] or rows > view.metadata.positions.numel():
             raise RuntimeError(
@@ -278,6 +1156,7 @@ class DeepseekV41DSpark(BaseDrafter):
             next_tokens,
             start_pos,
             num_prefill_outputs=num_prefill_outputs,
+            decode_query_indptr=base_ctx.decode_query_indptr,
         )
 
         # Every captured row writes its window row: a prompt's kept tail seeds

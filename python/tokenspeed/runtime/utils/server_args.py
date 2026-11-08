@@ -674,6 +674,8 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    enable_dsv41_adaptive_dspark: bool = False
+    dsv41_dspark_min_batch_size: int = 32
     synthetic_acceptance_length: float | None = None
     # Standard (draft-prob) rejection sampling for the chain drafters: the
     # drafter samples each step from its own distribution q and records it,
@@ -871,7 +873,54 @@ class ServerArgs:
         self.resolve_numerics()
         self.resolve_disaggregation()
         self.validate_output_cumulative_probs()
+        self.validate_dsv41_adaptive_dspark()
         self.validate()
+
+    def validate_dsv41_adaptive_dspark(self):
+        if (
+            type(self.dsv41_dspark_min_batch_size) is not int
+            or self.dsv41_dspark_min_batch_size < 1
+        ):
+            raise ValueError("DSpark minimum batch size must be a positive integer")
+        if not self.enable_dsv41_adaptive_dspark:
+            return
+        if self.enforce_eager:
+            raise ValueError("adaptive DSpark requires CUDA graphs")
+        if self.synthetic_acceptance_length is not None:
+            raise ValueError("adaptive DSpark requires real acceptance")
+        from tokenspeed.runtime.utils.env import envs
+
+        if self.speculative_algorithm != "DSPARK" or self.sampling_backend != "greedy":
+            raise ValueError(
+                "V4.1 adaptive verification requires DSPARK and greedy sampling"
+            )
+        if not self.disable_prefill_graph:
+            raise ValueError(
+                "V4.1 adaptive verification requires --disable-prefill-graph"
+            )
+        if (
+            self.kv_parallel_size != 1
+            or self.decode_context_parallel_size != 1
+            or self.query_context_parallel_size != 1
+            or self.mapping.has_attn_dp
+            or self.pipeline_parallel_size != 1
+            or self.dp_sampling
+        ):
+            raise ValueError(
+                "V4.1 adaptive verification requires KVP1/DCP1, attention DP1 and PP1"
+            )
+        if (
+            self.grammar_backend != "none"
+            or self.enable_output_logprobs
+            or self.enable_output_cumulative_probs
+            or self.enable_speculative_sampling
+            or self.speculative_draft_tree
+            or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
+            or self.disable_sampling_tp_sync
+        ):
+            raise ValueError(
+                "V4.1 adaptive verification requires plain greedy sampling, grammar none, and TP synchronization"
+            )
 
     def validate_output_cumulative_probs(self):
         from tokenspeed.runtime.utils.env import envs
@@ -4076,6 +4125,20 @@ class ServerArgs:
         )
 
         # Speculative decoding
+        parser.add_argument(
+            "--enable-dsv41-adaptive-dspark",
+            action="store_true",
+            default=ServerArgs.enable_dsv41_adaptive_dspark,
+            help="Adapt DeepSeek V4.1 DSpark verification capacity using confidence "
+            "and calibrated step costs. Requires greedy sampling and CUDA graphs.",
+        )
+        parser.add_argument(
+            "--dsv41-dspark-min-batch-size",
+            type=int,
+            default=ServerArgs.dsv41_dspark_min_batch_size,
+            help="Minimum actual decode batch size for adaptive DSpark. Smaller "
+            "or padded batches retain full verification.",
+        )
         parser.add_argument(
             "--draft-model-path-use-base",
             action="store_true",
