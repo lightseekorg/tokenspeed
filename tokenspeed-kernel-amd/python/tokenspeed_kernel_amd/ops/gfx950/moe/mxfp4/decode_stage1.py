@@ -70,23 +70,6 @@ def _direct_swiglu_reduce(
         BLOCK_M, BLOCK_N_FULL, gl.num_warps()
     )
     acc = gl.convert_layout(acc, split_layout)
-    return _swiglu_interleaved(acc, alpha, limit, beta, OUT_BLOCK_N)
-
-
-@gluon.jit
-def _swiglu_interleaved(
-    acc,
-    alpha: gl.constexpr,
-    limit: gl.constexpr,
-    beta: gl.constexpr,
-    OUT_BLOCK_N: gl.constexpr,
-):
-    """SwiGLU of a gate/up tile whose columns alternate gate and up.
-
-    Works in the tile's own layout: a lane must hold each gate/up pair, as
-    the transposed MFMA result layout and ``_direct_swiglu_split_layout`` do.
-    """
-    BLOCK_M: gl.constexpr = acc.shape[0]
     reshaped = acc.reshape((BLOCK_M, OUT_BLOCK_N, 2))
     gate, linear = gl.split(reshaped)
     if limit > 0.0:
