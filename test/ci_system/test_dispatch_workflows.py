@@ -1426,6 +1426,7 @@ def test_mi450_sim_uses_bounded_smoke_suite():
     assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "600"
     assert task["env"]["MI450_SIM_THREADS_PER_WORKER"] == "2"
     assert 'config["cpu_thread_budget"] = thread_budget' in setup_script
+    assert "runtimes/api-headers" in setup_script
     assert 'threads_per_emulator="${MI450_SIM_THREADS_PER_WORKER:-2}"' in (
         parallel_script
     )
@@ -1521,6 +1522,11 @@ def test_standalone_mi450_setup_loads_shared_stack(tmp_path):
 
 def test_mi450_sim_pins_one_rocm_nightly():
     env = read_mi450_sim_env(REPO_ROOT / "test/ci_system/mi450_sim_env.sh")
+
+    assert env["ROCM_SDK_VERSION"] == "10.3.0a20261107"
+    assert env["ROCM_SYSTEMS_REF"] == "3f917c0d61869b153dae1264e712b414a9343d10"
+    assert env["TORCH_VERSION"] == "2.16.0a0+rocm10.3.0a20261107"
+    assert env["TORCHVISION_VERSION"] == "0.30.0a0+rocm10.3.0a20261107"
 
     # PyTorch requires the exact ROCm SDK build it was built against.
     rocm_build = f"+rocm{env['ROCM_SDK_VERSION']}"

@@ -36,11 +36,12 @@ if [ ! -d "${SOURCE_ROOT}/.git" ]; then
         --no-checkout \
         https://github.com/ROCm/rocm-systems.git \
         "${SOURCE_ROOT}"
-    git -C "${SOURCE_ROOT}" sparse-checkout init --cone
-    git -C "${SOURCE_ROOT}" sparse-checkout set \
-        emulation/rocjitsu \
-        shared/machine-readable-isa/isa
 fi
+git -C "${SOURCE_ROOT}" sparse-checkout init --cone
+git -C "${SOURCE_ROOT}" sparse-checkout set \
+    emulation/rocjitsu \
+    runtimes/api-headers \
+    shared/machine-readable-isa/isa
 if ! git -C "${SOURCE_ROOT}" cat-file -e "${ROCM_SYSTEMS_REF}^{commit}"; then
     for attempt in 1 2 3; do
         if git -C "${SOURCE_ROOT}" fetch --depth 1 origin "${ROCM_SYSTEMS_REF}"; then
