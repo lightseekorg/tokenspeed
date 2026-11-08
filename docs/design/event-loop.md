@@ -629,8 +629,10 @@ them only when the loop holds no request, in-flight forward or open cache op.
 
 **Pause and memory release** (`control`). A pause in `abort` mode aborts what
 runs, `wait` lets it finish; both stop admissions and answer once the
-scheduler drained. `keep` freezes everything and answers at once: a frozen
-round commits what is dispatched and still joins the attention-DP agreement
+scheduler drained, including requests parked for PD retirement: both the
+transfer and local forwards must finish even if the output already ended.
+`keep` freezes everything and answers at once: a frozen round commits what is
+dispatched and still joins the attention-DP agreement
 (an idle forward when a peer runs one, but not while memory is released: the
 weights are unmapped; idle forwards count toward the expert rebalance like
 real ones, so the ranks' rebalances stay in step). It plans like any round,
@@ -784,11 +786,12 @@ prefill peer.
 
 **PD source retirement.** A terminal status alone does not release source
 pages. The prefill peer counts queued and executing transfer jobs. A failure
-agreed by the replica first stops new work on every rank, then every rank must
-have retired its jobs before a terminal event reaches the scheduler. Queued
+agreed by the replica first stops new work on every rank and reports `Failed`,
+which parks the request without releasing its resources. Every rank must
+retire its jobs before `Stopped` reaches the scheduler. Queued
 jobs for failed rooms are dropped; executing jobs finish or return from the
 synchronous transport call before retiring. Client cancellation keeps the
-request's source ownership until that terminal event. The retirement agreement
+request's source ownership until that retirement event. The retirement agreement
 is needed only in rounds with a terminal status.
 
 **PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
@@ -796,11 +799,16 @@ transfer as well as marking the request's output. A decode receiver sends a
 cancellation to every prefill target that could write its landing pages.
 Each target stops accepting work for the room and acknowledges only after
 its queued and executing writes retire. The receiver waits for every target,
-then agrees retirement across its replica before reporting failure to the
-scheduler. Failure notifications and receive timeouts use the same fence:
+then agrees retirement across its replica before reporting `Stopped` to the
+scheduler; `Failed` may already have ended the client request. Failure
+notifications and receive timeouts use the same fence:
 neither proves that remote writes stopped. A receiver that never advertised
 landing pages can retire locally. Cancelled rooms reject delayed registration
 and manifests; repeated cancellation is safe.
+
+`Failed` precedes `Stopped`, but both may arrive in the same poll when the
+transfer has already retired. Consumers accept either one poll or separate
+polls and keep the pages until the retirement event and local forwards complete.
 
 The prefill control receiver handles cancellation even when no native request
 claimed the room or its scheduler is paused. Unclaimed rooms therefore need
@@ -813,6 +821,20 @@ identities. A prefill cancellation that never learns a destination identity
 must retain its room tombstone until that peer exits, since an arbitrarily
 late manifest must not revive the transfer.
 
+A native write error does not prove that its remote DMA stopped. The prefill
+peer marks that room uncertain and withholds cancellation acknowledgments even
+after its queued and executing calls return. Failure notices may still reach
+the receiver, but cannot release its pages. An uncertain room or an unreachable
+writer can therefore keep the receiver's drain pending indefinitely; stalled
+drains are logged periodically. A parked request also keeps operations that
+require a drained engine, such as cache flush, weight replacement and sleep
+with memory release, from completing. Recovery requires verified retirement
+of the writers or transport invalidation that makes further access to these
+registrations impossible; local forwards must also have completed before
+pages are released. A timeout can trigger diagnostics or recovery but cannot
+authorize page reuse; the current protocol provides no forced retirement
+for an uncertain room.
+
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
 admission, and every round the replica agrees on which transfers changed
 state; their scheduler events join the round's tail feedback, and a failed
@@ -824,6 +846,11 @@ EPD embedding timeout), waits unclaimed; one still unclaimed after the
 bootstrap timeout is dropped, and the decode ranks that pre-allocated for it
 are told it failed. A decode room whose KV lands without the request's first
 token fails: the first decode feeds on it.
+
+`pd::TransferStoppedEvent` retires the transfer of the parked request. Its
+resources still wait for any outstanding local forward results before release:
+a transport fence does not fence this engine's execution stream. A late success
+retires a parked transfer under the same local-forward condition.
 
 **EPD prefill** (`--disaggregation-mode prefill` with encode nodes). A
 request whose images an encode node embeds is staged at admission; each

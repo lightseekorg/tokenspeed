@@ -70,7 +70,10 @@ def test_pd_event_fields_are_bound():
     "terminal", ["success", "failure", "cancel_success", "cancel_failure"]
 )
 @pytest.mark.parametrize("pool_pages", [8, 12])
-def test_prefill_duplicate_sources_survive_until_pd_terminal(terminal, pool_pages):
+@pytest.mark.parametrize("transfer_stops_first", [True, False])
+def test_prefill_duplicate_sources_survive_until_pd_terminal(
+    terminal, pool_pages, transfer_stops_first
+):
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
     cfg.prefix_granularity = 2
@@ -130,6 +133,8 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(terminal, pool_page
             int(p) for row in dict(later.block_tables)["history"] for p in row if p > 0
         }
         assert allocated.isdisjoint(set(sources["a"] + sources["b"]))
+    pinned_before_terminal = scheduler.active_lcm_blocks()
+    transfers_before_terminal = scheduler.pd_transfer_size()
     for rid in ("a", "b"):
         event = (
             PD.SucceededEvent(rid)
@@ -137,13 +142,25 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(terminal, pool_page
             else PD.FailedEvent(rid)
         )
         scheduler.advance(ExecutionEvent().add_event(event))
+    if terminal.endswith("failure"):
+        assert scheduler.pd_transfer_size() == transfers_before_terminal
+        assert (
+            scheduler.active_lcm_blocks() == pinned_before_terminal
+        ), "failure alone must not release transfer sources"
+        if pool_pages == 8:
+            waiting = scheduler.next_execution_plan().forward[0]
+            assert not waiting.request_ids, "failed transfers still own their pages"
+            assert scheduler.active_lcm_blocks() == pinned_before_terminal
+        for rid in ("a", "b"):
+            scheduler.advance(ExecutionEvent().add_event(PD.TransferStoppedEvent(rid)))
     if pool_pages == 8:
         later = scheduler.next_execution_plan().forward[0]
         assert list(later.request_ids) == ["c"], "terminal ACK must unblock allocation"
     scheduler.advance(ExecutionEvent().add_event(PD.FailedEvent("c")))
+    if transfer_stops_first:
+        scheduler.advance(ExecutionEvent().add_event(PD.TransferStoppedEvent("c")))
     assert scheduler.active_lcm_blocks() > 0, "the local forward has not landed yet"
-    # Repeated cancellation after the terminal transfer event must not make
-    # retirement wait for another transfer event that will never arrive.
+    # Repeated cancellation must preserve any transfer retirement already received.
     abort = ForwardEvent.Abort()
     abort.request_id = "c"
     scheduler.advance(ExecutionEvent().add_event(abort))
@@ -151,6 +168,9 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(terminal, pool_page
     result = ForwardEvent.ExtendResult()
     result.request_id, result.tokens = "c", [12]
     scheduler.advance(ExecutionEvent().add_event(result))
+    if not transfer_stops_first:
+        assert scheduler.active_lcm_blocks() > 0, "the PD transfer has not stopped yet"
+        scheduler.advance(ExecutionEvent().add_event(PD.TransferStoppedEvent("c")))
     scheduler.next_execution_plan()
     assert (
         scheduler.active_lcm_blocks() == 0

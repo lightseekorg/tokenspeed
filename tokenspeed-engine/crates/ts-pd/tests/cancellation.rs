@@ -68,10 +68,7 @@ fn cancellation_before_connection_does_not_wait_for_a_prefill_request() {
     pair.decode.cancel("cancelled");
     pair.decode.cancel("cancelled");
     pair.decode.cancel("unknown");
-    assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed("cancelled".to_owned())
-    );
+    expect_cancelled(&mut pair.decode, "cancelled", &mut mesh, &group);
     // A plan already handed to the forward thread cannot publish a late manifest.
     pair.admit("cancelled");
     assert!(!pair.decode.has_in_flight());
@@ -100,10 +97,7 @@ fn an_unclaimed_room_cancels_without_waiting_for_ttl_and_cannot_be_revived() {
     pair.admit(rid);
     pair.decode.cancel(rid);
     pair.decode.cancel(rid);
-    assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
+    expect_cancelled(&mut pair.decode, rid, &mut mesh, &group);
     assert!(!pair.decode.has_in_flight());
     // A delayed manifest and claim cannot restart the cancelled room.
     let manifest = br#"{"groups":[{"group_id":"history","block_ids":[1,2,3]}],"prefix_len":0,"prompt_len":48,"state_prefix_cached":false}"#;
@@ -118,10 +112,7 @@ fn an_unclaimed_room_cancels_without_waiting_for_ttl_and_cannot_be_revived() {
     pair.prefill
         .register("late-claim", &pair.bootstrap)
         .unwrap();
-    assert_eq!(
-        next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed("late-claim".to_owned())
-    );
+    expect_cancelled(&mut pair.prefill, "late-claim", &mut mesh, &group);
     assert!(destination.iter().all(|&byte| byte == 0));
 }
 
@@ -147,14 +138,8 @@ fn cancellation_retires_queued_layerwise_work_before_releasing_the_room() {
             .unwrap();
     }
     pair.decode.cancel(rid);
-    assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
-    assert_eq!(
-        next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
+    expect_cancelled(&mut pair.decode, rid, &mut mesh, &group);
+    expect_cancelled(&mut pair.prefill, rid, &mut mesh, &group);
     steps.store(1000, Ordering::Release);
     thread::sleep(Duration::from_millis(100));
     assert!(
@@ -197,23 +182,49 @@ fn blocked_write_retirement(cancel_decode: bool) {
     // Without a local abort, Decode must treat the ordinary failure report
     // as cancellation intent, not proof that its pages are free to reuse.
     pair.prefill.cancel(rid);
-    let until = Instant::now() + Duration::from_millis(150);
-    while Instant::now() < until {
-        assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
-        assert!(pair.prefill.poll(&mut mesh, &group).unwrap().is_empty());
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(5);
+    let mut decode_events = Vec::new();
+    let mut prefill_events = Vec::new();
+    let expected_failure = [PdEvent::Failed(rid.to_owned())];
+    loop {
+        decode_events.extend(pair.decode.poll(&mut mesh, &group).unwrap());
+        prefill_events.extend(pair.prefill.poll(&mut mesh, &group).unwrap());
+        assert!(
+            expected_failure.starts_with(&decode_events),
+            "stopped before write retirement: {decode_events:?}"
+        );
+        assert!(
+            expected_failure.starts_with(&prefill_events),
+            "stopped before write retirement: {prefill_events:?}"
+        );
+        assert!(pair.decode.has_in_flight() && pair.prefill.has_in_flight());
+        if decode_events == expected_failure
+            && prefill_events == expected_failure
+            && started.elapsed() >= Duration::from_millis(150)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "failure was not reported while the write was blocked"
+        );
         thread::sleep(Duration::from_millis(5));
     }
+    assert_eq!(decode_events, expected_failure);
+    assert_eq!(prefill_events, expected_failure);
     assert!(pair.decode_outbox.release_registration().is_err());
     assert!(pair.prefill_outbox.release_registration().is_err());
     library.release_writes();
     assert_eq!(
         next_event(&mut pair.decode, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
+        PdEvent::Stopped(rid.to_owned())
     );
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
+        PdEvent::Stopped(rid.to_owned())
     );
+    assert!(!pair.decode.has_in_flight() && !pair.prefill.has_in_flight());
     destination.fill(0);
     thread::sleep(Duration::from_millis(100));
     assert!(
