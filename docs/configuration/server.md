@@ -546,7 +546,7 @@ for the online variant.
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. `auto` uses `low_latency` for decode batches and `normal` for prefill batches. `normal` reads its per-expert receive counts on the host, so it forces eager execution and disables CUDA graphs. |
 | `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
-| `--disable-deepseek-v41-token-blacklist` | Allow DeepSeek V4.1 to generate BOS, PAD and image control/placeholder token IDs `0, 2, 129262..129264`; these are masked by default. |
+| `--disable-deepseek-v41-token-blacklist` | Allow DeepSeek V4.1 to generate BOS, PAD, and image control/placeholder token IDs `0, 2, 129262..129264`; these are masked by default. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason

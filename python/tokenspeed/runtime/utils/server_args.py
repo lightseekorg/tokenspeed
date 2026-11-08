@@ -4379,8 +4379,8 @@ class ServerArgs:
             "--disable-deepseek-v41-token-blacklist",
             action="store_true",
             default=ServerArgs.disable_deepseek_v41_token_blacklist,
-            help="Allow DeepSeek V4.1 to generate BOS, PAD and image "
-            "control/placeholder token IDs 0, 2 and 129262..129264. "
+            help="Allow DeepSeek V4.1 to generate BOS, PAD, and image "
+            "control/placeholder token IDs 0, 2, and 129262..129264. "
             "They are masked by default.",
         )
         parser.add_argument(

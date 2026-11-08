@@ -387,8 +387,11 @@ class _Backend:
     [(0, 1, 1), (0, 4, 4), (3, 4, 4), (0, 1, 4)],
 )
 def test_lm_head_checkpoint_and_logits_follow_model_dtype(
-    device, fused, dtype, rank, tp_size, world_size
+    device, fused, dtype, rank, tp_size, world_size, monkeypatch
 ):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
     if device != "cpu" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     config = _config()

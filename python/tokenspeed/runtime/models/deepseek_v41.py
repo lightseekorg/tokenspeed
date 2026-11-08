@@ -3002,7 +3002,7 @@ class _DeepseekV41LogitsProcessor(LogitsProcessor):
             else self._token_blacklist
         )
         self._blocked_token_indices: dict[
-            tuple[torch.device, int], torch.Tensor | None
+            tuple[torch.device, int, int], torch.Tensor | None
         ] = {}
 
     def _project_logits(
@@ -3014,10 +3014,14 @@ class _DeepseekV41LogitsProcessor(LogitsProcessor):
         # V4.1 has no logit softcap. Masking this rank's raw head shard covers
         # full-vocab gather, vocab-sharded sampling and distributed argmax alike.
         logits = super()._project_logits(hidden_states, lm_head, embedding_bias)
-        key = (logits.device, logits.shape[-1])
+        width = logits.shape[-1]
+        start = (
+            int(lm_head.shard_indices.org_vocab_start_index)
+            if isinstance(lm_head, VocabParallelEmbedding)
+            else 0
+        )
+        key = (logits.device, width, start)
         if key not in self._blocked_token_indices:
-            width = logits.shape[-1]
-            start = self.tp_rank * width
             local_ids = [
                 token_id - start
                 for token_id in self._blocked_token_ids
