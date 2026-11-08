@@ -931,7 +931,10 @@ obtain the normal retirement acknowledgments.
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
 to the scheduler, before cache admission. Every round the replica agrees on
 which transfers changed state; their scheduler events join the round's tail feedback, and a failed
-transfer aborts its request on every rank together. A peer keeps state only
+transfer aborts its request on every rank together. A prompt whose logits
+held a NaN is aborted as its forward commits, which cancels its transfer, and
+its client gets the `NumericalError` abort once that transfer failed. A peer
+keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
 for before its request registered here, or one this rank failed first (an

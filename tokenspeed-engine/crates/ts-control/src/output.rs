@@ -920,7 +920,9 @@ impl OutputProcessor {
 
     /// A request's PD transfer failed. A computed prefill still needs its
     /// final output; only a client abort or an already-sent final stays silent.
-    /// The scheduler keeps its pages until the transfer and local forwards retire.
+    /// A request already aborted keeps that abort: a pause's, or the NaN
+    /// guard's. The scheduler keeps its pages until the transfer and local
+    /// forwards retire.
     pub fn fail_transfer(&mut self, rid: &str) -> Committed {
         let mut committed = Committed::default();
         let Some(mut state) = self.states.remove(rid) else {
@@ -935,7 +937,15 @@ impl OutputProcessor {
                     .into_iter()
                     .collect();
         }
-        self.log_finished(rid, &state);
+        // A prompt whose last chunk committed with a NaN ran, and its stream
+        // ends here: it counts in the request metrics as every request that
+        // ran does. Any other failed transfer keeps its stats line only, a
+        // prompt that failed after a NaN in a middle chunk included.
+        if state.numerical_error_detected && state.prefill_finished() {
+            self.log_end(rid, &state);
+        } else {
+            self.log_finished(rid, &state);
+        }
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -1397,8 +1407,15 @@ impl OutputProcessor {
             }
 
             let nan_detected = nan_flag || state.numerical_error_detected;
+            // Kept for the P role, whose request leaves when its transfer
+            // failed (`fail_transfer`), aborted before this commit or not.
+            state.numerical_error_detected = nan_detected;
             if nan_detected && !state.finished() {
                 committed.stats.nan_aborts += 1;
+                // Its client waits for this abort: on the P role, until the
+                // transfer the abort cancels failed.
+                state.to_abort = true;
+                state.abort_notify_client = true;
                 state.finished_reason = Some(FinishReason::Abort {
                     message: NUMERICAL_ERROR.to_owned(),
                     err_type: AbortCode::NumericalError,
@@ -1556,12 +1573,11 @@ impl OutputProcessor {
 
             if self.role == Role::Prefill {
                 // A numerically corrupted prompt's KV must never transfer:
-                // the abort stops the remote decode. Otherwise the transfer
-                // owns the pages until it succeeds or fails, and the output
-                // goes out then.
+                // the abort cancels it. Either way the transfer owns the
+                // pages until it succeeds or fails, and the output goes out
+                // then.
                 if nan_detected {
                     committed.events.push(finish(rid, true));
-                    self.release(rid, &mut committed);
                 }
                 continue;
             }
@@ -2502,6 +2518,124 @@ mod tests {
                 }
                 assert_eq!(failed.released, ["r"]);
                 assert!(p.state("r").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_transfer_that_fails_before_anything_ran_stays_out_of_the_request_metrics() {
+        // A bootstrap timeout, on either role: neither its prompt nor a
+        // request time is counted; a NaN-aborted prompt, which ran, is
+        // (`a_prefill_nan_abort_reaches_its_client_once_the_transfer_failed`).
+        for role in [Role::Prefill, Role::Decode] {
+            let mut p = OutputProcessor::new(None, 1, None, role, NO_FINISH_LOG, true, None);
+            register(&mut p, "t", 4096, 8, &[]);
+            p.states.get_mut("t").unwrap().created_time = wall_seconds() - 120.0;
+            assert_eq!(p.fail_transfer("t").released, ["t"]);
+            assert_eq!(p.take_request_tokens(), (0, 0));
+            let metrics = p.take_request_metrics();
+            assert!(metrics.request_seconds.is_empty());
+            assert_eq!(metrics.completion_tokens, 0);
+        }
+    }
+
+    #[test]
+    fn a_transfer_that_fails_after_a_middle_chunk_nan_stays_out_of_the_request_metrics() {
+        // The NaN guard aborts a prompt as its last chunk commits. A transfer
+        // that fails before that, for its own reason, ends the request as
+        // any failed transfer does.
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        let nan = ForwardResult {
+            nan_flags: Some(vec![1]),
+            ..result(&[9], &[1])
+        };
+        register(&mut p, "m", 8, 8, &[]);
+        let c = p.commit(&batch(&[("m", 4, 0, 8)], 1), None, &nan).unwrap();
+        assert_eq!(c.stats.nan_aborts, 0);
+        let failed = p.fail_transfer("m");
+        assert_eq!(
+            failed.outputs[0].finish_details,
+            Some(FinishReason::abort("PD/EPD remote transfer failed or timed out").details())
+        );
+        assert_eq!(p.take_request_tokens(), (0, 0));
+        let metrics = p.take_request_metrics();
+        assert!(metrics.request_seconds.is_empty());
+        assert_eq!(metrics.completion_tokens, 0);
+    }
+
+    #[test]
+    fn a_prefill_nan_abort_reaches_its_client_once_the_transfer_failed() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        let nan = ForwardResult {
+            nan_flags: Some(vec![1]),
+            ..result(&[9], &[1])
+        };
+        // The output waits for the transfer the abort cancels.
+        register(&mut p, "n", 4, 8, &[]);
+        p.states.get_mut("n").unwrap().created_time = wall_seconds() - 120.0;
+        let c = p.commit(&batch(&[("n", 4, 0, 4)], 1), None, &nan).unwrap();
+        assert_eq!(
+            kinds(&c),
+            [
+                ("n".to_owned(), ForwardEventKind::ExtendResult, vec![9]),
+                ("n".to_owned(), ForwardEventKind::Abort, vec![]),
+            ]
+        );
+        assert!(c.outputs.is_empty() && c.released.is_empty());
+        assert_eq!(c.stats.nan_aborts, 1);
+        let failed = p.fail_transfer("n");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(
+            failed.outputs[0].finish_details,
+            Some(
+                FinishReason::Abort {
+                    message: NUMERICAL_ERROR.to_owned(),
+                    err_type: AbortCode::NumericalError,
+                    status_code: None,
+                }
+                .details()
+            )
+        );
+        assert_eq!(failed.released, ["n"]);
+        assert_eq!(failed.stats, CommitStats::default());
+        assert_eq!(p.num_running(), 0);
+        assert_eq!(p.take_request_tokens(), (4, 0));
+        let metrics = p.take_request_metrics();
+        assert_eq!(metrics.completion_tokens, 1);
+        assert_eq!(metrics.request_seconds.len(), 1);
+        // A client that aborted the request, before the NaN or after it,
+        // gets nothing; a pause's abort, before or after, is the one its
+        // client gets.
+        for pause in [false, true] {
+            for abort_first in [true, false] {
+                register(&mut p, "a", 4, 8, &[]);
+                if abort_first {
+                    p.mark_abort("a", pause);
+                }
+                let c = p.commit(&batch(&[("a", 4, 0, 4)], 1), None, &nan).unwrap();
+                assert_eq!(c.stats.nan_aborts, i64::from(!abort_first));
+                assert!(c.released.is_empty());
+                if !abort_first {
+                    p.mark_abort("a", pause);
+                }
+                let failed = p.fail_transfer("a");
+                assert_eq!(p.take_request_tokens(), (4, 0));
+                let details: Vec<_> = failed
+                    .outputs
+                    .iter()
+                    .map(|output| output.finish_details.clone())
+                    .collect();
+                let expected = if pause {
+                    vec![Some(FinishReason::abort("Aborted by pause").details())]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    details, expected,
+                    "pause {pause}, abort first {abort_first}"
+                );
+                assert_eq!(failed.released, ["a"]);
             }
         }
     }

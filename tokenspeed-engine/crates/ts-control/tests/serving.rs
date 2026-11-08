@@ -732,6 +732,7 @@ impl DataPlane for FakeDevice {
         };
         thread::sleep(FORWARD_TIME);
         let mut result = ForwardResult::default();
+        let mut nan_flags = Vec::with_capacity(batch.request_ids.len());
         for (i, rid) in batch.request_ids.iter().enumerate() {
             let mid_chunk = i < batch.num_extends
                 && batch.extend_prefix_lens[i] + batch.input_lengths[i] < batch.prefill_lengths[i];
@@ -749,9 +750,12 @@ impl DataPlane for FakeDevice {
                 *generated += 1;
                 1000 + *generated - 1
             };
+            // The NaN guard flags a `nan-*` request's every sample.
+            nan_flags.push(i32::from(!mid_chunk && rid.starts_with("nan-")));
             result.output_tokens.push(token);
             result.output_lengths.push(1);
         }
+        result.nan_flags = Some(nan_flags);
         // Like the sampler, the device always reports each token's logprob:
         // here -token/1000.
         result.output_logprobs = Some(
@@ -4058,6 +4062,186 @@ async fn a_failed_transfer_aborts_the_request_on_both_engines() {
         chunks.last().unwrap().finish_reason.as_deref(),
         Some("abort")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefill_nan_ends_both_clients_once_the_transfer_failed() {
+    // The NaN guard aborts the prompt as its forward commits; the abort
+    // cancels its transfer. Once that failed, the prefill client gets the NaN
+    // abort with the token the commit kept, and the decode client the
+    // transfer's abort and no token. Nothing was sent, every prefill rank
+    // releases the request once, and once the transfer stopped neither its
+    // pages nor its transfer hold the engine: the cache flushes, memory is
+    // released, and serving goes on.
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        for depth in [0, 1] {
+            let case = format!("{layout:?}, depth {depth}");
+            let (prefill, decode, wire) = start_pd_pair(
+                depth,
+                layout,
+                Tiers::DeviceOnly,
+                Setup::default(),
+            )
+            .await;
+            let request = disaggregated("nan-r", 9, 40, 4);
+            let (prefilled, decoded) = tokio::join!(
+                run(&prefill.client, request.clone()),
+                run(&decode.client, request)
+            );
+            assert_eq!(tokens(&prefilled), [1000], "{case}");
+            let last = prefilled.last().unwrap();
+            assert_eq!(last.finish_reason.as_deref(), Some("abort"), "{case}");
+            let details = &last.finish_details.as_ref().unwrap().0;
+            assert!(
+                details.contains(&("err_type".to_owned(), Value::from(523_i64))),
+                "{case}: {details:?}"
+            );
+            assert!(tokens(&decoded).is_empty(), "{case}");
+            let details = &decoded.last().unwrap().finish_details.as_ref().unwrap().0;
+            assert!(
+                details.contains(&(
+                    "message".to_owned(),
+                    Value::from("PD/EPD remote transfer failed or timed out")
+                )),
+                "{case}: {details:?}"
+            );
+            assert_eq!(wire.lock().unwrap().rooms[&9].sent, None, "{case}");
+            prefill.settle().await;
+            for rank in 0..prefill.ranks.len() {
+                assert_eq!(
+                    prefill.released_on(rank),
+                    [("nan-r".to_owned(), 1)],
+                    "{case}"
+                );
+            }
+            assert_eq!(
+                control(
+                    &prefill,
+                    ControlRequest::FlushCache(FlushCacheReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                    })
+                )
+                .await,
+                [("FlushCacheReqOutput", true)],
+                "{case}"
+            );
+            let tags = Some(vec!["kv_cache".to_owned()]);
+            assert_eq!(
+                control(
+                    &prefill,
+                    ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        tags: tags.clone(),
+                    })
+                )
+                .await,
+                [("ReleaseMemoryOccupationReqOutput", true)],
+                "{case}"
+            );
+            assert_eq!(
+                control(
+                    &prefill,
+                    ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        tags,
+                    })
+                )
+                .await,
+                [("ResumeMemoryOccupationReqOutput", true)],
+                "{case}"
+            );
+            let after = disaggregated("after", 10, 40, 4);
+            let (prefilled, decoded) = tokio::join!(
+                run(&prefill.client, after.clone()),
+                run(&decode.client, after)
+            );
+            assert_eq!(tokens(&prefilled), [1000], "{case}");
+            assert_eq!(tokens(&decoded), [1000, 1001, 1002, 1003], "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_client_abort_racing_a_prefill_nan_stays_silent() {
+    // The client aborts a prompt whose forward holds a NaN, from its
+    // submission round on: before that forward commits, while its output
+    // waits for the cancelled transfer to fail, or after. An abort before
+    // that failure leaves the client, which tore down its stream, without
+    // output; one after it finds the NaN abort already sent. Either way every
+    // rank releases the request once and nothing is sent.
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        for depth in [0, 1] {
+            let mut silent = Vec::new();
+            for abort_round in 0..6 {
+                let case = format!(
+                    "{layout:?}, depth {depth}, abort round {abort_round}"
+                );
+                let wire = Arc::new(Mutex::new(Wire {
+                    prefill_ranks: layout.sizes().1,
+                    ..Wire::default()
+                }));
+                wire.lock()
+                    .unwrap()
+                    .rooms
+                    .entry(9)
+                    .or_default()
+                    .preallocated = Some(1);
+                let mut script = vec![Vec::new(); 12];
+                script[0].push(EngineRequest::Add(Box::new(disaggregated(
+                    "nan-r", 9, 40, 4,
+                ))));
+                script[abort_round].push(EngineRequest::Abort(vec!["nan-r".to_owned()]));
+                let ranks = run_scripted(
+                    layout,
+                    depth,
+                    Tiers::DeviceOnly,
+                    Setup {
+                        pd: Some(Pd {
+                            role: Role::Prefill,
+                            wire: wire.clone(),
+                        }),
+                        ..Setup::default()
+                    },
+                    vec![script],
+                    no_reaction,
+                );
+                for rank in &ranks {
+                    assert_eq!(rank.outcome, Ok(()), "{case}");
+                    assert_eq!(
+                        rank.released
+                            .iter()
+                            .map(|(rid, _)| rid.as_str())
+                            .collect::<Vec<_>>(),
+                        ["nan-r"],
+                        "{case}"
+                    );
+                }
+                let outputs: Vec<_> = ranks[0]
+                    .outputs
+                    .iter()
+                    .filter(|output| output.rid == "nan-r")
+                    .collect();
+                match outputs.as_slice() {
+                    [] => silent.push(abort_round),
+                    [output] => assert!(
+                        output.finish_details.as_ref().is_some_and(|details| details
+                            .0
+                            .contains(&("err_type".to_owned(), Value::from(523_i64)))),
+                        "{case}: {output:?}"
+                    ),
+                    outputs => panic!("{case}: {outputs:?}"),
+                }
+                assert_eq!(wire.lock().unwrap().rooms[&9].sent, None, "{case}");
+            }
+            // The aborts before the failure, then those after it.
+            let case = format!("{layout:?}, depth {depth}");
+            assert!(silent.len() > 1 && silent.len() < 6, "{case}: {silent:?}");
+            assert_eq!(silent, (0..silent.len()).collect::<Vec<_>>(), "{case}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
