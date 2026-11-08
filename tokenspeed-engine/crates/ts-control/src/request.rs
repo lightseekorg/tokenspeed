@@ -284,10 +284,10 @@ pub struct RequestState {
     pub numerical_error_detected: bool,
     /// Set once the request ended.
     pub finished_reason: Option<FinishReason>,
-    /// The client aborted it (or a pause did).
+    /// The client aborted it (or a pause or the NaN guard did).
     pub to_abort: bool,
     /// An aborted request whose client still waits for a final output
-    /// (pause-initiated aborts).
+    /// (aborts a pause or the NaN guard made).
     pub abort_notify_client: bool,
 
     /// When it reached the scheduler's waiting queue, until its first
