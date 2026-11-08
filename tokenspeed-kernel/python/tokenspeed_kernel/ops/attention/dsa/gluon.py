@@ -182,7 +182,7 @@ if current_platform().is_amd:
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
-            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_format": frozenset({"fp8_scaled", "mxfp4"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
@@ -214,7 +214,7 @@ if current_platform().is_amd:
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
-            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_format": frozenset({"fp8_scaled", "mxfp4"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
@@ -764,6 +764,7 @@ if current_platform().is_amd:
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
+            "index_k_format": frozenset({"fp8_scaled", "mxfp4"}),
             "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         priority=Priority.SPECIALIZED,
@@ -785,6 +786,7 @@ if current_platform().is_amd:
         q_scales: torch.Tensor | None = None,
         query_group_size: int = 1,
         scores_out: torch.Tensor | None = None,
+        index_k_format: str = "fp8_scaled",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
             compact_index_pages,
@@ -823,6 +825,7 @@ if current_platform().is_amd:
             query_group_size=query_group_size,
             query_requests=query_requests.to(torch.int32).contiguous(),
             request_count=local_page_table.shape[0],
+            index_k_format=index_k_format,
         )
         if initial_tokens or local_tokens:
             # Without mandatory windows the mask has nothing to add: the

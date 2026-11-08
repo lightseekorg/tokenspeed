@@ -325,6 +325,7 @@ def test_dsa_sparse_leaf_log_follows_fp8_kv_and_dcp(
             "index_heads": 32,
             "head_dim": 128,
             "page_size": 64,
+            "index_k_format": "fp8_scaled",
             "index_k_layout": "packed",
         }
         assert solution is None

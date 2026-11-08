@@ -177,7 +177,7 @@ def configure_kimi_k31_attention(model_config, server_args: ServerArgs) -> None:
     ``indexer_use_fp8: true``) do not pin the serving format of the keys.
     """
     configure_dsa_attention(model_config, server_args)
-    model_config.index_k_format = "fp8_scaled"
+    model_config.index_k_format = server_args.dsa_index_k_format or "fp8_scaled"
     # K3.1 keeps all DSA ops in one eager break narrowing padded replays to live rows.
     model_config.dsa_padded_prefill_replay = True
 

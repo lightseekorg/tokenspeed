@@ -755,6 +755,9 @@ class ServerArgs:
     # in: as the top-k leaf emitted them (selection), or ascending (sorted,
     # batch-invariant whenever the selected set is).
     dsa_slot_order: str = "selection"
+    # Storage of the DSA indexer's key plane where the model's attention hook
+    # takes a choice (Kimi-K3.1); None keeps the model's default.
+    dsa_index_k_format: str | None = None
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -4630,6 +4633,18 @@ class ServerArgs:
             "served only by cores declaring the slot_order trait (the "
             "registered batch-invariant leaves). Folded to selection by --numerics "
             "rl-bitwise.",
+        )
+        parser.add_argument(
+            "--dsa-index-k-format",
+            type=str,
+            choices=["fp8_scaled", "mxfp4"],
+            default=ServerArgs.dsa_index_k_format,
+            help="Storage of the DSA indexer's key cache, for models whose "
+            "attention hook takes the choice (Kimi-K3.1). 'fp8_scaled' (the "
+            "default): FP8 keys with one fp32 scale per 128 elements, 132 "
+            "bytes per token per layer. 'mxfp4': E2M1 keys with one UE8M0 "
+            "scale per 32 elements, 68 bytes, scored against FP8 queries on "
+            "AMD CDNA4; refused under bitwise numerics.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

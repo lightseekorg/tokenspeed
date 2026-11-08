@@ -112,6 +112,13 @@ def _make_dot_layout(
     )
 
 
+@gluon.constexpr_function
+def _key_scale_layout(dot_b_layout, block_n, head_dim):
+    """The ``mfma_scaled`` layout of a key tile's ``[block_n, head_dim / 32]``
+    UE8M0 scales."""
+    return gl.amd.cdna4.get_mfma_scale_layout(dot_b_layout, [block_n, head_dim // 32])
+
+
 @gluon.jit
 def _candidate_slots(
     positions,
@@ -1151,16 +1158,19 @@ def _copy_key_tile(
     PAGE_STRIDE_BYTES: gl.constexpr,
     KEY_FP8: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    KEY_MXFP4: gl.constexpr = False,
 ):
-    # A lane copies 16 bytes of a key row; fp8_scaled pages put scales after the keys.
+    # A lane copies 16 bytes of a key row; scaled pages put scales after the keys.
+    # An mxfp4 row is HEAD_DIM / 2 bytes of nibble-packed E2M1 codes.
     vector: gl.constexpr = 16 if KEY_FP8 else 8
+    key_bytes: gl.constexpr = HEAD_DIM // 2 if KEY_MXFP4 else HEAD_DIM
     blocked: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[vector, 1],
-        threads_per_warp=[HEAD_DIM // vector, 64 // (HEAD_DIM // vector)],
+        threads_per_warp=[key_bytes // vector, 64 // (key_bytes // vector)],
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
     )
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, blocked))[:, None]
+    dims = gl.arange(0, key_bytes, layout=gl.SliceLayout(1, blocked))[:, None]
     columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked))
     valid = (tile_start + columns < candidate_end)[None, :]
     # Copies past the chunk are masked; clamp their slot reads into the slot buffer.
@@ -1170,7 +1180,7 @@ def _copy_key_tile(
         slots = slots.to(gl.int64)
     if KEY_FP8:
         pages = slots // PAGE_SIZE
-        rows = pages * PAGE_STRIDE_BYTES + (slots - pages * PAGE_SIZE) * HEAD_DIM
+        rows = pages * PAGE_STRIDE_BYTES + (slots - pages * PAGE_SIZE) * key_bytes
     else:
         rows = slots * HEAD_DIM
     if USE_BUFFER_LOAD:
@@ -1198,10 +1208,23 @@ def _score_rows_key_tile(
     ROWS: gl.constexpr,
     BLOCK_N: gl.constexpr,
     Q_FP8: gl.constexpr,
+    key_scales=None,
+    KEY_MXFP4: gl.constexpr = False,
 ):
     # A 32-row MFMA block per query row: scores bitwise independent of ROWS and warps.
     accumulator = gl.zeros([ROWS * 32, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-    if Q_FP8:
+    if KEY_MXFP4:
+        # E2M1 keys with one UE8M0 scale per 32 elements, applied inside the MFMA.
+        head_scores = gl.amd.cdna4.mfma_scaled(
+            a=query,
+            a_scale=None,
+            a_format="e4m3",
+            b=key,
+            b_scale=key_scales,
+            b_format="e2m1",
+            acc=accumulator,
+        )
+    elif Q_FP8:
         head_scores = gl.amd.cdna4.mfma_scaled(
             a=query,
             a_scale=None,
@@ -1256,7 +1279,12 @@ def _score_candidate_chunk(
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
     NONFINITE_TO_NEG_INF: gl.constexpr = False,
+    KEY_MXFP4: gl.constexpr = False,
 ):
+    # mxfp4 pages: PAGE_SIZE rows of HEAD_DIM / 2 code bytes, then each row's
+    # HEAD_DIM / 32 UE8M0 scale bytes as one int32 word (index_k_scale).
+    tl.static_assert(not KEY_MXFP4 or (KEY_FP8 and Q_FP8 and HEAD_DIM == 128))
+    key_bytes: gl.constexpr = HEAD_DIM // 2 if KEY_MXFP4 else HEAD_DIM
     # Slots stay in LDS so slot reads never queue behind key copies on the shared vmcnt.
     slot_positions = candidate_start + gl.arange(
         0, CHUNK_N, layout=gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
@@ -1291,26 +1319,26 @@ def _score_candidate_chunk(
         scale_pages = scale_slots // PAGE_SIZE
         scale_offsets = (
             scale_pages * (PAGE_STRIDE_BYTES // 4)
-            + (PAGE_SIZE * HEAD_DIM) // 4
+            + (PAGE_SIZE * key_bytes) // 4
             + (scale_slots - scale_pages * PAGE_SIZE)
         )
         if USE_BUFFER_LOAD:
             scale_values = gl.amd.cdna4.buffer_load(
-                ptr=index_k_scale, offsets=scale_offsets, mask=slot_valid, other=0.0
+                ptr=index_k_scale, offsets=scale_offsets, mask=slot_valid, other=0
             )
         else:
             scale_values = gl.load(
-                index_k_scale + scale_offsets, mask=slot_valid, other=0.0
+                index_k_scale + scale_offsets, mask=slot_valid, other=0
             )
         scale_shared = gl.allocate_shared_memory(
-            gl.float32,
+            index_k_scale.type.element_ty,
             [CHUNK_N],
             layout=gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0]),
             value=scale_values,
         )
         # XOR-swizzled 16-byte chunks spread 16 consecutive keys over all LDS banks.
         key_layout: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=16, per_phase=1, max_phase=HEAD_DIM // 16, order=[0, 1]
+            vec=16, per_phase=1, max_phase=key_bytes // 16, order=[0, 1]
         )
     else:
         key_layout: gl.constexpr = gl.SwizzledSharedLayout(
@@ -1318,9 +1346,18 @@ def _score_candidate_chunk(
         )
     key_shared = gl.allocate_shared_memory(
         index_k.type.element_ty,
-        [NUM_STAGES, HEAD_DIM, BLOCK_N],
+        [NUM_STAGES, key_bytes, BLOCK_N],
         layout=key_layout,
     )
+    if KEY_MXFP4:
+        scale_layout: gl.constexpr = _key_scale_layout(dot_b_layout, BLOCK_N, HEAD_DIM)
+        scale_columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, scale_layout))
+        scale_shifts = (
+            gl.arange(0, HEAD_DIM // 32, layout=gl.SliceLayout(0, scale_layout))[
+                None, :
+            ]
+            * 8
+        )
     tile_count = tl.cdiv(candidate_end - candidate_start, BLOCK_N)
     for stage in gl.static_range(NUM_STAGES - 1):
         _copy_key_tile(
@@ -1339,6 +1376,7 @@ def _score_candidate_chunk(
             PAGE_STRIDE_BYTES,
             KEY_FP8,
             USE_BUFFER_LOAD,
+            KEY_MXFP4,
         )
 
     columns = gl.arange(0, BLOCK_N, layout=col_layout)
@@ -1349,6 +1387,10 @@ def _score_candidate_chunk(
         key = key_shared.index(tile_id % NUM_STAGES).load(layout=dot_b_layout)
         if KEY_FP8 and not Q_FP8:
             key = key.to(gl.bfloat16)
+        key_scales = None
+        if KEY_MXFP4:
+            words = scale_shared.gather(tile_id * BLOCK_N + scale_columns, axis=0)
+            key_scales = ((words[:, None] >> scale_shifts) & 255).to(gl.uint8)
         _copy_key_tile(
             index_k,
             key_shared,
@@ -1365,16 +1407,33 @@ def _score_candidate_chunk(
             PAGE_STRIDE_BYTES,
             KEY_FP8,
             USE_BUFFER_LOAD,
+            KEY_MXFP4,
         )
         scores = _score_rows_key_tile(
-            query_0, weight_0, key, mfma_layout, ROWS, BLOCK_N, Q_FP8
+            query_0,
+            weight_0,
+            key,
+            mfma_layout,
+            ROWS,
+            BLOCK_N,
+            Q_FP8,
+            key_scales,
+            KEY_MXFP4,
         )
         if NUM_HEADS == 64:
             scores += _score_rows_key_tile(
-                query_1, weight_1, key, mfma_layout, ROWS, BLOCK_N, Q_FP8
+                query_1,
+                weight_1,
+                key,
+                mfma_layout,
+                ROWS,
+                BLOCK_N,
+                Q_FP8,
+                key_scales,
+                KEY_MXFP4,
             )
         scores = gl.convert_layout(scores, out_layout) * model_scale
-        if KEY_FP8:
+        if KEY_FP8 and not KEY_MXFP4:
             key_scales = scale_shared.gather(tile_id * BLOCK_N + columns, axis=0)
             scores = scores * key_scales[None, :]
         if NONFINITE_TO_NEG_INF:
@@ -1446,6 +1505,7 @@ def _multi_row_index_k_scores_body(
     EXPLICIT_ROW_LENS: gl.constexpr = False,
     NONFINITE_TO_NEG_INF: gl.constexpr = False,
     ROW_RUNS: gl.constexpr = False,
+    KEY_MXFP4: gl.constexpr = False,
 ):
     # Program (i, j): rows i on chunk j; positive key scales apply after the head sum.
     # NONFINITE_TO_NEG_INF stores NaN and infinite scores as -inf.
@@ -1646,6 +1706,7 @@ def _multi_row_index_k_scores_body(
                     USE_BUFFER_LOAD,
                     USE_BUFFER_STORE,
                     NONFINITE_TO_NEG_INF,
+                    KEY_MXFP4,
                 )
             previous = request
     elif CHUNK_LOOP:
@@ -1687,6 +1748,7 @@ def _multi_row_index_k_scores_body(
                 USE_BUFFER_LOAD,
                 USE_BUFFER_STORE,
                 NONFINITE_TO_NEG_INF,
+                KEY_MXFP4,
             )
     else:
         _score_candidate_chunk(
@@ -1726,6 +1788,7 @@ def _multi_row_index_k_scores_body(
             USE_BUFFER_LOAD,
             USE_BUFFER_STORE,
             NONFINITE_TO_NEG_INF,
+            KEY_MXFP4,
         )
 
 
@@ -1954,6 +2017,7 @@ def gluon_dsa_prefill_topk_fp8_rows_gfx950(
     Q_FP8: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    KEY_MXFP4: gl.constexpr = False,
 ):
     """Prefill scorer over an fp8_scaled paged plane and BF16 or FP8 q.
 
@@ -2005,6 +2069,7 @@ def gluon_dsa_prefill_topk_fp8_rows_gfx950(
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
         False,
+        KEY_MXFP4=KEY_MXFP4,
     )
 
 
@@ -2053,6 +2118,7 @@ def gluon_dsa_owned_prefill_topk_fp8_rows_gfx950(
     Q_FP8: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    KEY_MXFP4: gl.constexpr = False,
 ):
     """Prefill scorer over compact owned pages of an fp8_scaled paged plane.
 
@@ -2106,6 +2172,7 @@ def gluon_dsa_owned_prefill_topk_fp8_rows_gfx950(
         False,
         True,
         True,
+        KEY_MXFP4=KEY_MXFP4,
     )
 
 
@@ -2158,6 +2225,7 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     CHUNK_LOOP: gl.constexpr,
     explicit_row_lens=None,
     NONFINITE_TO_NEG_INF: gl.constexpr = False,
+    KEY_MXFP4: gl.constexpr = False,
 ):
     """Decode scorer over an fp8_scaled paged plane and BF16 or FP8 q.
 
@@ -2215,4 +2283,5 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
         CHUNK_LOOP,
         explicit_row_lens is not None,
         NONFINITE_TO_NEG_INF,
+        KEY_MXFP4=KEY_MXFP4,
     )

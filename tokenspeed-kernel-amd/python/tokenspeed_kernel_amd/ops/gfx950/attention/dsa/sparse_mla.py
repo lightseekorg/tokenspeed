@@ -4098,6 +4098,7 @@ def _check_standard_scorer_inputs(
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
     page_size: int,
+    row_bytes: int = 128 + 4,
 ) -> tuple[int, int, bool]:
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise TypeError(
@@ -4122,7 +4123,6 @@ def _check_standard_scorer_inputs(
         )
     if index_k_cache.dtype != torch.uint8:
         raise TypeError("index_k_cache must be a uint8 tensor")
-    row_bytes = 128 + 4
     if index_k_cache.dim() != 2:
         raise ValueError(
             "index_k_cache must be a packed slot matrix or page-planar matrix, "
@@ -4702,18 +4702,44 @@ def launch_gluon_dsa_prefill_topk_bf16_gfx950(
     return out, lens_out
 
 
+# Bytes of one 128-element index-K row of each scaled page format.
+_SCALED_INDEX_K_ROW_BYTES = {"fp8_scaled": 128 + 4, "mxfp4": 64 + 4}
+
+
 def _check_fp8_rows_scorer_inputs(
     q: torch.Tensor,
     q_scales: torch.Tensor | None,
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
     page_size: int,
+    index_k_format: str = "fp8_scaled",
 ) -> int:
-    """Validate queries against fp8_scaled pages; return the page stride."""
+    """Validate queries against fp8_scaled or mxfp4 pages; return the page
+    stride. mxfp4 pages hold E2M1 codes and take only E4M3 queries."""
+    if index_k_format not in _SCALED_INDEX_K_ROW_BYTES:
+        raise ValueError(f"no multi-row scorer for index_k_format={index_k_format!r}")
+    if index_k_format == "mxfp4" and q.dtype != torch.float8_e4m3fn:
+        raise TypeError("mxfp4 index keys score E4M3 queries with scales")
     _, page_stride_bytes, _ = _check_standard_scorer_inputs(
-        q, q_scales, weights, index_k_cache, page_size
+        q,
+        q_scales,
+        weights,
+        index_k_cache,
+        page_size,
+        _SCALED_INDEX_K_ROW_BYTES[index_k_format],
     )
     return page_stride_bytes
+
+
+def _scaled_index_k_views(
+    index_k_cache: torch.Tensor, index_k_format: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The key and scale pointers a multi-row scorer reads a scaled plane by:
+    FP8 keys with fp32 scales, or E2M1 code bytes with each row's UE8M0
+    scales as one int32 word."""
+    if index_k_format == "mxfp4":
+        return index_k_cache, index_k_cache.view(torch.int32)
+    return index_k_cache.view(torch.float8_e4m3fn), index_k_cache.view(torch.float32)
 
 
 def _fp8_rows_buffer_load(index_k_cache: torch.Tensor) -> bool:
@@ -4767,6 +4793,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     plan: object | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    index_k_format: str = "fp8_scaled",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score fp8_scaled paged index keys and return global top-k slots.
 
@@ -4785,7 +4812,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     if index_k_cache is None:
         raise RuntimeError("fp8_scaled multi-row scorer requires index_k_cache")
     page_stride_bytes = _check_fp8_rows_scorer_inputs(
-        q, q_scales, weights, index_k_cache, int(page_size)
+        q, q_scales, weights, index_k_cache, int(page_size), index_k_format
     )
     _check_standard_decode_metadata(q, seq_lens, block_table, q_len_per_req)
     if out is None:
@@ -4820,8 +4847,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     gluon_dsa_decode_topk_fp8_rows_gfx950[grid](
         q,
         q_rows_scales,
-        index_k_cache.view(torch.float8_e4m3fn),
-        index_k_cache.view(torch.float32),
+        *_scaled_index_k_views(index_k_cache, index_k_format),
         weights,
         seq_lens,
         block_table,
@@ -4853,6 +4879,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
         USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         CHUNK_LOOP=grid[1] < chunks,
+        KEY_MXFP4=index_k_format == "mxfp4",
         num_warps=_BF16_DECODE_NUM_WARPS,
         waves_per_eu=waves_per_eu,
     )
@@ -4886,6 +4913,7 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    index_k_format: str = "fp8_scaled",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score workspace rows of fp8_scaled pages and return top-k row ids.
 
@@ -4901,7 +4929,7 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
     if index_k_cache is None or page_size is None:
         raise RuntimeError("fp8_scaled multi-row scorer requires cache and page_size")
     page_stride_bytes = _check_fp8_rows_scorer_inputs(
-        q, q_scales, weights, index_k_cache, int(page_size)
+        q, q_scales, weights, index_k_cache, int(page_size), index_k_format
     )
     _check_standard_prefill_metadata(q, kv_workspace_slots, row_starts, row_ends)
     if out is None:
@@ -4937,8 +4965,7 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
         gluon_dsa_prefill_topk_fp8_rows_gfx950[grid](
             q[start:end],
             q_rows_scales[start:end],
-            index_k_cache.view(torch.float8_e4m3fn),
-            index_k_cache.view(torch.float32),
+            *_scaled_index_k_views(index_k_cache, index_k_format),
             weights[start:end],
             kv_workspace_slots,
             row_starts[start:end],
@@ -4968,6 +4995,7 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
             Q_FP8=q_scales is not None,
             USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
             USE_BUFFER_STORE=logits.nbytes < 2**31,
+            KEY_MXFP4=index_k_format == "mxfp4",
             num_warps=_BF16_PREFILL_NUM_WARPS,
             waves_per_eu=_BF16_PREFILL_WAVES_PER_EU,
         )

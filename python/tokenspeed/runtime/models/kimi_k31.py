@@ -190,10 +190,12 @@ class KimiK31Indexer(nn.Module):
         return self.wq_b(q_lora)[0].view(-1, self.index_n_heads, self.index_head_dim)
 
 
-def _scorers_take_fp8_index_queries(indexer: KimiK31Indexer) -> bool:
+def _scorers_take_fp8_index_queries(
+    indexer: KimiK31Indexer, index_k_format: str = "fp8_scaled"
+) -> bool:
     """Whether both paged top-k scorers (prefill and decode) of an
-    ``fp8_scaled`` plane are registered for this indexer's FP8 E4M3 queries
-    on this platform."""
+    ``index_k_format`` plane are registered for this indexer's FP8 E4M3
+    queries on this platform."""
     signature = format_signature(
         q=dense_tensor_format(torch.float8_e4m3fn),
         weights=dense_tensor_format(torch.bfloat16),
@@ -202,7 +204,7 @@ def _scorers_take_fp8_index_queries(indexer: KimiK31Indexer) -> bool:
         "index_heads": indexer.index_n_heads,
         "head_dim": indexer.index_head_dim,
         "topk": indexer.index_topk,
-        "index_k_format": "fp8_scaled",
+        "index_k_format": index_k_format,
     }
     try:
         for mode in ("dsa_prefill_topk", "dsa_decode_topk"):
@@ -282,8 +284,15 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         # K-major w_kc/w_vc take the grouped GEMM unless a bitwise plan is pinned.
         self.absorbed_weights_k_major = self.absorption_kernel_plan is None
         self.indexer = KimiK31Indexer(config, prefix=add_prefix("indexer", prefix))
-        # FP8 index queries where the platform registers fp8_scaled scorers.
-        self.index_query_fp8 = _scorers_take_fp8_index_queries(self.indexer)
+        # FP8 index queries where the platform registers the plane's scorers.
+        index_k_format = global_server_args_dict["dsa_index_k_format"] or "fp8_scaled"
+        self.index_query_fp8 = _scorers_take_fp8_index_queries(
+            self.indexer, index_k_format
+        )
+        if index_k_format == "mxfp4" and not self.index_query_fp8:
+            raise ValueError(
+                "--dsa-index-k-format mxfp4 has no FP8-query scorer on this platform"
+            )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []

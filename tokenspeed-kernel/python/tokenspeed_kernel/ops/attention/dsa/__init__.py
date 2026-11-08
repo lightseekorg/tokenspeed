@@ -192,20 +192,40 @@ _INDEX_K_FP8_GROUP_SIZE = 128
 _INDEX_K_SCALE_BYTES = 4
 
 
-def _index_k_plane_traits(index_k_cache: torch.Tensor, head_dim: int) -> dict:
+def _index_k_plane_traits(
+    index_k_cache: torch.Tensor, head_dim: int, index_k_format: str | None = None
+) -> dict:
     """``index_k_format`` / ``index_k_layout`` selection traits of a plane.
 
     ``uint8`` planes hold FP8 keys with one fp32 scale per 128 elements
     (``"fp8_scaled"``): ``"packed"`` as ``[slots, head_dim + 4 *
     head_dim / 128]`` rows, otherwise ``"page_planar"``. ``bfloat16`` planes
     hold the keys unquantized (``"bf16"``) and are only ever ``"packed"``
-    ``[slots, head_dim]``.
+    ``[slots, head_dim]``. A ``uint8`` plane holds ``"mxfp4"`` keys (E2M1
+    codes and one UE8M0 scale per 32 elements, ``[slots, head_dim / 2 +
+    head_dim / 8]`` packed) only when the caller says so: the dtype alone
+    never selects it.
     """
+    if index_k_format not in (None, "fp8_scaled", "bf16", "mxfp4"):
+        raise ValueError(f"unknown explicit index_k_format {index_k_format!r}")
+    if index_k_format == "mxfp4":
+        if index_k_cache.dtype != torch.uint8:
+            raise TypeError("an mxfp4 index-K plane is uint8")
+        packed = (
+            index_k_cache.ndim == 2
+            and index_k_cache.shape[1] == head_dim // 2 + head_dim // 32
+        )
+        return {
+            "index_k_format": "mxfp4",
+            "index_k_layout": "packed" if packed else "page_planar",
+        }
     if index_k_cache.dtype == torch.uint8:
         row_bytes = (
             head_dim + head_dim // _INDEX_K_FP8_GROUP_SIZE * _INDEX_K_SCALE_BYTES
         )
         packed = index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
+        if index_k_format not in (None, "fp8_scaled"):
+            raise TypeError(f"a uint8 index-K plane is not {index_k_format!r}")
         return {
             "index_k_format": "fp8_scaled",
             "index_k_layout": "packed" if packed else "page_planar",
@@ -216,6 +236,8 @@ def _index_k_plane_traits(index_k_cache: torch.Tensor, head_dim: int) -> dict:
                 "a bf16 index-K plane must be packed [slots, head_dim] = "
                 f"[slots, {head_dim}], got {tuple(index_k_cache.shape)}"
             )
+        if index_k_format not in (None, "bf16"):
+            raise TypeError(f"a bf16 index-K plane is not {index_k_format!r}")
         return {"index_k_format": "bf16", "index_k_layout": "packed"}
     raise TypeError(
         f"index-K plane dtype {index_k_cache.dtype} has no registered format: "
@@ -1106,7 +1128,9 @@ def _check_index_candidate_inputs(
     if q.ndim != 3 or weights.shape != q.shape[:2]:
         raise ValueError("Index queries and per-head weights must match")
     if index_k_cache.dtype != torch.uint8:
-        raise TypeError("DSA index candidates require packed FP8 Index-K storage")
+        raise TypeError(
+            "DSA index candidates require fp8_scaled or mxfp4 Index-K storage"
+        )
     if query_requests.shape != (q.shape[0],) or causal_lens.shape != (q.shape[0],):
         raise ValueError("Index candidate rows must match queries")
     if not local_page_table.shape[0] or not local_page_table.shape[1]:
@@ -1120,6 +1144,7 @@ def _select_index_candidates_kernel(
     *,
     page_size: int,
     solution: str | None,
+    index_k_format: str | None = None,
 ):
     return select_kernel(
         "attention",
@@ -1129,17 +1154,16 @@ def _select_index_candidates_kernel(
             "index_heads": q.shape[1],
             "head_dim": q.shape[2],
             "page_size": page_size,
-            "index_k_layout": (
-                "packed"
-                if (
-                    index_k_cache.ndim == 2
-                    and index_k_cache.shape[1] == q.shape[-1] + q.shape[-1] // 128 * 4
-                )
-                else "page_planar"
-            ),
+            **_index_k_plane_traits(index_k_cache, q.shape[-1], index_k_format),
         },
         solution=solution,
     )
+
+
+def _index_k_format_kwargs(index_k_format: str | None) -> dict:
+    """The ``index_k_format`` kwarg for a selected leaf, or nothing: only
+    mxfp4 leaves take it, as the dtype of their uint8 plane does not say."""
+    return {"index_k_format": "mxfp4"} if index_k_format == "mxfp4" else {}
 
 
 def _declares_index_candidate_pages(kernel) -> bool:
@@ -1154,6 +1178,7 @@ def dsa_index_candidates_accepts_pages(
     *,
     page_size: int,
     solution: str | None = None,
+    index_k_format: str | None = None,
 ) -> bool:
     """Whether the leaf :func:`dsa_index_candidates` selects for these inputs
     scores pages from :func:`plan_dsa_index_candidates`.
@@ -1164,7 +1189,12 @@ def dsa_index_candidates_accepts_pages(
     whole table on every call. Host-only: one cached kernel selection.
     """
     kernel = _select_index_candidates_kernel(
-        q, weights, index_k_cache, page_size=page_size, solution=solution
+        q,
+        weights,
+        index_k_cache,
+        page_size=page_size,
+        solution=solution,
+        index_k_format=index_k_format,
     )
     return _declares_index_candidate_pages(kernel)
 
@@ -1180,6 +1210,7 @@ def plan_dsa_index_candidates(
     page_size: int,
     solution: str | None = None,
     columns: int | None = None,
+    index_k_format: str | None = None,
 ) -> DSAIndexCandidatePages | None:
     """Compact owned pages once for rows scored by several candidate calls.
 
@@ -1209,7 +1240,12 @@ def plan_dsa_index_candidates(
     if not q.shape[0]:
         return None
     kernel = _select_index_candidates_kernel(
-        q, weights, index_k_cache, page_size=page_size, solution=solution
+        q,
+        weights,
+        index_k_cache,
+        page_size=page_size,
+        solution=solution,
+        index_k_format=index_k_format,
     )
     if not _declares_index_candidate_pages(kernel):
         return None
@@ -1290,6 +1326,7 @@ def dsa_index_candidates(
     q_scales: torch.Tensor | None = None,
     query_group_size: int = 1,
     scores_out: torch.Tensor | None = None,
+    index_k_format: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score a query tile against owned Index-K pages and select local candidates.
 
@@ -1348,7 +1385,12 @@ def dsa_index_candidates(
             ),
         )
     kernel = _select_index_candidates_kernel(
-        q, weights, index_k_cache, page_size=page_size, solution=solution
+        q,
+        weights,
+        index_k_cache,
+        page_size=page_size,
+        solution=solution,
+        index_k_format=index_k_format,
     )
     pages_kwargs = _index_candidate_pages_kwargs(kernel, pages)
     query_kwargs = (
@@ -1380,6 +1422,7 @@ def dsa_index_candidates(
             **pages_kwargs,
             **query_kwargs,
             **({"scores_out": scores_out} if writes_scores else {}),
+            **_index_k_format_kwargs(index_k_format),
         )
     if scores_out is None or writes_scores:
         return offsets, scores
@@ -1607,6 +1650,7 @@ def dsa_prefill_topk(
     override: str | None = None,
     solution: str | None = None,
     kernel_plan: KernelPlan | None = None,
+    index_k_format: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DSA prefill top-k over packed workspace rows.
 
@@ -1745,7 +1789,7 @@ def dsa_prefill_topk(
             "index_k_bf16) are two sources of index keys; pass one"
         )
     if index_k_cache is not None:
-        traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1]))
+        traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1], index_k_format))
     elif has_workspace_rows:
         _check_index_k_rows(
             index_k_fp8,
@@ -1840,6 +1884,7 @@ def dsa_prefill_topk(
             **candidate_lens_cpu_kwargs,
             **index_k_rows_kwargs,
             **slot_order_kwargs,
+            **_index_k_format_kwargs(index_k_format),
         }
         if row_starts_cpu is not None:
             kernel_kwargs["row_starts_cpu"] = row_starts_cpu
@@ -1878,6 +1923,7 @@ def dsa_decode_topk(
     override: str | None = None,
     solution: str | None = None,
     kernel_plan: KernelPlan | None = None,
+    index_k_format: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DSA decode top-k over a paged KV cache.
 
@@ -1992,7 +2038,7 @@ def dsa_decode_topk(
         "topk": int(topk),
     }
     if index_k_cache is not None:
-        traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1]))
+        traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1], index_k_format))
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
     required_features = set()
@@ -2062,6 +2108,7 @@ def dsa_decode_topk(
             "out": out,
             "lens_out": lens_out,
             **slot_order_kwargs,
+            **_index_k_format_kwargs(index_k_format),
         }
         if topk_layout == "logical_offsets":
             kernel_kwargs["topk_layout"] = topk_layout
