@@ -33,6 +33,7 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    BLOCKWISE_LOGPROB_ORDERS,
     DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
     LOGPROB_ORDERS,
@@ -412,6 +413,12 @@ class ServerArgs:
     max_prefill_tokens: int = 8192
     # Optional bound on summed per-request KV pages in a local prefill batch.
     chunk_prefill_kv_size: int | None = None
+    # Opt-in, prefill servers: the most tokens a prefill chunk that cannot
+    # finish its prompt gives up, page-aligned, so that bootstrapped prompts
+    # waiting behind it that fit whole run in the same forward
+    # (docs/design/scheduler.md section 1.1). 0 is off; at most half of
+    # chunked_prefill_size; a decode server ignores it.
+    prefill_chunk_yield_tokens: int = 0
     enable_mixed_batch: bool = False
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
@@ -419,7 +426,11 @@ class ServerArgs:
     # no chunk is cut for it. The prompt end that checkpoint covers and a
     # fused finish past the prompt end then publish no state and no KV tail:
     # a next turn that re-renders the end of the prompt and its reply cannot
-    # resume there (docs/design/scheduler.md section 1.2).
+    # resume there. A finish also demotes the in-forward checkpoint its
+    # conversation published two turns back, which both cache tiers then evict
+    # early. On a prefill server a prompt too short for the in-forward
+    # checkpoint whose end lies inside a page publishes no state and no KV tail
+    # there either (docs/design/scheduler.md section 1.2).
     enable_state_checkpoint_in_forward: bool = False
     # Hybrid models: a State checkpoint a later request's checkpoint extends
     # ranks, under cache pressure, as if last used this many new requests ago. None
@@ -579,6 +590,9 @@ class ServerArgs:
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
     # (default) is exact dense attention; see --skip-softmax-threshold help.
     skip_softmax_threshold: float = 0.0
+    # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
+    # of their pages, reserved from the KV cache budget; see the flag's help.
+    enable_qsa_prefill_bf16_scratch: bool = False
     sampling_backend: str | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
@@ -743,6 +757,8 @@ class ServerArgs:
     prefill_graph_capture_sizes: list[int] | None = None
     # Request capacities for inline attention; unset keeps the minimum per bucket.
     prefill_graph_capture_batch_sizes: list[int] | None = None
+    # Replay the speculative drafter's extend-round work from CUDA graphs too.
+    enable_drafter_prefill_graph: bool = False
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -1475,12 +1491,35 @@ class ServerArgs:
 
         This is the flag, except on a decode server, whose prompts arrive by
         transfer. Its scheduler then also skips the dead prompt-end and finish
-        checkpoints; a decode server publishes them as ever.
+        checkpoints and demotes superseded in-forward checkpoints; a decode
+        server publishes the former as ever.
         """
         return (
             self.enable_state_checkpoint_in_forward
             and self.disaggregation_mode != "decode"
         )
+
+    @property
+    def drops_short_prompt_end_checkpoints(self) -> bool:
+        """Whether this engine's scheduler drops short prompts' end checkpoints.
+
+        A prefill server does where it writes in-forward checkpoints; no other
+        role does (a fused server keeps its short prompt ends).
+        """
+        return (
+            self.writes_state_checkpoints_in_forward
+            and self.disaggregation_mode == "prefill"
+        )
+
+    @property
+    def scheduler_prefill_chunk_yield_tokens(self) -> int:
+        """The tokens this engine's prefill chunks give up for whole prompts
+        waiting behind them: the flag on a prefill server, 0 on a decode
+        server, which computes no prompt (validate_cache_options refuses the
+        flag on every other server)."""
+        if self.disaggregation_mode != "prefill":
+            return 0
+        return self.prefill_chunk_yield_tokens
 
     @property
     def retraction_snapshot_pool_disabled(self) -> bool:
@@ -1968,6 +2007,47 @@ class ServerArgs:
                 f"that the fp32 sentinel threshold + 1.0 stays above it; got {threshold}"
             )
 
+    def validate_drafter_prefill_graph(self) -> None:
+        """Refuse ``--enable-drafter-prefill-graph`` launches it cannot serve.
+
+        The drafter's graphs record an Eagle chain's extend round beside the
+        target's prefill CUDA graphs, with the argmax proposal, on one rank
+        (attention DP decides replays per rank; the tensor-, expert- and
+        pipeline-parallel collectives inside the round are not validated).
+        Whether the loaded draft model supports it is known only at executor
+        build, which refuses it there.
+        """
+        if not self.enable_drafter_prefill_graph:
+            return
+        if self.speculative_algorithm not in STEP_SPEC_ALGORITHMS:
+            raise ValueError(
+                "--enable-drafter-prefill-graph needs a chain drafter "
+                f"(--speculative-algorithm {', '.join(STEP_SPEC_ALGORITHMS)}); "
+                f"got {self.speculative_algorithm}"
+            )
+        if self.speculative_draft_tree:
+            raise ValueError(
+                "--enable-drafter-prefill-graph records a draft chain; draft trees "
+                "(--speculative-eagle-topk > 1 or EAGLE-Harness) are not supported"
+            )
+        if self.enable_speculative_sampling:
+            raise ValueError(
+                "--enable-drafter-prefill-graph records the argmax proposal and "
+                "does not support --enable-speculative-sampling"
+            )
+        if self.mapping.world_size != 1:
+            raise ValueError(
+                "--enable-drafter-prefill-graph runs on one rank (no tensor, "
+                "expert, pipeline, attention-data or context parallelism); got "
+                f"{self.mapping.world_size} ranks"
+            )
+        if self.disable_prefill_graph or self.enforce_eager:
+            raise ValueError(
+                "--enable-drafter-prefill-graph records the drafter beside the "
+                "target's prefill CUDA graphs, which --disable-prefill-graph and "
+                "--enforce-eager turn off"
+            )
+
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations,
         # and for Beam on Hopper or newer at any node count: across nodes Beam's
@@ -2109,7 +2189,7 @@ class ServerArgs:
         # The trainer's router is softmax + topk(scores + bias) in torch.
         self.router_topk = "torch"
         # The trainer's logprobs come from its vocab-parallel cross-entropy.
-        if self.logprob_order not in ("blockwise", "blockwise-direct"):
+        if self.logprob_order not in BLOCKWISE_LOGPROB_ORDERS:
             self.logprob_order = "blockwise"
         # The trainer's grouped MLP applies the router weight inside the
         # activation and folds a token's slots in fp32 slot order.
@@ -2134,7 +2214,7 @@ class ServerArgs:
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
         # pipeline needs the P role's structural guarantees (no decode token
-        # feedback, non-overlap loop).
+        # feedback, no overlap schedule).
         if self.pipeline_parallel_size > 1:
             # Debug escape hatch: run PP without PD to validate the stage
             # pipeline numerically (prefill + first token only — decode
@@ -2317,6 +2397,29 @@ class ServerArgs:
                 raise ValueError(
                     "--kvstore-write-policy write_back does not support "
                     f"{', '.join(unsupported)}"
+                )
+        # The yield belongs to the prefill scheduler, which never retracts; a
+        # decode server takes the flag as a no-op, so a PD launcher may pass
+        # it to both roles.
+        if self.prefill_chunk_yield_tokens < 0:
+            raise ValueError(
+                "--prefill-chunk-yield-tokens must be non-negative; got "
+                f"{self.prefill_chunk_yield_tokens}"
+            )
+        if self.prefill_chunk_yield_tokens > 0:
+            if self.disaggregation_mode not in ("prefill", "decode"):
+                raise ValueError(
+                    "--prefill-chunk-yield-tokens is for prefill servers "
+                    "(--disaggregation-mode prefill; a decode server ignores it)"
+                )
+            if (
+                self.disaggregation_mode == "prefill"
+                and self.prefill_chunk_yield_tokens > self.chunked_prefill_size // 2
+            ):
+                raise ValueError(
+                    "--prefill-chunk-yield-tokens must be at most half of "
+                    f"--chunked-prefill-size ({self.chunked_prefill_size}); got "
+                    f"{self.prefill_chunk_yield_tokens}"
                 )
 
     def validate_weight_memory_policy(self):
@@ -2636,6 +2739,7 @@ class ServerArgs:
                 )
 
         self.validate_expert_placement_options()
+        self.validate_drafter_prefill_graph()
 
         if not self.disable_pdl:
             os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
@@ -2868,6 +2972,21 @@ class ServerArgs:
             help="Maximum number of tokens the scheduler may issue in a single iteration. Setting this to -1 disables chunked prefill.",
         )
         parser.add_argument(
+            "--prefill-chunk-yield-tokens",
+            type=int,
+            default=ServerArgs.prefill_chunk_yield_tokens,
+            metavar="N",
+            help="Prefill servers: the room, in tokens, a prefill chunk that "
+            "cannot finish its prompt makes for bootstrapped prompts waiting "
+            "behind it that fit whole (counted past their prefix hit), so they "
+            "run complete in the same forward instead of waiting for the long "
+            "prompt's chunk to pass. The chunk ends on an earlier page and gives "
+            "up fewer than N plus one page, only while such prompts wait and "
+            "only what they take. 0 (default) is off; at most half of "
+            "--chunked-prefill-size. A decode server ignores it. See "
+            "docs/design/scheduler.md section 1.1.",
+        )
+        parser.add_argument(
             "--enable-mixed-batch",
             action="store_true",
             dest="enable_mixed_batch",
@@ -2893,8 +3012,21 @@ class ServerArgs:
             "finish, as on a prefill server, is kept if the state at the "
             "boundary has left the cache); a next turn that repeats the "
             "previous reply verbatim resumes at an earlier checkpoint instead "
-            "and recomputes the reply. Requires prefix caching; a decode server "
-            "ignores it. See docs/design/scheduler.md section 1.2.",
+            "and recomputes the reply. When a request publishes an in-forward "
+            "checkpoint past the one it resumed from, which its own predecessor "
+            "wrote past an earlier one, that earlier checkpoint -- two turns "
+            "back on the conversation -- is evicted early from the device and "
+            "host caches, and no new store or eviction write-back copies it to "
+            "host, unless another request also resumed from it, or acquired or "
+            "republished it after the conversation's previous turn resumed "
+            "there. On a prefill server, a prompt too short for the in-forward "
+            "checkpoint (by default, one no longer than the chunk budget) whose "
+            "end lies inside a prefix page publishes only its full pages, no "
+            "recurrent state and no KV tail at its end, since a next turn that "
+            "re-renders the end of the prompt cannot resume there; a page-aligned "
+            "prompt end keeps its state, and a fused server keeps short prompt "
+            "ends. Requires prefix caching; a decode server ignores it. See "
+            "docs/design/scheduler.md section 1.2.",
         )
         parser.add_argument(
             "--checkpoint-retention-requests",
@@ -3514,6 +3646,26 @@ class ServerArgs:
             "than silently ignoring it.",
         )
         parser.add_argument(
+            "--enable-qsa-prefill-bf16-scratch",
+            action="store_true",
+            dest="enable_qsa_prefill_bf16_scratch",
+            default=ServerArgs.enable_qsa_prefill_bf16_scratch,
+            help="QSA sparse-attention models (Qwen4-Exp) with --kv-cache-dtype "
+            "fp8_e4m3 on SM100 to SM107: a target prefill call of at least "
+            "2048 rows copies the FP8 KV pages it can read into a BF16 scratch "
+            "and attends there with the CuTe kernel's BF16 path instead of the "
+            "FP8 prefill kernel. Smaller and mixed calls, calls whose context "
+            "exceeds the scratch or 128 cache tokens per row, decode, verify "
+            "and drafts keep the FP8 path; the cache stays FP8. The scratch "
+            "holds one maximum-length context plus one --chunked-prefill-size "
+            "chunk, with that chunk's remapped slots and attention output, and "
+            "is reserved from the KV cache budget before the pool is sized. "
+            "Startup fails for a model without QSA layers, another KV cache "
+            "dtype (mxfp8 included), chunked prefill below 2048 tokens or "
+            "disabled, or a GPU without the CuTe QSA kernel. The decode role, "
+            "which runs no prefill, reserves no scratch.",
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=[
@@ -3956,7 +4108,9 @@ class ServerArgs:
         parser.add_argument(
             "--disable-overlap-schedule",
             action="store_true",
-            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker. "
+            "On a PD prefill server at PP=1 this also returns the event loop to in-flight depth 0; "
+            "under PP the chunk pipeline keeps one forward per stage in flight.",
         )
         parser.add_argument(
             "--disable-tf32",
@@ -4032,7 +4186,29 @@ class ServerArgs:
             "bucket needs one inline variant per configured request count. "
             "Adding request counts increases capture time and memory. "
             "This does not replace the scheduler's --max-num-seqs limit. "
-            "Batches without a fitting capacity retain the ordinary attention breaks.",
+            "Batches without a fitting capacity retain the ordinary attention breaks. "
+            "With --enable-drafter-prefill-graph these request counts also select "
+            "the drafter's step-0 and decode-step graphs, which replay only at the "
+            "exact count (unset: one request per bucket, or the fewest that fit a "
+            "bucket longer than the context length).",
+        )
+        parser.add_argument(
+            "--enable-drafter-prefill-graph",
+            action="store_true",
+            default=ServerArgs.enable_drafter_prefill_graph,
+            help="Also replay the speculative drafter's work inside a prefill "
+            "forward from CUDA graphs: the draft's extend step per prefill token "
+            "bucket at each exact request count of "
+            "--prefill-graph-capture-batch-sizes (unset: the fewest requests the "
+            "bucket fits in the context length), its decode steps per request "
+            "count, with attention at eager breaks. Only pure-extend forwards at a "
+            "captured request count replay; the others draft eagerly. Needs the "
+            "prefill graph on one rank (no TP, EP, PP or attention DP) and a chain "
+            "EAGLE-style drafter (no --speculative-eagle-topk > 1, no "
+            "--enable-speculative-sampling) whose draft model declares support "
+            "(Qwen4-Exp MTP without index_share_for_mtp_iteration); other launches "
+            "are refused. Its static buffers (the target's hidden rows at the "
+            "largest bucket) come out of the --gpu-memory-utilization headroom.",
         )
         parser.add_argument(
             "--enable-nan-detection",
@@ -4380,11 +4556,13 @@ class ServerArgs:
             "sum(exp) over fixed 32768-wide vocab blocks folded in block "
             "order), returning -(log(sum_exp) - target). 'blockwise-direct': "
             "the same reduction, returning target - log(sum_exp). "
+            "Suffix either with -16384 to select 16384-wide blocks, "
+            "independently of serving TP. "
             "Requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
             "logprobs only, never the sampled tokens. Folded to blockwise by "
             "--numerics rl-bitwise, overriding an explicit torch; an explicit "
-            "blockwise-direct is preserved.",
+            "blockwise form and block width are preserved.",
         )
         parser.add_argument(
             "--moe-combine-order",

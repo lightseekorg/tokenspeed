@@ -493,6 +493,57 @@ def test_verify_rows_match_reference_and_replay(
     _check_verify(invoke(), expected)
 
 
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("window_left", [-1, 2047], ids=["full", "window-2047"])
+def test_verify_is_deterministic_across_runs(window_left: int, fp8: bool) -> None:
+    """Repeated launches give bitwise-identical rows.
+
+    The four waves of a verify block share every K/V page they copy into LDS,
+    so a missing barrier between one wave's reads of a buffer and another
+    wave's next copy into it shows up as run-to-run differences, often too
+    small for the reference tolerance.
+    """
+    inputs = _verify_inputs(
+        [2048 + VERIFY_TOKENS + 37, 300 * PAGE_SIZE + 5, 9000, 700],
+        VERIFY_TOKENS,
+        VERIFY_Q_HEADS,
+        VERIFY_KV_HEADS,
+        HEAD_DIM,
+        20261103,
+    )
+    if fp8:
+        for name in ("q", "k_cache", "v_cache"):
+            inputs[name] = inputs[name].to(torch.float8_e4m3fn)
+    first = gluon_mha_decode_gfx950(**inputs, window_left=window_left)
+    for _ in range(20):
+        again = gluon_mha_decode_gfx950(**inputs, window_left=window_left)
+        assert torch.equal(again.view(torch.int16), first.view(torch.int16))
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_pipelined_sliding_verify_is_bitwise_single_buffered(
+    fp8: bool, monkeypatch
+) -> None:
+    """Pipelining the sliding split's pages is a schedule, not new math: the
+    rows must equal the single-buffered loop's bit for bit (a difference in
+    the last bit flips greedy tokens downstream)."""
+    inputs = _verify_inputs(
+        [2048 + VERIFY_TOKENS + 37, 300 * PAGE_SIZE + 5, 700],
+        VERIFY_TOKENS,
+        VERIFY_Q_HEADS,
+        VERIFY_KV_HEADS,
+        HEAD_DIM,
+        20261104,
+    )
+    if fp8:
+        for name in ("q", "k_cache", "v_cache"):
+            inputs[name] = inputs[name].to(torch.float8_e4m3fn)
+    pipelined = gluon_mha_decode_gfx950(**inputs, window_left=2047)
+    monkeypatch.setattr(decode, "_SLIDING_DECODE_STAGES", 1)
+    single = gluon_mha_decode_gfx950(**inputs, window_left=2047)
+    assert torch.equal(pipelined.view(torch.int16), single.view(torch.int16))
+
+
 def test_short_window_verify_compiles_once_per_request_bucket() -> None:
     """A short window's split count changes with the request count only
     between at most 4 and more requests, so one warm-up on each side covers
@@ -566,6 +617,76 @@ def test_pipelined_split_waits_for_prefetches_before_epilogue(monkeypatch) -> No
     expected = _verify_reference(inputs, -1, None)
     for _ in range(10):
         _check_verify(gluon_mha_decode_gfx950(**inputs, window_left=-1), expected)
+
+
+def test_sliding_split_stores_reach_l2_before_arrival() -> None:
+    """Every wave's split partial reaches L2 before the split arrives.
+
+    All waves store the partial, and one thread bumps the row block's
+    counter, whose release waits only for its own wave. Compile without
+    launching and check that, on every path, each wave runs s_waitcnt
+    vmcnt(0) before the barrier preceding the counter atomic.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._extern import extern_compile_options
+    from utils import vmcnt_zero_before_barrier
+
+    fn = decode._mha_decode_sliding_split_atomic
+    pointers = {
+        "q_ptr": "*fp8e4nv",
+        "k_cache_ptr": "*fp8e4nv",
+        "v_cache_ptr": "*fp8e4nv",
+        "page_table_ptr": "*i32",
+        "cache_seqlens_ptr": "*i32",
+        "mid_o_ptr": "*fp32",
+        "mid_lse_ptr": "*fp32",
+        "out_ptr": "*bf16",
+        "sink_ptr": "*fp8e4nv",
+        "counters_ptr": "*i32",
+    }
+    # One TP8 rank of a 2048-token sliding window: 16 query heads over 2 KV
+    # heads, 8 verify positions per request, 4 waves.
+    constexprs = {
+        "Q_STRIDE_B": 1024,
+        "Q_STRIDE_H": 64,
+        "Q_STRIDE_D": 1,
+        "SM_SCALE": 0.125 * 1.4426950408889634,
+        "PAGE_TABLE_STRIDE": 4096,
+        "PAGE_SIZE": 64,
+        "NUM_KV_SPLITS": 8,
+        "MAX_SEQLEN_Q": 8,
+        "NUM_Q_HEADS": 16,
+        "NUM_KV_HEADS": 2,
+        "HEAD_DIM": 64,
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "NUM_WARPS": 4,
+        "WINDOW_LEFT": 2047,
+        "HAS_SINK": False,
+        "IS_FP8": True,
+        "NUM_STAGES": 2,
+    }
+    signature = dict(pointers, **{name: "constexpr" for name in constexprs})
+    signature = {name: signature[name] for name in fn.arg_names}
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn, signature, constexprs=constexprs, attrs=attrs
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 4, **extern_compile_options()},
+    )
+    arrivals = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"],
+        "_mha_decode_sliding_split_atomic",
+        r"\bglobal_atomic_add\w*\b",
+    )
+    assert arrivals, "the split must arrive with an atomic add"
+    assert all(waited for _, waited, _ in arrivals), arrivals
 
 
 # ===-----------------------------------------------------------------------===#

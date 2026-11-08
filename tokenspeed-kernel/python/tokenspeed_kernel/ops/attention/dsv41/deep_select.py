@@ -95,10 +95,13 @@ def _select_topk_prepared(logits, ends, topk):
     """
     _validate(logits, ends, topk, 1, None)
     input_alignment, _ = deep_select_alignment()
-    alignment = input_alignment // logits.element_size()
-    # Contiguous rows must include the native vector-load padding.
+    # DeepSelect TMA jumps rows by stride(0). Column count need not be aligned;
+    # the last 512-wide segment stays inside a padded row when stride is.
     if not (
-        logits.shape[1] % alignment == 0 and logits.data_ptr() % input_alignment == 0
+        logits.stride(1) == 1
+        and logits.stride(0) >= logits.shape[1]
+        and (logits.stride(0) * logits.element_size()) % input_alignment == 0
+        and logits.data_ptr() % input_alignment == 0
     ):
         return select_topk(logits, ends, None, topk, 1)
     indices = _native_indices(logits, ends, topk)

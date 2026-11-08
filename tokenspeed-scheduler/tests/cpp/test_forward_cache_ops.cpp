@@ -740,6 +740,31 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
     }
 }
 
+TEST(SchedulerConfigValidateTest, DroppingShortPromptEndsTakesThePRoleAndTheInForwardCheckpoint) {
+    // The drop extends the dead checkpoints the in-forward checkpoint skips,
+    // at the P role's finish; the other roles refuse it instead of ignoring it.
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        SchedulerConfig config = MakeValidConfig();
+        config.role = role;
+        if (role != Role::kFused) {
+            for (CacheGroupConfig& group : config.cache_groups) {
+                group.transfer_policy = CacheTransferPolicy::FullSuffix;
+            }
+        }
+        SetTestSnapshotPool(config);
+        config.drop_short_prompt_end_checkpoints = true;
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument)
+            << "without the in-forward checkpoint";
+        config.state_checkpoint_in_forward = true;
+        if (role == Role::kP) {
+            EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+        } else {
+            EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+        }
+    }
+}
+
 TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
     // The pool is explicit on every role: 0 pages says nothing, the null page
     // alone says "never retract" (and takes no blob slots), anything above it
@@ -1042,6 +1067,26 @@ TEST(BlockTablePageIdsExport, ASwappedSlotExportsTheFreshBlock) {
     const std::vector<std::int32_t> after = allocator.BlockTablePageIds(table);
     EXPECT_EQ(after, (std::vector<std::int32_t>{before[0], allocator.ResolveCacheBlockId(*table.Blocks()[1])}));
     EXPECT_NE(after[1], before[1]);
+}
+
+// The decode role's probe leaves a tail inside the first block unclaimed: the
+// claimed table opens with a hole, which counts as released until the
+// admission fills it with the block the peer writes the tail into.
+TEST(BlockTablePageIdsExport, AFilledLeadingHoleExportsItsBlock) {
+    BlockPool pool(/*num_lcm_blocks=*/4, {1});
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    BlockTable table;
+    PrefixMatch hit;
+    hit.blocks.emplace_back();
+    allocator.ClaimHitBlocks(table, std::move(hit));
+    ASSERT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{0}));
+
+    const CacheBlockRef replaced = allocator.SwapInFreshBlock(pool, table, /*slot=*/0, /*available_tokens=*/2);
+
+    EXPECT_FALSE(replaced);
+    EXPECT_EQ(table.ReclaimedPrefixBlocks(), 0);
+    EXPECT_EQ(allocator.BlockTablePageIds(table),
+              (std::vector<std::int32_t>{allocator.ResolveCacheBlockId(*table.Blocks()[0])}));
 }
 
 TEST(BlockTablePageIdsExport, AHostExtensionExportsItsDeviceDestinations) {

@@ -27,7 +27,12 @@ import math
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._scheduling import sched_compile_options, wave_uniform_i32
+from tokenspeed_kernel_amd._extern import (
+    arithmetic_fence,
+    extern_compile_options,
+    release_drain,
+    wave_uniform_i32,
+)
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950._xcd import _remap_xcd
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
@@ -54,6 +59,10 @@ _GFX950_SM_COUNT = 256
 # for a one-wave work-group; with more waves, each wave issues its share. The
 # loop is either this deep or single-buffered.
 _FULL_DECODE_STAGES = 4
+# Pipeline depth of the long-window sliding split decode (four-wave
+# workgroups): each split streams several pages, each a full load round trip
+# when single-buffered.
+_SLIDING_DECODE_STAGES = 2
 # s_waitcnt vmcnt(N) takes a 6-bit count: a wave can wait for all but at most
 # 63 of its outstanding vector memory loads.
 _GFX950_MAX_VMCNT = 63
@@ -269,8 +278,12 @@ class AttentionProgram:
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        batch,
+        head_block,
+        split_id,
     ):
-        """Locate this program's request, KV head, row block and split.
+        """Locate a program's request, KV head, row block and split from its
+        request index, head block (KV head x row block) and split index.
 
         The rows of a block share one pass over the union of the keys they
         see: up to its last row's causal end and, under a sliding window, from
@@ -278,11 +291,8 @@ class AttentionProgram:
         its MAX_SEQLEN_Q query tokens, so query position p sees the keys
         before seq_len - (MAX_SEQLEN_Q - 1 - p).
         """
-        batch = gl.program_id(0)
-        head_block = gl.program_id(1)
         kv_head = head_block // cfg.NUM_ROW_BLOCKS
         row_start = (head_block - kv_head * cfg.NUM_ROW_BLOCKS) * cfg.BLOCK_M
-        split_id = gl.program_id(2)
         seq_len = gl.load(cache_seqlens_ptr + batch)
         if cfg.MAX_SEQLEN_Q == 1:
             first_end = maximum(seq_len, 0)
@@ -645,39 +655,9 @@ class AttentionProgram:
     @gluon.jit
     def finalize_splits(self, out_ptr, sink_ptr, counters_ptr, has_sink: gl.constexpr):
         """Let the last arriving split merge this row block and reset its counter."""
-        cfg = self.cfg
-        counter_offset = (
-            self.batch * (cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS)
-            + self.kv_head * cfg.NUM_ROW_BLOCKS
-            + self.row_start // cfg.BLOCK_M
-        )
-        if cfg.NUM_WARPS > 1:
-            # One thread performs the increment, and its release waits only
-            # for its own wave's stores. So every wave runs s_waitcnt
-            # vmcnt(0), which waits until its stores have reached L2 (CDNA4
-            # ISA 4.4); S_BARRIER waits on no counter, so the barrier the
-            # compiler places before the acq_rel atomic then orders every
-            # wave's stores before the increment. The release then writes
-            # back the L2 cache (BUFFER_WBL2), which makes all of those stores
-            # visible to the other L2 caches.
-            offs_m = gl.arange(
-                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
-            )
-            gl.inline_asm_elementwise(
-                asm="s_waitcnt vmcnt(0)",
-                constraints="=v,0",
-                args=[offs_m],
-                dtype=gl.int32,
-                is_pure=False,
-                pack=1,
-            )
-        old = gl.atomic_add(
-            counters_ptr + counter_offset,
-            1,
-            sem="acq_rel",
-            scope="gpu",
-        )
-        if old == cfg.NUM_KV_SPLITS - 1:
+        if self.arrive(counters_ptr) == self.cfg.NUM_KV_SPLITS - 1:
+            output = self.merge_splits(sink_ptr, has_sink).to(out_ptr.dtype.element_ty)
+            cfg = self.cfg
             offs_m = gl.arange(
                 0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
             )
@@ -687,79 +667,126 @@ class AttentionProgram:
             tokens = self.row_tokens(offs_m)
             q_heads = self.row_heads(offs_m)
             valid = self.row_valid(offs_m)
-            final_m = gl.full(
-                [cfg.BLOCK_M],
-                value=-float("inf"),
-                dtype=gl.float32,
-                layout=gl.SliceLayout(1, cfg.store_layout),
-            )
-            final_l = gl.zeros(
-                [cfg.BLOCK_M],
-                dtype=gl.float32,
-                layout=gl.SliceLayout(1, cfg.store_layout),
-            )
-            final_acc = gl.zeros(
-                [cfg.BLOCK_M, cfg.HEAD_DIM],
-                dtype=gl.float32,
-                layout=cfg.store_layout,
-            )
-            # Each split's waves stored their partials before its acq_rel
-            # increment, so this split's increment orders the partial loads
-            # after all of them, and the loads can be ordinary cached loads;
-            # volatile loads would bypass the caches and slow the merge. Only
-            # the incrementing wave acquires, but its BUFFER_INV invalidates
-            # the CU's whole vector L1 cache, which all of the work-group's
-            # waves share, and the L2's non-coherently cached lines (CDNA4
-            # ISA 9.1.10.2, Table 52), and the barrier that
-            # broadcasts the old count orders their loads after it.
-            for split in range(0, cfg.NUM_KV_SPLITS):
-                base = (
-                    (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
-                    * cfg.NUM_KV_SPLITS
-                    + split
-                ) * cfg.HEAD_DIM + offs_d[None, :]
-                part_o = gl.load(
-                    self.mid_o_ptr + base,
-                    mask=valid[:, None],
-                    other=0.0,
-                ).to(gl.float32)
-                lse_offset = (
-                    tokens * cfg.NUM_Q_HEADS + q_heads
-                ) * cfg.NUM_KV_SPLITS + split
-                part_lse = gl.load(
-                    self.mid_lse_ptr + lse_offset,
-                    mask=valid,
-                    other=-float("inf"),
-                ).to(gl.float32)
-                next_m = maximum(final_m, part_lse)
-                if cfg.MAX_SEQLEN_Q > 1:
-                    # A later query position's first splits can all precede
-                    # its window, leaving -inf - -inf.
-                    next_m_safe = gl.where(next_m == -float("inf"), 0.0, next_m)
-                    alpha = gl.exp2(final_m - next_m_safe)
-                    beta = gl.exp2(part_lse - next_m_safe)
-                else:
-                    alpha = gl.exp2(final_m - next_m)
-                    beta = gl.exp2(part_lse - next_m)
-                final_acc = final_acc * alpha[:, None] + part_o * beta[:, None]
-                final_l = final_l * alpha + beta
-                final_m = next_m
-            if has_sink:
-                sink_log2 = (
-                    gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)
-                    * _INV_LN2
-                )
-                next_m = maximum(final_m, sink_log2)
-                alpha = gl.exp2(final_m - next_m)
-                beta = gl.exp2(sink_log2 - next_m)
-                final_acc *= alpha[:, None]
-                final_l = final_l * alpha + beta
-            output = (final_acc / final_l[:, None]).to(out_ptr.dtype.element_ty)
             out_offsets = (
                 tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
             ) * cfg.HEAD_DIM + offs_d[None, :]
             cdna4.buffer_store(output, out_ptr, out_offsets, mask=valid[:, None])
-            gl.store(counters_ptr + counter_offset, 0)
+            gl.store(counters_ptr + self.split_counter_offset(), 0)
+
+    @gluon.jit
+    def split_counter_offset(self):
+        """This row block's arrival counter among the request's KV heads."""
+        cfg = self.cfg
+        return (
+            self.batch * (cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS)
+            + self.kv_head * cfg.NUM_ROW_BLOCKS
+            + self.row_start // cfg.BLOCK_M
+        )
+
+    @gluon.jit
+    def arrive(self, counters_ptr):
+        """Count this split's partial as stored; return the splits counted
+        before it (NUM_KV_SPLITS - 1 for the last). The last arriver merges
+        the row block and resets its counter to 0."""
+        cfg = self.cfg
+        counter_offset = self.split_counter_offset()
+        if cfg.NUM_WARPS > 1:
+            # One thread performs the increment, and its release waits only
+            # for its own wave's stores. So every wave runs s_waitcnt
+            # vmcnt(0), which waits until its stores have reached L2 (CDNA4
+            # ISA 4.4); S_BARRIER waits on no counter, so the barrier the
+            # compiler places before the acq_rel atomic then orders every
+            # wave's stores before the increment. The release then writes
+            # back the L2 cache (BUFFER_WBL2), which makes all of those stores
+            # visible to the other L2 caches.
+            release_drain()
+        old = gl.atomic_add(
+            counters_ptr + counter_offset,
+            1,
+            sem="acq_rel",
+            scope="gpu",
+        )
+        return old
+
+    @gluon.jit
+    def merge_splits(self, sink_ptr, has_sink: gl.constexpr):
+        """Merge the row block's split partials (and the sink) into its FP32
+        output rows, ``[BLOCK_M, HEAD_DIM]`` in ``cfg.store_layout``. Only the
+        last arriver (see ``arrive``) may call it."""
+        cfg = self.cfg
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        tokens = self.row_tokens(offs_m)
+        q_heads = self.row_heads(offs_m)
+        valid = self.row_valid(offs_m)
+        final_m = gl.full(
+            [cfg.BLOCK_M],
+            value=-float("inf"),
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.store_layout),
+        )
+        final_l = gl.zeros(
+            [cfg.BLOCK_M],
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.store_layout),
+        )
+        final_acc = gl.zeros(
+            [cfg.BLOCK_M, cfg.HEAD_DIM],
+            dtype=gl.float32,
+            layout=cfg.store_layout,
+        )
+        # Each split's waves stored their partials before its acq_rel
+        # increment, so this split's increment orders the partial loads
+        # after all of them, and the loads can be ordinary cached loads;
+        # volatile loads would bypass the caches and slow the merge. Only
+        # the incrementing wave acquires, but its BUFFER_INV invalidates
+        # the CU's whole vector L1 cache, which all of the work-group's
+        # waves share, and the L2's non-coherently cached lines (CDNA4
+        # ISA 9.1.10.2, Table 52), and the barrier that
+        # broadcasts the old count orders their loads after it.
+        for split in range(0, cfg.NUM_KV_SPLITS):
+            base = (
+                (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
+                * cfg.NUM_KV_SPLITS
+                + split
+            ) * cfg.HEAD_DIM + offs_d[None, :]
+            part_o = gl.load(
+                self.mid_o_ptr + base,
+                mask=valid[:, None],
+                other=0.0,
+            ).to(gl.float32)
+            lse_offset = (
+                tokens * cfg.NUM_Q_HEADS + q_heads
+            ) * cfg.NUM_KV_SPLITS + split
+            part_lse = gl.load(
+                self.mid_lse_ptr + lse_offset,
+                mask=valid,
+                other=-float("inf"),
+            ).to(gl.float32)
+            next_m = maximum(final_m, part_lse)
+            if cfg.MAX_SEQLEN_Q > 1:
+                # A later query position's first splits can all precede
+                # its window, leaving -inf - -inf.
+                next_m_safe = gl.where(next_m == -float("inf"), 0.0, next_m)
+                alpha = gl.exp2(final_m - next_m_safe)
+                beta = gl.exp2(part_lse - next_m_safe)
+            else:
+                alpha = gl.exp2(final_m - next_m)
+                beta = gl.exp2(part_lse - next_m)
+            final_acc = final_acc * alpha[:, None] + part_o * beta[:, None]
+            final_l = final_l * alpha + beta
+            final_m = next_m
+        if has_sink:
+            sink_log2 = (
+                gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)
+                * _INV_LN2
+            )
+            next_m = maximum(final_m, sink_log2)
+            alpha = gl.exp2(final_m - next_m)
+            beta = gl.exp2(sink_log2 - next_m)
+            final_acc *= alpha[:, None]
+            final_l = final_l * alpha + beta
+        return final_acc / final_l[:, None]
 
 
 # ===-----------------------------------------------------------------------===#
@@ -768,7 +795,7 @@ class AttentionProgram:
 
 
 @gluon.jit
-def _stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
+def stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
     """Load, wait for and consume one K/V page at a time; enough when other
     waves of the grid cover the load latency."""
     cfg = program.cfg
@@ -795,7 +822,7 @@ def _stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
 
 
 @gluon.jit
-def _stream_split_pipelined(
+def stream_split_pipelined(
     program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES: gl.constexpr
 ):
     cfg = program.cfg
@@ -818,7 +845,7 @@ def _stream_split_pipelined(
     # A split with fewer pages than buffers would spend more on the pipeline
     # prologue than it hides.
     if program.split_end - program.split_start < iteration_tokens:
-        return _stream_split_single_buffer(
+        return stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem.index(0), v_smem.index(0)
         )
     # Prologue: prefetch the first NUM_STAGES - 1 pages.
@@ -859,15 +886,27 @@ def _stream_split_pipelined(
             # Wait for this page; the NUM_STAGES - 1 prefetched pages stay
             # outstanding (s_waitcnt vmcnt(N), N = their copies).
             async_copy.wait_group(NUM_STAGES - 1)
-            k = program.shared_load_k(k_smem.index(stage))
-            qk = program.compute_qk(q, k)
-            # Full attention starts at token 0; only pages reaching past the
-            # split's end or the block's first causal end need a mask.
-            if start_n + cfg.BLOCK_N > program.mask_start:
-                qk = program.apply_kv_mask(qk, start_n)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-            v = program.shared_load_v(v_smem.index(stage))
-            acc = program.compute_pv(p, v, acc)
+            # A page past the split (the last iteration's padding) is skipped,
+            # not masked: masked to -inf it would still rescale the running
+            # sums by exp2 of the max's FMA rounding error, so the result would
+            # differ from the single-buffered loop's in the last bit.
+            if start_n < program.split_end:
+                k = program.shared_load_k(k_smem.index(stage))
+                qk = program.compute_qk(q, k)
+                # Full attention starts at token 0; only pages reaching past the
+                # split's end or the block's first causal end need a mask. A
+                # sliding window also masks keys before each row's window start.
+                if cfg.IS_SLIDING or start_n + cfg.BLOCK_N > program.mask_start:
+                    qk = program.apply_kv_mask(qk, start_n)
+                p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+                v = program.shared_load_v(v_smem.index(stage))
+                acc = program.compute_pv(p, v, acc)
+                # Each page must round as one iteration of the single-buffered
+                # loop does: there the running max enters as a loop-carried
+                # value, and m_i * SM_SCALE fuses into the rescale's FMA. Here
+                # the next page would reuse this page's rounded m_new *
+                # SM_SCALE instead, changing the last bit.
+                m_i = arithmetic_fence(m_i)
         pages = next_pages
         next_pages = later_pages
 
@@ -933,6 +972,9 @@ def gluon_mha_decode_gfx950(
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        gl.program_id(0),
+        gl.program_id(1),
+        gl.program_id(2),
     )
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
@@ -943,11 +985,11 @@ def gluon_mha_decode_gfx950(
         v_smem = gl.allocate_shared_memory(
             v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
         )
-        m_i, l_i, acc = _stream_split_single_buffer(
+        m_i, l_i, acc = stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem, v_smem
         )
     else:
-        m_i, l_i, acc = _stream_split_pipelined(
+        m_i, l_i, acc = stream_split_pipelined(
             program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
     program.store_split(acc, l_i, m_i)
@@ -1007,6 +1049,9 @@ def gluon_mha_decode_sliding_gfx950(
         cache_seqlens_ptr,
         out_ptr,
         out_ptr,
+        gl.program_id(0),
+        gl.program_id(1),
+        gl.program_id(2),
     )
     k_smem = gl.allocate_shared_memory(
         k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
@@ -1065,6 +1110,7 @@ def _mha_decode_sliding_split_atomic(
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -1093,35 +1139,26 @@ def _mha_decode_sliding_split_atomic(
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        gl.program_id(0),
+        gl.program_id(1),
+        gl.program_id(2),
     )
-    k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-    )
-    v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-    )
-
     q = program.load_q()
     m_i, l_i, acc, _ = program.init_state(sink_ptr, False)
-    physical_page = program.load_page(program.split_start)
-
-    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
-        with gl.amd.warp_pipeline_stage("load", priority=1):
-            program.issue_load_k(physical_page, k_smem)
-            program.issue_load_v(physical_page, v_smem)
-            physical_page = program.load_page(start_n + cfg.BLOCK_N)
-
-        with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
-            async_copy.wait_group(1)
-            k = program.shared_load_k(k_smem)
-            qk = program.compute_qk(q, k)
-            qk = program.apply_kv_mask(qk, start_n)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-
-        with gl.amd.warp_pipeline_stage("pv", priority=1):
-            async_copy.wait_group(0)
-            v = program.shared_load_v(v_smem)
-            acc = program.compute_pv(p, v, acc)
+    if NUM_STAGES == 1:
+        k_smem = gl.allocate_shared_memory(
+            k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+        )
+        v_smem = gl.allocate_shared_memory(
+            v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+        )
+        m_i, l_i, acc = stream_split_single_buffer(
+            program, q, m_i, l_i, acc, k_smem, v_smem
+        )
+    else:
+        m_i, l_i, acc = stream_split_pipelined(
+            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        )
 
     program.store_split(acc, l_i, m_i)
     program.finalize_splits(out_ptr, sink_ptr, counters_ptr, HAS_SINK)
@@ -1354,8 +1391,22 @@ def get_config(
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=num_kv_splits,
-        num_stages=_full_decode_stages(
-            num_kv_splits, page_size, head_dim, k_cache.element_size(), num_warps
+        # Short windows stay single-buffered: their one-wave blocks fill
+        # the grid, so other waves cover each page's load.
+        num_stages=(
+            1
+            if short_window
+            else (
+                _SLIDING_DECODE_STAGES
+                if is_sliding
+                else _full_decode_stages(
+                    num_kv_splits,
+                    page_size,
+                    head_dim,
+                    k_cache.element_size(),
+                    num_warps,
+                )
+            )
         ),
         block_m=block_m,
         block_n=block_n,
@@ -1475,7 +1526,9 @@ def launch_gluon_mha_decode_gfx950(
             config.window_left,
             has_sink,
             is_fp8,
+            config.num_stages,
             num_warps=config.num_warps,
+            **extern_compile_options(),
         )
     else:
         # Always use split-k for full attention
@@ -1518,7 +1571,7 @@ def launch_gluon_mha_decode_gfx950(
             is_fp8,
             config.num_stages,
             num_warps=config.num_warps,
-            **sched_compile_options(),
+            **extern_compile_options(),
         )
 
         # Sink is a single global softmax entry, so split-k must merge it once in
@@ -1825,7 +1878,7 @@ def _stream_balanced(
     NUM_STAGES: gl.constexpr,
 ):
     """Stream a balanced split, software-pipelined NUM_STAGES deep as
-    _stream_split_pipelined when the split spans at least one iteration,
+    stream_split_pipelined when the split spans at least one iteration,
     else single-buffered in the first LDS buffer: balanced splits can be
     shorter than one iteration, which the split grid's pipelined splits
     never are."""
@@ -1843,7 +1896,7 @@ def _stream_balanced(
     iteration_tokens: gl.constexpr = NUM_STAGES * cfg.BLOCK_N
     short = program.split_end - program.split_start < iteration_tokens
     if short:
-        return _stream_split_single_buffer(
+        return stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem.index(0), v_smem.index(0)
         )
     pages = program.load_page_indices(program.split_start, NUM_STAGES)
@@ -1886,7 +1939,7 @@ def _stream_balanced(
             acc = program.compute_pv(p, v, acc)
         pages = next_pages
         next_pages = later_pages
-    # As _stream_split_pipelined: wait for this wave's prefetched copies
+    # As stream_split_pipelined: wait for this wave's prefetched copies
     # before the layout conversions reuse their LDS.
     async_copy.wait_group(0)
     return m_i, l_i, acc
@@ -2315,7 +2368,7 @@ def launch_gluon_mha_decode_balanced_gfx950(
         is_fp8,
         _BALANCED_STAGES,
         num_warps=num_warps,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     has_sink = sinks is not None
     gluon_mha_decode_balanced_reduce_gfx950[(q.shape[0], q.shape[1])](
