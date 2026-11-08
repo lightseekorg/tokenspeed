@@ -330,7 +330,7 @@ def test_padded_replay_marks_filler_rows_then_restores(fail_forward, has_drafter
         (4, 8, False),
     ],
 )
-def test_mega_moe_counts_are_armed_only_for_whole_batch_layouts(
+def test_whole_batch_layouts_are_attention_tp_1_or_the_moe_size(
     attn_tp_size, moe_ep_size, whole_batches
 ):
     world_size = max(attn_tp_size, moe_ep_size)
@@ -349,6 +349,76 @@ def test_mega_moe_counts_are_armed_only_for_whole_batch_layouts(
         )
         is whole_batches
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "attn_tp_size,moe_ep_size,armed",
+    # Whole-batch layouts arm the pair; Qwen3.5's DP4/TP2/EP8 does not.
+    [(4, 4, True), (1, 8, True), (2, 8, False)],
+)
+def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
+    monkeypatch, attn_tp_size, moe_ep_size, armed
+):
+    from tokenspeed_kernel.ops.moe.deep_gemm import mega_moe_live_requests
+
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+
+    class Backend:
+        def init_cuda_graph_state(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.MEGA_MOE)
+    world_size = max(attn_tp_size, moe_ep_size)
+    config = ModelExecutorConfig(
+        max_req_pool_size=5,
+        output_length=1,
+        enforce_eager=False,
+        prefix_granularity=128,
+        max_num_seqs=32,
+        chunked_prefill_size=4096,
+        input_vocab_size=32,
+        vocab_size=32,
+        context_len=4096,
+        physical_context_len=4096,
+        # The runner creates the pair only on CUDA.
+        device="cuda",
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=[1, 2, 4],
+        disable_cuda_graph_padding=False,
+        spec_topk=1,
+        max_cudagraph_capture_size=4,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        input_logprob_chunk_tokens=1024,
+        decode_only_attention=False,
+        prefill_graph_capture_batch_sizes=None,
+        enable_speculative_sampling=False,
+        query_shard_size=1,
+        query_shard_rank=0,
+        enable_memory_saver=False,
+        enable_drafter_prefill_graph=False,
+        data_parallel_size=world_size // attn_tp_size,
+        attention_tp_size=attn_tp_size,
+        moe_tp_ep_size=moe_ep_size,
+        world_size=world_size,
+    )
+    runner = ForwardStepRunner(
+        forward_func=lambda *args, **kwargs: None,
+        attn_backend=Backend(),
+        token_to_kv_pool=SimpleNamespace(
+            arena=SimpleNamespace(cache_group_specs=(), cache_group_page_counts={})
+        ),
+        input_buffers=object(),
+        config=config,
+    )
+    # Armed, the runner's padded replays write the very pair every MegaMoE
+    # staging reads; otherwise it writes none and MegaMoE routes every row.
+    expected = mega_moe_live_requests(config.device) if armed else None
+    assert runner._mega_moe_live_requests is expected
 
 
 if __name__ == "__main__":
