@@ -391,6 +391,11 @@ def parse_args() -> argparse.Namespace:
         help="GitHub event name; workflow_dispatch always enables the workflow.",
     )
     parser.add_argument(
+        "--full-tests",
+        action="store_true",
+        help="A reviewer asked for every test (pr_test_scope.py): run this group.",
+    )
+    parser.add_argument(
         "--repo-root",
         type=Path,
         required=True,
@@ -406,7 +411,7 @@ def main() -> None:
         for line in args.changed_files.read_text(encoding="utf-8").splitlines()
         if line.strip()
     }
-    run_vendor_tests = should_run(
+    run_vendor_tests = args.full_tests or should_run(
         paths, args.runner_group, args.event_name, args.repo_root
     )
     run_import_check = should_run_import_check(

@@ -547,3 +547,28 @@ def test_workflow_classifies_the_checkout_after_installing_pyyaml(
     )
     assert f"--runner-group {runner_group}" in classify["run"]
     assert '--repo-root "$GITHUB_WORKSPACE"' in classify["run"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"), [([], "false"), (["--full-tests"], "true")]
+)
+def test_full_tests_request_runs_a_group_a_change_does_not_need(
+    tmp_path, flags, expected
+):
+    import subprocess
+    import sys
+
+    changed = tmp_path / "changed.txt"
+    changed.write_text("docs/guide.md\n")
+    script = REPO_ROOT / "test/ci_system/ci_path_filter.py"
+    argv = [sys.executable, str(script), *flags, "--runner-group", "amd-mi350"]
+    argv += [
+        "--event-name",
+        "pull_request",
+        "--repo-root",
+        str(REPO_ROOT),
+        str(changed),
+    ]
+    output = subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+
+    assert f"should_run={expected}" in output.splitlines()

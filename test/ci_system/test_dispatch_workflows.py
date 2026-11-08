@@ -155,6 +155,11 @@ def test_amd_workflow_builds_architecture_matrices(
         .replace(
             "${{ steps.changes.outputs.should_run_import_check }}", str(imports).lower()
         )
+        # No reviewer asked for every test.
+        .replace(
+            "${{ steps.changes.outputs.full_tests == 'true' && '--full-tests' || '' }}",
+            "",
+        )
     )
     script = re.sub(r"\$\{\{ github.event_name.*?\}\}", "per-commit", script)
     output = tmp_path / "outputs"

@@ -8,6 +8,7 @@ triggers:
   - debug
 import_roots:
   - tokenspeed-kernel/test
+changed_paths: true
 runner:
   labels:
     - amd-mi45x-cpu-test

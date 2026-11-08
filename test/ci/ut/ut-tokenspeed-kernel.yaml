@@ -7,6 +7,7 @@ triggers:
   - manual
 import_roots:
   - tokenspeed-kernel/test
+changed_paths: true
 runner:
   labels:
     - amd-mi355-1gpu
