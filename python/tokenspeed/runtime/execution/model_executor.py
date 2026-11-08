@@ -461,6 +461,10 @@ class ModelExecutorConfig:
     # ====== DP =========
     data_parallel_size: int = 1
     attention_tp_size: int = 1
+    # MoE TP x EP group size; with attention_tp_size it tells whether each
+    # rank's MegaMoE input is its attention-DP group's whole batch
+    # (mega_moe_stages_whole_batches).
+    moe_tp_ep_size: int = 1
     world_size: int = 1
     world_group: list[int] | None = None
 
@@ -574,6 +578,7 @@ class ModelExecutorConfig:
             enable_memory_saver=server_args.enable_memory_saver,
             data_parallel_size=server_args.mapping.attn.dp_size,
             attention_tp_size=server_args.mapping.attn.tp_size,
+            moe_tp_ep_size=server_args.mapping.moe.tp_ep_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
             pp_size=server_args.mapping.pp_size,
