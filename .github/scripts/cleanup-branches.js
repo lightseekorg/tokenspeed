@@ -39,14 +39,14 @@ module.exports = async function cleanupBranches({ github, core, context, dryRun,
     // share a commit. Only PR heads from this repository count as its history.
     const pulls = (await github.paginate(github.rest.pulls.list, {
       owner, repo, head: `${owner}:${branch.name}`, state: 'all', per_page: 100,
-    })).filter(pr => pr.head.repo?.id === repository.id && pr.head.ref === branch.name);
-    if (pulls.some(pr => pr.state === 'open')) continue;
+    })).filter((pr) => pr.head.repo?.id === repository.id && pr.head.ref === branch.name);
+    if (pulls.some((pr) => pr.state === 'open')) continue;
 
     // A branch may also be the base of an open (including stacked) PR.
     const openBases = await github.paginate(github.rest.pulls.list, {
       owner, repo, base: branch.name, state: 'open', per_page: 100,
     });
-    if (openBases.length) continue;
+    if (openBases.length > 0) continue;
 
     // Recheck the ref after the PR queries. GitHub's delete-ref API does not
     // support an expected SHA, so this is a best-effort concurrent-push guard.
@@ -56,34 +56,37 @@ module.exports = async function cleanupBranches({ github, core, context, dryRun,
         owner, repo, branch: branch.name,
       }));
     } catch (error) {
-      if (error.status === 404) continue; // Already deleted since enumeration.
+      // Already deleted since enumeration.
+      if (error.status === 404) continue;
       throw error;
     }
     if (current.protected || current.commit.sha !== branch.commit.sha) continue;
 
+    // Delete a closed-PR branch immediately only while its tip still matches
+    // the closed PR's head; a branch pushed past it gets the seven-day rule.
     let reason;
-    if (pulls.some(pr => pr.state === 'closed')) {
-      reason = 'all associated PRs are closed';
+    if (pulls.some((pr) => pr.state === 'closed' && pr.head.sha === current.commit.sha)) {
+      reason = 'tip matches the head of a closed PR';
     } else {
       const committedAt = Date.parse(current.commit.commit.committer?.date);
       if (!Number.isFinite(committedAt) || committedAt >= cutoff) continue;
-      reason = 'no PR history and tip commit is older than seven days';
+      reason = 'tip commit is older than seven days';
     }
 
-    eligible++;
+    eligible += 1;
     if (dryRun) {
       core.info(`Would delete ${branch.name}: ${reason}`);
     } else {
       try {
         await github.rest.git.deleteRef({ owner, repo, ref: `heads/${branch.name}` });
-        deleted++;
+        deleted += 1;
         core.info(`Deleted ${branch.name}: ${reason}`);
       } catch (error) {
-        failures++;
+        failures += 1;
         core.warning(`Could not delete ${branch.name}: ${error.message}`);
       }
     }
   }
   core.info(`${dryRun ? 'Eligible' : 'Deleted'} branches: ${dryRun ? eligible : deleted}`);
-  if (failures) core.setFailed(`Could not delete ${failures} branch(es). See warnings above.`);
+  if (failures > 0) core.setFailed(`Could not delete ${failures} branch(es). See warnings above.`);
 };

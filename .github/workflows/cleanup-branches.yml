@@ -30,9 +30,10 @@ jobs:
         with:
           persist-credentials: false
 
-      # Closed includes merged PRs. Branches with no PR history expire seven
-      # days after the tip commit's committer date, not the branch creation or
-      # push time. Default/protected branches and open PR heads/bases are kept.
+      # Closed includes merged PRs. A branch is deleted immediately only while
+      # its tip matches a closed PR's head; otherwise it expires seven days
+      # after the tip commit's committer date, not the branch creation or push
+      # time. Default/protected branches and open PR heads/bases are kept.
       - name: Clean up branches
         uses: actions/github-script@v7
         env:
