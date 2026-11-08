@@ -132,13 +132,7 @@ class Qwen3OmniMoeTextModel(Qwen3MoeModel):
         )
 
         for layer_idx, layer in enumerate(self.layers):
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                ctx,
-                residual,
-                cos_sin=None,
-            )
+            hidden_states, residual = layer(positions, hidden_states, ctx, residual)
             if layer_idx < num_deepstack and input_deepstack_embeds.numel() > 0:
                 start = layer_idx * hidden_size
                 # Add to the residual: under all-reduce fusion hidden_states is
