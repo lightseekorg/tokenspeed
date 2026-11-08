@@ -28,6 +28,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -96,7 +97,7 @@ TEST(ForwardBatch, EmptyOpsProducesEmpty) {
     EXPECT_TRUE(batch.empty());
     EXPECT_EQ(batch.NumExtends(), 0u);
     EXPECT_TRUE(batch.request_ids.empty());
-    EXPECT_TRUE(batch.block_tables_contig.empty());
+    EXPECT_TRUE(batch.block_tables.empty());
     EXPECT_TRUE(batch.BlockTables().empty());
 }
 
@@ -132,11 +133,11 @@ TEST(ForwardBatch, ContiguousAndNestedTablesMatchForRealAllocatorIds) {
     const auto expected_full1 = PageIds(full, full1);
     const auto expected_swa0 = PageIds(swa, swa0);
     const auto expected_swa1 = PageIds(swa, swa1);
-    EXPECT_EQ(batch.block_tables_contig.at("full"),
+    EXPECT_EQ(batch.block_tables.at("full").AbsoluteRows(),
               (std::vector<std::int32_t>{expected_full0[0], expected_full0[1], expected_full0[2], expected_full0[3],
                                          expected_full1[0], -1, -1, -1}));
     EXPECT_EQ(
-        batch.block_tables_contig.at("swa"),
+        batch.block_tables.at("swa").AbsoluteRows(),
         (std::vector<std::int32_t>{expected_swa0[0], expected_swa0[1], expected_swa0[2], expected_swa1[0], -1, -1}));
     EXPECT_EQ(nested.at("full"),
               (std::vector<std::vector<std::int32_t>>{expected_full0, {expected_full1[0], -1, -1, -1}}));
@@ -160,9 +161,14 @@ TEST(ForwardBatch, NullHoleZeroAndPaddingMinusOneRemainDistinct) {
 
     const ForwardBatch batch{std::move(ops)};
     const auto nested = batch.BlockTables();
-    ASSERT_EQ(batch.block_tables_contig.at("full").size(), 6u);
-    EXPECT_EQ(batch.block_tables_contig.at("full").at(0), 0);
-    EXPECT_EQ(batch.block_tables_contig.at("full").at(4), -1);
+    const auto& rows = batch.block_tables.at("full");
+    ASSERT_EQ(batch.block_tables.at("full").AbsoluteRows().size(), 6u);
+    EXPECT_EQ(batch.block_tables.at("full").AbsoluteRows().at(0), 0);
+    EXPECT_EQ(batch.block_tables.at("full").AbsoluteRows().at(4), -1);
+    EXPECT_EQ(rows.Spans(), (std::vector<std::int32_t>{0, 3, 0, 1}));
+    EXPECT_EQ(rows.WindowRows(), (std::vector<std::int32_t>{0, full.allocator.BlockTablePageIds(with_hole)[1],
+                                                            full.allocator.BlockTablePageIds(with_hole)[2],
+                                                            full.allocator.BlockTablePageIds(short_row)[0], -1, -1}));
     EXPECT_EQ(nested.at("full").at(0).at(0), 0);
     EXPECT_EQ(nested.at("full").at(1),
               (std::vector<std::int32_t>{full.allocator.BlockTablePageIds(short_row)[0], -1, -1}));
@@ -182,7 +188,7 @@ TEST(ForwardBatch, CheckpointPageIsThirdStateSlot) {
     const ForwardBatch batch{std::move(ops)};
     const auto nested = batch.BlockTables();
     const auto ids = PageIds(state, row);
-    EXPECT_EQ(batch.block_tables_contig.at("state"), (std::vector<std::int32_t>{ids[0], ids[1], checkpoint}));
+    EXPECT_EQ(batch.block_tables.at("state").AbsoluteRows(), (std::vector<std::int32_t>{ids[0], ids[1], checkpoint}));
     EXPECT_EQ(nested.at("state"), (std::vector<std::vector<std::int32_t>>{{ids[0], ids[1], checkpoint}}));
 }
 
@@ -212,6 +218,53 @@ TEST(ForwardBatch, MissingGroupAndEmptyTableRowsArePadded) {
     EXPECT_EQ(nested.at("full").at(1), (std::vector<std::int32_t>{-1, -1}));
     EXPECT_EQ(nested.at("state").at(0), (std::vector<std::int32_t>{-1, -1}));
     EXPECT_EQ(nested.at("state").at(1), (std::vector<std::int32_t>{-1, -1}));
+}
+
+TEST(ForwardBatch, ReclaimedPrefixUsesCompactWindowAndRaggedRowsStayAligned) {
+    Sources sources;
+    GroupSource& full = sources.AddGroup("full");
+    auto& reclaimed = full.AddRow({1, 2, 3, 4, 5, 6, 7, 8});
+    const auto ids = PageIds(full, reclaimed);
+    full.allocator.ReclaimExpired(full.pool, reclaimed, /*num_expired_blocks=*/6);
+
+    std::vector<ForwardOperation> ops;
+    PrefillOperation with_prefix;
+    with_prefix.request_id = "reclaimed";
+    with_prefix.block_tables.emplace("full", ForwardBlockTable{full.allocator, reclaimed, 0});
+    PrefillOperation missing_group;
+    missing_group.request_id = "missing";
+    ops.emplace_back(std::move(with_prefix));
+    ops.emplace_back(std::move(missing_group));
+    const ForwardBatch batch{std::move(ops)};
+    const auto& table = batch.block_tables.at("full");
+
+    EXPECT_EQ(table.Rows(), 2u);
+    EXPECT_EQ(table.Columns(), 8u);
+    EXPECT_EQ(table.WindowColumns(), 2u);
+    EXPECT_EQ(table.Spans(), (std::vector<std::int32_t>{6, 8, 0, 0}));
+    EXPECT_EQ(table.WindowRows(), (std::vector<std::int32_t>{ids[6], ids[7], -1, -1}));
+    EXPECT_EQ(table.AbsoluteRows(),
+              (std::vector<std::int32_t>{0, 0, 0, 0, 0, 0, ids[6], ids[7], -1, -1, -1, -1, -1, -1, -1, -1}));
+}
+
+TEST(ForwardBatch, AllReclaimedRowsKeepLogicalZeroWidthWindow) {
+    Sources sources;
+    GroupSource& full = sources.AddGroup("full");
+    auto& row = full.AddRow({1, 2, 3, 4});
+    full.allocator.ReclaimExpired(full.pool, row, /*num_expired_blocks=*/4);
+    std::vector<ForwardOperation> ops;
+    PrefillOperation prefill;
+    prefill.request_id = "all-reclaimed";
+    prefill.block_tables.emplace("full", ForwardBlockTable{full.allocator, row, 0});
+    ops.emplace_back(std::move(prefill));
+
+    const ForwardBatch batch{std::move(ops)};
+    const auto& table = batch.block_tables.at("full");
+    EXPECT_EQ(table.Columns(), 4u);
+    EXPECT_EQ(table.WindowColumns(), 0u);
+    EXPECT_EQ(table.Spans(), (std::vector<std::int32_t>{4, 4}));
+    EXPECT_TRUE(table.WindowRows().empty());
+    EXPECT_EQ(table.AbsoluteRows(), (std::vector<std::int32_t>{0, 0, 0, 0}));
 }
 
 TEST(ForwardBatch, PrefillBeforeDecodeKeepsRowsAligned) {
@@ -262,16 +315,16 @@ ForwardBatch BuildBatchAfterSourcesGoOutOfScope() {
     prefill.block_tables.emplace("full", ForwardBlockTable{full.allocator, row, 0});
     ops.emplace_back(std::move(prefill));
     ForwardBatch batch{std::move(ops)};
-    EXPECT_EQ(batch.block_tables_contig.at("full"), ids);
+    EXPECT_EQ(batch.block_tables.at("full").AbsoluteRows(), ids);
     return batch;
 }
 
 TEST(ForwardBatch, OwnsResolvedSnapshotAfterSourcesAreDestroyed) {
     const ForwardBatch batch = BuildBatchAfterSourcesGoOutOfScope();
     EXPECT_EQ(batch.request_ids, (std::vector<std::string>{"r0"}));
-    ASSERT_EQ(batch.block_tables_contig.at("full").size(), 3u);
+    ASSERT_EQ(batch.block_tables.at("full").AbsoluteRows().size(), 3u);
     const auto nested = batch.BlockTables();
-    EXPECT_EQ(nested.at("full").at(0), batch.block_tables_contig.at("full"));
+    EXPECT_EQ(nested.at("full").at(0), batch.block_tables.at("full").AbsoluteRows());
 }
 
 TEST(ForwardBatch, OwnsResolvedSnapshotAfterSourceTableIsFreed) {
@@ -285,11 +338,42 @@ TEST(ForwardBatch, OwnsResolvedSnapshotAfterSourceTableIsFreed) {
     prefill.block_tables.emplace("full", ForwardBlockTable{full.allocator, row, 0});
     ops.emplace_back(std::move(prefill));
     const ForwardBatch batch{std::move(ops)};
+    const ForwardBatch copied{batch};
 
     full.allocator.Free(row);
     EXPECT_TRUE(full.allocator.BlockTablePageIds(row).empty());
-    EXPECT_EQ(batch.block_tables_contig.at("full"), ids);
+    EXPECT_EQ(batch.block_tables.at("full").AbsoluteRows(), ids);
     EXPECT_EQ(batch.BlockTables().at("full").at(0), ids);
+    EXPECT_EQ(copied.block_tables.at("full").WindowRows(), ids);
+    EXPECT_EQ(copied.block_tables.at("full").WindowRows().data(), batch.block_tables.at("full").WindowRows().data());
+}
+
+TEST(ForwardBatch, AbsoluteRowsMaterializeOnceAcrossThreads) {
+    Sources sources;
+    GroupSource& full = sources.AddGroup("full");
+    auto& row = full.AddRow({1, 2, 3, 4, 5});
+    full.allocator.ReclaimExpired(full.pool, row, /*num_expired_blocks=*/3);
+    const auto expected = PageIds(full, row);
+    std::vector<ForwardOperation> ops;
+    PrefillOperation prefill;
+    prefill.request_id = "threaded";
+    prefill.block_tables.emplace("full", ForwardBlockTable{full.allocator, row, 0});
+    ops.emplace_back(std::move(prefill));
+    const ForwardBatch batch{std::move(ops)};
+
+    constexpr std::size_t kThreads = 8;
+    std::vector<const std::vector<std::int32_t>*> materialized(kThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (std::size_t i = 0; i < kThreads; ++i) {
+        threads.emplace_back(
+            [&batch, &materialized, i] { materialized[i] = &batch.block_tables.at("full").AbsoluteRows(); });
+    }
+    for (auto& thread : threads) thread.join();
+
+    ASSERT_NE(materialized[0], nullptr);
+    for (const auto* rows : materialized) EXPECT_EQ(rows, materialized[0]);
+    EXPECT_EQ(*materialized[0], (std::vector<std::int32_t>{0, 0, 0, expected[3], expected[4]}));
 }
 
 TEST(ForwardBatch, CarriesExtendReplayAndCheckpointLengthsAlongRows) {

@@ -250,7 +250,9 @@ def _case_rmsnorm_fp8_group32_swizzled():
     weight = torch.randn(hidden, dtype=torch.bfloat16, device=DEVICE)
 
     def run(x):
-        return triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, swizzled_scales=True)
+        return triton_rmsnorm_fp8_group32_ue8m0(
+            x, weight, 1e-6, scale_layout="swizzled"
+        )
 
     return real, run
 
