@@ -611,6 +611,10 @@ private:
                                std::vector<WriteBackOperation>& write_back_operations);
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
+    // True when a local-prefill candidate has been held back by the
+    // prefill/decode interval for prefill_decode_interval rounds in total
+    // (docs/design/scheduler.md §3.3).
+    bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
@@ -648,6 +652,10 @@ private:
     // retracted.
     std::int64_t plan_calls_{0};
     std::string forced_victim_id_;
+
+    // prefill_decode_interval: reset by a prefill round, counted down by a
+    // decode round. Derived from the plans alone, so mirrored ranks agree.
+    std::int32_t prefill_deferral_rounds_left_{0};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work or leaves work in flight.
