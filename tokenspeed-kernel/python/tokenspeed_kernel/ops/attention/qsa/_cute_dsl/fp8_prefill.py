@@ -573,6 +573,8 @@ class _Fp8SparsePrefill:
             cute.arch.griddepcontrol_launch_dependents()
 
 
+# Cache of cute.compile results keyed by (device, KV-head count, PDL) so each
+# static specialization compiles only once per process; later calls reuse it.
 _compiled = {}
 
 
