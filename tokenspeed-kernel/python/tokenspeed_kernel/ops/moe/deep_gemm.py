@@ -326,7 +326,7 @@ def _get_symm_buffer(
 
 
 def _warmup_m_values(max_tokens: int) -> list[int]:
-    """Return token counts covering every DeepGEMM tile reachable at runtime."""
+    """Return token counts covering DeepGEMM tiles up to ``max_tokens``."""
     dense = min(max_tokens, 2048)
     values: set[int] = set(range(1, dense + 1))
     values.update(range(dense, max_tokens + 1, 16))

@@ -676,6 +676,7 @@ Post-quantization warmup uses the existing DeepGEMM warmup hook to reserve
 workspace and compile reachable tiles before capture; matching layers reuse
 the backend's workspace and warmup cache. A lower warmup limit reduces the
 token counts exercised by the hook while retaining the planned workspace.
+DeepGEMM JIT-compiles any uncached tile needed by a forward above that limit.
 Set `TOKENSPEED_DISABLE_MEGA_MOE_WARMUP=1` to defer this work to the first
 forward. An empty owner still enters the
 collective with zero-row inputs and output, using DeepGEMM's native empty-rank
