@@ -48,13 +48,16 @@ from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
+    DFlash2DecoderLayer,
     DFlash2DraftModel,
+    DFlash2MonokernelDecoderLayer,
     DFlashGroupedConv,
     _dflash2_mla_rope,
     _dflash2_uses_mla,
     _grouped_conv,
     _score_edges,
 )
+from tokenspeed.runtime.models.monokernel import MonokernelState
 
 _CUDA_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -200,7 +203,7 @@ def test_block_drafter_declares_only_its_sliding_mask(
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter = DFlash2.__new__(DFlash2)
     drafter.model = SimpleNamespace(
-        config=SimpleNamespace(vocab_size=32), fp8_head=None
+        config=SimpleNamespace(vocab_size=32), fp8_head=None, monokernel_state=None
     )
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
@@ -595,3 +598,123 @@ def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     assert second.data_ptr() == first.data_ptr()
     assert second.shape == (2, 8)
     assert not second.any()
+
+
+@pytest.mark.parametrize(
+    "rows, tp_size, served",
+    [(1024, 8, True), (8192, 1, False), (8192, 8, False)],
+)
+def test_the_context_write_monokernel_takes_the_column_parallel_fc(
+    rows: int, tp_size: int, served: bool
+) -> None:
+    """The context write's monokernel reads each rank's own fc rows, the shard
+    the column-parallel ``fc`` holds; a replicated ``fc`` is not its layout."""
+    from tokenspeed.runtime.models import dflash2_monokernel
+
+    model = SimpleNamespace(
+        fc=SimpleNamespace(
+            quant_method=UnquantizedLinearMethod(),
+            tp_size=tp_size,
+            weight=torch.empty(rows, 5 * 8192, dtype=torch.bfloat16, device="meta"),
+        ),
+        hidden_norm=SimpleNamespace(
+            weight=torch.empty(8192, dtype=torch.bfloat16, device="meta"),
+            variance_epsilon=dflash2_monokernel.RMS_NORM_EPS,
+        ),
+    )
+    assert (dflash2_monokernel.context_reasons(model) == []) is served
+
+
+@pytest.mark.parametrize("fused_reduce_norm", [False, True])
+def test_preparing_the_draft_prepares_its_monokernels(fused_reduce_norm: bool) -> None:
+    """With --decode-monokernel the draft's collectives include the
+    monokernels' mailbox scratch, whether or not the regular layers' fused
+    reduce + norm is also prepared: unprepared, the monokernels never serve and
+    every draft step falls back to the layers."""
+    from tokenspeed.runtime.models import dflash2 as dflash2_model
+
+    group = [0, 1, 2, 3, 4, 5, 6, 7]
+    prepared = []
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    model.mapping = SimpleNamespace(attn=SimpleNamespace(tp_group=group))
+    # A prepared fused reduce + norm answers at once. Declining it needs an
+    # Iris group this test lacks, so that case declines without the device.
+    model.fused_reduce_norm = object() if fused_reduce_norm else None
+    if not fused_reduce_norm:
+        model._prepare_fused_reduce_norm = lambda max_num_tokens: False
+    model.monokernel_state = SimpleNamespace(
+        prepare=lambda *args: prepared.append(args)
+    )
+    with (
+        mock.patch.object(
+            dflash2_model.process_group_manager,
+            "get_device_process_group",
+            return_value="device",
+        ),
+        mock.patch.object(
+            dflash2_model.process_group_manager,
+            "get_process_group",
+            return_value="gloo",
+        ),
+        mock.patch.object(dflash2_model.dist, "get_rank", return_value=3),
+    ):
+        assert model.prepare_communication_runtime(64)
+
+    assert prepared == [("device", "gloo", 3)]
+
+
+class _BlockState(MonokernelState):
+    """A draft monokernel state whose 'last launch' wrote ``normed``."""
+
+    def __init__(self, normed: torch.Tensor | None) -> None:
+        super().__init__(torch.device("cpu"), 0)
+        self.normed = normed
+        self.calls: list[str] = []
+
+    def start_step(self) -> None:
+        super().start_step()
+        self.calls.append("start")
+        self.lm_head_input = self.normed
+
+    def finish_step(self) -> torch.Tensor | None:
+        self.calls.append("finish")
+        return super().finish_step()
+
+
+class _AddOne(torch.nn.Module):
+    def forward(self, *, positions, hidden_states, ctx, residual):
+        return hidden_states + 1, residual
+
+
+@pytest.mark.parametrize("launched", [False, True])
+def test_a_draft_block_takes_the_last_launchs_final_norm(launched: bool) -> None:
+    """The draft's run_decoder brackets its layers with start_step and
+    finish_step; when the last launch ran the final norm, finish_step's
+    output is the block's, else the model's own final norm runs."""
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    model.layers = torch.nn.ModuleList([_AddOne(), _AddOne()])
+    normed = torch.full((2, 3), 9.0)
+    model.monokernel_state = _BlockState(normed if launched else None)
+    model.final_norm = lambda hidden_states, residual: -hidden_states
+    hidden = torch.zeros(2, 3)
+
+    out = model.run_decoder(torch.zeros(2), hidden, torch.zeros(2, 3), None)
+
+    assert model.monokernel_state.calls == ["start", "finish"]
+    torch.testing.assert_close(out, normed if launched else -(hidden + 2))
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_the_switch_builds_the_draft_from_the_monokernel_layer_class(
+    monkeypatch, switch: bool
+) -> None:
+    """With --decode-monokernel the draft builds its layers from the
+    monokernel class (which keeps the regular code until they are packed)."""
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", switch)
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    expected = DFlash2MonokernelDecoderLayer if switch else DFlash2DecoderLayer
+    assert model.decoder_layer_cls is expected

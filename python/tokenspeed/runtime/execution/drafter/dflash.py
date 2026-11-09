@@ -983,6 +983,9 @@ class DFlash(BaseDrafter):
         """
         return (
             self._tap_rows is not None
+            and self.target_model is not None
+            # The target's decode monokernels store the taps themselves.
+            and not self.target_model.stores_capture_taps(ctx)
             and ctx.dspark_context_producer is None
             and ctx.num_extends == 0
             and ctx.input_num_tokens > 0

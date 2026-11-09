@@ -60,6 +60,7 @@ from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.models import muse_spark as module
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.models.monokernel import MonokernelState
 from tokenspeed.runtime.models.muse_spark import (
     RESIDUAL_GATE_EPS,
     MuseSparkAttention,
@@ -325,6 +326,7 @@ class _AddLayer(torch.nn.Module):
 def test_forward_threads_attention_input_rows_between_layers() -> None:
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.monokernel_state = None
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
@@ -359,7 +361,9 @@ class _CaptureSink:
 def _tapping_model(taps: list[int], with_sink: bool = True):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
+    model.config = SimpleNamespace(decode_monokernel=False)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.monokernel_state = None
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
@@ -402,6 +406,60 @@ def test_forward_taps_the_residual_stream_after_each_draft_target_layer(
     # produced, and rounds what it keeps itself.
     assert [index for index, _ in sink.captures] == [0, 1]
     assert sink.captures[0][1] is aux[0] and sink.captures[1][1] is aux[1]
+
+
+class _StepState(MonokernelState):
+    """A monokernel state that records the model's calls; its launches
+    store the taps when ``stores_taps``."""
+
+    def __init__(self, stores_taps: bool, taps: torch.Tensor | None) -> None:
+        super().__init__(torch.device("cpu"), 0)
+        self.stores_taps = stores_taps
+        self.taps = taps
+        self.calls: list[str] = []
+
+    def start_step(self) -> None:
+        super().start_step()
+        self.calls.append("start")
+
+    def finish_step(self) -> torch.Tensor | None:
+        self.calls.append("finish")
+        return super().finish_step()
+
+    def serves_taps(self, rows, ctx) -> bool:
+        self.calls.append("serves_taps")
+        return self.stores_taps
+
+    def tap_rows(self, rows: int) -> torch.Tensor:
+        return self.taps[:rows]
+
+
+def test_a_monokernel_step_brackets_the_layers_and_keeps_the_regular_capture() -> None:
+    # With a capture sink, the launches do not store the taps: the model
+    # captures the rows the layer before the tap returned, as without
+    # monokernels, between start_step and finish_step.
+    model, sink, ctx = _tapping_model([0])  # taps the stream entering layer 1
+    state = _StepState(stores_taps=False, taps=None)
+    model.monokernel_state = state
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    assert state.calls == ["start", "serves_taps", "finish"]
+    # A sink gets full rows unrounded (it rounds as it copies).
+    torch.testing.assert_close(sink.captures[0][1], hidden + 1.0, rtol=0, atol=0)
+
+
+def test_taps_the_launches_store_replace_the_models_captures() -> None:
+    model, sink, ctx = _tapping_model([0], with_sink=False)
+    stored = torch.full((2, 3), 7.0, dtype=torch.bfloat16)
+    model.monokernel_state = _StepState(stores_taps=True, taps=stored)
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    _, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    assert len(aux) == 1 and aux[0] is not None
+    torch.testing.assert_close(aux[0], stored, rtol=0, atol=0)
 
 
 def test_idle_forward_taps_nothing() -> None:
@@ -1420,7 +1478,10 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
     owner = SimpleNamespace(
         # Muse prepares Iris communication only at attention TP4 or TP8.
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
-        model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(mlp=mlp)],
+            config=SimpleNamespace(decode_monokernel=False),
+        ),
     )
 
     prepared = MuseSparkForConditionalGeneration.prepare_communication_runtime(
@@ -1429,6 +1490,21 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
 
     assert prepared is False
     assert mlp.down_columns is None
+
+
+def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
+    """The launches' scratch lives on the Iris heap: with --decode-monokernel,
+    a server whose Iris collectives cannot be prepared fails at startup and
+    names why, instead of at its first decode."""
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[], config=SimpleNamespace(decode_monokernel=True)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Iris collectives are not prepared"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
 @requires_gpu

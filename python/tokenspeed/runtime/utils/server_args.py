@@ -207,6 +207,7 @@ def _checkpoint_architectures(
 # Checkpoint architectures with decode monokernels (--decode-monokernel). A
 # model adds its architecture here with its monokernel seam.
 DECODE_MONOKERNEL_ARCHITECTURES = (
+    "MuseSparkForConditionalGeneration",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
@@ -646,6 +647,9 @@ class ServerArgs:
     # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
+    # A directory for each rank's decode monokernel stuck-poll record file
+    # (None: the records stay in pinned memory).
+    monokernel_stuck_record_dir: str | None = None
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -3947,12 +3951,27 @@ class ServerArgs:
             default=ServerArgs.decode_monokernel,
             help=(
                 "Run each decoder layer's decode step as one persistent "
-                "monokernel launch, for small batches (decode and speculative "
-                "verify of up to 4 token rows). Models: "
-                f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950, "
-                "without attention or expert parallelism. Startup fails when "
-                "a layer cannot be packed for its monokernel. Larger steps "
-                "keep the regular path."
+                "monokernel launch, for small decode and speculative verify "
+                "steps (each model's seam names the steps and parallel "
+                "layouts its kernels serve). Models: "
+                f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950. "
+                "Startup fails when a layer cannot be packed for its "
+                "monokernel, the speculative draft's layers, context write "
+                "and head included. Other steps keep the regular path."
+            ),
+        )
+        parser.add_argument(
+            "--monokernel-stuck-record-dir",
+            type=str,
+            default=ServerArgs.monokernel_stuck_record_dir,
+            help=(
+                "With --decode-monokernel: a directory where each rank keeps "
+                "its stuck-poll record file (stuck-rank<N>-pid<P>.bin and a "
+                ".json sidecar). A launch poll that gives up writes what it "
+                "waited for there before the launch traps, so the record "
+                "outlives the process; a run without a stuck poll removes the "
+                "files at exit. Without it the records stay in pinned memory "
+                "and are logged when the failure reaches Python."
             ),
         )
         parser.add_argument(

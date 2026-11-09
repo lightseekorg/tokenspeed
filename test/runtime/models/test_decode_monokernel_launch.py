@@ -70,3 +70,67 @@ def test_the_switch_reaches_the_model_config(tmp_path, switch) -> None:
     (tmp_path / "config.json").write_text(json.dumps(config))
     args = server_args(tmp_path, decode_monokernel=switch)
     assert model_config(args).hf_text_config.decode_monokernel is switch
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_the_switch_reaches_the_muse_spark_config(tmp_path, switch) -> None:
+    """Muse Spark's config is its own text config (no nested text config
+    object), and ModelConfig sets the switch on it."""
+    layer_types = ["sliding_attention", "full_attention"]
+    config = {
+        "architectures": ["MuseSparkForConditionalGeneration"],
+        "model_type": "muse_spark",
+        "torch_dtype": "bfloat16",
+        "text_config": {
+            "vocab_size": 128,
+            "hidden_size": 128,
+            "head_dim": 64,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "num_hidden_layers": len(layer_types),
+            "max_position_embeddings": 2048,
+            "rms_norm_eps": 1e-5,
+            "post_norm_eps": 1e-8,
+            "final_logit_softcapping": 20.0,
+            "qk_scale_factor": 1.0,
+            "output_multiplier": 1.0,
+            "residual_gate_temperature": 0.3,
+            "sliding_window": 64,
+            "layer_types": layer_types,
+            "layer_rope_theta": [500000.0, 0.0],
+            "mlp_layer_types": ["sparse", "sparse"],
+            "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
+            "moe_hidden_size": 128,
+            "moe_intermediate_size": 128,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "num_shared_experts": 0,
+            "routed_scaling_factor": 1.0,
+        },
+        "vision_config": {
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "intermediate_size": 32,
+            "layer_types": ["full_attention"],
+            "layer_norm_eps": 1e-5,
+            "merge_size": 2,
+            "patch_size": 2,
+            "patch_temporal": 2,
+            "pos_emb_height": 2,
+            "pos_emb_width": 2,
+            "max_position_embeddings": 4,
+            "rope_parameters": {"rope_theta": 10000, "rope_type": "axial"},
+            "hidden_act": "gelu",
+        },
+        "audio_config": {},
+        "image_token_id": 120,
+        "video_token_id": 121,
+        "audio_token_id": 122,
+        "out_hidden_size": 128,
+        "projector_hidden_size": 64,
+        "projector_hidden_act": "gelu",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    args = server_args(tmp_path, decode_monokernel=switch)
+    assert model_config(args).hf_text_config.decode_monokernel is switch

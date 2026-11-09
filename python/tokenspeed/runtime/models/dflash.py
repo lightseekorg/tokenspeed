@@ -464,6 +464,20 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             hidden_states = input_embeds
             residual = self._zeroed_residual(input_embeds)
 
+        hidden_states = self.run_decoder(positions, hidden_states, residual, ctx)
+
+        return LogitsProcessorOutput(
+            next_token_logits=None, hidden_states=hidden_states
+        )
+
+    def run_decoder(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Run the decoder layers, then the final norm; returns its output."""
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions=positions,
@@ -471,12 +485,7 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
                 ctx=ctx,
                 residual=residual,
             )
-
-        hidden_states = self.final_norm(hidden_states, residual)
-
-        return LogitsProcessorOutput(
-            next_token_logits=None, hidden_states=hidden_states
-        )
+        return self.final_norm(hidden_states, residual)
 
     def final_norm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None
