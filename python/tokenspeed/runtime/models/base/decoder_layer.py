@@ -100,7 +100,7 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=self.is_prev_moe_layer,
-            dense_batch_invariant=False,
+            dense_batch_invariant=self.dense_batch_invariant,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
             query_sharded=False,
@@ -115,6 +115,13 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
     def is_prev_moe_layer(self) -> bool:
 
         return self.is_moe_layer
+
+    @property
+    def dense_batch_invariant(self) -> bool:
+        """Whether the dense MLP tail transposes rows instead of
+        reduce-scattering head/channel partials (``--tp-batch-invariant``)."""
+
+        return False
 
     def resolve_norm(self) -> nn.Module:
 
@@ -156,6 +163,19 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
         )
 
         return hidden_states, residual
+
+    def forward_idle_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        aux_hidden_states: list | None,
+    ) -> None:
+        """Run the attention half of an idle forward, which has no rows.
+
+        Nothing by default; a layer whose attention joins collectives, or
+        whose tap must stay aligned across ranks, runs them here.
+        """
 
     def forward_mlp(
         self,
@@ -207,23 +227,17 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
                 aux_hidden_states,
             )
 
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-
         else:
 
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
+            self.forward_idle_attn(positions, hidden_states, ctx, aux_hidden_states)
+
+        hidden_states = self.forward_mlp(
+            hidden_states,
+            residual,
+            ctx,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+        )
 
         return hidden_states, residual
 

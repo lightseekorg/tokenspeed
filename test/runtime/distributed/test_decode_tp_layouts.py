@@ -527,6 +527,7 @@ def _draft_layer(mapping: Mapping, attn):
     identity MLP and identity norms; dense TP 1 keeps the MLP comm a no-op so
     the layer's output is the attention's."""
     from torch import nn
+    from transformers import PretrainedConfig
 
     from tokenspeed.runtime.models.deepseek_nextn import DeepseekV3DraftDecoderLayer
 
@@ -536,7 +537,9 @@ def _draft_layer(mapping: Mapping, attn):
     layer.layer_id = 0
     layer.hidden_size = HIDDEN
     layer.self_attn = attn
-    layer.is_moe_layer = False
+    # A dense layer: the config routes no experts.
+    layer.config = PretrainedConfig(n_routed_experts=None)
+    layer.is_nextn = False
     layer.mlp = lambda hidden: hidden
     layer.input_layernorm = _norm_stub
     layer.post_attention_layernorm = _norm_stub
