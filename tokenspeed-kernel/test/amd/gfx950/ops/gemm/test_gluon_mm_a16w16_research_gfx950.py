@@ -1,0 +1,174 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Correctness of the research 3-stage and Stream-K dense16 Gluon GEMMs (gfx950)."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+from utils import assert_no_triton_compile, is_cdna4
+
+if not is_cdna4():
+    pytest.skip(
+        "AMD CDNA4 is required for dense16 Gluon GEMM tests",
+        allow_module_level=True,
+    )
+
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_3stage import (  # noqa: E402
+    config_fits as gl3_config_fits,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_3stage import (  # noqa: E402
+    gluon_mm_a16w16_3stage_gfx950,
+    launch_gluon_mm_a16w16_3stage_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_streamk import (  # noqa: E402
+    config_fits as sk_config_fits,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_streamk import (  # noqa: E402
+    launch_gluon_mm_a16w16_streamk_gfx950,
+)
+
+# Kernels and reference accumulate in FP32 and round once to BF16, so outputs
+# differ by at most one BF16 ULP (2**-7 relative); split-K changes only the
+# FP32 summation order. atol covers FP32 accumulation-order noise near zero.
+_ATOL = 1e-5
+_RTOL = 2**-7
+
+
+def _inputs(m: int, n: int, k: int):
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.05
+    ref = (a.float() @ w.float().t()).to(torch.bfloat16)
+    return a, w, ref
+
+
+# cfg = (BM, BN, BK, WM, WN, NS, SPLIT_K, XCD); ragged M and N exercise masking.
+@pytest.mark.parametrize(
+    "mnk,cfg,warp_pipe,variant",
+    [
+        pytest.param(
+            (64, 1024, 1024), (64, 128, 64, 2, 2, 3, 1, 8), False, "base", id="base"
+        ),
+        pytest.param(
+            (100, 1120, 1024),
+            (64, 128, 64, 2, 2, 3, 1, 8),
+            False,
+            "base",
+            id="ragged-mn",
+        ),
+        pytest.param(
+            (128, 512, 2048), (128, 64, 128, 2, 2, 3, 2, 8), False, "base", id="splitk2"
+        ),
+        pytest.param(
+            (64, 640, 1536), (64, 64, 128, 2, 2, 3, 3, 8), False, "base", id="splitk3"
+        ),
+        pytest.param(
+            (256, 1024, 1024),
+            (256, 128, 64, 4, 2, 3, 1, 8),
+            True,
+            "base",
+            id="warp-pipe",
+        ),
+        pytest.param(
+            (128, 1024, 1024),
+            (128, 128, 64, 2, 2, 4, 1, 1),
+            False,
+            "sched",
+            id="sched-ns4",
+        ),
+        pytest.param(
+            (128, 1024, 1024),
+            (128, 128, 64, 2, 2, 3, 2, 8),
+            False,
+            "sched+pin",
+            id="sched-pin-splitk",
+        ),
+    ],
+)
+def test_3stage_matches_reference(mnk, cfg, warp_pipe, variant) -> None:
+    torch.manual_seed(0)
+    m, n, k = mnk
+    assert gl3_config_fits(cfg, m, n, k)
+    a, w, ref = _inputs(m, n, k)
+    c = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    kw = dict(
+        schedule_hint="mfma-schedule" if "sched" in variant else "",
+        pin_acc="pin" in variant,
+    )
+    # Run twice: split-K programs must leave their per-tile counters reset.
+    for _ in range(2):
+        c.fill_(float("nan"))
+        launch_gluon_mm_a16w16_3stage_gfx950(a, w, c, cfg, warp_pipe, **kw)
+        torch.testing.assert_close(c, ref, atol=_ATOL, rtol=_RTOL)
+
+
+def test_3stage_column_slice_output() -> None:
+    """Writing into a column slice of a wider C leaves the other columns untouched."""
+    torch.manual_seed(0)
+    m, n, k = 64, 512, 1024
+    a, w, ref = _inputs(m, n, k)
+    c = torch.zeros((m, n + 256), device="cuda", dtype=torch.bfloat16)
+    launch_gluon_mm_a16w16_3stage_gfx950(
+        a, w, c[:, 128 : 128 + n], (64, 128, 64, 2, 2, 3, 1, 8), False
+    )
+    torch.testing.assert_close(c[:, 128 : 128 + n], ref, atol=_ATOL, rtol=_RTOL)
+    assert not c[:, :128].any() and not c[:, 128 + n :].any()
+
+
+# cfg = (BM, BN, BK, WM, WN, NS, GRID, XCD); GRID below and above the tile count.
+@pytest.mark.parametrize(
+    "mnk,cfg",
+    [
+        pytest.param((64, 1024, 2048), (64, 128, 64, 2, 2, 3, 24, 8), id="grid>tiles"),
+        pytest.param(
+            (128, 1056, 1024), (128, 64, 128, 2, 2, 3, 8, 8), id="grid<tiles-ragged-n"
+        ),
+        pytest.param((96, 512, 4096), (64, 64, 128, 2, 2, 3, 40, 8), id="ragged-m"),
+    ],
+)
+def test_streamk_matches_reference(mnk, cfg) -> None:
+    torch.manual_seed(0)
+    m, n, k = mnk
+    assert sk_config_fits(cfg, m, n, k)
+    a, w, ref = _inputs(m, n, k)
+    c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    for _ in range(2):
+        c.fill_(float("nan"))
+        launch_gluon_mm_a16w16_streamk_gfx950(a, w, c, cfg)
+        torch.testing.assert_close(c, ref, atol=_ATOL, rtol=_RTOL)
+
+
+def test_3stage_row_count_does_not_recompile() -> None:
+    """M is a runtime argument: new row counts reuse the compiled kernel."""
+    torch.manual_seed(0)
+    n, k = 512, 1024
+    cfg = (64, 128, 64, 2, 2, 3, 2, 8)
+    w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+
+    def run(m: int) -> None:
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+        c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        launch_gluon_mm_a16w16_3stage_gfx950(a, w, c, cfg, False)
+
+    run(64)
+    with assert_no_triton_compile(gluon_mm_a16w16_3stage_gfx950):
+        for m in (16, 33, 100, 128, 200):
+            run(m)

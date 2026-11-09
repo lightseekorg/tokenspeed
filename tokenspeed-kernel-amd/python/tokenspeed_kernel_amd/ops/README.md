@@ -136,6 +136,21 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
+### gfx950 research BF16 GEMMs (3-stage, Stream-K)
+
+`mm_3stage.py` (`gluon_mm_a16w16_3stage_gfx950`) and `mm_streamk.py`
+(`gluon_mm_a16w16_streamk_gfx950`) are experimental. They are not
+registered with `tokenspeed-kernel`, and nothing in serving calls them.
+Both compute `C[M, N] = A[M, K] @ W[N, K].T` in BF16/FP16 with FP32 accumulate:
+
+- `M` is a runtime argument.
+- `N`, `K` and the tile configuration are compile-time.
+- `C` may be a column slice of a wider tensor.
+
+Split-K and Stream-K reduce FP32 partials through per-tile counters, which the
+last arriving program resets. Benchmarks, best configs and findings are in
+`tokenspeed-kernel-amd/research/gluon_decode_gemm/`.
+
 ### gfx950 single- and few-row BF16 GEMV
 
 `gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
