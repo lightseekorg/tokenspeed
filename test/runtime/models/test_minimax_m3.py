@@ -112,6 +112,7 @@ def _build_model(
     *,
     quant_config: Mxfp8Config | None = None,
     is_multimodal_active: bool = False,
+    config: MiniMaxM3Config | None = None,
 ) -> MiniMaxM3SparseForConditionalGeneration:
     mapping = _tp4_mapping()
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
@@ -124,7 +125,7 @@ def _build_model(
     try:
         with torch.device("meta"):
             return MiniMaxM3SparseForConditionalGeneration(
-                _tiny_config(),
+                _tiny_config() if config is None else config,
                 mapping,
                 quant_config=quant_config,
                 is_multimodal_active=is_multimodal_active,
@@ -257,6 +258,28 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
         "model.layers.3.mlp.experts.w13_weight_scale_inv",
         "model.layers.3.self_attn.indexer.q_norm.weight",
     }
+
+
+def test_minimax_m3_layers_open_on_the_previous_layers_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _tiny_config()
+    config.text_config.mlp_layer_types = ["dense", "sparse", "sparse", "dense"]
+
+    layers = _build_model(monkeypatch, config=config).model.layers
+
+    assert [layer.comm_manager.is_moe for layer in layers] == [
+        False,
+        True,
+        True,
+        False,
+    ]
+    assert [layer.comm_manager.prev_is_moe for layer in layers] == [
+        False,
+        False,
+        True,
+        True,
+    ]
 
 
 def _mixed_precision_config() -> "ModelOptMixedConfig":
