@@ -309,6 +309,10 @@ class Envs:
     TOKENSPEED_JIT_COMPILE_CHECK = EnvStr("warn")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
+    # Experiment: gather a KVP extend's latent history behind the DSA top-k.
+    TOKENSPEED_K31_DSA_HISTORY_PREFETCH = EnvBool(False)
+    # Experiment: gather half of the split prefill top-k while the other half selects.
+    TOKENSPEED_K31_DSA_TOPK_GATHER_OVERLAP = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
     # Shared-expert parallelism.

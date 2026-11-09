@@ -520,6 +520,7 @@ def _history_backend(
         0, workspace_rows=workspace_rows, qcp=False, index_k_format=index_k_format
     )
     backend._history_prefill = True
+    backend._history_kv_prefetch = None
     return backend
 
 

@@ -113,8 +113,9 @@ class HistoryGatherWorkspace:
 
     @property
     def nbytes(self) -> int:
-        if self.kv.data_ptr() == self.index_k.data_ptr():
-            return max(self.kv.nbytes, self.index_k.nbytes)
+        storage = self.kv.untyped_storage()
+        if storage.data_ptr() == self.index_k.untyped_storage().data_ptr():
+            return storage.nbytes()
         return self.kv.nbytes + self.index_k.nbytes
 
 

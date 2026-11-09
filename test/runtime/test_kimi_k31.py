@@ -2817,7 +2817,9 @@ def _recording_dsa_core(calls: list, *, write_rows: int, gather: bool):
         record("q_b_proj", q_norm)
         return q_norm @ weight, None
 
-    def sparse_prefill(positions, q, latent, ctx, locs, output, *, prefill_topk):
+    def sparse_prefill(
+        positions, q, latent, ctx, locs, output, *, prefill_topk, query=None
+    ):
         assert prefill_topk is selection
         record("sparse_prefill", positions, q, latent, ctx.input_num_tokens, locs)
         output.copy_(q + latent[:, :8])
