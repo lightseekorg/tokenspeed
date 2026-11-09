@@ -29,13 +29,17 @@ import torch
 from tokenspeed_kernel.ops.moe import try_latent_moe_input_projections
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front
-from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
 from torch import nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=30,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the fused front and the CuTe DSL MegaMoE runner are NVIDIA-only",
+)
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -94,6 +98,9 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
         and kimi3_latent_front.available()
     ):
         pytest.skip("requires a 152-SM GB300")
+    # Imported after the skip: the CuTe DSL runner needs the NVIDIA toolchain.
+    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
+
     monkeypatch.setattr(kimi_k3, "MoELayer", UnloadedExperts)
     monkeypatch.setattr(runner, "get_runner", lambda plan, experts: experts)
     monkeypatch.setattr(kimi_k3, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
