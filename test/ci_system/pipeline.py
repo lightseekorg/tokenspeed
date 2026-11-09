@@ -2359,14 +2359,14 @@ def path_is_ignored(path: str, prefixes: List[str]) -> bool:
 
 
 def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
-    """The modules directly under the models package that belong to one model:
-    those defining ``EntryClass`` and those a task lists in ``model_sources``.
-    Every other module there, such as ``utils.py``, is shared by all models."""
-    listed = {
-        source
-        for path in find_task_files(root)
-        for source in normalize_task(path, repo_root).get("model_sources", [])
-    }
+    """Return the modules directly under the models package that belong to one model.
+
+    They define ``EntryClass`` or a task lists them in ``model_sources``. Every
+    other module there, such as ``utils.py``, is shared by all models.
+    """
+    listed = set()
+    for path in find_task_files(root):
+        listed.update(normalize_task(path, repo_root).get("model_sources", []))
     defining = {
         path.relative_to(repo_root).as_posix()
         for path in (repo_root / MODEL_DIRECTORY).glob("*.py")
@@ -2376,8 +2376,11 @@ def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
 
 
 def imported_model_modules(path: Path) -> set[str]:
-    """Repo paths of the modules directly under the models package that any
-    import statement in ``path``, a module directly under it, names."""
+    """Return the modules directly under the models package that ``path`` imports.
+
+    ``path`` is such a module too, so relative imports resolve against that
+    package. The result holds repository paths.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     package = MODEL_DIRECTORY.removeprefix("python/").replace("/", ".")
     names = set()
@@ -2401,8 +2404,10 @@ def imported_model_modules(path: Path) -> set[str]:
 
 
 def check_model_sources_closed(root: Path, repo_root: Path) -> None:
-    """Fail when a task lists a model module but not a model-specific module it
-    imports, which would let changes to that module skip the task."""
+    """Fail when a listed model module imports an unlisted model-specific module.
+
+    Such a list would let changes to the unlisted module skip the task.
+    """
     model_specific = model_specific_modules(root, repo_root)
     for path in find_task_files(root):
         sources = normalize_task(path, repo_root).get("model_sources", [])
@@ -2419,7 +2424,7 @@ def check_model_sources_closed(root: Path, repo_root: Path) -> None:
 
 
 def task_test_paths(text: str) -> List[str]:
-    """The test files and directories that a task definition names."""
+    """Return the test files and directories that a task definition names."""
     pattern = "|".join(re.escape(directory) for directory in TEST_DIRECTORIES)
     return [
         match.split("::")[0].rstrip("/")
@@ -2433,10 +2438,12 @@ def path_is_ignored_for_model(
     model_specific: frozenset[str],
     run_tests: Optional[List[str]],
 ) -> bool:
-    """Return whether a task serving ``sources`` can ignore ``path``: Markdown,
-    another model's module, or a test. ``run_tests`` are the test files and
-    directories a unit-test task names, whose tests it cannot ignore, nor any
-    test helper; it is None for a model-test task."""
+    """Return whether a task serving ``sources`` can ignore ``path``.
+
+    It can ignore Markdown, another model's module, and tests. ``run_tests`` are
+    the test files and directories a unit-test task names; it cannot ignore their
+    tests, nor any test helper. ``run_tests`` is None for a model-test task.
+    """
     if path.endswith(".md"):
         return True
     if any(path.startswith(f"{directory}/") for directory in TEST_DIRECTORIES):
@@ -2452,8 +2459,10 @@ def path_is_ignored_for_model(
 def drop_unaffected_tasks(
     include: List[Dict[str, Any]], changed: List[str], repo_root: Path, root: Path
 ) -> List[Dict[str, Any]]:
-    """Drop the entries of tasks that ``ignore_changes`` or ``model_sources``
-    lets ignore every change."""
+    """Drop the entries of tasks that can ignore every change.
+
+    ``ignore_changes`` and ``model_sources`` say which changes a task ignores.
+    """
     tasks: Dict[str, Dict[str, Any]] = {}
     model_specific: Optional[frozenset[str]] = None
     kept = []
