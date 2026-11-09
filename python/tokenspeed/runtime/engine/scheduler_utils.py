@@ -63,12 +63,6 @@ _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
     "write_back": SchedulerConfig.HostWritePolicy.WriteBack,
 }
-# make_config's decode_allocation_policy names; ServerArgs validates the flag
-# and SchedulerConfig::Validate the role it is given on.
-_DECODE_ALLOCATION_POLICIES = {
-    "early": SchedulerConfig.DecodeAllocationPolicy.Early,
-    "independent": SchedulerConfig.DecodeAllocationPolicy.Independent,
-}
 
 
 def engram_context_len(text_config) -> int:
@@ -278,10 +272,18 @@ def make_config(
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     cfg.role = scheduler_role(role)
-    if decode_allocation_policy is not None:
-        cfg.decode_allocation_policy = _DECODE_ALLOCATION_POLICIES[
-            decode_allocation_policy
-        ]
+    # Read here, not at import: a scheduler wheel released before the policy
+    # has neither the field nor its enum and admits every prompt early, so
+    # early is left unset there and independent raises AttributeError.
+    # ServerArgs validates the name, SchedulerConfig::Validate the role.
+    if decode_allocation_policy is not None and (
+        decode_allocation_policy != "early" or hasattr(cfg, "decode_allocation_policy")
+    ):
+        policies = SchedulerConfig.DecodeAllocationPolicy
+        cfg.decode_allocation_policy = {
+            "early": policies.Early,
+            "independent": policies.Independent,
+        }[decode_allocation_policy]
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
