@@ -128,6 +128,12 @@ EXR_LANE_TASKS = gl.constexpr(64)  # LANES * NB1: one part
 # An intermediate row in MXFP4 words: 64 of E2M1 values, then a word per
 # ex1 block holding its 2 scale bytes.
 H1_WORDS = gl.constexpr(72)  # INTER // 8 + NB1
+# h1's room a pick, past the H1_WORDS it holds. The scratch layout (each
+# region's offset and the row stride) affects the launch time: at 72 words a
+# pick the regions after h1 moved 512 bytes within their 4 KiB page, the row
+# stride shrank, and an 8-row launch ran slower. Keep the measured layout's
+# sizing; change it only with a layer perf A/B.
+H1_REGION_WORDS = 256
 EX2_BLOCKS = gl.constexpr(1)  # 128-column blocks of an ex2 task
 EX2_TASKS = gl.constexpr(256)  # LANES * NB2 // EX2_BLOCKS
 # An ex2 task's first slots (all of them up to 64 distinct experts) are
@@ -220,7 +226,9 @@ def regions() -> tuple[tuple[str, int], ...]:
         ("xq", int(KSPLIT) * int(XQ_QUARTER_WORDS) // 2),  # words
         ("xqf", int(KSPLIT) * int(XQ_GROUPS)),
         ("p1", k * nb1 * ks * bn),  # FP32 [pick][block][K quarter][column] a row
-        ("h1", k * int(H1_WORDS)),  # the MXFP4 intermediate [pick][word] a row
+        # The MXFP4 intermediate [pick][word] a row (H1_WORDS a pick) in a
+        # region of H1_REGION_WORDS a pick (see there).
+        ("h1", k * int(H1_REGION_WORDS)),
         (
             "rr",
             int(WORLD) * k * int(OWNED_OUT) // 2,
