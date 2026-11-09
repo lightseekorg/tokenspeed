@@ -51,10 +51,12 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     gluon_mm_a16w16_medium_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
     launch_gluon_grouped_mm_a16w16_decode_gfx950,
+    launch_gluon_mm_a16w16_column_shard_gfx950,
     launch_gluon_mm_a16w16_decode_add3_gfx950,
     launch_gluon_mm_a16w16_decode_gfx950,
     launch_gluon_mm_a16w16_medium_gfx950,
     launch_gluon_mm_a16w16_splitk_gfx950,
+    supports_gluon_mm_a16w16_column_shard_gfx950,
     supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
 )
@@ -488,11 +490,17 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     # the next bucket's config: dense gate/up is measured only for 9..32.
     assert not supports_gluon_mm_a16w16_decode_gfx950(8, 8448, 7168)
     assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
+    # Only the Muse TP8 pre-expert projection is measured past 64 rows.
+    assert supports_gluon_mm_a16w16_decode_gfx950(256, 512, 8192)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(65, 8192, 1024)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
 
 
-def test_decode_gemm_row_count_does_not_recompile() -> None:
+# Kimi K3 shared gate/up, and the Muse TP8 pre-expert projection, whose
+# 64-row bucket splits K.
+@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192)])
+def test_decode_gemm_row_count_does_not_recompile(n: int, k: int) -> None:
     torch.manual_seed(0)
-    n, k = 1536, 7168
     a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
 
@@ -838,7 +846,8 @@ _DECODE_SHAPES = [(8192, 1024), (512, 8192)]
 
 
 @pytest.mark.parametrize("n,k", _DECODE_SHAPES)
-@pytest.mark.parametrize("m", [2, 3, 7, 16])
+# 24-64 rows are speculative verify batches of 3-8 requests.
+@pytest.mark.parametrize("m", [2, 3, 7, 16, 24, 33, 40, 64])
 def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -> None:
     torch.manual_seed(0)
     assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
@@ -849,6 +858,29 @@ def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -
         torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
         # gemm.mm hands the rows to the same kernel.
         assert torch.equal(mm(a, b), out)
+
+
+def test_decode_gemm_serves_muse_pre_expert_verify_rows() -> None:
+    # Speculative verify sends 65-172 rows (9-21 requests of eight) through the
+    # Muse TP8 pre-expert projection; the 128- and 256-row buckets take them,
+    # with rows a runtime argument inside each bucket.
+    torch.manual_seed(0)
+    n, k = 512, 8192
+    a = torch.randn((256, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def run(rows):
+        assert supports_gluon_mm_a16w16_decode_gfx950(rows, n, k)
+        out = _decode(a[:rows], b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+        assert torch.equal(mm(a[:rows], b), out)
+
+    # Warm both integer classes (divisible by 16 or not) of each bucket.
+    for rows in (65, 128, 129, 256):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (72, 100, 172, 200):
+            run(rows)
 
 
 def test_medium_coalesced_store_masks_strided_out() -> None:
@@ -866,3 +898,35 @@ def test_medium_coalesced_store_masks_strided_out() -> None:
     assert actual is out
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=_RTOL)
     assert torch.all(backing[:, n:] == 7.0)
+
+
+@pytest.mark.parametrize("m", [9, 13, 16])
+def test_column_shard_equals_the_replicated_decode_gemm_columns(m: int) -> None:
+    """Each 1024-column shard of the [8192, 4096] decode GEMM is bitwise its columns."""
+    torch.manual_seed(60 + m)
+    a = torch.randn((m, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((8192, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    assert supports_gluon_mm_a16w16_column_shard_gfx950(m, 8192, 1024, 4096)
+    full = launch_gluon_mm_a16w16_decode_gfx950(
+        a, b, torch.bfloat16, counters=torch.zeros(1, dtype=torch.int32, device="cuda")
+    )
+    for shard in (0, 5):
+        out = torch.empty(m, 1024, dtype=torch.bfloat16, device="cuda")
+        launch_gluon_mm_a16w16_column_shard_gfx950(
+            a, b[shard * 1024 : (shard + 1) * 1024], out
+        )
+        assert torch.equal(out, full[:, shard * 1024 : (shard + 1) * 1024]), shard
+
+
+def test_column_shard_row_count_does_not_recompile() -> None:
+    torch.manual_seed(77)
+    a = torch.randn((16, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((1024, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    out = torch.empty(16, 1024, dtype=torch.bfloat16, device="cuda")
+    # One warm-up per integer specialization class of the row count (16 is
+    # divisible by 16, 9 is not); every other row count reuses one of them.
+    for m in (9, 16):
+        launch_gluon_mm_a16w16_column_shard_gfx950(a[:m].contiguous(), b, out[:m])
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for m in range(9, 17):
+            launch_gluon_mm_a16w16_column_shard_gfx950(a[:m].contiguous(), b, out[:m])

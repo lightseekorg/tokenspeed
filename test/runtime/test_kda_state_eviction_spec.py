@@ -542,7 +542,11 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
     inputs = _inputs()
     _, reference_states = _reference(inputs, 24)
     runtime = RuntimeStates(
-        req_pool_size=8, vocab_size=1024, output_length=width, device="cuda"
+        req_pool_size=8,
+        input_vocab_size=1024,
+        vocab_size=1024,
+        output_length=width,
+        device="cuda",
     )
     commit = _Commit()
     prompt = list(range(4))

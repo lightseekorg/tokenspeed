@@ -510,8 +510,10 @@ def test_kda_fused_verify_selects_all_layout_traits(
         "paged_state": True,
         "store_states": store_states,
         "recurrent_layout": recurrent_layout,
+        "replay_records": False,
         "num_heads": 1,
         "head_dim": 1,
+        "spec_query_len": 1,
         "split_producers": False,
     }
     assert selected == expected

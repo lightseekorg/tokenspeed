@@ -15,7 +15,7 @@ its own cache groups.
 through `select_kernel` like any other kernel family, and a helper built on the
 first:
 
-* `gqa_prologue(q, k, v, *, norm, rotary, cache, return_kv,
+* `gqa_prologue(q, k, v, *, norm, rotary, cache, query_dtype, return_kv,
   solution, override)` for multi-head and grouped-query attention;
 * `mla_prologue(query, q_pe, latent_cache, *, expanded, rotary,
   cache, solution, override)` for multi-head latent attention; `cache=None`
@@ -38,7 +38,8 @@ rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
 When a projection or collective has already applied the same head-step numerics,
 `PagedAttention.store_prepared` uses `gqa_prologue` with no norm or rotary step.
 The prologue still owns slot selection and KV conversion/writes; the returned
-query/key rows need no additional copy in the Triton solution.
+query/key rows need no additional copy in the Triton solution unless the
+backend asks for an FP8 query.
 Flows that dispatch core attention themselves call `PagedAttention.prologue`
 (GQA) or `PagedAttention.latent_prologue` (MLA). Passing `k = v = None` means
 that `prologue`/`latent_prologue` call has prepared the inputs and written
@@ -183,8 +184,9 @@ rows but may own pages of rows another rank computed, so the write gathers
 before it stores: `latent_prologue(..., key_rows=QueryShardGather(plan,
 group))` runs `mla_prologue(cache=None)` over the local rows — the composite's
 rotation with no store, returning the rotated latent — all-gathers that
-latent over the query group with the plan's per-rank row counts into the
-whole span (every rank holds the span's slots), and stores it through the
+latent over the query group with the plan's per-rank row counts, puts the
+gathered rows in span order (`plan.to_span_order`; every rank holds the
+span's slots), and stores it through the
 same `resolve_cache_slots` target with `latent_store`, the composite's store
 step on its own. Rotation and store round once each way, so the stored rows
 and the query are byte-equal to the fused one-launch write of both the
@@ -237,9 +239,15 @@ given, which the decode half relies on. The gluon backend's absorbed cached
 extend rebuilds its query in the break from those untouched inputs and skips
 the store. Its captured expanded pass is spent. The backends' own breaks nest
 inside these and pass through, and remain for callers that reach a backend
-directly. Prefill graphs capture the target model only and replay a round
-with draft narrowing eagerly, so draft layers need no break. A narrowed draft
-step writes every row itself and skips the pre-break prologue.
+directly. Prefill graphs capture the target model and replay a round with
+draft narrowing eagerly, so draft layers need no break. A narrowed draft
+step writes every row itself and skips the pre-break prologue. The drafter
+prefill graph (`--enable-drafter-prefill-graph`, see
+[unified_path.md](unified_path.md#drafter-prefill-graphs)) records a draft's
+extend step only when the draft model declares
+`supports_breakable_draft_extend`: Qwen4-Exp's MTP head runs the GQA prologue
+in the captured segment and attends at `PagedAttention.attend`, like the
+target.
 
 ## Formats and scales
 
@@ -263,6 +271,13 @@ scales. MLA caches run at unit scale.
 An MLA layer reads its query in the activation dtype, except that an FP8
 latent cache gets an FP8 query, and FP8 expanded keys and values, whichever MLA
 backend serves the layer. A per-token-head cache keeps the activation dtype.
+A GQA layer's query dtype is the reader's choice, since readers of one FP8
+cache differ: the backend's `query_dtype` names it per layer and forward
+mode, and the prologue returns the query in it (the Triton solution rounds
+once from fp32, the composite converts its result), so no separate cast runs
+before attention. The MHA backend asks for unscaled FP8 in decode over an FP8
+cache; a fresh prefill attends the activation-dtype key and value rows the
+prologue returns, so extend keeps the activation dtype.
 
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
@@ -365,3 +380,31 @@ in the same order when publishing the cache pool, before any forward or
 decode graph capture. A forward never creates a process group; an idle DP
 rank still participates in startup. Temporary tensor ownership ends after
 the final consumer, while the process-group manager retains the communicator.
+
+### V4.1 fused decode attention
+
+On supported Blackwell configurations, V4.1 decode keeps a separate prepared
+copy of the query and grouped output projection weights. The query projection
+returns the fused attention layout without applying RoPE. Selected attention
+then applies Q RoPE, the existing softmax and sink, inverse output RoPE, and
+per-32 FP8 quantization; the matching output projection consumes those codes
+and packed scales directly. The latent query norm remains before its projection.
+DSpark decode uses the same contract over its BF16 window workspace.
+
+The native epilogue requires eight query heads per output group. Unsupported
+head or projection geometry and distributed partial attention retain the regular
+path. Pure prefill uses the same prepared weights and the same fused call, one
+per workspace batch; a mixed batch keeps the regular path, since its extend and
+decode halves must agree on the output format, and so does prefill under the
+operator's query context parallelism, whose head exchange cannot merge grouped
+FP8 rows. Prefill under a model query shard also keeps the regular path: the
+backend receives the shard's query rows while the caller rotates Q from its own
+source rows, so the fused Q RoPE would use other positions. Prepared copies are
+nonpersistent buffers, refreshed in place from the canonical checkpoint after
+weight updates so captured graphs retain their addresses. Cache ownership,
+selection and write ordering are unchanged.
+
+Attention-front FP8 projection warmup visits every layer and deduplicates by
+device and weight shape. The initial window-only layers have no indexer, and
+canonical Q weights remain active when fused attention is unavailable, so
+neither the first layer nor the fused Q copy alone covers every projection.

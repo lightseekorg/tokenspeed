@@ -336,6 +336,7 @@ def _probe(samples, ladders, *, world_size=1, gpu_id=0, hungriest=None, startup=
         capture_graphs=lambda entries, observer: seen.update(entries=entries),
         drafter=None,
         captures_drafter_prefill_graph=False,
+        drafter_extend_ladders=lambda entries: {},
         forward_step=SimpleNamespace(
             capture_ladders=lambda entries: {
                 k: v for k, v in ladders.items() if "decode" in k
@@ -455,6 +456,7 @@ def test_memory_taken_between_captures_is_not_reserved() -> None:
         device="cuda",
         drafter=None,
         captures_drafter_prefill_graph=False,
+        drafter_extend_ladders=lambda entries: {},
         prefill_graph=SimpleNamespace(capture_ladders=lambda entries: {}),
         forward_step=SimpleNamespace(
             capture_ladders=lambda entries: {"decode:default": _top(2, 2)}
@@ -504,6 +506,8 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
     executor.drafter = drafter
+    # Its own prefill graph does not wait for --enable-drafter-prefill-graph.
+    executor.config = SimpleNamespace(enable_drafter_prefill_graph=False)
     executor.forward_step = SimpleNamespace(
         disable=True, capture_ladders=lambda entries: {}, stream="stream"
     )
@@ -527,6 +531,108 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
         ModelExecutor.capture_graphs(executor, entries=None, observer=observer)
     observer.measure.assert_called_once_with("prefill:drafter")
     assert seen == [observer.measure.return_value]
+
+
+def test_the_drafter_extend_graphs_are_declared_captured_and_labelled() -> None:
+    """The drafter's extend-graph plan is the one channel: the projection
+    prices its series off it, and the capture hands the drafter exactly the
+    positions the projection sampled, the shared stream and the observer."""
+    seen = []
+
+    class Drafter:
+        captures_prefill_graph = False
+
+        def extend_graph_plan(self, token_buckets, request_counts):
+            graphs = [
+                (bucket, bs)
+                for bucket in sorted(token_buckets, reverse=True)
+                for bs in request_counts(bucket)
+            ]
+            counts = sorted({bs for _, bs in graphs}, reverse=True)
+            return {
+                "prefill:drafter-step0": graphs,
+                "prefill:drafter-decode": [(bs, bs) for bs in counts],
+                "prefill:drafter-unused": [],
+            }
+
+        def capture_extend_graphs(self, capture, *, observer):
+            seen.append((capture, observer))
+
+    buckets = [16, 32, 48, 64, 80, 96, 112]
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = "cuda"
+    executor.drafter = Drafter()
+    executor.draft_attn_backend = "draft backend"
+    executor.config = SimpleNamespace(
+        enable_drafter_prefill_graph=True,
+        prefill_graph_capture_batch_sizes=[1, 2],
+        context_len=4096,
+        max_num_seqs=8,
+        data_parallel_size=1,
+    )
+    executor.forward_step = SimpleNamespace(
+        disable=True, capture_ladders=lambda entries: {}, stream="stream"
+    )
+    executor.prefill_graph = SimpleNamespace(
+        disable=True, capture_ladders=lambda entries: {}, capture_buckets=buckets
+    )
+    # No prefill graph, no drafter graphs.
+    assert _ladders(executor, 5) == {}
+
+    dummies = []
+    executor.prefill_graph = SimpleNamespace(
+        disable=False,
+        capture_buckets=buckets,
+        num_warmup=2,
+        capture_ladders=lambda entries: {"prefill": _top(len(buckets), entries)},
+        capture=lambda *a, **k: None,
+        captured_hidden_spec=lambda: (64, torch.bfloat16),
+        make_dummy_draft_batch=lambda tokens, bs, backend: dummies.append(
+            (tokens, bs, backend)
+        ),
+    )
+    first_step = [(bucket, bs) for bucket in reversed(buckets) for bs in (1, 2)]
+    ladders = _ladders(executor, 5)
+    # The empty series is not declared. Each bucket's request counts are
+    # entries at its width, sampled together: the probe takes the widths at
+    # positions 0, 1, 2 and 4 of seven (112, 96, 80, 48).
+    assert ladders == {
+        "prefill": _top(len(buckets), 5),
+        "prefill:drafter-step0": CapturedLadder(
+            [bucket for bucket, _ in first_step], [0, 1, 2, 3, 4, 5, 8, 9]
+        ),
+        "prefill:drafter-decode": CapturedLadder([2, 1], [0, 1]),
+    }
+
+    observer = mock.Mock()
+    with mock.patch.object(model_executor, "workspace_pool", lambda _d: mock.Mock()):
+        ModelExecutor.capture_graphs(executor, entries=None, observer=observer)
+    [(capture, handed)] = seen
+    assert handed is observer
+    assert capture.plan == {
+        "prefill:drafter-step0": first_step,
+        "prefill:drafter-decode": [(2, 2), (1, 1)],
+    }
+    assert capture.ladders == executor.drafter_extend_ladders(None)
+    assert list(capture.ladders["prefill:drafter-step0"].sampled) == list(
+        range(len(first_step))
+    )
+    assert (capture.stream, capture.num_warmup) == ("stream", 2)
+    assert (capture.target_hidden_width, capture.target_hidden_dtype) == (
+        64,
+        torch.bfloat16,
+    )
+    # The dummy batch carries the draft metadata too.
+    capture.prepare_batch(48, 2)
+    assert dummies == [(48, 2, "draft backend")]
+
+    # Without the switch nothing is declared or captured.
+    seen.clear()
+    executor.config.enable_drafter_prefill_graph = False
+    assert set(_ladders(executor, 5)) == {"prefill"}
+    with mock.patch.object(model_executor, "workspace_pool", lambda _d: mock.Mock()):
+        ModelExecutor.capture_graphs(executor, entries=None, observer=observer)
+    assert seen == []
 
 
 def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:

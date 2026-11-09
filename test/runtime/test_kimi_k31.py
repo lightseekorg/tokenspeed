@@ -225,10 +225,6 @@ def test_kvp_launch_passes_the_full_attention_dcp_check(tmp_path) -> None:
     )
 
 
-# Named prefill buckets: the aggregated role's opt-in to the DSA padded prefill graph.
-_NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
-
-
 @pytest.mark.parametrize(
     "launch, is_draft, admitted",
     [
@@ -256,55 +252,42 @@ _NAMED_BUCKETS = {"prefill_graph_capture_sizes": [256, 1024, 4096]}
             False,
             False,
         ),
-        ({"disaggregation_mode": "decode", **_NAMED_BUCKETS}, False, False),
-        # Opt-in only: naming no buckets stays eager, and a cap alone names none.
-        ({"disaggregation_mode": "null"}, False, False),
         (
-            {"disaggregation_mode": "null", "prefill_graph_max_tokens": 4096},
+            {
+                "disaggregation_mode": "decode",
+                "prefill_graph_capture_sizes": [256, 1024, 4096],
+            },
             False,
             False,
         ),
-        # Named buckets admit it; no transfer step counter, so the interval cannot veto.
-        ({"disaggregation_mode": "null", **_NAMED_BUCKETS}, False, True),
+        # Admitted by default, with or without named buckets or a cap.
+        ({"disaggregation_mode": "null"}, False, True),
+        (
+            {"disaggregation_mode": "null", "prefill_graph_max_tokens": 4096},
+            False,
+            True,
+        ),
         (
             {
                 "disaggregation_mode": "null",
-                "disaggregation_layerwise_interval": 1,
-                **_NAMED_BUCKETS,
+                "prefill_graph_capture_sizes": [256, 1024, 4096],
             },
             False,
             True,
         ),
+        # No transfer step counter, so the interval cannot veto.
+        (
+            {"disaggregation_mode": "null", "disaggregation_layerwise_interval": 1},
+            False,
+            True,
+        ),
         # A MIXED round would replay with decode rows in the narrowed break.
-        (
-            {
-                "disaggregation_mode": "null",
-                "enable_mixed_batch": True,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        ({"disaggregation_mode": "null", **_NAMED_BUCKETS}, True, False),
-        (
-            {
-                "disaggregation_mode": "null",
-                "disable_prefill_graph": True,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        (
-            {
-                "disaggregation_mode": "null",
-                "pipeline_parallel_size": 2,
-                **_NAMED_BUCKETS,
-            },
-            False,
-            False,
-        ),
-        ({"disaggregation_mode": "encode", **_NAMED_BUCKETS}, False, False),
+        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, False),
+        ({"disaggregation_mode": "null"}, True, False),
+        # --disable-prefill-graph turns it off.
+        ({"disaggregation_mode": "null", "disable_prefill_graph": True}, False, False),
+        ({"disaggregation_mode": "null", "pipeline_parallel_size": 2}, False, False),
+        ({"disaggregation_mode": "encode"}, False, False),
     ],
 )
 def test_dsa_padded_prefill_replay_is_admitted_on_the_prefill_and_aggregated_roles(
@@ -330,17 +313,14 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
 
     model_config = _load_k31_model_config(tmp_path)
     server_args = ServerArgs(model=str(tmp_path))
-    # The launch defaults keep the aggregated role eager.
+    # The launch defaults admit the aggregated role.
     assert server_args.disaggregation_mode == "null"
     assert server_args.disaggregation_layerwise_interval == 1
     assert server_args.prefill_graph_capture_sizes is None
     assert server_args.enable_mixed_batch is False
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
-    assert spec["padded_prefill_replay"] is False
-    # Named buckets opt in; the disable flag or a mixed batch opts back out.
-    server_args.prefill_graph_capture_sizes = [256, 4096]
-    spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
+    # The disable flag or a mixed batch turns it off.
     server_args.disable_prefill_graph = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
@@ -349,8 +329,7 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
     server_args.enable_mixed_batch = False
-    server_args.prefill_graph_capture_sizes = None
-    # The prefill role keeps its layerwise condition and needs no named buckets.
+    # The prefill role keeps its layerwise condition.
     server_args.disaggregation_mode = "prefill"
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
@@ -601,6 +580,57 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format) -> None
     assert not deferred.get_index_k_buffer(7).any()
 
 
+@requires_gpu
+def test_the_index_k_write_can_quantize_the_index_query_in_its_launch() -> None:
+    """The fused write matches the separate write and query quantization.
+
+    It leaves the plane as the separate deferred-norm write does, foreign slots
+    included, and returns the separate quantization of the same rows' index
+    queries.
+    """
+    from tokenspeed_kernel.ops.attention.dsa import triton as dsa_triton
+
+    from tokenspeed.runtime.layers import layernorm
+
+    torch.manual_seed(0)
+    norm = layernorm.LayerNorm(128, eps=1e-6).cuda()
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)
+        norm.bias.normal_(0.0, 0.1)
+    slots = _slots([5, 2], 200, "cuda")
+    # Row-strided views of one key and head-weight projection, as the indexer returns.
+    keys, weights = (
+        (torch.randn(200, 160, device="cuda") * 3 + 1)
+        .to(torch.bfloat16)
+        .split((128, 32), dim=1)
+    )
+    magnitudes = torch.logspace(-3, 3, 32, device="cuda").unsqueeze(-1)
+    query = (torch.randn(200, 32, 128, device="cuda") * magnitudes).to(torch.bfloat16)
+    owned = torch.rand(200, device="cuda") < 0.75
+    fused, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    separate, _ = _k31_pool("cuda", num_lcm_blocks=1)
+
+    q_fp8, folded = fused.set_index_k_buffer_and_quantize_query(
+        3,
+        slots,
+        keys,
+        write_mask=owned,
+        key_norm=norm,
+        query=query,
+        query_weights=weights,
+        softmax_scale=128**-0.5 * 32**-0.5,
+    )
+    separate.set_index_k_buffer(3, slots, keys, write_mask=owned, key_norm=norm)
+    expected_q, expected_w = dsa_triton.quantize_index_query_weights(
+        query, weights, 128**-0.5 * 32**-0.5
+    )
+
+    assert torch.equal(fused.get_index_k_buffer(3), separate.get_index_k_buffer(3))
+    assert torch.equal(q_fp8.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(folded, expected_w)
+    assert not fused.get_index_k_buffer(7).any()
+
+
 def _indexer_attention(*, index_topk: int):
     """A real K3.1 sparse MLA layer (id 3) at small width on one rank."""
     from tokenspeed.runtime.distributed import Mapping
@@ -833,6 +863,42 @@ def test_prefill_topk_rows_gather_through_the_k3_iris_state(
     assert len(calls) == 2 and len(gathers) == 4 and rows.dtype == torch.int32
 
 
+@pytest.mark.parametrize("fused", [True, False], ids=["fused", "separate"])
+def test_a_k31_decode_step_reads_its_query_and_index_projections(fused) -> None:
+    """The decode weights in reading order.
+
+    They come from the stacked query and index-key weights when those were fused
+    after load, else from each projection.
+    """
+    from tokenspeed.runtime.models import kimi_k31
+
+    attention = object.__new__(kimi_k31.KimiK31SparseMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.fused_qkv_a_proj_with_mqa = SimpleNamespace(weight="qkv_a")
+    attention.q_b_proj = SimpleNamespace(weight="q_b")
+    attention.o_proj = SimpleNamespace(weight="o_proj")
+    attention.w_kc, attention.w_vc = "w_kc", "w_vc"
+    attention.q_b_wq_b_weight = "q_b_wq_b" if fused else None
+    attention.indexer = SimpleNamespace(
+        wq_b=SimpleNamespace(weight="wq_b"),
+        wk=SimpleNamespace(weight="wk"),
+        weights_proj=SimpleNamespace(weight="weights_proj"),
+        wk_weights_proj_weight="wk_weights_proj" if fused else None,
+    )
+    middle = (
+        ("q_b_wq_b", "wk_weights_proj")
+        if fused
+        else ("q_b", "wq_b", "wk", "weights_proj")
+    )
+    assert attention.decode_weights() == (
+        "qkv_a",
+        *middle,
+        "w_kc",
+        "w_vc",
+        "o_proj",
+    )
+
+
 def test_k31_layers_take_the_attention_iris_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1057,6 +1123,57 @@ def test_the_fused_key_and_head_weight_projection_matches_the_two_gemms(
     # Bitwise numerics project every row in one GEMM up front.
     eager = bitwise(hidden, q_lora, positions)
     assert eager.query_proj is None and eager.query.shape == (37, 32, 128)
+
+
+@requires_gpu
+def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
+    """One GEMM over ``q_norm`` for ``q_b_proj`` and the indexer's ``wq_b``
+    gives the two projections, keeps tracking in-place loads into either
+    parameter, and is skipped under bitwise numerics."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.manual_seed(0)
+    attention = _indexer_attention(index_topk=2048)
+    with torch.no_grad():
+        for linear in (attention.q_b_proj, attention.indexer.wq_b):
+            linear.weight.normal_(0.0, 0.05)
+    q_norm = torch.randn(37, 128, device="cuda", dtype=torch.bfloat16)
+    want_q = attention.q_b_proj(q_norm)[0].float()
+    want_index = attention.indexer._project_query(q_norm).float()
+
+    attention.fuse_query_projections()
+    fused = attention.q_b_wq_b_weight
+    rows = attention.q_b_proj.weight.shape[0]
+    assert fused.shape == (rows + 32 * 128, 128)
+    got_q, got_index = mm(q_norm, fused).split((rows, 32 * 128), dim=-1)
+    torch.testing.assert_close(got_q.float(), want_q, rtol=2**-7, atol=1e-5)
+    torch.testing.assert_close(
+        got_index.float().view(37, 32, 128), want_index, rtol=2**-7, atol=1e-5
+    )
+
+    with torch.no_grad():
+        attention.q_b_proj.weight.normal_(0.0, 0.05)
+        attention.indexer.wq_b.weight.normal_(0.0, 0.05)
+    got_q, got_index = mm(q_norm, fused).split((rows, 32 * 128), dim=-1)
+    torch.testing.assert_close(
+        got_q.float(),
+        q_norm.float() @ attention.q_b_proj.weight.float().T,
+        atol=2e-3,
+        rtol=1.6e-2,
+    )
+    torch.testing.assert_close(
+        got_index.float(),
+        q_norm.float() @ attention.indexer.wq_b.weight.float().T,
+        atol=2e-3,
+        rtol=1.6e-2,
+    )
+
+    bitwise = _indexer_attention(index_topk=2048)
+    monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
+    bitwise.fuse_query_projections()
+    assert bitwise.q_b_wq_b_weight is None
 
 
 def _separable_keys(num_tokens: int, bad: torch.Tensor, device):
@@ -1349,6 +1466,98 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
     good[bad] = False
     assert int(selected.topk_lens[0]) == 2048
     assert sorted(selected.topk_indices[0].tolist()) == sorted(slots[good].tolist())
+    if attention.decode_topk_solution is not None:
+        # The pinned fused top-k emits the selection in ascending position.
+        assert torch.equal(selected.topk_indices[0], slots[good].to(torch.int32))
+
+
+@requires_gpu
+def test_the_fused_decode_topk_is_pinned_only_where_every_round_fits(
+    monkeypatch,
+) -> None:
+    """More requests per round than the fused top-k takes keep normal selection."""
+    from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    cap = dsa_cute_dsl.FUSED_DECODE_TOPK_MAX_REQUESTS
+    monkeypatch.setitem(global_server_args_dict, "max_num_seqs", cap)
+    if _indexer_attention(index_topk=2048).decode_topk_solution is None:
+        pytest.skip("needs the fused decode top-k (SM100-SM103)")
+    monkeypatch.setitem(global_server_args_dict, "max_num_seqs", cap + 1)
+    attention = _indexer_attention(index_topk=2048)
+    assert attention.decode_topk_solution is None
+    assert not attention.index_k_write_quantizes_query
+
+
+@requires_gpu
+@pytest.mark.parametrize("q_len_per_req", [1, 8])
+def test_decode_topk_scores_the_query_the_index_k_write_quantized(
+    q_len_per_req,
+) -> None:
+    """The index-K write's E4M3 query selects what the BF16 query selects.
+
+    Handed the E4M3 query and folded weights of the fused index-K write, the
+    decode top-k selects exactly what it selects from the BF16 query.
+    """
+    import dataclasses
+
+    from tokenspeed_kernel.ops.attention import dsa
+    from tokenspeed_kernel.ops.attention.dsa import triton as dsa_triton
+
+    from tokenspeed.runtime.models import glm5
+
+    torch.manual_seed(2)
+    attention = _indexer_attention(index_topk=2048)
+    if not attention.index_k_write_quantizes_query:
+        pytest.skip("needs the fused decode top-k (SM100-SM103)")
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
+    block_ids = list(range(23, 5, -1))
+    seq_len = 2200
+    keys = torch.randn(seq_len, 128, device="cuda", dtype=torch.bfloat16)
+    pool.set_index_k_buffer(
+        3, _slots(block_ids, seq_len, "cuda"), keys, write_mask=None
+    )
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+    seq_lens_2d = seq_lens.repeat_interleave(q_len_per_req).unsqueeze(1).contiguous()
+    metadata = SimpleNamespace(
+        _dsa_seq_lens_2d=seq_lens_2d,
+        _dsa_plan=dsa.dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64),
+    )
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(
+            forward_decode_metadata=metadata, cache_placement=lambda layer: None
+        ),
+        token_to_kv_pool=pool,
+        num_extends=0,
+    )
+    query = torch.randn(q_len_per_req, 32, 128, device="cuda").to(torch.bfloat16)
+    weights = torch.randn(q_len_per_req, 32, device="cuda").to(torch.bfloat16)
+    plain = glm5.GlmDsaIndexerOutput(query=query, key=torch.empty(0), weights=weights)
+    quantized = dataclasses.replace(
+        plain,
+        quantized_query=dsa_triton.quantize_index_query_weights(
+            query, weights, attention.indexer.weights_softmax_scale
+        ),
+    )
+
+    def select(indexer_output):
+        selected = attention._compute_decode_topk_indices_portable(
+            indexer_output=indexer_output,
+            ctx=ctx,
+            seq_lens=seq_lens,
+            page_table=_kernel_page_table(block_ids, "cuda"),
+            q_len_per_req=q_len_per_req,
+            decode_start=0,
+            num_tokens=q_len_per_req,
+            num_decode_tokens=q_len_per_req,
+            topk=2048,
+        )
+        return selected.topk_indices.clone(), selected.topk_lens.clone()
+
+    expected_slots, expected_lens = select(plain)
+    slots, lens = select(quantized)
+    assert torch.equal(lens, expected_lens) and torch.equal(slots, expected_slots)
 
 
 @requires_gpu
@@ -2113,6 +2322,7 @@ def _prefill_then_decode_twice(
 
 
 @requires_gpu
+@pytest.mark.parametrize("fused_query", [False, True])
 @pytest.mark.parametrize(
     "kv_cache_dtype, spec_width, fraction",
     [
@@ -2124,7 +2334,7 @@ def _prefill_then_decode_twice(
     ],
 )
 def test_k31_attention_matches_dense_mla_and_replays_in_a_decode_graph(
-    monkeypatch, kv_cache_dtype, spec_width, fraction
+    monkeypatch, kv_cache_dtype, spec_width, fraction, fused_query
 ) -> None:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -2140,6 +2350,9 @@ def test_k31_attention_matches_dense_mla_and_replays_in_a_decode_graph(
         kvp_size=1,
         kvp_rank=0,
     )
+    if fused_query:
+        attention.fuse_query_projections()
+        assert attention.q_b_wq_b_weight is not None
     prompt = 40
     hidden = torch.randn(
         prompt + 2 * spec_width, 256, device="cuda", dtype=torch.bfloat16
@@ -2224,6 +2437,91 @@ def test_the_decode_chain_entry_attends_like_forward(
         )
         actual, _ = attention.o_proj(local, ctx=ctx)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@requires_gpu
+@pytest.mark.parametrize("spec_width", [1, 4])
+@pytest.mark.parametrize("prompt", [40, 2300], ids=["all_keys", "selected"])
+def test_a_decode_round_quantizes_its_query_in_the_index_k_write(
+    monkeypatch, prompt, spec_width
+) -> None:
+    """A decode round's fused index-K write matches the separate launches bit for bit.
+
+    The fused index-K write of a decode round leaves the plane, the selection
+    and the attention output bit-identical to the separate write and query
+    quantization.
+    """
+    from tokenspeed.runtime.execution import context, forward_batch_info, output_layout
+    from tokenspeed.runtime.utils import env
+
+    monkeypatch.setitem(env.global_server_args_dict, "chunked_prefill_size", 8192)
+    torch.manual_seed(5)
+    total = prompt + spec_width
+    num_blocks = -(-total // 128)
+    attention, comm, router, pool = _k31_attention_stack(
+        kv_cache_dtype=torch.float8_e4m3fn,
+        spec_width=spec_width,
+        heads=12,
+        index_topk=2048,
+        kvp_size=1,
+        kvp_rank=0,
+        full_blocks=num_blocks,
+        context_len=max(4096, 2 * total),
+    )
+    if not attention.index_k_write_quantizes_query:
+        pytest.skip("needs the fused decode top-k (SM100-SM103)")
+    hidden = torch.randn(total, 256, device="cuda", dtype=torch.bfloat16)
+    order = torch.randperm(num_blocks, generator=torch.Generator().manual_seed(3))
+    blocks = (order + 1).tolist()
+    _extend_forward(
+        attention, comm, router, pool, hidden, prefix=0, end=prompt, blocks=blocks
+    )
+    plane = pool.get_index_k_buffer(3)
+    history = plane.clone()
+    ctx = context.ForwardContext(
+        attn_backend=router,
+        token_to_kv_pool=pool,
+        bs=1,
+        num_extends=0,
+        input_num_tokens=spec_width,
+        forward_mode=forward_batch_info.ForwardMode.DECODE,
+        output_layout=output_layout.ForwardOutputLayout(0, 0, 1, spec_width),
+    )
+
+    def decode(fused: bool):
+        plane.copy_(history)
+        attention.index_k_write_quantizes_query = fused
+        router.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([0], dtype=torch.int32, device="cuda"),
+            torch.tensor([total], dtype=torch.int32, device="cuda"),
+            forward_mode=forward_batch_info.ForwardMode.DECODE,
+            block_tables=_block_table(blocks),
+        )
+        with torch.no_grad():
+            out = attention(
+                torch.arange(prompt, total, device="cuda"),
+                hidden[prompt:],
+                ctx,
+                comm,
+                projection_out=None,
+            ).clone()
+        selection = router.sparse_topk.decode
+        return (
+            out,
+            selection.topk_indices.clone(),
+            selection.topk_lens.clone(),
+            plane.clone(),
+        )
+
+    separate = decode(False)
+    fused = decode(True)
+    assert not torch.equal(separate[3], history)
+    for name, expected, got in zip(
+        ("output", "slots", "lens", "plane"), separate, fused
+    ):
+        assert torch.equal(got, expected), name
 
 
 def _extend_over_a_cached_prefix(stack, twin, hidden, *, prefix, blocks):

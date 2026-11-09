@@ -80,6 +80,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     IndexKeyInput,
     IndexQueryInput,
     index_query_rope_weights,
+    prepare_fused_decode_weights,
     rope_inplace,
     rope_pad_query,
     rope_quantize_fp8_grouped,
@@ -96,6 +97,8 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_fp8_projection,
     prepare_grouped_fp8_projection,
+    prepare_mxfp8_weight_scales,
+    warmup_fp8_projection,
     warmup_fp8_projections,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
@@ -107,6 +110,7 @@ from tokenspeed_kernel.ops.quantization import (
 from tokenspeed_kernel.ops.residual import (
     mhc_apply_pre_quantize_fp8,
     try_mhc_shifted_post_pre_norm,
+    try_mhc_shifted_post_pre_norm_quantize_fp8,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
@@ -150,6 +154,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
@@ -343,6 +348,43 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         # Plans the batch-invariant GEMM under a bitwise envelope.
         layer.quant_method.process_weights_after_loading(layer)
 
+    @torch.no_grad()
+    def prepare_weight_scales(self, layer: nn.Module) -> None:
+        """Prepare both GEMMs' weight scales; the activation's layout picks one.
+
+        DeepGEMM's E4M3 projection reads the MN-major packed activation scales
+        the group-32 quantizers write directly, where the prepacked FlashInfer
+        GEMM needs them in its own F8_128x4 layout. Neither can repack the
+        other's, and a quantized activation is shared by several projections,
+        so the producer chooses the layout and every consumer must already hold
+        the matching weight scales. Both are kept for that reason; the second
+        buffer costs ``N * K / 32`` bytes. Refreshes in place like the base
+        method, so captured graphs keep reading one address.
+        """
+        super().prepare_weight_scales(layer)
+        if (
+            not self.block_quant
+            or list(self.quant_config.weight_block_size) != [1, 32]
+            or layer.weight.dtype != torch.float8_e4m3fn
+            or layer.weight_scale_inv.dtype != torch.uint8
+        ):
+            return
+        prepared = prepare_fp8_projection(layer.weight, layer.weight_scale_inv)
+        cached = self.projection_weight_scales
+        if cached is None:
+            self.projection_weight_scales = prepared
+            return
+        if prepared is None or prepared.shape != cached.shape:
+            raise ValueError("DeepGEMM projection weight scales changed layout")
+        cached.copy_(prepared)
+
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        # Only row-parallel layers preallocate their output, and none of them
+        # takes the packed scales, which DeepGEMM's projection writes itself.
+        if block_scale is not None and block_scale.dtype == torch.int32:
+            raise ValueError("Packed activation scales have no output destination")
+        return super().apply_into(layer, x, bias, block_scale, output_dtype, out)
+
     def apply(
         self,
         layer: nn.Module,
@@ -353,15 +395,36 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     ) -> torch.Tensor:
         if block_scale is not None:
             # x holds E4M3 codes with group-32 UE8M0 scales, shared by every
-            # projection of one quantized activation: canonical [M, K/32], or
-            # 1-D F8_128x4 bytes that only the prepacked GEMM reads.
+            # projection of one quantized activation. The scales name their own
+            # reader: canonical uint8 [M, K/32] any path takes, 1-D F8_128x4
+            # bytes only the prepacked GEMM reads, and packed int32 words only
+            # DeepGEMM's projection reads.
             if block_scale.ndim == 1 and self.prepared_weight_scales is None:
                 raise ValueError(
                     "F8_128x4 activation scales require prepared weight scales"
                 )
+            if (
+                block_scale.dtype == torch.int32
+                and self.projection_weight_scales is None
+            ):
+                raise ValueError(
+                    "Packed activation scales require DeepGEMM projection scales"
+                )
             if x.shape[0] == 0:
                 return x.new_empty(
                     (*x.shape[:-1], layer.weight.shape[0]), dtype=output_dtype
+                )
+            if block_scale.dtype == torch.int32:
+                if output_dtype not in (None, torch.bfloat16):
+                    raise ValueError("DeepGEMM projection returns BF16")
+                if bias is not None:
+                    raise ValueError("DeepGEMM projection takes no bias")
+                return fp8_projection(
+                    x,
+                    block_scale,
+                    layer.weight,
+                    self.projection_weight_scales,
+                    None,
                 )
             if self.prepared_weight_scales is not None:
                 return mm(
@@ -423,13 +486,22 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         return self.apply(layer, activation(x), bias)
 
 
-def _reads_swizzled_scales(layer: nn.Module) -> bool:
-    """Whether the layer's GEMM reads F8_128x4 activation scales as given."""
+def _scale_layouts(layer: nn.Module) -> frozenset[str]:
+    """The group-32 activation scale layouts this layer's GEMMs read as given.
+
+    Canonical is always among them: every path takes it, and it is the only one
+    a caller can select rows of. A prepared layer adds the layout of whichever
+    GEMM holds its weight scales.
+    """
     method = layer.quant_method
-    return (
-        isinstance(method, _ReferenceFp8LinearMethod)
-        and method.prepared_weight_scales is not None
-    )
+    if not isinstance(method, _ReferenceFp8LinearMethod):
+        return frozenset({"canonical"})
+    layouts = {"canonical"}
+    if method.prepared_weight_scales is not None:
+        layouts.add("swizzled")
+    if method.projection_weight_scales is not None:
+        layouts.add("packed")
+    return frozenset(layouts)
 
 
 def _replicated(input_size, output_size, dtype, quant_config, prefix):
@@ -780,8 +852,12 @@ class DeepseekV41Compressor(nn.Module):
                 else F.linear(x.float(), self.wkv_wgate.weight.float())
             )
         if key_rows is not None:
-            projected = token_all_gather_rows(
-                projected.contiguous(), key_rows.group, list(key_rows.plan.row_counts)
+            projected = key_rows.plan.to_span_order(
+                token_all_gather_rows(
+                    projected.contiguous(),
+                    key_rows.group,
+                    list(key_rows.plan.row_counts),
+                )
             )
         if self.ratio == 2:
             content, scores = projected.chunk(2, dim=-1)
@@ -1035,6 +1111,12 @@ class DeepseekV41Attention(nn.Module):
         # own method.
         self.wo_b_fp8: bool | None = None
         self.register_buffer("wo_b_scales", None, persistent=False)
+        self.register_buffer("fused_q_weight", None, persistent=False)
+        self.register_buffer("fused_q_scales", None, persistent=False)
+        # DeepGEMM's scales for fused_q_weight; None when no kernel serves it.
+        self.register_buffer("fused_q_projection_scales", None, persistent=False)
+        self.register_buffer("fused_wo_a_weight", None, persistent=False)
+        self.register_buffer("fused_wo_a_scales", None, persistent=False)
         self.wo_b = RowParallelLinear(
             input_size=config.o_groups * config.o_lora_rank,
             output_size=config.hidden_size,
@@ -1123,6 +1205,70 @@ class DeepseekV41Attention(nn.Module):
             max_tokens,
         )
 
+    @torch.no_grad()
+    def prepare_fused_decode(self) -> None:
+        """Prepare, or refresh in place, the fused attention weight copies.
+
+        Decode and pure prefill both read these; the canonical weights stay for
+        every other mode and for the indexer.
+
+        Refresh existing buffers in place after weight updates: captured graphs
+        retain them. Q's latent norm and the indexer's projections stay canonical.
+        """
+        if (
+            self.wo_a_fp8 is not True
+            or not isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
+            or not self.wq_b.weight.is_cuda
+            or self.wq_b.weight.dtype != torch.float8_e4m3fn
+            or self.wq_b.weight.shape[1] % 128
+            or self.mapping.attn.head_tp_size != 1
+            or self.mapping.attn.kvp_size != 1
+            or self.n_local_heads not in (64, 128)
+            or self.n_local_heads != 8 * self.n_local_groups
+            or (self.head_dim, self.rotary_emb.dim) != (512, 64)
+        ):
+            return
+        prepared = prepare_fused_decode_weights(
+            self.wq_b.weight,
+            self.wq_b.weight_scale_inv,
+            self.wo_a.weight,
+            self.wo_a_scales,
+            self.n_local_heads,
+            self.n_local_groups,
+        )
+        if prepared is None:
+            return
+        query, canonical_scales, output, output_scales = prepared
+        query_scales = prepare_mxfp8_weight_scales(query, canonical_scales)
+        if query_scales is None:
+            return
+        projection_scales = prepare_fp8_projection(query, canonical_scales)
+        if self.fused_q_projection_scales is None:
+            self.fused_q_projection_scales = projection_scales
+        elif (
+            projection_scales is None
+            or projection_scales.shape != self.fused_q_projection_scales.shape
+        ):
+            raise ValueError("V4.1 fused Q projection scales changed layout")
+        else:
+            self.fused_q_projection_scales.copy_(projection_scales)
+        if self.fused_q_weight is None:
+            self.fused_q_weight, self.fused_q_scales = query, query_scales
+            self.fused_wo_a_weight, self.fused_wo_a_scales = output, output_scales
+        else:
+            for destination, source in (
+                (self.fused_q_weight, query),
+                (self.fused_q_scales, query_scales),
+                (self.fused_wo_a_weight, output),
+                (self.fused_wo_a_scales, output_scales),
+            ):
+                if (
+                    destination.shape != source.shape
+                    or destination.dtype != source.dtype
+                ):
+                    raise ValueError("V4.1 fused decode weights changed layout")
+                destination.copy_(source)
+
     def _kernel_attn_sink(self):
         if not self.attn_sink.is_cuda or self.n_kernel_heads == self.n_local_heads:
             return self.attn_sink
@@ -1182,6 +1328,32 @@ class DeepseekV41Attention(nn.Module):
             main_rope_cache=main_rope_cache,
         )
 
+    def _q_scale_layout(self, rows: V41RowPlan, fused_decode: bool) -> str:
+        """The group-32 scale layout every consumer of Q's latent rows reads.
+
+        The indexer's Q up-projection shares these scales when it has one, so
+        the layout has to serve both. DeepGEMM's packed words come first: they
+        are what its projection reads, and the kernel writing them needs no
+        separate repack. Narrowing selects rows of the scales, which only the
+        canonical layout supports.
+        """
+        if rows.keep_rows is not None:
+            return "canonical"
+        if fused_decode:
+            # The fused path reads fused_q_weight in place of wq_b.
+            layouts = {"canonical", "swizzled"}
+            if self.fused_q_projection_scales is not None:
+                layouts.add("packed")
+            layouts = frozenset(layouts)
+        else:
+            layouts = _scale_layouts(self.wq_b)
+        if self.indexer is not None:
+            layouts &= _scale_layouts(self.indexer.wq_b)
+        # Packed words cover whole 128-element spans of K.
+        if "packed" in layouts and self.q_norm.weight.numel() % 128 == 0:
+            return "packed"
+        return "swizzled" if "swizzled" in layouts else "canonical"
+
     @break_point
     def forward(
         self,
@@ -1211,6 +1383,20 @@ class DeepseekV41Attention(nn.Module):
             QueryShardGather(rows.query_shard, self.mapping.attn.qcp_group)
             if rows.query_shard is not None
             else None
+        )
+        # The prepared weights serve decode and pure prefill alike. A mixed
+        # batch keeps the step-by-step path, as its extend and decode halves
+        # must agree on the output format. So does a query shard: the fused
+        # kernel rotates Q from the positions the backend holds, and under
+        # model QCP those are the shard's query rows rather than the source
+        # rows this layer rotates itself.
+        fused_decode = (
+            self.fused_q_weight is not None
+            and query_gather is None
+            and (
+                (mode.is_decode() and backend.supports_fused_attention)
+                or (mode.is_extend() and backend.supports_fused_prefill)
+            )
         )
         if source_gather is not None and (
             source_gather.plan.size != len(source_gather.group)
@@ -1245,8 +1431,8 @@ class DeepseekV41Attention(nn.Module):
         # Backend positions carry -1 for padding; request indices are batch rows.
         positions, requests = source_positions, source_requests
         if rows.source_shard is not None:
-            positions = positions[rows.source_shard.local_slice]
-            requests = requests[rows.source_shard.local_slice]
+            positions = positions[rows.source_shard.local_row_ids]
+            requests = requests[rows.source_shard.local_row_ids]
         if (
             rows.keep_rows is not None
             and rows.keep_rows.numel() == 0
@@ -1283,21 +1469,13 @@ class DeepseekV41Attention(nn.Module):
             )
             and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
-            # Write the scales in the layout wq_b's GEMM reads as given, when
-            # every projection sharing them does and no narrowing selects
-            # their rows (only the canonical layout selects by row).
-            index_shares_scales = self.indexer is not None and isinstance(
-                self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod
-            )
+            # Write the scales in a layout every projection sharing them reads
+            # as given. Narrowing forces canonical: only it selects by row.
             qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
                 qr,
                 self.q_norm.weight,
                 self.q_norm.variance_epsilon,
-                swizzled_scales=rows.keep_rows is None
-                and _reads_swizzled_scales(self.wq_b)
-                and (
-                    not index_shares_scales or _reads_swizzled_scales(self.indexer.wq_b)
-                ),
+                scale_layout=self._q_scale_layout(rows, fused_decode),
                 override=None,
                 solution="triton",
             )
@@ -1310,8 +1488,8 @@ class DeepseekV41Attention(nn.Module):
             and self.indexer is not None
             and isinstance(self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
-            # Both reference methods consume canonical group-32 UE8M0 scales
-            # and reuse their prepared weight scales where the native GEMM runs.
+            # Both reference methods read the layout _q_scale_layout agreed on
+            # with this projection, so they share one quantization of Q.
             index_q_input, index_q_scale = q_input, q_scale
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
@@ -1365,7 +1543,7 @@ class DeepseekV41Attention(nn.Module):
                     else:
                         index_q_input, index_q_scale = qr, None
                     query_slice = (
-                        rows.query_shard.local_slice
+                        rows.query_shard.local_row_ids
                         if rows.query_shard is not None
                         else slice(None)
                     )
@@ -1402,8 +1580,13 @@ class DeepseekV41Attention(nn.Module):
                             positions,
                         )
                         if partition is not None:
-                            if index_scale is not None and index_scale.ndim == 1:
-                                # F8_128x4 scales do not slice by row; the
+                            if index_scale is not None and (
+                                index_scale.ndim == 1
+                                or index_scale.dtype == torch.int32
+                            ):
+                                # F8_128x4 scales and DeepGEMM's packed words do
+                                # not slice by row: a sliced copy loses the
+                                # row stride padded to four that TMA needs. The
                                 # projection quantizes the local BF16 rows into
                                 # the same codes and scales.
                                 index_input, index_scale = qr, None
@@ -1444,22 +1627,47 @@ class DeepseekV41Attention(nn.Module):
                         )
                         index_q = index_weights = None
             if q_input.shape[0]:
-                q, _ = self.wq_b(
-                    q_input,
-                    block_scale=q_scale,
-                    output_dtype=qr.dtype if q_scale is not None else None,
-                )
+                if (
+                    fused_decode
+                    and q_scale is not None
+                    and q_scale.dtype == torch.int32
+                ):
+                    q = fp8_projection(
+                        q_input,
+                        q_scale,
+                        self.fused_q_weight,
+                        self.fused_q_projection_scales,
+                        None,
+                    )
+                elif fused_decode:
+                    q = mm(
+                        q_input,
+                        self.fused_q_weight,
+                        A_scales=q_scale,
+                        B_scales=self.fused_q_scales,
+                        out_dtype=qr.dtype,
+                        quant="mxfp8",
+                        block_size=[1, 32],
+                        prepacked_scales=True,
+                    )
+                else:
+                    q, _ = self.wq_b(
+                        q_input,
+                        block_scale=q_scale,
+                        output_dtype=qr.dtype if q_scale is not None else None,
+                    )
             else:
                 q = qr.new_empty((0, self.n_local_heads * self.head_dim))
             q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
             if (
-                q.is_cuda
+                not fused_decode
+                and q.is_cuda
                 and mode.is_decode()
                 and self.head_dim == 512
                 and self.n_local_heads != self.n_kernel_heads
             ):
                 q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
-            elif q.shape[0]:
+            elif not fused_decode and q.shape[0]:
                 q = self.rotary_emb.apply_owned(q, positions, False)
             swa_rope_cache = None
             swa_norm_weight = None
@@ -1514,12 +1722,18 @@ class DeepseekV41Attention(nn.Module):
             swa_norm_weight=swa_norm_weight,
             swa_norm_eps=self.kv_norm.variance_epsilon,
             out_rope_cache=out_rope_cache,
+            fused_decode_groups=self.n_local_groups if fused_decode else None,
             key_rows=query_gather,
         )
-        if out.shape[0] == 0 and query_gather is not None:
-            return hidden_states.new_empty((0, self.wo_b.output_size))
-        out = out[:, : self.n_local_heads]
-        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+        if fused_decode:
+            codes, scales = out
+            weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
+        else:
+            if out.shape[0] == 0 and query_gather is not None:
+                return hidden_states.new_empty((0, self.wo_b.output_size))
+            out = out[:, : self.n_local_heads]
+            weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+            weight_scales = self.wo_a_scales
         target = None
         if self.mapping.attn.head_tp_size > 1:
             target = _all_reduce_output(
@@ -1532,21 +1746,20 @@ class DeepseekV41Attention(nn.Module):
             # One kernel undoes RoPE and casts every 32 channels to FP8, as the
             # reference rounds o before wo_a. Only CDNA attention rotates back
             # itself, and no grouped FP8 kernel serves CDNA.
-            codes, scales = self.rotary_emb.inverse_quantize_grouped(
-                out, positions, self.n_local_groups
-            )
+            if not fused_decode:
+                codes, scales = self.rotary_emb.inverse_quantize_grouped(
+                    out, positions, self.n_local_groups
+                )
             if self.wo_b_fp8:
                 # wo_a writes wo_b's FP8 input and scales; nothing quantizes between.
                 codes, scales = grouped_fp8_projection_quantize_fp8(
-                    codes, scales, weight, self.wo_a_scales
+                    codes, scales, weight, weight_scales
                 )
                 out = fp8_projection(
                     codes, scales, self.wo_b.weight, self.wo_b_scales, target
                 )
             else:
-                out = grouped_fp8_projection(
-                    codes, scales, weight, self.wo_a_scales, None
-                )
+                out = grouped_fp8_projection(codes, scales, weight, weight_scales, None)
                 out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
         else:
             if out_rope_cache is None:
@@ -1572,6 +1785,34 @@ class DeepseekV41Attention(nn.Module):
                 op=torch.distributed.ReduceOp.SUM,
             )
         return out
+
+
+def _warmup_query_projections(
+    attentions: Iterable[DeepseekV41Attention], max_tokens: int
+) -> None:
+    """Compile each distinct attention-front FP8 projection shape at startup."""
+    warmed = set()
+    for attn in attentions:
+        projections = []
+        if attn.fused_q_projection_scales is not None:
+            projections.append((attn.fused_q_weight, attn.fused_q_projection_scales))
+        # The first layers have no indexer. Canonical Q also runs on DeepGEMM
+        # in mixed/distributed batches and when fused attention is unavailable.
+        layers = [attn.wq_a_wkv, attn.wq_b]
+        if attn.indexer is not None:
+            layers.append(attn.indexer.wq_b)
+        for layer in layers:
+            method = layer.quant_method
+            if (
+                isinstance(method, _ReferenceFp8LinearMethod)
+                and method.projection_weight_scales is not None
+            ):
+                projections.append((layer.weight, method.projection_weight_scales))
+        for weight, scales in projections:
+            key = (weight.device, tuple(weight.shape))
+            if key not in warmed:
+                warmup_fp8_projection(weight, scales, max_tokens)
+                warmed.add(key)
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
@@ -1695,15 +1936,18 @@ def _v41_hc_post_pre(
     hc_eps: float,
     sinkhorn_iters: int,
     prefer_overlap: bool,
+    quantize_fp8: bool,
 ):
     """Prepare a consumer with its own weights at either sublayer boundary.
 
-    Returns the completed residual, optional normalized input and optional
-    consumer coefficients. Missing outputs are computed in the consumer's
-    stream fork, preserving input/coefficient overlap on the local path.
+    Returns the completed residual, optional normalized input, optional
+    consumer coefficients, and the input's E4M3 codes and packed scales when
+    ``quantize_fp8`` asks for them and MegaMHC served the join (else None).
+    Missing outputs are computed in the consumer's stream fork, preserving
+    input/coefficient overlap on the local path.
     """
     if pending is None:
-        return residual, None, None
+        return residual, None, None, None
     if pending.reduce_group is not None:
         residual, x = all_reduce_mhc_norm(
             pending.x,
@@ -1715,11 +1959,16 @@ def _v41_hc_post_pre(
             norm.variance_epsilon,
             pending.reduce_group,
         )
-        return residual, x, None
+        return residual, x, None, None
     # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
     # read the previous replay's partials, so keep it out of captured segments.
     if not prefer_overlap and not is_breakable_capture_active():
-        shifted = try_mhc_shifted_post_pre_norm(
+        join = (
+            try_mhc_shifted_post_pre_norm_quantize_fp8
+            if quantize_fp8
+            else try_mhc_shifted_post_pre_norm
+        )
+        shifted = join(
             pending.x,
             residual,
             pre_mix,
@@ -1733,9 +1982,9 @@ def _v41_hc_post_pre(
             norm.variance_epsilon,
         )
         if shifted is not None:
-            residual, x, pre, post, comb = shifted
-            return residual, x, (pre, post, comb)
-    return pending.finish(residual), None, None
+            residual, x, pre, post, comb, *quantized = shifted
+            return residual, x, (pre, post, comb), tuple(quantized) or None
+    return pending.finish(residual), None, None, None
 
 
 class DeepseekV41DecoderLayer(nn.Module):
@@ -1883,7 +2132,8 @@ class DeepseekV41DecoderLayer(nn.Module):
         # never fork across an attention graph break, including during warmup.
         # The FFN fork stays within its segment and is available in every phase.
         attn_overlap = decode_hc and can_overlap
-        residual, x, attn_mixes = _v41_hc_post_pre(
+        attn_method = self.attn.wq_a_wkv.quant_method
+        residual, x, attn_mixes, attn_quantized = _v41_hc_post_pre(
             hidden_states,
             pre_mix,
             pending_post,
@@ -1893,6 +2143,9 @@ class DeepseekV41DecoderLayer(nn.Module):
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.hc_sinkhorn_iters,
             prefer_overlap=attn_overlap,
+            # wq_a_wkv's DeepGEMM projection reads the packed scales as given.
+            quantize_fp8=isinstance(attn_method, _ReferenceFp8LinearMethod)
+            and attn_method.projection_weight_scales is not None,
         )
         # The model applies Engram before entry. Taps read the completed stream
         # even when MegaMHC also prepared this attention's input and coefficients.
@@ -1914,7 +2167,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                         self.hc_eps,
                         self.hc_sinkhorn_iters,
                     )
-            codes, scales = None, None
+            codes, scales = attn_quantized or (None, None)
             if x is None:
                 if isinstance(
                     self.attn.wq_a_wkv.quant_method, _ReferenceFp8LinearMethod
@@ -1960,7 +2213,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        residual, x, ffn_mixes = _v41_hc_post_pre(
+        residual, x, ffn_mixes, _ = _v41_hc_post_pre(
             residual,
             attn_pre,
             V41HCPost(
@@ -1975,6 +2228,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.hc_sinkhorn_iters,
             prefer_overlap=decode_hc and can_overlap,
+            quantize_fp8=False,
         )
         if x is None:
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
@@ -2629,7 +2883,7 @@ class DeepseekV41Model(nn.Module):
                     self.mapping.attn.qcp_group,
                     list(plan.row_counts),
                 )
-                captured = list(packed.split(widths, dim=-1))
+                captured = list(plan.to_span_order(packed).split(widths, dim=-1))
             if plan.sampled_rows_total != ctx.output_layout.num_output_tokens:
                 raise RuntimeError(
                     "V4.1 QCP output ownership disagrees with output layout"
@@ -2638,7 +2892,6 @@ class DeepseekV41Model(nn.Module):
                 hidden = gather_sampled_rows(
                     hidden,
                     plan,
-                    local.sampled_rows,
                     group=self.mapping.attn.qcp_group,
                 )
             else:
@@ -2736,10 +2989,60 @@ def _image_mask_from_spans(
     return mask
 
 
+class _DeepseekV41LogitsProcessor(LogitsProcessor):
+    """Keep V4.1 control and image-placeholder tokens out of generated text."""
+
+    _token_blacklist = (0, 2, 129262, 129263, 129264)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._blocked_token_ids = (
+            ()
+            if global_server_args_dict["disable_deepseek_v41_token_blacklist"]
+            else self._token_blacklist
+        )
+        self._blocked_token_indices: dict[
+            tuple[torch.device, int, int], torch.Tensor | None
+        ] = {}
+
+    def _project_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding | ReplicatedLinear,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # V4.1 has no logit softcap. Masking this rank's raw head shard covers
+        # full-vocab gather, vocab-sharded sampling and distributed argmax alike.
+        logits = super()._project_logits(hidden_states, lm_head, embedding_bias)
+        width = logits.shape[-1]
+        start = (
+            int(lm_head.shard_indices.org_vocab_start_index)
+            if isinstance(lm_head, VocabParallelEmbedding)
+            else 0
+        )
+        key = (logits.device, width, start)
+        if key not in self._blocked_token_indices:
+            local_ids = [
+                token_id - start
+                for token_id in self._blocked_token_ids
+                if start <= token_id < start + width
+            ]
+            self._blocked_token_indices[key] = (
+                torch.tensor(local_ids, dtype=torch.int64, device=logits.device)
+                if local_ids
+                else None
+            )
+        indices = self._blocked_token_indices[key]
+        if indices is not None:
+            logits.index_fill_(-1, indices, float("-inf"))
+        return logits
+
+
 class DeepseekV41ForCausalLM(BaseCausalLM):
     """V4.1 language and vision model with strict checkpoint coverage."""
 
     model_cls = DeepseekV41Model
+    logits_processor_cls = _DeepseekV41LogitsProcessor
 
     def __init__(
         self,
@@ -3283,6 +3586,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 module.quant_method.prepare_weight_scales(module)
             elif isinstance(module, DeepseekV41Attention):
                 module.prepare_output_projections()
+                module.prepare_fused_decode()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded
@@ -3300,6 +3604,13 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 # choice warms them all.
                 module.warmup_output_projections(_max_forward_tokens())
                 warmed.add(module.wo_b_fp8)
+        attentions = [
+            module
+            for module in self.modules()
+            if isinstance(module, DeepseekV41Attention)
+        ]
+        if attentions:
+            _warmup_query_projections(attentions, _max_forward_tokens())
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()

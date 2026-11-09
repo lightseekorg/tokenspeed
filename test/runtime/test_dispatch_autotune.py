@@ -78,6 +78,7 @@ from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
     UnquantizedLinearMethod,
 )
 from tokenspeed.runtime.utils import env as env_module  # noqa: E402
+from tokenspeed.runtime.utils import server_args as server_args_module  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
@@ -304,6 +305,9 @@ class _AutotuneExecutor:
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
+        # The stub gathers whole sampled rows, so autotune() runs no
+        # vocab-shard warmup.
+        self._samples_from_vocab_shard = False
 
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
@@ -325,6 +329,7 @@ class _ProcessGroupManagerDouble:
         return self._group
 
 
+@pytest.mark.parametrize("max_decode_bs", [1, 8])
 @pytest.mark.parametrize("attention_tp_size", [1, 2, 8])
 @pytest.mark.parametrize("chunk_size", [-1, 16, 17])
 @pytest.mark.parametrize("speculative", [False, True])
@@ -340,6 +345,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     failure,
     prefill_only,
     attention_tp_size,
+    max_decode_bs,
 ):
     events = []
     metadata = []
@@ -369,7 +375,8 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             raise RuntimeError("profiling failed")
 
     def draft(*, batch_sizes, graph_phase):
-        assert batch_sizes == (attention_tp_size,)
+        # One request per attention TP peer, within the decode state.
+        assert batch_sizes == (min(attention_tp_size, max_decode_bs),)
         assert tuning_module.is_autotuning() is (
             not disabled and tuning_module._autotuner is not None
         )
@@ -400,7 +407,9 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         ),
         prefill_graph=_PrefillGraphDouble(make_dummy_batch=prefill_batch),
         # Deliberately no capture_bs or graph-enabled flag: neither controls tuning.
-        forward_step=_ForwardStepDouble(warmup_decode_path=draft),
+        forward_step=_ForwardStepDouble(
+            warmup_decode_path=draft, max_decode_bs=max_decode_bs
+        ),
         drafter=object() if speculative else None,
         model_input_kwargs=lambda n, bs, rows: {
             "engram_hash_ids": ngram_history[rows],
@@ -433,7 +442,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     )
     if failure:
         with pytest.raises(RuntimeError, match="profiling failed"):
-            ModelExecutor.autotune(executor)
+            ModelExecutor.autotune(executor, keep_loaded_tactics=False)
         assert events == [
             "load",
             ("group", None),
@@ -442,7 +451,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             ("group", None),
         ]
     else:
-        ModelExecutor.autotune(executor)
+        ModelExecutor.autotune(executor, keep_loaded_tactics=False)
         assert events == [
             "load",
             ("group", None),
@@ -465,12 +474,14 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
 
 def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     """The dummy extend carries the engine's shard plan (make_dummy_batch),
-    and the target forward sees this rank's slice of the span -- ids,
+    and the target forward sees this rank's rows of the span -- ids,
     positions and the per-row model inputs -- as a real sharded extend does."""
     plan = QueryShardPlan.from_forward(
-        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2
+        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2, device="cpu"
     )
-    assert plan.local_slice == slice(8, 12)
+    # Every request is four rows, one per zigzag segment of the first four:
+    # rank 2 computes the third row of each.
+    assert plan.local_row_ids.tolist() == [2, 6, 10, 14]
     seen = {}
     events = []
     group = object()  # Stands in for the gloo CPU group.
@@ -522,10 +533,10 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
         lambda path, group, owner: events.append(("save", path, group, owner)),
     )
     _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
-    ModelExecutor.autotune(executor)
-    assert seen["input_ids"].tolist() == [8, 9, 10, 11]
-    assert seen["positions"].tolist() == [80, 90, 100, 110]
-    assert seen["rows"] == slice(8, 12) and seen["span"] == 16
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+    assert seen["input_ids"].tolist() == [2, 6, 10, 14]
+    assert seen["positions"].tolist() == [20, 60, 100, 140]
+    assert seen["rows"].tolist() == [2, 6, 10, 14] and seen["span"] == 16
     assert pg_manager.requests == [("gloo", (0, 1, 2, 3))]
     assert events == [
         ("load", None, group, 0),
@@ -632,9 +643,9 @@ def test_decode_only_attention_tunes_on_a_decode_step(
     )
     if failure:
         with pytest.raises(RuntimeError, match="decode warmup failed"):
-            ModelExecutor.autotune(executor)
+            ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     else:
-        ModelExecutor.autotune(executor)
+        ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert max_tokens == [8 * 3]
     assert events == [
         "load",
@@ -675,7 +686,7 @@ def test_pipeline_parallelism_does_not_run_unsupported_dummy_forward(
         model_input_kwargs=unexpected_forward,
         events=[],
     )
-    ModelExecutor.autotune(executor)
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert not tuning_module.is_warming_up()
 
 
@@ -695,6 +706,9 @@ class _DecodeCaptureDouble:
 
 
 class _PrefillCaptureDouble:
+    capture_buckets = [16]
+    num_warmup = 1
+
     def __init__(self, *, disable, on_capture):
         self.disable = disable
         self._on_capture = on_capture
@@ -702,13 +716,35 @@ class _PrefillCaptureDouble:
     def capture(self, runner, *, entries, observer):
         self._on_capture(runner)
 
+    def captured_hidden_spec(self):
+        return 8, torch.float32
+
 
 class _DrafterCaptureDouble:
-    def __init__(self, on_capture):
+    """A drafter with a prefill graph of its own (``captures_prefill_graph``)
+    or with extend graphs (``extend_graph_plan``)."""
+
+    def __init__(self, *, extend_graphs, on_capture):
+        self.captures_prefill_graph = not extend_graphs
+        self._extend_graphs = extend_graphs
         self._on_capture = on_capture
 
     def capture_prefill_graph(self, stream, observer):
         self._on_capture(stream)
+
+    def extend_graph_plan(self, token_buckets, request_counts):
+        if not self._extend_graphs:
+            return {}
+        return {
+            "prefill:drafter-step0": [
+                (bucket, bs)
+                for bucket in token_buckets
+                for bs in request_counts(bucket)
+            ]
+        }
+
+    def capture_extend_graphs(self, capture, *, observer):
+        self._on_capture(capture.stream)
 
 
 class _ObserverDouble:
@@ -716,24 +752,40 @@ class _ObserverDouble:
         return nullcontext()
 
 
+@dataclass
+class _CaptureConfig:
+    """The ModelExecutorConfig fields capture_graphs() reads."""
+
+    enable_drafter_prefill_graph: bool = True
+    prefill_graph_capture_batch_sizes: list[int] | None = None
+    context_len: int = 4096
+    max_num_seqs: int = 4
+    data_parallel_size: int = 1
+
+
 class _CaptureExecutor:
     """The ModelExecutor state capture_graphs() reads, without the GPU boot."""
 
-    def __init__(
-        self, *, captures_drafter_prefill_graph, forward_step, prefill_graph, drafter
-    ):
-        self.captures_drafter_prefill_graph = captures_drafter_prefill_graph
+    # Which drafter graphs a boot records is the executor's own logic.
+    captures_drafter_prefill_graph = ModelExecutor.captures_drafter_prefill_graph
+    _drafter_extend_plan = ModelExecutor._drafter_extend_plan
+    drafter_extend_ladders = ModelExecutor.drafter_extend_ladders
+    _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
+
+    def __init__(self, *, forward_step, prefill_graph, drafter):
+        self.config = _CaptureConfig()
         self.device = "cpu"
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph
         self.drafter = drafter
+        self.draft_attn_backend = None
 
 
 @pytest.mark.parametrize("decode_disabled", [False, True])
 @pytest.mark.parametrize("prefill_disabled", [False, True])
-@pytest.mark.parametrize("has_drafter", [False, True])
+@pytest.mark.parametrize("drafter_graphs", [None, "own", "extend"])
 def test_capture_lifecycle_preserves_main_order(
-    decode_disabled, prefill_disabled, has_drafter
+    decode_disabled, prefill_disabled, drafter_graphs
 ):
     events = []
     reset_workspace_pools()
@@ -759,13 +811,16 @@ def test_capture_lifecycle_preserves_main_order(
         events.append("draft")
 
     executor = _CaptureExecutor(
-        captures_drafter_prefill_graph=not prefill_disabled and has_drafter,
         forward_step=step,
         prefill_graph=_PrefillCaptureDouble(
             disable=prefill_disabled, on_capture=capture_prefill
         ),
         drafter=(
-            _DrafterCaptureDouble(on_capture=capture_draft) if has_drafter else None
+            None
+            if drafter_graphs is None
+            else _DrafterCaptureDouble(
+                extend_graphs=drafter_graphs == "extend", on_capture=capture_draft
+            )
         ),
     )
     ModelExecutor.capture_graphs(
@@ -777,7 +832,7 @@ def test_capture_lifecycle_preserves_main_order(
     assert events == [
         *([] if decode_disabled else ["decode"]),
         *([] if prefill_disabled else ["prefill"]),
-        *(["draft"] if not prefill_disabled and has_drafter else []),
+        *(["draft"] if not prefill_disabled and drafter_graphs is not None else []),
     ]
     reset_workspace_pools()
 
@@ -807,12 +862,34 @@ class _ModelConfigDouble:
     quantization: str | None
 
 
+class _VendorPlatform:
+    """The test host's platform reporting another GPU vendor: server
+    arguments read other platform facts as well."""
+
+    def __init__(self, real, *, is_nvidia):
+        self._real = real
+        self.is_nvidia = is_nvidia
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _on_vendor(monkeypatch, *, is_nvidia):
+    real = server_args_module.current_platform()
+    monkeypatch.setattr(
+        server_args_module,
+        "current_platform",
+        lambda: _VendorPlatform(real, is_nvidia=is_nvidia),
+    )
+
+
 @pytest.mark.parametrize("tp,dp,max_num_seqs", [(8, 1, 4), (2, 4, 4), (2, 4, 7)])
 @pytest.mark.parametrize("disable_autotune", [False, True])
 @pytest.mark.parametrize("role", ["null", "decode"])
-def test_speculative_warmup_rejects_capacity_below_attention_tp(
-    tp, dp, max_num_seqs, disable_autotune, role
+def test_speculative_warmup_rejects_capacity_below_attention_tp_on_nvidia(
+    monkeypatch, tp, dp, max_num_seqs, disable_autotune, role
 ):
+    _on_vendor(monkeypatch, is_nvidia=True)
     with pytest.raises(ValueError, match=f"Set --max-num-seqs to at least {tp * dp}"):
         ServerArgs(
             model="x",
@@ -829,11 +906,23 @@ def test_speculative_warmup_rejects_capacity_below_attention_tp(
 
 
 @pytest.mark.parametrize(
-    "tp,dp,max_num_seqs", [(8, 1, 8), (2, 4, 8), (2, 4, 9), (1, 8, 8)]
+    "tp,dp,max_num_seqs,is_nvidia",
+    [
+        (8, 1, 8, True),
+        (2, 4, 8, True),
+        (2, 4, 9, True),
+        (1, 8, 8, True),
+        # Without FlashInfer's lockstep tuning, any cap is kept.
+        (8, 1, 1, False),
+        (8, 1, 4, False),
+        (2, 4, 4, False),
+        (2, 4, 7, False),
+    ],
 )
-def test_speculative_warmup_accepts_capacity_covering_attention_tp(
-    tp, dp, max_num_seqs
+def test_speculative_warmup_accepts_capacity(
+    monkeypatch, tp, dp, max_num_seqs, is_nvidia
 ):
+    _on_vendor(monkeypatch, is_nvidia=is_nvidia)
     args = ServerArgs(
         model="x",
         dtype="bfloat16",
@@ -1828,6 +1917,50 @@ def test_mm_runs_the_joint_bf16_gemm_only_before_serving(monkeypatch, serving):
     torch.testing.assert_close(out, x @ w.T)
     assert len(joint_calls) == int(not serving)
     assert len(generic_calls) == int(serving)
+
+
+@pytest.mark.parametrize("tactic", [None, 21])
+@pytest.mark.parametrize("serving", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("override", [None, "forced"])
+def test_mm_runs_the_pinned_tgv_tile_only_before_serving(
+    monkeypatch, tactic, serving, bias, override
+):
+    """Decode rows above the joint bound run the TGV tactic the adapter picks,
+    only before serving and only without bias or a forced kernel. When it
+    picks none, or is not asked, selection runs as before."""
+    decisions, tgv_calls, generic_calls = [], [], []
+    monkeypatch.setattr(gemm_module, "autotune_bf16_gemm", lambda *args: None)
+    monkeypatch.setattr(
+        gemm_module,
+        "flashinfer_tgv_decode_tactic",
+        lambda a, b, out: decisions.append((a, b, out)) or tactic,
+    )
+    monkeypatch.setattr(
+        gemm_module,
+        "flashinfer_tgv_decode_gemm",
+        lambda a, b, out, chosen: tgv_calls.append(chosen) or torch.mm(a, b.T, out=out),
+    )
+    monkeypatch.setattr(gemm_module, "is_serving", lambda: serving)
+    monkeypatch.setattr(gemm_module, "pdl_enabled", lambda: False)
+    monkeypatch.setattr(
+        gemm_module, "select_kernel", _SelectKernelDouble(_generic_mm(generic_calls))
+    )
+    x = torch.randn(48, 4, dtype=torch.bfloat16)
+    w = torch.randn(8, 4, dtype=torch.bfloat16)
+    out = torch.empty(48, 8, dtype=torch.bfloat16)
+    b = torch.ones(8, dtype=torch.bfloat16) if bias else None
+    assert gemm_module.mm(x, w, bias=b, out=out, override=override) is out
+    torch.testing.assert_close(out, x @ w.T + (b if b is not None else 0))
+    asked = not serving and not bias and override is None
+    if asked:
+        ((a, weight, destination),) = decisions
+        assert a is x and weight is w and destination is out
+    else:
+        assert decisions == []
+    routed = asked and tactic is not None
+    assert tgv_calls == ([tactic] if routed else [])
+    assert len(generic_calls) == int(not routed)
 
 
 # ---------------------------------------------------------------------------

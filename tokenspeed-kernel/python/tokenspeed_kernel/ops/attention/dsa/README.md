@@ -34,15 +34,12 @@ optional LSE is FP32 in natural-log units. Empty selections produce zero
 output and negative-infinite LSE. Negative slots inside a visible prefix are
 masked. Omitting lengths inspects the full selected-slot width.
 
-Install a FlashInfer build containing PR #7984 (tested source revision
-`335e25d0b8d95bf42709d6851c569dddc26577d6`) and compatible CUTLASS DSL
-libraries. Select `solution="flashinfer_prims"` in the kernel API, or set
+The pinned FlashInfer 0.7.3 provides the Prims-TS sparse MLA wrapper. Select
+`solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
 and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`
 for serving. TRTLLM keeps its higher default priority, and also returns the
-LSE that decode context parallelism merges. The solution registers only when
-the installed FlashInfer provides the Prims-TS sparse MLA wrapper; otherwise
-such calls fall back to Triton. The indexer is unchanged.
+LSE that decode context parallelism merges. The indexer is unchanged.
 
 The upstream plan owns PDL scheduling. This adapter requires PDL enabled and
 rejects an explicit disable request. The caller prepares Q and the selected
@@ -263,6 +260,23 @@ launches from it declares the feature alongside the keyword, and the facade
 reads the registration rather than probing call signatures, so a
 `*args, **kwargs` wrapper never receives a keyword its launcher cannot take.
 
+`row_starts_cpu` optionally supplies an int32 or int64 CPU mirror of each query's
+inclusive workspace-row start, shape `[tokens]`. A strided mirror is valid.
+Together with `candidate_lens_cpu`, it lets a leaf plan groups of queries
+sharing a history without reading metadata back from the device. The caller
+must provide the current invocation's values in the same workspace coordinates
+as `row_starts`, including any slice or group rebase. The facade checks shape,
+device, and dtype; it does not compare values against device metadata.
+A stale mirror violates the contract and can produce incorrect selection.
+
+`None` supplies no mirror and preserves existing selection. A supplied mirror
+requires `ROW_STARTS_CPU_FEATURE` (`"row_starts_cpu"`) and reaches the selected
+leaf unchanged. Ordinary selection, explicit overrides, and saved plans reject
+leaves without the feature instead of dropping the argument. A declaring leaf
+must accept the keyword and support its omission. No in-tree production leaf
+currently declares this feature; it is an extension contract for registered
+providers, not a standalone scoring optimization.
+
 ## Slot order of the sparse cores
 
 `dsa_decode` and `dsa_prefill` take a required `slot_order` in
@@ -274,6 +288,48 @@ so the reduction is batch-invariant whenever the selected set is, and is
 served only by cores declaring `slot_order={"sorted", ...}`, which receive
 the choice as the `slot_order` keyword. Asking a silent core for `sorted`
 is a `ValueError`, not a silent fallback.
+
+## Fused decode top-k (`cute_dsl_dsa_decode_topk`)
+
+On SM100-SM103 the `cute_dsl` leaf runs a decode step's indexer tail in two
+PDL-chained launches (`thirdparty/cute_dsl/k3_decode/dsa/indexer.py`) after the
+shared query quantization: a persistent tcgen05 scorer and a one-CTA-per-row
+select. It replaces the DeepGEMM leaf's block-table expansion, paged MQA logits,
+non-finite scrub, radix top-k and slot mapping, and ignores the `dsa_plan`.
+
+- Logits are bit-identical to `deep_gemm.fp8_paged_mqa_logits` on the same FP8
+  query and FP32 weights: the same FP8 MMA (K 128 in four K 32 steps, FP32
+  accumulator, keys as operand A) and DeepGEMM's FP32 head sum (`x + |x|`, two
+  FMA chains over the head pairs, their sum halved, times the key's scale), with
+  NaN and `+inf` stored as `-inf` as the scrub would. They live in a
+  request-compact FP32 scratch no larger than DeepGEMM's `[tokens, block-table
+  capacity]` output.
+- Selection is exact over FP32 order keys (`-0` ranks as `+0`): a row's top-k is
+  the head of the stable descending sort of its causal window, so ties at the
+  threshold go to the lowest positions (the `batch_invariant` contract), and the
+  slots come out in ascending position, which serves both `slot_order` values.
+  A row of at most `topk` keys takes all of them; a request whose rows all fit
+  is not scored. Rows whose request length leaves no keys come out empty.
+- Rows, requests, pages and the block-table width are runtime values: one
+  compile per `q_len_per_req`. At most 4096 requests per call.
+- The select never releases its dependents early: trtllm-gen sparse attention
+  reads the counts before its PDL wait.
+- It also takes queries quantized ahead: contiguous E4M3 queries with unit
+  scales (`q_scales=None`) and the FP32 weights that carry their scales and
+  the score scale (`softmax_scale=1`), which it scores without its own
+  quantization launch.
+
+The leaf registers below every other `dsa_decode_topk` leaf, so only
+`solution="cute_dsl"` selects it. Kimi-K3.1 pins it where it is registered;
+other models with the same indexer geometry keep their leaf.
+
+A Kimi-K3.1 decode round quantizes those queries in the launch that writes
+its index keys: `index_k_layernorm_fp8_scatter_and_quantize_query`
+(`_triton/topk.py`) runs, per row, the row functions of
+`index_k_layernorm_fp8_scatter` (one warp, so the key's LayerNorm sums in the
+same order) and of `quantize_index_query_weights`, so the plane's bytes and
+the query and weights are bit-identical to the two separate launches. Mixed
+rounds, prefill, and KV-parallel decode keep the separate write.
 
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)
 
@@ -326,6 +382,14 @@ DeepGEMM index scoring registers for 16, 32, or 64 index heads. The
 16-head case pads queries and weights to its native 32-head ABI with zeros;
 caller-provided scoring scales and forced initial/local candidate policies
 remain unchanged. Kernel traits exclude other head counts.
+
+DeepGEMM's FP8 logits kernels take no query scale, so
+`quantize_index_query_weights` quantizes each (token, head) query to E4M3
+with the 1x128 token-group quantizer's arithmetic and folds that scale and
+`softmax_scale` into the head weights in one launch, bit-exact with NVIDIA's
+`quantize_fp8` followed by `combine_topk_weights`. Before the decode top-k,
+`scrub_nonfinite_logits` reads the per-request lengths and derives each
+verify row's causal candidate count itself.
 
 FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
 also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`

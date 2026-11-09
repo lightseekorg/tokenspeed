@@ -7,10 +7,16 @@ replicated-cache decode supplies the complete local query batch, including
 speculative verify rows. Owner-local history retains its per-request windows.
 This design avoids splitting a decode batch solely because its configured
 history capacity is large. Each score tensor uses 2 bytes per query-by-history
-entry; native logits and their cleaned copy can coexist, so peak storage
+entry; paged native logits and their cleaned copy can coexist, so peak storage
 includes the score matrices, alignment, and selection scratch.
-Dense broadcast prefill retains its 128 MiB score budget and the runtime's
-prefill query windows. The sparse candidate scorer already produces BF16 logits.
+Canonical replicated-cache prefill scores densely: the runtime batches request
+windows, and splits a request whose own logits exceed the budget, so one call's
+BF16 logits stay within `TOKENSPEED_PREFILL_INDEX_LOGITS_MB` (10 GiB by default,
+`index_logit_rows`); scoring only checks that bound. DeepSelect reads the MQA
+view's [0, end) using the padded row stride; dense Full, including
+candidate-source Full, does not copy a cleaned matrix and sets invalid pages
+inside [0, end) to -inf in place (`mask_invalid_pages`). The sparse candidate
+scorer already produces BF16 logits.
 Kernel warmup uses the same output dtype as execution and compiles both
 independent and request-grouped paged scoring before capture.
 
@@ -19,9 +25,9 @@ Full passes the same IDs to schedule construction and scoring, allowing the
 native kernel to reuse history across consecutive queries of one request.
 Such rows share a page table and have nondecreasing visible lengths. Empty
 rows get distinct scheduling labels so they cannot truncate an active request's
-history bound. The runtime groups canonical decode rows and ordered prefill
-spans. Free decode windows use independent rows so reordering queries cannot
-truncate the history scored for an earlier row.
+history bound. The runtime groups canonical decode rows; dense prefill ignores
+request IDs. Free decode windows use independent rows so reordering queries
+cannot truncate the history scored for an earlier row.
 Request IDs, tables, and lengths remain unchanged while sharing metadata;
 graph replay refreshes their captured producers.
 

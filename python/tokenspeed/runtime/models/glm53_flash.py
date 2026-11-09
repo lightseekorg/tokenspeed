@@ -95,6 +95,7 @@ from tokenspeed.runtime.models.glm5 import (
     GlmDsaIndexer,
     GlmDsaPrefillTopK,
     GlmMoeDsaAttention,
+    load_fused_indexer_projection,
 )
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -1536,6 +1537,7 @@ def load_glm53_flash_text_weights(
     params_dict = dict(owner.named_parameters())
     modules_dict = dict(owner.named_modules())
     loaded_indexer_shards: dict[str, set[int]] = {}
+    pending_fp8_wk: dict[str, dict[str, torch.Tensor]] = {}
     moe_loader = build_moe_checkpoint_loader(
         params_dict=params_dict,
         expert_schema=ExpertCheckpointSchema(),
@@ -1580,25 +1582,17 @@ def load_glm53_flash_text_weights(
                     direct_param.weight_loader(direct_param, loaded_weight)
                 else:
                     default_weight_loader(direct_param, loaded_weight)
-            if name.endswith(".weight"):
-                if ".indexer.wk." in name:
-                    module_name = name.rsplit(".wk.", 1)[0]
-                    shard_id = 0
-                else:
-                    module_name = name.rsplit(".weights_proj.", 1)[0]
-                    shard_id = 1
-                fused_param = params_dict.get(f"{module_name}.wk_weights_proj.weight")
-                if fused_param is not None:
-                    fused_param.weight_loader(
-                        fused_param,
-                        loaded_weight,
-                        shard_id,
-                    )
-                    shards = loaded_indexer_shards.setdefault(module_name, set())
-                    shards.add(shard_id)
-                    module = modules_dict.get(module_name)
-                    if shards == {0, 1} and hasattr(module, "_wk_weights_proj_loaded"):
-                        module._wk_weights_proj_loaded = True
+            load_fused_indexer_projection(
+                name,
+                loaded_weight,
+                params_dict=params_dict,
+                modules_dict=modules_dict,
+                pending_fp8_wk=pending_fp8_wk,
+                loaded_shards=loaded_indexer_shards,
+                weight_block_size=getattr(
+                    owner.quant_config, "weight_block_size", None
+                ),
+            )
             continue
 
         if moe_loader.matches(name):
@@ -1659,6 +1653,12 @@ def load_glm53_flash_text_weights(
             param.weight_loader(param, loaded_weight)
         else:
             default_weight_loader(param, loaded_weight)
+
+    if pending_fp8_wk:
+        raise RuntimeError(
+            "FP8 indexer wk weight or weight_scale_inv is missing its partner "
+            f"for {sorted(pending_fp8_wk)}"
+        )
 
 
 class Glm53FlashForCausalLM(BaseCausalLM):

@@ -33,10 +33,10 @@ microseconds against a multi-ms forward).
 
 from __future__ import annotations
 
-import importlib.util
 import math
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.kda.triton import (
     _DENSE_HALF_SIGNATURES,
@@ -52,11 +52,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 platform = current_platform()
 
 
-if (
-    platform.is_nvidia
-    and platform.is_hopper_plus
-    and importlib.util.find_spec("flash_kda") is not None
-):
+if platform.is_nvidia and platform.is_hopper_plus and has_optional_package("flash_kda"):
     from flash_kda import fwd as flash_kda_fwd
 
 __all__ = ["flash_kda_chunk_prefill"]

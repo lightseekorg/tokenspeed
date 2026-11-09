@@ -1143,6 +1143,8 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         # K3 width-64 decode: 1,024 routes take the fused one-program
         # histogram and prefix scan; most of the 896 experts stay empty.
         (64, 896, 16, 16, True),
+        # Dense 1,024 routes over 256 experts: most experts get a padded block.
+        (128, 256, 8, 16, True),
     ],
 )
 def test_route_sort_contract_gfx950(
@@ -1181,6 +1183,7 @@ def test_route_sort_contract_gfx950(
         block_m,
         use_minimum_route_chunks=use_minimum_route_chunks,
         runtime_rows=False,
+        deterministic_order=False,
     )
     valid_extent, reported_tokens = num_valid.cpu().tolist()
     assert reported_tokens == num_tokens
@@ -1253,6 +1256,7 @@ def test_package_prefill_sort_localizes_ep_routes_gfx950() -> None:
             expert_start=expert_start,
             out=output,
             runtime_rows=False,
+            deterministic_order=False,
         )
     )
 
@@ -1295,6 +1299,7 @@ def test_package_prefill_low_density_route_capacity_gfx950() -> None:
         block_m,
         use_minimum_route_chunks=False,
         runtime_rows=False,
+        deterministic_order=False,
     )
 
     expected_capacity = _max_padded_route_capacity(
@@ -1540,6 +1545,7 @@ def test_stage2_logical_k_ignores_padding_gfx950(
         sort_block_m,
         use_minimum_route_chunks=False,
         runtime_rows=False,
+        deterministic_order=False,
     )
     output_storage = torch.full(
         (tokens, n + 16), 42, dtype=torch.bfloat16, device="cuda"
@@ -1725,6 +1731,7 @@ def test_deferred_stage2_masks_uninitialized_remote_routes_gfx950() -> None:
                 expert_start=2,
                 use_minimum_route_chunks=False,
                 runtime_rows=False,
+                deterministic_order=False,
             )
             a_scale = _make_gdot128_scale_alias(
                 swizzle_cdna4_mxfp4_scale(
@@ -2676,6 +2683,7 @@ def test_route_sort_reuses_compilation_gfx950(use_minimum_route_chunks: bool) ->
             16,
             use_minimum_route_chunks=use_minimum_route_chunks,
             runtime_rows=False,
+            deterministic_order=False,
         )
         assert valid[1].item() == tokens
         counts = torch.bincount(ids.flatten().to(torch.int64), minlength=16)

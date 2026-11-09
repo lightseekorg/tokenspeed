@@ -25,7 +25,6 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
     merge_packed_index_candidates,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -1274,15 +1273,8 @@ def triton_dsa_sharded_index_candidates(
     local_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if current_platform().is_nvidia:
-        quantized, scale = quantize_fp8(
-            q.reshape(-1, q.shape[-1]),
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        scale = scale[: q.shape[0] * q.shape[1]].contiguous()
-        weights = combine_topk_weights(weights, scale, softmax_scale)
-        q = quantized.view_as(q).to(torch.bfloat16)
+        quantized, weights = quantize_index_query_weights(q, weights, softmax_scale)
+        q = quantized.to(torch.bfloat16)
         softmax_scale = 1.0
     return triton_dsa_index_candidates(
         q,

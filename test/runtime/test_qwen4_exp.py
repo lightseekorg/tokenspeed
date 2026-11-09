@@ -108,6 +108,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
@@ -829,7 +830,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         cache_accesses.append(("fields", indexer.layer_id))
         return None, torch.empty(0), None
 
-    indexer._fields = fields
+    indexer.cache_fields = fields
     stacks = router.stacks
     metadata = backend.indexer_backend.metadata_for(ForwardMode.EXTEND)
     qsa_table = metadata.qsa_block_table
@@ -927,7 +928,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
     indexer.recent_page_size = 64
     indexer.compress_ratio = 4
     pool = SimpleNamespace(layerwise_load_tracker=None)
-    indexer._fields = lambda pool: (None, torch.empty(0), None)
+    indexer.cache_fields = lambda pool: (None, torch.empty(0), None)
     indexer._project_qk_raw = lambda hidden: (hidden, hidden[:, None, :])
     selection_widths = []
 
@@ -938,7 +939,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
 
     indexer._select = select
     draft_scratch = tuple(torch.empty(2) for _ in range(3))
-    indexer._draft_scratch_buffers = lambda *args: draft_scratch
+    indexer.draft_scratch = lambda *args: draft_scratch
     prepared = SimpleNamespace(
         logical_positions=torch.arange(8),
         request_indices=torch.zeros(8, dtype=torch.int64),
@@ -1103,7 +1104,7 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
         mrope_section=None,
         mrope_interleaved=False,
     )
-    indexer._fields = lambda pool: (
+    indexer.cache_fields = lambda pool: (
         torch.empty((2, 4, 1, 8)),
         torch.empty((2, 64, 1, 8)),
         torch.empty((2, 3), dtype=torch.int64),
@@ -1266,7 +1267,7 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     raw = torch.zeros((3, 4, 1, 2), dtype=torch.float32, device=device)
     compressed = torch.zeros((3, 64, 1, 2), dtype=torch.float32, device=device)
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
-    indexer._fields = lambda pool: (raw, compressed, rope_positions)
+    indexer.cache_fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 
@@ -1369,12 +1370,7 @@ def test_qwen4_exp_qsa_draft_scratch_spans_compression_boundaries() -> None:
         stage_draft=False,
     )
     raw[1, 3, 0] = -99
-    seed_position = torch.tensor([3], dtype=torch.long, device=device)
-    scratch = indexer._draft_scratch_buffers(
-        committed_keys[:1],
-        indexer._position_values(seed_position),
-        1,
-    )
+    scratch = indexer.draft_scratch(1, committed_keys.dtype, committed_keys.device)
 
     for value in range(3, 8):
         logical = torch.tensor([value], dtype=torch.long, device=device)
@@ -2238,6 +2234,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         speculative_num_draft_tokens=0,
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
+        enable_qsa_prefill_bf16_scratch=False,
     )
 
     setup = prepare_cache_setup(
@@ -2404,6 +2401,7 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
         mapping=Mapping(rank=0, world_size=1),
+        enable_qsa_prefill_bf16_scratch=False,
     )
     return prepare_cache_setup(
         family="qwen4_exp",
@@ -3601,6 +3599,182 @@ def test_ple_prequantized_checkpoint_scale_is_applied(
     assert loaded == {"ple.lookup.ngram_embedding.weight"}
 
 
+_PLE_LAYER_PREFIX = "model.language_model.layers.1.ple"
+_PLE_TABLE_PREFIX = f"{_PLE_LAYER_PREFIX}.ple_embedding.ngram_embedding"
+
+
+def _checkpoint_quant_config(kind: str):
+    """The quantization config each checkpoint format declares, if any."""
+
+    if kind == "none":
+        return None
+    if kind.startswith("modelopt"):
+        layers = {"model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}}
+        if kind == "modelopt_fp8_table":
+            layers[_PLE_TABLE_PREFIX] = {"quant_algo": "FP8"}
+        return ModelOptMixedConfig.from_config(
+            {"quant_algo": "MIXED_PRECISION", "quantized_layers": layers}
+        )
+    fp8 = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        # As in Qwen/Qwen3.8-Flash-Next-FP8, the PLE projections stay BF16.
+        "modules_to_not_convert": [
+            f"{_PLE_LAYER_PREFIX}.key_proj",
+            f"{_PLE_LAYER_PREFIX}.value_proj",
+        ],
+    }
+    if kind == "hf_fp8_table":
+        fp8["modules_to_convert"] = ["ple.ple_embedding.ngram_embedding"]
+    return Fp8Config.from_config(fp8)
+
+
+def _tiny_ple_config(**overrides) -> Qwen4ExpTextConfig:
+    """A two-layer Qwen4-Exp text config whose second layer has PLE.
+
+    ``ngram_vocab_size_base`` is tiny so the n-gram table is small; the hash
+    geometry that decides which rows are read is unaffected by it.
+    """
+
+    kwargs = dict(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[2],
+        ngram_size=3,
+        heads_per_ngram=4,
+        ngram_vocab_size_base=257,
+        make_ngram_vocab_size_divisible_by=8,
+        hc_count=2,
+        num_experts=None,
+        eos_token_id=7,
+    )
+    kwargs.update(overrides)
+    return Qwen4ExpTextConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "ple_embed_dtype", "expect_fp8"),
+    [
+        ("none", None, False),
+        ("none", "float8_e4m3fn", True),
+        ("modelopt", None, False),
+        ("modelopt_fp8_table", None, True),
+        ("hf_fp8", None, False),
+        ("hf_fp8_table", None, True),
+    ],
+)
+def test_ple_table_storage_follows_checkpoint(
+    checkpoint: str, ple_embed_dtype: str | None, expect_fp8: bool
+) -> None:
+    """Without ``ple_embed_dtype`` the n-gram table keeps the checkpoint's format.
+
+    ModelOpt mixed-precision exports list an FP8 table in ``quantized_layers``
+    and Hugging Face fp8 exports in ``modules_to_convert``; either keeps the
+    table in FP8, and a checkpoint that declares neither stores the compute
+    dtype. An explicit ``float8_e4m3fn`` stores FP8 regardless.
+    """
+
+    layer = Qwen4ExpPLELayer(
+        _tiny_ple_config(ple_embed_dtype=ple_embed_dtype, ple_offload_embedding=False),
+        Mapping(rank=0, world_size=1),
+        layer_id=1,
+        ple_layer_index=0,
+        quant_config=_checkpoint_quant_config(checkpoint),
+        prefix=_PLE_LAYER_PREFIX,
+    )
+
+    expected = torch.float8_e4m3fn if expect_fp8 else torch.get_default_dtype()
+    assert layer.ple_embedding.lookup.ngram_embedding.weight.dtype == expected
+
+
+def test_ple_table_rejects_unsupported_storage_dtype() -> None:
+    config = _tiny_ple_config(ple_embed_dtype="bfloat16", ple_offload_embedding=False)
+
+    with pytest.raises(ValueError, match="ple_embed_dtype"):
+        Qwen4ExpNGramEmbedding(
+            config, Mapping(rank=0, world_size=1), 64, 0, None, "ple_embedding"
+        )
+
+
+def test_fp8_config_matches_modules_to_convert_on_module_boundaries() -> None:
+    quant_config = _checkpoint_quant_config("hf_fp8_table")
+
+    assert quant_config.stores_fp8_embedding(_PLE_TABLE_PREFIX)
+    assert quant_config.stores_fp8_embedding("ple.ple_embedding.ngram_embedding")
+    assert not quant_config.stores_fp8_embedding(
+        "model.language_model.layers.1.xple.ple_embedding.ngram_embedding"
+    )
+
+
+@_requires_cuda
+@pytest.mark.parametrize("scale_first", [False, True])
+@pytest.mark.parametrize("offload", [False, True])
+def test_ple_fp8_checkpoint_table_reads_like_dequantized_table(
+    offload: bool, scale_first: bool
+) -> None:
+    """Keeping an FP8 checkpoint table in FP8 returns the dequantized rows.
+
+    The kept table holds the checkpoint payload verbatim and applies the
+    per-tensor scale at lookup; a table stored in the compute dtype applies the
+    same scale at load. Lookups through both must match exactly.
+    """
+
+    config = _tiny_ple_config(ple_offload_embedding=offload, split_ngram_parts=1)
+    mapping = Mapping(rank=0, world_size=1)
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            kept, dequantized = [
+                Qwen4ExpNGramEmbedding(
+                    config,
+                    mapping,
+                    64,
+                    0,
+                    _checkpoint_quant_config(checkpoint),
+                    f"{_PLE_LAYER_PREFIX}.ple_embedding",
+                )
+                for checkpoint in ("modelopt_fp8_table", "modelopt")
+            ]
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    assert kept.lookup.embed_store_dtype == torch.float8_e4m3fn
+    assert dequantized.lookup.embed_store_dtype is None
+
+    torch.manual_seed(6)
+    rows = kept.lookup.ngram_embedding.org_vocab_size
+    payload = (
+        (torch.randn(rows, kept.head_dim) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+    )
+    shard = ("ple.ngram_embedding.shard_0.weight", payload)
+    # The scale of the released checkpoints' table.
+    scale = (
+        "ple.ngram_embedding.weight_scale",
+        torch.tensor([1.9931793212890625e-4], dtype=torch.bfloat16),
+    )
+    for embedding in (kept, dequantized):
+        root = torch.nn.Module()
+        root.ple = embedding
+        load_qwen4_exp_weights(
+            root,
+            config,
+            mapping,
+            [scale, shard] if scale_first else [shard, scale],
+            include_visual=False,
+        )
+
+    assert torch.equal(kept.lookup.ngram_embedding.weight[:rows].cpu(), payload)
+    contexts = torch.randint(0, 128, (96, 3), device="cuda")
+    torch.testing.assert_close(kept(contexts), dequantized(contexts), rtol=0, atol=0)
+
+
 def test_should_exclude_quant_module_expands_fused_members() -> None:
     from tokenspeed.runtime.layers.quantization.utils import (
         should_exclude_quant_module,
@@ -3729,38 +3903,18 @@ def _lookup_flat(embedding, input_ids, initial, req, col, starts):
 def _ngram_embedding_pair(
     store_fp8: bool,
 ) -> tuple[Qwen4ExpNGramEmbedding, Qwen4ExpNGramEmbedding]:
-    """A device-resident and a host-offloaded n-gram table holding equal rows.
+    """A device-resident and a host-offloaded n-gram table holding equal rows."""
 
-    ``ngram_vocab_size_base`` is tiny here so the two tables fit side by side;
-    the hash geometry that decides which rows are read is unaffected by it.
-    """
-
-    kwargs = dict(
-        vocab_size=128,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=16,
-        layer_types=["linear_attention", "full_attention"],
-        ple_layer_ids=[2],
-        ngram_size=3,
-        heads_per_ngram=4,
-        ngram_vocab_size_base=257,
-        make_ngram_vocab_size_divisible_by=8,
-        ple_embed_dtype="float8_e4m3fn" if store_fp8 else None,
-        hc_count=2,
-        num_experts=None,
-        eos_token_id=7,
-    )
     mapping = Mapping(rank=0, world_size=1)
     built = []
     for offload in (False, True):
-        config = Qwen4ExpTextConfig(**kwargs, ple_offload_embedding=offload)
+        config = _tiny_ple_config(
+            ple_embed_dtype="float8_e4m3fn" if store_fp8 else None,
+            ple_offload_embedding=offload,
+        )
         with torch.device("cuda"):
             built.append(
-                Qwen4ExpNGramEmbedding(config, mapping, 64, 0, "ple_embedding")
+                Qwen4ExpNGramEmbedding(config, mapping, 64, 0, None, "ple_embedding")
             )
     device, host = built
 
@@ -3863,30 +4017,13 @@ def test_ple_host_table_skips_device_allocation(
     """
 
     caplog.set_level(logging.INFO, logger="tokenspeed.runtime.layers.qwen4_exp_ple")
-    config = Qwen4ExpTextConfig(
-        vocab_size=128,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=16,
-        layer_types=["linear_attention", "full_attention"],
-        ple_layer_ids=[2],
-        ngram_size=3,
-        heads_per_ngram=4,
-        ngram_vocab_size_base=1_000_003,
-        make_ngram_vocab_size_divisible_by=8,
-        hc_count=2,
-        num_experts=None,
-        eos_token_id=7,
-    )
+    config = _tiny_ple_config(ngram_vocab_size_base=1_000_003)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.max_memory_allocated()
     with torch.device("cuda"):
         embedding = Qwen4ExpNGramEmbedding(
-            config, Mapping(rank=0, world_size=1), 64, 0, "ple_embedding"
+            config, Mapping(rank=0, world_size=1), 64, 0, None, "ple_embedding"
         )
     growth = torch.cuda.max_memory_allocated() - before
 

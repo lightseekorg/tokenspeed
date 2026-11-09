@@ -128,6 +128,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             host_group_packing=(),
             max_retracted_requests=0,
             host_write_policy="write_through",
+            prefill_decode_interval=0,
             storage_config=None,
             cache_groups=groups,
             state_checkpoint_in_forward=in_forward,
@@ -200,7 +201,9 @@ class TestGdnStateCheckpointInForward:
             layer_id=0,
         )
 
-    def _backend(self, state_dtype, *, spec_tokens=1):
+    def _backend(
+        self, state_dtype, *, writes_state_checkpoints_in_forward, spec_tokens=1
+    ):
         conv = torch.zeros(
             65, 3 * self.H * self.D, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
         )
@@ -215,7 +218,8 @@ class TestGdnStateCheckpointInForward:
                 spec_tokens=spec_tokens,
                 max_bs=4,
                 device="cuda",
-            )
+            ),
+            writes_state_checkpoints_in_forward=writes_state_checkpoints_in_forward,
         )
         backend.set_kv_pool(_ContractPool({0: ("linear_attention", conv, recurrent)}))
         backend.init_cuda_graph_state(max_bs=4)
@@ -301,7 +305,9 @@ class TestGdnStateCheckpointInForward:
         Returns the live slot's ``(conv, recurrent)`` state.
         """
         reference = _scheduler(self.ts, self.make_config, in_forward=False)
-        backend, conv, recurrent = self._backend(state_dtype)
+        backend, conv, recurrent = self._backend(
+            state_dtype, writes_state_checkpoints_in_forward=False
+        )
         self._submit(reference, "r", BOUNDARY)
         self._prefill(reference, backend, inputs)
         last, row, _ = self._prefill(reference, backend, inputs)
@@ -327,7 +333,9 @@ class TestGdnStateCheckpointInForward:
     ):
         inputs = (self.raw, self.a, self.b)
         scheduler = _scheduler(self.ts, self.make_config, in_forward=True)
-        backend, conv, recurrent = self._backend(state_dtype)
+        backend, conv, recurrent = self._backend(
+            state_dtype, writes_state_checkpoints_in_forward=True
+        )
         self._submit(scheduler, "x", PROMPT)
         first, _, _ = self._prefill(scheduler, backend, inputs)
         second, row, cold_output = self._prefill(scheduler, backend, inputs)
@@ -380,26 +388,35 @@ class TestGdnStateCheckpointInForward:
             tokens, 1, self.ForwardMode.EXTEND, capture=True
         )
 
-    def test_a_captured_shape_keeps_the_checkpoint_forwards_live_metadata(
-        self, state_dtype
+    @pytest.mark.parametrize("checkpoint_slots", [True, False])
+    def test_a_captured_shape_stores_the_checkpoint_of_its_forward(
+        self, state_dtype, checkpoint_slots
     ):
         # The second chunk (144 tokens, one request) has a startup-captured
-        # GDN shape. Its eager forward still prepares that shape's metadata,
-        # which carries no checkpoint: the forward keeps its own instead and
-        # stores the checkpoint.
+        # GDN shape, and its eager forward prepares that shape's metadata.
+        # With checkpoint slots (the server writes in-forward checkpoints) it
+        # runs on the shape's fixed metadata, whose scan stores at every page;
+        # without them the forward keeps its own live metadata. Either way the
+        # checkpoint block holds what a forward ending at the boundary leaves.
         inputs = (self.raw, self.a, self.b)
         scheduler = _scheduler(self.ts, self.make_config, in_forward=True)
-        backend, conv, recurrent = self._backend(state_dtype)
+        backend, conv, recurrent = self._backend(
+            state_dtype, writes_state_checkpoints_in_forward=checkpoint_slots
+        )
         self._retain_capture_shape(backend, PROMPT - BUDGET)
         self._submit(scheduler, "x", PROMPT)
         self._prefill(scheduler, backend, inputs)
         op, row = self._plan(scheduler, backend)
         assert list(op.extend_state_checkpoint_lens) == [BOUNDARY - BUDGET]
         live = backend.forward_metadata
-        assert not backend.prepare_prefill_metadata(
-            PROMPT - BUDGET, 1, self.ForwardMode.EXTEND, capture=False
+        assert (
+            backend.prepare_prefill_metadata(
+                PROMPT - BUDGET, 1, self.ForwardMode.EXTEND, capture=False
+            )
+            is checkpoint_slots
         )
-        assert backend.forward_metadata is live
+        assert (backend.forward_metadata is live) is not checkpoint_slots
+        assert backend.prefill_metadata_is_capture_ready is checkpoint_slots
         self._forward(backend, *(t[BUDGET:] for t in inputs))
         ref_conv, ref_recurrent = self._reference(state_dtype, inputs)
         assert torch.equal(conv[row[2]], ref_conv)
@@ -418,7 +435,9 @@ class TestGdnStateCheckpointInForward:
 
         inputs = (self.raw, self.a, self.b)
         scheduler = _scheduler(self.ts, self.make_config, in_forward=True)
-        backend, conv, recurrent = self._backend(state_dtype)
+        backend, conv, recurrent = self._backend(
+            state_dtype, writes_state_checkpoints_in_forward=True
+        )
         bucket = 256
         static = [
             torch.zeros(bucket, *t.shape[1:], dtype=t.dtype, device="cuda")
@@ -486,7 +505,9 @@ class TestGdnStateCheckpointInForward:
         accepted = torch.tensor([1, 1, 2, 3], dtype=torch.int32, device="cuda")
 
         def resuming_backend():
-            backend, conv, recurrent = self._backend(state_dtype, spec_tokens=width)
+            backend, conv, recurrent = self._backend(
+                state_dtype, writes_state_checkpoints_in_forward=True, spec_tokens=width
+            )
             conv[resumed] = resumed_conv
             recurrent[resumed] = resumed_recurrent
             return backend, conv, recurrent
@@ -662,7 +683,7 @@ def test_startup_refuses_a_state_consumer_that_cannot_store_the_checkpoint(
     # The checkpoints sit at multiples of the bound pool's prefix granularity.
     pool.arena.runtime_contract.prefix_granularity = prefix_granularity
 
-    gdn = GdnAttnBackend(config, spec)
+    gdn = GdnAttnBackend(config, spec, writes_state_checkpoints_in_forward=True)
     gdn.set_cache_pool(pool)
     if prefix_granularity % 64 == 0:
         validate_state_checkpoint_in_forward(attn_backend=gdn, kv_pool=pool)

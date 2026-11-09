@@ -22,12 +22,18 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.kvcache.triton import (
+    _index_k_layernorm_fp8_scatter_args,
+    _index_k_layernorm_fp8_scatter_row,
+)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _is_nvidia = current_platform().is_nvidia
 
 _RADIX_TOPK_MIN_COLS = 32768
 _RADIX_TOPK_BLOCK_N = 4096
+# Query heads per program of the fused index-K write; the row's key rides on the first block.
+_FUSED_QUERY_HEADS_PER_PROGRAM = 8
 
 
 @triton.jit
@@ -107,14 +113,18 @@ def mark_forced_initial_local_logits(
 def _scrub_nonfinite_logits_kernel(
     logits_ptr,
     logits_row_stride,
-    lengths_ptr,
+    seq_lens_ptr,
     # Width follows the block table; runtime so every width shares one binary.
     num_cols,
+    NEXT_N: tl.constexpr,
     SPLITS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    length = tl.minimum(tl.load(lengths_ptr + row).to(tl.int32), num_cols)
+    # Verify row j of a request sees its seq_len - (NEXT_N - 1 - j) causal candidates.
+    seq_len = tl.load(seq_lens_ptr + row // NEXT_N).to(tl.int32)
+    length = seq_len - (NEXT_N - 1) + (row % NEXT_N).to(tl.int32)
+    length = tl.minimum(tl.maximum(length, 0), num_cols)
     for start in range(tl.program_id(1) * BLOCK, length, SPLITS * BLOCK):
         cols = start + tl.arange(0, BLOCK)
         ptrs = logits_ptr + row * logits_row_stride + cols
@@ -123,31 +133,42 @@ def _scrub_nonfinite_logits_kernel(
         tl.store(ptrs, float("-inf"), mask=(cols < length) & bad)
 
 
-def scrub_nonfinite_logits(logits: torch.Tensor, lengths: torch.Tensor) -> None:
-    """Set NaN and +inf scores to -inf in each row's first ``lengths`` columns.
+def scrub_nonfinite_logits(
+    logits: torch.Tensor, seq_lens: torch.Tensor, *, next_n: int
+) -> None:
+    """Set NaN and +inf scores to -inf in each row's causal candidates.
 
-    Columns past a row's length are left as they are: the length-aware top-k
-    kernels never read them, so the work follows the context, not the width.
+    Row ``r`` holds verify row ``r % next_n`` of request ``r // next_n``,
+    whose candidates are the first ``seq_lens[r // next_n] - next_n + 1 +
+    r % next_n`` columns (clamped to the width). Columns past them are left as
+    they are: the length-aware top-k kernels never read them, so the work
+    follows the context, not the width.
 
     Args:
-        logits: ``[rows, candidates]`` FP32 scores, unit column stride; mutated.
-        lengths: ``[rows]`` valid candidates per row, clamped to the width.
+        logits: ``[requests * next_n, candidates]`` FP32 scores, unit column
+            stride; mutated.
+        seq_lens: ``[requests]`` context length per request.
+        next_n: Query rows per request (1 for plain decode).
     """
     if logits.dim() != 2 or logits.stride(1) != 1:
         raise ValueError("logits must be a 2-D tensor with unit column stride")
-    if lengths.shape != (logits.shape[0],):
+    if next_n < 1 or seq_lens.shape != (logits.shape[0] // next_n,):
         raise ValueError(
-            f"lengths must have shape ({logits.shape[0]},), got {tuple(lengths.shape)}"
+            f"seq_lens must have shape ({logits.shape[0]} // next_n,) for "
+            f"next_n={next_n}, got {tuple(seq_lens.shape)}"
         )
+    if logits.shape[0] % next_n:
+        raise ValueError(f"{logits.shape[0]} rows are not whole requests of {next_n}")
     if logits.numel() == 0:
         return
-    lengths = lengths.to(device=logits.device, dtype=torch.int32).contiguous()
+    seq_lens = seq_lens.to(device=logits.device, dtype=torch.int32).contiguous()
     splits = 16
     _scrub_nonfinite_logits_kernel[(logits.shape[0], splits)](
         logits,
         logits.stride(0),
-        lengths,
+        seq_lens,
         num_cols=logits.shape[1],
+        NEXT_N=next_n,
         SPLITS=splits,
         BLOCK=1024,
         num_warps=4,
@@ -448,6 +469,312 @@ def workspace_topk_to_global_slots(
     if out_view.data_ptr() != out.data_ptr():
         out.copy_(out_view)
     return out
+
+
+@triton.jit
+def _quantize_index_query_heads(
+    q_ptr,
+    weights_ptr,
+    q_out_ptr,
+    weights_out_ptr,
+    row,  # int64 token row
+    head,  # [HEADS_PER_PROGRAM] head indices
+    softmax_scale,
+    fp8_max,
+    amax_floor,
+    q_row_stride,
+    q_head_stride,
+    weights_row_stride,
+    heads,
+    DIM: tl.constexpr,
+):
+    head_mask = head < heads
+    cols = tl.arange(0, DIM)
+    y = tl.load(
+        q_ptr + row * q_row_stride + head[:, None] * q_head_stride + cols[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    # TRT-LLM's 1x128 token-group quantizer: amax floored at 1e-10 in the input dtype, IEEE divisions.
+    amax = tl.maximum(tl.max(tl.abs(y), axis=1), amax_floor)
+    y_s_inv = tl.div_rn(fp8_max, amax)
+    y_s = tl.div_rn(1.0, y_s_inv)
+    y_q = tl.clamp(y * y_s_inv[:, None], -fp8_max, fp8_max)
+    tl.store(
+        q_out_ptr + (row * heads + head[:, None]) * DIM + cols[None, :],
+        y_q.to(q_out_ptr.dtype.element_ty),
+        mask=head_mask[:, None],
+    )
+    w = tl.load(weights_ptr + row * weights_row_stride + head, mask=head_mask)
+    tl.store(
+        weights_out_ptr + row * heads + head,
+        w.to(tl.float32) * y_s * softmax_scale,
+        mask=head_mask,
+    )
+
+
+@triton.jit
+def _quantize_index_query_weights_kernel(
+    q_ptr,
+    weights_ptr,
+    q_out_ptr,
+    weights_out_ptr,
+    softmax_scale,
+    fp8_max,
+    amax_floor,
+    q_row_stride,
+    q_head_stride,
+    weights_row_stride,
+    heads,
+    DIM: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+):
+    _quantize_index_query_heads(
+        q_ptr,
+        weights_ptr,
+        q_out_ptr,
+        weights_out_ptr,
+        tl.program_id(0).to(tl.int64),
+        tl.program_id(1) * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM),
+        softmax_scale,
+        fp8_max,
+        amax_floor,
+        q_row_stride,
+        q_head_stride,
+        weights_row_stride,
+        heads,
+        DIM,
+    )
+
+
+def _quantize_index_query_weights_args(
+    q: torch.Tensor, weights: torch.Tensor, softmax_scale: float
+) -> tuple[tuple, torch.Tensor, torch.Tensor]:
+    """Validate :func:`quantize_index_query_weights`' inputs (same arguments).
+
+    Returns ``(args, q_fp8, folded)``: the runtime arguments
+    ``_quantize_index_query_weights_kernel`` takes and its two outputs.
+    """
+    tokens, heads, dim = q.shape
+    if dim != 128 or q.stride(-1) != 1 or weights.stride(-1) != 1:
+        raise ValueError("expects [tokens, heads, 128] queries and unit-stride rows")
+    if weights.shape != (tokens, heads):
+        raise ValueError(f"weights must have shape {(tokens, heads)}")
+    q_fp8 = torch.empty(
+        (tokens, heads, dim), dtype=torch.float8_e4m3fn, device=q.device
+    )
+    folded = torch.empty((tokens, heads), dtype=torch.float32, device=q.device)
+    args = (
+        q,
+        weights,
+        q_fp8,
+        folded,
+        float(softmax_scale),
+        float(torch.finfo(torch.float8_e4m3fn).max),
+        float(torch.tensor(1e-10, dtype=q.dtype)),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        heads,
+    )
+    return args, q_fp8, folded
+
+
+def quantize_index_query_weights(
+    q: torch.Tensor, weights: torch.Tensor, softmax_scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize index queries to E4M3 with one scale per (token, head) and fold
+    that scale and ``softmax_scale`` into the head weights, in one launch.
+
+    Bit-exact with NVIDIA's 1x128 token-group ``quantize_fp8`` followed by
+    ``combine_topk_weights``, which it replaces on the NVIDIA scoring paths.
+
+    Args:
+        q: ``[tokens, heads, 128]`` BF16 index queries, unit stride on the last dim.
+        weights: ``[tokens, heads]`` head weights, unit stride on the last dim.
+        softmax_scale: Constant score scale folded into the weights.
+
+    Returns:
+        ``[tokens, heads, 128]`` contiguous E4M3 queries and ``[tokens, heads]``
+        contiguous FP32 combined weights.
+    """
+    args, q_fp8, folded = _quantize_index_query_weights_args(q, weights, softmax_scale)
+    tokens, heads = q.shape[:2]
+    if tokens:
+        # One head per program while the grid is small, eight once rows fill the GPU.
+        per_program = 1 if tokens * heads <= 4096 else 8
+        _quantize_index_query_weights_kernel[(tokens, triton.cdiv(heads, per_program))](
+            *args,
+            DIM=q.shape[2],
+            HEADS_PER_PROGRAM=per_program,
+            num_warps=1 if per_program == 1 else 4,
+            num_stages=1,
+        )
+    return q_fp8, folded
+
+
+@triton.jit
+def _index_k_write_quantize_query_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    norm_weight_ptr,
+    norm_bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    q_ptr,
+    weights_ptr,
+    q_out_ptr,
+    weights_out_ptr,
+    softmax_scale,
+    fp8_max,
+    amax_floor,
+    q_row_stride,
+    q_head_stride,
+    weights_row_stride,
+    heads,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    DIM: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    _quantize_index_query_heads(
+        q_ptr,
+        weights_ptr,
+        q_out_ptr,
+        weights_out_ptr,
+        row,
+        block * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM),
+        softmax_scale,
+        fp8_max,
+        amax_floor,
+        q_row_stride,
+        q_head_stride,
+        weights_row_stride,
+        heads,
+        DIM,
+    )
+    # The first head block of a row also writes its key.
+    if block == 0:
+        _index_k_layernorm_fp8_scatter_row(
+            fp8_buf_ptr,
+            scale_buf_ptr,
+            x_ptr,
+            norm_weight_ptr,
+            norm_bias_ptr,
+            loc_ptr,
+            write_mask_ptr,
+            row,
+            x_row_stride,
+            page_bytes,
+            scale_base_off,
+            eps,
+            HAS_WRITE_MASK,
+            PAGE_SIZE,
+            HD,
+            GROUP,
+            NG,
+            BLOCK_NG,
+            FP8_MAX,
+        )
+
+
+def index_k_layernorm_fp8_scatter_and_quantize_query(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    loc: torch.Tensor,
+    q: torch.Tensor,
+    head_weights: torch.Tensor,
+    *,
+    eps: float,
+    page_size: int,
+    group_size: int,
+    write_mask: torch.Tensor | None,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write index keys and quantize the same rows' index queries in one launch.
+
+    The plane's bytes are exactly those of ``index_k_layernorm_fp8_scatter(buf,
+    index_k, norm_weight, norm_bias, loc, ...)`` and the outputs exactly
+    ``quantize_index_query_weights(q, head_weights, softmax_scale)``: each
+    program quantizes one block of a row's query heads with that kernel's row
+    function, and a row's first block also writes its key with the key
+    kernel's, the LayerNorm in one warp as there. CUDA-graph safe; no
+    per-batch constexpr.
+
+    Args:
+        buf: uint8 ``fp8_scaled`` index-K plane (a slot matrix or a page
+            view), as for ``index_k_layernorm_fp8_scatter``.
+        index_k: ``[tokens, head_dim]`` pre-norm keys with unit inner stride.
+        norm_weight: ``[head_dim]`` LayerNorm weight.
+        norm_bias: ``[head_dim]`` LayerNorm bias.
+        loc: ``[tokens]`` non-negative integer slot indices.
+        q: ``[tokens, heads, 128]`` BF16 index queries, unit last stride.
+        head_weights: ``[tokens, heads]`` head weights, unit last stride.
+        eps: Positive LayerNorm epsilon.
+        page_size: Rows per page of the plane.
+        group_size: Key elements per scale; divides ``head_dim``.
+        write_mask: Optional bool ``[tokens]`` ownership mask; False rows'
+            keys are not written. None writes every row.
+        softmax_scale: Score scale folded into the head weights.
+
+    Returns:
+        ``[tokens, heads, 128]`` contiguous E4M3 queries and ``[tokens,
+        heads]`` contiguous FP32 head weights carrying each query's scale and
+        ``softmax_scale``; ``buf`` is written in place.
+    """
+    key_args, key_constexprs = _index_k_layernorm_fp8_scatter_args(
+        buf,
+        index_k,
+        norm_weight,
+        norm_bias,
+        loc,
+        eps=eps,
+        page_size=page_size,
+        group_size=group_size,
+        write_mask=write_mask,
+    )
+    query_args, q_fp8, folded = _quantize_index_query_weights_args(
+        q, head_weights, softmax_scale
+    )
+    tokens, heads = q.shape[:2]
+    if index_k.shape[0] != tokens:
+        raise ValueError(
+            f"index_k has {index_k.shape[0]} rows and q has {tokens}; the "
+            "fused write quantizes the queries of its own rows"
+        )
+    if tokens:
+        enable_pdl = pdl_enabled()
+        grid = (tokens, triton.cdiv(heads, _FUSED_QUERY_HEADS_PER_PROGRAM))
+        _index_k_write_quantize_query_kernel[grid](
+            *key_args,
+            *query_args,
+            **key_constexprs,
+            DIM=q.shape[2],
+            HEADS_PER_PROGRAM=_FUSED_QUERY_HEADS_PER_PROGRAM,
+            ENABLE_PDL=enable_pdl,
+            # One warp: the key's LayerNorm sums in the order of the scatter kernel's.
+            num_warps=1,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
+    return q_fp8, folded
 
 
 @triton.jit
@@ -1592,9 +1919,11 @@ __all__ = [
     "combine_topk_weights",
     "dsa_decode_topk_fp8",
     "dsa_prefill_topk_fp8",
+    "index_k_layernorm_fp8_scatter_and_quantize_query",
     "triton_topk_from_logits",
     "local_topk_to_global_slots",
     "mark_forced_initial_local_logits",
+    "quantize_index_query_weights",
     "scrub_nonfinite_logits",
     "workspace_topk_to_global_slots",
 ]

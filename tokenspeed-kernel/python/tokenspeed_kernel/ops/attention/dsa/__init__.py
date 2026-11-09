@@ -160,6 +160,9 @@ SLOT_ORDERS = ("selection", "sorted")
 # a ``*args, **kwargs`` wrapper that does not declare it never sees it.
 CANDIDATE_LENS_CPU_FEATURE = "candidate_lens_cpu"
 
+# Required when a caller supplies the host mirror of prefill workspace starts.
+ROW_STARTS_CPU_FEATURE = "row_starts_cpu"
+
 # Feature a ``dsa_prefill_topk`` leaf declares when its launcher takes index-K
 # rows handed to it already in workspace-row order instead of resolving them
 # from a plane through ``kv_workspace_slots``: the ``index_k_fp8`` +
@@ -1268,6 +1271,7 @@ def dsa_prefill_topk(
     q_scales: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     candidate_lens_cpu: torch.Tensor | None = None,
+    row_starts_cpu: torch.Tensor | None = None,
     initial_tokens: int = 0,
     local_tokens: int = 0,
     out: torch.Tensor | None = None,
@@ -1331,6 +1335,13 @@ def dsa_prefill_topk(
             ``candidate_lens_cpu`` feature (DeepGEMM sizes its chunk launches
             from it without synchronizing the CUDA stream); implementations
             without the feature never see it.
+        row_starts_cpu: Optional int32 or int64 CPU mirror of ``row_starts``, shape
+            [tokens]. None supplies no mirror and leaves selection unchanged.
+            Supplying it requires the ``row_starts_cpu`` feature, including
+            for overrides and saved plans; the selected leaf receives it
+            unchanged. The caller must keep its values equal to row_starts
+            for this invocation; equality is not checked to avoid a device
+            synchronization. Strided CPU mirrors are accepted.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
         lens_out: Optional contiguous int32 output buffer on q's device with
@@ -1363,6 +1374,16 @@ def dsa_prefill_topk(
             "candidate_lens_cpu must be a CPU tensor with shape "
             f"{(q.shape[0],)}, got device={candidate_lens_cpu.device}, "
             f"shape={tuple(candidate_lens_cpu.shape)}"
+        )
+    if row_starts_cpu is not None and (
+        row_starts_cpu.device.type != "cpu"
+        or row_starts_cpu.dtype not in (torch.int32, torch.int64)
+        or row_starts_cpu.shape != (q.shape[0],)
+    ):
+        raise ValueError(
+            "row_starts_cpu must be an int32 or int64 CPU tensor with shape "
+            f"{(q.shape[0],)}, got device={row_starts_cpu.device}, "
+            f"dtype={row_starts_cpu.dtype}, shape={tuple(row_starts_cpu.shape)}"
         )
     if out is not None and out.shape != (q.shape[0], int(topk)):
         raise ValueError(
@@ -1422,6 +1443,8 @@ def dsa_prefill_topk(
         required_features.add("batch_invariant")
     if has_workspace_rows:
         required_features.add(INDEX_K_WORKSPACE_ROWS_FEATURE)
+    if row_starts_cpu is not None:
+        required_features.add(ROW_STARTS_CPU_FEATURE)
     signature = _attention_format_signature(q=q, weights=weights)
     if kernel_plan is None:
         kernel = select_kernel(
@@ -1491,6 +1514,8 @@ def dsa_prefill_topk(
             **index_k_rows_kwargs,
             **slot_order_kwargs,
         }
+        if row_starts_cpu is not None:
+            kernel_kwargs["row_starts_cpu"] = row_starts_cpu
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
         if initial_tokens or local_tokens:
@@ -1531,7 +1556,8 @@ def dsa_decode_topk(
 
     Args:
         q: BF16 or FP8 E4M3 indexer query with shape
-            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
+            [tokens, index_heads, head_dim]. FP8 queries take q_scales, or
+            unit scales where a leaf accepts them (see q_scales).
         weights: Per-token/head weights with shape [tokens, index_heads],
             FP32 or raw BF16 (implementations upcast on the fly).
         seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
@@ -1561,7 +1587,9 @@ def dsa_decode_topk(
             (``"bf16"``, packed).
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
-            q_scales[token, head]``.
+            q_scales[token, head]``. None gives FP8 queries unit scales, for
+            weights that already carry the query scales and the score scale
+            (``quantize_index_query_weights``' output, ``softmax_scale=1``).
         seq_lens_2d: Optional per-token rows of the request's full KV length
             (``[tokens, 1]``, every row of a request carrying ``seq_lens[req]``),
             the scoring extent the ``plan`` was built from (:func:`dsa_plan`).
@@ -1802,6 +1830,7 @@ __all__ = [
     "CANDIDATE_LENS_CPU_FEATURE",
     "INDEX_CANDIDATE_PAGES_FEATURE",
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
+    "ROW_STARTS_CPU_FEATURE",
     "SLOT_ORDERS",
     "DSAIndexCandidatePages",
     "DSAResources",

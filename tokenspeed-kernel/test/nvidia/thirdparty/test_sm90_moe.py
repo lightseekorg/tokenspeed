@@ -93,8 +93,8 @@ def _require_private_sm90():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Requires Hopper SM90")
     flashinfer = pytest.importorskip("flashinfer")
-    if flashinfer.__version__ != "0.7.2.post1":
-        pytest.skip("The private source patch targets FlashInfer 0.7.2.post1")
+    if flashinfer.__version__ != "0.7.3":
+        pytest.skip("The private source patch targets FlashInfer 0.7.3")
 
 
 @pytest.fixture(scope="module")

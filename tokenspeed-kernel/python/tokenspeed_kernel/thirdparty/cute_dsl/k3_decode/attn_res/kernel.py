@@ -208,7 +208,6 @@ class ClusterAttnRes:
             base = delta.iterator + token * 7168 + col
             got = poll(base, delta.shape[1] * 7168, self.slots)
             for slot in cutlass.range_constexpr(self.slots):
-                rearm(base + slot * delta.shape[1] * 7168)
                 part = cute.make_rmem_tensor((1, 8), Float32)
                 unpack(tuple(got[slot, k] for k in range(4)), part, 0)
                 for i in cutlass.range_constexpr(8):
@@ -274,3 +273,9 @@ class ClusterAttnRes:
         for j in cutlass.range_constexpr(4):
             words[j] = bf16x2(result[0, 2 * j], result[0, 2 * j + 1])
         store_words(at(output, token, col), tuple(words[j] for j in range(4)))
+        if cutlass.const_expr(self.slots > 0):
+            # Re-arm the mailbox fragments only now: sentinel stores between the
+            # Lamport poll and the exchange slowed the CTA's other pollers.
+            base = delta.iterator + token * 7168 + col
+            for slot in cutlass.range_constexpr(self.slots):
+                rearm(base + slot * delta.shape[1] * 7168)

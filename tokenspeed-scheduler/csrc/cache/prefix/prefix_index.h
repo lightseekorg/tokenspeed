@@ -77,6 +77,10 @@ public:
         // one never does.
         std::uint64_t max_access_epoch{0};
         SessionCacheOwner session;
+        // Demote dated the entry back and no access has touched it since. A
+        // session's demotion (DemoteSessions) and a superseded input date an
+        // entry back too, but never set this.
+        bool demoted{false};
     };
 
     // Non-owning traversal state, bound on first use to one index/pool. The
@@ -476,6 +480,42 @@ public:
         return changed;
     }
 
+    // Dates key's entry back to `epoch`, never forward, marks it demoted
+    // (CachedBlockMetadata::demoted) and forgets its acquisition
+    // (CacheCoordinator::DemoteEntries); an entry a session's demotion dated
+    // there already is marked too. False when the tier does not cache key, the
+    // entry is demoted already or older than `epoch`, or anything holds its
+    // block beyond the index and the write_back_holds references of an
+    // eviction write-back that publishes into this very entry. A later hit,
+    // touch or republication dates it forward again and ends the demotion.
+    bool Demote(const BlockPool& pool, const CacheKey& key, std::uint64_t epoch, std::uint32_t write_back_holds) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return false;
+        }
+        const CacheEntryIterator entry_it = findEntry(*cache_index, key);
+        if (entry_it == cache_index->entries.end() || entry_it->demoted || entry_it->last_access_epoch < epoch ||
+            entry_it->block_ref.use_count() > 1 + write_back_holds) {
+            return false;
+        }
+        markDemoted(*cache_index, entry_it, epoch);
+        return true;
+    }
+
+    // Marks key's entry demoted, as Demote does, when it carries `epoch`
+    // already, whatever holds it: an eviction write-back publishes a copy a
+    // demotion reached on its way (CacheCoordinator::CacheHostBlock).
+    void MarkDemoted(const BlockPool& pool, const CacheKey& key, std::uint64_t epoch) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return;
+        }
+        const CacheEntryIterator entry_it = findEntry(*cache_index, key);
+        if (entry_it != cache_index->entries.end() && entry_it->last_access_epoch == epoch) {
+            markDemoted(*cache_index, entry_it, epoch);
+        }
+    }
+
     // The key of the entry at `location` when Evict would take it: the index
     // is its block's only owner.
     std::optional<CacheKey> UnpinnedKeyAt(const BlockPool& pool, CacheBlockLocation location) const {
@@ -605,6 +645,8 @@ private:
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         // Set only after a successful request admission acquires this entry.
         bool was_acquired{false};
+        // See CachedBlockMetadata::demoted.
+        bool demoted{false};
         // See CachedBlockMetadata::max_access_epoch.
         std::uint64_t max_access_epoch{0};
         EvictionOrderMap* available_order{nullptr};
@@ -674,6 +716,7 @@ private:
             .was_acquired = cache_entry.was_acquired,
             .max_access_epoch = cache_entry.max_access_epoch,
             .session = cache_entry.session,
+            .demoted = cache_entry.demoted,
         };
     }
     static EvictionOrder evictionOrder(const CacheEntry& cache_entry) {
@@ -691,6 +734,8 @@ private:
     // back of an LRU list would not preserve this order.
     void touchEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch) {
         entry_it->max_access_epoch = std::max(entry_it->max_access_epoch, access_epoch);
+        // A touch ends a demotion; markDemoted marks the entry after its own.
+        entry_it->demoted = false;
         if (entry_it->session && entry_it->session->demoted) access_epoch = 0;
         if (entry_it->last_access_epoch == access_epoch) {
             return;
@@ -710,6 +755,12 @@ private:
         } else {
             entry_it->pinned_order.key() = evictionOrder(*entry_it);
         }
+    }
+    // Demote's and MarkDemoted's common step.
+    void markDemoted(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t epoch) {
+        entry_it->was_acquired = false;
+        touchEntry(cache_index, entry_it, epoch);
+        entry_it->demoted = true;
     }
 
     CacheEntries& cacheEntries(const BlockPool& pool) {
