@@ -62,7 +62,13 @@ class EngineMetrics:
         labelnames = list(labels.keys())
         self.num_requests_running = factory.gauge(
             name="tokenspeed:num_requests_running",
-            documentation="Requests with scheduler-side generation state (decode path).",
+            documentation="Requests in the scheduler's running batch: prefill, prefill-done, and decode rows.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+        )
+        self.num_requests_inflight = factory.gauge(
+            name="tokenspeed:num_requests_inflight",
+            documentation="Requests admitted and not finished, including PD transfer and waiting states.",
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -207,6 +213,12 @@ class EngineMetrics:
         self.num_decode_prealloc_queue_reqs = factory.gauge(
             name="tokenspeed:num_decode_prealloc_queue_reqs",
             documentation="Decode requests waiting for their prefill peer to connect.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+        )
+        self.num_decode_kv_wait_reqs = factory.gauge(
+            name="tokenspeed:num_decode_kv_wait_reqs",
+            documentation="Decode requests waiting for the prefill peer's KV: admitted with destination pages held, with no schedulable work.",
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -403,11 +415,17 @@ class EngineMetrics:
         )
 
     def set_scheduler_snapshot(
-        self, *, running: int, waiting: int, kv_cache_usage_ratio: float
+        self,
+        *,
+        running: int,
+        inflight: int,
+        waiting: int,
+        kv_cache_usage_ratio: float,
     ) -> None:
         if not self.enabled:
             return
         self.num_requests_running.labels(**self.labels).set(running)
+        self.num_requests_inflight.labels(**self.labels).set(inflight)
         self.num_requests_waiting.labels(**self.labels).set(waiting)
         self.kv_cache_usage_ratio.labels(**self.labels).set(kv_cache_usage_ratio)
 
@@ -419,6 +437,7 @@ class EngineMetrics:
         self,
         *,
         running: int,
+        inflight: int,
         waiting: int,
         num_active_pages: int,
         num_total_pages: int,
@@ -429,6 +448,7 @@ class EngineMetrics:
         ratio = num_active_pages / num_total_pages if num_total_pages else 0.0
         self.set_scheduler_snapshot(
             running=running,
+            inflight=inflight,
             waiting=waiting,
             kv_cache_usage_ratio=ratio,
         )
@@ -517,11 +537,12 @@ class EngineMetrics:
         self.num_retracted_queue_reqs.labels(**self.labels).set(max(retracted, 0))
 
     def record_decode_queues(
-        self, *, prealloc: int, transfer: int, retracted: int
+        self, *, prealloc: int, kv_wait: int, transfer: int, retracted: int
     ) -> None:
         if not self.enabled:
             return
         self.num_decode_prealloc_queue_reqs.labels(**self.labels).set(max(prealloc, 0))
+        self.num_decode_kv_wait_reqs.labels(**self.labels).set(max(kv_wait, 0))
         self.num_decode_transfer_queue_reqs.labels(**self.labels).set(max(transfer, 0))
         self.num_retracted_queue_reqs.labels(**self.labels).set(max(retracted, 0))
 

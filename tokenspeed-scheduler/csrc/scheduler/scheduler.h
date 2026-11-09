@@ -130,6 +130,11 @@ public:
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
+    // Requests in the running batch: local prefill forwards, prompts whose
+    // prefill is done (about to decode or to transfer), and decodes.
+    // RemotePrefilling (waiting for the peer's KV), waiting and retracted
+    // requests are not running.
+    std::size_t RunningSize() const;
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.

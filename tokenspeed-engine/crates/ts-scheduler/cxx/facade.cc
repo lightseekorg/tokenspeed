@@ -203,6 +203,7 @@ AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std
 
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
     return SchedulerSizes{
+        .running = scheduler.RunningSize(),
         .waiting = scheduler.WaitingSize(),
         .prefilling = scheduler.PrefillSize(),
         .decoding = scheduler.DecodingSize(),

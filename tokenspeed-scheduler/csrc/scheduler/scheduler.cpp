@@ -462,6 +462,12 @@ std::size_t Scheduler::PrefillSize() const {
     }));
 }
 
+std::size_t Scheduler::RunningSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone, fsm::Decoding>();
+    }));
+}
+
 std::size_t Scheduler::RemotePrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::RemotePrefilling>(); }));
