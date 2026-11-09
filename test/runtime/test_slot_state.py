@@ -240,8 +240,7 @@ def _dsa(pool, *, is_draft: bool) -> DSABackend:
 def _sampling_backend(cls) -> SamplingBackend:
     """A sampling backend over the test pool geometry, on the CPU."""
     sonic = cls is SonicSamplingBackend
-    # sonic verifies point-draw drafts and has no draft-prob verify.
-    draft_probs = cls not in (GreedySamplingBackend, SonicSamplingBackend)
+    draft_probs = cls is not GreedySamplingBackend
     config = SamplingBackendConfig(
         synthetic_acceptance_length=None,
         enable_speculative_sampling=draft_probs,

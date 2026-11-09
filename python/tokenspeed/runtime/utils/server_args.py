@@ -73,12 +73,13 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 
 logger = get_colorful_logger(__name__)
 
-# Sampling backends whose verify runs the draft-prob chain kernel
-# (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP).
+# Sampling backends whose verify runs a draft-prob chain kernel
+# (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP): the
+# FlashInfer backends over whole rows, sonic over its top-128 candidates.
 # greedy verifies by exact match and the Triton backends by target-sampled
 # exact match; the step drafters' dense recorded distribution never enters
 # either.
-SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full"})
+SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "sonic"})
 # The one backend whose verify reads the DFlash2 candidate selector's sparse
 # draft q (RuntimeStates.future_draft_q): DFLASH under the flag needs it.
 DFLASH_SPECULATIVE_SAMPLING_BACKEND = "triton"
