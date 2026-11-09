@@ -1656,6 +1656,61 @@ protected:
     }
 };
 
+TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantedFirstAdmissionCountsTowardOldestProtection) {
+    for (const bool abort_victim : {false, true}) {
+        SCOPED_TRACE(abort_victim ? "abort grant" : "retraction grant");
+        auto cfg = MakeConfig();
+        cfg.prefill_decode_interval = 0;
+        cfg.enable_short_prefill_first = true;
+        if (abort_victim) {
+            cfg.snapshot_allocator.total_pages = 1;
+            cfg.max_retracted_requests = 0;
+        }
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+        Submit(
+            {MakeRequestSpec("c", 1, /*start=*/300), MakeRequestSpec("e", 1, /*start=*/500), MakeRequestSpec("a", 2)});
+        EXPECT_EQ(Round(), "P:cea");
+        EXPECT_EQ(Round(), "D:cea");
+        EXPECT_EQ(Round(), "D:cea");
+
+        Submit(MakeRequestSpec("old", 6, /*start=*/100));
+        Submit(MakeRequestSpec("short", 4, /*start=*/200));
+        // Neither prompt fits until a gives up its pages. The shorter prompt receives
+        // the freed capacity after its ordinary admission failed this round.
+        const auto grant = PlanOnce();
+        const auto* batch = FindForwardBatch(grant);
+        ASSERT_NE(batch, nullptr);
+        EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"short", "c", "e"}));
+        ASSERT_EQ(grant.aborts.size(), abort_victim ? 1u : 0u);
+        if (abort_victim) {
+            EXPECT_EQ(grant.aborts.front().request_id, "a");
+            EXPECT_EQ(grant.aborts.front().reason, AbortReason::kImageDoesNotFit);
+        }
+        ASSERT_EQ(scheduler_->RetractedSize(), abort_victim ? 0u : 1u);
+        AckImageStores(grant);
+        SendForwardDone("short");
+        SendForwardDone("c", {7});
+        SendForwardDone("e", {7});
+        SendFinish("c");
+        SendFinish("e");
+        if (!abort_victim) {
+            SendAbortEvent("a");
+        }
+        SendAbortEvent("short");
+
+        // The grant was the first bypass. Seven ordinary admissions fill the
+        // remaining allowance; each consumes the round's entire token budget.
+        for (int i = 0; i < 7; ++i) {
+            const std::string id = "s" + std::to_string(i);
+            Submit(MakeRequestSpec(id, 4, /*start=*/1000 + i * 100));
+            EXPECT_EQ(Round(), "P:" + id);
+            SendFinish(id);
+        }
+        Submit(MakeRequestSpec("later", 4, /*start=*/2000));
+        EXPECT_EQ(Round({"old"}), "P:old");
+    }
+}
+
 TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantAdmittedPromptIsNotHeldBackThatRound) {
     Submit({MakeRequestSpec("c", 1, /*start=*/300), MakeRequestSpec("e", 1, /*start=*/500), MakeRequestSpec("a", 2)});
     EXPECT_EQ(Round(), "P:cea");

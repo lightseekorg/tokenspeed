@@ -187,6 +187,40 @@ TEST_P(ShortPrefillOrderTest, ForbiddenReuseDoesNotImproveTheRank) {
     EXPECT_EQ(batch->extend_prefix_lens, (std::vector<std::int32_t>{0, 0}));
 }
 
+TEST_P(ShortPrefillOrderTest, ReplayWorkRanksAfterASmallerColdPrompt) {
+    auto config = MakeConfig();
+    config.max_scheduled_tokens = 16;
+    config.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "replayable",
+        .block_granularity = 4,
+        .total_pages = 2049,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 8,
+        .replayable = true,
+        .transfer_policy = CacheTransferPolicy::FullSuffix,
+    });
+    config_ = WithHostPackingFromDevice(config);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Seed(RequestSpec{.request_id = "seed", .tokens = MakeTokens(64), .max_new_tokens = 1});
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    // The hit leaves one new token but also replays eight: nine tokens of
+    // work must rank after the eight-token cold prompt.
+    Start({RequestSpec{.request_id = "cold", .tokens = MakeTokens(8, 501), .max_new_tokens = 1},
+           RequestSpec{.request_id = "hit", .tokens = MakeTokens(65), .max_new_tokens = 1}});
+    const auto first = PlanOnce();
+    const auto* batch = FindForwardBatch(first);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"cold"}));
+    EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{8}));
+    Land(first);
+    const auto next = PlanOnce();
+    batch = FindForwardBatch(next);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"hit"}));
+    EXPECT_EQ(batch->extend_prefix_lens, (std::vector<std::int32_t>{56}));
+    EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{9}));
+}
+
 TEST_P(ShortPrefillOrderTest, EqualWorkPreservesSubmissionOrder) {
     Start({RequestSpec{.request_id = "first", .tokens = MakeTokens(8, 101), .max_new_tokens = 1},
            RequestSpec{.request_id = "second", .tokens = MakeTokens(8, 201), .max_new_tokens = 1}});

@@ -73,11 +73,27 @@ constexpr std::int32_t kMaxRestoreAttemptsPerRound = 4;
 // the prompt's prefix pages, so the scan is bounded.
 constexpr std::int32_t kMaxYieldProbesPerRound = 8;
 
+constexpr std::int32_t kMaxPrefillBypasses = 8;
+
 // An incomplete prefill keeps the head of line: admission reserved only this
 // chunk, and a later candidate could strand it by consuming the capacity it
 // needs to finish.
 bool holdsHeadOfLine(const Request& request) {
     return request.Is<fsm::Prefilling>();
+}
+
+void recordPrefillBypass(std::span<Request* const> candidates, const Request* admitted) {
+    // Count only for the oldest waiting prompt. Aging every older prompt
+    // together would disable short-work preference after eight admissions.
+    for (Request* older : candidates) {
+        if (older == admitted) {
+            break;
+        }
+        if (auto* waiting = older->GetIf<fsm::Submitted>()) {
+            waiting->prefill_bypasses = std::min(kMaxPrefillBypasses, waiting->prefill_bypasses + 1);
+            break;
+        }
+    }
 }
 
 template <typename Operation>
@@ -1468,6 +1484,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // No chunk yield: it is a P-role option, and the P role never
             // retracts.
             const std::int32_t budget = remote_grant ? blocker->PrefillSize() : build.token_budget;
+            const bool first_admission = blocker->Is<fsm::Submitted>();
             if (auto admitted =
                     schedulePrefillCandidate(build.plan, feedback, blocker, budget, config_.decode_input_tokens,
                                              build.load_backs, build.kv_page_budget, /*yield_tokens=*/0,
@@ -1478,6 +1495,9 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                     build.scheduled.insert(blocker);
                     build.remote_prefill.emplace_back(std::move(*admitted));
                 } else {
+                    if (config_.enable_short_prefill_first && first_admission) {
+                        recordPrefillBypass(candidates, blocker);
+                    }
                     pushOperation(build, *blocker, std::move(*admitted));
                     blocker->TrackScheduledForward();
                 }
@@ -1652,8 +1672,6 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
 
 namespace {
 
-constexpr std::int32_t kMaxPrefillBypasses = 8;
-
 struct PendingPrefill {
     Request* request;
     std::int32_t remaining_tokens;
@@ -1677,20 +1695,6 @@ Request* popShortPrefill(std::vector<PendingPrefill>& pending) {
     Request* request = selected->request;
     pending.erase(selected);
     return request;
-}
-
-void recordPrefillBypass(std::span<Request* const> candidates, const Request* admitted) {
-    // Count only for the oldest waiting prompt. Aging every older prompt
-    // together would disable short-work preference after eight admissions.
-    for (Request* older : candidates) {
-        if (older == admitted) {
-            break;
-        }
-        if (auto* waiting = older->GetIf<fsm::Submitted>()) {
-            waiting->prefill_bypasses = std::min(kMaxPrefillBypasses, waiting->prefill_bypasses + 1);
-            break;
-        }
-    }
 }
 
 }  // namespace
@@ -1864,10 +1868,11 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 }
                 // Rank only: admission probes again after earlier admissions may evict pages.
                 const auto match = matchPrefixAtAdmission(request);
-                const auto remaining = match.waits_for_eviction_store
-                                           ? std::numeric_limits<std::int32_t>::max()
-                                           : request->PrefillSize() - std::max(match.probe.device.num_common_tokens,
-                                                                               match.probe.host.num_common_tokens);
+                const auto hit_tokens =
+                    std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+                const auto remaining = match.waits_for_eviction_store ? std::numeric_limits<std::int32_t>::max()
+                                                                      : request->PrefillSize() - hit_tokens +
+                                                                            coordinator_.ReplayTokens(hit_tokens);
                 pending.push_back(PendingPrefill{request, remaining});
             }
         }
