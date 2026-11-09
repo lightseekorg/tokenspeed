@@ -82,6 +82,42 @@ def discover_iris_world() -> bool:
     return discover_world()
 
 
+def reserve_iris_heap(owner: str, nbytes: int) -> None:
+    """Reserve ``nbytes`` of the shared Iris heap for ``owner``, replacing its
+    earlier reservation. Call before the heap exists: a live heap does not grow."""
+    from tokenspeed_kernel.ops.communication._iris import reserve_heap
+
+    reserve_heap(owner, nbytes)
+
+
+def iris_heap_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
+    """The heap bytes that an allocation of ``shape`` and ``dtype`` takes,
+    alignment included."""
+    from tokenspeed_kernel.ops.communication._iris import allocation_bytes
+
+    return allocation_bytes(shape, dtype)
+
+
+def iris_symmetric_heap(group: dist.ProcessGroup, rank: int, device: torch.device):
+    """The shared Iris context and the heap addresses of ``group``'s ranks
+    (``rank`` this process's rank in it).
+
+    Returns:
+        ``(context, iris_group)``: ``context.zeros(shape, dtype=)`` allocates
+        at the same heap offset on every rank; ``iris_group.bases`` holds each
+        rank's heap base, and ``iris_group.finish_prepare()`` ends the group's
+        preparation.
+    """
+    from tokenspeed_kernel.ops.communication._iris import (
+        MIN_HEAP_BYTES,
+        IrisGroup,
+        get_or_create_context,
+    )
+
+    context = get_or_create_context(heap_size=MIN_HEAP_BYTES)
+    return context, IrisGroup(context, group, rank, device)
+
+
 def iris_maps_world() -> bool | None:
     """``discover_iris_world``'s cached answer, or None before it ran."""
     from tokenspeed_kernel.ops.communication._iris import maps_world
@@ -362,10 +398,10 @@ def create_iris_state(
     if min(staged_max_numel, producer_direct_max_numel) < 0:
         raise ValueError("Iris all-reduce capacities must be non-negative")
     from tokenspeed_kernel.ops.communication._iris import (
-        HEAP_HEADROOM_BYTES,
         MIN_HEAP_BYTES,
         IrisGroup,
         get_or_create_context,
+        heap_headroom_bytes,
     )
 
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -375,7 +411,7 @@ def create_iris_state(
             IrisAllReduce.heap_bytes(
                 staged_max_numel, producer_direct_max_numel, group.size(), dtype
             )
-            + HEAP_HEADROOM_BYTES,
+            + heap_headroom_bytes(),
         )
     ctx = get_or_create_context(heap_size=heap_size)
     peers = IrisGroup(ctx, group, rank_in_group, device)
@@ -430,6 +466,30 @@ def iris_lamport_residual_rmsnorm_supported(
     return dtype == torch.bfloat16 and LamportResidualRMSNorm.supported(
         world_size, hidden_size
     )
+
+
+def iris_lamport_residual_rmsnorm_heap_bytes(
+    world_size: int, max_rows: int, hidden_size: int
+) -> int:
+    """The Iris heap bytes ``prepare_iris_lamport_residual_rmsnorm`` allocates.
+
+    Its mailboxes come from the heap's headroom. A caller whose own heap
+    reservations set that headroom (``_iris.reserve_heap``) reserves these
+    bytes too, so the preparation keeps room after the reserved buffers.
+
+    Args:
+        world_size: Number of ranks in the group.
+        max_rows: Most rows one call reduces.
+        hidden_size: Row width in elements.
+
+    Returns:
+        The bytes of both mailboxes at the heap allocator's alignment.
+    """
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+    return LamportResidualRMSNorm.heap_bytes(world_size, max_rows, hidden_size)
 
 
 def prepare_iris_lamport_residual_rmsnorm(

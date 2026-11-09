@@ -22,7 +22,7 @@
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
-from tokenspeed_kernel.ops.communication._iris import IrisGroup
+from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_group_heap_base,
     _iris_sanitize_lamport_bf16x2,
@@ -72,6 +72,27 @@ class LamportResidualRMSNorm:
             and 2 * threads <= width <= 2 * threads * LamportResidualRMSNorm.CHUNKS
         )
 
+    @staticmethod
+    def mailbox_shapes(
+        world_size: int, max_rows: int, width: int
+    ) -> tuple[tuple[int, int, int], tuple[int, int]]:
+        """The BF16 shapes of the two mailboxes on the Iris heap: ``scatter``
+        (a slot per source rank for each owned row) and ``gather`` (every row)."""
+        max_local_rows = triton.cdiv(max_rows, world_size)
+        return (world_size, max_local_rows, width), (max_rows, width)
+
+    @staticmethod
+    def heap_bytes(world_size: int, max_rows: int, width: int) -> int:
+        """The Iris heap bytes an instance allocates, at the allocator's
+        alignment: for reserving them before the heap exists
+        (``_iris.reserve_heap``)."""
+        return sum(
+            allocation_bytes(shape, torch.bfloat16)
+            for shape in LamportResidualRMSNorm.mailbox_shapes(
+                world_size, max_rows, width
+            )
+        )
+
     def __init__(self, peers: IrisGroup, max_rows: int, width: int):
         if not self.supported(peers.world_size, width) or not (
             1 <= max_rows <= self.MAX_ROWS
@@ -83,13 +104,12 @@ class LamportResidualRMSNorm:
         self.peers = peers
         self.max_rows = max_rows
         self.width = width
-        self.max_local_rows = triton.cdiv(max_rows, peers.world_size)
+        scatter, gather = self.mailbox_shapes(peers.world_size, max_rows, width)
+        self.max_local_rows = scatter[1]
         # scatter[source rank][owned row slot] receives each peer's partial.
-        self.scatter = peers.ctx.empty(
-            (peers.world_size, self.max_local_rows, width), dtype=torch.bfloat16
-        )
+        self.scatter = peers.ctx.empty(scatter, dtype=torch.bfloat16)
         # gather[row] receives the row's reduced BF16 values from its owner.
-        self.gather = peers.ctx.empty((max_rows, width), dtype=torch.bfloat16)
+        self.gather = peers.ctx.empty(gather, dtype=torch.bfloat16)
         for mailbox in (self.scatter, self.gather):
             # An empty word's high half is negative zero, which no payload sends.
             mailbox.view(torch.int32).fill_(-(1 << 31))

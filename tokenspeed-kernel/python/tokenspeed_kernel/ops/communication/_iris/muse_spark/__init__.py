@@ -25,11 +25,11 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.communication._iris import (
-    HEAP_HEADROOM_BYTES,
     MIN_HEAP_BYTES,
     IrisGroup,
     allocation_bytes,
     get_or_create_context,
+    heap_headroom_bytes,
 )
 from tokenspeed_kernel.ops.communication._iris.all_gather import (
     IrisAllGather,
@@ -2455,7 +2455,7 @@ def prepare_muse_communication(
             staged_max_numel, capacity, group.size(), torch.bfloat16
         )
         ctx = get_or_create_context(
-            heap_size=max(MIN_HEAP_BYTES, size + HEAP_HEADROOM_BYTES)
+            heap_size=max(MIN_HEAP_BYTES, size + heap_headroom_bytes())
         )
         peers = IrisGroup(ctx, group, rank_in_group, device)
         all_reduce = IrisAllReduce(peers, staged_max_numel, capacity, torch.bfloat16)

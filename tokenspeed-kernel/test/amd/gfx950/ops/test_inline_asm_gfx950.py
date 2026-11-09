@@ -36,6 +36,9 @@ every compiled variant here is checked for:
 
 Compiles without a GPU, at 8 rows and at 16 where a 16-row launch compiles a
 different variant (the few-row GEMV at 4, the largest row count it serves).
+The Muse Spark monokernels compile through their own launchers, at the row
+counts serving launches (1, 8 and 16 target rows; the DFlash2 draft's 8 and
+16, its head's 7 and 14).
 Inline asm that existed before this gate is listed separately in
 ``INLINE_ASM_ON_MAIN``.
 """
@@ -43,7 +46,9 @@ Inline asm that existed before this gate is listed separately in
 import importlib
 import inspect
 import re
+import sys
 from functools import cache
+from pathlib import Path
 
 import pytest
 import torch
@@ -60,6 +65,8 @@ from utils import is_cdna4
 # The cases compile gfx950 Gluon kernels from the AMD kernel package and Iris,
 # which other platforms' runners do not install.
 pytestmark = pytest.mark.skipif(not is_cdna4(), reason="gfx950 inline asm checks")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "monokernel"))
 
 
 def _peer_signal_store():
@@ -583,6 +590,202 @@ def _dsa_persistent_topk():
     )
 
 
+# ---------------------------------------------------------------------------
+# The Muse Spark monokernels, through their own launchers
+# ---------------------------------------------------------------------------
+#
+# A monokernel launch packs its operands into nested tuples, so these run the
+# real launcher with ``compile_only`` and replace only the step that needs a
+# device: the launcher's ``warmup``, which here binds the same arguments with
+# Triton's own binder (the launch's signature and specialization) and
+# compiles for gfx950. The tensors are CPU placeholders of the launch's
+# shapes and dtypes; only their types, strides and alignment matter.
+
+
+def _offline_warmup(fn, compiled):
+    """A ``fn.warmup`` that compiles for gfx950 without a device and appends
+    the kernel to ``compiled``."""
+    from tokenspeed_kernel._triton import gluon, triton
+
+    target = triton.backends.compiler.GPUTarget("hip", "gfx950", 64)
+    backend = triton.compiler.make_backend(target)
+    binder = triton.runtime.jit.create_function_from_signature(
+        fn.signature, fn.params, backend
+    )
+
+    def warmup(*args, grid, **kwargs):
+        bound, specialization, options = binder(*args, **kwargs)
+        options, signature, constexprs, attrs = fn._pack_args(
+            backend, kwargs, bound, specialization, options
+        )
+        source = gluon._runtime.GluonASTSource(fn, signature, constexprs, attrs)
+        kernel = triton.compile(source, target=target, options=options.__dict__)
+        compiled.append(kernel)
+        return kernel
+
+    return warmup
+
+
+def _compile_launch(fn, launch, *args, **kwargs):
+    """``launch(*args, **kwargs, compile_only=True)`` compiled offline: the
+    kernel of ``fn`` (the launcher's jit function) that the launch compiles."""
+    compiled = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(fn, "warmup", _offline_warmup(fn, compiled))
+        launch(*args, **kwargs, compile_only=True)
+    (kernel,) = compiled
+    return kernel
+
+
+def _zeros(*shape, dtype=torch.bfloat16):
+    return torch.zeros(*shape, dtype=dtype)
+
+
+_I64 = torch.int64
+_F32 = torch.float32
+_I32 = torch.int32
+
+
+@cache
+def _layer_weights(full):
+    from muse_spark_reference import preprocessed_experts
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import weights as w
+
+    # The regular path's MXFP4 preprocessing: its layout and strides.
+    experts = preprocessed_experts(0, w.EXPERTS, torch.device("cpu"))
+    row, pooled = _zeros(w.HIDDEN, dtype=_F32), _zeros(w.POOLED, dtype=_F32)
+    return w.pack_layer(
+        rank=5, full=full, qkvg=_zeros(w.QKVG, w.HIDDEN), o=_zeros(w.HIDDEN, w.Q),
+        alpha1=row, beta1=row, pre_gain=row, router=_zeros(w.HIDDEN, 256, dtype=_F32),
+        router_bias=_zeros(256, dtype=_F32), pool=_zeros(w.POOLED, w.HIDDEN),
+        experts=experts, pre_exp_gain=pooled,
+        pen_gain=pooled, post=_zeros(w.HIDDEN, w.POOLED), post_gain=row,
+        alpha2=row, beta2=row, in_gain=row,
+    )  # fmt: skip
+
+
+def _layer(rows, chain, full, tap=False, trace=False):
+    """A target layer launch of ``rows`` rows, requests of ``chain`` tokens,
+    as serving launches a layer between two fused ones: past one row it reads
+    its q | k | v projection from the previous launch and ends with the next
+    layer's; at one row it warms the next layer's weights. ``tap``: it also
+    stores a draft's tap; ``trace``: a bench's traced launch."""
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel import trace as trace_module
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import layer, qkvg
+
+    weights = _layer_weights(full)
+    # Past one row the launch projects the next layer in place of the warm.
+    one = rows == 1
+    plan = layer.layer_plan(
+        full=full,
+        rows=rows,
+        chain=chain,
+        warm_next=one,
+        own_qkvg=one,
+        next_qkvg=not one,
+        check_parity=False,
+    )
+    proj = _zeros(2, layer.MAX_ROWS, int(qkvg.PROJ_WORDS), dtype=_I32)
+    cache = _zeros(1 << 16, 2, 64, dtype=torch.float8_e4m3fn)
+    return _compile_launch(
+        layer.gluon_muse_spark_layer_gfx950,
+        layer.launch_gluon_muse_spark_layer_gfx950,
+        weights,
+        h=_zeros(rows, 1024, dtype=_F32), a=_zeros(rows, 8192),
+        h_out=_zeros(rows, 1024, dtype=_F32), a_out=_zeros(rows, 8192),
+        seq_len=_zeros(rows, dtype=_I32), slot=_zeros(rows, dtype=_I32),
+        page_table=_zeros(rows // chain, 4096, dtype=_I32), k_cache=cache,
+        v_cache=cache.clone(), cos_sin=_zeros(1 << 16, 64, dtype=_F32),
+        scratch=_zeros(plan.scratch_pairs, dtype=_I64), step=_zeros(1, dtype=_I32),
+        peer_bases=_zeros(8, dtype=_I64), layer=5, chain=chain, whole_rows=False,
+        tap=_zeros(layer.MAX_ROWS, 4, 8192) if tap else None, tap_slot=1 if tap else None,
+        warm_next=weights, proj_in=None if rows == 1 else proj[1],
+        proj_out=None if rows == 1 else proj[0],
+        trace_buf=(
+            _zeros(plan.grid, int(trace_module.EVENTS), 8, dtype=_I64) if trace else None
+        ),
+        stuck_rec=_zeros(256, 8, dtype=_I64), check_parity=False,
+    )  # fmt: skip
+
+
+def _draft_layer(rows, last):
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_layer
+
+    shapes = {
+        "input_norm": (8192,), "post_norm": (8192,), "attn_coef": (2048, 8192),
+        "mlp_coef": (2048, 8192), "attn_base": (2, 2, 8192), "mlp_base": (2, 2, 8192),
+        "qkv": (1280, 8192), "q_norm": (128,), "k_norm": (128,),
+        "o_proj": (8192, 1024), "gate_up": (7168, 8192), "down": (8192, 3584),
+    }  # fmt: skip
+    weights = draft_layer.pack_draft_layer(
+        {name: _zeros(*shape) for name, shape in shapes.items()}, 5
+    )
+    plan = draft_layer.layer_plan(rows, last)
+    cache = _zeros(1 << 16, 1, 128)
+    return _compile_launch(
+        draft_layer.gluon_muse_spark_draft_layer_gfx950,
+        draft_layer.launch_gluon_muse_spark_draft_layer_gfx950,
+        weights,
+        x=_zeros(rows, 8192), residual=_zeros(rows, 8192),
+        residual_out=_zeros(rows, 8192), out=None if last else _zeros(rows, 8192),
+        final_gain=_zeros(1024, dtype=_F32) if last else None,
+        normed=_zeros(rows, 8192) if last else None,
+        seq_len=_zeros(rows // 8, dtype=_I32), positions=_zeros(rows, dtype=_I32),
+        slots=_zeros(rows, dtype=_I64), page_table=_zeros(2, 4096, dtype=_I32),
+        k_cache=cache, v_cache=cache.clone(), cos_sin=_zeros(1 << 16, 128, dtype=_F32),
+        scratch=_zeros(plan.scratch_pairs, dtype=_I64), step=_zeros(1, dtype=_I32),
+        peer_bases=_zeros(8, dtype=_I64), layer=4 if last else 1, trace_buf=None,
+    )  # fmt: skip
+
+
+def _draft_head(requests):
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_head as h
+
+    tensors = {
+        "lm_head": torch.empty(int(h.SHARD), int(h.HIDDEN), dtype=torch.bfloat16),
+        "hidden_proj": _zeros(int(h.RANK_DIM), int(h.HIDDEN)),
+        "pred_codebook": torch.empty(h.VOCAB, int(h.RANK_DIM), dtype=torch.bfloat16),
+        "succ_codebook": torch.empty(h.VOCAB, int(h.RANK_DIM), dtype=torch.bfloat16),
+    }
+    weights = h.pack_draft_head(tensors, 5, 1.0, 30.0)
+    rows = requests * h.STEPS
+    return _compile_launch(
+        h.gluon_muse_spark_draft_head_gfx950,
+        h.launch_gluon_muse_spark_draft_head_gfx950,
+        weights,
+        x=_zeros(rows, 8192), first_token=_zeros(requests, dtype=_I32),
+        anchor=_zeros(requests, dtype=_I64), cand_ids=_zeros(rows, 16, dtype=_I64),
+        unary=_zeros(rows, 16, dtype=_F32), scores=_zeros(rows, 16, 16, dtype=_F32),
+        scratch=_zeros(h.head_plan(rows).scratch_pairs, dtype=_I64),
+        step=_zeros(1, dtype=_I32), peer_bases=_zeros(8, dtype=_I64), trace_buf=None,
+    )  # fmt: skip
+
+
+def _draft_context(rows):
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
+        draft_context as c,
+    )
+
+    layers = int(c.LAYERS)
+    tensors = {
+        "fc": torch.empty(int(c.OWNED), int(c.TAPS_K), dtype=torch.bfloat16),
+        "hidden_norm": _zeros(int(c.HIDDEN)),
+        **{f"qkv_{i}": _zeros(1280, int(c.HIDDEN)) for i in range(layers)},
+        **{f"k_norm_{i}": _zeros(int(c.HEAD)) for i in range(layers)},
+    }
+    caches = tuple(_zeros(1 << 16, 1, int(c.HEAD)) for _ in range(2 * layers))
+    return _compile_launch(
+        c.gluon_muse_spark_draft_context_gfx950,
+        c.launch_gluon_muse_spark_draft_context_gfx950,
+        c.pack_draft_context(tensors, 5),
+        taps=_zeros(rows, int(c.TAPS_K)), positions=_zeros(rows, dtype=_I32),
+        slots=_zeros(rows, dtype=_I64), k_caches=caches[:layers],
+        v_caches=caches[layers:], cos_sin=_zeros(1 << 16, 128, dtype=_F32),
+        scratch=_zeros(c.context_plan(rows).scratch_pairs, dtype=_I64),
+        step=_zeros(1, dtype=_I32), peer_bases=_zeros(8, dtype=_I64), trace_buf=None,
+    )  # fmt: skip
+
+
 VARIANTS = {
     "mha_decode_split": _mha_decode_split,
     "mha_decode_sliding_split": _mha_decode_sliding_split,
@@ -601,6 +804,24 @@ VARIANTS = {
     "mha_extend_warp_pipelined": _mha_extend_warp_pipelined,
     "mla_prefill_8wave": _mla_prefill_8wave,
     "dsa_persistent_topk": _dsa_persistent_topk,
+    # The target layer: decode (1 row), one verify (8) and two (16).
+    "muse_layer-rows1-sliding": lambda: _layer(1, 1, False),
+    "muse_layer-rows1-full": lambda: _layer(1, 1, True),
+    "muse_layer-rows8-sliding": lambda: _layer(8, 8, False),
+    "muse_layer-rows8-full": lambda: _layer(8, 8, True),
+    "muse_layer-rows16-sliding": lambda: _layer(16, 8, False),
+    "muse_layer-rows16-full": lambda: _layer(16, 8, True),
+    "muse_layer-rows8-sliding-tap": lambda: _layer(8, 8, False, tap=True),
+    "muse_layer-rows8-sliding-trace": lambda: _layer(8, 8, False, trace=True),
+    # The DFlash2 draft: its layers, head (7 steps a request) and context write.
+    "muse_draft_layer-rows8": lambda: _draft_layer(8, False),
+    "muse_draft_layer-rows16": lambda: _draft_layer(16, False),
+    "muse_draft_layer-rows8-last": lambda: _draft_layer(8, True),
+    "muse_draft_layer-rows16-last": lambda: _draft_layer(16, True),
+    "muse_draft_head-rows7": lambda: _draft_head(1),
+    "muse_draft_head-rows14": lambda: _draft_head(2),
+    "muse_draft_context-rows8": lambda: _draft_context(8),
+    "muse_draft_context-rows16": lambda: _draft_context(16),
 }
 
 
@@ -619,7 +840,50 @@ def _compiled(name):
 # "module:name"; why no compiler-visible operation serves; the compiler
 # support that would retire it). A helper not listed here fails the gate.
 _AMD = "tokenspeed_kernel_amd.ops.gfx950."
-INLINE_ASM = {}
+_MONO = _AMD + "monokernel."
+INLINE_ASM = {
+    # The monokernels' mailbox, code warm-up, trace and expert routing.
+    "_poll_n": (
+        _MONO + "mailbox:_poll_n",
+        "a loop of uncached loads that retries only the late pairs' lanes",
+        "a volatile load that a loop keeps, and a Gluon ballot (wave vote) op",
+    ),
+    "raise_flag": (
+        _MONO + "mailbox:Mailbox.raise_flag",
+        "waits for this wave's stores before the CTA publishes them",
+        "_extern.release_drain, once every mailbox kernel links its library",
+    ),
+    "raise_flag_peers": (
+        _MONO + "mailbox:Mailbox.raise_flag_peers",
+        "waits for this wave's peer stores before the CTA publishes them",
+        "_extern.release_drain, once every mailbox kernel links its library",
+    ),
+    "code_pointer": (
+        _MONO + "code_warm:code_pointer",
+        "reads the program counter (s_getpc_b64)",
+        "an intrinsic for the program counter in the extern library",
+    ),
+    "stamp": (
+        _MONO + "trace:stamp",
+        "a clock read and its LDS store, in order (bench traces only)",
+        "a Gluon clock op and an ordered LDS store",
+    ),
+    "topk_stage": (
+        _MONO + "muse_spark.moe_route:topk_stage",
+        "a wave's top 8 by lane masks in SGPRs (v_cmp, s_ff1, v_readlane)",
+        "Gluon ballot and lane-read ops, or the extern library's",
+    ),
+    "_ballot_slots": (
+        _MONO + "muse_spark.moe_experts:_ballot_slots",
+        "the picks' slots by lane reads and ballots (up to 64 picks)",
+        "Gluon ballot and lane-read ops, or the extern library's",
+    ),
+    "_ballot_slots2": (
+        _MONO + "muse_spark.moe_experts:_ballot_slots2",
+        "the picks' slots by lane reads and ballots (128 picks)",
+        "Gluon ballot and lane-read ops, or the extern library's",
+    ),
+}
 # Inline asm that existed before this gate, which the kernels above compile in.
 INLINE_ASM_ON_MAIN = {
     "_keep_in_cluster": (
@@ -716,6 +980,8 @@ def test_inline_asm_checks_catch_their_cases():
     assert undeclared_asm_writes("s_mov_b32 s80, $1\n\ts_mov_b32 $0, s80", "=s,s") == [
         "s_mov_b32 writes undeclared s80"
     ]
+    # s_getpc_b64 leaves SCC alone; s_add_u32 writes it.
+    assert undeclared_asm_writes("s_getpc_b64 $0", "=s") == []
     assert undeclared_asm_writes("s_add_u32 $1, $1, 1", "=s,s") == [
         "s_add_u32 writes input $1",
         "s_add_u32 writes undeclared scc",
