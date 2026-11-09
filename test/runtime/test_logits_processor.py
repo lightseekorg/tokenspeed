@@ -2083,3 +2083,141 @@ def test_sampled_vocab_fallback_finishes_all_rows(monkeypatch):
     shard = processor.sampled_vocab_shard(logits, head)
     actual = shard.gather_full(logits)
     torch.testing.assert_close(actual, torch.cat((logits, logits + 100), dim=1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("attn_tp,head_tp", [(2, 8), (2, 2), (4, 2), (1, 8)])
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize(
+    "mode", ["greedy", "full", "empty", "padded", "limit", "softcap"]
+)
+def test_dp_head_argmax_and_local_head_input(monkeypatch, attn_tp, head_tp, rank, mode):
+    """Real projections/argmax keys, with only the missing peers simulated."""
+    from transformers import PretrainedConfig
+
+    group = tuple(range(rank // head_tp * head_tp, (rank // head_tp + 1) * head_tp))
+    local_rank = group.index(rank)
+    vocab = 32 if mode != "padded" else 31
+    counts = [
+        0 if mode == "empty" else (2, 0, 3, 1)[r // attn_tp % 4] for r in range(8)
+    ]
+    hidden = [
+        torch.arange(n * 4, device="cuda", dtype=torch.float32).reshape(n, 4) / 8
+        + r // attn_tp
+        for r, n in enumerate(counts)
+    ]
+    weights = (
+        torch.arange(128, device="cuda", dtype=torch.float32).reshape(32, 4) / 16 - 4
+    )
+    # Equal maxima in different vocabulary shards must select the lowest ID.
+    weights[0] = weights[-1]
+    if mode == "padded":
+        weights[-1] = 1000  # This padded token must never win.
+    processor = LogitsProcessor(
+        PretrainedConfig(
+            vocab_size=vocab, final_logit_softcapping=3.0 if mode == "softcap" else None
+        ),
+        tp_rank=local_rank,
+        tp_size=head_tp,
+        tp_group=group,
+        attn_tp_size=attn_tp,
+        dp_lm_head_tp=True,
+        skip_all_gather=True,
+        do_argmax=True,
+        logit_scale=2.0,
+    )
+    head = ParallelLMHead(
+        vocab,
+        4,
+        params_dtype=torch.float32,
+        padding_size=32,
+        tp_rank=local_rank,
+        tp_size=head_tp,
+        tp_group=group,
+    )
+    head = head.to("cuda").requires_grad_(False)
+    width = 32 // head_tp
+    with torch.no_grad():
+        head.weight.copy_(weights[local_rank * width : (local_rank + 1) * width])
+    if mode == "full":
+        processor.require_full_vocab_logits()
+    if mode == "limit":
+        monkeypatch.setattr(processor, "_LOGITS_DIST_ARGMAX_MAX_TOKENS", 0)
+    processor.prepare_communication(head)
+    replicas = min(attn_tp, head_tp)
+    all_hidden = torch.cat([hidden[r] for r in group[::replicas]])
+    fast = mode in ("greedy", "empty") or (mode == "limit" and all_hidden.shape[0] == 0)
+
+    def reduce(tensor, ranks, op=torch.distributed.ReduceOp.SUM):
+        assert ranks == group
+        if tensor.dtype != torch.int64:
+            # Within one attention group no hidden-state collective is legal.
+            assert head_tp > attn_tp
+            expected = torch.zeros_like(all_hidden)
+            if local_rank % replicas == 0:
+                offset = sum(counts[r] for r in group[:local_rank:replicas])
+                expected[offset : offset + counts[rank]] = hidden[rank]
+            torch.testing.assert_close(tensor, expected)
+            return all_hidden.clone()
+        assert fast and op == torch.distributed.ReduceOp.MAX
+        keys = []
+        for i in range(head_tp):
+            peer_logits = (all_hidden @ weights[i * width : (i + 1) * width].T) * 2.0
+            out = torch.empty(all_hidden.shape[0], dtype=torch.int64, device="cuda")
+            logits_processor_module.vocab_parallel_argmax_keys(
+                peer_logits, vocab_offset=i * width, out=out
+            )
+            keys.append(out)
+        torch.testing.assert_close(tensor, keys[local_rank])
+        return torch.stack(keys).max(dim=0).values
+
+    def gather_rows(tensor, ranks, row_counts):
+        assert attn_tp == 1 and ranks == group
+        return all_hidden.clone()
+
+    comm_scale = 1.0 if mode == "softcap" else 2.0
+
+    def gather_vocab(output, tensor, ranks):
+        assert not fast and ranks == group
+        expected = all_hidden @ head.weight.T * comm_scale
+        torch.testing.assert_close(tensor, expected)
+        output.copy_(
+            torch.cat(
+                [all_hidden @ w.T * comm_scale for w in weights.split(width)], dim=0
+            )
+        )
+
+    def transpose(tensor, ranks, *, input_split_sizes):
+        assert not fast and attn_tp == 1 and ranks == group
+        return hidden[rank] @ weights.T * comm_scale
+
+    def gather_counts(tensor, ranks, dim):
+        assert head_tp > attn_tp and ranks == group
+        return tensor.new_tensor([counts[r] for r in group])
+
+    monkeypatch.setattr(logits_processor_module, "all_gather", gather_counts)
+    monkeypatch.setattr(logits_processor_module, "all_reduce", reduce)
+    monkeypatch.setattr(logits_processor_module, "token_all_gather", gather_rows)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", gather_vocab)
+    monkeypatch.setattr(logits_processor_module, "all_to_all_transpose", transpose)
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.DECODE,
+        query_shard=None,
+        global_num_tokens=counts,
+        all_decode_or_idle=True,
+        logits_rows_selected=True,
+    )
+    result = processor(None, hidden[rank], head, metadata)
+    expected = (hidden[rank] @ weights[:vocab].T) * 2.0
+    if mode == "softcap":
+        expected = 3.0 * torch.tanh(expected / 3.0)
+    if mode == "full":
+        assert result.next_token_ids is None
+    else:
+        torch.testing.assert_close(result.next_token_ids, expected.argmax(dim=-1))
+    if not fast:
+        torch.testing.assert_close(result.next_token_logits, expected)
+    else:
+        torch.testing.assert_close(
+            result.next_token_logits, hidden[rank] @ head.weight.T * 2.0
+        )

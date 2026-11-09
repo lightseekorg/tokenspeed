@@ -141,6 +141,22 @@ and each attention TP peer reads its DP slot. This avoids multiplying the
 LM-head GEMM rows by attention TP. Head and attention TP widths must tile
 each other; for example, DP4/TP2 supports an explicit LM-head TP8 while its
 default stays replicated. A shared MTP head uses the same row layout.
+When the head group stays within a single attention TP group (including
+head TP equal to attention TP), its peers already hold identical hidden
+states, so the input row exchange is skipped. The output still gathers the
+vocabulary unless the consumer requests greedy token IDs.
+
+For greedy heads, eligible cross-DP layouts reduce each row's vocabulary
+maximum and global token ID before selecting the owning DP rows. They use
+fused distributed argmax with alternating slot bands when supported, and
+otherwise the packed-key argmax collective, instead of gathering full logits.
+The alternating bands allow consecutive target/draft calls without an extra
+group barrier; calls sharing a state must still be ordered across streams. Returned
+logits remain vocabulary-sharded and are not a full distribution. Sampled
+draft distributions and consumers requiring full logits keep the vocabulary
+exchange; padded vocabularies, softcapping, and other argmax eligibility
+limits also retain the full-logit fallback.
+
 On the decode path the row counts come
 from the per-rank token tables (every rank's logits rows are its decode
 tokens, or the live rows a narrowing draft step reported), so the step has
