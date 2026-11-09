@@ -21,6 +21,7 @@
 """Distributed adaptive verification agreement and CED count exchange."""
 
 import os
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -46,31 +47,7 @@ class DraftModel(nn.Module):
         self.mapping = mapping
 
 
-@pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) < 2,
-    reason="requires torchrun with multiple GPUs",
-)
-@torch.inference_mode()
-def test_dp_budget_agreement_and_native_fallback():
-    world = int(os.environ["WORLD_SIZE"])
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    mapping = Mapping(
-        rank=rank,
-        world_size=world,
-        attn_tp_size=1,
-        attn_dp_size=world,
-        moe_ep_size=world,
-    )
-    process_group_manager.init_distributed(
-        mapping,
-        distributed_init_method="env://",
-        backend="nccl",
-        timeout=120,
-        device_id=torch.device("cuda", local_rank),
-    )
-    process_group_manager.init_process_group(tuple(range(world)), backend="nccl")
+def _make_drafter(mapping):
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.draft_model = DraftModel(mapping)
     drafter.tp_group = mapping.attn.tp_group
@@ -100,6 +77,35 @@ def test_dp_budget_agreement_and_native_fallback():
     drafter._verify_layout_counts = None
     drafter._verify_budget_graphs = {}
     drafter._verify_budget_buffers = {}
+    return drafter
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) < 2,
+    reason="requires torchrun with multiple GPUs",
+)
+@torch.inference_mode()
+def test_dp_budget_agreement_and_native_fallback():
+    world = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    mapping = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=1,
+        attn_dp_size=world,
+        moe_ep_size=world,
+    )
+    process_group_manager.init_distributed(
+        mapping,
+        distributed_init_method="env://",
+        backend="nccl",
+        timeout=120,
+        device_id=torch.device("cuda", local_rank),
+    )
+    process_group_manager.init_process_group(tuple(range(world)), backend="nccl")
+    drafter = _make_drafter(mapping)
     stream = torch.cuda.Stream()
     pool = torch.cuda.graph_pool_handle()
     drafter.capture_round_graphs(2, stream=stream, pool=pool)
@@ -134,6 +140,32 @@ def test_dp_budget_agreement_and_native_fallback():
     assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 12
     assert drafter._verify_indptr[-1].item() == 12
     assert drafter._verify_budget_buffers[4].valid.item()
+    # Repeated allocations must retain fresh per-rank scores and layouts.
+    # Snapshot results on the same stream without synchronizing each iteration.
+    pending_layouts = []
+    for iteration in range(24):
+        favored = (rank + iteration) % 4
+        changing_scores = [[20.0 if i == favored else -20.0] * 5 for i in range(4)]
+        drafter.verify_feedback.publish(
+            drafter.verify_feedback.snapshot(),
+            changing_scores,
+            context_lengths=[120 + rank] * 4,
+        )
+        for _ in range(2):
+            drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+        assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 12
+        pending_layouts.append(
+            (
+                favored,
+                drafter._verify_indptr.clone(),
+                drafter._verify_budget_buffers[4].scores.clone(),
+                changing_scores,
+            )
+        )
+    for favored, indptr, scores, expected in pending_layouts:
+        counts = indptr.diff().cpu().tolist()
+        assert counts[favored] == 6 and sum(counts) == 12
+        torch.testing.assert_close(scores.cpu(), torch.tensor(expected), rtol=0, atol=0)
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -204,4 +236,94 @@ def test_dp_budget_agreement_and_native_fallback():
     )
     assert _exchange_decoder_counts(rank * 3, world) == [i * 3 for i in range(world)]
     assert _exchange_decoder_counts(0, world) == [0] * world
+    torch.distributed.barrier()
+
+
+@contextmanager
+def _strict_serving_sync():
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        # Test-side tensor inspection may synchronize; serving calls may not.
+        torch.cuda.set_sync_debug_mode(previous)
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) < 2,
+    reason="requires torchrun with multiple GPUs",
+)
+@pytest.mark.parametrize("topology", ["dp", "tp", "mixed"])
+@torch.inference_mode()
+def test_budget_and_calibration_without_forward_thread_sync(topology):
+    world = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if topology == "mixed" and (world < 4 or world % 2):
+        pytest.skip("mixed TP/DP requires an even world of at least four ranks")
+    tp = world if topology == "tp" else (2 if topology == "mixed" else 1)
+    torch.cuda.set_device(local_rank)
+    mapping = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=tp,
+        attn_dp_size=world // tp,
+        moe_ep_size=world,
+    )
+    process_group_manager.init_distributed(
+        mapping,
+        distributed_init_method="env://",
+        backend="nccl",
+        timeout=120,
+        device_id=torch.device("cuda", local_rank),
+    )
+    process_group_manager.init_process_group(tuple(range(world)), backend="nccl")
+    drafter = _make_drafter(mapping)
+    drafter.capture_round_graphs(
+        4, stream=torch.cuda.Stream(), pool=torch.cuda.graph_pool_handle()
+    )
+    drafter.install_verify_calibration(
+        (VerifyCalibration(4, 1, 16384, 6, 100.0, ((12, 1.0),), 8),),
+        policy_ms=0.0,
+    )
+    ids = [f"{mapping.attn.dp_rank}-{i}" for i in range(4)]
+    slots = list(range(4))
+    drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    favored = mapping.attn.dp_rank % 4
+    scores = [[20.0 if i == favored else -20.0] * 5 for i in range(4)]
+    # Missing non-root feedback is allowed only for authoritative TP broadcast.
+    if rank != world - 1:
+        drafter.verify_feedback.publish(
+            drafter.verify_feedback.snapshot(), scores, context_lengths=[120] * 4
+        )
+    for _ in range(2):
+        drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    with _strict_serving_sync():
+        selected = drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4)
+    assert selected == (12 if topology == "tp" else 24)
+
+    drafter.verify_feedback.publish(
+        drafter.verify_feedback.snapshot(), scores, context_lengths=[120] * 4
+    )
+    for _ in range(2):
+        drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    with _strict_serving_sync():
+        selected = drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4)
+    assert selected == 12
+    counts = drafter._verify_indptr.diff().cpu().tolist()
+    assert counts[favored] == 6 and sum(counts) == 12
+    torch.testing.assert_close(
+        drafter._verify_budget_buffers[4].scores.cpu(),
+        torch.tensor(scores),
+        rtol=0,
+        atol=0,
+    )
+    drafter._verify_step_samples = [
+        VerifyStepSample(17, 4, 12, 120, 125, float(rank + 1))
+    ]
+    with _strict_serving_sync():
+        drafter._synchronize_verify_samples(drafter._verify_budget_buffers[4])
+    assert len(drafter._aligned_verify_samples) == 1
+    assert drafter._aligned_verify_samples[0].elapsed_ms == float(world)
     torch.distributed.barrier()

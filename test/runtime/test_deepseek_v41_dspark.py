@@ -1627,6 +1627,7 @@ def test_small_or_padded_batches_keep_full_verification(actual, padded):
     drafter._verify_step_id = 0
     drafter._active_verify_timing = None
     drafter.verify_budget_policy = VerifyBudgetPolicy(True, 32, 6, 0.02)
+    drafter.draft_model = SimpleNamespace(mapping=_mapping(0, 1, 1))
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
