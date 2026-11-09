@@ -26,8 +26,15 @@ FILES = {
     f"{TESTS}/test_serving_e2e.py": 'MODEL = "openai/gpt-oss-20b"\n',
     f"{TESTS}/test_uses_misc.py": "from test.runtime.test_misc import helper\n",
     f"{TESTS}/test_uses_misc_bare.py": "import test_misc\n",
+    # Not in the suite, yet it links test_two_hop to test_misc.
+    f"{TESTS}/test_unregistered.py": "import test.runtime.test_misc\n",
+    f"{TESTS}/test_two_hop.py": "from runtime.test_unregistered import helper\n",
 }
-ALL = sorted(path for path in FILES if path.startswith(TESTS))
+ALL = sorted(
+    path
+    for path in FILES
+    if path.startswith(TESTS) and path != f"{TESTS}/test_unregistered.py"
+)
 
 
 @pytest.fixture
@@ -47,7 +54,7 @@ def repo(tmp_path: Path) -> Path:
         ([f"{MODELS}/gpt_oss.py"], ["test_serving_e2e"]),
         (
             [f"{TESTS}/test_misc.py"],
-            ["test_misc", "test_uses_misc", "test_uses_misc_bare"],
+            ["test_misc", "test_two_hop", "test_uses_misc", "test_uses_misc_bare"],
         ),
         (
             [
@@ -55,7 +62,7 @@ def repo(tmp_path: Path) -> Path:
                 "docs/a.md",
                 "tokenspeed-kernel/test/ops/test_gemm.py",
             ],
-            ["test_misc", "test_uses_misc", "test_uses_misc_bare"],
+            ["test_misc", "test_two_hop", "test_uses_misc", "test_uses_misc_bare"],
         ),
         (["tokenspeed-kernel/test/ops/test_gemm.py"], []),
     ],

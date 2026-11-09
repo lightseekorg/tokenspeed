@@ -3,10 +3,10 @@
 CI lists a pull request's changed paths in ``TOKENSPEED_CI_CHANGED_PATHS``.
 When every change is Markdown, a test file, or a model module (a module
 directly under the models package that defines ``EntryClass``), only these
-runtime test files run: the changed ones and those importing them, and for a
-changed model module, the tests that import it or a module built on it, or
-that name it or such a module (``gpt_oss`` matches ``openai/gpt-oss-20b``).
-Any other change runs every test.
+runtime test files run: the changed ones; for a changed model module, the
+tests that import it or a module built on it, or that name it or such a module
+(``gpt_oss`` matches ``openai/gpt-oss-20b``); and the tests that import any of
+these, directly or through other test files. Any other change runs every test.
 """
 
 from __future__ import annotations
@@ -36,14 +36,21 @@ def imported_modules(path: Path) -> set[str]:
     return modules
 
 
-def imported_models(path: Path) -> set[str]:
-    """Modules directly under the models package (by name) that ``path`` imports."""
+def model_names(modules: set[str]) -> set[str]:
+    """Modules directly under the models package (by name) among ``modules``."""
     prefix = f"{MODEL_PACKAGE}."
     return {
         module[len(prefix) :].split(".")[0]
-        for module in imported_modules(path)
+        for module in modules
         if module.startswith(prefix)
     }
+
+
+def test_module_names(test: str) -> set[str]:
+    """Names that import a test file: test.runtime.<name>, runtime.<name> or
+    <name>."""
+    dotted = test.removesuffix(".py").replace("/", ".")
+    return {dotted, dotted.removeprefix("test."), Path(test).stem}
 
 
 def squashed(text: str) -> str:
@@ -67,7 +74,7 @@ def models_built_on(changed: set[str], repo_root: Path) -> set[str]:
     imports one of them, directly or through other such modules."""
     importers: dict[str, set[str]] = {}
     for path in sorted((repo_root / MODEL_DIRECTORY).glob("*.py")):
-        for imported in imported_models(path):
+        for imported in model_names(imported_modules(path)):
             importers.setdefault(imported, set()).add(path.stem)
     reached, pending = set(), list(changed)
     while pending:
@@ -103,25 +110,25 @@ def select_runtime_tests(
         return None
     reached = models_built_on(changed_models, repo_root) if changed_models else set()
     names = {squashed(name) for name in reached}
-    # A test may import a changed test as test.runtime.<name>, runtime.<name>
-    # or <name>.
-    changed_test_modules = {
-        name
-        for test in changed_tests
-        for name in (
-            test.removesuffix(".py").replace("/", "."),
-            test.removesuffix(".py").replace("/", ".").removeprefix("test."),
-            Path(test).stem,
-        )
+    # Every runtime test file, so that an unselected one still links others.
+    sources = {
+        path.relative_to(repo_root).as_posix(): path
+        for path in sorted((repo_root / RUNTIME_TEST_DIRECTORY).rglob("*.py"))
     }
-    selected = []
-    for test in test_files:
-        path = repo_root / test
-        if (
-            test in changed_tests
-            or imported_modules(path) & changed_test_modules
-            or imported_models(path) & reached
-            or any(name in squashed(path.read_text(encoding="utf-8")) for name in names)
-        ):
-            selected.append(test)
-    return selected
+    imports = {test: imported_modules(path) for test, path in sources.items()}
+    affected = {
+        test
+        for test, path in sources.items()
+        if test in changed_tests
+        or model_names(imports[test]) & reached
+        or any(name in squashed(path.read_text(encoding="utf-8")) for name in names)
+    }
+    # A test that imports an affected test file is affected too.
+    pending = list(affected)
+    while pending:
+        modules = test_module_names(pending.pop())
+        for test in sources:
+            if test not in affected and imports[test] & modules:
+                affected.add(test)
+                pending.append(test)
+    return [test for test in test_files if test in affected]
