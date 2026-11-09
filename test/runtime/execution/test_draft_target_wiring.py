@@ -917,9 +917,20 @@ def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
     )
 
 
-def _sink_dflash(enabled: bool, hidden: int = 3, taps: int = 2) -> DFlash:
+class _TapTarget:
+    def __init__(self, stores_taps: bool):
+        self._stores_taps = stores_taps
+
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        return self._stores_taps
+
+
+def _sink_dflash(
+    enabled: bool, hidden: int = 3, taps: int = 2, stores_taps: bool = False
+) -> DFlash:
     """A DFlash with only the capture-sink state set up."""
     drafter = DFlash.__new__(DFlash)
+    drafter.target_model = _TapTarget(stores_taps)
     drafter.hidden_size = hidden
     drafter._tap_count = taps
     drafter._tap_rows = (
@@ -944,6 +955,16 @@ def test_dflash_arms_the_capture_sink_on_the_forward_context():
     drafter.prepare_target_forward(ctx)
 
     assert ctx.target_capture_sink is drafter
+    assert drafter._context_written is False
+
+
+def test_dflash_leaves_the_taps_to_a_target_that_stores_them():
+    drafter = _sink_dflash(enabled=True, stores_taps=True)
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+
+    drafter.prepare_target_forward(ctx)
+
+    assert ctx.target_capture_sink is None
     assert drafter._context_written is False
 
 
@@ -1013,7 +1034,6 @@ def test_dflash_sink_concatenates_the_taps_and_writes_the_context_once():
 
 def test_dflash_run_refuses_a_round_whose_sink_never_completed():
     drafter = _sink_dflash(enabled=True)
-    drafter.target_model = object()
     ctx = _target_ctx(num_extends=0, num_tokens=4)
     drafter.prepare_target_forward(ctx)
     drafter.on_target_capture(0, torch.zeros(4, 3))

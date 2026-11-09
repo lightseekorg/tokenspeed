@@ -107,11 +107,22 @@ def _worker(rank, world_size, port, error_dict):
             dist.destroy_process_group()
 
 
+class _TapTarget:
+    """This target hands taps to the sink instead of storing them itself."""
+
+    def __init__(self, stores_taps: bool):
+        self._stores_taps = stores_taps
+
+    def stores_capture_taps(self, ctx) -> bool:
+        return self._stores_taps
+
+
 def _sink_drafter(model, device, max_bs: int, spec_num_tokens: int):
     """A DFlash holding only the state its capture sink runs on."""
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
 
     drafter = DFlash.__new__(DFlash)
+    drafter.target_model = _TapTarget(stores_taps=False)
     drafter.device = device
     drafter.hidden_size = int(model.config.hidden_size)
     drafter.target_layer_ids = list(model.target_layer_ids)
