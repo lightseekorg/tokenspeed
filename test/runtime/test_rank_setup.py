@@ -52,6 +52,7 @@ from test.runtime.cache_pool_test_utils import (  # noqa: E402
 )
 
 import tokenspeed.runtime.engine.rank_setup as rank_setup  # noqa: E402
+import tokenspeed.runtime.engine.scheduler_utils as scheduler_utils  # noqa: E402
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
@@ -339,6 +340,37 @@ def test_independent_admission_reaches_the_prefill_scheduler():
         cfg.decode_allocation_policy
         == ts.SchedulerConfig.DecodeAllocationPolicy.Independent
     )
+
+
+def test_an_older_scheduler_wheel_admits_early_without_the_policy(monkeypatch):
+    # tokenspeed-scheduler 0.1.54 has neither the field nor its enum and only
+    # admits a prompt once its destination is allocated: a prefill server
+    # starts with early left unset, and independent fails at startup.
+    class OldSchedulerConfig:
+        pass
+
+    monkeypatch.setattr(scheduler_utils, "SchedulerConfig", OldSchedulerConfig)
+    specs = _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0)
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="prefill",
+        disaggregation_transfer_backend="mooncake",
+    )
+    assert args.disaggregation_decode_allocation_policy == "early"
+    cfg = _config(args, specs)
+    assert cfg.num_snapshot_pages == 1
+    assert "decode_allocation_policy" not in vars(cfg)
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="prefill",
+        disaggregation_transfer_backend="mooncake",
+        disaggregation_decode_allocation_policy="independent",
+        disaggregation_layerwise_interval=0,
+    )
+    with pytest.raises(AttributeError, match="DecodeAllocationPolicy"):
+        _config(args, specs)
 
 
 @pytest.mark.parametrize(
