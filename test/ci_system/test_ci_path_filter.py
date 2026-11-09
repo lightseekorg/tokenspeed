@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pipeline
@@ -105,6 +107,7 @@ def test_shared_paths_require_every_group(path):
         "tokenspeed-kernel/python/requirements/rocm.txt",
         "tokenspeed-kernel/benchmarks/amd/unknown.json",
         "test/ci_system/install_deps_rocm.sh",
+        "test/ci_system/verify_rocm_stack.py",
         f"{KERNEL}/ops/attention/mha/gluon.py",
         f"{KERNEL}/ops/attention/dsv41/_gluon/indexer.py",
         f"{KERNEL}/ops/moe/gluon.py",
@@ -156,7 +159,6 @@ def test_unclassified_amd_paths_keep_both_full_suites(path):
         "mi450_sim_env.sh",
         "run_mi450_rocjitsu.sh",
         "run_mi450_rocjitsu_parallel.sh",
-        "mi450_rocjitsu_worker_python.sh",
         "mi450_sim_report_digest.py",
     ],
 )
@@ -548,3 +550,25 @@ def test_workflow_classifies_the_checkout_after_installing_pyyaml(
     )
     assert f"--runner-group {runner_group}" in classify["run"]
     assert '--repo-root "$GITHUB_WORKSPACE"' in classify["run"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"), [([], "false"), (["--full-tests"], "true")]
+)
+def test_full_tests_request_runs_a_group_a_change_does_not_need(
+    tmp_path, flags, expected
+):
+    changed = tmp_path / "changed.txt"
+    changed.write_text("docs/guide.md\n")
+    script = REPO_ROOT / "test/ci_system/ci_path_filter.py"
+    argv = [sys.executable, str(script), *flags, "--runner-group", "amd-mi350"]
+    argv += [
+        "--event-name",
+        "pull_request",
+        "--repo-root",
+        str(REPO_ROOT),
+        str(changed),
+    ]
+    output = subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+
+    assert f"should_run={expected}" in output.splitlines()

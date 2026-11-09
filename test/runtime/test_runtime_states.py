@@ -223,6 +223,7 @@ def _scheduled_batch():
         host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
+        prefill_decode_interval=0,
         storage_config=None,
         enable_kv_cache_events=False,
         decode_input_tokens=1,

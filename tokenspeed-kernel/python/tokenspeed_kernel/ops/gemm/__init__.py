@@ -30,6 +30,10 @@ from types import MappingProxyType
 
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu_layout import (
+    interleave_linear_and_gate,
+    swizzle_blockscale_2d,
+)
 from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
     flashinfer_fp8_blockscale_quantize_prepacked,
 )
@@ -85,6 +89,9 @@ __all__ = [
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "prepare_nvfp4_a16_weights",
+    # NVFP4 GEMM+SwiGLU weight layout
+    "interleave_linear_and_gate",
+    "swizzle_blockscale_2d",
     # DeepSeek V4.1 projections
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
@@ -1293,7 +1300,9 @@ def grouped_bf16_projection_quantize_fp8(
         ``[tokens, groups * output_dim / 32]`` of the BF16 projection, as
         ``quantize_fp8(granularity="token_group", group_size=32,
         scale_encoding="ue8m0")`` produces them. A kernel that quantizes in
-        its epilogue is used when one is registered for the geometry.
+        its epilogue is used when one is registered for the geometry; it may
+        split K differently from ``grouped_bf16_projection``, so a BF16 value
+        it quantizes can differ from that projection's by one ulp.
     """
     try:
         kernel = select_kernel(

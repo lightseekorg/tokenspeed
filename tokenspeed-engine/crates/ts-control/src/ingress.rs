@@ -33,7 +33,10 @@ use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
     grammar::ReasoningGrammar,
-    request::{LogprobRequest, RequestState, MAX_CACHE_SESSION_ID_BYTES, MAX_STOP_TOKEN_IDS},
+    request::{
+        LogprobRequest, ReasoningTokens, RequestState, MAX_CACHE_SESSION_ID_BYTES,
+        MAX_STOP_TOKEN_IDS,
+    },
     sampling,
 };
 
@@ -63,6 +66,9 @@ pub struct IngressLimits {
     /// How a JSON schema waits for the reasoning block; `None` without a
     /// grammar, a reasoning parser, or xgrammar's template for it.
     pub reasoning: Option<ReasoningGrammar>,
+    /// The reasoning parser's token markers, independent of whether grammar
+    /// constraints are enabled; `None` when the parser has no known template.
+    pub reasoning_usage: Option<ReasoningGrammar>,
     /// Which logprobs beyond the sampled tokens' the engine returns.
     pub logprobs: LogprobServability,
 }
@@ -288,6 +294,10 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         params.stream_interval,
         request.return_logprob,
     );
+    state.reasoning_tokens = limits
+        .reasoning_usage
+        .as_ref()
+        .map(|grammar| ReasoningTokens::new(grammar, &state.prompt_ids));
     state.created_time = request.created_time;
     state.session_id = request
         .session_params
@@ -586,6 +596,7 @@ mod tests {
             multimodal: false,
             grammar: false,
             reasoning: None,
+            reasoning_usage: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
@@ -851,6 +862,7 @@ mod tests {
             may_open: r#"{"may_open":SLOT}"#.to_owned(),
             schema_slot: "SLOT".to_owned(),
             markers: Some((7, 8)),
+            implicit_closer: None,
         };
         let admitted = |limits: &IngressLimits, prompt: Vec<i32>, schema: &str| {
             let params = SamplingParams {

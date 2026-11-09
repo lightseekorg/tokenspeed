@@ -374,13 +374,18 @@ private:
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
     // A PD transfer is out against this request's pages, so nothing here may
-    // retract, finish or flush them. Derived from the FSM, never recorded: on
-    // the D role it is the peer's prefill writing the destination pages
-    // (RemotePrefilling); on the P role it is the peer's decode reading them,
-    // which begins with the first scheduled chunk and ends only with the PD
-    // ACK -- every page-holding state before Finishing. A fused engine never
-    // transfers.
+    // retract, finish, flush or free them. Derived from the FSM, never
+    // recorded: on the D role it is the peer's prefill writing the
+    // destination pages (RemotePrefilling); on the P role it is the peer's
+    // decode reading them, which begins with the first scheduled chunk and
+    // ends only with the PD ACK -- every page-holding state before Finishing.
+    // A request that ends while pinned (an abort, a failed transfer) parks
+    // in PdTransferring until the transport reports the transfer stopped. A
+    // fused engine never transfers.
     bool pdTransferInFlight(const Request& request) const;
+    // Ends a request on an abort or a failed transfer, through PdTransferring
+    // while a transfer may still touch its pages.
+    void abortRequest(Request& request);
 
     void handleEvent(const cache::StorageTick& event);
     void handleEvent(const cache::StorageDone& event);
@@ -395,6 +400,7 @@ private:
     void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::FailedEvent& event);
+    void handleEvent(const pd::TransferStoppedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);
@@ -605,6 +611,10 @@ private:
                                std::vector<WriteBackOperation>& write_back_operations);
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
+    // True when a local-prefill candidate has been held back by the
+    // prefill/decode interval for prefill_decode_interval rounds in total
+    // (docs/design/scheduler.md §3.3).
+    bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
@@ -642,6 +652,10 @@ private:
     // retracted.
     std::int64_t plan_calls_{0};
     std::string forced_victim_id_;
+
+    // prefill_decode_interval: reset by a prefill round, counted down by a
+    // decode round. Derived from the plans alone, so mirrored ranks agree.
+    std::int32_t prefill_deferral_rounds_left_{0};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work or leaves work in flight.

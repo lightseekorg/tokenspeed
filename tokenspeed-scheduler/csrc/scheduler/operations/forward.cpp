@@ -266,6 +266,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
                                                                         : OwnerTail::kFinal,
             .preserve_source_blocks = preserve_source_blocks,
             .publish_state = publish_state,
+            .state_slot = cache_progress.prompt_end_rotated && num_computed_tokens == request.PrefillSize() ? 0 : 1,
             .state_checkpoint_pages = state_checkpoint_pages,
             .state_checkpoint_blocks = cache_progress.published_state_checkpoint_blocks,
             .boundary_kind =
@@ -924,6 +925,9 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         return std::nullopt;
     }
     staged.Commit();
+    if (prompt_end) {
+        cache_progress.prompt_end_rotated = true;
+    }
 
     if (first_decode && cache_progress.retained_input_checkpoint.empty()) {
         const std::int32_t checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
@@ -1135,10 +1139,8 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
     // tail it drops under the per-prior cap takes its Host entries along;
     // under the write-back policy the segment step ranks Host victims by
     // what the Device holds, which the publication adds to
-    // (NumHostBoundariesThatFit); and under KV parallelism a slot it
-    // re-points to the Device entry already holding its key rides the pool
-    // in that entry's bucket, not the one counted here. The split
-    // retractVictim makes after the publication can then refuse the image.
+    // (NumHostBoundariesThatFit). The split retractVictim makes after the
+    // publication can then refuse the image.
     // Nothing is mutated: a candidate that does not fit is left as it was,
     // and so is the Host.
     fsm::CacheProgress cache_progress = request.CacheProgress();
@@ -1973,26 +1975,72 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // without (MinPrefillChunkTokens); the prefill phases spend the rest. Outside
 // mixed mode prefill work runs alone, and decodes get a round only when no
 // prefill scheduled.
+//
+// With prefill_decode_interval N, a round that schedules a prefill chunk owes
+// the running decodes N decode rounds: until they have run, decodes are
+// scheduled first, and a round that scheduled any skips the prefill phases.
+// A round with no decode to schedule runs prefill work as usual, so the
+// engine never idles to honor the interval. No prompt is held back more
+// than N rounds in total, across its chunks and other prompts' intervals: a
+// prompt held back N rounds suspends the interval, and the round runs as if
+// none were owed.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
+    const bool interval_owes_decodes = prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates);
     if (config_.enable_mixed_prefill_decode) {
-        const bool has_local_prefill = std::ranges::any_of(candidates, [](const Request* request) {
-            return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
-        });
+        // A deferred prefill joins no decode, so the decodes keep its reserve.
+        const bool has_local_prefill =
+            !interval_owes_decodes && std::ranges::any_of(candidates, [](const Request* request) {
+                return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
+            });
         build.pending_prefill_reserve = has_local_prefill ? MinPrefillChunkTokens(coordinator_) : 0;
+        scheduleDecodeBatch(feedback, build, candidates);
+    } else if (interval_owes_decodes) {
         scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    const bool prefill_phases_skipped = interval_owes_decodes && build.pushed_decode;
+    if (!prefill_phases_skipped) {
+        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    }
 
-    if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
+    if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {
         scheduleDecodeBatch(feedback, build, candidates);
+    }
+
+    // The prompts this round held back, taken before a retraction can make
+    // one of them its victim: that one sat the round out all the same.
+    std::vector<Request*> held_back;
+    if (prefill_phases_skipped) {
+        std::ranges::copy_if(candidates, std::back_inserter(held_back), [](const Request* request) {
+            return request->IsAnyOf<fsm::Submitted, fsm::Prefilling>();
+        });
     }
 
     maybeRetractForCapacity(feedback, build, candidates, write_back_operations);
+
+    // A retraction's grant may have scheduled the prefill, so count last; a
+    // prompt the grant scheduled was not held back.
+    for (Request* request : held_back) {
+        if (!build.Scheduled(*request)) {
+            request->NotePrefillDeferred();
+        }
+    }
+    if (build.pushed_prefill) {
+        prefill_deferral_rounds_left_ = config_.prefill_decode_interval;
+    } else if (build.pushed_decode && prefill_deferral_rounds_left_ > 0) {
+        --prefill_deferral_rounds_left_;
+    }
+}
+
+bool Scheduler::prefillDeferralExhausted(std::span<Request* const> candidates) const {
+    return std::ranges::any_of(candidates, [this](const Request* request) {
+        return request->IsAnyOf<fsm::Submitted, fsm::Prefilling>() &&
+               request->PrefillDeferredRounds() >= config_.prefill_decode_interval;
+    });
 }
 
 Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,

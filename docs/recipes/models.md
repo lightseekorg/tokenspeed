@@ -67,7 +67,8 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
     --moe-backend gluon \
     --kv-cache-dtype fp8_e4m3 \
     --max-model-len 1048576 \
-    --max-num-seqs 64 \
+    --max-num-seqs 2 \
+    --prefill-decode-interval 192 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
     --cudagraph-capture-sizes 1 2 3 4 5 6 8 12 16 32 64 \
@@ -105,17 +106,28 @@ itself. `DEBUG_HIP_FORCE_GRAPH_QUEUES=1` matters most for the two-stream
 speculative decode graph. The extra capture sizes (3, 5, 6, 12) cut padding at
 the small batch sizes that speculative decoding runs at.
 
-For multi-turn agentic traffic, set `--max-num-seqs` by concurrency:
+For multi-turn agentic traffic, set `--max-num-seqs` and
+`--prefill-decode-interval` by concurrency. The earlier launch uses the row for
+a concurrency of 2:
 
-| Concurrency | `--max-num-seqs` |
-| ----------- | ---------------- |
-| 1 to 4      | 64               |
-| 8           | 3                |
-| 16          | 4                |
+| Concurrency | `--max-num-seqs` | `--prefill-decode-interval` |
+| ----------- | ---------------- | --------------------------- |
+| 1           | 1                | 0                           |
+| 2           | 2                | 192                         |
+| 4           | 2                | 96                          |
+| 8           | 2                | 256                         |
+| 16          | 3                | 384                         |
 
-A `--max-num-seqs` below the concurrency queues the extra requests: decode
-batches stay small, which lowers TPOT, but queued requests wait longer for
-their first token. Keep 64 when time-to-first-token matters more.
+A `--max-num-seqs` below the concurrency queues the extra requests. With an
+interval of N, the scheduler runs N decode rounds after each prefill chunk
+before the next one. Both keep decode batches small and uninterrupted, which
+lowers TPOT, but queued and deferred prompts wait longer for their first token.
+At a concurrency of 8, time-to-first-token is noticeably higher. If
+time-to-first-token matters more, raise `--max-num-seqs` and lower the
+interval.
+
+`--prefill-decode-interval` needs a `tokenspeed-scheduler` release that
+includes the prefill/decode interval. With an older scheduler, leave it at 0.
 
 ### Blackwell NVFP4
 
@@ -1231,6 +1243,12 @@ The B200 and AMD GSM8K CI jobs, the GB300 Slurm 1P1D GSM8K job, and the
 manual 1P1D smoke test use `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
 The 1P1D CI tasks set `MODEL` explicitly so both serving roles and the
 evaluation client select the same checkpoint.
+
+The target LM head masks BOS, PAD, and the image control/placeholder token IDs
+`0, 2, 129262..129264` to `-inf`. The mask applies before ordinary sampling,
+fused argmax, and speculative verification, and to target-side logprob scoring;
+draft-model proposals are unchanged. Pass
+`--disable-deepseek-v41-token-blacklist` to allow these tokens.
 
 DeepSeek V4.1 (`deepseek_v41`) runs on its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows, and the

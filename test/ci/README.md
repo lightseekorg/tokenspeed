@@ -183,6 +183,40 @@ optional:
   amd-mi355-1gpu: true
 ```
 
+`ignore_changes` lists directories whose changes cannot affect a task. On
+pull requests the scan drops the task when every changed file is Markdown or
+lies under one of them. Pushes to `main` and manual runs keep every task. The
+per-commit kernel unit-test tasks list the runtime sources and runtime tests,
+so a pull request that changes only the runtime skips them. That holds because
+the kernel tests never import the runtime: the `kernel-tests-without-runtime`
+pre-commit hook rejects such an import under `tokenspeed-kernel/test`.
+
+```yaml
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+```
+
+`changed_paths: true` hands a pull request's changed paths to the task's
+commands as `TOKENSPEED_CI_CHANGED_PATHS`, one path per line, so the suite can
+pick its own tests. The scan sets it only where it narrows tasks: pull
+requests with fewer than 300 changed files. The kernel unit-test tasks use it:
+`tokenspeed-kernel/test/kernel_test_selection.py` runs the test files whose
+op families a change names (`ops/<family>/`, an attention variant such as
+`ops/attention/mla/`, `thirdparty/<package>/`, and the AMD
+`ops/<arch>/<family>/`), the changed test files, and the tests that load every
+kernel. A change to a core module, `conftest.py`, packaging, or anything else
+that names no family runs every test. Dependencies between families are not
+followed; pushes to `main` run every test.
+
+A reviewer can widen a pull request's tests. The `ci-full-tests` label turns
+off every changed-path narrowing (vendor path filtering, `ignore_changes`,
+and `changed_paths`), and each `CI-Extra-Changes: <path>` line in the description
+counts as a changed path, such as a kernel family directory whose tests should
+also run. The scan job reads both from the pull request
+(`test/ci_system/pr_test_scope.py`), so re-run the workflows after adding the
+label or editing the description.
+
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
 `b200v2-<Ngpu>` by default. Set the `TOKENSPEED_B200_RUNNER_LABEL` repository
 variable in GitHub Actions (`Settings` -> `Secrets and variables` -> `Actions`
@@ -225,20 +259,6 @@ the task's server restarts, and the same job cleanup removes it. Compiler
 options and test workloads are unchanged. Performance jobs retain the runner's
 Triton cache policy so cold compilation is not newly introduced into measured
 requests.
-
-The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
-tokenizer under
-`.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf`, including the
-request/response database. These artifacts support investigating input,
-output, and speculative acceptance differences alongside timing changes. The
-task measures 16 concurrent 50K-input/500-output requests with TP8/EP1 and
-zero benchmark warmup requests.
-
-The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
-predictions and scoring records under
-`.ci-artifacts/published/kimi-k3-eagle3-aime26`. This retains evidence for accuracy
-misses without changing the full 30-question workload, generation settings, or
-score threshold.
 
 Model jobs load weights from the runner's shared Hugging Face cache
 (`HF_HOME`) and must not pass `--download-dir` into the job's work directory.
