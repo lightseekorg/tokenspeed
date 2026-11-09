@@ -812,6 +812,42 @@ def test_prefill_topk_rows_gather_through_the_k3_iris_state(
     assert len(calls) == 2 and len(gathers) == 4 and rows.dtype == torch.int32
 
 
+@pytest.mark.parametrize("fused", [True, False], ids=["fused", "separate"])
+def test_a_k31_decode_step_reads_its_query_and_index_projections(fused) -> None:
+    """The decode weights in reading order.
+
+    They come from the stacked query and index-key weights when those were fused
+    after load, else from each projection.
+    """
+    from tokenspeed.runtime.models import kimi_k31
+
+    attention = object.__new__(kimi_k31.KimiK31SparseMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.fused_qkv_a_proj_with_mqa = SimpleNamespace(weight="qkv_a")
+    attention.q_b_proj = SimpleNamespace(weight="q_b")
+    attention.o_proj = SimpleNamespace(weight="o_proj")
+    attention.w_kc, attention.w_vc = "w_kc", "w_vc"
+    attention.q_b_wq_b_weight = "q_b_wq_b" if fused else None
+    attention.indexer = SimpleNamespace(
+        wq_b=SimpleNamespace(weight="wq_b"),
+        wk=SimpleNamespace(weight="wk"),
+        weights_proj=SimpleNamespace(weight="weights_proj"),
+        wk_weights_proj_weight="wk_weights_proj" if fused else None,
+    )
+    middle = (
+        ("q_b_wq_b", "wk_weights_proj")
+        if fused
+        else ("q_b", "wq_b", "wk", "weights_proj")
+    )
+    assert attention.decode_weights() == (
+        "qkv_a",
+        *middle,
+        "w_kc",
+        "w_vc",
+        "o_proj",
+    )
+
+
 def test_k31_layers_take_the_attention_iris_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
