@@ -334,9 +334,10 @@ class LogitsProcessor(nn.Module):
         ``dp_lm_head_tp`` selects the layout where that group's ranks are
         data-parallel for attention. ``attn_tp_size`` describes replicated
         rows within each attention TP group: each DP slot is gathered once
-        before the logits GEMM and full-vocab logits returned to its peers (``skip_all_gather`` is then
-        required, as the plain vocab all-gather does not apply). ``False`` is
-        today's layout: every rank of the group holds the same rows.
+        before the logits GEMM and full-vocab logits returned to its peers.
+        This layout requires ``skip_all_gather`` because it uses a dedicated
+        vocab exchange. With ``dp_lm_head_tp=False``, every rank of the head
+        group holds the same rows.
         """
         super().__init__()
         self.config = config
@@ -1359,7 +1360,8 @@ class LogitsProcessor(nn.Module):
                             n != counts[begin] for n in counts[begin : begin + replicas]
                         ):
                             raise ValueError(
-                                "Attention TP peers must have identical LM-head row counts"
+                                "Attention TP peers must have identical "
+                                "LM-head row counts"
                             )
                     dp_counts = counts[::replicas]
                     dp_rank = self.tp_rank // replicas
@@ -1513,6 +1515,7 @@ class LogitsProcessor(nn.Module):
         *,
         require_full_vocab: bool,
     ) -> torch.Tensor:
+        """Gather full-vocabulary logits, using a private buffer when required."""
         # The multicast buffer/kernel is BF16-only; retain other logits dtypes
         # through the existing collective, including when a state is cached.
         # A private full-vocab result never uses the shared buffer either.
