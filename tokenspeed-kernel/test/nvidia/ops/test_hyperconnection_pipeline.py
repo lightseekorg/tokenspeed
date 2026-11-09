@@ -46,25 +46,28 @@ def fused_device():
     torch.set_num_threads(previous_threads)
 
 
-def _inputs(rows, dtype, inject):
+def _inputs(rows, dtype, inject, model):
+    branches, hidden_size, lowrank = model
+    width = branches * hidden_size
     generator = torch.Generator(device="cuda").manual_seed(1409 + rows)
     return tuple(
         torch.randn(shape, device="cuda", dtype=dtype, generator=generator) * scale
         for shape, scale in (
-            ((rows, 32768), 1.0),
-            ((1028 if inject else 1024, 32768), 1.0 / math.sqrt(32768) / 4),
-            ((32768, 1024), 1.0 / math.sqrt(1024)),
+            ((rows, width), 1.0),
+            (
+                (lowrank + (branches if inject else 0), width),
+                1.0 / math.sqrt(width) / branches,
+            ),
+            ((width, lowrank), 1.0 / math.sqrt(lowrank)),
         )
     )
 
 
-def _mix(values, inject, weights_independent):
+def _mix(values, inject, weights_independent, model):
     return gated_residual_mix(
         *values,
-        4,
-        8192,
-        1024,
-        projection_rows=1028 if inject else 1024,
+        *model,
+        projection_rows=model[2] + (model[0] if inject else 0),
         projection_scale=1.0,
         weights_independent=weights_independent,
         override="cute_fused_hyperconnection_mix",
@@ -72,13 +75,11 @@ def _mix(values, inject, weights_independent):
     )
 
 
-def _check(actual, values, inject):
+def _check(actual, values, inject, model):
     expected = torch_hyperconnection_mix(
         *(value.cpu() for value in values),
-        4,
-        8192,
-        1024,
-        1028 if inject else 1024,
+        *model,
+        model[2] + (model[0] if inject else 0),
         1.0,
         True,
     )
@@ -105,8 +106,32 @@ def _check_single_kernel(graph):
 
 
 @pytest.mark.parametrize(
+    "model", [(4, 2560, 320), (4, 8192, 1024)], ids=["legacy", "wide"]
+)
+@pytest.mark.parametrize(
     "rows,inject",
-    [(rows, True) for rows in (8, 16, 24, 32, 64, 96, 128, 192, 256, 95, 127, 191, 255)]
+    [
+        (rows, True)
+        for rows in (
+            1,
+            4,
+            8,
+            16,
+            24,
+            32,
+            63,
+            64,
+            65,
+            96,
+            128,
+            192,
+            256,
+            95,
+            127,
+            191,
+            255,
+        )
+    ]
     + [(rows, False) for rows in (64, 128, 256)],
 )
 @pytest.mark.parametrize(
@@ -115,20 +140,20 @@ def _check_single_kernel(graph):
 )
 @torch.inference_mode()
 def test_pipeline_graph_uses_current_inputs(
-    rows, inject, dtype, enable_pdl, weights_independent
+    rows, inject, dtype, enable_pdl, weights_independent, model
 ):
-    values = _inputs(rows, dtype, inject)
+    values = _inputs(rows, dtype, inject, model)
     originals = tuple(value.clone() for value in values)
     pdl_enabled(enable_pdl)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        actual = _mix(values, inject, weights_independent)
+        actual = _mix(values, inject, weights_independent, model)
     stream.synchronize()
-    _check(actual, values, inject)
+    _check(actual, values, inject, model)
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph, stream=stream):
-        actual = _mix(values, inject, weights_independent)
+        actual = _mix(values, inject, weights_independent, model)
     _check_single_kernel(graph)
     for changed, factor in enumerate((-0.75, -2.0, 4.0)):
         with torch.cuda.stream(stream):
@@ -138,21 +163,33 @@ def test_pipeline_graph_uses_current_inputs(
             for _ in range(3):
                 graph.replay()
         stream.synchronize()
-        _check(actual, values, inject)
+        _check(actual, values, inject, model)
 
 
 @pytest.mark.parametrize(
-    "rows", [(5, 6, 7), (17, 19, 23), (97, 113, 127), (129, 157, 191), (193, 221, 255)]
+    "model", [(4, 2560, 320), (4, 8192, 1024)], ids=["legacy", "wide"]
+)
+@pytest.mark.parametrize(
+    "rows",
+    [
+        (5, 6, 7),
+        (17, 19, 23),
+        (33, 39, 47),
+        (65, 79, 95),
+        (97, 113, 127),
+        (129, 157, 191),
+        (193, 221, 255),
+    ],
 )
 @torch.inference_mode()
-def test_pipeline_reuses_compilation_within_row_bucket(rows):
-    values = _inputs(max(rows), torch.bfloat16, True)
+def test_pipeline_reuses_compilation_within_row_bucket(rows, model):
+    values = _inputs(max(rows), torch.bfloat16, True, model)
     first = (values[0][: rows[0]], values[1], values[2])
-    _mix(first, True, True)
+    _mix(first, True, True, model)
     torch.cuda.synchronize()
     with assert_no_cute_compile():
         for count in rows[1:]:
             current = (values[0][:count], values[1], values[2])
-            actual = _mix(current, True, True)
+            actual = _mix(current, True, True, model)
             torch.cuda.synchronize()
-            _check(actual, current, True)
+            _check(actual, current, True, model)

@@ -554,10 +554,13 @@ tiles can retain two Up accumulators, publishing the first only after its final
 K tiles complete while the second continues. Readers acknowledge TMEM before
 reuse or deallocation. PDL, mutable weights and eager/graph calls use these same
 ownership and publication edges. Startup warms the bounded tactic variants
-through the ordinary operator; the validated model dimensions `(4, 2560, 320)` and `(4, 8192, 1024)` use
-the same parameterized implementation. Row-derived reduction groups and token
-pairing belong only to the wider model. Other dimensions keep ordinary kernel
-selection; the fused work budget still bounds automatic selection.
+through the ordinary operator. The validated model dimensions `(4, 2560, 320)`
+and `(4, 8192, 1024)` use the same parameterized implementation, with
+model-specific tile geometry, Up K width and cache policy. Token tiles for the
+existing model preserve resident parallelism and bound per-thread gate state
+for larger batches. Row-derived reduction groups and token pairing belong
+only to the wider model. Other dimensions keep ordinary kernel selection;
+the fused work budget still bounds automatic selection.
 
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows

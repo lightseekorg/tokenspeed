@@ -240,8 +240,8 @@ def _tactic(rows: int, projection_rows: int):
     if rows <= 96:
         return 4, 64, 16, 1, 1, 5, 32
     if rows <= 192:
-        return 4, 64, 16, 1, 1, 5, 32
-    return 4, 128, 16, 1, 1, 4, 32
+        return 4, 64, 32, 1, 1, 5, 32
+    return 4, 128, 32, 1, 1, 4, 32
 
 
 def _epilogue_threads(token_tile: int, down_token_parts: int) -> int:
@@ -390,7 +390,31 @@ def _up_token_tail_overlap_tactic(
     )
 
 
-def _up_k_tactic(hc_count: int, hidden_size: int, lowrank: int, token_tile: int) -> int:
+def _legacy_up_tactic(
+    hc_count: int, hidden_size: int, lowrank: int, token_tile: int, split_k: int
+) -> bool:
+    # K64 covers rank 320 without padding. Keep its weights cached across
+    # token workers while reusing Down's operand arena.
+    return (
+        (hc_count, hidden_size, lowrank) == (4, 2560, 320)
+        and token_tile == 16
+        and split_k == 4
+    )
+
+
+def _evict_up_weights_first_tactic(
+    hc_count: int, hidden_size: int, lowrank: int, token_tile: int, split_k: int
+) -> bool:
+    return _EVICT_UP_WEIGHTS_FIRST and not _legacy_up_tactic(
+        hc_count, hidden_size, lowrank, token_tile, split_k
+    )
+
+
+def _up_k_tactic(
+    hc_count: int, hidden_size: int, lowrank: int, token_tile: int, split_k: int
+) -> int:
+    if _legacy_up_tactic(hc_count, hidden_size, lowrank, token_tile, split_k):
+        return 64
     if (
         hc_count == 4
         and hidden_size == 8192
@@ -451,8 +475,10 @@ def _up_stage_counts_tactic(
 
 
 def _down_k_order_tactic(
-    hc_count: int, hidden_size: int, lowrank: int, token_tile: int
+    hc_count: int, hidden_size: int, lowrank: int, token_tile: int, split_k: int
 ) -> str:
+    if _legacy_up_tactic(hc_count, hidden_size, lowrank, token_tile, split_k):
+        return "paired"
     if hc_count == 4 and hidden_size == 8192 and lowrank == 1024:
         if token_tile in (96, 128, 192):
             return "paired"
@@ -526,7 +552,11 @@ def _activation_tactic(
     pipes, up_columns, shared_budget = _local_pipeline_parameters(
         n, hc_count, hidden_size, lowrank
     )
-    reuse = n > 16 or _reduction_groups(hc_count, hidden_size, lowrank) > 1
+    reuse = (
+        n > 16
+        or _reduction_groups(hc_count, hidden_size, lowrank) > 1
+        or _legacy_up_tactic(hc_count, hidden_size, lowrank, n, split_k)
+    )
     if not _AVAILABLE:
         return (*tactic, False, reuse)
 
@@ -535,7 +565,7 @@ def _activation_tactic(
             hc_count=hc_count,
             hidden_size=hidden_size,
             lowrank=lowrank,
-            up_k=_up_k_tactic(hc_count, hidden_size, lowrank, n),
+            up_k=_up_k_tactic(hc_count, hidden_size, lowrank, n, split_k),
             down_x_cache_mode=_down_x_cache_mode_tactic(
                 hc_count,
                 hidden_size,
@@ -550,7 +580,9 @@ def _activation_tactic(
                 0,
                 False,
             ),
-            down_k_order=_down_k_order_tactic(hc_count, hidden_size, lowrank, n),
+            down_k_order=_down_k_order_tactic(
+                hc_count, hidden_size, lowrank, n, split_k
+            ),
             projection_tile=m,
             token_tile=n,
             token_major_up=_token_major_up_tactic(hc_count, hidden_size, lowrank, n),
@@ -583,7 +615,9 @@ def _activation_tactic(
             use_pdl=False,
             scale=1.0,
             weights_independent=True,
-            evict_up_weights_first=_EVICT_UP_WEIGHTS_FIRST,
+            evict_up_weights_first=_evict_up_weights_first_tactic(
+                hc_count, hidden_size, lowrank, n, split_k
+            ),
             evict_down_weights_first=_evict_down_weights_first_tactic(
                 hc_count,
                 hidden_size,
@@ -671,6 +705,13 @@ def _model_tactic(
         hc_count == 4 and hidden_size == 8192 and lowrank == 1024 and 65 <= rows <= 256
     )
     split_k, m, n, lp, lb, stages, f = _tactic(rows, projection_rows)
+    if (
+        (hc_count, hidden_size, lowrank) == (4, 2560, 320)
+        and 32 < rows <= 64
+        and (split_k, m, n, lp, lb, stages, f) == (4, 64, 16, 1, 1, 5, 32)
+    ):
+        # S8/N32 keeps this model's token groups in one resident round.
+        split_k, n = 8, 32
     if projection_rows > 6 * m:
         # Four-CTA clusters expose more Up output work at the resident limit.
         # Keep enough independent projection tiles while buffering their K loop.
@@ -753,11 +794,11 @@ def _down_tactic(hc_count, hidden_size, lowrank, projection_rows, tactic):
         hc_count=hc_count,
         hidden_size=hidden_size,
         lowrank=lowrank,
-        up_k=_up_k_tactic(hc_count, hidden_size, lowrank, n),
+        up_k=_up_k_tactic(hc_count, hidden_size, lowrank, n, split_k),
         down_x_cache_mode=_down_x_cache_mode_tactic(
             hc_count, hidden_size, lowrank, n, split_k, 1, 1, lp, lb, 1, 0, False
         ),
-        down_k_order=_down_k_order_tactic(hc_count, hidden_size, lowrank, n),
+        down_k_order=_down_k_order_tactic(hc_count, hidden_size, lowrank, n, split_k),
         projection_tile=m,
         token_tile=n,
         token_major_up=_token_major_up_tactic(hc_count, hidden_size, lowrank, n),
@@ -784,7 +825,9 @@ def _down_tactic(hc_count, hidden_size, lowrank, projection_rows, tactic):
         use_pdl=False,
         scale=1.0,
         weights_independent=True,
-        evict_up_weights_first=_EVICT_UP_WEIGHTS_FIRST,
+        evict_up_weights_first=_evict_up_weights_first_tactic(
+            hc_count, hidden_size, lowrank, n, split_k
+        ),
         evict_down_weights_first=_evict_down_weights_first_tactic(
             hc_count,
             hidden_size,
@@ -1091,7 +1134,9 @@ if _AVAILABLE:
                 enable_pdl,
                 projection_scale,
                 weights_independent,
-                _EVICT_UP_WEIGHTS_FIRST,
+                _evict_up_weights_first_tactic(
+                    hc_count, hidden_size, lowrank, n, split_k
+                ),
                 _USE_UP_TANH,
                 _USE_UP_TOKEN_TAIL,
                 # The final plan key also includes actual worker count.
@@ -1100,13 +1145,13 @@ if _AVAILABLE:
                 pipes,
                 up_columns,
                 shared_budget,
-                _up_k_tactic(hc_count, hidden_size, lowrank, n),
+                _up_k_tactic(hc_count, hidden_size, lowrank, n, split_k),
                 _token_major_up_tactic(hc_count, hidden_size, lowrank, n),
                 _up_output_parts_tactic(hc_count, hidden_size, lowrank, n),
                 _up_token_parts_tactic(hc_count, hidden_size, lowrank, n),
                 _up_stage_counts_tactic(hc_count, hidden_size, lowrank, n),
                 _rotate_up_k_tactic(hc_count, hidden_size, lowrank, n),
-                _down_k_order_tactic(hc_count, hidden_size, lowrank, n),
+                _down_k_order_tactic(hc_count, hidden_size, lowrank, n, split_k),
                 _USE_NATIVE64_DOWN_X_RETENTION,
             )
 
@@ -1174,7 +1219,7 @@ if _AVAILABLE:
                     hc_count=hc_count,
                     hidden_size=hidden_size,
                     lowrank=lowrank,
-                    up_k=_up_k_tactic(hc_count, hidden_size, lowrank, n),
+                    up_k=_up_k_tactic(hc_count, hidden_size, lowrank, n, split_k),
                     down_x_cache_mode=_down_x_cache_mode_tactic(
                         hc_count,
                         hidden_size,
@@ -1190,7 +1235,7 @@ if _AVAILABLE:
                         full_tiles,
                     ),
                     down_k_order=_down_k_order_tactic(
-                        hc_count, hidden_size, lowrank, n
+                        hc_count, hidden_size, lowrank, n, split_k
                     ),
                     projection_tile=m,
                     token_tile=n,
@@ -1229,7 +1274,9 @@ if _AVAILABLE:
                     use_pdl=enable_pdl,
                     scale=projection_scale,
                     weights_independent=weights_independent,
-                    evict_up_weights_first=_EVICT_UP_WEIGHTS_FIRST,
+                    evict_up_weights_first=_evict_up_weights_first_tactic(
+                        hc_count, hidden_size, lowrank, n, split_k
+                    ),
                     evict_down_weights_first=_evict_down_weights_first_tactic(
                         hc_count,
                         hidden_size,
