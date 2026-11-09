@@ -32,7 +32,6 @@ from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.page_table import (
@@ -516,48 +515,34 @@ class Dots3NoteDecoderLayer(DeepseekV3DecoderLayer):
     def __init__(
         self, config, layer_id, mapping, quant_config=None, prefix="", alt_stream=None
     ):
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.layer_id = layer_id
-        self.hidden_size = config.hidden_size
-        self.self_attn = self.attention_cls(
-            config, mapping, layer_id, quant_config, add_prefix("self_attn", prefix)
+        super().__init__(
+            config,
+            layer_id,
+            mapping,
+            quant_config,
+            is_nextn=False,
+            prefix=prefix,
+            alt_stream=alt_stream,
         )
-        self.is_moe_layer = self._is_moe_layer(layer_id, False, config)
+
+    @property
+    def dense_batch_invariant(self) -> bool:
+        return False
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        return self.attention_cls(
+            self.config,
+            self.mapping,
+            self.layer_id,
+            self.quant_config,
+            add_prefix("self_attn", prefix),
+        )
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+        mlp = super().resolve_mlp(prefix)
         if self.is_moe_layer:
-            self.mlp = DeepseekV3MoE(
-                config,
-                mapping,
-                quant_config,
-                layer_index=layer_id,
-                prefix=add_prefix("mlp", prefix),
-                alt_stream=alt_stream,
-            )
-            self.mlp.gate = Dots3NoteRouter(self.mlp.gate)
-        else:
-            self.mlp = DeepseekV3MLP(
-                config.hidden_size,
-                config.intermediate_size,
-                config.hidden_act,
-                mapping,
-                quant_config,
-                prefix=add_prefix("mlp", prefix),
-                batch_invariant=False,
-            )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.comm_manager = CommManager(
-            mapping=mapping,
-            layer_id=layer_id,
-            is_moe=self.is_moe_layer,
-            prev_is_moe=self._is_moe_layer(layer_id - 1, False, config),
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            dense_batch_invariant=False,
-            query_sharded=False,
-        )
+            mlp.gate = Dots3NoteRouter(mlp.gate)
+        return mlp
 
 
 class Dots3NoteModel(DeepseekV3Model):
