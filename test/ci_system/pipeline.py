@@ -2364,7 +2364,7 @@ def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
     They define ``EntryClass`` or a task lists them in ``model_sources``. Every
     other module there, such as ``utils.py``, is shared by all models.
     """
-    listed = set()
+    listed: set[str] = set()
     for path in find_task_files(root):
         listed.update(normalize_task(path, repo_root).get("model_sources", []))
     defining = {
@@ -2383,7 +2383,7 @@ def imported_model_modules(path: Path) -> set[str]:
     """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     package = MODEL_DIRECTORY.removeprefix("python/").replace("/", ".")
-    names = set()
+    names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
@@ -2465,7 +2465,7 @@ def drop_unaffected_tasks(
     """
     tasks: Dict[str, Dict[str, Any]] = {}
     model_specific: Optional[frozenset[str]] = None
-    kept = []
+    kept: List[Dict[str, Any]] = []
     for entry in include:
         config = entry["config"]
         if config not in tasks:
@@ -2477,22 +2477,16 @@ def drop_unaffected_tasks(
             continue
         if sources is not None and model_specific is None:
             model_specific = model_specific_modules(root, repo_root)
+        run_tests: Optional[List[str]] = None
+        if tasks[config].get("workflow_stage") != "model-test":
+            run_tests = task_test_paths(
+                (repo_root / config).read_text(encoding="utf-8")
+            )
         if not all(
             (prefixes is not None and path_is_ignored(path, prefixes))
             or (
                 sources is not None
-                and path_is_ignored_for_model(
-                    path,
-                    sources,
-                    model_specific,
-                    (
-                        None
-                        if tasks[config].get("workflow_stage") == "model-test"
-                        else task_test_paths(
-                            (repo_root / config).read_text(encoding="utf-8")
-                        )
-                    ),
-                )
+                and path_is_ignored_for_model(path, sources, model_specific, run_tests)
             )
             for path in changed
         ):
