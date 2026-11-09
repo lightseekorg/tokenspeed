@@ -28,6 +28,7 @@ Modes:
   --mode tuned --tuned-file CSV   torch.mm replaying a TunableOp results file
   --mode gl3                      Gluon 3-stage kernel, config sweep (or --cfgs JSON)
   --mode sk                       Gluon Stream-K kernel, config sweep (or --cfgs JSON)
+  --mode pers                     Gluon persistent rounds + split-K tail kernel, sweep (or --cfgs JSON)
   --compile-only                  launch every candidate once (fills the Triton cache)
 
 Each record is one JSON line: shape, M, method, us, relerr (max error / max |ref|).
@@ -46,6 +47,7 @@ import time
 
 import torch
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm_3stage as G3
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm_persistent as PS
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm_streamk as SK
 
 SHAPES = {
@@ -116,6 +118,23 @@ def sk_candidates(M, N, K, ns_list, grids, xcds):
     return out
 
 
+def pers_candidates(M, N, K, ns_list, grids, xcds):
+    out = []
+    for bm, bn, bk in itertools.product((64, 128, 256), (64, 128, 256), (64, 128)):
+        if bm > 64 and bm >= 2 * M:
+            continue
+        for wm, wn in ((2, 4), (4, 2), (2, 2), (1, 4), (4, 1)):
+            if bm * bn // (64 * wm * wn) > 128:
+                continue
+            for ns in ns_list:
+                for gr in grids:
+                    for x in xcds:
+                        c = (bm, bn, bk, wm, wn, ns, gr, x)
+                        if PS.config_fits(c, M, N, K):
+                            out.append(c)
+    return out
+
+
 def bench_graph(fns, reps=4, trials=9):
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -146,7 +165,9 @@ def bench_graph(fns, reps=4, trials=9):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", required=True, choices=("torch", "tuned", "gl3", "sk"))
+    ap.add_argument(
+        "--mode", required=True, choices=("torch", "tuned", "gl3", "sk", "pers")
+    )
     ap.add_argument("--tuned-file", default="")
     ap.add_argument("--shapes", default=",".join(SHAPES))
     ap.add_argument("--rows", default=",".join(map(str, ROWS)))
@@ -258,6 +279,35 @@ def main():
                                 "sk:" + ",".join(map(str, cfg)) + f"@{v}",
                                 (
                                     lambda c, kw: lambda W, C: SK.launch_gluon_mm_a16w16_streamk_gfx950(
+                                        A, W, C, c, **kw
+                                    )
+                                )(cfg, vkw(v)),
+                            )
+                        )
+            elif args.mode == "pers":
+                if isinstance(explicit, dict):
+                    cfgs = explicit.get(name, {}).get(str(M), [])
+                elif explicit is not None:
+                    cfgs = explicit
+                else:
+                    cfgs = pers_candidates(
+                        M,
+                        N,
+                        K,
+                        ns_list,
+                        tuple(map(int, args.grid.split(","))),
+                        tuple(map(int, args.xcd.split(","))),
+                    )
+                for cfg in cfgs:
+                    cfg = tuple(cfg)
+                    if not PS.config_fits(cfg, M, N, K):
+                        continue
+                    for v in variants:
+                        cands.append(
+                            (
+                                "pers:" + ",".join(map(str, cfg)) + f"@{v}",
+                                (
+                                    lambda c, kw: lambda W, C: PS.launch_gluon_mm_a16w16_persistent_gfx950(
                                         A, W, C, c, **kw
                                     )
                                 )(cfg, vkw(v)),

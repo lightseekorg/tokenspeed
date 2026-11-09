@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Correctness of the research 3-stage and Stream-K dense16 Gluon GEMMs (gfx950)."""
+"""Correctness of the research 3-stage, Stream-K and persistent Gluon GEMMs (gfx950)."""
 
 from __future__ import annotations
 
@@ -38,6 +38,14 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_3stage import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_3stage import (  # noqa: E402
     gluon_mm_a16w16_3stage_gfx950,
     launch_gluon_mm_a16w16_3stage_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_persistent import (  # noqa: E402
+    config_fits as pers_config_fits,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_persistent import (  # noqa: E402
+    gluon_mm_a16w16_persistent_gfx950,
+    launch_gluon_mm_a16w16_persistent_gfx950,
+    tail_pieces,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_streamk import (  # noqa: E402
     config_fits as sk_config_fits,
@@ -170,5 +178,63 @@ def test_3stage_row_count_does_not_recompile() -> None:
 
     run(64)
     with assert_no_triton_compile(gluon_mm_a16w16_3stage_gfx950):
+        for m in (16, 33, 100, 128, 200):
+            run(m)
+
+
+# cfg = (BM, BN, BK, WM, WN, NS, GRID, XCD). A small GRID gives several
+# data-parallel rounds plus a split-K tail on small shapes.
+@pytest.mark.parametrize(
+    "mnk,cfg,max_pieces,expect_pieces",
+    [
+        pytest.param(
+            (64, 1152, 1024), (64, 64, 64, 2, 2, 3, 16, 8), 32, 5, id="round+tail"
+        ),
+        pytest.param(
+            (64, 512, 4096), (64, 128, 64, 2, 2, 3, 16, 8), 32, 4, id="tail-only"
+        ),
+        pytest.param(
+            (128, 2048, 1024), (128, 128, 64, 2, 2, 3, 16, 8), 32, 1, id="no-tail"
+        ),
+        pytest.param(
+            (100, 1120, 1024),
+            (64, 128, 64, 2, 2, 3, 8, 8),
+            32,
+            4,
+            id="ragged-mn-2rounds",
+        ),
+        pytest.param(
+            (64, 1152, 1024), (64, 64, 64, 2, 2, 3, 16, 8), 1, 1, id="tail-unsplit"
+        ),
+    ],
+)
+def test_persistent_matches_reference(mnk, cfg, max_pieces, expect_pieces) -> None:
+    torch.manual_seed(0)
+    m, n, k = mnk
+    assert pers_config_fits(cfg, m, n, k)
+    assert tail_pieces(cfg, m, n, k, max_pieces) == expect_pieces
+    a, w, ref = _inputs(m, n, k)
+    c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    # Run three times: the tail pieces must leave their counters reset.
+    for _ in range(3):
+        c.fill_(float("nan"))
+        launch_gluon_mm_a16w16_persistent_gfx950(a, w, c, cfg, max_pieces=max_pieces)
+        torch.testing.assert_close(c, ref, atol=_ATOL, rtol=_RTOL)
+
+
+def test_persistent_row_count_does_not_recompile() -> None:
+    """M and the tail split are runtime arguments: no recompile across M."""
+    torch.manual_seed(0)
+    n, k = 1152, 1024
+    cfg = (64, 64, 64, 2, 2, 3, 16, 8)
+    w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+
+    def run(m: int) -> None:
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+        c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        launch_gluon_mm_a16w16_persistent_gfx950(a, w, c, cfg)
+
+    run(64)
+    with assert_no_triton_compile(gluon_mm_a16w16_persistent_gfx950):
         for m in (16, 33, 100, 128, 200):
             run(m)
