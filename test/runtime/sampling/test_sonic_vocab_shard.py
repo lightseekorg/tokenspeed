@@ -30,6 +30,7 @@ processor's own kernel; fp32 rows (Beam's capped head) gathered as they are.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 
@@ -283,6 +284,74 @@ def test_verify_on_shards_matches_whole_rows(monkeypatch, dtype) -> None:
     assert torch.equal(sharded.state.decode_counts, whole.state.decode_counts)
     # The windows were neither all accepted nor all rejected.
     assert min(lengths) < N and max(lengths) > 1
+
+
+def _kernel_test_utils():
+    """tokenspeed-kernel's test helpers, for ``assert_no_triton_compile``."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(os.path.dirname(root), "tokenspeed-kernel", "test", "utils.py")
+    spec = importlib.util.spec_from_file_location("sonic_kernel_test_utils", path)
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    return utils
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_sharded_launches_compile_nothing_after_warm_up(monkeypatch, dtype) -> None:
+    """``warmup_vocab_shard_sampling`` compiles what every batch size, offset slot pointer and draft width the shard path launches needs."""
+    from tokenspeed_kernel.thirdparty.sonic_sampler.ops import (
+        multistep,
+        prologue,
+    )
+    from tokenspeed_kernel.thirdparty.sonic_sampler.ops import shard as shard_ops
+    from tokenspeed_kernel.thirdparty.sonic_sampler.ops import (
+        singular,
+        verify,
+    )
+
+    def all_gather_single(landing, staged, group):
+        # Every rank's pairs are this rank's: the gather launches no watched kernel.
+        rows = staged.shape[0]
+        for peer in range(RANKS):
+            landing[peer * rows : (peer + 1) * rows].copy_(staged)
+
+    monkeypatch.setattr(shard_module, "all_gather_single", all_gather_single)
+    utils = _kernel_test_utils()
+    backend = SonicSamplingBackend(_config())
+    shard = _Group(BS * N, N, 7, dtype).shard(RANK)
+    # The processor hands over its projection's contiguous rows.
+    logits = shard.logits.contiguous()
+    backend.warmup_vocab_shard_sampling(
+        shard,
+        torch.zeros((1, N), dtype=torch.int32, device="cuda"),
+        draft_q=None,
+        with_vocab_mask=False,
+    )
+    slots = _prepare(backend, N)
+    # The same slots 8 bytes past 16-byte alignment, as a mixed round passes its decode rows.
+    shifted = torch.cat([slots[:1], slots])[1:]
+    offsets = torch.zeros(POOL + 1, dtype=torch.int64, device="cuda")
+    drafts = torch.zeros((BS, N), dtype=torch.int32, device="cuda")
+    kernels = (
+        prologue.bitpacked_reduction_kernel,
+        shard_ops.shard_candidates_kernel,
+        singular.cumulative_selection_kernel,
+        multistep.cumulative_unpack_kernel,
+        verify.chain_speculative_verification_kernel,
+    )
+    with utils.assert_no_triton_compile(*kernels):
+        for request_slots in (slots, shifted):
+            for bs in range(1, BS + 1):
+                backend._fused_singular(
+                    logits[:bs], request_slots[:bs], offsets, shard=shard
+                )
+                backend._fused_multistep(
+                    logits[: bs * N],
+                    request_slots[:bs],
+                    offsets,
+                    drafts[:bs],
+                    shard=shard,
+                )
 
 
 def test_shards_need_tp_and_whole_row_readers_off() -> None:
