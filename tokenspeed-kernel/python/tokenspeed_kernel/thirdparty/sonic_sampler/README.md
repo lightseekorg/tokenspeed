@@ -39,6 +39,16 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
   its first column, and sampled rows rank by bf16 keys only to pick their
   top-128 candidates, whose fp32 values are re-read (from the new trailing
   arguments), transformed and re-sorted before masking and the draw;
+- vocabulary-sharded logits (a vocab-parallel LM head under TP): the new
+  `ops/shard.py` (not upstream) adds `shard_candidates_kernel`, which writes
+  each rank's best `MAX_K` (value, global token id) pairs from its reduced
+  shard for the ranks' gather, and `merged_candidates` and `merged_first`,
+  which merge every rank's gathered pairs inside `cumulative_selection_kernel`
+  and `cumulative_unpack_kernel` (new trailing `cand_ptr`, `ranks`, `stride_mr`
+  and `stride_mb`) in place of their own unpack. `ops/prologue.py` adds
+  `head_logits`, the logits processor's logit scale and softcap, which
+  `bitpacked_reduction_kernel` (new trailing `logit_scale` and `softcap`) and
+  `exact_candidates` apply to a shard's raw head logits;
 - the msgspec host layer is not vendored: `base/`, `core/buffer.py`,
   `interface/` (the `fused_singular`/`fused_multistep` wrappers, the tiling
   and warp-config structs, the class-based interfaces), the packaged dispatch

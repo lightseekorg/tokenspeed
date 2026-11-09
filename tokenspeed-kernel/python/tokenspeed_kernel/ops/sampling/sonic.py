@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -51,6 +52,9 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.multistep import (
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     bitpacked_reduction_kernel,
+)
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
+    shard_candidates_kernel,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.singular import (
     cumulative_selection_kernel,
@@ -240,11 +244,212 @@ def _check_offsets(logits: Tensor, scratchpad: Tensor) -> None:
             )
 
 
+@dataclass(frozen=True)
+class VocabShard:
+    """This rank's slice of vocabulary-parallel logits, and how its candidates meet the other ranks'.
+
+    A launch given one reads ``logits`` as this rank's raw head logits ``[rows,
+    V_s]`` (before the logit scale and softcap) for global tokens
+    ``vocab_start`` onward; each rank selects its best ``MAX_K`` candidates
+    (``shard_candidates``), ``gather`` collects every rank's, and the draw
+    merges them and samples them as whole-vocabulary logits would be.
+    """
+
+    vocab_start: int  # Global token id of shard column 0.
+    logit_scale: float | None  # The logits processor's multiplier, or None.
+    softcap: float | None  # The processor's final logit softcap, or None.
+    # This rank's [rows, 2 * MAX_K] pairs to every rank's [W, rows, 2 * MAX_K], W a power of two.
+    gather: Callable[[Tensor], Tensor]
+    pairs: Tensor  # [>= rows, 2 * MAX_K] fp32: this rank's candidates.
+
+
 def _exact(logits: Tensor) -> bool:
     """Whether the logits are fp32, which the kernels sample exactly; bf16 is the other supported dtype."""
     if logits.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError(f"sonic samples bf16 or fp32 logits, got {logits.dtype}")
     return logits.dtype == torch.float32
+
+
+def _reduce(
+    logits: Tensor,
+    state: SlotState,
+    slots: Tensor,
+    drafted: Tensor | None,
+    scratchpad: Tensor,
+    config: SonicConfig,
+    enable_pdl: bool,
+    shard: VocabShard | None,
+) -> None:
+    """The first stage: each block's keys (or greedy maximum) in ``scratchpad``; ``drafted`` is None for one row per request."""
+    exact = _exact(logits)
+    rows, vocab_size = logits.shape
+    blocks = triton.cdiv(vocab_size, config.block_n)
+    singular = drafted is None
+    if singular:
+        batch_size, gamma, block_g = rows, 0, None
+        stride_g = state.grammar.stride(0)
+    else:
+        batch_size, timesteps = drafted.shape
+        gamma, block_g = timesteps - 1, next_power_of_2(timesteps)
+        stride_g = state.grammar.flatten(0, -2).stride(0)
+    bitpacked_reduction_kernel[(rows, blocks)](
+        logits,
+        state.indicators,
+        slots,
+        None,
+        None,
+        state.grammar,
+        state.context_counts,
+        state.decode_counts,
+        drafted,
+        state.repetition,
+        state.frequency,
+        state.presence,
+        state.logit_bias,
+        state.temperature,
+        scratchpad,
+        vocab_size,
+        0 if shard is None else shard.vocab_start,
+        gamma,
+        MAX_K,
+        _TOP_K_SCALE,
+        batch_size,
+        False,
+        not singular,
+        True,
+        singular,
+        False,
+        False,
+        config.radix,
+        enable_pdl,
+        logits.stride(0),
+        stride_g,
+        state.decode_counts.stride(0),
+        None,
+        scratchpad.stride(0),
+        config.block_n,
+        None,
+        block_g,
+        exact,
+        tl.float32 if exact else tl.bfloat16,
+        logit_scale=None if shard is None else shard.logit_scale,
+        softcap=None if shard is None else shard.softcap,
+        num_warps=config.first_warps,
+    )
+
+
+def shard_candidates(
+    logits: Tensor,
+    state: SlotState,
+    slots: Tensor,
+    drafted: Tensor | None,
+    scratchpad: Tensor,
+    shard: VocabShard,
+    config: SonicConfig,
+    enable_pdl: bool,
+) -> Tensor:
+    """This rank's best ``MAX_K`` candidates per logits row, for the ranks' gather.
+
+    Args:
+        logits: ``[rows, V_s]`` bf16 or fp32 raw head logits of this rank's shard.
+        state: The slot state; fp32 scalars with fp32 logits.
+        slots: ``[B]`` int64 slot of each request.
+        drafted: ``[B, g + 1]`` int32 drafts of a verify launch (rows request-major), or None for one row per request.
+        scratchpad: ``[rows, >= scratchpad_columns(V_s)]`` uint32 keys.
+        shard: This rank's slice; its ``pairs`` receive the candidates.
+        config: The launch config (``pick`` over the shard's columns).
+        enable_pdl: Launch with programmatic dependent launch.
+
+    Returns:
+        ``[rows, 2 * MAX_K]`` fp32 view of ``shard.pairs``: each row's candidate
+        values in descending order (bf16 values for bf16 logits, fp32 for
+        fp32), the lower token id first among equal values, then their global
+        token ids as exact fp32 integers; a greedy row keeps only its first
+        maximum, the rest -inf.
+
+    Raises:
+        ValueError: The logits are neither bf16 nor fp32, or a row offset
+            would pass ``MAX_OFFSET``.
+    """
+    _check_offsets(logits, scratchpad)
+    _reduce(logits, state, slots, drafted, scratchpad, config, enable_pdl, shard)
+    exact = _exact(logits)
+    rows, vocab_size = logits.shape
+    blocks = triton.cdiv(vocab_size, config.block_n)
+    block_v = next_power_of_2(blocks)
+    pairs = shard.pairs[:rows]
+    if drafted is None:
+        gamma, block_g, stride_g = 0, None, state.grammar.stride(0)
+    else:
+        gamma, block_g = drafted.shape[1] - 1, next_power_of_2(drafted.shape[1])
+        stride_g = state.grammar.flatten(0, -2).stride(0)
+    shard_candidates_kernel[(rows,)](
+        scratchpad,
+        state.indicators,
+        slots,
+        pairs,
+        blocks,
+        gamma,
+        MAX_K,
+        block_v * MAX_K,
+        not config.radix,
+        enable_pdl,
+        scratchpad.stride(0),
+        pairs.stride(0),
+        config.block_n,
+        block_v,
+        logits if exact else None,
+        state.grammar if exact else None,
+        state.context_counts if exact else None,
+        state.decode_counts if exact else None,
+        drafted if exact else None,
+        state.repetition if exact else None,
+        state.frequency if exact else None,
+        state.presence if exact else None,
+        state.logit_bias if exact else None,
+        state.temperature if exact else None,
+        vocab_size,
+        shard.vocab_start,
+        logits.stride(0),
+        stride_g,
+        state.decode_counts.stride(0),
+        block_g,
+        exact,
+        shard.logit_scale,
+        shard.softcap,
+        num_warps=config.second_warps,
+    )
+    return pairs
+
+
+def _merged(
+    logits: Tensor,
+    state: SlotState,
+    slots: Tensor,
+    drafted: Tensor | None,
+    scratchpad: Tensor,
+    shard: VocabShard | None,
+    config: SonicConfig,
+    enable_pdl: bool,
+) -> dict:
+    """The selection kernels' candidate arguments: none for whole rows, else every rank's gathered candidates, which they merge."""
+    if shard is None:
+        _reduce(logits, state, slots, drafted, scratchpad, config, enable_pdl, None)
+        return {}
+    pairs = shard.gather(
+        shard_candidates(
+            logits, state, slots, drafted, scratchpad, shard, config, enable_pdl
+        )
+    )
+    ranks = pairs.shape[0]
+    if ranks & (ranks - 1):
+        raise ValueError(f"sonic merges a power-of-two count of ranks, got {ranks}")
+    return dict(
+        cand_ptr=pairs,
+        ranks=ranks,
+        stride_mr=pairs.stride(0),
+        stride_mb=pairs.stride(1),
+    )
 
 
 def sample(
@@ -256,18 +461,22 @@ def sample(
     scratchpad: Tensor,
     config: SonicConfig,
     enable_pdl: bool,
+    shard: VocabShard | None = None,
 ) -> Tensor:
     """Draw one token per logits row from its slot's distribution, counting it in the slot's decode counts.
 
     Args:
-        logits: ``[B, V]`` bf16 or fp32 logits.
+        logits: ``[B, V]`` bf16 or fp32 logits, or this rank's ``[B, V_s]``
+            raw head logits with ``shard``.
         state: The slot state; fp32 scalars with fp32 logits.
         slots: ``[B]`` int64 slot of each row.
         offsets: ``[P]`` int64 Philox offset of each slot (the drawn token's position).
         tokens: ``[B, 1]`` int32 output.
         scratchpad: ``[B, >= scratchpad_columns(V)]`` uint32 keys.
-        config: The launch config (``pick``).
+        config: The launch config (``pick``, over the shard's columns with ``shard``).
         enable_pdl: Launch with programmatic dependent launch.
+        shard: This rank's vocabulary slice when the logits are sharded;
+            every rank must launch with the same rows.
 
     Returns:
         ``tokens``.
@@ -284,48 +493,7 @@ def sample(
     stride_x, stride_y = logits.stride(0), scratchpad.stride(0)
     stride_g, stride_c = state.grammar.stride(0), state.decode_counts.stride(0)
 
-    bitpacked_reduction_kernel[(rows, blocks)](
-        logits,
-        state.indicators,
-        slots,
-        None,
-        None,
-        state.grammar,
-        state.context_counts,
-        state.decode_counts,
-        None,
-        state.repetition,
-        state.frequency,
-        state.presence,
-        state.logit_bias,
-        state.temperature,
-        scratchpad,
-        vocab_size,
-        0,
-        0,
-        MAX_K,
-        _TOP_K_SCALE,
-        rows,
-        False,
-        False,
-        True,
-        True,
-        False,
-        False,
-        config.radix,
-        enable_pdl,
-        stride_x,
-        stride_g,
-        stride_c,
-        None,
-        stride_y,
-        config.block_n,
-        None,
-        None,
-        exact,
-        tl.float32 if exact else tl.bfloat16,
-        num_warps=config.first_warps,
-    )
+    merged = _merged(logits, state, slots, None, scratchpad, shard, config, enable_pdl)
     cumulative_selection_kernel[(rows,)](
         scratchpad,
         state.indicators,
@@ -391,6 +559,7 @@ def sample(
         None,
         None,
         exact,
+        **merged,
         num_warps=config.second_warps,
     )
     return tokens
@@ -408,6 +577,7 @@ def verify(
     indices: Tensor,
     config: SonicConfig,
     enable_pdl: bool,
+    shard: VocabShard | None = None,
 ) -> None:
     """Verify each request's point-draw drafts against its slot's distribution by masked rejection.
 
@@ -416,7 +586,8 @@ def verify(
     slot's decode counts.
 
     Args:
-        logits: ``[B * (g + 1), V]`` bf16 or fp32 logits, request-major.
+        logits: ``[B * (g + 1), V]`` bf16 or fp32 logits, request-major, or
+            this rank's ``[B * (g + 1), V_s]`` raw head logits with ``shard``.
         state: The slot state; fp32 scalars with fp32 logits.
         slots: ``[B]`` int64 slot of each request.
         offsets: ``[P]`` int64 Philox offset of each slot (its first row's position).
@@ -426,8 +597,10 @@ def verify(
         scratchpad: ``[B * (g + 1), >= scratchpad_columns(V)]`` uint32 keys.
         values: ``[B * (g + 1), MAX_K]`` fp32 candidate probabilities (scratch).
         indices: ``[B * (g + 1), MAX_K]`` int32 candidate tokens (scratch).
-        config: The launch config (``pick``).
+        config: The launch config (``pick``, over the shard's columns with ``shard``).
         enable_pdl: Launch with programmatic dependent launch.
+        shard: This rank's vocabulary slice when the logits are sharded;
+            every rank must launch with the same rows.
 
     Raises:
         ValueError: The logits are neither bf16 nor fp32, or a row offset
@@ -444,47 +617,8 @@ def verify(
     stride_g = state.grammar.flatten(0, -2).stride(0)
     stride_c = state.decode_counts.stride(0)
 
-    bitpacked_reduction_kernel[(rows, blocks)](
-        logits,
-        state.indicators,
-        slots,
-        None,
-        None,
-        state.grammar,
-        state.context_counts,
-        state.decode_counts,
-        drafted,
-        state.repetition,
-        state.frequency,
-        state.presence,
-        state.logit_bias,
-        state.temperature,
-        scratchpad,
-        vocab_size,
-        0,
-        gamma,
-        MAX_K,
-        _TOP_K_SCALE,
-        batch_size,
-        False,
-        True,
-        True,
-        False,
-        False,
-        False,
-        config.radix,
-        enable_pdl,
-        stride_x,
-        stride_g,
-        stride_c,
-        None,
-        stride_y,
-        config.block_n,
-        None,
-        block_g,
-        exact,
-        tl.float32 if exact else tl.bfloat16,
-        num_warps=config.first_warps,
+    merged = _merged(
+        logits, state, slots, drafted, scratchpad, shard, config, enable_pdl
     )
     cumulative_unpack_kernel[(rows,)](
         scratchpad,
@@ -534,6 +668,7 @@ def verify(
         stride_c,
         block_g,
         exact,
+        **merged,
         num_warps=config.second_warps,
     )
     chain_speculative_verification_kernel[(batch_size,)](
@@ -580,9 +715,11 @@ __all__ = [
     "Indicator",
     "SlotState",
     "SonicConfig",
+    "VocabShard",
     "configs",
     "pick",
     "sample",
     "scratchpad_columns",
+    "shard_candidates",
     "verify",
 ]
