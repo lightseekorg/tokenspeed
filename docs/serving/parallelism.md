@@ -138,13 +138,13 @@ full-vocab rows as a replicated head. With attention TP greater than one,
 only one peer writes each DP slot into a zeroed hidden-state buffer, which
 is all-reduced across the LM-head group. The vocabulary shards are gathered
 and each attention TP peer reads its DP slot. This avoids multiplying the
-LM-head GEMM rows by attention TP. Head and attention TP widths must tile
-each other; for example, DP4/TP2 supports an explicit LM-head TP8 while its
+LM-head GEMM rows by attention TP. LM-head and attention TP widths must tile
+each other. For example, DP4/TP2 supports an explicit LM-head TP8 while its
 default stays replicated. A shared MTP head uses the same row layout.
-When the head group stays within a single attention TP group (including
-head TP equal to attention TP), its peers already hold identical hidden
-states, so the input row exchange is skipped. The output still gathers the
-vocabulary unless the consumer requests greedy token IDs.
+When the LM-head group stays within a single attention TP group (including
+when LM-head TP equals attention TP), its peers already hold identical
+hidden states, so the input row exchange is skipped. The output still
+gathers the vocabulary unless the consumer requests greedy token IDs.
 
 For greedy heads, eligible cross-DP layouts reduce each row's vocabulary
 maximum and global token ID before selecting the owning DP rows. They use
