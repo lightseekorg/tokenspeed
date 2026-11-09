@@ -20,6 +20,7 @@ from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.qwen3_5_nextn import (
@@ -32,6 +33,31 @@ def test_unquantized_mtp_checkpoint_disables_draft_quantization():
     quant_config = Nvfp4Config(exclude_modules=["mtp.layers.0*"])
 
     assert _resolve_mtp_quant_config(quant_config) is None
+
+
+def test_quark_mtp_tensor_exclusions_disable_draft_quantization():
+    # AMD Quark lists excluded tensors, not modules.
+    mtp = [
+        f"mtp.layers.0.{name}.weight"
+        for name in (
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        )
+    ]
+    quant_config = Mxfp4Config.from_config(
+        {"quant_method": "mxfp4", "exclude": ["lm_head", *mtp]}
+    )
+
+    assert _resolve_mtp_quant_config(quant_config) is None
+    keep = Mxfp4Config.from_config(
+        {"quant_method": "mxfp4", "exclude": ["lm_head", *mtp[:-1]]}
+    )
+    assert _resolve_mtp_quant_config(keep) is keep
 
 
 def test_quantized_mtp_checkpoint_keeps_draft_quantization():

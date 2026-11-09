@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 from tokenspeed_kernel.ops.gemm import (
     KIMI3_HIDDEN_SIZE,
     KIMI3_QKVFAB_SIZE,
@@ -30,9 +31,14 @@ from tokenspeed_kernel.ops.gemm import (
     grouped_bf16_projection,
 )
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
+from tokenspeed_kernel.ops.gemm._triton.mxfp4 import triton_mm_mxfp4
 from tokenspeed_kernel.ops.gemm.native import MV_FP8_WEIGHT_SIGNATURES
-from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
+from tokenspeed_kernel.ops.gemm.triton import (
+    MXFP4_LINEAR_LINEAR_LAYOUT,
+    MXFP4_LINEAR_SIGNATURES,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -1097,6 +1103,130 @@ else:
         raise ImportError(
             "gluon_mxfp4_swiglu_linear_gfx950 requires tokenspeed-kernel-amd"
         )
+
+
+# ===-----------------------------------------------------------------------===#
+# MXFP4 linear and BF16 decode GEMM: Gluon (AMD gfx120x)
+# ===-----------------------------------------------------------------------===#
+
+
+if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx120x.gemm import (
+        launch_gluon_mm_bf16_decode_gfx120x as _mm_bf16_decode_gfx120x_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx120x.gemm import (
+        launch_gluon_mm_mxfp4_decode_gfx120x as _mm_mxfp4_decode_gfx120x_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx120x.gemm.bf16_decode import (
+        BLOCK_K as _BF16_DECODE_BLOCK_K,
+    )
+    from tokenspeed_kernel_amd.ops.gfx120x.gemm.bf16_decode import (
+        MAX_ROWS as _BF16_DECODE_MAX_ROWS,
+    )
+
+    _GFX120X_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 0),
+        max_arch_version=ArchVersion(12, 0),
+        vendors=frozenset({"amd"}),
+    )
+
+    def _mxfp4_linear_gfx120x(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if x.shape[0] <= 3 and x.stride(-1) == 1:
+            return _mm_mxfp4_decode_gfx120x_impl(x, weight, weight_scale, out=out)
+        x_fp4, x_scale = mxfp4_quantize(x)
+        return triton_mm_mxfp4(x_fp4, weight, x_scale, weight_scale, x.dtype, out=out)
+
+    @register_kernel(
+        "gemm",
+        "mxfp4_linear",
+        name="gluon_mxfp4_linear_gfx120x",
+        solution="gluon",
+        capability=_GFX120X_CAPABILITY,
+        signatures=MXFP4_LINEAR_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={"weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT})},
+    )
+    def gluon_mxfp4_linear_gfx120x(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``mxfp4(x) @ W.T``; 1-3 rows run the RDNA4 decode GEMM."""
+        return _mxfp4_linear_gfx120x(x, weight, weight_scale, out)
+
+    @register_kernel(
+        "gemm",
+        "mxfp4_swiglu_linear",
+        name="gluon_mxfp4_swiglu_linear_gfx120x",
+        solution="gluon",
+        capability=_GFX120X_CAPABILITY,
+        signatures=MXFP4_LINEAR_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={"weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT})},
+    )
+    def gluon_mxfp4_swiglu_linear_gfx120x(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``silu(gate) * up`` of ``mxfp4(x) @ W.T``; 1-3 rows run the RDNA4 decode GEMM."""
+        gate_up = _mxfp4_linear_gfx120x(x, weight, weight_scale, None)
+        if out is None:
+            out = torch.empty(
+                (x.shape[0], weight.shape[0] // 2), dtype=x.dtype, device=x.device
+            )
+        return silu_and_mul(gate_up, out)
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_bf16_decode_gfx120x",
+        solution="gluon",
+        capability=_GFX120X_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    a=dense_tensor_format(torch.bfloat16),
+                    b=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "m_max": frozenset({_BF16_DECODE_MAX_ROWS}),
+            "k_align": frozenset({_BF16_DECODE_BLOCK_K}),
+            "b_layout": frozenset({"NK"}),
+            "a_contiguous": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "out_contiguous": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "has_alpha": frozenset({False}),
+        },
+    )
+    def gluon_mm_bf16_decode_gfx120x(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``A @ B.T`` for at most four BF16 rows (the decode LM head)."""
+        if A_scales is not None or B_scales is not None or block_size is not None:
+            raise ValueError("gluon_mm_bf16_decode_gfx120x takes no quantization")
+        return _mm_bf16_decode_gfx120x_impl(A, B, out=out)
 
 
 # ===-----------------------------------------------------------------------===#

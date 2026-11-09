@@ -364,7 +364,12 @@ def prefill_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if platform.is_amd:
+    waves_per_eu = 1
+    if platform.is_rdna4 and has_kv_cache:
+        BLOCK_M, BLOCK_N = (128, 32)
+        num_warps = 8
+        waves_per_eu = 2
+    elif platform.is_amd:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
 
@@ -413,7 +418,7 @@ def prefill_attention_fwd(
 
     extra_kargs = {}
     if platform.is_amd:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16}
+        extra_kargs = {"waves_per_eu": waves_per_eu, "matrix_instr_nonkdim": 16}
 
     _fwd_kernel[grid](
         q_extend,
