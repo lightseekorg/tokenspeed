@@ -299,6 +299,13 @@ class AttentionBackend(CachePoolBinding, ABC):
         {"full_history", "sliding_window"}
     )
 
+    # Whether this side computes a query-context shard of the extend span. The
+    # runner reads it to decide whether to hand a side the forward's shard plan:
+    # the draft of a sharded target may itself be unsharded, and a backend that
+    # cannot attend a shard refuses one (``reject_query_shard``). A subclass that
+    # skips ``__init__`` sets it from its config or the child it wraps.
+    query_sharded: bool = False
+
     @property
     def stores_in_forward_state_checkpoints(self) -> bool:
         """Whether every State group this node consumes stores in-forward checkpoints.

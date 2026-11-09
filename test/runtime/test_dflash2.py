@@ -613,14 +613,17 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
         bs=3,
         num_extends=1,
         input_num_tokens=positions.numel(),
-        # The round's write vector comes from the TARGET router: the prefill
-        # row's extend span first, then the decode rows' verify windows, in
-        # the token order the hidden states arrive in.
         attn_backend=SimpleNamespace(
+            group_ids=("full_attention",),
             extend_span_locations=lambda: torch.arange(5, dtype=torch.int32),
             decode_window_locations=lambda: torch.arange(5, 13, dtype=torch.int32),
         ),
     )
+    # A shared cache group: the taps are the TARGET's rows, so its router owns
+    # the write vector -- the prefill row's extend span first, then the decode
+    # rows' verify windows, in the token order the hidden states arrive in.
+    # (The draft's own router has republished a block window by now.)
+    drafter.attn_backend = SimpleNamespace(group_ids=("full_attention",))
     drafter._update_native_cache_from_target(
         ctx,
         SimpleNamespace(hidden_states=torch.zeros(positions.numel(), 8)),
