@@ -327,7 +327,10 @@ def test_mla_prefill_bounds_history_and_preserves_causal_attention(
 
 @pytest.mark.parametrize("batch", [24, 32])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_mla_graph_updates_lengths_and_releases_scratch(batch, dtype):
+@pytest.mark.parametrize("replay_before_update", [False, True])
+def test_mla_graph_updates_lengths_and_releases_scratch(
+    batch, dtype, replay_before_update
+):
     """Real packed FIA: caller buffers, changed-input replay and graph lifetime."""
     import gc
     import weakref
@@ -396,8 +399,11 @@ def test_mla_graph_updates_lengths_and_releases_scratch(batch, dtype):
                 qr.copy_(torch.randn(qr.shape, dtype=torch.bfloat16) * 0.1)
             lengths.refresh(torch.tensor(current_lengths, device="npu"))
             invoke(expected, expected_lse)
+            if replay_before_update:
+                graph.replay()
             graph.update(cpu_update_input=[{"actual_seq_lengths_kv": [1] * batch}])
-            graph.replay()
+            if not replay_before_update:
+                graph.replay()
             torch.npu.synchronize()
             for out, lse in zip(outputs, lses):
                 torch.testing.assert_close(out, expected, atol=0, rtol=0)
