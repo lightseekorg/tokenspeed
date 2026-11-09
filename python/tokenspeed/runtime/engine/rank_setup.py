@@ -121,8 +121,13 @@ def load_model_config(
     """
     quantization = server_args.quantization
     dtype = server_args.dtype
+    revision = server_args.revision
     if draft_of is not None:
         quantization = server_args.speculative_draft_model_quantization
+        # A revision is a branch, tag, or commit of one repository, so only a
+        # draft inside the target checkpoint can use the target's.
+        if not server_args.draft_model_path_use_base:
+            revision = server_args.speculative_draft_model_revision
         if dtype == "auto":
             # A draft is fed the target's hidden states and borrows its
             # embedding and LM head, so the two dtypes have to agree.
@@ -130,7 +135,7 @@ def load_model_config(
     return ModelConfig(
         model_path,
         trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.revision,
+        revision=revision,
         context_length=server_args.max_model_len,
         model_override_args=server_args.hf_overrides,
         dtype=dtype,

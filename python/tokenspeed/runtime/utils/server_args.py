@@ -667,6 +667,7 @@ class ServerArgs:
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
+    speculative_draft_model_revision: str | None = None
     speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
@@ -1791,6 +1792,20 @@ class ServerArgs:
 
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
+
+        draft_revision = self.speculative_draft_model_revision
+        if draft_revision is not None and self.speculative_draft_model_path is None:
+            raise ValueError(
+                "--speculative-draft-model-revision applies only to a draft in its "
+                "own repository, but no draft model is set. Pass "
+                f"--speculative-draft-model-path (got {draft_revision!r})."
+            )
+        if draft_revision is not None and self.draft_model_path_use_base:
+            raise ValueError(
+                "--speculative-draft-model-revision applies only to a draft in its "
+                "own repository, but this draft is the target checkpoint. Set "
+                f"--revision instead (got {draft_revision!r})."
+            )
 
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
@@ -4035,6 +4050,15 @@ class ServerArgs:
             "--speculative-draft-model-path",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-revision",
+            type=str,
+            default=None,
+            help="The draft model version to use when the draft has its own "
+            "repository: a branch name, a tag name, or a commit id. If "
+            "unspecified, the draft uses its repository's default version. A "
+            "draft inside the target checkpoint uses --revision.",
         )
         parser.add_argument(
             "--speculative-draft-model-quantization",
