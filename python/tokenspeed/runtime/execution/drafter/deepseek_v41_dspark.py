@@ -43,7 +43,9 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
@@ -530,6 +532,12 @@ class DeepseekV41DSpark(BaseDrafter):
         mapping = self.draft_model.mapping.attn
         return int(mapping.rank if mapping.dp_size > 1 else mapping.tp_rank)
 
+    @property
+    def _verification_host_group(self):
+        return pg_manager.get_process_group(
+            "gloo", self._verification_group, name="dsv41_verify_metadata"
+        )
+
     def _prepare_dp_verify_budget(self, *, batch_size: int) -> int:
         """Agree one physical capacity while keeping each DP rank's scores."""
         full = batch_size * self.spec_num_tokens
@@ -542,11 +550,11 @@ class DeepseekV41DSpark(BaseDrafter):
         if scores is not None and bounds is not None:
             packet[:2] = torch.tensor(bounds, dtype=torch.float32)
             packet[2:].copy_(torch.tensor(scores, dtype=torch.float32).flatten())
-        buffers.packet.copy_(packet, non_blocking=True)
-        all_gather_single(
-            buffers.peers.flatten(), buffers.packet, self._verification_group
+        # Feedback already resides on the host. Avoid a synchronizing round trip.
+        torch.distributed.all_gather_into_tensor(
+            buffers.peers.flatten(), packet, group=self._verification_host_group
         )
-        peers = buffers.peers.cpu().tolist()
+        peers = buffers.peers.tolist()
         selected = full
         collecting = True
         if all(math.isfinite(value) for peer in peers for value in peer):
@@ -585,10 +593,9 @@ class DeepseekV41DSpark(BaseDrafter):
                     selected = collector.next_capacity() or full
         self._verify_collecting = collecting
         if selected != full:
-            # All ranks select the same capacity; each allocates its local rows.
-            source = buffers.peers[self._verification_rank, 2:].view(
-                batch_size, self.block_size
-            )
+            # Keep the pinned H2D source step-local; peers is CPU-only storage.
+            buffers.packet.copy_(packet, non_blocking=True)
+            source = buffers.packet[2:].view(batch_size, self.block_size)
             self.prepare_verify_budget_layout(
                 source, batch_size=batch_size, query_capacity=selected
             )
@@ -644,17 +651,17 @@ class DeepseekV41DSpark(BaseDrafter):
         packet[1] = int(collecting)
         if rank == 0 and selected != full:
             packet[2:].copy_(torch.tensor(scores, dtype=torch.float32).flatten())
-        buffers.packet.copy_(packet, non_blocking=True)
         if tp > 1:
-            all_gather_single(buffers.peers.flatten(), buffers.packet, self.tp_group)
-            selected_value, collecting_value = buffers.peers[0, :2].tolist()
+            torch.distributed.broadcast(
+                packet, src=self.tp_group[0], group=self._verification_host_group
+            )
+            selected_value, collecting_value = packet[:2].tolist()
             selected = int(selected_value)
             collecting = bool(collecting_value)
-            source = buffers.peers[0, 2:].view(actual_bs, self.block_size)
-        else:
-            source = buffers.packet[2:].view(actual_bs, self.block_size)
         self._verify_collecting = collecting
         if selected != full:
+            buffers.packet.copy_(packet, non_blocking=True)
+            source = buffers.packet[2:].view(actual_bs, self.block_size)
             self.prepare_verify_budget_layout(
                 source, batch_size=actual_bs, query_capacity=selected
             )
@@ -754,15 +761,14 @@ class DeepseekV41DSpark(BaseDrafter):
                     dtype=torch.float64,
                 )
             )
-        buffers.timing_packet.copy_(packet, non_blocking=True)
         tp = len(self._verification_group)
         if tp > 1:
-            all_gather_single(
+            torch.distributed.all_gather_into_tensor(
                 buffers.timing_peers.flatten(),
-                buffers.timing_packet.flatten(),
-                self._verification_group,
+                packet.flatten(),
+                group=self._verification_host_group,
             )
-            peers = buffers.timing_peers.cpu().tolist()
+            peers = buffers.timing_peers.tolist()
         else:
             peers = [packet.tolist()]
         histories = []
@@ -784,6 +790,12 @@ class DeepseekV41DSpark(BaseDrafter):
             return
         if graph_bs in self._verify_budget_buffers:
             return
+        if len(self._verification_group) > 1:
+            pg_manager.init_process_group(
+                self._verification_group,
+                backend="gloo",
+                name="dsv41_verify_metadata",
+            )
         buffers = _VerifyBudgetBuffers(
             scores=torch.zeros(
                 (graph_bs, self.block_size), dtype=torch.float32, device=self.device
@@ -799,13 +811,12 @@ class DeepseekV41DSpark(BaseDrafter):
                     2 + graph_bs * self.block_size,
                 ),
                 dtype=torch.float32,
-                device=self.device,
+                device="cpu",
             ),
-            timing_packet=torch.empty((8, 6), dtype=torch.float64, device=self.device),
+            timing_packet=torch.empty((8, 6), dtype=torch.float64),
             timing_peers=torch.empty(
                 (len(self._verification_group), 8, 6),
                 dtype=torch.float64,
-                device=self.device,
             ),
         )
         self._verify_budget_buffers[graph_bs] = buffers
