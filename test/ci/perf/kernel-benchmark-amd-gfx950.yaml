@@ -5,6 +5,10 @@ workflow_stage: kernel-benchmark
 triggers:
   - per-commit
   - manual
+# The kernel packages never import the runtime.
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
 runner:
   labels:
     - amd-mi355-1gpu

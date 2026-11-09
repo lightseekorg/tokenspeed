@@ -197,6 +197,23 @@ ignore_changes:
   - test/runtime
 ```
 
+`model_sources` lists the model modules (directly under
+`python/tokenspeed/runtime/models/`) that a model-test task serves, including
+those its model and draft model import. On pull requests the scan drops the
+task when every changed file is Markdown, another model's module, or a test
+under `test/runtime/` or `tokenspeed-kernel/test/`; a unit-test task keeps the
+tests its definition names, as files or directories, and every test helper. A
+module there belongs to one model when it defines `EntryClass` or a task lists
+it; any other module, such as `utils.py`, is shared, and a change to it runs
+every task. The scan fails when a listed module does not exist, or imports a
+module that belongs to one model without the task listing it too.
+
+```yaml
+model_sources:
+  - python/tokenspeed/runtime/models/minimax_m3.py
+  - python/tokenspeed/runtime/models/llama_eagle3.py
+```
+
 `changed_paths: true` hands a pull request's changed paths to the task's
 commands as `TOKENSPEED_CI_CHANGED_PATHS`, one path per line, so the suite can
 pick its own tests. The scan sets it only where it narrows tasks: pull

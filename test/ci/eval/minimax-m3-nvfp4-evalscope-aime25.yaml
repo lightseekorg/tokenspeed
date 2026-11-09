@@ -5,6 +5,11 @@ workflow_stage: model-test
 triggers:
   - per-commit
   - manual
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/llama.py
+  - python/tokenspeed/runtime/models/llama_eagle3.py
+  - python/tokenspeed/runtime/models/minimax_m3.py
 runner:
   labels:
     - b200-4gpu
