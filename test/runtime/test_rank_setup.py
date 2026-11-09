@@ -213,6 +213,68 @@ def test_server_args_refuse_a_prefill_decode_interval_it_cannot_honor(flags, err
         prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
 
 
+@pytest.mark.parametrize(
+    "flags,gate,interval",
+    [
+        ([], None, 0),
+        (["--prefill-decode-interval", "64"], None, 64),
+        (
+            ["--prefill-attempt-interval", "4", "--prefill-any-attempt-interval", "64"],
+            (4, 64),
+            0,
+        ),
+    ],
+)
+def test_prefill_delay_policies_can_be_selected_independently(flags, gate, interval):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    assert args.prefill_delay == gate
+    assert args.prefill_decode_interval == interval
+
+
+@pytest.mark.parametrize("attempt,any_attempt", [(4, None), (None, 64)])
+def test_prefill_delay_rejects_an_incomplete_pair_after_configuration_changes(
+    attempt, any_attempt
+):
+    args = ServerArgs(model="x", max_num_seqs=8)
+    args.prefill_attempt_interval = attempt
+    args.prefill_any_attempt_interval = any_attempt
+    with pytest.raises(ValueError, match="must be set together"):
+        _ = args.prefill_delay
+
+
+@pytest.mark.parametrize("attempt,any_attempt", [(4, None), (None, 64)])
+def test_prefill_delay_rejects_an_incomplete_pair_at_construction(attempt, any_attempt):
+    with pytest.raises(ValueError, match="must be set together"):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            prefill_attempt_interval=attempt,
+            prefill_any_attempt_interval=any_attempt,
+        )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_prefill_delay_refuses_a_conflicting_local_interval(mixed):
+    flags = [
+        "--model",
+        "x",
+        "--max-num-seqs",
+        "8",
+        "--prefill-decode-interval",
+        "64",
+        "--prefill-attempt-interval",
+        "4",
+        "--prefill-any-attempt-interval",
+        "64",
+    ]
+    if mixed:
+        flags.append("--enable-mixed-batch")
+    with pytest.raises(
+        ValueError, match="--prefill-decode-interval cannot be combined"
+    ):
+        prepare_server_args(flags)
+
+
 @pytest.mark.parametrize("tokens,pages", [(None, 0), (1, 1), (16, 1), (17, 2)])
 def test_prefill_kv_budget_is_translated_to_scheduler_pages(tokens, pages):
     flags = [] if tokens is None else ["--chunk-prefill-kv-size", str(tokens)]

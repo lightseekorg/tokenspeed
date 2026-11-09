@@ -1297,8 +1297,9 @@ TEST_F(PrefillChunkYieldSuite, MirroredSchedulersPlanAlike) {
         for (int i = 0; i < 2; ++i, ++next) {
             submit("s" + std::to_string(next), MakeTokens(1 + next % 7, 10000 + 10 * next));
         }
-        const ExecutionPlan plan = ranks[0]->NextExecutionPlan();
-        ASSERT_TRUE(ranks[1]->NextExecutionPlan() == plan) << "round " << round;
+        const Scheduler::PlanOptions options{.allow_prefill = true, .apply_prefill_watermark = false};
+        const ExecutionPlan plan = ranks[0]->NextExecutionPlan(options);
+        ASSERT_TRUE(ranks[1]->NextExecutionPlan(options) == plan) << "round " << round;
         if (plan.remote_decode) {
             ExecutionEvent acks;
             for (const std::string& id : plan.remote_decode->request_ids) {

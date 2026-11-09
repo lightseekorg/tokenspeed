@@ -878,7 +878,7 @@ cost of a retraction is the image's bytes (proportional to the pages held)
 plus the client-visible pause; nothing is recomputed.
 
 **Retract-and-grant, in one round.** The retraction serves a specific request —
-the first candidate whose admission failed for capacity
+the first eligible candidate whose admission failed for capacity
 (`AdmissionFeedback::capacity_blocker`). Victims are retracted and the blocked
 admission is **retried in the same plan build**, looping (retract → retry →
 retract) until it fits or the victims run out. The freed capacity therefore
@@ -892,7 +892,16 @@ wait for whoever asks first next round. A D-role round full by batch count
 retracts nothing either, although its remote admission takes no batch slot:
 the batch already runs as many requests as it can hold, so retracting a
 resident for the admission would add no throughput and cost an image and a
-restore. Two edges of the loop:
+restore.
+
+With the fused [prefill gate](prefill-delay.md#4-what-the-gate-does-not-hold),
+a prefill excluded by the current window or watermark is ineligible both as
+a capacity blocker and as a grant recipient. The blocker-redirect order below
+filters every prefill alternative through that same live eligibility check.
+Such a prefill cannot cause a retraction or acquire its freed pages through a
+retry; decode-driven retraction and readmission restores are unchanged.
+
+Two edges of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
   next page is the preferred victim). It comes back through the restore
