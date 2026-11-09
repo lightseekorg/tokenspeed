@@ -229,8 +229,19 @@ def attn_kernel(
         draft_attn.merge_stage(mb, task, SPLITS_, "merge")
 
 
-@pytest.mark.parametrize("prefix", [52000, 900, 0])
-def test_attention_takes_the_window_and_the_whole_block_for_every_row(prefix: int):
+# The first page whose first element lies past 2^31 elements of a cache.
+FAR_PAGE = (1 << 31) // (PAGE * HEAD) + 1
+
+
+@pytest.mark.parametrize(
+    "prefix, page_base", [(52000, 0), (900, 0), (0, 0), (52000, FAR_PAGE)]
+)
+def test_attention_takes_the_window_and_the_whole_block_for_every_row(
+    prefix: int, page_base: int
+):
+    """``page_base`` numbers the request's pages from there: past 2^31
+    cache elements, a page offset computed in int32 reads the wrong keys.
+    The pages below it are allocated and never touched."""
     rows = 8
     g = torch.Generator().manual_seed(prefix + 1)
     device = torch.device("cuda")
@@ -268,10 +279,10 @@ def test_attention_takes_the_window_and_the_whole_block_for_every_row(prefix: in
     attn_kernel[(plan.grid,)](
         scratch,
         torch.full((1,), step, dtype=torch.int32, device=device),
-        table.to(device),
+        (table + page_base).to(device),
         torch.full((1,), end, dtype=torch.int32, device=device),
-        k_cache.to(device),
-        v_cache.to(device),
+        _far(k_cache, page_base * PAGE, device),
+        _far(v_cache, page_base * PAGE, device),
         plan.key,
         SPLITS,
         num_warps=8,
@@ -289,6 +300,18 @@ def test_attention_takes_the_window_and_the_whole_block_for_every_row(prefix: in
         # The PV product takes the probabilities in BF16, as the target
         # layer's attention does.
         torch.testing.assert_close(got, want[row], rtol=2**-6, atol=2e-3)
+
+
+def _far(cache: torch.Tensor, first: int, device) -> torch.Tensor:
+    """``cache`` on the device as the slots from ``first`` on of a cache that
+    large; the slots below stay unwritten."""
+    if not first:
+        return cache.to(device)
+    out = torch.empty(
+        (first + cache.shape[0], *cache.shape[1:]), dtype=cache.dtype, device=device
+    )
+    out[first:] = cache.to(device)
+    return out
 
 
 WORLD, HIDDEN, OWNED = 8, ref.HIDDEN, 1024

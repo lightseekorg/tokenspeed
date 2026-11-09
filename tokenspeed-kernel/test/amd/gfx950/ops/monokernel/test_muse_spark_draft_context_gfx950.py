@@ -122,16 +122,23 @@ def _worker(rank: int, port: int, seed: int) -> None:
         )
         cos_sin = _rope_table(70000, device)
         slots_n = 4096
-        k_caches = tuple(
-            torch.zeros(slots_n, 1, HEAD, dtype=torch.bfloat16, device=device)
-            for _ in range(LAYERS)
-        )
-        v_caches = tuple(torch.zeros_like(c) for c in k_caches)
+        # The rows' slots lie past 2^31 cache elements (a slot is HEAD
+        # elements): a slot offset computed in int32 writes the wrong place.
+        # Only those last slots are written and read.
+        far = (1 << 31) // HEAD + 1
+
+        def far_cache() -> torch.Tensor:
+            c = torch.empty(far + slots_n, 1, HEAD, dtype=torch.bfloat16, device=device)
+            c[far:].zero_()
+            return c
+
+        k_caches = tuple(far_cache() for _ in range(LAYERS))
+        v_caches = tuple(far_cache() for _ in range(LAYERS))
         for step, start in ((3, 60000), (4, 129)):
             positions = torch.arange(
                 start, start + ROWS, dtype=torch.int32, device=device
             )
-            slots = torch.randperm(slots_n, generator=g, device=device)[:ROWS]
+            slots = far + torch.randperm(slots_n, generator=g, device=device)[:ROWS]
             # The second launch, at other rows, runs the first one's binary.
             with (
                 assert_no_triton_compile(
@@ -182,8 +189,11 @@ def _worker(rank: int, port: int, seed: int) -> None:
             ("b", slice(ROWS, 2 * ROWS), 6),
             ("both", slice(0, 2 * ROWS), 7),
         ):
-            ks = tuple(torch.zeros_like(c) for c in k_caches)
-            vs = tuple(torch.zeros_like(c) for c in k_caches)
+            ks = tuple(
+                torch.zeros(slots_n, 1, HEAD, dtype=torch.bfloat16, device=device)
+                for _ in range(LAYERS)
+            )
+            vs = tuple(torch.zeros_like(c) for c in ks)
             draft_context.launch_gluon_muse_spark_draft_context_gfx950(
                 weights,
                 taps=torch.cat([taps, taps_b])[rows].contiguous(),

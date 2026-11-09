@@ -143,6 +143,31 @@ def test_attention_matches_the_regular_path_math(
     attends its own cache (its length and page table) and takes its own
     tokens' keys from the projection. An FP8 cache holds the regular path's
     unit-scale e4m3 bytes: the rows' K and V round once to it."""
+    _check_attention(length, window, splits, rows, requests, kv_dtype, page_base=0)
+
+
+# The first page whose first element lies past 2^31 elements of a cache.
+FAR_PAGE = (1 << 31) // (PAGE * KV_HEADS * HEAD) + 1
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "length,window,splits",
+    [(3000, 2048, SLIDING_SPLITS), (9000, 0, FULL_SPLITS)],
+)
+def test_attention_reaches_pages_past_2_31_cache_elements(
+    length, window, splits, kv_dtype
+):
+    """Pages and slots at the far end of a large cache: every page of the
+    launch starts past 2^31 elements, so a page or slot offset computed in
+    int32 reads and writes the wrong place. Only the far end is filled."""
+    _check_attention(length, window, splits, 8, 2, kv_dtype, page_base=FAR_PAGE)
+
+
+def _check_attention(length, window, splits, rows, requests, kv_dtype, page_base):
+    """One launch of ``requests`` requests of ``rows`` tokens against the
+    regular path's math; the cache's pages are numbered from ``page_base``
+    (the pages below it are allocated and never touched)."""
     rope = window != 0
     g = torch.Generator().manual_seed(length + window)
     # The second request is longer and has pages of its own.
@@ -186,13 +211,13 @@ def test_attention_matches_the_regular_path_math(
         ):
             half = (part.float() / 2).view(torch.int32)
             fill(scratch, plan, region, torch.cat([half, half]).cuda(), tag, row=row)
-    kc, vc = k_cache.clone().cuda(), v_cache.clone().cuda()
+    kc, vc = (_cache_from(c, page_base) for c in (k_cache, v_cache))
     attention_kernel[(plan.grid,)](
         scratch,
         torch.full((1,), step, dtype=torch.int32, device="cuda"),
         (positions + 1).to(torch.int32).cuda(),
-        slots.to(torch.int32).cuda(),
-        table.cuda(),
+        (slots + page_base * PAGE).to(torch.int32).cuda(),
+        (table + page_base * (table != 0)).to(torch.int32).cuda(),
         width,
         kc,
         vc,
@@ -233,8 +258,9 @@ def test_attention_matches_the_regular_path_math(
                 atol=1e-3,
             )
             # The cache gets the rotated k and the raw v of each row's token.
-            got_k = kc.view(-1, KV_HEADS, HEAD)[slots[row]].cpu()
-            got_v = vc.view(-1, KV_HEADS, HEAD)[slots[row]].cpu()
+            slot = slots[row] + page_base * PAGE
+            got_k = kc.view(-1, KV_HEADS, HEAD)[slot].cpu()
+            got_v = vc.view(-1, KV_HEADS, HEAD)[slot].cpu()
             # FP32 norm sums in another order: within one step of k's dtype
             # (BF16 2^-7, e4m3 2^-3).
             step_k = 2**-7 if kv_dtype == torch.bfloat16 else 2**-3
@@ -242,3 +268,15 @@ def test_attention_matches_the_regular_path_math(
                 got_k.float(), k[t].float(), rtol=step_k, atol=1e-2
             )
             assert torch.equal(got_v.view(torch.uint8), v[t].view(torch.uint8))
+
+
+def _cache_from(cache: torch.Tensor, page_base: int) -> torch.Tensor:
+    """``cache``'s pages on the device as pages ``page_base`` on of a cache
+    that large; the pages below stay unwritten."""
+    if not page_base:
+        return cache.clone().cuda()
+    out = torch.empty(
+        (page_base + cache.shape[0], *cache.shape[1:]), dtype=cache.dtype, device="cuda"
+    )
+    out[page_base:] = cache.cuda()
+    return out
