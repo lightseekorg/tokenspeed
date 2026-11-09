@@ -13,11 +13,19 @@ FILES = {
     ),
     f"{MODELS}/gamma.py": "EntryClass = Gamma\n",
     f"{MODELS}/helper.py": "",
+    # A module without EntryClass built on gamma.
+    f"{MODELS}/gamma_deepep.py": "from tokenspeed.runtime.models.gamma import Gamma\n",
+    f"{MODELS}/gpt_oss.py": "EntryClass = GptOss\n",
     f"{MODELS}/utils.py": "",
     f"{TESTS}/test_alpha.py": "from tokenspeed.runtime.models.alpha import Alpha\n",
     f"{TESTS}/models/test_beta.py": "import tokenspeed.runtime.models.beta\n",
     f"{TESTS}/test_gamma.py": "def test():\n    from tokenspeed.runtime.models import gamma\n",
     f"{TESTS}/test_misc.py": "import torch\n",
+    f"{TESTS}/test_gamma_deepep.py": "import tokenspeed.runtime.models.gamma_deepep\n",
+    # Serves its model by checkpoint name.
+    f"{TESTS}/test_serving_e2e.py": 'MODEL = "openai/gpt-oss-20b"\n',
+    f"{TESTS}/test_uses_misc.py": "from test.runtime.test_misc import helper\n",
+    f"{TESTS}/test_uses_misc_bare.py": "import test_misc\n",
 }
 ALL = sorted(path for path in FILES if path.startswith(TESTS))
 
@@ -35,15 +43,19 @@ def repo(tmp_path: Path) -> Path:
     [
         ([f"{MODELS}/alpha.py"], ["test_alpha", "test_beta"]),
         ([f"{MODELS}/beta.py"], ["test_beta"]),
-        ([f"{MODELS}/gamma.py"], ["test_gamma"]),
-        ([f"{TESTS}/test_misc.py"], ["test_misc"]),
+        ([f"{MODELS}/gamma.py"], ["test_gamma", "test_gamma_deepep"]),
+        ([f"{MODELS}/gpt_oss.py"], ["test_serving_e2e"]),
+        (
+            [f"{TESTS}/test_misc.py"],
+            ["test_misc", "test_uses_misc", "test_uses_misc_bare"],
+        ),
         (
             [
                 f"{TESTS}/test_misc.py",
                 "docs/a.md",
                 "tokenspeed-kernel/test/ops/test_gemm.py",
             ],
-            ["test_misc"],
+            ["test_misc", "test_uses_misc", "test_uses_misc_bare"],
         ),
         (["tokenspeed-kernel/test/ops/test_gemm.py"], []),
     ],

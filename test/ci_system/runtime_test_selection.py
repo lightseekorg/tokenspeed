@@ -3,8 +3,10 @@
 CI lists a pull request's changed paths in ``TOKENSPEED_CI_CHANGED_PATHS``.
 When every change is Markdown, a test file, or a model module (a module
 directly under the models package that defines ``EntryClass``), only these
-runtime test files run: the changed ones, and those that import a changed
-model module or a model module built on one. Any other change runs every test.
+runtime test files run: the changed ones and those importing them, and for a
+changed model module, the tests that import it or a module built on it, or
+that name it or such a module (``gpt_oss`` matches ``openai/gpt-oss-20b``).
+Any other change runs every test.
 """
 
 from __future__ import annotations
@@ -20,8 +22,9 @@ RUNTIME_TEST_DIRECTORY = "test/runtime"
 KERNEL_TEST_DIRECTORY = "tokenspeed-kernel/test"
 
 
-def imported_models(path: Path) -> set[str]:
-    """Model modules (by name) that any import statement in ``path`` names."""
+def imported_modules(path: Path) -> set[str]:
+    """Modules that any import statement in ``path`` names, including imports
+    inside functions; a name after ``from ... import`` counts as a submodule."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     modules = set()
     for node in ast.walk(tree):
@@ -30,12 +33,23 @@ def imported_models(path: Path) -> set[str]:
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             modules.add(node.module)
             modules.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return modules
+
+
+def imported_models(path: Path) -> set[str]:
+    """Modules directly under the models package (by name) that ``path`` imports."""
     prefix = f"{MODEL_PACKAGE}."
     return {
         module[len(prefix) :].split(".")[0]
-        for module in modules
+        for module in imported_modules(path)
         if module.startswith(prefix)
     }
+
+
+def squashed(text: str) -> str:
+    """``text`` lowercased without ``_``, ``-`` and ``.``, so that the module
+    ``qwen3_5`` matches the checkpoint ``Qwen3.5-35B``."""
+    return re.sub(r"[_.-]", "", text.lower())
 
 
 def model_modules(repo_root: Path) -> dict[str, Path]:
@@ -49,13 +63,12 @@ def model_modules(repo_root: Path) -> dict[str, Path]:
 
 
 def models_built_on(changed: set[str], repo_root: Path) -> set[str]:
-    """``changed`` and every model module that imports one of them, directly
-    or through other model modules."""
-    models = model_modules(repo_root)
+    """``changed`` and every module directly under the models package that
+    imports one of them, directly or through other such modules."""
     importers: dict[str, set[str]] = {}
-    for name, path in models.items():
+    for path in sorted((repo_root / MODEL_DIRECTORY).glob("*.py")):
         for imported in imported_models(path):
-            importers.setdefault(imported, set()).add(name)
+            importers.setdefault(imported, set()).add(path.stem)
     reached, pending = set(), list(changed)
     while pending:
         name = pending.pop()
@@ -89,9 +102,26 @@ def select_runtime_tests(
             continue
         return None
     reached = models_built_on(changed_models, repo_root) if changed_models else set()
-    return [
-        test
-        for test in test_files
-        if test in changed_tests
-        or (reached and imported_models(repo_root / test) & reached)
-    ]
+    names = {squashed(name) for name in reached}
+    # A test may import a changed test as test.runtime.<name>, runtime.<name>
+    # or <name>.
+    changed_test_modules = {
+        name
+        for test in changed_tests
+        for name in (
+            test.removesuffix(".py").replace("/", "."),
+            test.removesuffix(".py").replace("/", ".").removeprefix("test."),
+            Path(test).stem,
+        )
+    }
+    selected = []
+    for test in test_files:
+        path = repo_root / test
+        if (
+            test in changed_tests
+            or imported_modules(path) & changed_test_modules
+            or imported_models(path) & reached
+            or any(name in squashed(path.read_text(encoding="utf-8")) for name in names)
+        ):
+            selected.append(test)
+    return selected
