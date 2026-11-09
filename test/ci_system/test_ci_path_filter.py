@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pipeline
@@ -556,9 +558,6 @@ def test_workflow_classifies_the_checkout_after_installing_pyyaml(
 def test_full_tests_request_runs_a_group_a_change_does_not_need(
     tmp_path, flags, expected
 ):
-    import subprocess
-    import sys
-
     changed = tmp_path / "changed.txt"
     changed.write_text("docs/guide.md\n")
     script = REPO_ROOT / "test/ci_system/ci_path_filter.py"
