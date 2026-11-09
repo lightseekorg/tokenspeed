@@ -50,12 +50,23 @@ std::span<const std::string> Request::PromptPrefixHashes() {
 
 std::span<const std::uint64_t> Request::KvEventBlockHashes(std::size_t num_pages) {
     if (kv_event_block_hashes_.size() < num_pages) {
-        const auto first_page = static_cast<std::int32_t>(kv_event_block_hashes_.size());
-        for (const std::span<const std::int32_t> page : PrefixPages(first_page, static_cast<std::int32_t>(num_pages))) {
+        if (static_cast<std::int64_t>(num_pages) * prefix_granularity_ > TokenSize()) {
+            throw std::runtime_error("KvEventBlockHashes: the request has fewer full prefix pages than asked");
+        }
+        if (kv_event_block_hashes_.empty()) {
+            // One allocation per request: every page its declared budget can
+            // reach (its current pages when it declares none).
+            const std::int64_t reach = HasDeclaredBudget() ? TokenLimit() : std::int64_t{TokenSize()};
+            kv_event_block_hashes_.reserve(static_cast<std::size_t>(reach / prefix_granularity_) + 2);
+        }
+        for (auto page = static_cast<std::int32_t>(kv_event_block_hashes_.size());
+             page < static_cast<std::int32_t>(num_pages); ++page) {
+            // The page's tokens as a view into the request: no page list.
+            const std::span<const std::int32_t> tokens = TokenSlice(page * prefix_granularity_, prefix_granularity_);
             const std::optional<std::uint64_t> parent_hash =
                 kv_event_block_hashes_.empty() ? std::nullopt
                                                : std::optional<std::uint64_t>{kv_event_block_hashes_.back()};
-            kv_event_block_hashes_.push_back(HashKvBlock(page, parent_hash));
+            kv_event_block_hashes_.push_back(HashKvBlock(tokens, parent_hash));
         }
     }
     return std::span<const std::uint64_t>{kv_event_block_hashes_}.first(num_pages);

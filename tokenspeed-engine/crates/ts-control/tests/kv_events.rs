@@ -18,58 +18,30 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The KV event publisher against the Python one: the payload bytes
-//! (`tests/fixtures/kv_events.hex`, from `pd/kv_events.py`) and the PUB and
-//! replay protocol a subscriber speaks.
+//! The KV event publisher: the frame the scheduler encodes (the payload of
+//! `tests/fixtures/kv_events.hex`, the Python schema's bytes) goes out
+//! unchanged with its sequence number on the PUB and replay protocol a
+//! subscriber speaks.
 
 use std::time::Duration;
 
 use bytes::Bytes;
-use ts_control::kv_events::{encode_batch, KvEventPublisher, KvEventsConfig};
-use ts_scheduler::KvEventView;
+use ts_control::kv_events::{KvEventPublisher, KvEventsConfig};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
-fn fixture_batch() -> Vec<KvEventView> {
-    vec![
-        KvEventView {
-            stored: true,
-            block_hashes: vec![11, (1 << 63) + 5],
-            has_parent: true,
-            parent_block_hash: 7,
-            token_ids: (1..=8).collect(),
-            block_size: 4,
-        },
-        KvEventView {
-            stored: true,
-            block_hashes: vec![u64::MAX],
-            has_parent: false,
-            parent_block_hash: 0,
-            token_ids: vec![9, 10, 11, 12],
-            block_size: 4,
-        },
-        KvEventView {
-            stored: false,
-            block_hashes: vec![11, 3],
-            has_parent: false,
-            parent_block_hash: 0,
-            token_ids: Vec::new(),
-            block_size: 0,
-        },
-    ]
-}
-
-#[test]
-fn a_batch_encodes_as_the_python_publisher_s() {
+/// The Python schema's encoding of a three-event batch, as the scheduler's
+/// frame drain writes it.
+fn fixture_frame() -> Vec<u8> {
     let path = format!(
         "{}/tests/fixtures/kv_events.hex",
         env!("CARGO_MANIFEST_DIR")
     );
-    let expected = std::fs::read_to_string(path).unwrap();
-    let encoded: String = encode_batch(1_700_000_000.25, &fixture_batch(), 1)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    assert_eq!(encoded, expected.trim());
+    let hex = std::fs::read_to_string(path).unwrap();
+    let hex = hex.trim();
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 fn free_port() -> u16 {
@@ -81,7 +53,7 @@ fn free_port() -> u16 {
 }
 
 #[test]
-fn subscribers_receive_batches_and_replay_them() {
+fn subscribers_receive_frames_and_replay_them() {
     let (port, replay_port) = (free_port(), free_port());
     let publisher = KvEventPublisher::start(
         &KvEventsConfig {
@@ -94,6 +66,8 @@ fn subscribers_receive_batches_and_replay_them() {
         0,
     )
     .unwrap();
+    assert_eq!(publisher.dp_rank(), 0);
+    let frame = fixture_frame();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -110,7 +84,7 @@ fn subscribers_receive_batches_and_replay_them() {
     // until one lands.
     let received = loop {
         // From the control thread, outside any runtime, as the loop does.
-        publisher.publish(&fixture_batch()[2..]);
+        publisher.publish(&frame);
         let received = runtime.block_on(async {
             tokio::time::timeout(Duration::from_millis(200), subscriber.recv()).await
         });
@@ -121,6 +95,11 @@ fn subscribers_receive_batches_and_replay_them() {
     assert_eq!(received.len(), 3);
     assert_eq!(received[0], Bytes::from_static(b"kv"));
     let seq = u64::from_be_bytes(received[1].as_ref().try_into().unwrap());
+    assert_eq!(
+        received[2].as_ref(),
+        frame.as_slice(),
+        "the frame goes out as the scheduler encoded it"
+    );
 
     // Replay from that batch: it and every later one, then the end marker.
     let replayed = runtime.block_on(async {
@@ -140,9 +119,31 @@ fn subscribers_receive_batches_and_replay_them() {
             if replayed == -1 {
                 return seqs;
             }
+            assert_eq!(frames[2].as_ref(), frame.as_slice());
             seqs.push(replayed as u64);
         }
     });
     assert_eq!(replayed.first(), Some(&seq));
     assert!(replayed.windows(2).all(|pair| pair[1] == pair[0] + 1));
+}
+
+#[test]
+fn an_empty_frame_is_not_published() {
+    let port = free_port();
+    let publisher = KvEventPublisher::start(
+        &KvEventsConfig {
+            endpoint: format!("tcp://*:{port}"),
+            replay_endpoint: None,
+            buffer_steps: 2,
+            max_queue_size: 2,
+            topic: "kv".to_owned(),
+        },
+        3,
+    )
+    .unwrap();
+    assert_eq!(publisher.dp_rank(), 3);
+    // Nothing to send: the call returns at once and the thread stays idle;
+    // dropping the publisher then returns within its shutdown bound.
+    publisher.publish(&[]);
+    drop(publisher);
 }

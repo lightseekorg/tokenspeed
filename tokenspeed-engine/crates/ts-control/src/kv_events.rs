@@ -19,9 +19,17 @@
 // SOFTWARE.
 
 //! KV cache event publishing (`pd/kv_events.py`): each round's prefix-cache
-//! mutations, drained from the scheduler once per round, go out as one
-//! `KVEventBatch` on a ZMQ PUB socket, with an optional ROUTER socket that
-//! replays recent batches to a subscriber that missed them.
+//! mutations, drained from the scheduler once per round as one encoded
+//! frame, go out as one `KVEventBatch` on a ZMQ PUB socket, with an optional
+//! ROUTER socket that replays recent batches to a subscriber that missed
+//! them.
+//!
+//! The scheduler encodes the frame (`Scheduler::drain_kv_event_frame`), so
+//! the control thread copies bytes into a bounded ring and never encodes,
+//! allocates or waits on a socket; the publisher thread sends. A ring that
+//! is full overwrites its oldest frame: the sequence number that frame was
+//! given at push time is never sent, the relay reads the gap and asks the
+//! replay, and what the replay no longer holds it resyncs from a snapshot.
 //!
 //! The wire, unchanged from the Python publisher's: `[topic, seq, payload]`
 //! frames, the sequence number 8 bytes big-endian, the payload the msgpack
@@ -31,13 +39,13 @@
 
 use std::{
     collections::VecDeque,
-    sync::mpsc as std_mpsc,
+    sync::{mpsc as std_mpsc, Arc, Mutex, PoisonError},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
-use ts_scheduler::KvEventView;
+use tokio::sync::Notify;
 use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
 /// How long shutdown waits for queued batches to go out
@@ -71,7 +79,8 @@ pub struct KvEventsConfig {
     pub replay_endpoint: Option<String>,
     /// Batches kept for replay.
     pub buffer_steps: usize,
-    /// Batches queued for the publisher thread before `publish` waits.
+    /// Frames the ring holds for the publisher thread; when it is full, the
+    /// oldest frame is overwritten and its sequence number skipped.
     pub max_queue_size: usize,
     /// The topic frame every batch carries.
     pub topic: String,
@@ -97,43 +106,11 @@ pub fn offset_endpoint_port(endpoint: &str, dp_rank: i64) -> Result<String, KvEv
     }
 }
 
-/// One round's events as the publisher's payload (`KVEventBatch`): the
-/// time, the events and this rank's attention-DP rank.
-pub fn encode_batch(timestamp: f64, events: &[KvEventView], dp_rank: i64) -> Vec<u8> {
-    let mut encoder = ts_wire::msgpack::Encoder::new();
-    encoder.array_len(3);
-    encoder.float(timestamp);
-    encoder.array_len(events.len());
-    for event in events {
-        if event.stored {
-            encoder.array_len(5);
-            encoder.str("BlockStored");
-            hashes(&mut encoder, &event.block_hashes);
-            if event.has_parent {
-                encoder.uint(event.parent_block_hash);
-            } else {
-                encoder.nil();
-            }
-            encoder.array_len(event.token_ids.len());
-            for &token in &event.token_ids {
-                encoder.int(i64::from(token));
-            }
-            encoder.int(i64::from(event.block_size));
-        } else {
-            encoder.array_len(2);
-            encoder.str("BlockRemoved");
-            hashes(&mut encoder, &event.block_hashes);
-        }
-    }
-    encoder.int(dp_rank);
-    encoder.into_single_frame()
-}
-
-fn hashes(encoder: &mut ts_wire::msgpack::Encoder, hashes: &[u64]) {
-    encoder.array_len(hashes.len());
-    for &hash in hashes {
-        encoder.uint(hash);
-    }
+/// The batch timestamp the frame carries: seconds since the epoch.
+pub fn now_timestamp() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
 /// Bind addresses as libzmq reads them: `*` is every interface.
@@ -141,10 +118,79 @@ fn bind_address(endpoint: &str) -> String {
     endpoint.replace("://*:", "://0.0.0.0:")
 }
 
+/// The frames waiting for the publisher thread, oldest first, each with the
+/// sequence number it was given when pushed. Fixed capacity: the slots keep
+/// their buffers, so a push copies and allocates nothing once every slot
+/// has grown to the frames it sees; a push into a full ring drops the oldest
+/// frame.
+struct Ring {
+    slots: Vec<(u64, Vec<u8>)>,
+    head: usize,
+    len: usize,
+    next_seq: u64,
+    dropped: u64,
+    closed: bool,
+}
+
+impl Ring {
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: (0..capacity.max(1)).map(|_| (0, Vec::new())).collect(),
+            head: 0,
+            len: 0,
+            next_seq: 0,
+            dropped: 0,
+            closed: false,
+        }
+    }
+
+    fn push(&mut self, frame: &[u8]) -> u64 {
+        let capacity = self.slots.len();
+        if self.len == capacity {
+            self.head = (self.head + 1) % capacity;
+            self.len -= 1;
+            self.dropped += 1;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let (slot_seq, slot) = &mut self.slots[(self.head + self.len) % capacity];
+        *slot_seq = seq;
+        slot.clear();
+        slot.extend_from_slice(frame);
+        self.len += 1;
+        seq
+    }
+
+    /// Copies the oldest frame into `out` and returns its sequence number.
+    fn pop_into(&mut self, out: &mut Vec<u8>) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        let (seq, frame) = &self.slots[self.head];
+        out.clear();
+        out.extend_from_slice(frame);
+        let seq = *seq;
+        self.head = (self.head + 1) % self.slots.len();
+        self.len -= 1;
+        Some(seq)
+    }
+}
+
+struct Shared {
+    ring: Mutex<Ring>,
+    wake: Notify,
+}
+
+impl Shared {
+    fn ring(&self) -> std::sync::MutexGuard<'_, Ring> {
+        self.ring.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// One rank's publisher; dropping it sends what is queued, for up to a
 /// second.
 pub struct KvEventPublisher {
-    queue: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    shared: Arc<Shared>,
     dp_rank: i64,
     done: std_mpsc::Receiver<()>,
 }
@@ -183,7 +229,10 @@ impl KvEventPublisher {
             None => None,
         };
         tracing::info!(endpoint, replay = ?replay_endpoint, "publishing KV cache events");
-        let (queue, batches) = tokio::sync::mpsc::channel::<Vec<u8>>(config.max_queue_size.max(1));
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(Ring::new(config.max_queue_size)),
+            wake: Notify::new(),
+        });
         let (done_tx, done) = std_mpsc::channel();
         let state = PublisherState {
             publisher,
@@ -191,33 +240,47 @@ impl KvEventPublisher {
             topic: Bytes::from(config.topic.clone().into_bytes()),
             buffer: VecDeque::new(),
             buffer_steps: config.buffer_steps,
-            next_seq: 0,
+            shared: Arc::clone(&shared),
+            scratch: Vec::new(),
         };
         thread::Builder::new()
             .name("ts-kv-events".to_owned())
             .spawn(move || {
-                runtime.block_on(state.run(batches));
+                runtime.block_on(state.run());
                 let _ = done_tx.send(());
             })?;
         Ok(Self {
-            queue: Some(queue),
+            shared,
             dp_rank,
             done,
         })
     }
 
-    /// Queue one round's events; waits while the queue is full.
-    pub fn publish(&self, events: &[KvEventView]) {
-        if events.is_empty() {
+    /// The attention-DP rank the frames name.
+    pub fn dp_rank(&self) -> i64 {
+        self.dp_rank
+    }
+
+    /// Hands one round's frame to the publisher thread. Never waits: a full
+    /// ring drops its oldest frame, whose skipped sequence number tells the
+    /// relay to resync.
+    pub fn publish(&self, frame: &[u8]) {
+        if frame.is_empty() {
             return;
         }
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0.0, |elapsed| elapsed.as_secs_f64());
-        let payload = encode_batch(timestamp, events, self.dp_rank);
-        if let Some(queue) = &self.queue {
-            if queue.blocking_send(payload).is_err() {
-                tracing::warn!("the KV event publisher stopped; dropping a batch");
+        let dropped = {
+            let mut ring = self.shared.ring();
+            let before = ring.dropped;
+            ring.push(frame);
+            (ring.dropped != before).then_some(ring.dropped)
+        };
+        self.shared.wake.notify_one();
+        if let Some(dropped) = dropped {
+            if dropped == 1 || dropped % 1000 == 0 {
+                tracing::warn!(
+                    dropped,
+                    "the KV event publisher fell behind; the oldest queued batch was dropped"
+                );
             }
         }
     }
@@ -225,8 +288,9 @@ impl KvEventPublisher {
 
 impl Drop for KvEventPublisher {
     fn drop(&mut self) {
-        // The thread sends what is queued once the channel closes.
-        self.queue = None;
+        // The thread sends what is queued once the ring closes.
+        self.shared.ring().closed = true;
+        self.shared.wake.notify_one();
         if self.done.recv_timeout(SHUTDOWN_TIMEOUT).is_err() {
             tracing::warn!("KV event batches still queued at shutdown");
         }
@@ -239,18 +303,31 @@ struct PublisherState {
     topic: Bytes,
     buffer: VecDeque<(u64, Bytes)>,
     buffer_steps: usize,
-    next_seq: u64,
+    shared: Arc<Shared>,
+    scratch: Vec<u8>,
 }
 
 impl PublisherState {
-    async fn run(mut self, mut batches: tokio::sync::mpsc::Receiver<Vec<u8>>) {
+    async fn run(mut self) {
         loop {
+            loop {
+                let seq = self.shared.ring().pop_into(&mut self.scratch);
+                match seq {
+                    Some(seq) => {
+                        let payload = Bytes::copy_from_slice(&self.scratch);
+                        self.send(seq, payload).await;
+                    }
+                    None => break,
+                }
+            }
+            if self.shared.ring().closed {
+                return;
+            }
+            let wake = &self.shared.wake;
+            let replay = &mut self.replay;
             tokio::select! {
-                batch = batches.recv() => match batch {
-                    Some(payload) => self.send(payload).await,
-                    None => return,
-                },
-                request = recv_replay(&mut self.replay) => match request {
+                () = wake.notified() => {}
+                request = recv_replay(replay) => match request {
                     Ok(request) => self.serve_replay(request).await,
                     Err(error) => tracing::warn!(%error, "KV event replay socket failed"),
                 },
@@ -258,10 +335,7 @@ impl PublisherState {
         }
     }
 
-    async fn send(&mut self, payload: Vec<u8>) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let payload = Bytes::from(payload);
+    async fn send(&mut self, seq: u64, payload: Bytes) {
         let mut message = ZmqMessage::from(self.topic.clone());
         message.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
         message.push_back(payload.clone());
@@ -331,5 +405,27 @@ mod tests {
             "tcp://*:5559"
         );
         assert!(offset_endpoint_port("ipc:///tmp/x", 1).is_err());
+    }
+
+    #[test]
+    fn a_full_ring_drops_its_oldest_frame_and_keeps_the_sequence_numbers() {
+        let mut ring = Ring::new(2);
+        assert_eq!(ring.push(b"a"), 0);
+        assert_eq!(ring.push(b"b"), 1);
+        assert_eq!(ring.push(b"c"), 2);
+        assert_eq!(ring.dropped, 1);
+        let mut out = Vec::new();
+        assert_eq!(ring.pop_into(&mut out), Some(1));
+        assert_eq!(out, b"b");
+        assert_eq!(ring.pop_into(&mut out), Some(2));
+        assert_eq!(out, b"c");
+        assert_eq!(ring.pop_into(&mut out), None);
+        // The slots keep their buffers: a later push reuses them.
+        let capacity_before: Vec<usize> =
+            ring.slots.iter().map(|(_, slot)| slot.capacity()).collect();
+        assert_eq!(ring.push(b"d"), 3);
+        let capacity_after: Vec<usize> =
+            ring.slots.iter().map(|(_, slot)| slot.capacity()).collect();
+        assert_eq!(capacity_before, capacity_after);
     }
 }

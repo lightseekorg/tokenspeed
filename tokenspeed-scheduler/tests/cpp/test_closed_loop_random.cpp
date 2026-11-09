@@ -198,9 +198,10 @@ struct ClosedLoop {
     // The P role's requests a plan left incomplete: each later chunk of
     // theirs is a resident's.
     std::set<std::string> prefilling;
-    // With KV cache events: per rank, the blocks the feed reports stored,
-    // and how many stored events the first rank's feed carried.
-    std::vector<std::set<std::uint64_t>> kv_stored_blocks;
+    // With KV cache events: per rank, the groups that hold each block the
+    // feed reports stored, and how many stored events the first rank's feed
+    // carried.
+    std::vector<std::map<std::uint64_t, std::uint64_t>> kv_stored_blocks;
     std::uint64_t kv_stored_events{0};
 
     int Rand(int lo, int hi_exclusive) { return std::uniform_int_distribution<int>(lo, hi_exclusive - 1)(rng); }
@@ -208,34 +209,42 @@ struct ClosedLoop {
     // A request's place in submission order: ids are "r" and a counter.
     static int Serial(const std::string& id) { return std::stoi(id.substr(1)); }
 
-    // Drains every rank's KV event feed after a plan: a removal names a block
-    // the feed stored, no block is stored twice without a removal between,
-    // and mirrored ranks report the same events.
+    // Drains every rank's KV event feed after a plan: a removal drops only
+    // groups the feed reported holding the block, a store adds a group that
+    // holds it, and mirrored ranks report the same events.
     void DrainKvEvents() {
         if (!knobs.kv_events) {
             return;
         }
         kv_stored_blocks.resize(schedulers.size());
-        std::vector<std::pair<bool, std::uint64_t>> first_feed;
+        std::vector<std::tuple<bool, std::uint64_t, std::uint64_t>> first_feed;
         for (std::size_t rank = 0; rank < schedulers.size(); ++rank) {
-            std::vector<std::pair<bool, std::uint64_t>> feed;
+            std::vector<std::tuple<bool, std::uint64_t, std::uint64_t>> feed;
             for (const KvCacheEvent& event : schedulers[rank]->DrainKvEvents()) {
                 if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
                     for (const std::uint64_t hash : removed->block_hashes) {
-                        if (kv_stored_blocks[rank].erase(hash) == 0) {
+                        const auto it = kv_stored_blocks[rank].find(hash);
+                        if (it == kv_stored_blocks[rank].end() ||
+                            (it->second & removed->group_mask) != removed->group_mask) {
                             throw std::logic_error("round " + std::to_string(round) +
-                                                   ": a KV event removes a block never stored");
+                                                   ": a KV event removes a block a group never stored");
                         }
-                        feed.emplace_back(false, hash);
+                        it->second &= ~removed->group_mask;
+                        if (it->second == 0) {
+                            kv_stored_blocks[rank].erase(it);
+                        }
+                        feed.emplace_back(false, removed->group_mask, hash);
                     }
                     continue;
                 }
                 const auto& stored = std::get<KvBlockStoredEvent>(event);
                 for (const std::uint64_t hash : stored.block_hashes) {
-                    if (!kv_stored_blocks[rank].insert(hash).second) {
+                    std::uint64_t& held = kv_stored_blocks[rank][hash];
+                    if ((stored.group_mask & ~held) == 0) {
                         throw std::logic_error("round " + std::to_string(round) + ": a KV event stores a block twice");
                     }
-                    feed.emplace_back(true, hash);
+                    held = stored.group_mask;
+                    feed.emplace_back(true, stored.group_mask, hash);
                 }
                 kv_stored_events += rank == 0 ? 1 : 0;
             }

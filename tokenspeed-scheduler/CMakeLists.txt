@@ -48,6 +48,7 @@ add_library(tokenspeed_scheduler_core STATIC
 
     csrc/scheduler/capacity_model.cpp
     csrc/scheduler/kv_cache_events.cpp
+    csrc/scheduler/kv_event_ledger.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/types.cpp
     csrc/scheduler/outside_event_handler.cpp
@@ -204,6 +205,21 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     )
 
     target_include_directories(tokenspeed_scheduler_group_allocator_benchmark
+        PRIVATE
+            csrc
+            tests/cpp
+    )
+
+    add_executable(tokenspeed_scheduler_kv_events_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_kv_events.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_kv_events_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+    )
+
+    target_include_directories(tokenspeed_scheduler_kv_events_benchmark
         PRIVATE
             csrc
             tests/cpp

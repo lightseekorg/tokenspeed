@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
+#include "scheduler/kv_event_ledger.h"
 #include "cache/core/block_pool.h"
 #include "cache/tier/transfer_manager.h"
 #include "cache/tier/storage_manager.h"
@@ -101,6 +102,11 @@ public:
 
     ExecutionPlan NextExecutionPlan();
     void Advance(const ExecutionEvent& event);
+    // The KV-event publisher's batch since the previous drain, encoded for the
+    // wire ([timestamp, events, attn_dp_rank]); empty when nothing changed or
+    // events are off. The bytes live until the next drain.
+    std::span<const std::uint8_t> DrainKvEventFrame(double timestamp, std::int64_t dp_rank);
+    // The same drain as structs: tests and the Python binding.
     std::vector<KvCacheEvent> DrainKvEvents();
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
@@ -320,7 +326,9 @@ private:
                                 std::span<const std::int32_t> tails);
     // The descriptor of `tail` past the full pages `prefix_hashes`.
     void registerKvEventTail(Request& request, std::span<const std::string> prefix_hashes, const TailPublication& tail);
-    void markKvEventBoundaryForReconcile(const CacheKey& boundary);
+    // How many Device entries each group indexes for a boundary it holds: a
+    // page's (tail_tokens 0) or a tail's blocks, none for a replayable group.
+    void kvEventBlocksPerGroup(std::int32_t tail_tokens, std::vector<std::int32_t>& out) const;
     // Finished requests whose forwards have all landed: publish the frontier
     // (state and KV tail) and release the pages. Runs after every batch of
     // events, so a request that finished quiescent settles with its Finish
@@ -669,29 +677,12 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
-    // What the prefix index cannot tell us about a boundary: the token
-    // descriptor the external event carries, and whether that event is
-    // currently out (a BlockStored not yet followed by its BlockRemoved).
-    // Residency itself is the coordinator's answer, never mirrored here.
-    // Cache mutations and registrations only mark a boundary for reconcile;
-    // DrainKvEvents reconciles each marked boundary against its residency, so
-    // the order of evictions and publications inside one admission does not
-    // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with a cached child.
-    struct KvEventBoundary {
-        KvBlockStoredEvent stored;
-        // Position in the prefix chain (page index). Consumers resolve a
-        // Stored event's parent_block_hash on receipt, so DrainKvEvents
-        // orders each batch by depth rather than by mutation order.
-        std::int32_t depth{0};
-        bool published{false};
-        bool needs_reconcile{false};
-    };
-    std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;
-    // The boundaries marked for reconcile. Mutations mark them in whatever
-    // order the coordinator touches pages (evictions run suffix-first), so
-    // this order carries no meaning; DrainKvEvents sorts the batch.
-    std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
+    // The KV-event publisher's bookkeeping (enable_kv_cache_events): the
+    // descriptors of the boundaries some group holds, their per-group
+    // residency kept by the coordinator's mutation sink, and the frame the
+    // drain encodes. The scratch for kvEventBlocksPerGroup rides beside it.
+    std::optional<KvEventLedger> kv_events_;
+    std::vector<std::int32_t> kv_event_blocks_scratch_;
 
     // SchedulerConfig::demote_superseded_state_checkpoints where it takes
     // effect (a model with State groups, outside the D role): what finishes

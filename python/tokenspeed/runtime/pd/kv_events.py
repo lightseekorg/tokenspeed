@@ -28,6 +28,20 @@ Every rank's Rust control plane drains its scheduler's events and the
 attention-TP group's first rank publishes them over ZMQ (``ts-control``'s
 ``kv_events``). These structs are the payload's schema as a consumer decodes
 it with msgspec; the publisher's encoding matches them byte for byte.
+
+One event per boundary. A ``BlockStored`` goes out when a cache group newly
+holds a boundary and carries ``group_mask``, the groups that hold it after the
+drain (bit i for the scheduler's cache group i); a ``BlockRemoved`` goes out
+when groups dropped it and carries the dropped groups. ``group_idx`` names the
+lowest group the event is about, ``kv_cache_spec_kind`` that group's attention
+kind (``full_attention``, ``sliding_window`` or ``mamba`` for a recurrent-state
+group) and ``kv_cache_spec_sliding_window`` its window, so a consumer that
+reads one group per event, the reference engine's shape, sees that group's
+store or removal, and one that reads the mask sees a hybrid model's History
+chain, its State checkpoints and its sliding windows under the same block
+hashes. The field order is the reference engine publisher's with
+``group_mask`` after its last slot; every slot is written, and the fields this
+engine does not use (adapter, medium, placement) ride as ``None``.
 """
 
 from typing import Any
@@ -62,10 +76,30 @@ class BlockStored(KVCacheEvent):
     parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
+    lora_id: int | None = None
+    medium: str | None = None
+    lora_name: str | None = None
+    extra_keys: list[Any] | None = None
+    group_idx: int | None = None
+    kv_cache_spec_kind: str | None = None
+    kv_cache_spec_sliding_window: int | None = None
+    locality: str | None = None
+    ownership: str | None = None
+    session_id: str | None = None
+    # This engine's extension after the reference slots: bit i for cache group
+    # i. A store carries the groups that hold the boundary after it, a removal
+    # the groups that dropped it; group_idx names the lowest group the event
+    # is about.
+    group_mask: int | None = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    medium: str | None = None
+    group_idx: int | None = None
+    locality: str | None = None
+    ownership: str | None = None
+    group_mask: int | None = None
 
 
 class AllBlocksCleared(KVCacheEvent):

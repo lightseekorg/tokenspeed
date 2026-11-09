@@ -75,6 +75,10 @@ void SchedulerConfig::Validate() const {
                 "Scheduler: a State group with checkpoint_granularity > 1 requires state_checkpoint_in_forward");
         }
     }
+    // The KV-event ledger keeps one bit per group in a boundary's masks (KvEventLedger::kMaxGroups).
+    if (enable_kv_cache_events && cache_groups.size() > 64) {
+        throw std::invalid_argument("Scheduler: KV cache events track at most 64 cache groups");
+    }
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }

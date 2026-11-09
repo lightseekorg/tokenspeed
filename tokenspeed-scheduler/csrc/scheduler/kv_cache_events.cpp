@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string_view>
 
 namespace tokenspeed {
 namespace {
@@ -50,6 +51,18 @@ void MixInt32(std::uint64_t& hash, std::int32_t value) {
 }
 
 }  // namespace
+
+std::string_view KvCacheSpecKind(AttnKind attn_kind) {
+    switch (attn_kind) {
+        case AttnKind::kFull:
+            return "full_attention";
+        case AttnKind::kSlidingWindow:
+            return "sliding_window";
+        case AttnKind::kState:
+            return "mamba";
+    }
+    return "unknown";
+}
 
 std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional<std::uint64_t> parent_hash) {
     std::uint64_t hash = kFnvOffsetBasis;

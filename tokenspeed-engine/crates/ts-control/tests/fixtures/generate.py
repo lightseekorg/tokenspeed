@@ -114,24 +114,32 @@ def _expected(rid: str, raw: bytes) -> tuple[bytes, str]:
     return msgspec.msgpack.encode(params), verdict
 
 
-#: A KV event batch: a stored chain under a parent, a root block whose hash
-#: needs 64 bits, and a removal.
+#: A KV event batch: a stored chain under a parent in the History group, a
+#: root block whose hash needs 64 bits in a sliding-window group and in a
+#: State group, and a removal.
 _KV_EVENT_BATCH = KVEventBatch(
     ts=1_700_000_000.25,
     events=[
         BlockStored(
-            block_hashes=[11, 2**63 + 5],
+            block_hashes=[11],
             parent_block_hash=7,
             token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
-            block_size=4,
+            block_size=8,
+            group_idx=0,
+            kv_cache_spec_kind="full_attention",
+            group_mask=0b011,
         ),
         BlockStored(
             block_hashes=[2**64 - 1],
             parent_block_hash=None,
             token_ids=[9, 10, 11, 12],
-            block_size=4,
+            block_size=8,
+            group_idx=2,
+            kv_cache_spec_kind="sliding_window",
+            kv_cache_spec_sliding_window=128,
+            group_mask=0b100,
         ),
-        BlockRemoved(block_hashes=[11, 3]),
+        BlockRemoved(block_hashes=[3], group_idx=1, group_mask=0b010),
     ],
     attn_dp_rank=1,
 )

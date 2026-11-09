@@ -42,7 +42,6 @@ struct SchedulerAbortView;
 struct SchedulerSizes;
 struct AdmissionSnapshot;
 struct CacheGroupPages;
-struct KvEventView;
 struct StorageTickView;
 struct StorageCancellationView;
 struct StorageDoneView;
@@ -61,7 +60,8 @@ AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
-rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler);
+rust::Slice<const std::uint8_t> drain_kv_event_frame(tokenspeed::Scheduler& scheduler, double timestamp,
+                                                    std::int64_t dp_rank);
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool storage_pending(const tokenspeed::Scheduler& scheduler);
