@@ -28,12 +28,14 @@ import torch
 from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
     compact_index_pages,
 )
+from tokenspeed_kernel.ops.attention.dsv41.triton import pack_index_queries
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
+    ScaleFormat,
     dense_tensor_format,
     format_signature,
     tensor_format,
@@ -66,6 +68,50 @@ def _attention_format_signature(**roles: torch.Tensor):
     return format_signature(
         **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
     )
+
+
+# An mxfp4 index query: uint8 [tokens, heads, head_dim / 2] E2M1 codes (even
+# element in the low nibble) and, per (token, head), head_dim / 32 UE8M0
+# scales as the bytes of one int32 word -- the mxfp4 index-K row codec.
+MXFP4_INDEX_QUERY_FORMAT = tensor_format(
+    "mxfp4",
+    torch.uint8,
+    scale=ScaleFormat(
+        storage_dtype=torch.uint8, granularity="block", block_shape=(32,)
+    ),
+)
+
+
+def _index_query_format(q: torch.Tensor):
+    """An index query's format: uint8 is mxfp4, any other dtype dense."""
+    if q.dtype == torch.uint8:
+        return MXFP4_INDEX_QUERY_FORMAT
+    return dense_tensor_format(q.dtype)
+
+
+def _index_query_head_dim(q: torch.Tensor) -> int:
+    """Elements per index-query head: an mxfp4 byte packs two."""
+    return 2 * q.shape[-1] if q.dtype == torch.uint8 else q.shape[-1]
+
+
+def _index_query_signature(q: torch.Tensor, weights: torch.Tensor):
+    return format_signature(
+        q=_index_query_format(q), weights=dense_tensor_format(weights.dtype)
+    )
+
+
+def dsa_quantize_index_query_mxfp4(
+    q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize BF16 index queries ``[tokens, heads, 128]`` to mxfp4.
+
+    Returns uint8 ``[tokens, heads, 64]`` codes and int32 ``[tokens, heads]``
+    scale words (``MXFP4_INDEX_QUERY_FORMAT``), encoded per (token, head) by
+    the codec of mxfp4 index-K rows, so queries round as the keys they meet.
+    """
+    if q.ndim != 3 or q.shape[-1] != 128 or q.dtype != torch.bfloat16:
+        raise ValueError("mxfp4 index queries quantize BF16 [tokens, heads, 128]")
+    return pack_index_queries(q)
 
 
 def dsa_interleave_rope(
@@ -1149,12 +1195,14 @@ def _select_index_candidates_kernel(
     return select_kernel(
         "attention",
         "dsa_index_candidates",
-        _attention_format_signature(q=q, weights=weights),
+        _index_query_signature(q, weights),
         traits={
             "index_heads": q.shape[1],
-            "head_dim": q.shape[2],
+            "head_dim": _index_query_head_dim(q),
             "page_size": page_size,
-            **_index_k_plane_traits(index_k_cache, q.shape[-1], index_k_format),
+            **_index_k_plane_traits(
+                index_k_cache, _index_query_head_dim(q), index_k_format
+            ),
         },
         solution=solution,
     )
@@ -1353,18 +1401,19 @@ def dsa_index_candidates(
     _check_index_candidate_inputs(
         q, weights, index_k_cache, local_page_table, query_requests, causal_lens
     )
+    # FP8 queries take FP32 per-head scales; mxfp4 (uint8) ones int32 scale words.
+    scale_dtypes = {torch.float8_e4m3fn: torch.float32, torch.uint8: torch.int32}
     if q_scales is not None:
         if (
-            q.dtype != torch.float8_e4m3fn
-            or q_scales.dtype != torch.float32
+            scale_dtypes.get(q.dtype) != q_scales.dtype
             or q_scales.shape != q.shape[:2]
             or q_scales.device != q.device
         ):
             raise ValueError(
-                "FP8 candidate queries require matching FP32 per-head scales"
+                "FP8 or mxfp4 candidate queries require matching per-head scales"
             )
-    elif q.dtype == torch.float8_e4m3fn:
-        raise ValueError("FP8 candidate queries require explicit per-head scales")
+    elif q.dtype in scale_dtypes:
+        raise ValueError("quantized candidate queries require explicit per-head scales")
     if query_group_size < 1:
         raise ValueError("candidate query group size must be positive")
     query_requests = query_requests.contiguous()
@@ -1766,7 +1815,7 @@ def dsa_prefill_topk(
         )
     traits = {
         "index_heads": q.shape[1],
-        "head_dim": q.shape[-1],
+        "head_dim": _index_query_head_dim(q),
         "page_size": None if page_size is None else int(page_size),
         "topk": int(topk),
     }
@@ -1789,13 +1838,17 @@ def dsa_prefill_topk(
             "index_k_bf16) are two sources of index keys; pass one"
         )
     if index_k_cache is not None:
-        traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1], index_k_format))
+        traits.update(
+            _index_k_plane_traits(
+                index_k_cache, _index_query_head_dim(q), index_k_format
+            )
+        )
     elif has_workspace_rows:
         _check_index_k_rows(
             index_k_fp8,
             index_k_scale,
             index_k_bf16,
-            head_dim=q.shape[-1],
+            head_dim=_index_query_head_dim(q),
             workspace_rows=kv_workspace_slots.numel(),
         )
         traits.update(_index_k_rows_traits("bf16" if has_bf16_rows else "fp8_scaled"))
@@ -1816,7 +1869,7 @@ def dsa_prefill_topk(
         required_features.add(INDEX_K_WORKSPACE_ROWS_FEATURE)
     if row_starts_cpu is not None:
         required_features.add(ROW_STARTS_CPU_FEATURE)
-    signature = _attention_format_signature(q=q, weights=weights)
+    signature = _index_query_signature(q, weights)
     if kernel_plan is None:
         kernel = select_kernel(
             "attention",
@@ -1855,7 +1908,7 @@ def dsa_prefill_topk(
         "tokens": q.shape[0],
         "workspace_rows": kv_workspace_slots.numel(),
         "index_heads": q.shape[1],
-        "head_dim": q.shape[-1],
+        "head_dim": _index_query_head_dim(q),
         "topk": int(topk),
     }
     ShapeCapture.get().record(
@@ -2033,12 +2086,16 @@ def dsa_decode_topk(
     traits = {
         "q_len": int(q_len_per_req),
         "index_heads": q.shape[1],
-        "head_dim": q.shape[-1],
+        "head_dim": _index_query_head_dim(q),
         "page_size": int(page_size),
         "topk": int(topk),
     }
     if index_k_cache is not None:
-        traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1], index_k_format))
+        traits.update(
+            _index_k_plane_traits(
+                index_k_cache, _index_query_head_dim(q), index_k_format
+            )
+        )
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
     required_features = set()
@@ -2048,7 +2105,7 @@ def dsa_decode_topk(
         required_features.add("forced_initial_local")
     if batch_invariant:
         required_features.add("batch_invariant")
-    signature = _attention_format_signature(q=q, weights=weights)
+    signature = _index_query_signature(q, weights)
     if kernel_plan is None:
         kernel = select_kernel(
             "attention",
@@ -2078,7 +2135,7 @@ def dsa_decode_topk(
         "tokens": q.shape[0],
         "max_pages": block_table.shape[1],
         "index_heads": q.shape[1],
-        "head_dim": q.shape[-1],
+        "head_dim": _index_query_head_dim(q),
         "page_size": int(page_size),
         "topk": int(topk),
         "q_len_per_req": int(q_len_per_req),
@@ -2202,6 +2259,7 @@ __all__ = [
     "INDEX_CANDIDATE_PAGES_FEATURE",
     "INDEX_CANDIDATE_SCORES_OUT_FEATURE",
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
+    "MXFP4_INDEX_QUERY_FORMAT",
     "ROW_STARTS_CPU_FEATURE",
     "SLOT_ORDERS",
     "DSAIndexCandidatePages",
@@ -2219,6 +2277,7 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "dsa_quantize_index_query_mxfp4",
     "plan_dsa_index_candidates",
     "plan_dsa_topk",
     "select_dsa_prefill_topk_for_rows",

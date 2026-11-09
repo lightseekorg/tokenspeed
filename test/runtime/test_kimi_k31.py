@@ -902,7 +902,7 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
     fp8_scaled plane quantizes exactly those projected rows."""
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.models import glm5
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
@@ -937,7 +937,7 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
 
     # Whole 16-row groups per rank: 560 rows, then the remaining 540.
     assert len(calls) == 2
-    fp8_queries = _scorers_take_fp8_index_queries(indexer)
+    fp8_queries = _scorers_take_quantized_index_queries(indexer)
     for (q, q_scales), rows in zip(calls, (slice(0, 560), slice(560, num_rows))):
         reference = indexer._project_query(q_lora[rows])
         if fp8_queries:
@@ -1225,7 +1225,7 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
 def test_k31_scores_an_fp8_scaled_plane_with_fp8_index_queries() -> None:
     """Over an fp8_scaled plane K3.1 quantizes its index query per (token,
     head), where the platform registers FP8-query scorers."""
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
@@ -1236,7 +1236,7 @@ def test_k31_scores_an_fp8_scaled_plane_with_fp8_index_queries() -> None:
 
     q_out, q_scales = attention._scorer_index_query(q, plane)
 
-    if _scorers_take_fp8_index_queries(attention.indexer):
+    if _scorers_take_quantized_index_queries(attention.indexer):
         _assert_fp8_index_query(q_out, q_scales, q)
     else:
         assert q_out is q and q_scales is None
@@ -1275,7 +1275,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
 ) -> None:
     from tokenspeed_kernel.ops.attention.dsa import dsa_plan
 
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     if index_k_format == "bf16" and torch.version.hip is None:
         pytest.skip("BF16 index-K top-k kernels require AMD")
@@ -1322,7 +1322,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
     )
 
     [(q, q_scales)] = calls
-    if index_k_format == "fp8_scaled" and _scorers_take_fp8_index_queries(
+    if index_k_format == "fp8_scaled" and _scorers_take_quantized_index_queries(
         attention.indexer
     ):
         _assert_fp8_index_query(q, q_scales, indexer_output.query)

@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.dsa import (
+    MXFP4_INDEX_QUERY_FORMAT,
     dsa_decode,
     dsa_decode_dcp_records,
     dsa_decode_dcp_records_supported,
@@ -690,7 +691,7 @@ class DSABackend(PagedAttentionBackend):
         Under DCP the indexer scores the model-dtype index query and head
         weights against packed index-K pages of this leaf's page size,
         without a solution pin (``select_dsa_topk``); an mxfp4 plane's
-        scorers take FP8 queries only.
+        scorers take mxfp4 queries only.
         """
         use_dcp = len(self.kvp_group) > 1
         q_dtype = (
@@ -742,10 +743,10 @@ class DSABackend(PagedAttentionBackend):
                     "dsa_index_candidates",
                     "dsa_index_candidates",
                     format_signature(
-                        q=dense_tensor_format(
-                            torch.float8_e4m3fn
+                        q=(
+                            MXFP4_INDEX_QUERY_FORMAT
                             if self.index_k_format == "mxfp4"
-                            else self.q_data_type
+                            else dense_tensor_format(self.q_data_type)
                         ),
                         weights=dense_tensor_format(self.q_data_type),
                     ),

@@ -34,11 +34,13 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
     _BF16_PREFILL_WAVES_PER_EU,
     _FP8_ROWS_DECODE_NUM_STAGES,
     _FP8_ROWS_PREFILL_TILES,
+    _ROWS_Q_FORMATS,
     _check_fp8_rows_scorer_inputs,
     _check_standard_decode_metadata,
     _fp8_rows_buffer_load,
     _fp8_rows_decode_shape,
     _fp8_rows_decode_splits,
+    _rows_head_dim,
     _scaled_index_k_views,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (
@@ -110,17 +112,16 @@ def _launch_prefill_rows(
         PAGE_SIZE=page_size,
         PAGE_STRIDE_BYTES=page_stride,
         NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
+        HEAD_DIM=_rows_head_dim(q),
         ROWS=rows_per_program,
         BLOCK_N=block_n,
         CHUNK_N=chunk_n,
         WARPS_M=_BF16_PREFILL_NUM_WARPS,
         WARPS_N=1,
         NUM_STAGES=_BF16_PREFILL_NUM_STAGES,
-        Q_FP8=True,
+        Q_FORMAT=_ROWS_Q_FORMATS[q.dtype],
         USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
-        KEY_MXFP4=index_k_format == "mxfp4",
         num_warps=_BF16_PREFILL_NUM_WARPS,
         waves_per_eu=_BF16_PREFILL_WAVES_PER_EU,
     )
@@ -173,9 +174,10 @@ def launch_gluon_dsa_index_candidates_gfx950(
     page_stride = _check_fp8_rows_scorer_inputs(
         q, q_scales, weights, index_k_cache, page_size, index_k_format
     )
-    if q.dtype != torch.float8_e4m3fn:
+    if q.dtype not in (torch.float8_e4m3fn, torch.uint8):
         raise TypeError(
-            "owned-page native scorer requires FP8 queries and explicit scales"
+            "owned-page native scorer requires fp8_e4m3 or mxfp4 queries and "
+            "explicit scales"
         )
     table = _owned_query_group_metadata(q, pages, lengths, query_group_size)
     requests = table.shape[0]
@@ -237,20 +239,19 @@ def launch_gluon_dsa_index_candidates_gfx950(
         PAGE_SIZE=page_size,
         PAGE_STRIDE_BYTES=page_stride,
         NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
+        HEAD_DIM=_rows_head_dim(q),
         ROWS=rows,
         BLOCK_N=block_n,
         CHUNK_N=_BF16_DECODE_CHUNK_N,
         WARPS_M=warps_m,
         WARPS_N=warps_n,
         NUM_STAGES=_FP8_ROWS_DECODE_NUM_STAGES,
-        Q_FP8=True,
+        Q_FORMAT=_ROWS_Q_FORMATS[q.dtype],
         USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         CHUNK_LOOP=splits < chunks,
         explicit_row_lens=lengths,
         NONFINITE_TO_NEG_INF=True,
-        KEY_MXFP4=index_k_format == "mxfp4",
         num_warps=_BF16_DECODE_NUM_WARPS,
         waves_per_eu=waves,
     )

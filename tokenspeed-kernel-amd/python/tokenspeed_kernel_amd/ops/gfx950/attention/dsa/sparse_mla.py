@@ -4092,31 +4092,11 @@ def launch_gluon_dsa_prefill_topk_fp8_gfx950(
     return out, lens_out
 
 
-def _check_standard_scorer_inputs(
-    q: torch.Tensor,
-    q_scales: torch.Tensor | None,
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    page_size: int,
-    row_bytes: int = 128 + 4,
-) -> tuple[int, int, bool]:
-    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-        raise TypeError(
-            f"standard-cache DSA scorer expects BF16 or FP8 q, got {q.dtype}"
-        )
-    if weights.dtype not in (torch.bfloat16, torch.float32):
-        raise TypeError(f"DSA weights must be BF16 or FP32, got {weights.dtype}")
-    if q.dim() != 3 or q.shape[1] not in (32, 64) or q.shape[2] != 128:
-        raise ValueError(
-            "standard-cache DSA scorer requires q=[tokens, 32|64, 128], got "
-            f"{tuple(q.shape)}"
-        )
-    if weights.shape != q.shape[:2]:
-        raise ValueError(
-            f"weights must have shape {tuple(q.shape[:2])}, got {tuple(weights.shape)}"
-        )
-    if q.stride(-1) != 1 or weights.stride(-1) != 1:
-        raise ValueError("q and weights must have contiguous innermost dimensions")
+def _scaled_plane_page_stride(
+    index_k_cache: torch.Tensor, page_size: int, row_bytes: int
+) -> int:
+    """Validate a packed or page-planar index-K plane of ``row_bytes`` rows;
+    return its page stride in bytes."""
     if page_size != 64:
         raise ValueError(
             f"standard-cache DSA scorer requires page_size=64, got {page_size}"
@@ -4149,6 +4129,35 @@ def _check_standard_scorer_inputs(
         )
     if index_k_cache.storage_offset() % 4 or page_stride_bytes % 4:
         raise ValueError("index_k_cache page storage must be float32 aligned")
+    return page_stride_bytes
+
+
+def _check_standard_scorer_inputs(
+    q: torch.Tensor,
+    q_scales: torch.Tensor | None,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    page_size: int,
+    row_bytes: int = 128 + 4,
+) -> tuple[int, int, bool]:
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError(
+            f"standard-cache DSA scorer expects BF16 or FP8 q, got {q.dtype}"
+        )
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"DSA weights must be BF16 or FP32, got {weights.dtype}")
+    if q.dim() != 3 or q.shape[1] not in (32, 64) or q.shape[2] != 128:
+        raise ValueError(
+            "standard-cache DSA scorer requires q=[tokens, 32|64, 128], got "
+            f"{tuple(q.shape)}"
+        )
+    if weights.shape != q.shape[:2]:
+        raise ValueError(
+            f"weights must have shape {tuple(q.shape[:2])}, got {tuple(weights.shape)}"
+        )
+    if q.stride(-1) != 1 or weights.stride(-1) != 1:
+        raise ValueError("q and weights must have contiguous innermost dimensions")
+    page_stride_bytes = _scaled_plane_page_stride(index_k_cache, page_size, row_bytes)
     if weights.device != q.device or index_k_cache.device != q.device:
         raise ValueError("q, weights, and index_k_cache must be on the same device")
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
@@ -4715,20 +4724,61 @@ def _check_fp8_rows_scorer_inputs(
     index_k_format: str = "fp8_scaled",
 ) -> int:
     """Validate queries against fp8_scaled or mxfp4 pages; return the page
-    stride. mxfp4 pages hold E2M1 codes and take only E4M3 queries."""
+    stride. fp8_scaled pages take BF16 or E4M3 queries; mxfp4 pages take
+    only mxfp4 queries: uint8 ``[tokens, heads, 64]`` E2M1 codes and int32
+    ``[tokens, heads]`` words of four UE8M0 scales."""
     if index_k_format not in _SCALED_INDEX_K_ROW_BYTES:
         raise ValueError(f"no multi-row scorer for index_k_format={index_k_format!r}")
-    if index_k_format == "mxfp4" and q.dtype != torch.float8_e4m3fn:
-        raise TypeError("mxfp4 index keys score E4M3 queries with scales")
-    _, page_stride_bytes, _ = _check_standard_scorer_inputs(
-        q,
-        q_scales,
-        weights,
-        index_k_cache,
-        page_size,
-        _SCALED_INDEX_K_ROW_BYTES[index_k_format],
-    )
-    return page_stride_bytes
+    row_bytes = _SCALED_INDEX_K_ROW_BYTES[index_k_format]
+    if (index_k_format == "mxfp4") != (q.dtype == torch.uint8):
+        raise TypeError(
+            "mxfp4 index keys score mxfp4 (uint8) queries, and only them, "
+            f"got {q.dtype} queries for {index_k_format!r} keys"
+        )
+    if index_k_format != "mxfp4":
+        _, page_stride_bytes, _ = _check_standard_scorer_inputs(
+            q, q_scales, weights, index_k_cache, page_size, row_bytes
+        )
+        return page_stride_bytes
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"DSA weights must be BF16 or FP32, got {weights.dtype}")
+    if q.dim() != 3 or q.shape[1] not in (32, 64) or q.shape[2] != 64:
+        raise ValueError(
+            "mxfp4 index queries must be uint8 [tokens, 32|64, 64], got "
+            f"{tuple(q.shape)}"
+        )
+    if weights.shape != q.shape[:2]:
+        raise ValueError(
+            f"weights must have shape {tuple(q.shape[:2])}, got {tuple(weights.shape)}"
+        )
+    if q.stride(-1) != 1 or weights.stride(-1) != 1:
+        raise ValueError("q and weights must have contiguous innermost dimensions")
+    if (
+        q_scales is None
+        or q_scales.dtype != torch.int32
+        or q_scales.shape != q.shape[:2]
+        or q_scales.stride(-1) != 1
+    ):
+        raise ValueError(
+            "mxfp4 queries need int32 [tokens, heads] UE8M0 scale words with a "
+            "contiguous head axis"
+        )
+    if any(t.device != q.device for t in (q_scales, weights, index_k_cache)):
+        raise ValueError("q, q_scales, weights and index_k_cache must share a device")
+    return _scaled_plane_page_stride(index_k_cache, page_size, row_bytes)
+
+
+# The multi-row scorers' Q_FORMAT of each index-query dtype.
+_ROWS_Q_FORMATS = {
+    torch.bfloat16: "bf16",
+    torch.float8_e4m3fn: "fp8_e4m3",
+    torch.uint8: "mxfp4",
+}
+
+
+def _rows_head_dim(q: torch.Tensor) -> int:
+    """Elements per query head: an mxfp4 byte packs two."""
+    return 2 * q.shape[2] if q.dtype == torch.uint8 else q.shape[2]
 
 
 def _scaled_index_k_views(
@@ -4801,7 +4851,9 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     standard fp8_scaled pages (``launch_gluon_dsa_decode_topk_standard_gfx950``
     ``index_k_cache``) with BF16 queries, or E4M3 queries with FP32
     ``q_scales[token, head]`` on the FP8 MFMA: one program covers a request's
-    rows, so each gathered key tile serves all of them.
+    rows, so each gathered key tile serves all of them. ``index_k_format``
+    ``"mxfp4"`` pages take mxfp4 queries (``_check_fp8_rows_scorer_inputs``)
+    on the E2M1 scaled MFMA.
     """
     del plan, seq_lens_2d
     topk = int(topk)
@@ -4868,18 +4920,17 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
         PAGE_SIZE=int(page_size),
         PAGE_STRIDE_BYTES=page_stride_bytes,
         NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
+        HEAD_DIM=_rows_head_dim(q),
         ROWS=rows,
         BLOCK_N=block_n,
         CHUNK_N=_BF16_DECODE_CHUNK_N,
         WARPS_M=warps_m,
         WARPS_N=warps_n,
         NUM_STAGES=num_stages,
-        Q_FP8=q_scales is not None,
+        Q_FORMAT=_ROWS_Q_FORMATS[q.dtype],
         USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         CHUNK_LOOP=grid[1] < chunks,
-        KEY_MXFP4=index_k_format == "mxfp4",
         num_warps=_BF16_DECODE_NUM_WARPS,
         waves_per_eu=waves_per_eu,
     )
@@ -4921,7 +4972,8 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
     standard fp8_scaled pages with BF16 queries, or E4M3 queries with FP32
     ``q_scales[token, head]`` on the FP8 MFMA: ``kv_workspace_slots``
     holds plane slots, and a program shares each key tile across its
-    block of query rows.
+    block of query rows. ``index_k_format`` ``"mxfp4"`` pages take mxfp4
+    queries (``_check_fp8_rows_scorer_inputs``) on the E2M1 scaled MFMA.
     """
     del index_k_fp8, index_k_scale
     topk = int(topk)
@@ -4985,17 +5037,16 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
             PAGE_SIZE=int(page_size),
             PAGE_STRIDE_BYTES=page_stride_bytes,
             NUM_HEADS=q.shape[1],
-            HEAD_DIM=q.shape[2],
+            HEAD_DIM=_rows_head_dim(q),
             ROWS=rows_per_program,
             BLOCK_N=block_n,
             CHUNK_N=chunk_n,
             WARPS_M=_BF16_PREFILL_NUM_WARPS,
             WARPS_N=1,
             NUM_STAGES=_BF16_PREFILL_NUM_STAGES,
-            Q_FP8=q_scales is not None,
+            Q_FORMAT=_ROWS_Q_FORMATS[q.dtype],
             USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
             USE_BUFFER_STORE=logits.nbytes < 2**31,
-            KEY_MXFP4=index_k_format == "mxfp4",
             num_warps=_BF16_PREFILL_NUM_WARPS,
             waves_per_eu=_BF16_PREFILL_WAVES_PER_EU,
         )

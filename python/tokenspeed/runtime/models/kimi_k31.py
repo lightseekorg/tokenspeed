@@ -48,7 +48,10 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.attention.dsa import dsa_decode_dcp_records_workspace_bytes
+from tokenspeed_kernel.ops.attention.dsa import (
+    MXFP4_INDEX_QUERY_FORMAT,
+    dsa_decode_dcp_records_workspace_bytes,
+)
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.gemm import kimi3_mla_gate_projection, mm
 from tokenspeed_kernel.platform import current_platform
@@ -190,15 +193,18 @@ class KimiK31Indexer(nn.Module):
         return self.wq_b(q_lora)[0].view(-1, self.index_n_heads, self.index_head_dim)
 
 
-def _scorers_take_fp8_index_queries(
+def _scorers_take_quantized_index_queries(
     indexer: KimiK31Indexer, index_k_format: str = "fp8_scaled"
 ) -> bool:
     """Whether both paged top-k scorers (prefill and decode) of an
-    ``index_k_format`` plane are registered for this indexer's FP8 E4M3
-    queries on this platform."""
+    ``index_k_format`` plane are registered for this indexer's quantized
+    queries on this platform: mxfp4 over an mxfp4 plane, else FP8 E4M3."""
+    if index_k_format == "mxfp4":
+        q_format = MXFP4_INDEX_QUERY_FORMAT
+    else:
+        q_format = dense_tensor_format(torch.float8_e4m3fn)
     signature = format_signature(
-        q=dense_tensor_format(torch.float8_e4m3fn),
-        weights=dense_tensor_format(torch.bfloat16),
+        q=q_format, weights=dense_tensor_format(torch.bfloat16)
     )
     traits = {
         "index_heads": indexer.index_n_heads,
@@ -284,14 +290,15 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         # K-major w_kc/w_vc take the grouped GEMM unless a bitwise plan is pinned.
         self.absorbed_weights_k_major = self.absorption_kernel_plan is None
         self.indexer = KimiK31Indexer(config, prefix=add_prefix("indexer", prefix))
-        # FP8 index queries where the platform registers the plane's scorers.
+        # Quantized index queries where the platform registers the plane's
+        # scorers: mxfp4 over an mxfp4 plane (its only scorers), else FP8.
         index_k_format = global_server_args_dict["dsa_index_k_format"] or "fp8_scaled"
-        self.index_query_fp8 = _scorers_take_fp8_index_queries(
-            self.indexer, index_k_format
-        )
-        if index_k_format == "mxfp4" and not self.index_query_fp8:
+        quantized = _scorers_take_quantized_index_queries(self.indexer, index_k_format)
+        self.index_query_mxfp4 = index_k_format == "mxfp4"
+        self.index_query_fp8 = quantized and not self.index_query_mxfp4
+        if self.index_query_mxfp4 and not quantized:
             raise ValueError(
-                "--dsa-index-k-format mxfp4 has no FP8-query scorer on this platform"
+                "--dsa-index-k-format mxfp4 has no mxfp4-query scorer on this platform"
             )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
