@@ -33,6 +33,7 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
     exact_greedy,
 )
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import merged_candidates
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.singular import greedy_maximum
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.unpack import unpack_top_k
 
@@ -137,6 +138,10 @@ def cumulative_unpack_kernel(
     stride_cr: tl.constexpr,  # Batch Stride of Counts and Bias.
     block_t: tl.constexpr,  # Block Size of Drafted Tokens.
     exact: tl.constexpr,  # Exact fp32 Logits Flag.
+    # Merged Candidates of Vocabulary-Sharded Logits (in place of the scratch-pad).
+    cv_ptr=None,  # Candidate Values -> [ B • (γ + 1), M ].
+    ci_ptr=None,  # Candidate Token Ids -> [ B • (γ + 1), M ].
+    stride_m: tl.constexpr = None,  # Batch Stride of Candidates.
 ) -> None:
 
     # Extract the batch id from program id and load the indicator.
@@ -164,7 +169,17 @@ def cumulative_unpack_kernel(
 
         # Load, reduce, and unpack greedy i.e. top-1 maximum.
 
-        if exact:
+        if cv_ptr is not None:
+
+            # The merged candidates lead with the row's first maximum.
+
+            if enable_pdl:
+
+                gdc_wait()
+
+            selection = tl.load(ci_ptr + (row_id * stride_m))
+
+        elif exact:
 
             selection = exact_greedy(
                 s_ptr, row_id, vocab_blocks, enable_pdl, stride_s, block_v
@@ -202,28 +217,36 @@ def cumulative_unpack_kernel(
 
         # Load, reduce, and unpack top-k stochastic subset.
 
-        values, indices = unpack_top_k(
-            s_ptr,
-            row_id,
-            vocab_blocks,
-            world_size,
-            shard_size,
-            max_k,
-            scale,
-            total_rows,
-            total_cols,
-            sharded,
-            is_adaptive,
-            is_alternating,
-            enable_pdl,
-            stride_r,
-            stride_b,
-            stride_s,
-            block_n,
-            block_v,
-        )
+        if cv_ptr is not None:
 
-        if exact:
+            values, indices = merged_candidates(
+                cv_ptr, ci_ptr, row_id, exact, enable_pdl, stride_m, max_k
+            )
+
+        else:
+
+            values, indices = unpack_top_k(
+                s_ptr,
+                row_id,
+                vocab_blocks,
+                world_size,
+                shard_size,
+                max_k,
+                scale,
+                total_rows,
+                total_cols,
+                sharded,
+                is_adaptive,
+                is_alternating,
+                enable_pdl,
+                stride_r,
+                stride_b,
+                stride_s,
+                block_n,
+                block_v,
+            )
+
+        if exact and cv_ptr is None:
 
             # Re-read the candidates' exact values: bf16 keys only chose them.
 
@@ -258,6 +281,8 @@ def cumulative_unpack_kernel(
                 None,
                 block_t,
                 max_k,
+                None,
+                None,
             )
 
         # Prepare for later softmax computation and write-out offset(s).

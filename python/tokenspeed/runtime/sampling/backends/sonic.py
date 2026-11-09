@@ -43,6 +43,13 @@ of at least one, so that case resolves through ``sample``: the same
 kernel ``sample()`` uses, reading the same slot state and noise, so the two
 paths are bitwise identical (pinned by ``test_sonic_backend.py``).
 
+Under TP with a vocabulary-parallel head the sampled rows can stay
+vocab-sharded (``vocab_shard_top_k``): each rank selects its shard's best
+``MAX_K`` candidates with the slot state applied at global token ids, the ranks
+gather only those (``gather_topk_pairs``), and every rank draws from their merge
+what it would draw from the gathered rows (bf16 bit for bit; fp32 among the
+exact fp32 top-``MAX_K``).
+
 Not yet supported: DP-sampling, draft trees, top-k output logprobs, EAGLE3
 ``d2t`` cross-vocab.
 
@@ -54,10 +61,11 @@ nothing tunes at startup.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling import sonic
+from tokenspeed_kernel.ops.sampling import sonic, vocab_topk_merge_supports
 from tokenspeed_kernel.ops.sampling.sonic import (
     MAX_K,
     MAX_OFFSET,
@@ -70,6 +78,7 @@ from tokenspeed_kernel.ops.sampling.sonic import (
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.sampled_vocab_shard import gather_topk_pairs
 from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
     SamplingBackendConfig,
@@ -82,8 +91,9 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 if TYPE_CHECKING:
 
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
 
 
 # Logits sonic ranks: bf16, or fp32 (soft-capped heads) sampled exactly at the candidates bf16 keys pick.
@@ -221,6 +231,16 @@ class SonicSamplingBackend(SamplingBackend):
                 self.values = torch.empty((rows, MAX_K), dtype=torch.float32)
                 self.indices = torch.empty((rows, MAX_K), dtype=torch.int32)
 
+            # Vocabulary-sharded rows: this rank's candidates, every rank's, and their merge.
+            self._shard_ranks = self._vocab_shard_ranks(config)
+            if self._shard_ranks is not None:
+                self._shard_pairs = torch.empty((rows, 2 * MAX_K), dtype=torch.float32)
+                self._shard_landing = torch.empty(
+                    (self._shard_ranks * rows, 2 * MAX_K), dtype=torch.float32
+                )
+                self._shard_ids = torch.empty((rows, MAX_K), dtype=torch.int32)
+                self._shard_values = torch.empty((rows, MAX_K), dtype=torch.float32)
+
             # fp32 temperature, top-p, min-p and penalties, read with fp32 logits so none rounds to bf16.
             self.exact_scalars = (
                 torch.tensor(_EXACT_DEFAULTS, dtype=torch.float32)[:, None]
@@ -244,6 +264,98 @@ class SonicSamplingBackend(SamplingBackend):
         if torch.device(self.device).type == "cuda":
 
             self._warmup(torch.bfloat16)
+
+    # ------------------------------------------------------------------ #
+    # Vocabulary-sharded rows
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _vocab_shard_ranks(config: SamplingBackendConfig) -> int | None:
+        """Ranks a vocabulary-parallel head shards the sampled rows over, or None to read whole rows.
+
+        Output logprobs, cumulative probabilities and NaN detection read whole rows.
+        """
+        tp_size = 1 if config.tp_group is None else len(config.tp_group)
+        if (
+            tp_size <= 1
+            or config.enable_output_logprobs
+            or config.enable_output_cumulative_probs
+            or config.enable_nan_detection
+        ):
+            return None
+        return tp_size
+
+    @override
+    def vocab_shard_top_k(self) -> int | None:
+        return None if self._shard_ranks is None else MAX_K
+
+    @override
+    def supports_vocab_shard(
+        self, dtype: torch.dtype, columns: int, tp_size: int
+    ) -> bool:
+        # sonic's reduction tiles at least 512 columns.
+        return (
+            self._shard_ranks == tp_size
+            and dtype in _LOGITS_DTYPES
+            and columns >= 512
+            and columns * tp_size == self.vocab_size
+            and vocab_topk_merge_supports(tp_size, MAX_K)
+        )
+
+    def _vocab_shard(self, shard: SampledVocabShard, rows: int) -> sonic.VocabShard:
+        """The launch's view of ``shard``: its slice of the vocabulary and the gather of every rank's candidates."""
+        landing = self._shard_landing[: shard.tp_size * rows]
+        return sonic.VocabShard(
+            vocab_start=shard.vocab_start,
+            logit_scale=shard.logit_scale,
+            softcap=shard.softcap,
+            gather=functools.partial(
+                gather_topk_pairs,
+                landing=landing,
+                tp_size=shard.tp_size,
+                tp_group=shard.tp_group,
+            ),
+            pairs=self._shard_pairs,
+            ids=self._shard_ids,
+            values=self._shard_values,
+        )
+
+    @override
+    def warmup_vocab_shard_sampling(
+        self,
+        shard: SampledVocabShard,
+        candidates: torch.Tensor,
+        *,
+        draft_q: DraftTreeQ | None,
+        with_vocab_mask: bool,
+    ) -> None:
+        """Launch every batch size once over dummy shard logits, as ``_warmup`` does over whole rows.
+
+        Every rank runs the same launches, so their gathers pair up. Grammar
+        masks and draft q change no sonic kernel (masks are slot state, and
+        sonic verifies point-draw drafts).
+        """
+        del candidates, draft_q, with_vocab_mask
+        with torch.device(self.device):
+            logits = torch.zeros(
+                (self.max_bs * self.n_max, shard.logits.shape[1]),
+                dtype=shard.logits.dtype,
+            )
+            slot = torch.zeros((self.max_bs,), dtype=torch.int64)
+            shifted = torch.zeros((self.max_bs + 1,), dtype=torch.int64)[1:]
+            offsets = torch.zeros((self.pool_rows,), dtype=torch.int64)
+            cand = torch.zeros((self.max_bs, self.n_max), dtype=torch.int32)
+        for slots in (slot, shifted):
+            for bs in range(1, self.max_bs + 1):
+                self._fused_singular(logits[:bs], slots[:bs], offsets, shard=shard)
+                if self.spec:
+                    self._fused_multistep(
+                        logits[: bs * self.n_max],
+                        slots[:bs],
+                        offsets,
+                        cand[:bs],
+                        shard=shard,
+                    )
+        self.reset_capture_state()
 
     # ------------------------------------------------------------------ #
     # JIT warm-up
@@ -449,21 +561,30 @@ class SonicSamplingBackend(SamplingBackend):
     # ------------------------------------------------------------------ #
     # Tuned dispatch
     # ------------------------------------------------------------------ #
-    def _check_logits(self, logits: torch.Tensor) -> SlotState:
+    def _check_logits(
+        self, logits: torch.Tensor, shard: SampledVocabShard | None
+    ) -> SlotState:
         """The slot state these logits launch with: fp32 logits read the fp32 scalars."""
 
-        if logits.dtype not in _LOGITS_DTYPES or logits.shape[-1] != self.vocab_size:
+        width = self.vocab_size if shard is None else self.vocab_size // shard.tp_size
+
+        if logits.dtype not in _LOGITS_DTYPES or logits.shape[-1] != width:
 
             raise ValueError(
                 f"SonicSamplingBackend requires bf16 or fp32 logits of width "
-                f"{self.vocab_size}, got {logits.dtype} x {logits.shape[-1]}"
+                f"{width}, got {logits.dtype} x {logits.shape[-1]}"
             )
 
         if logits.dtype == torch.bfloat16:
 
             return self.state
 
-        if not self._fp32_warm and not torch.cuda.is_current_stream_capturing():
+        # Sharded launches warm in ``warmup_vocab_shard_sampling``; whole rows warm on first use.
+        if (
+            shard is None
+            and not self._fp32_warm
+            and not torch.cuda.is_current_stream_capturing()
+        ):
 
             self._fp32_warm = True
             self._warmup(torch.float32)
@@ -479,12 +600,16 @@ class SonicSamplingBackend(SamplingBackend):
         slot_mapping: torch.Tensor,
         offsets: torch.Tensor,
         config: SonicConfig | None = None,
+        shard: SampledVocabShard | None = None,
     ) -> torch.Tensor:
-        """One draw per row into ``out_tok``, counted for penalties; returns the ``[bs, 1]`` tokens."""
+        """One draw per row into ``out_tok``, counted for penalties; returns the ``[bs, 1]`` tokens.
 
-        state = self._check_logits(logits)
+        With ``shard``, ``logits`` are this rank's raw head logits of its shard.
+        """
 
-        bs = logits.shape[0]
+        state = self._check_logits(logits, shard)
+
+        bs, width = logits.shape
 
         return sonic.sample(
             logits,
@@ -493,8 +618,9 @@ class SonicSamplingBackend(SamplingBackend):
             offsets,
             self.out_tok[:bs],
             self.scratchpad[:bs],
-            config or pick(self.vocab_size, bs),
+            config or pick(width, bs),
             enable_pdl=pdl_enabled(),
+            shard=None if shard is None else self._vocab_shard(shard, bs),
         )
 
     def _sample_rows(
@@ -505,7 +631,8 @@ class SonicSamplingBackend(SamplingBackend):
         """One fused single-step draw per row: the body shared by ``sample()``
         and the ``N == 1`` (non-speculative decode) case of ``verify()``."""
 
-        logits = logits_output.next_token_logits
+        shard = logits_output.vocab_shard
+        logits = logits_output.next_token_logits if shard is None else shard.logits
 
         bs = logits.shape[0]
 
@@ -518,7 +645,10 @@ class SonicSamplingBackend(SamplingBackend):
             self._scatter_grammar(sampling_info.vocab_mask, slot_mapping, bs, 1)
 
         sampled = self._fused_singular(
-            logits, slot_mapping, self._prepare_sampling_offsets(sampling_info)
+            logits,
+            slot_mapping,
+            self._prepare_sampling_offsets(sampling_info),
+            shard=shard,
         ).view(-1)
 
         # TP-rank sync (rank 0 wins): gathered logits are not bit-identical across ranks.
@@ -574,6 +704,7 @@ class SonicSamplingBackend(SamplingBackend):
         offsets: torch.Tensor,
         candidates: torch.Tensor,
         config: SonicConfig | None = None,
+        shard: SampledVocabShard | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One ``verify`` launch over ``[bs * n, V]`` logits; returns ``(drafted, accepted)``.
 
@@ -587,7 +718,7 @@ class SonicSamplingBackend(SamplingBackend):
         sonic's masked-rejection regime natively verifies point-draw drafts
         (accept iff u <= p(draft), residual = p with the drafted token zeroed)."""
 
-        state = self._check_logits(logits)
+        state = self._check_logits(logits, shard)
 
         bs, n = candidates.shape
         gamma = n - 1
@@ -607,8 +738,9 @@ class SonicSamplingBackend(SamplingBackend):
             self.scratchpad[: bs * n],
             self.values[: bs * n],
             self.indices[: bs * n],
-            config or pick(self.vocab_size, bs * n),
+            config or pick(logits.shape[1], bs * n),
             enable_pdl=pdl_enabled(),
+            shard=None if shard is None else self._vocab_shard(shard, bs * n),
         )
 
         return drafted, accepted
@@ -656,7 +788,9 @@ class SonicSamplingBackend(SamplingBackend):
                 f"verify candidates width {n} != configured n_max {self.n_max}"
             )
 
-        logits = logits_output.next_token_logits  # flat [bs * n, V]
+        # Flat [bs * n, V], or this rank's [bs * n, V_s] shard.
+        shard = logits_output.vocab_shard
+        logits = logits_output.next_token_logits if shard is None else shard.logits
 
         slot_mapping = sampling_info.req_pool_indices[:bs]
 
@@ -670,6 +804,7 @@ class SonicSamplingBackend(SamplingBackend):
             slot_mapping,
             self._prepare_sampling_offsets(sampling_info),
             candidates,
+            shard=shard,
         )
 
         predict = predict.view(-1)

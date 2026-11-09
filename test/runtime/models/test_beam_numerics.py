@@ -460,6 +460,29 @@ def test_logits_projection_and_softcap_dtypes(loaded, softcap):
 
 
 @pytest.mark.parametrize("softcap", [None, 30.0])
+def test_a_vocab_shard_is_capped_as_its_slice_of_the_whole_rows(loaded, softcap):
+    # A sampler reading each rank's vocabulary shard sees the capped rows' slice.
+    model, weights = loaded
+    config = copy(model.config)
+    config.final_logit_softcapping = softcap
+    processor = BeamLogitsProcessor(config, model.mapping)
+    hidden = torch.linspace(-1, 1, 2 * 128, device="cuda").reshape(2, 128).bfloat16()
+    whole = processor._get_logits(
+        hidden,
+        model.lm_head,
+        None,
+        embedding_bias=None,
+        plan=None,
+        require_full_vocab=False,
+    )
+    raw = F.linear(hidden, weights["lm_head.weight"])
+    columns = slice(whole.shape[1] // 4, whole.shape[1] // 2)
+    shard = processor._capped(raw[:, columns].contiguous())
+    assert processor.sampled_shard_dtype(model.lm_head) == whole.dtype
+    assert torch.equal(shard, whole[:, columns])
+
+
+@pytest.mark.parametrize("softcap", [None, 30.0])
 def test_logits_processor_fuses_argmax_only_without_softcap(softcap):
     # Greedy sampling asks the target head to fuse its argmax; the soft cap
     # runs after the shared processor, which keeps it out of a capped head.

@@ -22,6 +22,7 @@
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
@@ -431,8 +432,14 @@ class LogitsProcessor(nn.Module):
             )
         self.do_argmax = True
 
+    def sampled_shard_dtype(self, lm_head: VocabParallelEmbedding) -> torch.dtype:
+        """The dtype of the shard logits ``sampled_vocab_shard`` hands the sampler: the head's projection dtype."""
+        return lm_head.weight.dtype
+
     def keep_sampled_logits_vocab_sharded(
-        self, lm_head: VocabParallelEmbedding, top_k: int
+        self,
+        lm_head: VocabParallelEmbedding,
+        supports: Callable[[torch.dtype, int, int], bool],
     ) -> bool:
         """Leave the sampled rows' logits as this rank's vocabulary shard.
 
@@ -446,18 +453,15 @@ class LogitsProcessor(nn.Module):
 
         Args:
             lm_head: The vocab-parallel head the processor projects through.
-            top_k: Most candidates the sampler selects per row.
+            supports: The sampler's ``supports_vocab_shard``: whether it
+                selects from shards of a dtype, columns per shard and rank count.
 
         Returns:
             Whether the head's layout allows it (then it is on): plain TP
             vocabulary sharding of an unpadded 16-bit head whose token ids are
-            exact in the fp32 the candidates travel in.
+            exact in the fp32 the candidates travel in, in shards the sampler
+            takes.
         """
-        from tokenspeed_kernel.ops.sampling import (
-            vocab_shard_topk_supports,
-            vocab_topk_merge_supports,
-        )
-
         # Plain vocab-parallel heads only (a replicated or absent head has no
         # vocabulary shard).
         if not isinstance(lm_head, VocabParallelEmbedding):
@@ -480,8 +484,8 @@ class LogitsProcessor(nn.Module):
             or int(shard.num_org_elements_padded) != columns
             or columns * self.tp_size != self.config.vocab_size
             or int(shard.org_vocab_start_index) != columns * self.tp_rank
-            or not vocab_shard_topk_supports(weight.dtype, columns, top_k)
-            or not vocab_topk_merge_supports(self.tp_size, top_k)
+            or weight.dtype not in (torch.bfloat16, torch.float16)
+            or not supports(self.sampled_shard_dtype(lm_head), columns, self.tp_size)
         ):
             return False
         self._sampled_shard_start = columns * self.tp_rank
