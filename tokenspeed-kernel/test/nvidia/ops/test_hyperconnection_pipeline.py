@@ -24,7 +24,6 @@ import math
 
 import pytest
 import torch
-from cuda.bindings import driver
 from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import pdl_enabled
@@ -94,6 +93,8 @@ def _check(actual, values, inject, model):
 
 
 def _check_single_kernel(graph):
+    from cuda.bindings import driver
+
     handle = driver.CUgraph(graph.raw_cuda_graph())
     status, _, count = driver.cuGraphGetNodes(handle, 0)
     assert status == driver.CUresult.CUDA_SUCCESS
@@ -167,7 +168,12 @@ def test_pipeline_graph_uses_current_inputs(
 
 
 @pytest.mark.parametrize(
-    "model", [(4, 2560, 320), (4, 8192, 1024)], ids=["legacy", "wide"]
+    "model,worker_limit",
+    [
+        pytest.param((4, 2560, 320), None, id="legacy"),
+        pytest.param((4, 2560, 320), 5, id="legacy-five-workers"),
+        pytest.param((4, 8192, 1024), None, id="wide"),
+    ],
 )
 @pytest.mark.parametrize(
     "rows",
@@ -175,17 +181,34 @@ def test_pipeline_graph_uses_current_inputs(
         (5, 6, 7),
         (17, 19, 23),
         (33, 39, 47),
-        (65, 79, 95),
+        (65, 67, 79, 81, 93, 95),
         (97, 113, 127),
-        (129, 157, 191),
+        (129, 133, 157, 161, 189, 191),
         (193, 221, 255),
     ],
 )
 @torch.inference_mode()
-def test_pipeline_reuses_compilation_within_row_bucket(rows, model):
+def test_pipeline_reuses_compilation_within_row_bucket(
+    rows, model, worker_limit, monkeypatch
+):
+    if worker_limit is not None:
+        real_capacity = cute_fused._capacity
+
+        def limited_capacity(compiled, kernel, device, stream):
+            return min(
+                real_capacity(compiled, kernel, device, stream),
+                kernel.physical_clusters * worker_limit,
+            )
+
+        # Exercise smaller GPU contexts while launching real kernels.
+        monkeypatch.setattr(cute_fused, "_capacity", limited_capacity)
+        monkeypatch.setattr(cute_fused, "_CAPACITIES", {})
     values = _inputs(max(rows), torch.bfloat16, True, model)
-    first = (values[0][: rows[0]], values[1], values[2])
-    _mix(first, True, True, model)
+    # Occupancy can split one tile bucket into several scheduling-round buckets.
+    # Warm both ends before exercising the unseen interior row counts.
+    for count in (rows[0], rows[-1]):
+        current = (values[0][:count], values[1], values[2])
+        _mix(current, True, True, model)
     torch.cuda.synchronize()
     with assert_no_cute_compile():
         for count in rows[1:]:

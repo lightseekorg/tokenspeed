@@ -540,7 +540,9 @@ TMA a logical view of that same storage. Eager and CUDA graph calls therefore
 share both the weight layout and its update semantics.
 
 CuTe gated residual mixing keeps model dimensions static and token rows dynamic
-within bounded full/tail and scheduling-round buckets. The cooperative grid
+within bounded full/tail and scheduling-round buckets. Scheduling-round
+boundaries depend on measured worker capacity, so one tile bucket can span
+several round buckets on a different device or stream. The cooperative grid
 must fit the selected function's measured resident capacity. Local pipelines
 share a physical CTA; their logical tiles are counted separately from that
 capacity. A rank-ordered FP32 merge completes Down before SiLU and publishes
