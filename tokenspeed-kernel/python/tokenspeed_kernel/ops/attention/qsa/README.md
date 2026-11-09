@@ -50,6 +50,53 @@ Only static geometry, explicit algorithm parameters, and bucketed capacity
 specialize compilation. Graph replay refreshes the same input buffers as
 eager execution; no backend-private request state is introduced.
 
+## FP8 direct-slot prefill
+
+`cute_dsl_fp8_qsa_sparse_prefill` handles SM107 BF16 queries with E4M3FN K/V,
+256-wide heads, twelve query heads per KV head, one or two KV heads, and
+512 four-token blocks plus three tail columns. Q/K/V must be dense and
+16-byte aligned. Int32 selected-slot rows may have padding; int64 query
+positions may be strided. Other inputs retain the existing registry candidates.
+Use the full registered name to force this prefill implementation. A normal
+`solution="cute_dsl"` filter respects prefill/decode traits; a forced
+`override="cute_dsl"` retains the established decode entry.
+
+The independent implementation lives in `ops/attention/qsa/_cute_dsl/`.
+It reuses the existing MIT-licensed TMA, MMA, and descriptor helpers under
+`thirdparty/cute_dsl/`, whose notices remain with those helpers. One CTA owns
+a query and KV head. TMA gathers existing physical slots into separate K/V
+stages, overlapping copies with native FP8 tensor-core operations. The existing
+`QSASparseMetadata.query_positions` bounds the complete-block prefix and fixed
+tail columns, including cached prefixes and ragged requests. Nonpositive slots
+contribute no probability mass; empty rows produce zero. Q and the cache remain
+unmodified. No packed KV copy, persistent request state, or global scratch is
+introduced; the prologue remains the sole cache writer.
+
+This solution introduces additional quantization. Each query head uses an
+E4M3FN temporary with scale `max(abs(Q)) / 448` (one for an all-zero head).
+Scale construction and Q division round to nearest-even FP32 before the FP8
+cast. Native FP8 QK accumulates in FP32; the attention scale, key descale, and
+Q scale apply afterward. Online softmax processes 128 selected tokens per
+tile. Its unnormalized probabilities multiply by 448 and round to E4M3FN for
+PV. The normalization sum and output accumulator stay FP32; the value descale
+and inverse probability scale apply before the final BF16 output. An empty
+tile keeps its running maximum at negative infinity, so later negative logits
+still normalize correctly. Scalar descales are supported; tensor descales are
+rejected when this implementation is forced.
+
+These Q/P roundings can change attention values and generated tokens relative
+to FA2 or BF16-operand attention. Tests compare the implementation tightly to
+an independent reference with the same quantization, while real-input studies
+report the additional approximation separately. Force the existing FA2 kernel
+when these extra roundings are undesirable.
+
+Only device, head geometry, and PDL specialize compilation. Query counts, pool
+rows, slot/position strides, and all scales remain runtime inputs. Metadata
+offsets widen to int64 before multiplication; TMA computes cache byte offsets.
+Query and pool row counts must remain below `2**31`, independent of pool byte
+size. Graph replay reads refreshed buffers through the same entry. PDL waits
+before producer-owned reads and signals after output stores.
+
 ## PrimTS plan preparation
 
 FlashInfer PrimTS caches cluster occupancy by CUDA device and cluster size.
