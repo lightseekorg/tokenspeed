@@ -2377,16 +2377,22 @@ def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
 
 def imported_model_modules(path: Path) -> set[str]:
     """Repo paths of the modules directly under the models package that any
-    import statement in ``path`` names."""
+    import statement in ``path``, a module directly under it, names."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     package = MODEL_DIRECTORY.removeprefix("python/").replace("/", ".")
     names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            names.add(node.module)
-            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                module = node.module or ""
+            else:
+                # A relative import resolves against the models package.
+                parts = package.split(".")[: len(package.split(".")) + 1 - node.level]
+                module = ".".join(parts + ([node.module] if node.module else []))
+            names.add(module)
+            names.update(f"{module}.{alias.name}" for alias in node.names)
     return {
         f"{MODEL_DIRECTORY}/{name[len(package) + 1 :].split('.')[0]}.py"
         for name in names
@@ -2412,21 +2418,33 @@ def check_model_sources_closed(root: Path, repo_root: Path) -> None:
                 )
 
 
+def task_test_paths(text: str) -> List[str]:
+    """The test files and directories that a task definition names."""
+    pattern = "|".join(re.escape(directory) for directory in TEST_DIRECTORIES)
+    return [
+        match.split("::")[0].rstrip("/")
+        for match in re.findall(rf"(?:{pattern})(?:/[^\s'\"]*)?", text)
+    ]
+
+
 def path_is_ignored_for_model(
     path: str,
     sources: List[str],
     model_specific: frozenset[str],
-    task_text: Optional[str],
+    run_tests: Optional[List[str]],
 ) -> bool:
     """Return whether a task serving ``sources`` can ignore ``path``: Markdown,
-    another model's module, or a test. ``task_text`` is the definition of a
-    unit-test task, which cannot ignore the test files it names or any test
-    helper; it is None for a model-test task."""
+    another model's module, or a test. ``run_tests`` are the test files and
+    directories a unit-test task names, whose tests it cannot ignore, nor any
+    test helper; it is None for a model-test task."""
     if path.endswith(".md"):
         return True
     if any(path.startswith(f"{directory}/") for directory in TEST_DIRECTORIES):
-        return task_text is None or (
-            Path(path).name.startswith("test_") and path not in task_text
+        return run_tests is None or (
+            Path(path).name.startswith("test_")
+            and not any(
+                path == test or path.startswith(f"{test}/") for test in run_tests
+            )
         )
     return path in model_specific and path not in sources
 
@@ -2461,7 +2479,9 @@ def drop_unaffected_tasks(
                     (
                         None
                         if tasks[config].get("workflow_stage") == "model-test"
-                        else (repo_root / config).read_text(encoding="utf-8")
+                        else task_test_paths(
+                            (repo_root / config).read_text(encoding="utf-8")
+                        )
                     ),
                 )
             )

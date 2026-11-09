@@ -1529,14 +1529,20 @@ def test_scan_keeps_a_model_unit_test_task_for_test_changes(
     root = tmp_path / "test/ci"
     root.mkdir(parents=True)
     listed = f"model_sources:\n  - {_MODELS}/alpha.py\n"
-    runs = "ut:\n  commands:\n    - pytest test/runtime/test_alpha_pd.py\n"
+    runs = (
+        "ut:\n  commands:\n"
+        "    - pytest test/runtime/test_alpha_pd.py::TestPD -v\n"
+        "    - pytest 'test/runtime/distributed/'\n"
+    )
     _write_task_yaml(root, "ut.yaml", _default_body("ut", ["b200-1gpu"], listed + runs))
     _write_task_yaml(root, "eval.yaml", _model_task_body("eval", listed))
     for changed, expected in [
-        # The unit-test task runs this test; the eval never reads tests.
+        # The unit-test task runs these tests; the eval never reads tests.
         ("test/runtime/test_alpha_pd.py\n", ["ut"]),
+        ("test/runtime/distributed/test_beta_pd.py\n", ["ut"]),
         ("test/runtime/pd_helpers.py\n", ["ut"]),
-        ("test/runtime/test_other.py\n", []),
+        ("test/runtime/test_alpha_pd_extra.py\n", []),
+        ("test/runtime/distributed_extra/test_x.py\n", []),
     ]:
         changed_file = tmp_path / "changed.txt"
         changed_file.write_text(changed)
@@ -1547,8 +1553,17 @@ def test_scan_keeps_a_model_unit_test_task_for_test_changes(
         assert [entry["name"] for entry in matrix["include"]] == expected
 
 
+@pytest.mark.parametrize(
+    "gamma_import",
+    [
+        "from tokenspeed.runtime.models.gamma import Gamma",
+        "from tokenspeed.runtime.models import gamma",
+        "from .gamma import Gamma",
+        "from . import gamma",
+    ],
+)
 def test_scan_fails_when_a_listed_module_imports_an_unlisted_model(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, gamma_import
 ):
     monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
     for name, text in _MODEL_FILES.items():
@@ -1556,7 +1571,7 @@ def test_scan_fails_when_a_listed_module_imports_an_unlisted_model(
         (tmp_path / name).write_text(text)
     (tmp_path / _MODELS / "alpha.py").write_text(
         "def build():\n"
-        "    from tokenspeed.runtime.models.gamma import Gamma\n"
+        f"    {gamma_import}\n"
         "    from tokenspeed.runtime.models import utils\n"
         "EntryClass = Alpha\n"
     )

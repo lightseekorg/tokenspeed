@@ -202,7 +202,7 @@ ignore_changes:
 those its model and draft model import. On pull requests the scan drops the
 task when every changed file is Markdown, another model's module, or a test
 under `test/runtime/` or `tokenspeed-kernel/test/`; a unit-test task keeps the
-test files its definition names and every test helper. A
+tests its definition names, as files or directories, and every test helper. A
 module there belongs to one model when it defines `EntryClass` or a task lists
 it; any other module, such as `utils.py`, is shared, and a change to it runs
 every task. The scan fails when a listed module does not exist, or imports a
