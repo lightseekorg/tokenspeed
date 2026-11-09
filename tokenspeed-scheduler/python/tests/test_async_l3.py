@@ -256,7 +256,7 @@ def test_d2h_publishes_before_put_and_freeze_drops_unowned_candidates():
 
 def test_query_credits_never_split_a_prefix_boundary_across_groups():
     s = scheduler(role=ts.SchedulerConfig.Role.Fused, groups=6)
-    s.submit_requests([_spec("bounded", list(range(16)))])
+    s.submit_requests([_spec("bounded", list(range(14)))])
     op = storage_ops(s.next_execution_plan())[0]
     assert op.kind == ts.StorageKind.Query
     # 32 keys fit five whole six-group boundaries. A partial sixth boundary

@@ -36,7 +36,7 @@ env:
 
 concurrency:
   group: pr-test-amd-kernel-benchmark-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   scan:
@@ -92,7 +92,18 @@ jobs:
               : > "$changed_files"
               ;;
           esac
-          python3 test/ci_system/ci_path_filter.py \
+          full_tests=false
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            # Reviewers widen the tests with a label or description lines.
+            full_tests=$(python3 test/ci_system/pr_test_scope.py \
+              --repository "${{ github.repository }}" \
+              --pull-request "${{ github.event.pull_request.number }}" \
+              --changed-files "$changed_files")
+          fi
+          echo "full_tests=$full_tests" >> "$GITHUB_OUTPUT"
+          full_tests_flag=
+          if [ "$full_tests" = true ]; then full_tests_flag=--full-tests; fi
+          python3 test/ci_system/ci_path_filter.py $full_tests_flag \
             --runner-group amd-mi350 \
             --event-name "${{ github.event_name }}" \
             --repo-root "$GITHUB_WORKSPACE" \
@@ -107,6 +118,7 @@ jobs:
           matrix=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
             --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
+            ${{ steps.changes.outputs.full_tests == 'true' && '--full-tests' || '' }} \
             --trigger "${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
             --runner-group amd-mi350 \
             --workflow-stage "kernel-benchmark")

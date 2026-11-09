@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 
 import cuda.bindings.driver as cuda
@@ -43,6 +44,7 @@ from flashinfer.autotuner import (
     is_in_profile_measurement,
 )
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
+from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.input_stage import Nvfp4InputStage
 from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.megamoe_kernel import (
     Sm100MegaMoEKernel,
     _layout_regions,
@@ -77,6 +79,10 @@ def _init_fp4(shapes, dtype, device):
     return torch.randint(0, 256, shapes, dtype=dtype, device=device)
 
 
+def _init_bf16(shapes, dtype, device):
+    return torch.randn(shapes, dtype=dtype, device=device)
+
+
 def _init_scales(shapes, dtype, device):
     return torch.ones(shapes, dtype=torch.float8_e4m3fn, device=device).view(dtype)
 
@@ -98,14 +104,18 @@ class MegaMoEWorkspace:
         intermediate: int,
         top_k: int,
         capacity: int,
-        situ_beta: float,
-        situ_linear_beta: float,
+        situ_beta: float | None,
+        situ_linear_beta: float | None,
+        *,
+        prequantized: bool,
     ):
         self.capacity = capacity
         self.hidden = hidden
         self.intermediate = intermediate
         self.num_experts = num_experts
         self.top_k = top_k
+        self.prequantized = prequantized
+        self.input_stage = None if prequantized else Nvfp4InputStage(hidden, top_k)
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.world = dist.get_world_size(group)
@@ -124,6 +134,7 @@ class MegaMoEWorkspace:
             and situ_linear_beta == 25.0
         )
         self.key = (
+            id(group),
             torch.cuda.current_device(),
             self.world,
             num_experts,
@@ -133,6 +144,7 @@ class MegaMoEWorkspace:
             capacity,
             situ_beta,
             situ_linear_beta,
+            prequantized,
         )
         self.kernels = {
             (capacity, tactic): self._make_kernel(capacity, tactic)
@@ -195,6 +207,12 @@ class MegaMoEWorkspace:
         self.local = torch.zeros(sizes["local"], dtype=torch.uint8, device=device)
         self.output = torch.empty(
             (capacity, hidden), dtype=torch.bfloat16, device=device
+        )
+        logging.getLogger(__name__).info(
+            f"MegaMoE workspace: ep_rank={dist.get_rank(group)}, "
+            f"capacity={capacity}, tactics={len(_TACTICS)}, "
+            f"local_bytes={self.local.nbytes}, symmetric_bytes={self.storage.nbytes}, "
+            f"output_bytes={self.output.nbytes}, route_bytes={self.topk_ids.nbytes}"
         )
         self.mapper = SymBufferHost(
             offsets=tuple(
@@ -268,6 +286,10 @@ class MegaMoEWorkspace:
         )
 
     def _kernel(self, capacity: int, tactic: tuple):
+        if capacity > self.capacity or tactic not in _TACTICS:
+            raise ValueError(
+                "MegaMoE capacity or tactic was not reserved before capture"
+            )
         key = (capacity, tactic)
         kernel = self.kernels.get(key)
         if kernel is None:
@@ -347,7 +369,19 @@ class MegaMoEWorkspace:
         if not tokens <= capacity <= self.capacity:
             raise ValueError("MegaMoE token count exceeds workspace capacity")
         kernel = self._kernel(capacity, tactic)
-        self.stage_inputs(x, topk_ids, topk_weights, capacity)
+        if self.prequantized:
+            self.stage_inputs(x, topk_ids, topk_weights, capacity)
+        else:
+            self.input_stage.run(
+                x[0],
+                x[1],
+                topk_ids,
+                topk_weights,
+                self.x[:capacity],
+                self.scales[:capacity],
+                self.topk_ids[:capacity],
+                self.topk_weights[:capacity],
+            )
         profiling = is_in_profile_measurement()
         key = (capacity, tactic, *[t.data_ptr() for t in weights], output.data_ptr())
         # Do not retain temporary profiling clones through cached DLPack views.
@@ -423,9 +457,12 @@ class MegaMoERunner(TunableRunner):
         hidden: int,
         intermediate: int,
         top_k: int,
-        situ_beta: float,
-        situ_linear_beta: float,
+        situ_beta: float | None,
+        situ_linear_beta: float | None,
         max_capacity: int,
+        *,
+        prequantized: bool,
+        tactic_autotune: bool,
     ):
         self.group = group
         self.world = dist.get_world_size(group)
@@ -438,9 +475,10 @@ class MegaMoERunner(TunableRunner):
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.max_capacity = max_capacity
-        self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
+        self.prequantized = prequantized
+        self.tactic_autotune = tactic_autotune
         self._extras = (
-            "nvfp4_situ_bf16_graph_fixed_workspace_epi_only_v10_blackwell_small_cap124",
+            "nvfp4_full_collective_workspace_v7_blackwell_small_cap124",
             self.world,
             num_experts,
             hidden,
@@ -449,6 +487,8 @@ class MegaMoERunner(TunableRunner):
             situ_beta,
             situ_linear_beta,
             max_capacity,
+            prequantized,
+            self.tactic_autotune,
         )
         self._key = (group, self.device, *self._extras)
         self.workspace: MegaMoEWorkspace | None = None
@@ -467,11 +507,12 @@ class MegaMoERunner(TunableRunner):
                 DynamicTensorSpec((11,), (0,), _token_buckets, _token_capacity),
             ),
             constraint_specs=tuple(
-                ConstraintSpec(i, 0, lambda shapes: shapes[11][0]) for i in range(4)
+                ConstraintSpec(i, 0, lambda shapes: shapes[11][0])
+                for i in ((0, 1, 2, 3) if prequantized else (0, 2, 3))
             ),
             tensor_initializers=(
-                (0, _init_fp4),
-                (1, _init_scales),
+                (0, _init_fp4 if prequantized else _init_bf16),
+                (1, _init_scales if prequantized else autotuner_initializer_ones),
                 (2, init_routes),
                 (3, autotuner_initializer_ones),
                 (11, autotuner_initializer_empty),
@@ -541,6 +582,7 @@ class MegaMoERunner(TunableRunner):
                 self.max_capacity,
                 self.situ_beta,
                 self.situ_linear_beta,
+                prequantized=self.prequantized,
             )
         return self.workspace
 
@@ -548,16 +590,20 @@ class MegaMoERunner(TunableRunner):
         self, tokens: int, max_tokens: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         capacity = _token_capacity(max_tokens)
-        if capacity > self.max_capacity:
+        if not self.prequantized:
+            raise ValueError("Direct input buffers require prequantized MegaMoE")
+        if not 0 <= tokens <= max_tokens or capacity > self.max_capacity:
             raise ValueError("MegaMoE token count exceeds the configured maximum")
-        return self._ensure_workspace().input_buffers(tokens, capacity)
+        workspace = self._ensure_workspace()
+        return workspace.input_buffers(tokens, capacity)
 
     def run(self, x, topk_ids, topk_weights, weights, max_tokens: int):
         capacity = _token_capacity(max_tokens)
         if capacity > self.max_capacity:
             raise ValueError("MegaMoE token count exceeds the configured maximum")
         workspace = self._ensure_workspace()
-        # All ranks use the same capacity, including ranks with no local tokens.
+        if x[0].shape[0] > max_tokens:
+            raise ValueError("MegaMoE local rows exceed the collective token bound")
         inputs = [
             *x,
             topk_ids,
@@ -592,8 +638,11 @@ class MegaMoERunner(TunableRunner):
         return chosen(inputs=inputs, tactic=tactic)
 
 
-def get_runner(plan: dict, w: torch.nn.Module) -> MegaMoERunner:
-    """Return the shared runner for the plan's EP group and module's geometry."""
+def get_runner(plan: dict, w: torch.nn.Module, *, prequantized: bool) -> MegaMoERunner:
+    """Return the shared runner with an explicit input contract.
+
+    Pass prequantized=True for NVFP4 inputs or False for fused BF16 staging.
+    """
     group = plan["process_group"]
     num_experts = w.num_experts
     hidden = w.hidden_size
@@ -602,6 +651,7 @@ def get_runner(plan: dict, w: torch.nn.Module) -> MegaMoERunner:
     situ_beta = w.activation_situ_beta
     situ_linear_beta = w.activation_situ_linear_beta
     max_capacity = _token_capacity(get_autotune_max_num_tokens())
+    tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
     key = (
         id(group),
         torch.cuda.current_device(),
@@ -612,6 +662,8 @@ def get_runner(plan: dict, w: torch.nn.Module) -> MegaMoERunner:
         situ_beta,
         situ_linear_beta,
         max_capacity,
+        prequantized,
+        tactic_autotune,
     )
     runner = _runners.get(key)
     if runner is None:
@@ -624,6 +676,8 @@ def get_runner(plan: dict, w: torch.nn.Module) -> MegaMoERunner:
             situ_beta,
             situ_linear_beta,
             max_capacity,
+            prequantized=prequantized,
+            tactic_autotune=tactic_autotune,
         )
         _runners[key] = runner
     return runner

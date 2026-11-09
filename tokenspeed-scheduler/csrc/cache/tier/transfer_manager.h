@@ -80,6 +80,15 @@ public:
     // became dead meanwhile; one that waits for none settles here. nullopt
     // when nothing is copied.
     std::optional<WriteBackOperation> StartEvictionStores();
+    // A checkpoint demotion (CacheCoordinator::DemoteEntries) while an
+    // eviction write-back still carries some of `keys` to the Host: each such
+    // member's segment publishes it demoted, dated at the demoted epoch
+    // instead of its Device entry's. A Host entry the Host held already, which
+    // the segment holds to publish into and whose newer date its settlement
+    // would keep, is demoted now, unless something else holds it too. Returns
+    // the entries it demoted: the members that publish a new Host entry, and
+    // the Host entries.
+    std::int32_t DemoteInFlightEvictions(std::span<const CacheKey> keys);
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     // A retraction image and the two store ops that fill it. The L2 leg is a
@@ -87,13 +96,13 @@ public:
     // already Host-cached or carried by an in-flight store that publishes them
     // at its ACK are pinned, not copied again); the tail leg is the snapshot
     // store of every other data slot plus the slot-state blob.
-    // pending_store_ops lists every op the image waits for -- both legs' own
-    // ops and any earlier in-flight store carrying one of its keys.
+    // image_stores names every op the image waits for -- both legs' own ops
+    // and any earlier in-flight store carrying one of its keys.
     struct RetractionStores {
         RetractionImage image;
         std::optional<WriteBackOperation> host_store;
         SnapshotStoreOperation snapshot_store;
-        std::vector<std::uint32_t> pending_store_ops;
+        std::vector<StoreWait> image_stores;
     };
     // A retraction image's Host L2 leg, planned before anything is acquired
     // or evicted for it, so the victim probe and the retraction run one plan.
@@ -103,8 +112,8 @@ public:
         // unacknowledged store that publishes it at its ACK
         // (InFlightWriteBack::publishes_at_ack).
         std::vector<std::vector<ImageSlot>> host_slots;
-        // The ops of the stores whose blocks host_slots holds.
-        std::vector<std::uint32_t> pending_store_ops;
+        // The stores whose blocks host_slots holds.
+        std::vector<StoreWait> host_slot_stores;
         // The other published slots, the rows to place: each row's group, its
         // Device block's bucket and the slot.
         std::vector<std::uint32_t> group_ids;
@@ -158,19 +167,19 @@ public:
                                                   std::uint64_t access_epoch);
 
     // Publishes every ticket's Host entry (an eviction write-back's tickets
-    // excepted: their segments publish them) and drops the op's pins, then
-    // settles every in-flight segment for which this was the last op it
-    // waited on. Returns the entries as published -- the block canonical for
-    // each key after the index possibly redirected the publication to an
-    // existing entry -- so a retraction image pinned on a ticket's block can
-    // follow the redirect.
+    // excepted: their segments publish them) and drops the op's record with
+    // its pins -- every StoreWait on the op has landed -- then settles every
+    // in-flight segment for which this was the last op it waited on. Returns
+    // the entries as published -- the block canonical for each key after the
+    // index possibly redirected the publication to an existing entry -- so a
+    // retraction image pinned on a ticket's block can follow the redirect.
     std::vector<HostPublication> CompleteWriteBack(std::uint32_t op_id);
     // A prefix load landed: drops the op's pins. Its destinations were
     // published at admission (every source is a Host-warm entry).
     void CompleteLoadBack(std::uint32_t op_id);
-    // Returns the request the op belonged to (nullopt for an unknown or
-    // duplicate ACK) so the scheduler can advance its FSM.
-    std::optional<std::string> CompleteSnapshotStore(std::uint32_t op_id);
+    // A tail leg landed: drops the op's record with its pins, which lands
+    // the image's StoreWait on it. An unknown or duplicate ACK is a no-op.
+    void CompleteSnapshotStore(std::uint32_t op_id);
     // The request an in-flight restore belongs to (nullopt for an unknown or
     // duplicate ACK). Looked up before CompleteSnapshotRestore so the
     // scheduler can register the KV-event descriptors the republication
@@ -256,14 +265,17 @@ private:
         // publish through the segments that wait for this op instead, which
         // may wait for later ops or be cancelled.
         bool publishes_at_ack{false};
+        // The op's lifetime, made with the record: every StoreWait on the op
+        // lands when the ACK erases the record.
+        std::shared_ptr<const StoreInFlight> in_flight{std::make_shared<StoreInFlight>()};
     };
     // An eviction write-back's segment between its drain and its last ACK:
-    // every member carries the Host block it publishes, and pending_store_ops
-    // lists the ops still out among those carrying its members (its own
-    // drain's, and earlier ones it borrowed a member from).
+    // every member carries the Host block it publishes, and `stores` names
+    // the ops carrying its members (its own drain's, and earlier ones it
+    // borrowed a member from).
     struct InFlightSegment {
         CacheCoordinator::EvictedSegment segment;
-        std::vector<std::uint32_t> pending_store_ops;
+        std::vector<StoreWait> stores;
     };
 
     // A tail store pins its snapshot-pool destinations and the blob slot it
@@ -271,9 +283,10 @@ private:
     // restore pins both ends of every row, the blob slot it imports from and
     // the request-pool row it imports into.
     struct InFlightSnapshotStore {
-        std::string request_id;
         std::vector<CacheBlockRef> destinations;
         std::shared_ptr<SnapshotSlotIndex> blob_slot;
+        // The op's lifetime, as InFlightWriteBack::in_flight.
+        std::shared_ptr<const StoreInFlight> in_flight{std::make_shared<StoreInFlight>()};
     };
     struct InFlightSnapshotRestore {
         std::string request_id;
@@ -286,13 +299,13 @@ private:
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
     // The Host block an unacknowledged store already carries for each key, with
-    // that store's op id and publishes_at_ack (InFlightWriteBack). Built once
-    // per drain from write_backs_ (rather than mirrored in a second container)
-    // and looked up per block; a key a store publishing at its ACK carries
-    // names that store.
+    // a wait on that store and its publishes_at_ack (InFlightWriteBack). Built
+    // once per drain from write_backs_ (rather than mirrored in a second
+    // container) and looked up per block; a key a store publishing at its ACK
+    // carries names that store.
     struct InFlightHostBlock {
         CacheBlockRef block;
-        std::uint32_t op_id{0};
+        StoreWait store;
         bool publishes_at_ack{false};
     };
     using InFlightHostBlocks = std::unordered_map<CacheKey, InFlightHostBlock, CacheKeyHash>;
@@ -300,7 +313,8 @@ private:
 
     CacheCoordinator& coordinator_;
     std::unordered_map<std::uint32_t, InFlightWriteBack> write_backs_;
-    // In drain order. Each waits for at least one op of write_backs_.
+    // In drain order. Each waits for at least one op of write_backs_: a
+    // segment whose stores have all landed settles at that ACK.
     std::vector<InFlightSegment> in_flight_segments_;
     // Each transfer pins both tiers until the runtime acknowledges the copy.
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;

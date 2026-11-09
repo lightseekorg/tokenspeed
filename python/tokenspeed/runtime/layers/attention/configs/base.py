@@ -67,6 +67,21 @@ def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
     return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
 
 
+def block_draft_is_causal(hf_config) -> bool:
+    """Whether a block draft's queries attend causally within their block.
+
+    Only an explicit declaration makes a block causal: ``is_causal``, else
+    ``dflash_config.causal`` (Kimi-K3.1's DSpark draft). A draft declaring
+    neither (Kimi-K3 DSpark) attends the whole block; ``sliding_attention``
+    layers only bound how far back a query reads.
+    """
+    is_causal = getattr(hf_config, "is_causal", None)
+    if is_causal is not None:
+        return bool(is_causal)
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    return bool(dflash_config.get("causal", False))
+
+
 def resolve_cache_layer_types(
     hf_config,
     *,
@@ -195,6 +210,8 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # Causal within a block draft; otherwise every query sees the whole block.
+    draft_block_causal: bool = False
     # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
     # of attention TP): one topology for target and continuation/MTP views;
     # KVP does not add ranks. Decode attends the owned pages and merges the
@@ -202,8 +219,8 @@ class AttnConfig:
     kvp_size: int = 1
     kvp_rank: int = 0
     kvp_group: tuple[int, ...] = (0,)
-    # Query context parallelism: the extend rows this rank computes are a
-    # contiguous shard of the chunk; the group is the attention TP group.
+    # Query context parallelism: each rank computes early and late segments
+    # of every request; the group is the attention TP group.
     qcp_size: int = 1
     qcp_rank: int = 0
     qcp_group: tuple[int, ...] = (0,)
@@ -222,18 +239,25 @@ class AttnConfig:
             raise ValueError("INT8 KV cache is not supported by the runtime")
         if self.qcp_size > 1:
             softmax = softmax_components[0]
-            # The gathered-history extend arm exists on the GPU DSA leaf only;
-            # every other leaf rejects a query shard at its metadata build.
-            if not (softmax.is_dsa and softmax.backend_name in (None, "dsa")):
+            # DSA gathers paged history; V4.1 publishes its packed KV from
+            # gathered projections and keeps full logical metadata.
+            is_v41 = softmax.backend_name == "deepseek_v41"
+            if not (
+                is_v41 or (softmax.is_dsa and softmax.backend_name in (None, "dsa"))
+            ):
                 raise ValueError(
-                    "query context parallelism requires GPU DSA attention; "
+                    "query context parallelism requires GPU DSA or V4.1 attention; "
                     f"got {softmax.backend_name!r}"
                 )
+            if not is_v41 and self.qcp_size != self.kvp_size:
+                raise ValueError(
+                    "DSA query context parallelism requires KVP equal to QCP"
+                )
             if torch.device(self.device).type != "cuda":
-                raise ValueError("GPU DSA query context parallelism requires CUDA")
+                raise ValueError("GPU query context parallelism requires CUDA")
             # The sharded KV write gathers the rotated latent and stores it
             # with latent_store, which writes native (bf16) rows only.
-            if (
+            if not is_v41 and (
                 self.kv_cache_dtype is not torch.bfloat16
                 or self.kv_cache_mxfp8
                 or self.kv_cache_quant_method != "none"
@@ -296,6 +320,7 @@ def model_wide_kwargs(
     kv_cache_dtype: torch.dtype,
     kv_cache_mxfp8: bool = False,
     draft_block_decode: bool = False,
+    draft_block_causal: bool = False,
     speculative_num_draft_tokens: int | None = None,
 ) -> dict:
     """The AttnConfig fields shared by every family's generate().
@@ -316,6 +341,7 @@ def model_wide_kwargs(
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
+        draft_block_causal=draft_block_causal,
     )
     attn_mapping = server_args.mapping.attn
     kwargs.update(

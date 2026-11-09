@@ -39,12 +39,15 @@ from types import SimpleNamespace
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_PREFILL_QUERY_TILE,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -124,6 +127,17 @@ class _WindowAttention:
     def query_metadata(self, mode):
         return self.meta
 
+    @property
+    def supports_fused_attention(self) -> bool:
+        return True
+
+    @property
+    def supports_fused_prefill(self) -> bool:
+        # The drafter runs its window attention as decode rows only, and
+        # forward_v41 below serves the fused path for decode alone. Declaring
+        # prefill support here would raise instead of falling back.
+        return False
+
     def _workspace(self, swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps):
         """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
 
@@ -169,13 +183,42 @@ class _WindowAttention:
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        fused_decode_groups,
         out_rope_cache=None,
+        key_rows,
     ):
+        if key_rows is not None:
+            raise ValueError("DSpark window attention does not accept query sharding")
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
+        if fused_decode_groups is not None and (
+            not forward_mode.is_decode()
+            or swa_rope_cache is None
+            or out_rope_cache is not None
+        ):
+            raise ValueError(
+                "Fused DSpark attention requires decode with its RoPE table"
+            )
         kv = self._workspace(
             swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
         )
+        if fused_decode_groups is not None:
+            return dsv41.selected_attention_fp8(
+                q,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                attn_sink,
+                softmax_scale,
+                positions,
+                swa_rope_cache,
+                fused_decode_groups,
+                kv.view(-1, 1, kv.shape[-1]),
+                self.selection.indices,
+            )
         if q.is_cuda and q.shape[-1] == 512:
             out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
         else:
@@ -244,7 +287,11 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 f"{tuple(head.shape)} {head.dtype} for {hidden_states.dtype}."
             )
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-        if flat.is_cuda:
+        if flat.is_cuda and current_platform().is_cdna5:
+            logits = dsv4_linear_fp32(flat, head, override=None, solution=None)
+        elif flat.is_cuda:
+            # dsv4_linear_fp32's NVIDIA kernels are router GEMMs sized for
+            # expert counts, not a vocabulary shard.
             logits = torch.mm(flat, head.T, out_dtype=torch.float32)
         else:
             logits = flat.float() @ head.float().T
@@ -447,6 +494,10 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
 
 class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigurator):
     """Strict mtp-only adapter sharing embedding/head with its V4.1 target."""
+
+    # Match the target-only blacklist: proposals stay unmasked; target verify
+    # still rejects them through the target's masked distribution.
+    logits_processor_cls = LogitsProcessor
 
     def configure_target(self, target_model, target_config) -> None:
         """Install the checkpoint's target taps before draft execution exists."""

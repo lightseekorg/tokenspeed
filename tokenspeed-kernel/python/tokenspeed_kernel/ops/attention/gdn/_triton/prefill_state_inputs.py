@@ -106,6 +106,8 @@ def prepare_prefill_state_inputs(
     ssm_states: torch.Tensor,
     state_in_blocks: torch.Tensor,
     state_out_blocks: torch.Tensor,
+    *,
+    dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Copy resumed conv windows and gather/zero recurrent inputs in one launch.
 
@@ -117,6 +119,7 @@ def prepare_prefill_state_inputs(
             As required by cache ownership, a destination cannot overwrite
             another request's input snapshot; source==destination is allowed
             for that request's private in-place evolution.
+        dtype: Recurrent input dtype; conversion is fused into the gather.
 
     Returns:
         Contiguous [requests, heads, key, value] recurrent inputs and bool
@@ -145,7 +148,7 @@ def prepare_prefill_state_inputs(
             has_initial_state, state_in_blocks, state_out_blocks
         ).to(torch.int64)
         conv_states[state_out_blocks.long()] = conv_states[safe_inputs]
-        recurrent = ssm_states[safe_inputs]
+        recurrent = ssm_states[safe_inputs].to(dtype)
         recurrent.masked_fill_(~has_initial_state[:, None, None, None], 0)
         return recurrent, has_initial_state
 
@@ -153,7 +156,7 @@ def prepare_prefill_state_inputs(
     recurrent = torch.empty(
         (rows, *ssm_states.shape[1:]),
         device=ssm_states.device,
-        dtype=ssm_states.dtype,
+        dtype=dtype,
     )
     has_initial_state = torch.empty(
         rows, dtype=torch.bool, device=state_in_blocks.device

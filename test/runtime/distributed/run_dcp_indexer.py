@@ -27,6 +27,60 @@ Exercises the production collectives, candidate selection and attention merge.
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 
+def check_attention_merge(group) -> None:
+    import torch
+    import torch.distributed as dist
+    from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
+        dcp_apply_sink,
+        dcp_weight_for_reduce_scatter,
+    )
+
+    from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
+    from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
+    from tokenspeed.runtime.layers.attention.dcp.comm import combine_attention_partials
+
+    rank = dist.get_rank()
+    backend = get_global_backend()
+    for tokens in (1, 4, 16):
+        torch.manual_seed(981 + rank)
+        output = torch.randn(tokens, 64, 512, device="cuda", dtype=torch.bfloat16)
+        # Strided FP32 LSE, including empty shards and non-finite entries.
+        lse = torch.randn(tokens, 128, device="cuda")[:, ::2]
+        lse[0, :4] = torch.tensor(
+            [-torch.inf, torch.inf, float("nan"), -0.0], device="cuda"
+        )
+        sink = torch.randn(64 // len(group), device="cuda")
+
+        def merge():
+            return combine_attention_partials(
+                output, lse, group=group, rank=rank, sink=sink, keep_all_heads=False
+            )
+
+        def reference():
+            gathered = backend.nccl.all_gather(
+                lse.unsqueeze(0).contiguous(), group, dim=0
+            )
+            weighted, global_lse = dcp_weight_for_reduce_scatter(output, gathered, rank)
+            reduced = reduce_scatter(weighted, group).movedim(0, 1)
+            return dcp_apply_sink(reduced, global_lse, sink, dtype=output.dtype)
+
+        expected = reference()
+        torch.testing.assert_close(merge(), expected, rtol=0, atol=0, equal_nan=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = merge()
+        for _ in range(3):
+            lse.add_(0.125 * (rank + 1))
+            graph.replay()
+            torch.testing.assert_close(
+                actual, reference(), rtol=0, atol=0, equal_nan=True
+            )
+    print(
+        f"rank {rank}: DCP merge and graph replay matched FP32 NCCL reference",
+        flush=True,
+    )
+
+
 def main() -> None:
     import os
 
@@ -62,6 +116,7 @@ def main() -> None:
         speculative_algorithm=None,
     )
     initialize_comm_backend(use_pynccl=False)
+    check_attention_merge(group)
     torch.manual_seed(912)
     page_size, topk, pages = 64, 512, 17
     keys = torch.randn(pages * page_size, 128, device="cuda", dtype=torch.bfloat16)
@@ -279,12 +334,16 @@ def main() -> None:
     backend.num_local_heads = 2
     backend.num_attention_heads = 2 * len(group)
     backend.slot_order = "selection"
+    # A three-row verify without causal lengths: decode derives them from seq_lens_k.
+    backend.is_draft = False
+    backend.spec_num_tokens = 3
     end_length = torch.tensor([129], device="cuda", dtype=torch.int32)
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0,
             seq_lens_k=end_length,
             max_seq_len_k=1024,
+            _dsa_kv_seq_lens=None,
         )
     )
     layer = SimpleNamespace(
@@ -296,7 +355,8 @@ def main() -> None:
         logit_cap=0.0,
     )
     pool = SimpleNamespace(quant_method=None, get_key_buffer=lambda _: local_latent)
-    for end in (129, 132, 128):
+    # At 64 the whole window sits in one page, so the other ranks' rows are empty.
+    for end in (129, 132, 128, 64):
         end_length.fill_(end)
         lengths.copy_(
             end_length + torch.arange(-2, 1, device="cuda", dtype=torch.int32)
@@ -346,6 +406,142 @@ def main() -> None:
             output, ref_out[:, rank * 2 : (rank + 1) * 2], rtol=0.01, atol=0.005
         )
     print(f"rank {rank}: DSA verify and re-anchor matched unsharded", flush=True)
+    # K3.1 verify geometry: one-tile, three-row-tile and unsharded metadata must agree.
+    from tokenspeed.runtime.layers.attention.dcp.indexer import (
+        build_dcp_index_metadata,
+    )
+
+    torch.manual_seed(2048)
+    blocks, q_len = 40, 8
+    k31_keys = torch.randn(blocks * 128, 128, device="cuda", dtype=torch.bfloat16)
+    k31_values, k31_scales = quantize_fp8(
+        k31_keys, granularity="token_group", group_size=128, scale_encoding="float32"
+    )
+
+    def k31_plane(placement):
+        local_blocks = -(-(blocks - 1) // len(placement.group)) + 1
+        plane = torch.zeros(local_blocks * 128, 132, device="cuda", dtype=torch.uint8)
+        slots, owned = resolve_cache_slots(
+            torch.arange(blocks * 128, device="cuda"), placement
+        )
+        index_k_block_split_scatter(
+            plane,
+            k31_values,
+            k31_scales,
+            slots,
+            page_size=64,
+            head_dim=128,
+            group_size=128,
+            write_mask=owned,
+        )
+        return plane
+
+    k31_sharded = CachePlacement(128, blocks, group, rank)
+    k31_unsharded = CachePlacement(128, blocks, (rank,), 0)
+    k31_local, k31_full = k31_plane(k31_sharded), k31_plane(k31_unsharded)
+    # Block order unrelated to owners; one request past topk, one short.
+    request_blocks = (
+        [17, 3, 30, 8, 25, 1, 12, 36, 21, 5, 33, 14, 28, 9, 2, 39, 19, 26, 6, 31],
+        [11, 4, 22],
+    )
+    k31_table = torch.zeros(2, 64, device="cuda", dtype=torch.int32)
+    for row, ids in enumerate(request_blocks):
+        pages = torch.tensor(ids, device="cuda", dtype=torch.int32) * 2
+        k31_table[row, : 2 * len(ids)] = torch.stack((pages, pages + 1), 1).flatten()
+    k31_seq = torch.tensor([2523, 300], device="cuda", dtype=torch.int32)
+    k31_q = torch.randn(2 * q_len, 32, 128, device="cuda", dtype=torch.bfloat16)
+    k31_w = torch.randn(2 * q_len, 32, device="cuda", dtype=torch.bfloat16)
+    k31_requests = torch.arange(2 * q_len, device="cuda", dtype=torch.int32) // q_len
+    k31_causal = (
+        k31_seq[k31_requests.long()]
+        - (q_len - 1)
+        + torch.arange(2 * q_len, device="cuda") % q_len
+    )
+    k31_kw = dict(
+        page_size=64, topk=2048, softmax_scale=0.1, initial_tokens=0, local_tokens=0
+    )
+    metadata = build_dcp_index_metadata(
+        k31_q,
+        k31_w,
+        k31_local,
+        k31_table,
+        k31_requests,
+        k31_causal,
+        placement=k31_sharded,
+        page_size=64,
+    )
+    single, single_lens = select_dsa_topk(
+        k31_q,
+        k31_w,
+        k31_local,
+        k31_table,
+        metadata.query_requests,
+        metadata.causal_lens,
+        placement=k31_sharded,
+        max_logits_bytes=None,
+        metadata=metadata,
+        **k31_kw,
+    )
+    tiled, tiled_lens = select_dsa_topk(
+        k31_q,
+        k31_w,
+        k31_local,
+        k31_table,
+        k31_requests,
+        k31_causal,
+        placement=k31_sharded,
+        max_logits_bytes=3 * 64 * 64 * 4,
+        **k31_kw,
+    )
+    reference, ref_lens = select_dsa_topk(
+        k31_q,
+        k31_w,
+        k31_full,
+        k31_table,
+        k31_requests,
+        k31_causal,
+        placement=k31_unsharded,
+        max_logits_bytes=None,
+        **k31_kw,
+    )
+    torch.testing.assert_close(ref_lens, k31_causal.clamp(0, 2048).int())
+    for result, lens in ((single, single_lens), (tiled, tiled_lens)):
+        torch.testing.assert_close(lens, ref_lens)
+        torch.testing.assert_close(
+            result.sort(-1).values, reference.sort(-1).values, rtol=0, atol=0
+        )
+    seq2d = k31_seq.repeat_interleave(q_len).unsqueeze(1).contiguous()
+    native_slots, native_lens = dsa_decode_topk(
+        k31_q,
+        k31_w,
+        k31_seq,
+        k31_table,
+        page_size=64,
+        topk=2048,
+        softmax_scale=0.1,
+        batch_invariant=False,
+        q_len_per_req=q_len,
+        index_k_cache=k31_full,
+        seq_lens_2d=seq2d,
+        plan=dsa_plan(page_size=64, seq_lens_2d=seq2d),
+        solution="deep_gemm",
+        slot_order="selection",
+    )
+    expected_slots = torch.where(
+        single >= 0,
+        k31_table[
+            k31_requests.long().unsqueeze(1), single.clamp_min(0).long() // 64
+        ].long()
+        * 64
+        + single % 64,
+        -1,
+    )
+    torch.testing.assert_close(native_lens, single_lens)
+    for row in range(2 * q_len):
+        assert {s for s in expected_slots[row].tolist() if s >= 0} == {
+            s for s in native_slots[row].tolist() if s >= 0
+        }
+    print(f"rank {rank}: K3.1 8-row verify top-k matched unsharded", flush=True)
     dist.destroy_process_group()
 
 

@@ -233,16 +233,21 @@ def test_amd_fp8_layer_keeps_checkpoint_codes_and_channel_scales(
     assert layer.topk.topk_config.routed_scaling_factor is None
 
 
-def test_amd_fp8_loader_retains_resident_fp8_weights(server, amd_platform):
+@pytest.mark.parametrize("expert_width", [64, 128])
+def test_amd_fp8_loader_retains_resident_fp8_weights(
+    server, amd_platform, expert_width
+):
     server("triton")
-    model = beam.BeamForCausalLM(tiny_config(), Mapping(rank=0, world_size=1), ct())
-    checkpoint, _ = fp8_checkpoint()
+    config = tiny_config()
+    config.moe_intermediate_size = expert_width
+    model = beam.BeamForCausalLM(config, Mapping(rank=0, world_size=1), ct())
+    checkpoint, _ = fp8_checkpoint(config)
     assert model.load_weights(checkpoint.items()) == checkpoint.keys()
     experts = model.model.layers[1].mlp.experts
     for expert in range(8):
         prefix = f"model.layers.1.mlp.experts.{expert}"
         for half, projection in enumerate(("gate_proj", "up_proj")):
-            rows = slice(half * 64, (half + 1) * 64)
+            rows = slice(half * expert_width, (half + 1) * expert_width)
             assert torch.equal(
                 experts.w13_weight[expert, rows].view(torch.uint8),
                 checkpoint[f"{prefix}.{projection}.weight"].view(torch.uint8),

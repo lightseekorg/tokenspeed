@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gc
 import importlib.util
 import json
 import os
@@ -339,7 +340,7 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
         assert embed.scale.dtype == torch.uint8
         assert embed.weight.numel() + embed.scale.numel() == 5 * (64 + 2)
         assert embed.weight.engram_row_sharded
-        outputs.append(embed(indices))
+        outputs.append(embed(indices, query_shard=None))
         valid_rows = embed.row_end - embed.row_start
         torch.testing.assert_close(
             embed.weight[:valid_rows].view(torch.uint8),
@@ -364,7 +365,11 @@ def test_scale_bytes_and_loader_validation():
     embed.weight_loader(embed.weight, codes)
     embed.weight_loader(embed.scale, scales.view(torch.float8_e8m0fnu))
     torch.testing.assert_close(
-        embed(torch.arange(8)), _dequant(codes, scales), rtol=0, atol=0, equal_nan=True
+        embed(torch.arange(8), query_shard=None),
+        _dequant(codes, scales),
+        rtol=0,
+        atol=0,
+        equal_nan=True,
     )
     with pytest.raises(TypeError, match="must stay FP8"):
         embed.weight_loader(embed.weight, codes.float())
@@ -405,7 +410,7 @@ def test_embedding_noncontiguous_ids(device, ndim):
     assert not ids.is_contiguous()
     expected = _dequant(codes, scales)[ids.clamp(0, 63)]
     expected[ids >= 64] = 0
-    torch.testing.assert_close(embed(ids), expected, rtol=0, atol=0)
+    torch.testing.assert_close(embed(ids, query_shard=None), expected, rtol=0, atol=0)
 
 
 def _model(device, quant_config):
@@ -456,9 +461,11 @@ def test_gate_matches_reference_and_mask_is_identity():
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
     gate[~mask] = 0
     expected = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).to(hidden.dtype)
-    torch.testing.assert_close(model(hidden, ids, mask), expected, rtol=0, atol=0)
     torch.testing.assert_close(
-        model(hidden, ids, mask)[~mask], hidden[~mask], rtol=0, atol=0
+        model(hidden, ids, mask, query_shard=None), expected, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        model(hidden, ids, mask, query_shard=None)[~mask], hidden[~mask], rtol=0, atol=0
     )
     # Signed sqrt clamps zero to +sqrt(1e-6), rather than using sign(0) == 0.
     model.q_weight.data.zero_()
@@ -466,7 +473,10 @@ def test_gate_matches_reference_and_mask_is_identity():
         hidden.dtype
     )
     torch.testing.assert_close(
-        model(hidden, ids, torch.ones_like(mask)), expected, rtol=0, atol=0
+        model(hidden, ids, torch.ones_like(mask), query_shard=None),
+        expected,
+        rtol=0,
+        atol=0,
     )
 
 
@@ -530,15 +540,15 @@ def test_cuda_lookup_hash_and_graph_replay():
     previous = torch.tensor([[-1, -1, -1], [3, -1, -1], [4, 3, -1]], device="cuda:0")
     mask = torch.ones(3, dtype=torch.bool, device="cuda:0")
     for _ in range(3):
-        expected = embed(state(ids, previous, mask)[:, 0])
+        expected = embed(state(ids, previous, mask)[:, 0], query_shard=None)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = embed(state(ids, previous, mask)[:, 0])
+        actual = embed(state(ids, previous, mask)[:, 0], query_shard=None)
     previous.copy_(torch.tensor([[6, 7, 8], [6, -1, 9], [11, 12, 1]], device="cuda:0"))
     mask[1] = False
     graph.replay()
-    expected = embed(state(ids, previous, mask)[:, 0])
+    expected = embed(state(ids, previous, mask)[:, 0], query_shard=None)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -568,12 +578,12 @@ def test_cuda_quantized_projection_forward():
     ids = torch.arange(24, device="cuda:0").reshape(4, 6)
     hidden = torch.randn(4, 4, 32, dtype=torch.bfloat16, device="cuda:0")
     mask = torch.ones(4, dtype=torch.bool, device="cuda:0")
-    actual = model(hidden, ids, mask)
+    actual = model(hidden, ids, mask, query_shard=None)
     reference = _model("cuda:0", None)
     reference.embed.weight_loader(reference.embed.weight, codes)
     reference.embed.weight_loader(reference.embed.scale, scales)
     reference.wkv.weight.data.copy_((weight.float() / 64).to(torch.bfloat16))
-    expected = reference(hidden, ids, mask)
+    expected = reference(hidden, ids, mask, query_shard=None)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
     # Hopper uses BF16 projection weights; other supported GPUs retain FP8.
     expected_dtype = (
@@ -581,20 +591,85 @@ def test_cuda_quantized_projection_forward():
     )
     assert model.wkv.weight.dtype == expected_dtype
     for _ in range(2):
-        model(hidden, ids, mask)
+        model(hidden, ids, mask, query_shard=None)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = model(hidden, ids, mask)
+        captured = model(hidden, ids, mask, query_shard=None)
     hidden.mul_(0.5)
     mask[1] = False
     graph.replay()
-    torch.testing.assert_close(captured, model(hidden, ids, mask), rtol=0, atol=0)
-    empty = model(hidden[:0], ids[:0], mask[:0])
+    torch.testing.assert_close(
+        captured, model(hidden, ids, mask, query_shard=None), rtol=0, atol=0
+    )
+    empty = model(hidden[:0], ids[:0], mask[:0], query_shard=None)
     assert empty.shape == (0, 4, 32)
 
 
-def test_distributed_four_way_lookup():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_host_table_feeds_wkv_its_mxfp8_rows():
+    """A shared host table hands wkv quantized rows; the output is the GPU
+    table's BF16 round trip bit for bit, eagerly and replayed."""
+    quant = Mxfp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [32, 32],
+            "scale_fmt": "ue8m0",
+        }
+    )
+    torch.manual_seed(7)
+    codes, scales = _weights(72, 32)
+    weight = (torch.randn(160, 192) * 4).to(torch.float8_e4m3fn)
+    models = []
+    for host_table in (False, True):
+        model = DeepseekV41Engram(
+            _config(),
+            1,
+            _mapping(0, 1, 1),
+            v41_mxfp8_config(quant),
+            "model.layers.1.engram",
+            "cuda:0",
+            host_table,
+            "shared" if host_table else "gpu",
+        )
+        model.embed.weight_loader(model.embed.weight, codes)
+        model.embed.weight_loader(model.embed.scale, scales)
+        model.wkv.weight.weight_loader(
+            model.wkv.weight, weight, shard_id=None, begin_size=None
+        )
+        model.wkv.weight_scale_inv.weight_loader(
+            model.wkv.weight_scale_inv, torch.full((5, 6), 121, dtype=torch.uint8)
+        )
+        model.wkv.quant_method.process_weights_after_loading(model.wkv)
+        models.append(model)
+    gpu, host = models
+    assert host.embed.serves_mxfp8_rows and not gpu.embed.serves_mxfp8_rows
+    hashes = torch.randint(0, 72, (5, 2, 6), device="cuda:0")
+    hashes[1, 0, 2], hashes[3, 0, 5] = -1, 72
+    ids = hashes[:, 0]
+    hidden = torch.randn(5, 4, 32, dtype=torch.bfloat16, device="cuda:0")
+    mask = torch.tensor([True, True, False, True, True], device="cuda:0")
+    torch.testing.assert_close(
+        host(hidden, ids, mask, query_shard=None),
+        gpu(hidden, ids, mask, query_shard=None),
+        rtol=0,
+        atol=0,
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = host(hidden, ids, mask, query_shard=None)
+    hashes.copy_(torch.randint(0, 72, (5, 2, 6), device="cuda:0"))
+    graph.replay()
+    torch.testing.assert_close(
+        captured, gpu(hidden, ids, mask, query_shard=None), rtol=0, atol=0
+    )
+
+
+def test_distributed_four_way_lookup(monkeypatch):
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("launch with torchrun --nproc_per_node=4")
     from tokenspeed.runtime.distributed.process_group_manager import (
@@ -605,6 +680,15 @@ def test_distributed_four_way_lookup():
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     torch.cuda.set_device(device)
     mapping = _mapping(rank, 4, 4)
+    for key, value in dict(
+        mapping=mapping,
+        chunked_prefill_size=16,
+        max_num_seqs=4,
+        max_prefill_tokens=16,
+        max_model_len=32,
+        speculative_algorithm=None,
+    ).items():
+        monkeypatch.setitem(global_server_args_dict, key, value)
     process_group_manager.init_distributed(
         mapping,
         distributed_init_method="env://",
@@ -620,8 +704,21 @@ def test_distributed_four_way_lookup():
         table.weight_loader(table.scale, scales)
         ids = torch.tensor([[0, 4, 5, 9, 10, 14, 15, 18]], device=device)
         torch.testing.assert_close(
-            table(ids), _dequant(codes, scales)[ids.cpu()].to(device), rtol=0, atol=0
+            table(ids, query_shard=None),
+            _dequant(codes, scales)[ids.cpu()].to(device),
+            rtol=0,
+            atol=0,
         )
+        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+        for rows in (7, 2):
+            full_ids = torch.arange(rows * 3, device=device).reshape(rows, 3) % 19
+            plan = QueryShardPlan.from_forward(
+                total_tokens=rows, input_lengths=[rows], size=4, rank=rank, device="cpu"
+            )
+            actual = table(full_ids[plan.local_row_ids], query_shard=plan)
+            expected = _dequant(codes, scales)[full_ids.cpu()][plan.local_row_ids]
+            torch.testing.assert_close(actual, expected.to(device), rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
 
@@ -737,7 +834,7 @@ def test_local_snapshot_reference_parity():
         clamp_value=1e-6,
     )
     torch.testing.assert_close(
-        model(hidden, hash_ids, token_mask),
+        model(hidden, hash_ids, token_mask, query_shard=None),
         namespace["forward"](ref_model, hidden, hash_ids, token_mask),
         rtol=0,
         atol=0,
@@ -769,7 +866,7 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             embed.load_sharded("weight", handle.get_slice("weight"), 4)
             embed.load_sharded("scale", handle.get_slice("scale"), 4)
-        sharded.append(embed(indices))
+        sharded.append(embed(indices, query_shard=None))
     gpu_path = torch.stack(sharded).sum(0)
     assert reduces
     host = RowShardedEngramEmbedding(
@@ -779,7 +876,7 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
         host.load_sharded("weight", handle.get_slice("weight"), 4)
         host.load_sharded("scale", handle.get_slice("scale"), 4)
     reduces.clear()
-    host_out = host(indices)
+    host_out = host(indices, query_shard=None)
     assert reduces == []
     assert host.weight.shape == (rows, width)
     torch.testing.assert_close(host_out, gpu_path, rtol=0, atol=0)
@@ -865,8 +962,8 @@ def test_host_sharded_table_matches_gpu_and_allreduces(tmp_path, monkeypatch):
         assert host.weight.shape == gpu.weight.shape
         assert host.row_start == gpu.row_start
         assert host.weight.engram_row_sharded
-        gpu_parts.append(gpu(indices))
-        host_parts.append(host(indices))
+        gpu_parts.append(gpu(indices, query_shard=None))
+        host_parts.append(host(indices, query_shard=None))
     assert reduces
     torch.testing.assert_close(
         torch.stack(host_parts).sum(0),
@@ -975,8 +1072,66 @@ def test_cuda_host_table_gather_matches_device_shard():
     host_embed.weight_loader(host_embed.weight, codes)
     host_embed.weight_loader(host_embed.scale, scales)
     ids = torch.tensor([3, 4, 5, 0, 71], device="cuda:0")
-    torch.testing.assert_close(host_embed(ids), device_embed(ids), rtol=0, atol=0)
+    torch.testing.assert_close(
+        host_embed(ids, query_shard=None),
+        device_embed(ids, query_shard=None),
+        rtol=0,
+        atol=0,
+    )
     host_embed._register_host_for_gpu = lambda: (_ for _ in ()).throw(
         AssertionError("host gather must not register")
     )
-    host_embed(ids)
+    host_embed(ids, query_shard=None)
+    torch.cuda.synchronize()
+    weight = host_embed.weight.detach()
+    scale = host_embed.scale.detach()
+    del host_embed
+    gc.collect()
+    assert not weight.is_pinned()
+    assert not scale.is_pinned()
+
+
+@pytest.mark.parametrize("counts", [(2, 1, 1, 1), (1, 1, 0, 0)])
+def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    codes, scales = _weights(19, 64)
+    ids = torch.arange(sum(counts) * 3).reshape(-1, 3) % 19
+    expected = _dequant(codes, scales)[ids]
+    tables = []
+    partials = []
+    # Only transport is mocked: each table computes its actual contribution.
+    monkeypatch.setattr(engram, "all_reduce", lambda tensor, **kwargs: tensor)
+    for rank in range(4):
+        table = RowShardedEngramEmbedding(
+            19, 64, _mapping(rank, 4, 4), "cpu", False, "gpu", 1
+        )
+        table.weight_loader(table.weight, codes)
+        table.weight_loader(table.scale, scales)
+        tables.append(table)
+        partials.append(table(ids, query_shard=None).flatten(1))
+    total = torch.stack(partials).sum(0)
+    for rank, table in enumerate(tables):
+        plan = QueryShardPlan.from_forward(
+            total_tokens=sum(counts),
+            input_lengths=[sum(counts)],
+            size=4,
+            rank=rank,
+            device="cpu",
+        )
+
+        def gather(local, group, row_counts):
+            torch.testing.assert_close(local, ids[plan.local_row_ids])
+            assert tuple(row_counts) == plan.row_counts
+            return plan.to_gather_order(ids)
+
+        def scatter(local, group, row_counts):
+            torch.testing.assert_close(
+                local, plan.to_gather_order(partials[rank]), rtol=0, atol=0
+            )
+            return total[plan.local_row_ids]
+
+        monkeypatch.setattr(engram, "token_all_gather_rows", gather)
+        monkeypatch.setattr(engram, "token_reduce_scatter", scatter)
+        actual = table(ids[plan.local_row_ids], query_shard=plan)
+        torch.testing.assert_close(actual, expected[plan.local_row_ids], rtol=0, atol=0)

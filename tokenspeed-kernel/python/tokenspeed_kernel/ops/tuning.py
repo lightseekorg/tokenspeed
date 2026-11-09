@@ -343,6 +343,12 @@ def autotune(
     if tune_mode:
         # FI 0.6.18: TGV tactics 16-28 are 2-CTA and can fail during replay.
         # The heuristic uses 1-CTA tactic 1. Keep this blocklist after tuning.
+        # It binds FI's tuner only. FI 0.7.2.post1 runs TGV as a CuTe DSL
+        # rewrite of that C++ kernel, and mm() launches three of its 2-CTA
+        # tiles directly for decode GEMMs on small weights (README "Decode
+        # GEMMs on small weights" in ops/gemm); test_bf16_tgv_decode_gemm.py
+        # replays them from captured graphs, alone and in a chain of PDL
+        # kernels.
         tuner = _autotuner.AutoTuner.get()
         tuner._blocklist._invalid.setdefault("bf16_gemm::TGVRunner", set()).update(
             range(16, 29)

@@ -49,7 +49,6 @@ from tokenspeed.runtime.layers.attention.backends.support import (
     CudaGraphSupport,
     TreeSupport,
 )
-from tokenspeed.runtime.layers.attention.chunk import prefix_chunk_len
 from tokenspeed.runtime.layers.attention.dcp.cache import PrefixHistoryGather
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -340,12 +339,13 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
                 :func:`reject_query_shard`.
             page_table_cpu: Host mirror of ``page_table``'s extend rows
                 (``[num_extends, cols]`` int32 kernel pages, unpadded) when the
-                forward is sharded, or when it extends a prefix and this leaf's
-                group is KVP page-sharded; else ``None``. The only host-side
-                table a leaf sees: the sharded extend arm and the KVP
-                prefix-chunk gather count how many history rows each page owner
-                holds from it, so the gather's per-rank split never waits on the
-                device.
+                forward is sharded, or when this leaf's group is KVP
+                page-sharded and the forward extends a prefix or is a pure
+                extend; else ``None``. The only host-side table a leaf sees:
+                the sharded extend arm and the KVP prefix-chunk gather count
+                how many history rows each page owner holds from it, so the
+                gather's per-rank split never waits on the device, and the DSA
+                leaf bounds the index pages each rank owns from it.
         """
 
     @abstractmethod
@@ -532,7 +532,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         chunk_kv_indices_list: Sequence[torch.Tensor],
         *,
         page_table_cpu: torch.Tensor | None,
-        prefix_lens_cpu: torch.Tensor,
+        chunk_bounds_cpu: torch.Tensor,
     ) -> None:
         """Record a prefill forward's prefix-chunk loops for
         :meth:`read_prefix_history`.
@@ -546,8 +546,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             page_table_cpu: ``[requests, columns]`` host kernel-page table of
                 the extend requests; required when the cache is dealt over
                 owners and there are loops.
-            prefix_lens_cpu: ``[requests]`` host cached-prefix lengths of the
-                requests the loops were cut for.
+            chunk_bounds_cpu: ``[loops + 1, requests]`` host prefix positions
+                delimiting exactly the same loops as the slot indices.
         """
         if self._prefix_history is None:
             # A leaf deals every layer's pages the same way.
@@ -560,8 +560,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self._prefix_history.prepare(
             chunk_kv_indices_list,
             page_table_cpu=page_table_cpu,
-            prefix_lens_cpu=prefix_lens_cpu,
-            chunk_len=prefix_chunk_len(len(prefix_lens_cpu)),
+            chunk_bounds_cpu=chunk_bounds_cpu,
         )
 
     def read_prefix_history(

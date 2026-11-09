@@ -34,6 +34,7 @@ global_server_args_dict: dict = {
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
     "deepseek_v4_indexer_prefill_max_logits_mb": ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
+    "disable_deepseek_v41_token_blacklist": ServerArgs.disable_deepseek_v41_token_blacklist,
     "engram_host_table": ServerArgs.engram_host_table,
     "engram_host_table_dir": ServerArgs.engram_host_table_dir,
     "engram_host_table_layout": ServerArgs.engram_host_table_layout,
@@ -43,7 +44,11 @@ global_server_args_dict: dict = {
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
     "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
     "numerics": ServerArgs.numerics,
+    "speculative_rejection_sample_method": (
+        ServerArgs.speculative_rejection_sample_method
+    ),
     "yarn_ramp_mask_device": ServerArgs.yarn_ramp_mask_device,
+    "yarn_frequency_device": ServerArgs.yarn_frequency_device,
     "mla_lora_scale": ServerArgs.mla_lora_scale,
     "layer_boundary_norm": ServerArgs.layer_boundary_norm,
     "router_topk": ServerArgs.router_topk,
@@ -60,6 +65,7 @@ global_server_args_dict: dict = {
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
+    "chunk_prefill_kv_size": ServerArgs.chunk_prefill_kv_size,
     "mla_chunk_multiplier": ServerArgs.mla_chunk_multiplier,
     "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
     "init_expert_location": ServerArgs.init_expert_location,
@@ -78,6 +84,7 @@ global_server_args_dict: dict = {
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
+    "disable_cuda_graph_padding": ServerArgs.disable_cuda_graph_padding,
     "disable_prefill_graph": ServerArgs.disable_prefill_graph,
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
     "all2all_backend": ServerArgs.all2all_backend,
@@ -95,6 +102,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
             "deepseek_v4_indexer_prefill_max_logits_mb": server_args.deepseek_v4_indexer_prefill_max_logits_mb,
+            "disable_deepseek_v41_token_blacklist": server_args.disable_deepseek_v41_token_blacklist,
             "engram_host_table": server_args.engram_host_table,
             "engram_host_table_dir": server_args.engram_host_table_dir,
             "engram_host_table_layout": server_args.engram_host_table_layout,
@@ -104,7 +112,11 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
             "batch_invariant_collectives": server_args.batch_invariant_collectives,
             "numerics": server_args.numerics,
+            "speculative_rejection_sample_method": (
+                server_args.speculative_rejection_sample_method
+            ),
             "yarn_ramp_mask_device": server_args.yarn_ramp_mask_device,
+            "yarn_frequency_device": server_args.yarn_frequency_device,
             "mla_lora_scale": server_args.mla_lora_scale,
             "layer_boundary_norm": server_args.layer_boundary_norm,
             "router_topk": server_args.router_topk,
@@ -123,6 +135,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
             "chunked_prefill_size": server_args.chunked_prefill_size,
+            "chunk_prefill_kv_size": server_args.chunk_prefill_kv_size,
             "mla_chunk_multiplier": server_args.mla_chunk_multiplier,
             "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
             "init_expert_location": server_args.init_expert_location,
@@ -141,6 +154,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,
+            "disable_cuda_graph_padding": server_args.disable_cuda_graph_padding,
             "disable_prefill_graph": server_args.disable_prefill_graph,
             "prefill_graph_max_tokens": server_args.prefill_graph_max_tokens,
             "all2all_backend": server_args.all2all_backend,
@@ -271,6 +285,8 @@ class Envs:
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
+    # Scan scheduler page-table values against the supplied page-ID bounds.
+    TOKENSPEED_VALIDATE_PAGE_IDS = EnvBool(False)
     # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
     TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")

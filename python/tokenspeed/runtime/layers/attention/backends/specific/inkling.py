@@ -36,12 +36,13 @@ rejected speculative rows are overwritten when their positions recur.
   derives the conv metadata (``InklingConvMetadata``) the model's sconv modules
   consume.
 
-The conv windows are also checkpointed in two state groups (kvconv +
-hiddenconv), each a two-slot block table per request: slot 0 holds the input
-checkpoint a chunk resumes from (a prefix hit, or the previous chunk's window
-the scheduler rotated there), slot 1 the live block that receives the window
-at the chunk end. A fresh prefill runs with ``has_initial_state=False`` so a
-reused ring slot's previous contents are ignored and overwritten.
+The conv windows are also checkpointed in state groups (kvconv, plus one
+hiddenconv group per attention group), each a two-slot block table per
+request: slot 0 holds the input checkpoint a chunk resumes from (a prefix hit,
+or the previous chunk's window the scheduler rotated there), slot 1 the live
+block that receives the window at the chunk end. A fresh prefill runs with
+``has_initial_state=False`` so a reused ring slot's previous contents are
+ignored and overwritten.
 """
 
 from __future__ import annotations
@@ -78,6 +79,10 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
+    HIDDENCONV_GROUP_ID,
+    KVCONV_GROUP_ID,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_INPUT_SLOT,
     STATE_LIVE_SLOT,
@@ -190,7 +195,11 @@ class InklingConvColumns(TypedDict):
 def conv_columns_for_pool(pool: CachePool) -> InklingConvColumns:
     """The ShortConv checkpoint groups a backend derives from its bound pool."""
     published = {spec.group_id: spec for spec in pool.arena.cache_group_specs}
-    groups = tuple(gid for gid in ("kvconv", "hiddenconv") if gid in published)
+    groups = tuple(
+        gid
+        for gid in published
+        if gid == KVCONV_GROUP_ID or gid.startswith(f"{HIDDENCONV_GROUP_ID}_")
+    )
     return InklingConvColumns(
         groups=groups,
         pd_endpoint_snapshots=all(
@@ -1092,15 +1101,20 @@ class InklingAttnBackend(AttentionBackend):
         if actual_bs < bs:
             # Pad rows may carry stale indices aliasing LIVE slots; PAD_SLOT_ID keeps writes off them.
             self._graph_cache_indices[actual_bs:bs].fill_(PAD_SLOT_ID)
+        dsts, srcs = [], []
         for g, buf in self._graph_col_tables.items():
             src = block_tables.get(g)
             if src is None:
                 raise RuntimeError(
                     f"paged sconv decode: no {g!r} table in block_tables"
                 )
-            cols = min(src.shape[1], buf.shape[1])
-            rows = min(src.shape[0], bs)
-            buf[:rows, :cols].copy_(src[:rows, :cols])
+            src = src[:bs, : buf.shape[1]]
+            dsts.append(buf[: src.shape[0], : src.shape[1]])
+            srcs.append(src)
+        # One launch refreshes every conv group's table; a copy per group costs ~4 us at bs=1.
+        torch._foreach_copy_(dsts, srcs)
+        for buf, src in zip(self._graph_col_tables.values(), srcs, strict=True):
+            rows, cols = src.shape
             if cols < buf.shape[1]:
                 buf[:rows, cols:].fill_(-1)
             if rows < bs:

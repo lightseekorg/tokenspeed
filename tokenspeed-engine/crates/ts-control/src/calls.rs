@@ -53,7 +53,10 @@
 //!   flush_cache = true, weight_version}])`;
 //! * `release_memory_occupation([{tags}])`,
 //!   `resume_memory_occupation([{tags}])`;
-//! * `rebalance_experts()`.
+//! * `rebalance_experts()`;
+//! * `demote_sessions([{session_ids, ended}])`: explicit cache eviction hints;
+//! * `reload_forward([{mode = "wait", modules, id, timeout_s}])`: development only
+//!   (`--allow-reload-forward`); `id` is required and the same on every engine.
 
 use std::time::{Duration, Instant};
 
@@ -61,14 +64,19 @@ use ts_wire::{
     control::{
         ControlCall, DestroyWeightsUpdateGroupReqInput, FlushCacheReqInput,
         InitWeightsUpdateGroupReqInput, PauseSchedulerReqInput, ProfileReq,
-        RebalanceExpertsReqInput, ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput,
-        ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
+        RebalanceExpertsReqInput, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
         UpdateWeightsFromDistributedReqInput, UpdateWeightsFromMooncakeReqInput, PROFILE_START,
         PROFILE_STOP,
     },
     msgpack::Integer,
     ControlRequest, Value,
 };
+
+use crate::request::MAX_CACHE_SESSION_ID_BYTES;
+
+/// The most session IDs a single demotion call may carry.
+const MAX_DEMOTE_SESSION_IDS: usize = 4096;
 
 /// The weight-update group an RL route names when its body names none.
 const DEFAULT_GROUP: &str = "weight_update_group";
@@ -142,6 +150,30 @@ pub fn translate(call: &ControlCall, now: Instant) -> Result<Translated, String>
 fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> {
     let body = Body::of(method, args)?;
     Ok(match method {
+        "demote_sessions" => {
+            let session_ids = body.strs("session_ids")?;
+            if session_ids.len() > MAX_DEMOTE_SESSION_IDS
+                || session_ids
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > MAX_CACHE_SESSION_ID_BYTES)
+            {
+                return Err(format!(
+                    "demote_sessions requires at most {MAX_DEMOTE_SESSION_IDS} nonempty session ids \
+                     of at most {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
+                ));
+            }
+            let ended = body
+                .get("ended")
+                .and_then(boolean)
+                .ok_or_else(|| body.missing("ended (boolean)"))?;
+            ControlRequest::DemoteSessions(ts_wire::control::DemoteSessionsReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                session_ids,
+                ended,
+            })
+        }
+
         "pause_generation" => ControlRequest::PauseScheduler(PauseSchedulerReqInput {
             rid: None,
             http_worker_ipc: None,
@@ -217,6 +249,13 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
                 version,
                 flush_cache,
                 weight_version,
+                snapshot: body
+                    .get("snapshot")
+                    .map(|value| match value {
+                        Value::Map(_) => Ok(value.clone()),
+                        other => Err(body.wrong("snapshot", "a map", other)),
+                    })
+                    .transpose()?,
             })
         }
         "release_memory_occupation" => {
@@ -240,12 +279,26 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
                 http_worker_ipc: None,
             })
         }
+        "reload_forward" => ControlRequest::ReloadForward(ReloadForwardReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            mode: body.str_or("mode", "wait")?,
+            modules: body.strs_opt("modules")?,
+            id: Some(body.str("id")?),
+            timeout_s: body
+                .get("timeout_s")
+                .map(|value| {
+                    number(value).ok_or_else(|| body.wrong("timeout_s", "a number", value))
+                })
+                .transpose()?,
+        }),
         other => unreachable!("Body::of admitted {other}"),
     })
 }
 
 /// The methods [`rl_operation`] serves.
 const RL_METHODS: &[&str] = &[
+    "demote_sessions",
     "pause_generation",
     "continue_generation",
     "init_weights_update_group",
@@ -256,6 +309,7 @@ const RL_METHODS: &[&str] = &[
     "release_memory_occupation",
     "resume_memory_occupation",
     "rebalance_experts",
+    "reload_forward",
 ];
 
 /// An RL call's body: the route's JSON body as a map, read by field name. A
@@ -720,6 +774,38 @@ mod tests {
         assert_eq!(named.weight_version.as_deref(), Some("step-7"));
     }
 
+    #[test]
+    fn a_mooncake_load_preserves_the_snapshot_directory() {
+        let snapshot = body(vec![
+            ("version", int(7)),
+            (
+                "publishers",
+                Value::Array(vec![body(vec![("key", "weights/7".into())])]),
+            ),
+        ]);
+        let request = rl(
+            "update_weights_from_mooncake",
+            vec![body(vec![
+                ("version", int(7)),
+                ("snapshot", snapshot.clone()),
+            ])],
+        )
+        .unwrap();
+        let ControlRequest::UpdateWeightsFromMooncake(load) = request else {
+            panic!("expected a Mooncake load");
+        };
+        assert_eq!(load.snapshot, Some(snapshot));
+        let error = rl(
+            "update_weights_from_mooncake",
+            vec![body(vec![
+                ("version", int(7)),
+                ("snapshot", Value::Array(vec![])),
+            ])],
+        )
+        .unwrap_err();
+        assert!(error.contains("snapshot takes a map"), "{error}");
+    }
+
     /// A body the route would refuse is refused by name: a missing or
     /// mistyped field, lists of different lengths, a body where the route
     /// takes none, and arguments that are not one map.
@@ -751,5 +837,72 @@ mod tests {
         assert!(error.contains("takes no body"), "{error}");
         let error = rl("pause_generation", vec!["wait".into()]).unwrap_err();
         assert!(error.contains("takes [body]"), "{error}");
+    }
+
+    #[test]
+    fn demotion_enforces_session_id_byte_and_count_limits() {
+        for (ids, accepted) in [
+            (vec!["s".repeat(4096)], true),
+            (vec!["s".repeat(4097)], false),
+            (vec!["🦀".repeat(1024)], true),
+            (vec![format!("{}s", "🦀".repeat(1024))], false),
+            (vec!["s".to_owned(); 4096], true),
+            (vec!["s".to_owned(); 4097], false),
+        ] {
+            let result = rl(
+                "demote_sessions",
+                vec![body(vec![
+                    (
+                        "session_ids",
+                        Value::Array(ids.iter().cloned().map(Value::Str).collect()),
+                    ),
+                    ("ended", Value::Bool(false)),
+                ])],
+            );
+            if accepted {
+                let ControlRequest::DemoteSessions(request) = result.unwrap() else {
+                    panic!("expected a demotion request");
+                };
+                assert_eq!(request.session_ids, ids);
+                assert!(!request.ended);
+            } else {
+                assert!(result.unwrap_err().contains("UTF-8 bytes"));
+            }
+        }
+    }
+
+    #[test]
+    fn demotion_requires_explicit_end_semantics_and_bounded_ids() {
+        let ids = Value::Array(vec!["s".into()]);
+        assert!(rl(
+            "demote_sessions",
+            vec![body(vec![("session_ids", ids.clone())])]
+        )
+        .is_err());
+        let request = rl(
+            "demote_sessions",
+            vec![body(vec![
+                ("session_ids", ids),
+                ("ended", Value::Bool(false)),
+            ])],
+        )
+        .unwrap();
+        let ControlRequest::DemoteSessions(request) = request else {
+            panic!("demotion request");
+        };
+        assert_eq!(request.session_ids, ["s"]);
+        assert!(!request.ended);
+        assert!(rl(
+            "demote_sessions",
+            vec![body(vec![
+                ("session_ids", Value::Array(vec!["".into()])),
+                ("ended", Value::Bool(true))
+            ])]
+        )
+        .is_err());
+        assert!(
+            rl("get_admission", Vec::new()).is_err(),
+            "structured snapshots require the typed control API"
+        );
     }
 }

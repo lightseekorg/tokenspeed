@@ -200,6 +200,14 @@ class _LinearAttn:
         return hidden_states
 
 
+class _Mlp:
+    def nvfp4_global_scale(self):
+        return None
+
+    def __call__(self, hidden_states, fp4):
+        return hidden_states
+
+
 def _attn(**kwargs):
     return kwargs["hidden_states"] if kwargs else None
 
@@ -209,10 +217,6 @@ def _stub_layer(cls):
     layer = cls.__new__(cls)
     nn.Module.__init__(layer)
     comm = _Comm()
-    mlp = SimpleNamespace(
-        nvfp4_global_scale=lambda: None,
-        forward_prequantized=lambda hidden_states, fp4: hidden_states,
-    )
     if cls is _RuntimeLongcatDecoderLayer:
         layer.moe_comm = comm
         layer.branch_comm = [comm, comm]
@@ -233,7 +237,7 @@ def _stub_layer(cls):
     layer.comm_manager = comm
     layer.input_layernorm = None
     layer.post_attention_layernorm = None
-    layer.mlp = mlp if cls.__name__.startswith("Qwen3_5") else (lambda h, *_: h)
+    layer.mlp = _Mlp() if cls.__name__.startswith("Qwen3_5") else (lambda h, *_: h)
     layer.is_moe_layer = False
     layer.linear_attn = _LinearAttn()
     layer.qkv_proj = SimpleNamespace(
@@ -326,7 +330,6 @@ def _bare(model_cls):
         Qwen3MoeForCausalLM,
         Qwen3OmniMoeForConditionalGeneration,
         DeepseekV41ForCausalLM,
-        MuseSparkForConditionalGeneration,
         Qwen4ExpForConditionalGeneration,
     ],
 )
@@ -341,7 +344,13 @@ def test_capture_is_refused_where_forward_returns_no_taps(model_cls):
 
 
 @pytest.mark.parametrize(
-    "model_cls", [LlamaForCausalLM, GptOssForCausalLM, NemotronHForCausalLM]
+    "model_cls",
+    [
+        LlamaForCausalLM,
+        GptOssForCausalLM,
+        NemotronHForCausalLM,
+        MuseSparkForConditionalGeneration,
+    ],
 )
 def test_capture_is_accepted_where_forward_returns_taps(model_cls):
     lm = _bare(model_cls)

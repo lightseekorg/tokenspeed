@@ -97,15 +97,13 @@ void Scheduler::handleEvent(const cache::StorageDetach& event) {
 
 void Scheduler::releaseStorage(Request& request) {
     if (!storage_transfers_) return;
-    if (const auto* prefetch = request.GetIf<fsm::Prefetching>()) {
-        storage_transfers_->Detach(prefetch->operation_id);
+    // The request gives L3 up and keeps its place: the lease on the operation
+    // it waits for, or on its Ready data, dies with the wait.
+    if (request.Is<fsm::Prefetching>()) {
         request.Apply(fsm::FinishPrefetchEvent{std::nullopt});
     }
     if (auto* admission = request.AdmissionResourcesPtr()) {
-        if (admission->storage_hold) {
-            storage_transfers_->Detach(admission->storage_hold->operation_id);
-            admission->storage_hold.reset();
-        }
+        admission->storage_hold.reset();
         admission->storage_prepared = true;
     }
 }
@@ -114,11 +112,12 @@ void Scheduler::prepareStorage(Request& request) {
     if (!storage_transfers_) return;
     const auto& limits = storage_transfers_->Config();
     if (auto* state = request.GetIf<fsm::Prefetching>()) {
-        if (storage_transfers_->Completed(state->operation_id) && !storage_transfers_->IsQuery(state->operation_id)) {
+        const std::uint64_t operation = state->lease.OperationId();
+        if (storage_transfers_->Completed(operation) && !storage_transfers_->IsQuery(operation)) {
             const auto deadline =
                 storage_now_us_ +
                 std::min(limits.ready_timeout_us, std::numeric_limits<std::int64_t>::max() - storage_now_us_);
-            request.Apply(fsm::FinishPrefetchEvent{fsm::StorageReadyHold{state->operation_id, deadline}});
+            request.Apply(fsm::FinishPrefetchEvent{deadline});
             return;
         }
         if (storage_now_us_ >= state->deadline_us) {
@@ -138,16 +137,18 @@ void Scheduler::prepareStorage(Request& request) {
         }
         // Congestion skips a new GET; an existing GET keeps its original
         // deadline and Host references until native retirement.
-        if (storage_transfers_->IsQuery(state->operation_id) && storage_transfers_->PressureGateClosed()) {
+        if (storage_transfers_->IsQuery(operation) && storage_transfers_->PressureGateClosed()) {
             ++storage_pressure_bypasses_;
             releaseStorage(request);
             return;
         }
-        if (!storage_transfers_->Completed(state->operation_id) || !storage_allowed_) return;
-        const auto hits = storage_transfers_->QueryHits(state->operation_id);
-        storage_transfers_->Detach(state->operation_id);
-        state->operation_id = storage_transfers_->StartRead(prompt, hits);
-        if (!state->operation_id) releaseStorage(request);
+        if (!storage_transfers_->Completed(operation) || !storage_allowed_) return;
+        const auto hits = storage_transfers_->QueryHits(operation);
+        // The finished query retires before the GET starts: CanStart counts
+        // its ticket.
+        state->lease.reset();
+        state->lease = storage_transfers_->StartRead(prompt, hits);
+        if (!state->lease) releaseStorage(request);
         return;
     }
 
@@ -190,13 +191,23 @@ void Scheduler::prepareStorage(Request& request) {
     auto query = coordinator_.MissingStorageKeys(prompt(), limits.max_keys_per_operation);
     setBound(query.max_tokens);
     auto keys = std::move(query.keys);
+    auto key_tokens = std::move(query.key_tokens);
     if (bound - local < limits.min_prefetch_tokens || keys.empty()) return;
+    _assert(key_tokens.size() == keys.size(), "Each storage query key needs a token span");
     // A known failed immutable object remains unavailable for this attempt.
-    std::erase_if(keys, [this](const auto& key) { return storage_transfers_->IsNegative(key); });
-    const auto operation = storage_transfers_->StartQuery(std::move(keys));
-    if (!operation) return;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (storage_transfers_->IsNegative(keys[i])) continue;
+        keys[kept] = keys[i];
+        key_tokens[kept] = key_tokens[i];
+        ++kept;
+    }
+    keys.resize(kept);
+    key_tokens.resize(kept);
+    StorageLease query_lease = storage_transfers_->StartQuery(std::move(keys), std::move(key_tokens));
+    if (!query_lease) return;
     const auto deadline =
         storage_now_us_ + std::min(limits.wait_timeout_us, std::numeric_limits<std::int64_t>::max() - storage_now_us_);
-    request.Apply(fsm::StartPrefetchEvent{operation, deadline, std::move(hashes), bound, std::move(tail)});
+    request.Apply(fsm::StartPrefetchEvent{std::move(query_lease), deadline, std::move(hashes), bound, std::move(tail)});
 }
 }  // namespace tokenspeed

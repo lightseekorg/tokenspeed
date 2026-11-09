@@ -142,6 +142,13 @@ class CacheRuntimeContract:
                     raise ValueError(
                         f"local cache slots for {spec.group_id!r} exceed int32 range"
                     )
+                # Router slots use the virtual block's raw-token span before
+                # ownership mapping, including compressed-entry token strides.
+                virtual_slots = virtual_counts[spec.group_id] * spec.block_granularity
+                if virtual_slots - 1 > (1 << 31) - 1:
+                    raise ValueError(
+                        f"virtual cache slots for {spec.group_id!r} exceed int32 range"
+                    )
         max_child_pages = max(virtual_counts.values()) - 1
         if token_capacity > max_child_pages * prefix_granularity:
             raise ValueError(

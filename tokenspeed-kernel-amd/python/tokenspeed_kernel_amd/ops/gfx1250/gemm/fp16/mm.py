@@ -56,6 +56,7 @@ _WARP_BASES_M4 = ((1, 0), (2, 0))
 _WARP_BASES_M8 = ((1, 0), (2, 0), (4, 0))
 _WARP_BASES_4 = ((0, 1), (1, 0))
 _WARP_BASES_8 = ((0, 1), (1, 0), (2, 0))
+_WARP_BASES_N8 = ((0, 1), (0, 2), (0, 4))
 _LARGEM_SHAPES = {
     (512, 3072),
     (768, 7168),
@@ -163,8 +164,8 @@ def _wmma_tdm_dense_kernel(
         "row tile is 16, 32, 64 or 128 rows",
     )
     gl.static_assert(
-        BLOCK_N == 16 or BLOCK_N == 32 or BLOCK_N == 64,
-        "column tile is one, two or four WMMA output tiles",
+        BLOCK_N == 16 or BLOCK_N == 32 or BLOCK_N == 64 or BLOCK_N == 128,
+        "column tile is one, two, four or eight WMMA output tiles",
     )
     gl.static_assert(
         BLOCK_K == 128 or BLOCK_K == 256, "candidate uses 128- or 256-wide K tiles"
@@ -215,7 +216,7 @@ def _wmma_tdm_dense_kernel(
     else:
         b_rows = N - pid_n * BLOCK_N
     b_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-        base=b_ptr + pid_n * BLOCK_N * stride_bn,
+        base=b_ptr + (pid_n * BLOCK_N).to(gl.int64) * stride_bn,
         shape=(b_rows, K),
         strides=(stride_bn, stride_bk),
         block_shape=(BLOCK_N, BLOCK_K),
@@ -723,6 +724,19 @@ def gluon_wmma_tdm_dense_gfx1250(
             warp_bases=_WARP_BASES_4,
             split_k=split_k,
             num_buffers=_DENSE_BUFFERS,
+        )
+        return out
+    if _use_128_column_tiles(16, n):
+        _launch_wmma_tdm_dense_tiles(
+            A,
+            B,
+            out,
+            block_m=16,
+            block_n=128,
+            block_k=128,
+            warp_bases=_WARP_BASES_N8,
+            split_k=split_k,
+            num_buffers=6,
         )
         return out
     # One warp per 16-column WMMA tile along N.
@@ -1851,6 +1865,31 @@ def _mm_a16w16_tiles(
     return 128, 64, 128, 4, _WARP_BASES_8, split_k
 
 
+def _use_128_column_tiles(block_m: int, n: int) -> bool:
+    """Return whether unsplit 128-column tiles beat the narrower choices.
+
+    They read each activation tile once per 128 weight rows. Covering half
+    the CUs or fewer leaves CUs idle, and past one wave two resident
+    128-row programs keep only two TDM buffers each.
+    """
+    tiles = triton.cdiv(n, 128)
+    return tiles > _NUM_CUS // 2 and (block_m < 128 or tiles <= _NUM_CUS)
+
+
+def _mm_a16w16_wide_tiles(
+    m: int, n: int
+) -> tuple[int, int, int, int, tuple[tuple[int, int], ...], int] | None:
+    """Return 128-column dense tiles for a wide output of up to 128 rows."""
+    if m > 128:
+        return None
+    block_m = 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128
+    if not _use_128_column_tiles(block_m, n):
+        return None
+    if block_m == 128:
+        return 128, 128, 128, 4, _WARP_BASES_8, 1
+    return block_m, 128, 128, 6 if block_m == 16 else 4, _WARP_BASES_N8, 1
+
+
 def use_gluon_mm_a16w16_gfx1250(m: int, k: int, n: int) -> bool:
     """Return whether the general CDNA5 BF16 GEMM accepts this shape."""
     return m >= 1 and n % 16 == 0 and k % 128 == 0
@@ -1916,7 +1955,7 @@ def gluon_mm_a16w16_gfx1250(
             f"out must be GPU {out_dtype} ({m}, {n}) with unit column stride"
         )
 
-    tiles = _mm_a16w16_tiles(m, n, k)
+    tiles = _mm_a16w16_wide_tiles(m, n) or _mm_a16w16_tiles(m, n, k)
     if tiles is None:
         _launch_largem(A, B, out)
         return out

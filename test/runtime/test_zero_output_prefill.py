@@ -362,7 +362,11 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     full = SimpleNamespace(positions=positions, request_indices=requests)
     empty = SimpleNamespace(positions=positions[:0], request_indices=requests[:0])
     plan = SimpleNamespace(
-        source=full, query=empty, keep_rows=torch.empty(0, dtype=torch.int64)
+        source=full,
+        query=empty,
+        keep_rows=torch.empty(0, dtype=torch.int64),
+        source_shard=None,
+        query_shard=None,
     )
     forward = load_symbol(
         RUNTIME + "models/deepseek_v41.py",
@@ -375,7 +379,7 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     attention = SimpleNamespace(
         layer_id=20,
         ced_decoder_start=20,
-        _write_global_kv=lambda hidden, *args: writes.append(hidden.clone()),
+        _write_global_kv=lambda hidden, *args, **kwargs: writes.append(hidden.clone()),
     )
     hidden = torch.randn(4, 8)
     output = forward(
@@ -405,7 +409,7 @@ def test_zero_decoder_skips_layers_and_normalization():
         pre_mix=torch.empty(0, 4),
         captured=[torch.empty(0, 8)] * 2,
     )
-    hidden, captures = forward(model, state, None)
+    hidden, captures = forward(model, state, SimpleNamespace(query_shard=None))
     assert hidden.shape == (0, 8)
     assert [t.shape for t in captures] == [(0, 8)] * 3
 
@@ -496,7 +500,9 @@ def test_idle_graph_grammar_adds_an_identity_batch():
         token_to_kv_pool=None,
         input_buffers=buffers,
         runtime_states=SimpleNamespace(
-            valid_cache_lengths=torch.zeros(1), vocab_size=32
+            valid_cache_lengths=torch.zeros(1),
+            input_vocab_size=32,
+            vocab_size=32,
         ),
         device="cpu",
         default_stream=None,
@@ -547,6 +553,11 @@ def test_drafter_future_inputs_keep_original_request_rows():
         tree_spec=None,
         capturable_grammar=None,
         dspark_context_producer=None,
+        attn_backend=SimpleNamespace(
+            prepare_cache_batch=lambda *args, **kwargs: None,
+            writeback_accepted_kv=lambda *args: None,
+        ),
+        device_module=SimpleNamespace(current_stream=lambda: None),
         drafter=SimpleNamespace(
             prepare_target_forward=lambda ctx: None,
             rewrite_verify_outputs=lambda ctx, output_tokens, accept_lengths: None,
@@ -558,6 +569,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
             future_input_map=future_inputs,
             valid_cache_lengths=torch.zeros(6, dtype=torch.int32),
             mark_spec_candidates_drafted=lambda rows: drafted.extend(rows.tolist()),
+            input_vocab_size=64,
             vocab_size=64,
         ),
         input_buffers=SimpleNamespace(
@@ -625,6 +637,8 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
     )
     backend = SimpleNamespace(
         device="cpu",
+        kvp_size=1,
+        _local_decode_selections={},
         spec_num_tokens=2,
         spec=SimpleNamespace(sliding_window_tokens=2, max_query_tokens=32),
         _swa_plans={},
@@ -737,7 +751,11 @@ def test_decoder_swa_excludes_history_before_its_retained_window(
     view = methods["_build_decoder_view"](backend, metadata, [True], 128, mode)
     backend._decoder_view = view
     plan = methods["_swa_query_plan"](
-        backend, view.prefill.positions, view.prefill.request_indices, mode
+        backend,
+        view.prefill.positions,
+        view.prefill.request_indices,
+        mode,
+        query_shard=None,
     )
     request = plan.requests[0]
     # Even an unchanged row set must not inherit the encoder's older SWA keys.
@@ -759,6 +777,10 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         RUNTIME + "execution/forward_step.py",
         "__call__",
         owner="ForwardStepRunner",
+        nullcontext=nullcontext,
+        live_graph_outputs=load_symbol(
+            RUNTIME + "execution/forward_step.py", "live_graph_outputs"
+        ),
         nvtx_range=lambda *args, **kwargs: nullcontext(),
     )
     width, padded_bs = 3, 4
@@ -770,6 +792,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         forward_mode=SimpleNamespace(is_decode=lambda: True, is_idle=lambda: False),
     )
     observed = []
+    accepted_lengths = []
     runner = SimpleNamespace(
         _can_use_graph=lambda *args: True,
         _padded_bs=lambda *args: padded_bs,
@@ -783,6 +806,12 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         _graph_debug=False,
         _expert_load_rows=None,
         device="cuda",
+        config=SimpleNamespace(spec_draft_tree=False),
+        attn_backend=SimpleNamespace(
+            commit_state_after_acceptance=lambda lengths, **kwargs: accepted_lengths.append(
+                lengths.clone()
+            )
+        ),
         max_tokens_per_req=width,
         drafter=None,
         deepep_adapter=SimpleNamespace(replay=lambda: None),
@@ -802,11 +831,12 @@ def test_graph_padding_restores_live_output_layout(live_bs):
                 torch.ones(padded_bs),
                 None,
                 None,
+                None,
             )
         },
     )
     empty = torch.empty(0, dtype=torch.int32)
-    tokens, lengths, _, _ = run(
+    tokens, lengths, _, _, _ = run(
         runner,
         live_bs,
         ctx,
@@ -826,3 +856,5 @@ def test_graph_padding_restores_live_output_layout(live_bs):
     assert ctx.output_layout is live_layout
     assert tokens.tolist() == list(range(live_bs * width))
     assert len(lengths) == live_bs
+    assert len(accepted_lengths) == 1
+    torch.testing.assert_close(accepted_lengths[0], lengths)

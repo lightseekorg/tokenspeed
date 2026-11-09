@@ -102,6 +102,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         use_trtllm=not mega_moe,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
+        decode_chain=False,
     )
     forbidden = mock.Mock(side_effect=AssertionError("TP-only setup reached"))
     monkeypatch.setattr(

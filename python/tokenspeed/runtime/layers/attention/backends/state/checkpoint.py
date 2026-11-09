@@ -77,6 +77,10 @@ class InForwardStateCheckpoints:
     chunk's first ``offsets[i]`` tokens into the row's third block (slot 2),
     which the scheduler publishes as a prefix-cache checkpoint.
 
+    Capacity-shaped (graph) metadata keeps one fixed slot per request slot
+    in the device tensors: slots past the live checkpoints hold block ``-1``,
+    which the masked state writers skip, and an in-range token index.
+
     Args:
         rows: Host int64 batch rows that write a checkpoint.
         offsets: Host int64 tokens of each such row's chunk before its
@@ -182,12 +186,13 @@ def scan_checkpoint_plan(
 
     Args:
         checkpoints: This forward's checkpoints.
-        scan_seq_lens_cpu: Host ``[bs]`` tokens of each scanned sequence, in
-            batch-row order.
+        scan_seq_lens_cpu: Host ``[num_seqs]`` tokens of each sequence the
+            scan covers: the batch's leading rows, in order, every
+            checkpoint's row among them.
 
     Returns:
-        ``(interval, host int64 [bs + 1] cumulative state counts, host int64
-        buffer row of each checkpoint)``.
+        ``(interval, host int64 [num_seqs + 1] cumulative state counts, host
+        int64 buffer row of each checkpoint)``.
     """
     interval = math.gcd(*(int(x) for x in checkpoints.offsets.tolist()))
     counts = scan_seq_lens_cpu.to(torch.int64) // interval

@@ -107,7 +107,9 @@ def _drop_prefilled_encodings(items: list[MultimodalDataItem]) -> None:
 
     def drop(tensor: torch.Tensor | None) -> None:
         if tensor is not None and tensor.device.type != "cpu":
-            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            tensor.record_stream(
+                torch.get_device_module(tensor.device).current_stream(tensor.device)
+            )
 
     for item in items:
         drop(item.encoded)

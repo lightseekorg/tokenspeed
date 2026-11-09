@@ -333,7 +333,7 @@ python -m tokenspeed.cli serve \
   --attn-tp-size 1 --data-parallel-size 16 --dense-tp-size 1 \
   --moe-tp-size 1 --expert-parallel-size 16 \
   --all2all-backend flashinfer --moe-backend flashinfer_trtllm \
-  --attention-backend tokenspeed_mla --kda-backend cutedsl_kda \
+  --attention-backend tokenspeed_mla --kda-backend cudnn \
   --dist-init-addr HEAD_NODE:29500 \
   --max-num-seqs 256 --max-model-len 4096 \
   --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
@@ -688,13 +688,41 @@ query against that query's local causal length, so a width-`w` window reads
 each request's owned pages `w` times instead of once. The full rule set is in
 `docs/configuration/server.md`.
 
+The chunked prefill of an MLA model reads each prefix chunk's history from its
+page owners, a window of chunks per all-gather. On SM100 and SM103 GPUs (GB200,
+GB300) a KVP group of 2, 4, or 8 ranks (on one host, or across hosts over an
+NVLink fabric) gathers these windows with a fused all-gather kernel instead of
+a pack copy plus an NCCL all-gather: each owner stores its rows straight from
+its cache into every rank's receive slot, over NVLink multicast where the group
+has it, else with one store per peer. There is no flag; startup picks it for
+the whole group and reserves two receive slots per GPU before the KV cache is
+sized, each holding one chunk's history capacity (`--chunked-prefill-size` x
+`--mla-chunk-multiplier` rows) from every rank: `2 x kvp_size x capacity x row
+bytes`, 288 MiB at KVP 8 with the defaults (8192 x 4) and an FP8 MLA cache
+(576-byte rows). The group keeps NCCL on other GPUs and group sizes, for
+DeepSeek V4.1 (which gathers its own history), on a PD decode engine, without
+chunked prefill, when one receive slot would take 2 GiB or more (such as at
+KVP 8 with an FP8 cache and `--chunked-prefill-size 131072`), with
+`--kv-cache-quant-method per_token_head` (an FP8 `--kv-cache-dtype` cache is
+gathered fused), and when a configured kernel waits on other ranks inside a
+kernel that needs the whole GPU (MegaMoE, DeepEP or any other all-to-all
+backend, fused DP projections, or any MoE backend or solution the runtime does
+not list as safe). A reader whose cache rows differ from the target's
+(another row width or dtype) uses NCCL. The fused kernel's waits end 30 s
+before `--distributed-timeout-seconds` (at half of it when it is under 90 s).
+The group's first rank logs the choice: `KVP history group ... gathers through
+the fused all-gather`, or `... keeps its NCCL all-gather:` with the reason.
+
 ## Query context parallelism on the prefill role
 
 `--query-context-parallel-size N` (QCP) splits every extend forward's rows
-over the attention TP group of a PD prefill engine: rank `r` computes the
-batch-global contiguous rows `[sum(c[:r]), sum(c[:r+1]))` of the chunk, with
-`c` the same uneven split the reduce-scatter / all-gather communication path
-uses, against the full KV history of its requests. It is a layout of the
+over the attention TP group of a PD prefill engine, request by request in
+zigzag: every request's new rows are cut into `2N` near-equal segments and
+rank `r` computes segments `r` and `2N - 1 - r` of every request, against
+the full KV history of the request. For sufficiently long requests, each
+rank holds an early and a late part, balancing causal attention and letting
+the ranks compute each history group in parallel. Short requests can leave
+some ranks empty; they still participate in all collectives. It is a layout of the
 `Mapping` (`mapping.attn.qcp_size / qcp_rank / qcp_group`), not a mode: the
 scheduler plans the same chunk on every rank, cache allocation and the P->D
 transfer see page ownership only, and `--chunked-prefill-size` keeps counting
@@ -710,6 +738,14 @@ history of each request group, and the model exit gathers only the sampled
 rows (one per request) before the LM head. Every QCP collective is data
 movement, so a row's bits do not depend on which rank computes it
 (`docs/design/numerics.md`).
+
+DSA packs whole request histories into contiguous groups within its reserved
+history workspace. It keeps the minimum group count that fits the workspace,
+then minimizes the largest group's history row count. Request order and query
+ownership stay unchanged. This reduces the peak rows presented to the indexer
+without adding history gathers; latency still depends on query distribution
+and the selected kernels. A request whose history exceeds the workspace is
+rejected.
 
 Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the

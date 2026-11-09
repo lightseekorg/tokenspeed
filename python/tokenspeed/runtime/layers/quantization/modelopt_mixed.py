@@ -324,6 +324,10 @@ class ModelOptMixedConfig(QuantizationConfig):
     def quantizes_any(self, prefix: str) -> bool:
         return any(name.startswith(prefix) for name in self.quantized_layers)
 
+    @override
+    def stores_fp8_embedding(self, prefix: str) -> bool:
+        return self.quantized_layers.get(prefix) == "FP8"
+
     def is_quantized_layer(self, prefix: str) -> bool:
         """Whether a runtime module prefix resolves to a non-excluded algorithm."""
         return (

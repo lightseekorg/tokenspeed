@@ -58,7 +58,7 @@ eval:
     --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26","prompt_template":"Solve the following math problem. Show your reasoning step by step.\nEnclose only your final answer in standard LaTeX boxed-answer notation. Once you provide the final answer, stop immediately.\n\nProblem: {question}"}}'
     --eval-batch-size 8
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"top_k":64,"seed":0,"max_tokens":32768,"timeout":7200,"extra_body":{"reasoning_effort":"high","skip_special_tokens":false,"chat_template_kwargs":{"force_nonempty_content":true}}}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"top_k":64,"seed":0,"max_tokens":63488,"timeout":7200,"extra_body":{"reasoning_effort":"high","skip_special_tokens":false,"chat_template_kwargs":{"force_nonempty_content":true}}}'
 report:
   github_step_summary: true
 # Match the TP8/EP8 high-reasoning gate: at least 28 of 30 answers.

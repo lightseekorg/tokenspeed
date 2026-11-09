@@ -25,6 +25,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "utils.h"
+
 namespace tokenspeed {
 
 void StoragePressure::Validate() const {
@@ -102,16 +104,39 @@ std::size_t StorageTransferManager::availableHostCredits() const {
     return used < limit ? limit - used : 0;
 }
 
-std::uint64_t StorageTransferManager::StartQuery(std::vector<CacheKey> keys) {
+StorageLease::StorageLease(StorageLease&& other) noexcept
+    : manager_{std::exchange(other.manager_, nullptr)}, operation_id_{std::exchange(other.operation_id_, 0)} {}
+
+StorageLease& StorageLease::operator=(StorageLease&& other) noexcept {
+    if (this != &other) {
+        reset();
+        manager_ = std::exchange(other.manager_, nullptr);
+        operation_id_ = std::exchange(other.operation_id_, 0);
+    }
+    return *this;
+}
+
+StorageLease::~StorageLease() {
+    reset();
+}
+
+void StorageLease::reset() noexcept {
+    if (StorageTransferManager* manager = std::exchange(manager_, nullptr)) {
+        manager->detach(std::exchange(operation_id_, 0));
+    }
+}
+
+StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens) {
     if (keys.empty() || !CanStart() || availableHostCredits() == 0 ||
         keys.size() > static_cast<std::size_t>(config_.max_keys_per_operation)) {
-        return 0;
+        return {};
     }
+    _assert(keys.size() == key_tokens.size(), "Each storage query key needs a token span");
     StorageQueryOperation op{nextId(), std::move(keys)};
     const auto id = op.op_id;
-    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, {}, {}});
+    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, std::move(key_tokens), {}, {}});
     commands_.push_back(std::move(op));
-    return id;
+    return StorageLease{*this, id};
 }
 
 bool StorageTransferManager::Completed(std::uint64_t id) const {
@@ -124,20 +149,22 @@ bool StorageTransferManager::IsQuery(std::uint64_t id) const {
     return it != operations_.end() && it->second.kind == StorageKind::kQuery;
 }
 
-std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) const {
-    const Ticket& ticket = operations_.at(id);
+std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
+    Ticket& ticket = operations_.at(id);
     std::vector<CacheKey> keys;
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
-        if (ticket.success[i] && !IsNegative(ticket.keys[i])) keys.push_back(ticket.keys[i]);
+        if (!ticket.success[i] || IsNegative(ticket.keys[i])) continue;
+        keys.push_back(ticket.keys[i]);
+        query_hit_tokens_ += std::exchange(ticket.key_tokens[i], 0);
     }
     return keys;
 }
 
-std::uint64_t StorageTransferManager::StartRead(const CacheCoordinator::PromptPrefix& prompt,
-                                                std::span<const CacheKey> hits) {
-    if (!CanStart() || hits.empty()) return 0;
+StorageLease StorageTransferManager::StartRead(const CacheCoordinator::PromptPrefix& prompt,
+                                               std::span<const CacheKey> hits) {
+    if (!CanStart() || hits.empty()) return {};
     auto reservation = coordinator_.ReserveStoragePrefix(prompt, hits, availableHostCredits());
-    if (reservation.keys.empty()) return 0;
+    if (reservation.keys.empty()) return {};
     StorageGetOperation op{nextId(), reservation.keys, {}};
     for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
         op.host_blocks.push_back(coordinator_.Allocator(static_cast<std::int32_t>(op.keys[i].group_id))
@@ -146,12 +173,13 @@ std::uint64_t StorageTransferManager::StartRead(const CacheCoordinator::PromptPr
     const auto id = op.op_id;
     operations_.emplace(id, Ticket{decltype(op)::kKind,
                                    op.keys,
+                                   {},
                                    std::move(reservation.blocks),
                                    {},
                                    std::move(reservation.tail_prior),
                                    std::move(reservation.tail)});
     commands_.push_back(std::move(op));
-    return id;
+    return StorageLease{*this, id};
 }
 
 void StorageTransferManager::rememberNegative(const CacheKey& key) {
@@ -197,11 +225,11 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
     if (ticket.detached || kind == StorageKind::kPut) operations_.erase(it);
 }
 
-void StorageTransferManager::Detach(std::uint64_t id) {
-    auto it = operations_.find(id);
-    if (it == operations_.end()) return;
+void StorageTransferManager::detach(std::uint64_t id) noexcept {
+    const auto it = operations_.find(id);
+    // An attached ticket stays until its one lease detaches it.
+    FatalCheck(it != operations_.end() && !it->second.detached, "a storage lease names an attached operation");
     Ticket& ticket = it->second;
-    if (ticket.detached) return;
     ticket.detached = true;
     if (ticket.quarantined) return;
     if (ticket.completed) {
@@ -280,7 +308,7 @@ void StorageTransferManager::StartBackups() {
     }
     if (refs.empty()) return;
     op.op_id = nextId();
-    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, std::move(refs), {}});
+    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, {}, std::move(refs), {}});
     commands_.push_back(std::move(op));
 }
 

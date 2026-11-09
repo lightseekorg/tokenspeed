@@ -31,8 +31,6 @@ from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 _CP_OPERATORS = (
     "npu_dcp_merge_topk",
     "npu_dsa_merge_lse_direct",
-    "npu_select_local_topk_indices",
-    "npu_kvp_attention_merge",
 )
 
 
@@ -47,18 +45,7 @@ def native_constructor_dependencies(monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_partial_merge_handles_all_empty_and_mixed_rows(monkeypatch, dtype):
-    def native_merge(output, lse):
-        # Model the native normalized-partial ABI, including its undefined
-        # softmax for rows whose LSE values are all -inf.
-        assert output.dtype == torch.float32
-        assert lse.dtype == torch.float32
-        weights = torch.softmax(lse, dim=0)
-        return (output * weights[..., None]).sum(0).to(torch.bfloat16)
-
-    monkeypatch.setattr(
-        torch.ops.custom, "npu_kvp_attention_merge", native_merge, raising=False
-    )
+def test_partial_merge_handles_all_empty_and_mixed_rows(dtype):
     kernels = AscendDSAKernels()
     output = torch.tensor(
         [

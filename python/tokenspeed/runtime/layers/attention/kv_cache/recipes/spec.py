@@ -443,7 +443,7 @@ def hybrid_slab_group_size(
     return None if len(distinct) > 1 else max(counts.values())
 
 
-def _layer_attn_kind_windows(
+def layer_attn_kind_windows(
     layer_types: Sequence[str],
     sliding_window_tokens: SlidingWindowTokens,
 ) -> list[tuple[AttnKind, int | None]]:
@@ -497,7 +497,7 @@ def layer_group_ids(
     The id is the bare label unless sliding layers carry more than one
     distinct window (then ``label_<window>``), so single-window models keep
     byte-identical ids."""
-    rows = _layer_attn_kind_windows(layer_types, sliding_window_tokens)
+    rows = layer_attn_kind_windows(layer_types, sliding_window_tokens)
     distinct = {w for k, w in rows if k == "sliding_window"}
     multi_window = len(distinct) > 1
     return [
@@ -598,7 +598,7 @@ def group(
             f"group_ids has {len(resolved_group_ids)} entries but layer_types "
             f"has {len(resolved_layer_types)}"
         )
-    layer_policies = _layer_attn_kind_windows(
+    layer_policies = layer_attn_kind_windows(
         resolved_layer_types, sliding_window_tokens
     )
 
@@ -695,6 +695,7 @@ __all__ = [
     "group",
     "compute_max_logical_pages_for_capture",
     "hybrid_slab_group_size",
+    "layer_attn_kind_windows",
     "layer_group_ids",
     "split_recurrent_state_groups",
     "validate_scheduler_config",

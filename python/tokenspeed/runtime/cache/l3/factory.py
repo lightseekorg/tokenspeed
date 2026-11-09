@@ -59,6 +59,7 @@ def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any
         "draft_dtype": draft_dtype,
         "numerics": args.numerics,
         "yarn_ramp_mask_device": args.yarn_ramp_mask_device,
+        "yarn_frequency_device": args.yarn_frequency_device,
         "mla_lora_scale": args.mla_lora_scale,
         "layer_boundary_norm": args.layer_boundary_norm,
         "router_topk": args.router_topk,
@@ -89,6 +90,13 @@ def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any
         "dense_tp_size": mapping.dense.tp_size,
         "moe_tp_size": mapping.moe.tp_size,
         "moe_ep_size": mapping.moe.ep_size,
+        # Large prefill calls attend through another kernel; listed only when
+        # on, so deployments without it keep their identity.
+        **(
+            {"enable_qsa_prefill_bf16_scratch": True}
+            if args.enable_qsa_prefill_bf16_scratch
+            else {}
+        ),
     }
 
 

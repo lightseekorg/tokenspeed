@@ -6,6 +6,11 @@ triggers:
   - per-commit
   - manual
   - debug
+# Kernel tests never import the runtime (a pre-commit hook checks it).
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+changed_paths: true
 runner:
   labels:
     - amd-mi45x-cpu-test
@@ -159,8 +164,13 @@ env:
     # compile reuse, seven-buffer QKVFAB, AttnRes partials and entry point.
     # AttnRes tiles at four tokens: a spare row for the prefix, a power-of-two
     # tile with a delta, a block write, and the 16-row tile; token-count
-    # compile reuse and a refused strided weight.
-    tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_bf16_gfx1250.py
+    # compile reuse and a refused strided weight. LM-head shards stay on
+    # hardware.
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_bf16_gfx1250.py::test_dense_split_k_strided_output_and_replay
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_bf16_gfx1250.py::test_dense_split_k_reduction_multiple_tiles
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_bf16_gfx1250.py::test_dense_buffers_fit_k_and_shared_lds
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_bf16_gfx1250.py::test_dense_short_k_drains_tdm
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_bf16_gfx1250.py::test_dense_batch_sizes_reuse_compilation
     tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_kda_qkvfab_tdm_auto_matches_and_captures[2]
     tokenspeed-kernel/test/ops/test_gemm.py::test_linear_attnres_partials_gfx1250_matches_composition[3648]
     tokenspeed-kernel/test/ops/test_gemm.py::test_linear_attnres_partials_gfx1250_cuda_graph_replay[6288]

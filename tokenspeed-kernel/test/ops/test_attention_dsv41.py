@@ -1658,7 +1658,7 @@ def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
 @pytest.mark.parametrize(
     "heads,rows",
     [(32, rows) for rows in (0, 6, 12, 24, 48, 96, 128, 129, 192, 257)]
-    + [(heads, 257) for heads in (4, 8, 16)],
+    + [(heads, 257) for heads in (4, 8, 13, 16)],
 )
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

@@ -57,6 +57,23 @@ def test_nightly_versions_and_kernel_dependency_share_date(project):
     )
 
 
+def test_release_candidate_kernel_nightly_makes_a_tokenspeed_release_candidate(
+    project,
+):
+    base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
+        "project"
+    ]["version"]
+    version = PREPARE(project, "20261108", "0.1.4rc1.post20261108")
+    metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
+    assert metadata["version"] == version == f"{base_version}rc1.post20261108"
+    pins = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
+    assert pins == ["tokenspeed-kernel==0.1.4rc1.post20261108"]
+    assert (
+        runpy.run_path(str(project / "python/tokenspeed/version.py"))["__version__"]
+        == version
+    )
+
+
 @pytest.mark.parametrize(
     "date,kernel",
     [("20260230", "0.1.3.post20260230"), ("20260930", "0.1.3.post20260929")],
@@ -66,6 +83,23 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
     original = path.read_bytes()
     with pytest.raises(ValueError):
         PREPARE(project, date, kernel)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        "0.1.4.post20261108.dev1",
+        "0.1.4.post20261108+exp1",
+        "0.1.4a1.post20261108",
+        "0.1.4rc1.post20261108.dev1",
+    ],
+)
+def test_kernel_with_anything_but_a_release_candidate_is_refused(project, kernel):
+    path = project / "python/pyproject.toml"
+    original = path.read_bytes()
+    with pytest.raises(ValueError):
+        PREPARE(project, "20261108", kernel)
     assert path.read_bytes() == original
 
 

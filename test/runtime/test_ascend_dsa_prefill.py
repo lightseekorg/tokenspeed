@@ -25,7 +25,10 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillPlan
+from tokenspeed.runtime.layers.attention.dcp.ascend import (
+    AscendPrefillOptions,
+    AscendPrefillPlan,
+)
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
 
@@ -89,6 +92,7 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
             page_size=page,
             topk=2048,
             local_cache_pages=local_capacity,
+            options=AscendPrefillOptions(max(sum(extends), 1), page),
         )
         for rank in range(degree)
     ]
@@ -102,12 +106,18 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
         physical = ((block - 1) // degree + 1) * per_block + subpage if block else 0
         caches[owner][physical] = torch.arange(page, dtype=torch.int64) + virtual * page
     send_rows = -(-sum(extends) // (degree * page)) * page
+    gather_plan = plans[0].gather
+    history_rows = page + sum(gather_plan.row_counts)
     gathered = torch.zeros(
-        (degree * local_capacity + degree * send_rows // page, page), dtype=torch.int64
+        (history_rows // page + degree * send_rows // page, page), dtype=torch.int64
     )
-    for rank, cache in enumerate(caches):
-        for physical, values in cache.items():
-            gathered[rank * local_capacity + physical] = values
+    offset = page
+    for rank, plan in enumerate(plans):
+        slots = plan.gather.send_slots.tolist()
+        for local in slots:
+            physical, lane = divmod(local, page)
+            gathered.view(-1)[offset] = caches[rank][physical][lane]
+            offset += 1
     current_values = []
     for request, (prefix, count) in enumerate(zip(prefixes, extends)):
         positions = torch.arange(prefix, prefix + count)
@@ -118,7 +128,7 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
         )
     for owner, count in enumerate(plans[0].row_counts):
         start = sum(plans[0].row_counts[:owner])
-        target = degree * local_capacity * page + owner * send_rows
+        target = history_rows + owner * send_rows
         gathered.view(-1)[target : target + count] = torch.tensor(
             current_values[start : start + count]
         )
@@ -188,4 +198,5 @@ def test_prefill_rejects_mismatched_request_lengths():
             page_size=128,
             topk=2048,
             local_cache_pages=8,
+            options=AscendPrefillOptions(5, 128),
         )

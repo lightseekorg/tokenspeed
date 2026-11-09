@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.layers.attention import deepseek_v41_kvp as kvp
+from tokenspeed.runtime.layers.attention.dcp import cache as history_cache
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -48,26 +49,33 @@ def test_packed_history_preserves_bytes_and_strides(monkeypatch, size, rows, wid
     expected = (
         (logical[:, None] * 13 + torch.arange(width)[None, :]).remainder(256).byte()
     )
-    order = torch.argsort((virtual // 64 - 1) % size, stable=True)
+    owner = (virtual // 64 - 1) % size
     for rank in range(size):
         placement = CachePlacement(64, 17, tuple(range(size)), rank)
         # Simulate LCM planes whose page stride exceeds the field width.
         storage = torch.zeros((18, 64, width + 16), dtype=torch.uint8)
         cache = storage[:, :, :width]
-        owner = (virtual // 64 - 1) % size
         local = ((virtual // 64 - 1) // size + 1) * 64 + virtual % 64
         mine = owner == rank
         cache[local[mine] // 64, local[mine] % 64] = expected[mine]
 
-        def gather(plan, local_rows, *, out):
-            assert plan.rank == rank
-            torch.testing.assert_close(local_rows, expected[mine], rtol=0, atol=0)
-            assert sum(plan.owned_rows_per_rank) == padded_rows
-            torch.testing.assert_close(plan.order, order)
-            out[:padded_rows].index_copy_(0, plan.order, expected[order])
-            return out[:padded_rows]
+        def all_gather(output, payload, group):
+            # Only communication is simulated; the production planner and
+            # gather must reconstruct every byte, including partial pages.
+            counts = torch.bincount(owner, minlength=size)
+            share = int(counts.max())
+            own = int(mine.sum())
+            assert payload.shape == (share, width)
+            torch.testing.assert_close(payload[:own], expected[mine], rtol=0, atol=0)
+            assert not payload[own:].any()
+            shares = []
+            for other in range(size):
+                rows_ = expected[owner == other]
+                pad = rows_.new_full((share - rows_.shape[0], width), 255)
+                shares.append(torch.cat([rows_, pad]))
+            output.copy_(torch.cat(shares))
 
-        monkeypatch.setattr(kvp, "gather_history_rows", gather)
+        monkeypatch.setattr(history_cache, "all_gather_single", all_gather)
         result = kvp.gather_paged_history(
             cache, table, table, rows=rows, placement=placement
         )
@@ -140,13 +148,28 @@ def test_remote_selection_is_valid_but_remote_write_is_masked():
     assert not backend.cuda_graph_support.prefill_graph
     tables = _tables("cpu")
     tables[R1][0, :2] = torch.tensor([1, 2], dtype=torch.int32)
+    # The shared _extend helper supplies host tables. Omit them explicitly
+    # here to test the invalid-input contract before exercising real KVP.
+    lengths = torch.tensor([128], dtype=torch.int32)
+    zeros = torch.zeros(1, dtype=torch.int32)
     with pytest.raises(ValueError, match="host block tables"):
-        _extend(backend, tables, [128], [0], [0], [128])
-    # Use the existing fixture to initialize all baseline metadata, then restore KVP.
-    backend.kvp_size = 1
+        backend.init_forward_metadata(
+            1,
+            1,
+            torch.zeros(1, dtype=torch.int64),
+            lengths,
+            ForwardMode.EXTEND,
+            block_tables=tables,
+            extend_seq_lens=lengths,
+            extend_seq_lens_cpu=lengths,
+            extend_prefix_lens=zeros,
+            extend_prefix_lens_cpu=zeros,
+            extend_replay_lens_cpu=zeros,
+            extend_prompt_lens_cpu=lengths,
+            extend_with_prefix=False,
+            query_shard=None,
+        )
     _extend(backend, tables, [128], [0], [0], [128])
-    backend.kvp_size = 2
-    backend._kvp_tables_cpu = tables
     positions = torch.tensor([0, 64], dtype=torch.int64)
     requests = torch.zeros(2, dtype=torch.int64)
     writes = backend.cache_slots(R1, positions, requests, ForwardMode.EXTEND)
@@ -161,7 +184,7 @@ def test_remote_selection_is_valid_but_remote_write_is_masked():
     "role,speculative,mixed,graph",
     [
         ("encode", None, False, False),
-        ("decode", None, False, False),
+        ("decode", "MTP", False, False),
         ("prefill", "MTP", False, False),
         ("prefill", None, True, False),
         ("prefill", None, False, True),
@@ -312,6 +335,7 @@ def test_kvp_decode_refresh_has_no_host_history_plan(
                 ForwardMode.DECODE,
                 None,
                 projected_partition=None,
+                query_shard=None,
             )
         assert calls == ([False] * 4 if local_reindex else [False] * 4 + [True] * 2)
         assert len(history_calls) == (4 if local_reindex else 6)

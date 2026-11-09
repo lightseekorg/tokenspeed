@@ -28,19 +28,18 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
-    MergedColumnParallelLinear,
+    ColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.paged_attention import (
     PagedAttention,
     hf_sliding_window_to_window_left,
@@ -185,49 +184,6 @@ class DFlashAttention(nn.Module):
         )
 
 
-class DFlashMLP(nn.Module):
-    def __init__(
-        self,
-        config,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        hidden_size = int(config.hidden_size)
-        intermediate_size = int(config.intermediate_size)
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=mapping.dense.tp_rank,
-            tp_size=mapping.dense.tp_size,
-            tp_group=mapping.dense.tp_group,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-            reduce_results=False,
-            tp_rank=mapping.dense.tp_rank,
-            tp_size=mapping.dense.tp_size,
-            tp_group=mapping.dense.tp_group,
-        )
-        if getattr(config, "hidden_act", "silu") != "silu":
-            raise ValueError("DFlash only supports silu activation.")
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
-
 class DFlashDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -250,9 +206,17 @@ class DFlashDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.mlp = DFlashMLP(
-            config=config,
-            mapping=mapping,
+        self.mlp = GatedMLP.tensor_parallel(
+            hidden_size=hidden_size,
+            intermediate_size=int(config.intermediate_size),
+            activation=gated_activation(
+                getattr(config, "hidden_act", "silu"), swiglu_limit=None
+            ),
+            tp_rank=mapping.dense.tp_rank,
+            tp_size=mapping.dense.tp_size,
+            tp_group=mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
@@ -383,11 +347,18 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             "target_layer_ids"
         ) or (getattr(config, "target_layer_ids", None) or [])
         self.num_context_features = len(target_layer_ids)
-        self.fc = ReplicatedLinear(
+        # Each attention-TP rank holds the fc rows of its own output columns,
+        # so a projection reads 1/TP of the weight; gathering the columns
+        # completes the rows the draft's attention reads.
+        self.fc = ColumnParallelLinear(
             self.num_context_features * int(config.hidden_size),
             int(config.hidden_size),
             bias=False,
+            gather_output=False,
             prefix=add_prefix("fc", prefix),
+            tp_rank=mapping.attn.tp_rank,
+            tp_size=mapping.attn.tp_size,
+            tp_group=mapping.attn.tp_group,
         )
         self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
         # Name the DFlash drafter reads off the draft model.
@@ -395,7 +366,24 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         self._residual_buffer: torch.Tensor | None = None
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        return self.hidden_norm(self.fc(target_hidden)[0])
+        """Project the concatenated target taps to normalized context rows.
+
+        Gathers ``fc``'s output columns over the attention TP group, so call
+        it in stream order with the group's other collectives.
+
+        Args:
+            target_hidden: ``[num_tokens, context_in_features]`` taps,
+                identical on every rank of the group.
+
+        Returns:
+            The ``[num_tokens, hidden]`` context rows.
+        """
+        columns = self.fc(target_hidden)[0]
+        # Every rank holds the same rows, so skipping an empty gather is
+        # uniform across the group.
+        if self.fc.tp_size > 1 and columns.shape[0] > 0:
+            columns = all_gather(columns, self.fc.tp_group, dim=-1)
+        return self.hidden_norm(columns)
 
     # ------------------------------------------------------------------
     # Context-injection contract
@@ -465,7 +453,6 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         positions: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
-        kv_sync_event=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
@@ -476,9 +463,6 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         else:
             hidden_states = input_embeds
             residual = self._zeroed_residual(input_embeds)
-
-        if kv_sync_event is not None:
-            torch.cuda.current_stream().wait_event(kv_sync_event)
 
         for layer in self.layers:
             hidden_states, residual = layer(

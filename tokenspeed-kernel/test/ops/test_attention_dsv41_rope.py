@@ -501,3 +501,51 @@ def test_fused_rope_launches_reuse_compilation_across_token_counts():
             for tokens in (1, 3, 64, 129, 500):
                 keys(tokens)
                 global_keys(tokens)
+
+
+def _rope_reference(values, positions, cache):
+    rotary_dim = cache.shape[1]
+    x = values.float()
+    pairs = x[..., -rotary_dim:].unflatten(-1, (-1, 2))
+    cosine, sine = cache[positions.clamp_min(0)].chunk(2, dim=-1)
+    if values.ndim == 3:
+        cosine, sine = cosine[:, None], sine[:, None]
+    even = pairs[..., 0] * cosine - pairs[..., 1] * sine
+    odd = pairs[..., 1] * cosine + pairs[..., 0] * sine
+    rotated = torch.stack((even, odd), dim=-1).flatten(-2)
+    return torch.cat((x[..., :-rotary_dim], rotated), dim=-1).to(values.dtype)
+
+
+@pytest.mark.parametrize(
+    "heads,dim",
+    [(None, 512), (1, 512), (3, 512), (13, 128), (64, 512), (128, 512)],
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_rope_inplace_rotates_every_head_tail_exactly(heads, dim, strided):
+    """Heads are grouped per program; a partial last group must neither skip
+    nor touch heads past the end, and NoPE channels stay as they were."""
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+    from utils import assert_no_triton_compile
+
+    torch.manual_seed(97)
+    rows = 1 if heads is None else heads
+    storage = torch.randn(
+        300, rows * (2 if strided else 1), dim, device="cuda", dtype=torch.bfloat16
+    )
+    values = storage[:, ::2] if strided else storage
+    if heads is None:
+        values = values[:, 0]
+    gaps = storage[:, 1::2].clone() if strided else None
+    positions = torch.arange(300, device="cuda", dtype=torch.int64) * 7 - 5
+    angles = torch.randn(4096, 32, device="cuda")
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    expected = _rope_reference(values, positions, cache)
+
+    assert rope_inplace(values, positions, cache) is values
+    torch.testing.assert_close(values, expected, rtol=0, atol=0)
+    if gaps is not None:
+        torch.testing.assert_close(storage[:, 1::2], gaps, rtol=0, atol=0)
+    # Token counts change every batch and must not key a new binary.
+    with assert_no_triton_compile(implementation._rope_inplace_kernel):
+        for tokens in (1, 64, 129):
+            rope_inplace(values[:tokens], positions[:tokens], cache)

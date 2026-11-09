@@ -23,6 +23,7 @@
 from functools import lru_cache
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import (
     _mxfp4_cache_view,
     warmup_mqa_logits,
@@ -33,7 +34,10 @@ from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
     gather_index_pages,
 )
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexQueryInput
-from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexGeometry
+from tokenspeed_kernel.ops.attention.dsv41._metadata import (
+    IndexGeometry,
+    index_logit_rows,
+)
 from tokenspeed_kernel.ops.attention.dsv41._triton.rope import (
     triton_dsv41_index_query_rope_quant,
 )
@@ -58,6 +62,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     clean_logits_for_selection,
     dense_ranges,
     finish_selection,
+    mask_invalid_pages,
     pack_index_inputs,
     quantize_index_queries,
     safe_metadata,
@@ -76,21 +81,23 @@ from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
 
 platform = current_platform()
 
-if platform.is_blackwell:
+if platform.is_blackwell and has_optional_package("deep_gemm"):
     prepare_cuda_toolkit_env()
     import deep_gemm
 
 if platform.is_hopper:
     prepare_cuda_toolkit_env()
-    import deep_gemm
+    if has_optional_package("deep_gemm"):
+        import deep_gemm
 
     # The selector compiles with nvidia-cutlass-dsl, a CUDA-only dependency.
     from tokenspeed_kernel.ops.attention.dsa._cute_dsl import deep_select as row_select
 
 
+@lru_cache(maxsize=1)
 def is_native_indexer_available() -> bool:
     """Whether the current platform supports packed DeepGEMM MQA scoring."""
-    return platform.is_blackwell
+    return platform.is_blackwell and has_optional_package("deep_gemm")
 
 
 @lru_cache(maxsize=32)
@@ -105,6 +112,7 @@ def _warmup_indexer(heads: int, device: torch.device, enable_pdl: bool) -> None:
         cache_block_size=64,
         max_decode_tokens=32,
         device=device,
+        logits_dtype=torch.bfloat16,
     )
 
 
@@ -135,7 +143,7 @@ def _paged_scores(
         )
     if queries[0].shape[0] == 0:
         return (
-            torch.zeros((0, capacity), dtype=torch.float32, device=cache.device),
+            torch.zeros((0, capacity), dtype=torch.bfloat16, device=cache.device),
             valid_lengths,
             None,
         )
@@ -149,14 +157,32 @@ def _paged_scores(
             block_table, valid_lengths, cache.shape[0], capacity, page_size
         )
         context_lens = lengths[:, None]
+        request_indices = (
+            index_metadata.source.acquire()[2] if index_metadata is not None else None
+        )
+        indices = None
+        if request_indices is not None:
+            # Padding must not end an active request's run with a zero length:
+            # the native scheduler sizes shared KV work from the run's last row.
+            padding_start = torch.iinfo(torch.int32).min
+            indices = torch.where(
+                lengths > 0,
+                request_indices[tile_begin:tile_end],
+                torch.arange(
+                    padding_start,
+                    padding_start + lengths.numel(),
+                    device=cache.device,
+                    dtype=torch.int32,
+                ),
+            )
         schedule = api.get_paged_mqa_logits_metadata(
-            context_lens, page_size, api.get_num_sms()
+            context_lens, page_size, api.get_num_sms(), indices=indices
         )
         if index_metadata is not None:
-            geometry = IndexGeometry((table, lengths, context_lens, schedule))
+            geometry = IndexGeometry((table, lengths, context_lens, schedule, indices))
             index_metadata.paged[key] = geometry
     else:
-        table, lengths, context_lens, schedule = geometry.acquire()
+        table, lengths, context_lens, schedule, indices = geometry.acquire()
     logits = api.fp8_fp4_paged_mqa_logits(
         q=(
             queries[0].contiguous().view(torch.int8).unsqueeze(1),
@@ -169,7 +195,8 @@ def _paged_scores(
         schedule_meta=schedule,
         max_context_len=capacity,
         clean_logits=False,
-        logits_dtype=torch.float32,
+        logits_dtype=torch.bfloat16,
+        indices=indices,
     )
     if prepare_blocks:
         input_alignment, _ = deep_select_alignment()
@@ -185,35 +212,67 @@ def _paged_scores(
         return cleaned, lengths, (block_scores, block_ends)
     return (
         clean_logits_for_selection(
-            logits, lengths, block_table, cache.shape[0], capacity, page_size
+            logits,
+            lengths,
+            block_table,
+            cache.shape[0],
+            capacity,
+            page_size,
+            deep_select_alignment()[0] // logits.element_size(),
         ),
         lengths,
         None,
     )
 
 
+def _pack_index_keys(cache, page_table, history_rows):
+    """Gather each request history once into one packed key buffer.
+
+    history_rows gives the consecutive query rows sharing one history. Returns
+    (keys, scales) for all histories back to back, the flattened history page
+    list they came from, and each row's int32 start.
+    Host ints only drive slicing and fills, so no host-device copy or sync.
+    """
+    page_size = 64
+    span = page_table.shape[1] * page_size
+    starts = torch.empty(
+        page_table.shape[0], dtype=torch.int32, device=page_table.device
+    )
+    rows = []
+    first = 0
+    for run, count in enumerate(history_rows):
+        rows.append(page_table[first : first + 1])
+        starts[first : first + count].fill_(run * span)
+        first += count
+    pages = rows[0][0] if len(rows) == 1 else torch.cat(rows).reshape(-1)
+    return gather_index_pages(cache, pages, page_size), pages, starts
+
+
 def _dense_scores(
-    queries, keys, weights, lengths, table, pages, capacity, prepare_blocks
+    queries,
+    keys,
+    weights,
+    lengths,
+    pages,
+    capacity,
+    offsets,
+    history_pages,
 ):
     api = _api(queries)
-    starts, ends = dense_ranges(lengths, capacity)
+    starts, packed_ends = dense_ranges(lengths, capacity, offsets)
     logits = api.fp8_fp4_mqa_logits(
         q=(queries[0].view(torch.int8), queries[1]),
         kv=(keys[0].view(torch.int8), keys[1]),
         weights=weights,
         cu_seq_len_k_start=starts,
-        cu_seq_len_k_end=ends,
+        cu_seq_len_k_end=packed_ends,
         clean_logits=False,
         max_seqlen_k=capacity,
-        logits_dtype=torch.float32,
+        logits_dtype=torch.bfloat16,
     )
-    if prepare_blocks:
-        input_alignment, _ = deep_select_alignment()
-        cleaned, block_scores, block_ends = clean_logits_and_block_max(
-            logits, ends, table, pages, capacity, 64, input_alignment
-        )
-        return cleaned, (block_scores, block_ends)
-    return clean_logits(logits, ends, table, pages, capacity, 64), None
+    visible = lengths.clamp(0, capacity).to(torch.int32)
+    # DeepSelect reads only [0, end); mask holes there without copying logits.
+    return mask_invalid_pages(logits, visible, history_pages, offsets, pages, 64)
 
 
 @register_kernel(
@@ -280,18 +339,25 @@ def index_topk(
         blocks.fill_(-1)
         block_lengths.zero_()
         return out
-    # Scores and selection scratch are transient and independent of configured
-    # request count. Never materialize the full prefill-by-history matrix.
+    # The caller bounds this call. Dense Full packs one or more request
+    # histories; DeepSelect reads [0, end) of the MQA view without a cleaned copy.
     sparse = _use_sparse_candidate_scores(index_cache, candidate_blocks, candidate_topk)
-    dense = not sparse and page_table.stride(0) == 0 and n > 1
-    # Wide histories benefit from skipping wholly future cleaning tiles;
-    # combine full-width block preparation only for smaller capacities.
-    prepare_blocks = candidate_topk > 0 and capacity <= 65536
-    # Sparse width is bounded by candidates; use the caller's query tile.
-    tile = query_chunk_size
-    if not sparse:
-        budget = (128 if dense else 32) << 20
-        tile = min(tile, max(1, budget // (capacity * 4)))
+    # Prefill callers declare which rows share a history (new_index_metadata
+    # history_rows); those gather each history once and score densely.
+    # Without that declaration (decode/verify) every row scores paged.
+    history_rows = None if index_metadata is None else index_metadata.history_rows
+    dense = not sparse and history_rows is not None
+    # Dense selects block candidates from the MQA logits in place, keeping one
+    # score matrix inside the index_logit_rows budget; paged prepares a copy.
+    prepare_blocks = candidate_topk > 0 and capacity <= 65536 and not dense
+    # The runtime splits dense prefill windows within index_logit_rows using
+    # this table width; scoring only checks the budget and never re-splits.
+    tile = max(1, query_chunk_size)
+    if dense and min(n, tile) > index_logit_rows(capacity):
+        raise ValueError(
+            f"Dense index scoring of {min(n, tile)} rows x {capacity} columns "
+            "exceeds TOKENSPEED_PREFILL_INDEX_LOGITS_MB; split the window"
+        )
     cache = index_cache.as_strided(
         (index_cache.shape[0], 64 * 68), (index_cache.stride(0), 1)
     )
@@ -308,10 +374,12 @@ def index_topk(
     else:
         queries, weights = pack_index_inputs(index_q, weights, weight_dtype)
     keys = None
+    history_pages = None
+    key_offsets = None
     if dense:
-        # A zero row stride is a proof that all queries address one request's
-        # history. Gather once for this call; never retain payload across writes.
-        keys = gather_index_pages(cache, page_table[0], 64)
+        keys, history_pages, key_offsets = _pack_index_keys(
+            cache, page_table, history_rows
+        )
     for begin in range(0, n, tile):
         end = min(begin + tile, n)
         visible = visible_lens[begin:end]
@@ -337,16 +405,17 @@ def index_topk(
             continue
         if dense:
             visible = visible.clamp(0, capacity).to(torch.int32)
-            logits, prepared_blocks = _dense_scores(
+            logits = _dense_scores(
                 packed,
                 keys,
                 weights[begin:end],
                 visible,
-                page_table[begin:end],
                 index_cache.shape[0],
                 capacity,
-                prepare_blocks,
+                key_offsets[begin:end],
+                history_pages,
             )
+            prepared_blocks = None
         else:
             logits, visible, prepared_blocks = _paged_scores(
                 packed,
@@ -404,9 +473,10 @@ _INDEX_ROW_BYTES = _LAYOUTS["index_v4"][3]
 _INDEX_VALUE_BYTES = _LAYOUTS["index_v4"][2]
 
 
+@lru_cache(maxsize=1)
 def is_hopper_indexer_available() -> bool:
     """Whether this platform scores FP8 index rows with DeepGEMM."""
-    return platform.is_hopper
+    return platform.is_hopper and has_optional_package("deep_gemm")
 
 
 @lru_cache(maxsize=8)

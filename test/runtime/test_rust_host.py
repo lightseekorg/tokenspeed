@@ -60,8 +60,13 @@ from tokenspeed.runtime.engine.profiler import Profiler  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import request_length_limits  # noqa: E402
 from tokenspeed.runtime.engine.rust_host import (  # noqa: E402
     HostDataPlane,
+    host_in_flight_depth,
     rust_host_refusals,
     start_rust_host,
+)
+from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
+    resolve_in_flight_depth,
+    should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
@@ -159,18 +164,24 @@ def _rank_args(rank: int) -> tuple[ServerArgs, PortArgs]:
     return server_args, PortArgs.init_new(server_args)
 
 
-def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(tmp_path):
+@pytest.mark.parametrize("enable_async_logging", [False, True])
+def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
+    tmp_path, enable_async_logging
+):
     binary = _fake_host(
         tmp_path,
         """
         server_args, port_args, relay = connection.recv()
         connection.send({"status": "ready", "rank": server_args.mapping.rank,
-                         "python": python, "relay": relay})
+                         "python": python, "relay": relay,
+                         "async_logging": args["--enable-async-logging"]})
         time.sleep(600)
         """,
     )
+    server_args, port_args = _rank_args(3)
+    server_args.enable_async_logging = enable_async_logging
     proc, reader = start_rust_host(
-        binary, *_rank_args(3), nullcontext(), "ipc:///tmp/relay", False
+        binary, server_args, port_args, nullcontext(), "ipc:///tmp/relay", False
     )
     try:
         (ready,) = receive_ready_messages([reader], [proc])
@@ -179,6 +190,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(tmp_path):
             "rank": 3,
             "python": sys.executable,
             "relay": "ipc:///tmp/relay",
+            "async_logging": str(enable_async_logging).lower(),
         }
         assert proc.is_alive() and proc.exitcode is None
     finally:
@@ -240,6 +252,65 @@ def test_prefill_kv_capacity_must_exceed_the_unchanged_prompt_limit(
     else:
         with pytest.raises(ValueError, match="greater than max_req_input_len"):
             request_length_limits(**args)
+
+
+# ----------------------------------------------------------------------
+# The rank's in-flight depth
+# ----------------------------------------------------------------------
+
+# (disaggregation_mode, pp_size, disable_overlap_schedule) -> in-flight depth.
+_IN_FLIGHT_DEPTHS = {
+    ("null", 1, False): 1,
+    ("null", 1, True): 0,
+    ("decode", 1, False): 1,
+    ("decode", 1, True): 0,
+    # The prefill role commits one chunk behind.
+    ("prefill", 1, False): 1,
+    ("prefill", 1, True): 0,
+    # An encode rank runs no LM loop.
+    ("encode", 1, False): 0,
+    ("encode", 1, True): 0,
+    # The chunk pipeline keeps one forward per stage in flight, overlap
+    # disabled or not.
+    ("prefill", 2, False): 2,
+    ("prefill", 2, True): 2,
+    ("prefill", 4, False): 4,
+    ("null", 2, False): 2,
+}
+
+
+@pytest.mark.parametrize("mode, pp_size, disabled", sorted(_IN_FLIGHT_DEPTHS))
+def test_the_in_flight_depth_per_role_pipeline_and_overlap_flag(
+    mode, pp_size, disabled
+):
+    depth = resolve_in_flight_depth(
+        disable_overlap_schedule=disabled,
+        disaggregation_mode=mode,
+        pp_size=pp_size,
+    )
+
+    assert depth == _IN_FLIGHT_DEPTHS[mode, pp_size, disabled]
+
+
+def test_a_prefill_rank_runs_one_chunk_ahead_without_the_overlap_schedule():
+    def prefill(**fields) -> ServerArgs:
+        return ServerArgs(
+            model="x",
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="mooncake",
+            **fields,
+        )
+
+    server_args = prefill()
+    assert host_in_flight_depth(server_args) == 1
+    # It reserves no decode KV for the forward in flight: the role never
+    # decodes locally.
+    assert not should_use_overlap_schedule(
+        disable_overlap_schedule=server_args.disable_overlap_schedule,
+        disaggregation_mode=server_args.disaggregation_mode,
+    )
+    assert host_in_flight_depth(prefill(disable_overlap_schedule=True)) == 0
+    assert host_in_flight_depth(prefill(pipeline_parallel_size=2)) == 2
 
 
 # ----------------------------------------------------------------------
@@ -392,7 +463,12 @@ def executor():
     return _CpuExecutor(output_token_cumulative_probs=None)
 
 
-def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
+@pytest.mark.parametrize(
+    "history_prefix,history_tokens", [(2, [7, 8]), (9, [7, 8]), (9, [])]
+)
+def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
+    executor, history_prefix, history_tokens
+):
     plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1", temperature=0.0, max_new_tokens=8, stop_token_ids={9})
     plane.admit([("r1", msgspec.msgpack.encode(params), [2, 9], 11, None)])
@@ -409,7 +485,7 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
         None,
         None,
         (None, 0),
-        ([1], [2], [[7, 8]]),
+        ([1], [history_prefix], [history_tokens]),
     )
 
     assert pending is not None
@@ -429,7 +505,11 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
     assert sampling_params == [params]
     assert stop_criteria == (StopCriteria(stop_token_ids=(2, 9), token_limit=11),)
     assert executor.history_seeds == [
-        RequestHistorySeeds(slots=(1,), prefix_lengths=(2,), tokens=((7, 8),))
+        RequestHistorySeeds(
+            slots=(1,),
+            prefix_lengths=(history_prefix,),
+            tokens=(tuple(history_tokens),),
+        )
     ]
 
 

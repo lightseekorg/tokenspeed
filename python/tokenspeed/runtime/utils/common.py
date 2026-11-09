@@ -26,11 +26,13 @@ import dataclasses
 import functools
 import json
 import logging
+import logging.config
 import os
 import random
 import re
 import resource
 import subprocess
+import sys
 import tempfile
 import threading
 from collections import OrderedDict
@@ -282,12 +284,22 @@ def configure_logger(server_args, prefix: str = ""):
     global LOG_LEVEL
     LOG_LEVEL = server_args.log_level.upper()
 
-    from tokenspeed._logging import suppress_noisy_third_party_logs
+    from tokenspeed._logging import (
+        configure_root_logger,
+        stop_async_logging,
+        suppress_noisy_third_party_logs,
+    )
     from tokenspeed.runtime.utils.env import envs
 
     suppress_noisy_third_party_logs()
 
     if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
+        if server_args.enable_async_logging:
+            raise ValueError(
+                "--enable-async-logging cannot be combined with "
+                "TOKENSPEED_LOGGING_CONFIG_PATH; configure async handlers in "
+                "the custom file or use the default logging configuration"
+            )
         if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
             raise FileNotFoundError(
                 "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
@@ -295,16 +307,18 @@ def configure_logger(server_args, prefix: str = ""):
             )
         with open(TOKENSPEED_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
             custom_config = json.loads(file.read())
+        stop_async_logging()
         logging.config.dictConfig(custom_config)
         suppress_noisy_third_party_logs()
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
     log_level = getattr(logging, server_args.log_level.upper())
-    logging.basicConfig(
+    configure_root_logger(
         level=log_level,
-        format=format,
+        log_format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
+        stream=sys.stderr,
+        enable_async_logging=server_args.enable_async_logging,
     )
 
     # Only set specified log level for tokenspeed-related loggers

@@ -125,7 +125,7 @@ class AscendMLABackend(MLAAttnBackend):
         self._current_active: torch.Tensor | None = None
         self._current_local = None
         self._prefill_runtime = None
-        self._prefill_workspace = None
+        self._prefill_group = None
         self._prefill_slots: torch.Tensor | None = None
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_spans: tuple[tuple[int, int, int], ...] = ()
@@ -134,12 +134,12 @@ class AscendMLABackend(MLAAttnBackend):
         self._prefill_cpu_table = None
 
     @property
-    def native_prefill_enabled(self):
+    def prefill_enabled(self):
         return self._prefill_options is not None
 
     @property
     def prefill_needs_host_page_table(self):
-        return self.native_prefill_enabled
+        return self.prefill_enabled
 
     def init_forward_metadata(self, *args, page_table_cpu=None, **kwargs):
         self._prefill_cpu_table = page_table_cpu
@@ -163,44 +163,37 @@ class AscendMLABackend(MLAAttnBackend):
         self._prefill_plan = None
         self._prefill_pages = None
         self._prefill_spans = ()
+        # Every world rank creates the cache-owner groups before any forward.
+        if self.prefill_enabled and self._dcp.degree > 1:
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager,
+            )
 
-    def prepare_prefill_workspace(self):
-        if not self.native_prefill_enabled:
+            self._prefill_group = process_group_manager.get_dedicated_device_group(
+                self._dcp.ranks, "prefill-history"
+            )
+        else:
+            self._prefill_group = None
+
+    def prepare_prefill(self) -> int:
+        if not self.prefill_enabled or self._prefill_runtime is not None:
             return 0
-        if self._prefill_runtime is not None:
-            return self._prefill_workspace.capacity_bytes
         if self.cache_pool is None:
             raise RuntimeError("Bind the MLA cache before preparing Prefill")
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager,
-        )
-
         layer_id = min(self.cache_pool.history_group_by_layer())
         kv = self.cache_pool.get_key_buffer(layer_id)
-        workspace, buffers = self._prefill_options.allocate_workspace(
-            local_rows=kv.numel() // 576,
-            degree=self._dcp.degree,
-            index_width=0,
-            device=kv.device,
-        )
         runtime = prepare_ascend_mla_prefill(
             kv,
             ranks=self._dcp.ranks,
-            bootstrap_group=process_group_manager.get_process_group(
-                "gloo", self._dcp.ranks
-            ),
+            history_group=self._prefill_group,
             max_current_rows=self._prefill_options.max_current_rows,
-            workspace=buffers[:3],
-            max_history_rows=self._prefill_options.history_capacity_rows,
             history_null_rows=self._prefill_options.kv_page_size,
         )
-        self._prefill_workspace = workspace
-        self._prefill_slots = buffers[3]
         self._prefill_runtime = runtime
-        return self._prefill_workspace.capacity_bytes
+        return 0
 
     def _init_prefill_metadata(self, **kwargs):
-        if not self.native_prefill_enabled:
+        if not self.prefill_enabled:
             return super()._init_prefill_metadata(**kwargs)
         extends = kwargs["extend_seq_lens_cpu"].tolist()
         prefixes = kwargs["extend_prefix_lens_cpu"].tolist()
@@ -246,25 +239,26 @@ class AscendMLABackend(MLAAttnBackend):
         self.chunked_prefill_metadata = metadata
 
     def prefetch_prefill_layer(self, layer_id):
-        if not self.native_prefill_enabled or self._prefill_plan is None:
-            raise RuntimeError("Prepare native MLA Prefill metadata first")
+        """Submit history at KDA, or ensure it at the attention entry."""
+        plan = self._prefill_plan
+        if not self.prefill_enabled or plan is None or plan.gather is None:
+            raise RuntimeError("Prepare MLA Prefill page metadata first")
         if self._prefill_runtime is None:
-            self.prepare_prefill_workspace()
-        self._prefill_runtime.prefetch(
+            self.prepare_prefill()
+        runtime = self._prefill_runtime
+        if runtime.layer_id is None:
+            self._prefill_slots = torch.empty(
+                sum(plan.row_counts), dtype=torch.int64, device=plan.page_table.device
+            )
+        runtime.prefetch(
             layer_id,
             self.cache_pool.get_key_buffer(layer_id),
             None,
-            has_history=not self._prefill_plan.cold,
-            history_slots=(
-                None
-                if self._prefill_plan.gather is None
-                else self._prefill_plan.gather.send_slots
-            ),
-            history_counts=(
-                None
-                if self._prefill_plan.gather is None
-                else self._prefill_plan.gather.row_counts
-            ),
+            batch_key=plan,
+            total_rows=sum(plan.row_counts),
+            has_history=not plan.cold,
+            history_slots=plan.gather.send_slots,
+            history_counts=plan.gather.row_counts,
         )
 
     def start_prefill_kv(self, layer_id, latent):
@@ -300,12 +294,12 @@ class AscendMLABackend(MLAAttnBackend):
 
     def finish_prefill_layer(self, layer_id):
         self._prefill_runtime.finish(layer_id)
+        self._prefill_slots = None
 
     def close_prefill(self):
         if self._prefill_runtime is not None:
             self._prefill_runtime.close()
             self._prefill_runtime = None
-        self._prefill_workspace = None
         self._prefill_slots = None
 
     def configure_runtime(

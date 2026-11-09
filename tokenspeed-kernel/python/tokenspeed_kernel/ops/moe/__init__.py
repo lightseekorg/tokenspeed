@@ -70,6 +70,10 @@ __all__ = [
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
     "prepare_sm90_fp8_moe",
+    "moe_sorted_down",
+    "moe_sorted_gate_up",
+    "prepare_moe_sorted_down_weight",
+    "warmup_moe_sorted_prefill",
 ]
 
 
@@ -162,7 +166,7 @@ def prepare_sm90_fp8_moe(
         returning its output list. Private modes additionally accept a positive
         uint32 ``expected_m`` or None. Callers compute that hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
-        private modes require FlashInfer 0.7.2, Hopper, and a working JIT compiler.
+        private modes require FlashInfer 0.7.3, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
@@ -1062,6 +1066,12 @@ from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
     gather_moe_routes,
     routed_input_scale_rmsnorm_sum,
     routed_input_scale_rmsnorm_sum_gathered,
+)
+from tokenspeed_kernel.ops.moe.sorted_prefill import (  # noqa: E402
+    moe_sorted_down,
+    moe_sorted_gate_up,
+    prepare_moe_sorted_down_weight,
+    warmup_moe_sorted_prefill,
 )
 
 
@@ -2099,6 +2109,9 @@ def moe_plan(
         "supports_valid_token_mask": "valid_token_mask" in apply_spec.features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
+        "fuse_shared_expert": getattr(
+            kernel.impl, "_tokenspeed_fuse_shared_expert", None
+        ),
         "a2a_backend": a2a_backend,
         "process_group": process_group,
         "deepep_mode": deepep_mode or "auto",

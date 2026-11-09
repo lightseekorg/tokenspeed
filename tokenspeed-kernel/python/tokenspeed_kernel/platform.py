@@ -88,9 +88,14 @@ def _prepend_env_path(name: str, path: Path) -> None:
 def _npu_is_available() -> bool:
     """Return whether torch-npu is installed and an Ascend device is visible."""
     try:
-        import torch_npu  # noqa: F401
+        import torch_npu
     except ImportError:
         return False
+    # Use timed completion events by default; preserve explicit constructor arguments.
+    torch_npu.npu.Event.__new__.__defaults__ = (
+        True,
+        *torch_npu.npu.Event.__new__.__defaults__[1:],
+    )
     return bool(torch.npu.is_available())
 
 
@@ -232,6 +237,14 @@ class PlatformInfo:
         )
         if int(status) != 0:
             raise RuntimeError(f"cudaHostRegister failed with {status!s}")
+
+    def unregister_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
+        """Release a host registration while its backing tensor is still alive."""
+        if tensor.device.type != "cpu" or tensor.numel() == 0:
+            return
+        status = torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+        if int(status) != 0:
+            raise RuntimeError(f"cudaHostUnregister failed with {status!s}")
 
     def device_visible_data_ptr(self, tensor: torch.Tensor) -> int:
         """Return a pointer value that is valid to dereference from GPU kernels."""

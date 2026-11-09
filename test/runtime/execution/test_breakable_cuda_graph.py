@@ -211,6 +211,34 @@ class TestBreakableCudaGraph:
             torch.cuda.synchronize()
             torch.testing.assert_close(captured_out, eager(new_x), msg=f"trial {trial}")
 
+    def test_a_break_indexes_with_its_segment_while_segments_run_in_capture(self):
+        """A capture records a segment without running it; with
+        run_segments_while_capturing the break that follows reads what the
+        segment computed, during the capture too, so it may index with it."""
+        table = torch.arange(100, device=self.dev, dtype=self.dtype) * 3
+        offsets = torch.tensor([1, 5, 2], device=self.dev)
+        seen = []
+
+        def gather(rows):
+            # An index outside the table faults the device.
+            picked = table[rows]
+            seen.append(picked.clone())
+            return picked
+
+        dst = torch.empty(3, device=self.dev, dtype=self.dtype)
+        cap = BreakableCapture(run_segments_while_capturing=True)
+        with cap:
+            rows = offsets * 10 + 7
+            result = break_here(gather, dst, rows) + 1
+        torch.cuda.synchronize()
+        assert torch.equal(seen[0], table[offsets * 10 + 7])
+
+        offsets.copy_(torch.tensor([0, 9, 4], device=self.dev))
+        cap.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(seen[1], table[offsets * 10 + 7])
+        assert torch.equal(result, table[offsets * 10 + 7] + 1)
+
     def test_nested_capture_rejected(self):
         with BreakableCapture():
             with pytest.raises((RuntimeError)):
@@ -800,6 +828,7 @@ class TestPrefillGraphMaxTokensResolution:
     @staticmethod
     def _args(**overrides):
         base = dict(
+            disaggregation_mode="null",
             prefill_graph_max_tokens=None,
             chunked_prefill_size=8192,
             max_total_tokens=None,

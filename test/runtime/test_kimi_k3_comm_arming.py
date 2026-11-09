@@ -108,6 +108,8 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
         value.iris_state = None
         value.comm = None
         value.shared_experts = SimpleNamespace(shared_parallel=None)
+        # As on CDNA4: the execution plan leaves the decode chain off.
+        value.execution_plan = SimpleNamespace(decode_chain=False)
         return value
 
     layers = []
@@ -564,6 +566,15 @@ def test_attention_producer_window(monkeypatch, rows, eligible):
     out = comm.acquire_projection_output(like, projection)
     assert (out is destination) == eligible
     assert acquire.call_count == int(eligible)
+    # Acquiring storage for a new producer forgets an earlier publication.
+    comm.iris_state = SimpleNamespace(take_published=Mock(return_value=object()))
+    out = comm.acquire_projection_output(like, projection)
+    assert (out is destination) == eligible
+    if eligible:
+        comm.iris_state.take_published.assert_called_once_with(destination)
+    else:
+        comm.iris_state.take_published.assert_not_called()
+    comm.iris_state = None
     if rows == 16 and eligible:
         projection.reduce_results = True
         assert comm.acquire_projection_output(like, projection) is None
@@ -576,8 +587,10 @@ def test_attention_producer_window(monkeypatch, rows, eligible):
     "rows,is_cdna4,eligible",
     [
         (48, True, False),
-        (56, True, True),
-        (57, True, False),
+        (56, True, False),
+        (64, True, False),
+        (72, True, True),
+        (73, True, False),
         (8192, True, True),
         (8200, True, False),
         (512, False, False),
@@ -599,6 +612,7 @@ def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
     monkeypatch.setattr(
         module, "current_platform", lambda: SimpleNamespace(is_cdna4=is_cdna4)
     )
+    published = object()
     result = comm.mix_for_moe(
         partial,
         None,
@@ -609,6 +623,9 @@ def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
         out_norm_weight=weight,
         out_norm_eps=1e-5,
         num_valid_blocks=4,
+        residual_is_sharded=False,
+        published=published,
+        defer_gather=True,
     )
     if eligible:
         assert result is expected
@@ -622,10 +639,54 @@ def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
             out_norm_weight=weight,
             out_norm_eps=1e-5,
             num_valid_blocks=4,
+            residual_is_sharded=False,
+            published=published,
+            defer_gather=True,
         )
     else:
         assert result is None
         operation.assert_not_called()
+
+
+@pytest.mark.parametrize("publisher", [None, 0, 1])
+def test_attention_projection_publishes_or_falls_back_to_mm(monkeypatch, publisher):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    activation = torch.empty((8192, 1536), dtype=torch.bfloat16, device="meta")
+    weight = torch.empty((7168, 1536), dtype=torch.bfloat16, device="meta")
+    out = torch.empty((8192, 7168), dtype=torch.bfloat16, device="meta")
+    states = {
+        (index,): SimpleNamespace(
+            project_attention=Mock(return_value=index == publisher)
+        )
+        for index in range(2)
+    }
+    gemm = Mock(return_value=out)
+    monkeypatch.setattr(module.K3AttnComm, "iris_states", states)
+    monkeypatch.setattr(module, "mm", gemm)
+    assert module.project_attention_partial(activation, weight, out) is out
+    if publisher is None:
+        gemm.assert_called_once_with(activation, weight, bias=None, out=out)
+    else:
+        gemm.assert_not_called()
+    for index, state in enumerate(states.values()):
+        if publisher is None or index <= publisher:
+            state.project_attention.assert_called_once_with(activation, weight, out)
+        else:
+            state.project_attention.assert_not_called()
+
+
+def test_take_published_needs_an_iris_state():
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    comm = module.K3AttnComm.__new__(module.K3AttnComm)
+    comm.iris_state = None
+    partial = torch.empty((8192, 7168), dtype=torch.bfloat16, device="meta")
+    assert comm.take_published(partial) is None
+    record = object()
+    comm.iris_state = SimpleNamespace(take_published=Mock(return_value=record))
+    assert comm.take_published(partial) is record
+    comm.iris_state.take_published.assert_called_once_with(partial)
 
 
 if __name__ == "__main__":

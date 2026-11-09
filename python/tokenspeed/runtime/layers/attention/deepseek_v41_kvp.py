@@ -69,7 +69,7 @@ def gather_paged_history(
         placement=placement,
         owned_rows_per_rank=counts,
     )
-    slots = plan.local_fetch_slots
+    slots = plan.send_slots
     local = cache[slots // 64, slots % 64].contiguous()
     # Page zero is never selected; padding is masked by visible lengths.
     result = cache.new_zeros((pages + 1, 64, cache.shape[-1]))
@@ -102,6 +102,19 @@ def gather_decode_history(
         or placement.block_granularity != 64
     ):
         raise ValueError("V4.1 decode history requires a page table and scalar length")
+    if cache.is_cuda:
+        from tokenspeed_kernel.ops.attention.dsv41 import history_pack
+
+        result = history_pack(
+            cache,
+            table,
+            visible_rows,
+            virtual_block_count=placement.virtual_block_count,
+            degree=len(placement.group),
+            rank=placement.rank,
+        )
+        # Including the zero null page avoids a post-reduction allocation/copy.
+        return all_reduce(result, placement.group, op=torch.distributed.ReduceOp.MAX)
     slots, owned = resolve_cache_slots(table.long() * 64, placement)
     active = owned & (
         torch.arange(table.numel(), device=table.device) * 64 < visible_rows

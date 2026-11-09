@@ -51,13 +51,10 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.distributed.comm_ops import all_gather
+from tokenspeed.runtime.distributed.comm_ops import all_gather, token_all_gather
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.backends.base import (
-    AttentionBackend,
-    reject_query_shard,
-)
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
@@ -74,8 +71,11 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_GLOBAL_R1_GROUP_ID,
     V41_GLOBAL_R2_GROUP_ID,
     V41_GROUP_GEOMETRY,
+    V41_HEAD_DIM,
     V41_PREFILL_QUERY_TILE,
     V41_SWA_GROUP_ID,
+    V41_WINDOW_SIZE,
+    v41_prefill_kv_workspace_rows,
     v41_table_widths,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v41_kvp import (
@@ -92,6 +92,7 @@ from tokenspeed.runtime.layers.attention.prefill_head_exchange import (
 )
 from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
 
 # Initial long-prefill thresholds; tune with query count and visible history.
@@ -170,12 +171,17 @@ class V41RowPlan(NamedTuple):
     layer attends and returns; ``keep_rows`` gathers them out of the source
     rows, None when the two are the same window. Only the first CED decoder
     layer narrows: it projects the decoder's global KV from every encoder row
-    and then attends the per-request tail only.
+    and then attends the per-request tail only. Under model QCP the metadata
+    stays full-window, source_shard/query_shard describe local ownership, and
+    keep_rows indexes local source rows. Cache production still uses the full
+    metadata, never a shard-relative prefix or compressor plan.
     """
 
     source: V41Metadata
     query: V41Metadata
     keep_rows: torch.Tensor | None
+    source_shard: QueryShardPlan | None
+    query_shard: QueryShardPlan | None
 
 
 class V41DecoderView(NamedTuple):
@@ -190,6 +196,23 @@ class V41DecoderView(NamedTuple):
     spans: tuple[V41PrefillSpan, ...]
     keep_rows: torch.Tensor | None
     logits_rows: torch.Tensor | None
+    # Host copy for planning output ownership without reading device metadata.
+    logits_rows_cpu: tuple[int, ...] | None = None
+
+
+class V41PrefillQueryShard(NamedTuple):
+    """This rank's rows of a model-wide QCP prefill, planned once per forward.
+
+    Cache-production metadata stays in the full layout. keep_rows selects
+    this rank's CED decoder rows from its encoder rows. decoder_plan splits
+    the decoder view's rows at the encoder shard boundaries, without
+    redistributing ownership; its sampled rows are the view's logits rows,
+    which sampled_rows holds on the device in the view's layout.
+    """
+
+    keep_rows: torch.Tensor
+    decoder_plan: QueryShardPlan
+    sampled_rows: torch.Tensor
 
 
 @dataclass
@@ -220,6 +243,8 @@ class V41PrefillRequestPlan:
     prefix_slots: torch.Tensor
     swa_indices: torch.Tensor
     history_slots: dict[int, torch.Tensor]
+    # Source KV rows can span other ranks; rows above index local queries.
+    current_rows: slice | torch.Tensor | None = None
 
 
 @dataclass
@@ -227,6 +252,63 @@ class V41SWAQueryPlan:
     positions: torch.Tensor
     request_indices: torch.Tensor
     requests: tuple[V41PrefillRequestPlan, ...]
+
+
+@dataclass
+class V41PrefillBatch:
+    """Prefill requests sharing one attention call over one KV workspace.
+
+    Workspace rows are [every request's owner history | every request's SWA
+    keys]. Row tensors are fixed for every layer sharing the plan and owner.
+    """
+
+    kv_rows: int
+    history_rows: int
+    # (request plan, first history row, history rows) per request, including
+    # requests without local queries: they still join KVP history gathers.
+    histories: tuple[tuple[V41PrefillRequestPlan, int, int], ...]
+    # Local query rows in call order; None when no request has local queries.
+    query_rows: slice | torch.Tensor | None
+    prefix_source: torch.Tensor
+    prefix_target: torch.Tensor
+    current_source: torch.Tensor
+    current_target: torch.Tensor
+    # [queries, WINDOW] workspace rows of each query's SWA keys, -1 for none.
+    swa_indices: torch.Tensor
+    # [queries] first workspace row of each query's owner history.
+    history_base: torch.Tensor
+
+
+@dataclass
+class V41PrefillLayout:
+    """Batched prefill attention addressing for one SWA plan and KV owner."""
+
+    plan: V41SWAQueryPlan
+    # Every request's old SWA prefix slots, gathered once per layer.
+    prefix_slots: torch.Tensor
+    batches: tuple[V41PrefillBatch, ...]
+    # Per batch: owner history slots in workspace order (replicated cache).
+    history_slots: tuple[torch.Tensor | None, ...]
+
+
+def zeroed_fused_output(
+    q: torch.Tensor, groups: int, rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zeroed grouped FP8 attention output in the fused kernel's own layout.
+
+    Batches of one prefill step fill disjoint rows, so the destination has to
+    match what the kernel returns for one batch. The codes are contiguous
+    [rows, groups, group width]. The scales keep the fused kernel's scale
+    layout: allocated as [groups, scale words, rows padded to four] and viewed
+    back to [rows, groups, scale words], which leaves the row stride at one.
+    Zeroed codes read as zero under any scale, as the zeroed BF16 output of the
+    step-by-step path does.
+    """
+    width = q.shape[1] * q.shape[2] // groups
+    codes = q.new_zeros((rows, groups, width), dtype=torch.float8_e4m3fn)
+    padded = (rows + 3) // 4 * 4
+    scales = q.new_zeros((groups, width // 128, padded), dtype=torch.int32)
+    return codes, scales.transpose(1, 2)[:, :rows].transpose(0, 1)
 
 
 @dataclass
@@ -297,6 +379,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._swa_plans: dict[tuple[ForwardMode, int], V41SWAQueryPlan] = {}
         self._prefill_spans: tuple[V41PrefillSpan, ...] = ()
         self._decoder_view: V41DecoderView | None = None
+        self._prefill_query_shard: V41PrefillQueryShard | None = None
         self._decode_schedule_keepalive: list[object] = []
         # One native decode schedule per distinct (SWA lengths, global lengths)
         # pair within a forward; layers reusing a selection share it.
@@ -306,6 +389,22 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prepared_selections: dict[tuple, tuple] = {}
         self._index_geometry: dict[tuple, V41IndexGeometry] = {}
         self._in_model_forward = False
+        # Batched prefill attention packs requests' owner histories and SWA
+        # keys into this persistent workspace; requests beyond it start
+        # another batch. Sized by v41_prefill_kv_workspace_rows.
+        self._prefill_kv_rows = v41_prefill_kv_workspace_rows(
+            config.context_len,
+            spec.max_query_tokens,
+            spec.kv_owners,
+            spec.compress_ratios,
+        )
+        self._prefill_kv: torch.Tensor | None = None
+        # Batch addressing per (SWA plan, owner); cleared with the SWA plans.
+        self._prefill_layouts: dict[tuple[int, int], V41PrefillLayout] = {}
+        # Batch whose owner histories the workspace holds. Layers reading the
+        # same owner skip that gather; any global write or other batch, and
+        # every layout reset, clears it.
+        self._prefill_kv_batch: V41PrefillBatch | None = None
         self._local_decode_selections: dict[tuple, tuple] = {}
         self._partitioned_index_layers: set[int] = set()
 
@@ -338,6 +437,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._kvp_tables_cpu = {}
+        # Allocated once with the pool (the recipe reserves it); every layer
+        # and forward rewrites its rows instead of allocating workspaces.
+        self._prefill_kv = torch.empty(
+            (self._prefill_kv_rows, V41_HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
         self.forward_metadata = None
         self.forward_prefill_metadata = None
         self.forward_decode_metadata = None
@@ -345,8 +451,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decode_buffers = None
         self._max_decode_bs = 0
         self._swa_plans.clear()
+        self._prefill_layouts.clear()
+        self._prefill_kv_batch = None
         self._prefill_spans = ()
         self._decoder_view = None
+        self._prefill_query_shard = None
         self._decode_schedule_keepalive.clear()
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
@@ -472,6 +581,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 del self._swa_plans[key]
         else:
             self._swa_plans.clear()
+            self._prefill_layouts.clear()
+            self._prefill_kv_batch = None
         meta = self._decode_view(bs)
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
             copy_page_table,
@@ -486,6 +597,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             copy_page_table(src, dest, actual_bs)
         meta.num_extends = num_extends
         self.forward_metadata = self.forward_decode_metadata = meta
+        self._prefill_query_shard = None
         from tokenspeed_kernel.ops.attention.dsv41 import decode_rows
 
         decode_rows(
@@ -614,7 +726,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
-        reject_query_shard(query_shard, "DeepseekV41AttentionBackend")
+        if query_shard is not None:
+            if (
+                not forward_mode.is_extend()
+                or forward_mode.is_mixed()
+                or num_extends != bs
+            ):
+                raise ValueError("V4.1 model QCP requires pure prefill")
+            if (
+                len(self.spec.indexer_query_group) > 1
+                or len(self.spec.attention_query_group) > 1
+            ):
+                raise ValueError(
+                    "V4.1 model QCP cannot combine with operator-level QCP"
+                )
         if self.kvp_size > 1:
             if (
                 not forward_mode.is_extend()
@@ -634,6 +759,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError("V4.1 decode metadata must use refresh_decode_metadata")
         self._check_tables(block_tables, bs)
         self._swa_plans.clear()
+        self._prefill_layouts.clear()
+        self._prefill_kv_batch = None
         self._prepared_selections.clear()
         self._index_geometry.clear()
         self._decode_schedules.clear()
@@ -646,6 +773,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             width
         ] * (bs - num_extends)
         total = sum(counts)
+        if query_shard is not None and query_shard.total_rows != total:
+            raise ValueError("V4.1 query shard must cover the full prefill span")
         if "num_tokens" in kwargs and kwargs["num_tokens"] != total:
             raise ValueError("V4.1 num_tokens disagrees with extend/verify lengths")
         prefixes = [int(n) for n in extend_prefix_lens_cpu[:num_extends].tolist()]
@@ -744,6 +873,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decoder_view = self._build_decoder_view(
             meta, completes, window, forward_mode
         )
+        self._prefill_query_shard = (
+            None
+            if query_shard is None
+            else self._partition_prefill_queries(query_shard)
+        )
         self.sparse_topk.clear()
 
     def _build_decoder_view(
@@ -783,6 +917,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._prefill_spans,
                 None,
                 None,
+                tuple(span.offset + span.count - 1 for span in self._prefill_spans),
             )
         rows = []
         spans = []
@@ -846,6 +981,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             tuple(spans),
             keep_rows,
             self._upload_int64(logits_rows),
+            tuple(logits_rows),
         )
 
     def decoder_view(self) -> V41DecoderView:
@@ -853,6 +989,51 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if self._decoder_view is None:
             raise RuntimeError("V4.1 metadata has not been prepared for this forward")
         return self._decoder_view
+
+    def prefill_query_shard(self) -> V41PrefillQueryShard:
+        """This rank's rows of the current model-wide QCP prefill."""
+        if self._prefill_query_shard is None:
+            raise RuntimeError("V4.1 metadata was not prepared with a query shard")
+        return self._prefill_query_shard
+
+    def _partition_prefill_queries(self, plan: QueryShardPlan) -> V41PrefillQueryShard:
+        """Derive encoder/CED row ownership without slicing cache-write plans.
+
+        Planning uses host spans and the decoder view's host logits rows; it
+        never copies a GPU selection to the host or treats a rank boundary as
+        a cache prefix. Device row maps are uploaded once per forward.
+        """
+        view = self.decoder_view()
+        sources = {span.request: span for span in self._prefill_spans}
+        kept = []
+        for span in view.spans:
+            source = sources[span.request]
+            start = source.offset + span.prefix - source.prefix
+            if (
+                not source.offset
+                <= start
+                <= start + span.count
+                <= (source.offset + source.count)
+            ):
+                raise ValueError("V4.1 CED rows fall outside their source request")
+            kept.extend(range(start, start + span.count))
+        kept_cpu = torch.tensor(kept, dtype=torch.int64)
+        sampled_cpu = torch.tensor(view.logits_rows_cpu, dtype=torch.int64)
+        decoder_plan = plan.select_rows(
+            kept_cpu,
+            input_lengths=[span.count for span in view.spans],
+            sampled_rows=sampled_cpu,
+        )
+        local = plan.split_rows(kept_cpu).local_ids
+        return V41PrefillQueryShard(
+            self._upload_int64(local.tolist()),
+            decoder_plan,
+            (
+                view.logits_rows
+                if view.logits_rows is not None
+                else self._upload_int64(sampled_cpu.tolist())
+            ),
+        )
 
     def _window(self, positions, requests, forward_mode):
         """Canonical window backing (positions, requests), or None for a free subset.
@@ -1165,6 +1346,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
         gid = self._owner_group(owner)
         ratio = self.spec.compress_ratios[owner]
+        # New global rows make any history held by the prefill workspace stale.
+        self._prefill_kv_batch = None
         index_values = (
             index_k.values if isinstance(index_k, dsv41.IndexKeyInput) else index_k
         )
@@ -1282,6 +1465,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         index_process_group,
         *,
         projected_partition: InterleavedQueryPlan | None = None,
+        query_shard: QueryShardPlan | None,
     ):
         """Select/reuse request-local global rows; return (physical slots, lengths).
 
@@ -1292,12 +1476,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         always supply None. A sharded indexer must supply its head-reduction
         process group; replicated indexer heads supply None. Candidates survive
         Reindex updates.
+        query_shard supplies a model-level row plan: coordinates remain
+        the complete canonical window on entry, projections contain local rows,
+        and returned selections/candidates stay local. History bounds are taken
+        from the full request spans, including requests with no local queries.
         Decode graph Full sources use the refresh's full query window; consumers
         may reorder/subset it. A subset Reindex and its Reuse consumers share the
         same window tensors. Other source windows retain eager coverage validation.
-        Full scans device-visible history in fixed partitions; Reindex scans
-        shape-bounded candidates. TP gathers small Q/weight tiles once, not
-        scores per history tile. No full-history query/score matrix is materialized.
+        Full scans device-visible history; Reindex scans shape-bounded candidates.
+        Replicated-cache decode scores the caller's complete query batch;
+        owner-local history retains per-request windows. Canonical replicated-cache
+        prefill batches request windows into one index_topk call within the
+        index_logit_rows budget. TP gathers Q/weight once per call.
         """
         from tokenspeed_kernel.ops.attention import dsv41
 
@@ -1308,6 +1498,24 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError(
                 "V4.1 selection queries exceed or disagree with the workspace budget"
             )
+        source_window = None
+        if query_shard is not None:
+            if not forward_mode.is_extend() or forward_mode.is_mixed():
+                raise ValueError("Model QCP selection requires pure prefill")
+            if (
+                projected_partition is not None
+                or len(self.spec.indexer_query_group) > 1
+            ):
+                raise ValueError(
+                    "Model QCP cannot combine with operator-level indexer QCP"
+                )
+            source_window = self._window(positions, request_indices, forward_mode)
+            if source_window is None or positions.numel() != query_shard.total_rows:
+                raise ValueError(
+                    "Model QCP selection requires its canonical source window"
+                )
+            positions = positions[query_shard.local_row_ids]
+            request_indices = request_indices[query_shard.local_row_ids]
         owner, source = self.spec.kv_owners[layer_id], self.spec.index_sources[layer_id]
         if owner < 0:
             if index_q is not None or index_weights is not None:
@@ -1342,8 +1550,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 ),
                 lens,
             )
-        history_bound = self._index_history_bound(
-            positions, request_indices, forward_mode
+        history_bound = (
+            max((span.prefix + span.count for span in source_window[1]), default=0)
+            if source_window is not None
+            else self._index_history_bound(positions, request_indices, forward_mode)
         )
         selection_kind = self._index_selection_kind(layer_id, history_bound)
         if (index_q is None) != (index_weights is None):
@@ -1373,7 +1583,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if history_bound is not None:
             table = table[:, : max(1, (history_bound // ratio + 63) // 64)]
         window = (
-            self._window(positions, request_indices, forward_mode)
+            source_window or self._window(positions, request_indices, forward_mode)
             if forward_mode.is_extend()
             else None
         )
@@ -1458,27 +1668,49 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             device=self.device,
         )
         block_lens = torch.empty(n, dtype=torch.int32, device=self.device)
-        # Query tiling bounds both score scratch and replicated table rows. Do
-        # not index_select the table for the entire prefill (T * context pages).
+        # Canonical replicated-cache prefill batches request windows so one
+        # index_topk call covers the index_logit_rows budget. KVP windows stay
+        # per request; other prefill windows use 256-row tiles and decode
+        # scores its whole batch.
         canonical_prefill = window is not None
         query_tile = 1024 if canonical_prefill else 256
-        windows = (
-            [
+        if forward_mode.is_decode():
+            query_tile = max(1, n)
+        if kvp_decode:
+            windows = [
                 (span.offset, span.offset + span.count, span)
                 for span in spans
                 if span.count
             ]
-            if canonical_prefill or kvp_decode
-            else [
+        elif canonical_prefill:
+            windows = [
+                (span.offset, span.offset + span.count, span)
+                for span in spans
+                if span.count
+            ]
+        else:
+            windows = [
                 (start, min(start + query_tile, n), None)
                 for start in range(0, n, query_tile)
             ]
-        )
+        if query_shard is not None:
+            # Keep the complete request list: even empty query owners must join
+            # the same KVP history gathers, using the original history bounds.
+            windows = [
+                (*query_shard.local_bounds(start, stop), span)
+                for start, stop, span in windows
+            ]
         if partition is not None:
             windows = [
                 (*partition.local_bounds(start, stop), span)
                 for start, stop, span in windows
             ]
+        if canonical_prefill and self.kvp_size == 1:
+            windows = self._merge_index_windows(windows, ratio, reindex)
+        elif canonical_prefill and not reindex:
+            # KVP gathers one request's history per window; only a request whose
+            # own logits exceed one call is split.
+            windows = self._split_index_windows(windows, ratio)
         # Candidate-source Full passes still gather history for block maxima.
         # Ordinary Full and Reindex exchange only local row candidates.
         local_index_available = (
@@ -1491,9 +1723,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         )
         for start, stop, span in windows:
+            members = self._index_window_members(span)
+            window_history = (
+                max((item.prefix + item.count for item, _ in members), default=0)
+                if members
+                else (history_bound if span is None else span.prefix + span.count)
+            )
             selection_kind = self._index_selection_kind(
                 layer_id,
-                span.prefix + span.count if canonical_prefill else history_bound,
+                window_history if canonical_prefill else history_bound,
             )
             local_index = local_index_available and selection_kind != "all"
             scoring_cache = index_cache
@@ -1539,8 +1777,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     )[None, :]
                 tile_table = row.expand(stop - start, -1)
                 if kvp_decode:
-                    # Broadcast tables select dense scoring; decode/verify needs
-                    # paged Full and candidate-only sparse Reindex scoring.
+                    # Decode/verify needs paged Full and candidate-only sparse
+                    # Reindex scoring; prefill scores the request's history densely.
                     tile_table = tile_table.contiguous()
                 geometry = V41IndexGeometry(
                     scoring_positions,
@@ -1548,7 +1786,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     source_table,
                     tile_table,
                     visible,
-                    dsv41.new_index_metadata(tile_table, visible),
+                    dsv41.new_index_metadata(
+                        tile_table,
+                        visible,
+                        scoring_requests[start:stop].to(torch.int32).contiguous(),
+                        history_rows=None if kvp_decode else (stop - start,),
+                    ),
                 )
             else:
                 geometry = self._selection_geometry(
@@ -1609,7 +1852,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self.spec.index_topk,
                 candidate_capacity if produce_candidates else 0,
                 self.spec.candidate_block_size,
-                query_tile,
+                max(1, stop - start),
                 256,
                 index_process_group,
                 outputs,
@@ -1662,12 +1905,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             forward_mode,
             index_process_group,
             projected_partition=projected_partition,
+            query_shard=None,
         )
         key = (layer_id, forward_mode, id(positions), id(requests))
         self._prepared_selections[key] = (positions, requests, result)
         return result
 
-    def _swa_query_plan(self, positions, requests, forward_mode) -> V41SWAQueryPlan:
+    def _swa_query_plan(
+        self,
+        positions,
+        requests,
+        forward_mode,
+        *,
+        query_shard: QueryShardPlan | None,
+    ) -> V41SWAQueryPlan:
         """Validate one prefill query window and retain only address scratch.
 
         Canonical spans reuse the scheduler's CPU lengths. Arbitrary reordered
@@ -1675,6 +1926,41 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         distinguish equal-sized windows; only the latest plan per mode is held.
         Every metadata refresh invalidates these plans. No KV payload is cached.
         """
+
+        if query_shard is not None:
+            if not forward_mode.is_extend() or forward_mode.is_mixed():
+                raise ValueError("V4.1 sharded SWA requires pure prefill")
+            if positions.numel() != query_shard.total_rows:
+                raise ValueError("V4.1 SWA source rows disagree with the query shard")
+            if self._window(positions, requests, forward_mode) is None:
+                raise ValueError("V4.1 sharded SWA requires a canonical source window")
+            source = self._swa_query_plan(
+                positions, requests, forward_mode, query_shard=None
+            )
+            plans = []
+            for request in source.requests:
+                rows = request.rows
+                # Canonical windows have contiguous request spans. Preserve
+                # every request (even with no local query) for KV collectives.
+                start, stop = query_shard.local_bounds(rows.start, rows.stop)
+                local_rows = slice(start, stop)
+                query_rows = query_shard.local_row_ids[local_rows] - rows.start
+                plans.append(
+                    V41PrefillRequestPlan(
+                        request.request,
+                        local_rows,
+                        request.last_position,
+                        request.prefix_slots,
+                        request.swa_indices[query_rows],
+                        request.history_slots,
+                        current_rows=rows,
+                    )
+                )
+            return V41SWAQueryPlan(
+                positions[query_shard.local_row_ids],
+                requests[query_shard.local_row_ids],
+                tuple(plans),
+            )
         key = (forward_mode, id(positions))
         plan = self._swa_plans.get(key)
         if (
@@ -1756,6 +2042,145 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._swa_plans[key] = plan
         return plan
 
+    def _prefill_layout(self, plan, owner, forward_mode) -> V41PrefillLayout:
+        """Pack a plan's requests into batches of the persistent KV workspace.
+
+        Requests fill a batch in plan order, each taking its owner history and
+        its SWA keys (old prefix plus step rows); one that does not fit starts
+        the next batch. The workspace holds several worst-case requests, so any
+        one request fits. Layers sharing the plan and owner reuse the result.
+        """
+        key = (id(plan), owner)
+        layout = self._prefill_layouts.get(key)
+        if layout is not None and layout.plan is plan:
+            return layout
+        ratio = self.spec.compress_ratios[owner] if owner >= 0 else 0
+        groups, pending, rows = [], [], 0
+        prefix_offset = 0
+        for request_plan in plan.requests:
+            prefix_count = request_plan.prefix_slots.numel()
+            current = self._prefill_rows(
+                request_plan.current_rows
+                if request_plan.current_rows is not None
+                else request_plan.rows
+            )
+            history = (request_plan.last_position + 1) // ratio if owner >= 0 else 0
+            need = history + prefix_count + current.numel()
+            if need > self._prefill_kv_rows:
+                raise RuntimeError("V4.1 prefill request exceeds the KV workspace")
+            if pending and rows + need > self._prefill_kv_rows:
+                groups.append(pending)
+                pending, rows = [], 0
+            pending.append((request_plan, prefix_offset, current, history))
+            rows += need
+            prefix_offset += prefix_count
+        if pending:
+            groups.append(pending)
+        batches = tuple(self._prefill_batch(group) for group in groups)
+        history_slots = tuple(
+            (
+                torch.cat(
+                    [
+                        self._prefill_global_history(request, owner, forward_mode)
+                        for request, _, _ in batch.histories
+                    ]
+                )
+                if owner >= 0 and self.kvp_size == 1 and batch.histories
+                else None
+            )
+            for batch in batches
+        )
+        prefix_slots = (
+            torch.cat([request.prefix_slots for request in plan.requests])
+            if plan.requests
+            else torch.empty(0, dtype=torch.int64, device=self.device)
+        )
+        layout = V41PrefillLayout(plan, prefix_slots, batches, history_slots)
+        self._prefill_layouts[key] = layout
+        return layout
+
+    def _prefill_batch(self, entries) -> V41PrefillBatch:
+        device = self.device
+        history_rows = sum(history for _, _, _, history in entries)
+        histories = []
+        query_parts, swa_parts, base_parts = [], [], []
+        prefix_source, prefix_target = [], []
+        current_source, current_target = [], []
+        history_start, swa_start = 0, history_rows
+        for request_plan, prefix_offset, current, history in entries:
+            histories.append((request_plan, history_start, history))
+            prefix_count = request_plan.prefix_slots.numel()
+            swa_count = prefix_count + current.numel()
+            queries = self._prefill_rows(request_plan.rows).numel()
+            if queries:
+                # Requests without local queries only join history gathers.
+                prefix_source.append(
+                    torch.arange(
+                        prefix_offset, prefix_offset + prefix_count, device=device
+                    )
+                )
+                prefix_target.append(
+                    torch.arange(swa_start, swa_start + prefix_count, device=device)
+                )
+                current_source.append(current)
+                current_target.append(
+                    torch.arange(
+                        swa_start + prefix_count, swa_start + swa_count, device=device
+                    )
+                )
+                query_parts.append(request_plan.rows)
+                # Local SWA indices address [old prefix | step rows].
+                local = request_plan.swa_indices
+                swa_parts.append(torch.where(local >= 0, local + swa_start, local))
+                base_parts.append(
+                    torch.full(
+                        (queries,), history_start, dtype=torch.int32, device=device
+                    )
+                )
+                swa_start += swa_count
+            history_start += history
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+
+        def joined(parts):
+            return torch.cat(parts) if parts else empty
+
+        return V41PrefillBatch(
+            swa_start,
+            history_rows,
+            tuple(histories),
+            self._joined_prefill_rows(query_parts),
+            joined(prefix_source),
+            joined(prefix_target),
+            joined(current_source),
+            joined(current_target),
+            (
+                torch.cat(swa_parts)
+                if swa_parts
+                else torch.empty((0, V41_WINDOW_SIZE), dtype=torch.int32, device=device)
+            ),
+            joined(base_parts),
+        )
+
+    def _prefill_rows(self, rows) -> torch.Tensor:
+        if isinstance(rows, slice):
+            return torch.arange(rows.start, rows.stop, device=self.device)
+        return rows.to(torch.int64)
+
+    def _joined_prefill_rows(self, parts):
+        """One slice for consecutive slices, else int64 row indices; None if empty."""
+        parts = [
+            part
+            for part in parts
+            if (part.stop > part.start if isinstance(part, slice) else part.numel())
+        ]
+        if not parts:
+            return None
+        if all(isinstance(part, slice) for part in parts) and all(
+            left.stop == right.start for left, right in zip(parts, parts[1:])
+        ):
+            return slice(parts[0].start, parts[-1].stop)
+        return torch.cat([self._prefill_rows(part) for part in parts])
+
     def _prefill_global_history(self, plan, owner, forward_mode):
         ratio = self.spec.compress_ratios[owner]
         if ratio not in plan.history_slots:
@@ -1820,6 +2245,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._decode_schedule_keepalive.append(schedule)
         return schedule
 
+    @property
+    def supports_fused_attention(self) -> bool:
+        # FP8 output must follow the complete softmax, not a DCP partial.
+        return self.kvp_size == 1
+
+    @property
+    def supports_fused_prefill(self) -> bool:
+        # Prefill with a query group exchanges BF16 partial heads and merges
+        # them. The fused kernel returns the output already permuted, grouped
+        # and cast, so exchanging it would mean undoing all three.
+        return self.supports_fused_attention and (
+            len(self.spec.attention_query_group) == 1
+        )
+
     def forward_v41(
         self,
         q,
@@ -1837,12 +2276,22 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        fused_decode_groups: int | None,
         out_rope_cache=None,
-    ) -> torch.Tensor:
+        key_rows: QueryShardGather | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Joint SWA/global attention; returns BF16 [T,Hlocal,512].
 
         The output is BEFORE inverse RoPE unless out_rope_cache (the inverse
         FP32 [positions,64] table) is given; then it is rotated with it.
+
+        With fused_decode_groups, q instead uses the prepared weight's unrotated
+        layout. Local decode and pure prefill return grouped FP8 codes/scales
+        after inverse RoPE, for the matching prepared output projection; prefill
+        runs one fused call per workspace batch and the batches fill zeroed
+        codes and scales in the kernel's own layout. SWA uses the same RoPE
+        table. A mixed batch and the operator's query context parallelism keep
+        the BF16 return.
 
         q and swa_kv are [T,Hlocal,512] / [T,512]. q is post-RoPE; SWA can
         defer RMSNorm and RoPE using swa_norm_weight/eps and swa_rope_cache.
@@ -1853,9 +2302,65 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         pages. Decode publishes the current row before its paged read; it cannot
         alias the preceding 127 logical rows. CED callers supply the required SWA
         activation range, not only the final output position.
+
+        With key_rows, q and swa_kv hold local query rows while positions and
+        request_indices describe the complete canonical source window. The
+        source SWA is gathered before reading/writing cache; only local queries
+        are evaluated. Global selections and Reindex candidates remain query-local.
         """
         from tokenspeed_kernel.ops.attention import dsv41
 
+        if fused_decode_groups is not None and (
+            q.shape[1] not in (64, 128) or q.shape[1] != 8 * fused_decode_groups
+        ):
+            raise ValueError("Fused V4.1 output requires 8 heads per group")
+        if fused_decode_groups is not None and (
+            not (forward_mode.is_decode() or forward_mode.is_extend())
+            or not self.supports_fused_attention
+            or swa_rope_cache is None
+            or out_rope_cache is not None
+        ):
+            raise ValueError(
+                "Fused V4.1 attention requires local decode or extend with its "
+                "RoPE table"
+            )
+        # MIXED is excluded above: is_extend() is EXTEND alone. Two prefill
+        # shapes also keep the regular path. The operator's query group
+        # exchanges BF16 partial heads and merges them, which the permuted,
+        # grouped and cast rows cannot serve. A model query shard hands this
+        # call the shard's query rows, whereas the caller rotates Q from its
+        # own source rows, so the fused Q RoPE would use other positions.
+        if fused_decode_groups is not None and forward_mode.is_extend():
+            if len(self.spec.attention_query_group) > 1:
+                raise ValueError(
+                    "Fused V4.1 prefill does not serve operator query context "
+                    "parallelism"
+                )
+            if key_rows is not None:
+                raise ValueError(
+                    "Fused V4.1 prefill does not serve a model query shard"
+                )
+
+        source_positions, source_requests = positions, request_indices
+        source_window = None
+        if key_rows is not None:
+            if not forward_mode.is_extend() or forward_mode.is_mixed():
+                raise ValueError("V4.1 sharded SWA requires pure prefill")
+            if not 0 <= layer_id < len(self.spec.kv_owners):
+                raise ValueError("V4.1 layer_id is outside the backbone")
+            if len(self.spec.attention_query_group) > 1:
+                raise ValueError(
+                    "Model QCP cannot combine with operator-level attention QCP"
+                )
+            if positions.numel() != key_rows.plan.total_rows:
+                raise ValueError("V4.1 SWA source rows disagree with the query shard")
+            if positions.numel() > self.spec.max_query_tokens:
+                raise ValueError("V4.1 SWA source rows exceed the query budget")
+            source_window = self._window(positions, request_indices, forward_mode)
+            if source_window is None:
+                raise ValueError("V4.1 sharded SWA requires a canonical source window")
+            positions = positions[key_rows.plan.local_row_ids]
+            request_indices = request_indices[key_rows.plan.local_row_ids]
         n = positions.numel()
         if (
             n > self.spec.max_query_tokens
@@ -1931,10 +2436,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     swa_rope_cache=swa_rope_cache,
                     swa_norm_weight=swa_norm_weight,
                     swa_norm_eps=swa_norm_eps,
+                    fused_decode_groups=None,
                     out_rope_cache=out_rope_cache,
+                    key_rows=None,
                 )
             return out
-        if n == 0:
+        if n == 0 and key_rows is None:
+            if fused_decode_groups is not None:
+                groups = fused_decode_groups
+                width = q.shape[1] * q.shape[2] // groups
+                return (
+                    q.new_empty((0, groups, width), dtype=torch.float8_e4m3fn),
+                    q.new_empty((0, groups, width // 128), dtype=torch.int32),
+                )
             return torch.empty_like(q)
         prepared = self._prepared_selections.pop(
             (layer_id, forward_mode, id(positions), id(request_indices)), None
@@ -1944,11 +2458,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 layer_id,
                 index_q,
                 index_weights,
-                positions,
-                request_indices,
+                source_positions if key_rows is not None else positions,
+                source_requests if key_rows is not None else request_indices,
                 forward_mode,
                 index_process_group,
                 projected_partition=None,
+                query_shard=key_rows.plan if key_rows is not None else None,
             )
         else:
             global_slots, global_lens = prepared[2]
@@ -1956,7 +2471,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         global_cache = self.cache_pool.global_kv(owner) if owner >= 0 else None
         cache = self.cache_pool.swa(layer_id)
         metadata = self.query_metadata(forward_mode)
-        window = self._window(positions, request_indices, forward_mode)
+        window = (
+            source_window
+            if key_rows is not None
+            else self._window(positions, request_indices, forward_mode)
+        )
         canonical = window is not None
         if self.kvp_size > 1 and (
             not canonical or not (forward_mode.is_extend() or forward_mode.is_decode())
@@ -1993,6 +2512,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 if canonical
                 else self.window_slots(V41_SWA_GROUP_ID, positions, request_indices)
             )
+            if fused_decode_groups is not None:
+                return dsv41.selected_attention_fp8(
+                    q,
+                    cache,
+                    swa_slots,
+                    swa_lens,
+                    global_cache,
+                    global_slots,
+                    global_lens,
+                    attn_sink,
+                    softmax_scale,
+                    positions,
+                    swa_rope_cache,
+                    fused_decode_groups,
+                    None,
+                    None,
+                )
             if self.kvp_size > 1 and owner >= 0:
                 # Indexer selections remain global; only KV reads are owner-local.
                 local_slots, local_counts, local_swa_lens = (
@@ -2067,13 +2603,22 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 None,
                 lse=None,
             )
-        plan = self._swa_query_plan(positions, request_indices, forward_mode)
+        if key_rows is not None:
+            swa_kv = key_rows.plan.to_span_order(
+                token_all_gather(
+                    swa_kv.contiguous(), key_rows.group, list(key_rows.plan.row_counts)
+                )
+            )
+        plan = self._swa_query_plan(
+            source_positions,
+            source_requests,
+            forward_mode,
+            query_shard=key_rows.plan if key_rows is not None else None,
+        )
         # Quantize current rows exactly as cache storage, without publishing them
         # until every request has read its old sliding prefix.
-        prefixes = [
-            dsv41.cache_gather(cache, request.prefix_slots, self.swa_format, None)
-            for request in plan.requests
-        ]
+        layout = self._prefill_layout(plan, owner, forward_mode)
+        prefixes = dsv41.cache_gather(cache, layout.prefix_slots, self.swa_format, None)
         if swa_rope_cache is None:
             current = dsv41.cache_unpack(
                 dsv41.cache_pack(swa_kv, self.swa_format, None), self.swa_format, None
@@ -2082,7 +2627,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             current = torch.empty_like(swa_kv)
             dsv41.swa_rope_scatter(
                 swa_kv,
-                positions,
+                source_positions,
                 swa_rope_cache,
                 cache,
                 locations,
@@ -2104,28 +2649,61 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 logical_rows = record.logical_rows[selected.clamp_min(0)].masked_fill(
                     selected[:, None] < 0, -1
                 )
-        out = torch.zeros_like(q)
-        for request_plan, prefix in zip(plan.requests, prefixes, strict=True):
-            rows = request_plan.rows
-            prefix_count = request_plan.prefix_slots.numel()
-            current_rows = current[rows]
-            swa_count = prefix_count + current_rows.shape[0]
-            history_slots = (
-                self._prefill_global_history(request_plan, owner, forward_mode)
-                if owner >= 0 and self.kvp_size == 1
-                else None
-            )
-            history_count = (
-                (request_plan.last_position + 1) // self.spec.compress_ratios[owner]
-                if owner >= 0 and self.kvp_size > 1
-                else (history_slots.numel() if history_slots is not None else 0)
-            )
-            workspace = current.new_empty((swa_count + history_count, 512))
-            workspace[:prefix_count].copy_(prefix)
-            workspace[prefix_count:swa_count].copy_(current_rows)
-            indices = request_plan.swa_indices
-            if owner >= 0:
-                if self.kvp_size > 1:
+        # Every request and every query row of a batch run as one attention
+        # call. FlashMLA writes the output by row coordinates, so the row count
+        # is not split. When one batch covers every row in order, the kernel's
+        # output is the layer output; otherwise batches fill a zeroed output.
+        whole = (
+            len(layout.batches) == 1
+            and isinstance(layout.batches[0].query_rows, slice)
+            and layout.batches[0].query_rows == slice(0, q.shape[0])
+        )
+        if whole:
+            out = None
+        elif fused_decode_groups is not None:
+            out = zeroed_fused_output(q, fused_decode_groups, q.shape[0])
+        else:
+            out = torch.zeros_like(q)
+        batches = list(zip(layout.batches, layout.history_slots, strict=True))
+        # Run the batch whose histories the workspace still holds first, so a
+        # layer after its owner reuses them even when the step needs several
+        # batches. Batches write disjoint output rows; the order is the same
+        # on every rank, so KVP and QCP collectives stay matched.
+        held = next(
+            (i for i, (b, _) in enumerate(batches) if b is self._prefill_kv_batch), 0
+        )
+        batches = batches[held:] + batches[:held]
+        for batch, history_slots in batches:
+            # Workspace rows: [owner histories | SWA keys]. SWA keys are
+            # rewritten per layer; histories only when the workspace holds
+            # another batch or the owner has written new global rows.
+            workspace = self._prefill_kv[: batch.kv_rows]
+            reuse = owner >= 0 and batch is self._prefill_kv_batch
+            # Mark the workspace as holding this batch only once its histories
+            # are complete.
+            self._prefill_kv_batch = None
+            if batch.prefix_target.numel():
+                workspace.index_copy_(
+                    0,
+                    batch.prefix_target,
+                    prefixes.index_select(0, batch.prefix_source),
+                )
+            if batch.current_target.numel():
+                workspace.index_copy_(
+                    0,
+                    batch.current_target,
+                    current.index_select(0, batch.current_source),
+                )
+            if history_slots is not None and not reuse:
+                dsv41.cache_gather(
+                    global_cache,
+                    history_slots,
+                    self.global_format,
+                    workspace[: batch.history_rows],
+                )
+            elif owner >= 0 and not reuse:
+                # KVP owners exchange each request's history; every rank joins.
+                for request_plan, start, history_count in batch.histories:
                     packed = self._gather_kvp_history(
                         global_cache,
                         owner,
@@ -2137,37 +2715,78 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                         64, 64 + history_count, device=self.device, dtype=torch.int64
                     )
                     dsv41.cache_gather(
-                        packed, compact_slots, self.global_format, workspace[swa_count:]
+                        packed,
+                        compact_slots,
+                        self.global_format,
+                        workspace[start : start + history_count],
                     )
                     del packed, compact_slots
-                else:
-                    dsv41.cache_gather(
-                        global_cache,
-                        history_slots,
-                        self.global_format,
-                        workspace[swa_count:],
-                    )
-                selected = logical_rows[rows]
-                compressed_indices = torch.where(
-                    (selected >= 0) & (global_slots[rows] >= 0),
-                    selected + swa_count,
-                    -1,
+            self._prefill_kv_batch = batch
+            rows = batch.query_rows
+            if rows is None:
+                # Only empty query shards: they joined the history gathers.
+                continue
+            # [SWA rows | selected history rows shifted to the request's
+            # history in the workspace], built as int32 in one kernel.
+            indices = (
+                dsv41.prefill_indices(
+                    batch.swa_indices,
+                    logical_rows,
+                    global_slots,
+                    rows,
+                    batch.history_base,
                 )
-                indices = torch.cat((indices, compressed_indices), dim=-1).to(
-                    torch.int32
-                )
-            # Advanced request subsets do not provide a writable output view;
-            # copy their compact result back explicitly after native execution.
-            output = out[rows] if isinstance(rows, slice) else None
-            request_q = q[rows].contiguous()
+                if owner >= 0
+                else batch.swa_indices
+            )
+            # Row subsets do not provide a writable output view; copy their
+            # compact result back explicitly after native execution. The fused
+            # kernel takes no destination, so its result always copies back.
+            output = (
+                out[rows]
+                if out is not None
+                and fused_decode_groups is None
+                and isinstance(rows, slice)
+                else None
+            )
+            batch_q = q[rows].contiguous()
+            # Padded head counts need a padded query copy per call; keep that
+            # bounded by tiles. Native head counts run the batch in one call.
+            query_chunk = (
+                max(1, batch_q.shape[0])
+                if batch_q.shape[1] in (64, 128)
+                else V41_PREFILL_QUERY_TILE
+            )
             group = self.spec.attention_query_group
-            if (
+            if fused_decode_groups is not None:
+                # One call per batch: the fused kernel rotates this batch's
+                # queries, attends, rotates the result back and casts it, so
+                # the rows it returns are already the output projection's
+                # grouped FP8 input. Checked first: the guards above leave the
+                # head exchange and this path mutually exclusive.
+                result = dsv41.selected_attention_fp8(
+                    batch_q,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    attn_sink,
+                    softmax_scale,
+                    positions[rows],
+                    swa_rope_cache,
+                    fused_decode_groups,
+                    workspace[:, None, :],
+                    indices.contiguous(),
+                )
+            elif (
                 canonical
                 and q.is_cuda
                 and index_process_group is None
                 and should_exchange_prefill_heads(
-                    num_queries=request_q.shape[0],
-                    local_heads=request_q.shape[1],
+                    num_queries=batch_q.shape[0],
+                    local_heads=batch_q.shape[1],
                     group_size=len(group),
                     min_queries=self.spec.attention_query_min_tokens,
                     swa_min_queries=self.spec.attention_query_swa_min_tokens,
@@ -2177,17 +2796,17 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 if layer_id not in self._attention_exchange_layers:
                     logging.getLogger(__name__).info(
                         f"V4.1 prefill attention QCP: layer={layer_id}, "
-                        f"size={len(group)}, rows={request_q.shape[0]}, "
-                        f"local_heads={request_q.shape[1]}"
+                        f"size={len(group)}, rows={batch_q.shape[0]}, "
+                        f"local_heads={batch_q.shape[1]}"
                     )
                     self._attention_exchange_layers.add(layer_id)
                 result = selected_prefill_with_head_exchange(
-                    request_q,
+                    batch_q,
                     workspace[:, None, :],
                     indices,
                     attn_sink,
                     softmax_scale=softmax_scale,
-                    query_chunk_size=V41_PREFILL_QUERY_TILE,
+                    query_chunk_size=query_chunk,
                     group=group,
                     rank=self.spec.attention_query_rank,
                 )
@@ -2195,7 +2814,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     output.copy_(result)
             else:
                 result = dsv41.selected_attention(
-                    request_q,
+                    batch_q,
                     cache,
                     None,
                     None,
@@ -2205,15 +2824,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     attn_sink,
                     softmax_scale,
                     output,
-                    V41_PREFILL_QUERY_TILE,
+                    query_chunk,
                     None,
                     workspace[:, None, :],
                     indices.contiguous(),
                     lse=None,
                 )
-            if output is None:
+            if out is None:
+                out = result
+            elif fused_decode_groups is not None:
+                out[0][rows] = result[0]
+                out[1][rows] = result[1]
+            elif output is None:
                 out[rows] = result
-            del workspace, current_rows, indices
+            del workspace, indices
         if swa_rope_cache is None:
             dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
         if out_rope_cache is not None:
@@ -2292,6 +2916,98 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if not self._in_model_forward:
             self._index_geometry.clear()
 
+    @staticmethod
+    def _index_columns(span, ratio):
+        """Logits columns of a request's index call: its page-table width in rows."""
+        return max(1, ((span.prefix + span.count) // ratio + 63) // 64) * 64
+
+    def _split_index_windows(self, windows, ratio):
+        """Split a request window whose own logits exceed one index_topk call.
+
+        index_topk scores each window in one call, so every piece keeps
+        rows * columns BF16 logits within index_logit_rows. Empty and spanless
+        windows pass through unchanged.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        pieces = []
+        for start, stop, span in windows:
+            if span is None or start >= stop:
+                pieces.append((start, stop, span))
+                continue
+            limit = dsv41.index_logit_rows(self._index_columns(span, ratio))
+            pieces.extend(
+                (cursor, min(cursor + limit, stop), span)
+                for cursor in range(start, stop, limit)
+            )
+        return pieces
+
+    def _merge_index_windows(self, windows, ratio, reindex):
+        """Merge request windows, splitting a request whose own Q×K exceeds one call."""
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        active = [
+            (start, stop, span)
+            for start, stop, span in windows
+            if span is not None and start < stop
+        ]
+        if not active:
+            return windows
+        if reindex:
+            return [
+                (
+                    active[0][0],
+                    active[-1][1],
+                    tuple((item[2], item[1] - item[0]) for item in active),
+                )
+            ]
+        pieces = [
+            (start, stop, span, self._index_columns(span, ratio))
+            for start, stop, span in self._split_index_windows(active, ratio)
+        ]
+        merged = []
+        batch = []
+        rows = 0
+        max_k = 0
+
+        def flush():
+            nonlocal batch, rows, max_k
+            if not batch:
+                return
+            start = batch[0][0]
+            stop = batch[-1][1]
+            members = tuple((item[2], item[1] - item[0]) for item in batch)
+            merged.append((start, stop, members))
+            batch = []
+            rows = 0
+            max_k = 0
+
+        for start, stop, span, columns in pieces:
+            next_rows = rows + (stop - start)
+            next_k = max(max_k, columns)
+            if batch and next_rows > dsv41.index_logit_rows(next_k):
+                flush()
+                next_rows = stop - start
+                next_k = columns
+            batch.append((start, stop, span))
+            rows = next_rows
+            max_k = next_k
+        flush()
+        return merged
+
+    def _index_window_members(self, span):
+        """Normalize a window payload to ((request span, local rows), ...)."""
+        if span is None or isinstance(span, V41PrefillSpan):
+            return ()
+        if not isinstance(span, tuple) or not span:
+            return ()
+        first = span[0]
+        if isinstance(first, tuple) and len(first) == 2:
+            return span
+        if isinstance(first, V41PrefillSpan):
+            return tuple((item, item.count) for item in span)
+        return ()
+
     def _selection_geometry(
         self, positions, requests, source_table, table, ratio, start, stop, span, mode
     ):
@@ -2310,7 +3026,36 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         geometry = self._index_geometry.get(key)
         if geometry is None:
-            if span is not None:
+            # Prefill windows know which rows share a request history; the
+            # kernel scores those densely. Other windows (decode, arbitrary
+            # rows) carry None and score through the paged table.
+            history_rows = None
+            members = self._index_window_members(span)
+            if members:
+                visible = (
+                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
+                )
+                width = max(
+                    1,
+                    max((item.prefix + item.count) // ratio + 63 for item, _ in members)
+                    // 64,
+                )
+                parts = []
+                for item, local in members:
+                    row = table[item.request : item.request + 1, :width]
+                    row = row.masked_fill(row <= 0, -1)
+                    if local:
+                        parts.append((row, local))
+                history_rows = tuple(local for _, local in parts) or None
+                if not parts:
+                    tile_table = table[:0, :width]
+                elif len(parts) == 1:
+                    tile_table = parts[0][0].expand(parts[0][1], -1)
+                else:
+                    tile_table = torch.cat(
+                        [row.expand(local, -1) for row, local in parts], dim=0
+                    )
+            elif span is not None:
                 visible = (
                     ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
                 )
@@ -2318,6 +3063,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 row = table[span.request : span.request + 1, :width]
                 row = row.masked_fill(row <= 0, -1)
                 tile_table = row.expand(stop - start, -1)
+                history_rows = (stop - start,) if stop > start else None
             else:
                 tile_table, visible = dsv41.selection_table(
                     positions[start:stop], requests[start:stop], table, ratio
@@ -2325,13 +3071,34 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # Arbitrary prefill windows may cover a whole prompt. Retaining
             # every replicated table would defeat query tiling's memory bound.
             cacheable = mode.is_decode() or span is not None
+            # DeepGEMM schedules a request from its last query's length. A
+            # free decode window can put a shorter query after a longer one.
+            decode = self.forward_decode_metadata
+            ordered = span is not None or (
+                decode is not None
+                and positions is decode.positions
+                and requests is decode.request_indices
+            )
             geometry = V41IndexGeometry(
                 positions,
                 requests,
                 source_table,
                 tile_table,
                 visible,
-                dsv41.new_index_metadata(tile_table, visible) if cacheable else None,
+                (
+                    dsv41.new_index_metadata(
+                        tile_table,
+                        visible,
+                        (
+                            requests[start:stop].to(torch.int32).contiguous()
+                            if ordered
+                            else None
+                        ),
+                        history_rows=history_rows,
+                    )
+                    if cacheable
+                    else None
+                ),
             )
             if cacheable:
                 self._index_geometry[key] = geometry

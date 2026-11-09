@@ -67,6 +67,61 @@ inline std::int64_t ParentsNeededForBuckets(std::span<const std::int64_t> need_b
     return std::max(parents, (total_short + packing - 1) / packing);
 }
 
+// Where pairs of blocks go when a pair's two blocks must share a bucket but
+// which bucket is free to choose (a tail block an admission allocates beside
+// its copy-in block): one pair at a time, into the bucket with the most holes
+// left over after `demand` -- the blocks wanted per bucket so far, the pairs
+// before it included -- the lowest such bucket on ties. Under
+// ParentsNeededForBuckets no other choice needs fewer parents: the pairs add
+// the same blocks to the total whatever buckets they take, and filling the
+// least short bucket first keeps the largest bucket shortfall as small as it
+// can be.
+inline std::size_t NextPairBucket(std::span<const std::int64_t> demand, std::span<const std::int64_t> holes_by_bucket) {
+    _assert(!demand.empty() && demand.size() == holes_by_bucket.size(),
+            "bucket demand and holes must cover the same shard count");
+    std::size_t best = 0;
+    for (std::size_t b = 1; b < demand.size(); ++b) {
+        if (holes_by_bucket[b] - demand[b] > holes_by_bucket[best] - demand[best]) {
+            best = b;
+        }
+    }
+    return best;
+}
+
+// The bucket each of `pairs` pairs takes (NextPairBucket).
+inline std::vector<std::int32_t> AssignPairBuckets(std::span<const std::int64_t> need_by_bucket,
+                                                   std::span<const std::int64_t> holes_by_bucket, std::int64_t pairs) {
+    _assert(pairs >= 0, "pair demand must be non-negative");
+    std::vector<std::int64_t> demand(need_by_bucket.begin(), need_by_bucket.end());
+    std::vector<std::int32_t> buckets;
+    buckets.reserve(static_cast<std::size_t>(pairs));
+    for (std::int64_t pair = 0; pair < pairs; ++pair) {
+        const std::size_t bucket = NextPairBucket(demand, holes_by_bucket);
+        demand[bucket] += 2;
+        buckets.push_back(static_cast<std::int32_t>(bucket));
+    }
+    return buckets;
+}
+
+// ParentsNeededForBuckets once `pairs` pairs join need_by_bucket in the
+// buckets NextPairBucket gives them. `scratch`, one entry per bucket, holds
+// the demand with the pairs in place, so a fit tried for every eviction
+// candidate allocates nothing.
+inline std::int64_t ParentsNeededForBucketsAndPairs(std::span<const std::int64_t> need_by_bucket,
+                                                    std::span<const std::int64_t> holes_by_bucket,
+                                                    std::int64_t dense_need, std::int64_t pairs, std::int64_t packing,
+                                                    std::span<std::int64_t> scratch) {
+    if (pairs == 0) {
+        return ParentsNeededForBuckets(need_by_bucket, holes_by_bucket, dense_need, packing);
+    }
+    _assert(pairs > 0 && scratch.size() == need_by_bucket.size(), "pairs need one scratch entry per bucket");
+    std::ranges::copy(need_by_bucket, scratch.begin());
+    for (std::int64_t pair = 0; pair < pairs; ++pair) {
+        scratch[NextPairBucket(scratch, holes_by_bucket)] += 2;
+    }
+    return ParentsNeededForBuckets(scratch, holes_by_bucket, dense_need, packing);
+}
+
 // Physical LCM placement only. It deliberately has no cache key, LRU node,
 // CacheBlock pointer, or ownership count.
 class BlockPool {

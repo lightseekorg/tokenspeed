@@ -107,11 +107,12 @@ RL_BITWISE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "gree
 # (request seed, position), which the bitwise envelope requires.
 SAMPLING_STREAMS = ("batch", "per-request")
 
-# ``--yarn-ramp-mask-device``: where the deepseek_yarn RoPE inverse frequencies
-# (position frequencies, both divisions and the YaRN linear ramp mask) are
-# computed before moving to the model device. The trainer builds them on the
-# host.
+# ``--yarn-ramp-mask-device`` selects the deepseek_yarn linear ramp device;
+# ``--yarn-frequency-device`` selects powers, divisions and interpolation.
+# Under auto, both devices default independently to CUDA.
+# rl-bitwise pins a CPU ramp and CUDA frequency construction.
 YARN_RAMP_MASK_DEVICES = ("cuda", "cpu")
+YARN_FREQUENCY_DEVICES = ("cuda", "cpu")
 
 # ``--mla-lora-scale``: where LongCat-style MLA applies its sqrt(hidden /
 # lora_rank) norm scales — folded into the q_a/kv_a layernorm weights at load,
@@ -129,10 +130,17 @@ LAYER_BOUNDARY_NORMS = ("fused", "unfused")
 ROUTER_TOPKS = ("fused", "torch")
 
 # ``--logprob-order``: the selected-token log-softmax behind every returned
-# logprob — ``torch.log_softmax``, or Megatron's vocab-parallel cross-entropy
-# order over fixed ``MEGATRON_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
-LOGPROB_ORDERS = ("torch", "megatron")
-MEGATRON_VOCAB_BLOCK = 32768
+# logprob — ``torch.log_softmax``, or fixed-width blockwise reduction
+# over ``BLOCKWISE_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
+BLOCKWISE_VOCAB_BLOCK = 32768
+# Block width describes the trainer's reduction, independently of serving TP.
+BLOCKWISE_LOGPROB_ORDERS = {
+    "blockwise": (BLOCKWISE_VOCAB_BLOCK, "negative-cross-entropy"),
+    "blockwise-direct": (BLOCKWISE_VOCAB_BLOCK, "direct"),
+    "blockwise-16384": (16384, "negative-cross-entropy"),
+    "blockwise-direct-16384": (16384, "direct"),
+}
+LOGPROB_ORDERS = ("torch", *BLOCKWISE_LOGPROB_ORDERS)
 
 # ``--moe-combine-order``: how a token's routed-expert contributions meet
 # across the MoE TP-EP group — ``rank``: per-rank partials summed by the
@@ -145,7 +153,7 @@ MOE_COMBINE_ORDERS = ("rank", "slot")
 
 # ``--dsa-slot-order``: the order the sparse attention cores reduce a token's
 # selected KV slots in — ``selection``: as the top-k leaf emitted them (what
-# every core does); ``sorted``: ascending slot order, so the reduction is
+# every core does); ``sorted``: ascending token position, so the reduction is
 # batch-invariant whenever the selected set is; served only by cores
 # declaring the ``slot_order`` trait (registered batch-invariant leaves). Mirrors
 # ``tokenspeed_kernel``'s ``attention.dsa.SLOT_ORDERS``.
@@ -168,13 +176,13 @@ def require_verified_numerics(
             model (none of which is verified under an envelope beyond auto).
         architecture: The model's architecture name, for the error.
         quantization: The checkpoint's resolved quantization method, or None.
-        vocab_size: The model's vocabulary size; the envelope's Megatron-order
-            logprobs fold fixed ``MEGATRON_VOCAB_BLOCK``-wide blocks of it.
+        vocab_size: The model's vocabulary size; the envelope's blockwise
+            logprobs fold fixed ``BLOCKWISE_VOCAB_BLOCK``-wide blocks of it.
 
     Raises:
         ValueError: The envelope is not verified for this model, or its
             checkpoint validator rejects the storage or vocabulary. The RL
-            policy requires unquantized weights and whole Megatron vocab blocks.
+            policy requires unquantized weights and whole blockwise vocab blocks.
     """
     if numerics == "auto":
         return
@@ -196,10 +204,10 @@ def require_verified_numerics(
             f"{architecture} is {quantization}-quantized, and no "
             "batch-invariant quantized GEMM leaf exists"
         )
-    if vocab_size % MEGATRON_VOCAB_BLOCK != 0:
+    if vocab_size % BLOCKWISE_VOCAB_BLOCK != 0:
         raise ValueError(
-            f"--numerics {numerics} folds --logprob-order megatron, whose "
-            f"sum(exp) runs over fixed {MEGATRON_VOCAB_BLOCK}-wide vocabulary "
+            f"--numerics {numerics} folds --logprob-order blockwise, whose "
+            f"sum(exp) runs over fixed {BLOCKWISE_VOCAB_BLOCK}-wide vocabulary "
             f"blocks; {architecture} has vocab_size {vocab_size}, not a "
             "multiple of it"
         )
@@ -210,7 +218,8 @@ __all__ = [
     "DSA_SLOT_ORDERS",
     "LAYER_BOUNDARY_NORMS",
     "LOGPROB_ORDERS",
-    "MEGATRON_VOCAB_BLOCK",
+    "BLOCKWISE_VOCAB_BLOCK",
+    "BLOCKWISE_LOGPROB_ORDERS",
     "MLA_LORA_SCALES",
     "MOE_COMBINE_ORDERS",
     "NUMERICS_ENVELOPES",
@@ -218,6 +227,7 @@ __all__ = [
     "ROUTER_TOPKS",
     "SAMPLING_STREAMS",
     "YARN_RAMP_MASK_DEVICES",
+    "YARN_FREQUENCY_DEVICES",
     "require_verified_numerics",
     "register_numerics_envelope",
     "resolve_numerics_envelope",
