@@ -9,6 +9,7 @@ triggers:
 ignore_changes:
   - python/tokenspeed
   - test/runtime
+changed_paths: true
 runner:
   labels:
     - h100-1gpu
