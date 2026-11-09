@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.sampling.eagle_harness import (
     eagle_harness_write_verify_tree,
 )
 from tokenspeed_kernel.ops.sampling.eagle_harness import triton as eh_triton
+from tokenspeed_kernel.ops.sampling.eagle_harness._triton import sampled as eh_sampled
 from tokenspeed_kernel.ops.sampling.eagle_harness._triton import tree as eh_tree
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
@@ -48,7 +49,7 @@ pytestmark = pytest.mark.skipif(
 
 _DEVICE = "cuda"
 
-# The sampled-tree ops exist only in the CUDA build.
+# Both builds have the sampled-tree ops; the check guards a platform with neither.
 _sampled_trees = pytest.mark.skipif(
     not torch.cuda.is_available() or not eagle_harness_sampled_trees_available(),
     reason="the platform has no sampled-tree kernels",
@@ -870,3 +871,114 @@ def test_triton_tree_kernels_do_not_recompile_across_rounds() -> None:
     ):
         for rows, depth in ((1, 1), (16, 16), (17, 31), (32, 3)):
             _triton_tree_round(rows=rows, depth=depth)
+
+
+def _triton_sampled_round(bs: int, slot_base: int, launch: int, width: int) -> None:
+    """One sampled round of the Triton build's sampled-tree kernels at ``bs``
+    requests: children of ``width`` expanded rows, the q publish, the tree
+    rejection and the bonus."""
+    k, nc, vocab, nodes, slots = 2, 32, 300, 7, 4
+
+    def int32(*shape, fill=0):
+        return torch.full(shape, fill, dtype=torch.int32, device=_DEVICE)
+
+    q_store = torch.zeros((bs, slots, nc), device=_DEVICE)
+    qid_store = int32(bs, slots, nc)
+    node_slot, node_pos = int32(bs, 64, fill=-1), int32(bs, 64)
+    eh_triton.triton_eagle_harness_sample_children(
+        torch.randn((bs, 2, nc), device=_DEVICE),
+        torch.randint(0, vocab, (bs, 2, nc), device=_DEVICE),
+        torch.zeros((bs, 2, k), dtype=torch.int64, device=_DEVICE),
+        torch.zeros((bs, 2, k), device=_DEVICE),
+        torch.ones(bs, device=_DEVICE), int32(bs, fill=1 << 30),
+        torch.full((bs,), 0.9, device=_DEVICE), q_store, qid_store, node_slot,
+        node_pos, _count(width), slot_base, _count(1 + slot_base), vocab, 11,
+        torch.tensor([slot_base], dtype=torch.int64, device=_DEVICE), launch,
+    )  # fmt: skip
+    rows = torch.arange(bs, device=_DEVICE)
+    slot_tab, pos_tab = int32(bs, nodes), int32(bs, nodes)
+    eh_triton.triton_eagle_harness_publish_draft_q(
+        torch.arange(nodes, device=_DEVICE).repeat(bs, 1), node_slot, node_pos,
+        q_store, qid_store, rows, torch.zeros_like(q_store), torch.zeros_like(qid_store),
+        slot_tab, pos_tab, _count(bs), _count(nodes),
+    )  # fmt: skip
+    probas = torch.softmax(torch.randn((bs * nodes, vocab), device=_DEVICE), -1)
+    tokens = int32(bs, nodes)
+    parents = torch.tensor(
+        [-1, 0, 0, 1, 1, 2, 2], dtype=torch.int32, device=_DEVICE
+    ).repeat(bs, 1)
+    top_ks = int32(bs * nodes, fill=1 << 30)
+    argmax = torch.zeros(bs * nodes, dtype=torch.int64, device=_DEVICE)
+    path, predicts, length = int32(bs, nodes), int32(bs * nodes), int32(bs)
+    last_row = torch.zeros(bs, dtype=torch.int64, device=_DEVICE)
+    eh_triton.triton_eagle_harness_tree_reject_sample(
+        probas, tokens, parents, rows, slot_tab, pos_tab, q_store, qid_store,
+        torch.rand((bs, nodes), device=_DEVICE), top_ks, argmax, path, predicts,
+        length, last_row,
+    )  # fmt: skip
+    eh_triton.triton_eagle_harness_residual_sample(
+        probas, last_row, torch.rand(bs, device=_DEVICE), top_ks, argmax, length,
+        predicts, nodes,
+    )  # fmt: skip
+
+
+def test_triton_sampled_tree_kernels_do_not_recompile_across_rounds() -> None:
+    """Request counts, widths, slot bases and launches are runtime arguments
+    of the Triton build's sampled-tree kernels: new rounds reuse them."""
+    _triton_sampled_round(bs=5, slot_base=0, launch=0, width=2)
+    with assert_no_triton_compile(
+        eh_sampled._sample_children_kernel,
+        eh_sampled._publish_draft_q_kernel,
+        eh_sampled._tree_reject_nodes_kernel,
+        eh_sampled._tree_reject_path_kernel,
+        eh_sampled._residual_sample_kernel,
+    ):
+        for bs, slot_base, launch, width in (
+            (1, 1, 1, 1),
+            (16, 2, 17, 2),
+            (32, 1, 63, 1),
+        ):
+            _triton_sampled_round(bs, slot_base, launch, width)
+
+
+@_sampled_trees
+def test_tree_verify_reads_rows_past_int32_offsets() -> None:
+    """Target rows whose element offsets pass 2**31 (a row stride past
+    2**31 / rows) verify and draw exactly what packed rows do."""
+    bs, n, nc, vocab = 2, 3, 8, 64
+    rows = bs * n
+    stride = (2**31 // (rows - 1) // 128 + 1) * 128
+    storage = torch.empty((rows - 1) * stride + vocab, device=_DEVICE)
+    wide = storage.as_strided((rows, vocab), (stride, 1))
+    assert (rows - 1) * stride > 2**31
+    gen = torch.Generator().manual_seed(9)
+    packed = torch.softmax(torch.randn((rows, vocab), generator=gen), -1).to(_DEVICE)
+    wide.copy_(packed)
+    ids = torch.randperm(vocab, generator=gen)[:nc].to(torch.int32)
+    q = torch.softmax(torch.randn(nc, generator=gen), -1)
+    tokens = torch.cat(
+        [torch.zeros((bs, 1), dtype=torch.int32), ids[[1, 4]].repeat(bs, 1)], 1
+    )
+    q_tables = (
+        torch.tensor([[-1, 0, 0]] * bs, dtype=torch.int32),
+        torch.tensor([[0, 1, 4]] * bs, dtype=torch.int32),
+        q.repeat(bs, 1, 1),
+        ids.repeat(bs, 1, 1),
+    )
+    parents = torch.tensor([[-1, 0, 0]] * bs, dtype=torch.int32)
+    # Coins that reject both children: the bonus is drawn from the root's residual.
+    coins = torch.full((bs, n), 1.0 - 2**-24)
+    final = torch.rand(bs, generator=gen)
+    args = [
+        t.to(_DEVICE) for t in (tokens.contiguous(), parents, *q_tables, coins, final)
+    ]
+    outs = []
+    for probas in (packed, wide):
+        tokens_d, parents_d, *tables, coins_d, final_d = args
+        out = _verify(
+            probas, tokens_d, parents_d, torch.arange(bs, device=_DEVICE), tables,
+            coins_d, final_d, _no_top_k(rows), torch.zeros(rows, dtype=torch.int64, device=_DEVICE),
+        )  # fmt: skip
+        outs.append((*out, probas.clone()))
+    for actual, expected in zip(outs[1], outs[0]):
+        assert torch.equal(actual, expected)

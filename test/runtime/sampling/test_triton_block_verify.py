@@ -337,6 +337,13 @@ def test_standard_rejection_allocates_no_block_buffers(monkeypatch):
     backend = _backend(monkeypatch, method="standard")
     assert not backend._block_verify
     assert backend._draft_probs_gather_buf is None and backend._block_coins is None
+    # Standard rejection reads the chain's p' from its own buffer instead.
+    assert backend._target_probs is not None
+
+
+def test_block_verification_allocates_no_standard_target_buffer(monkeypatch):
+    backend = _backend(monkeypatch)
+    assert backend._block_verify and backend._target_probs is None
 
 
 @requires_gpu

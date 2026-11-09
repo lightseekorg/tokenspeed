@@ -326,59 +326,19 @@ def _top_k_top_p_candidates_stage1_kernel(
 
 
 @triton.jit
-def _top_k_top_p_gumbel_stage2_kernel(
+def _merge_top_k_candidates(
     candidate_ids_ptr,
     candidate_logits_ptr,
-    req_pool_indices_ptr,
-    temperature_pool_ptr,
-    top_k_pool_ptr,
-    top_p_pool_ptr,
-    min_p_pool_ptr,
-    seed_pool_ptr,
-    offsets_pool_ptr,
-    out_ptr,
-    row_accept_ptr,
-    verify_candidates_ptr,
-    slot_ptr,
-    pos_ptr,
-    q_ptr,
-    q_ids_ptr,
+    row,
+    top_k,
     candidate_row_stride: tl.constexpr,
     num_blocks: tl.constexpr,
-    vocab_size: tl.constexpr,
     TOPK_PAD: tl.constexpr,
     NUM_BLOCKS_PAD: tl.constexpr,
-    NUM_TOKENS_PER_REQ: tl.constexpr,
-    HAS_DRAFT_Q: tl.constexpr,
-    verify_candidates_row_stride: tl.constexpr,
-    verify_candidates_col_stride: tl.constexpr,
-    slot_pool_stride: tl.constexpr,
-    q_pool_stride: tl.constexpr,
-    q_slot_stride: tl.constexpr,
-    NUM_CANDIDATES: tl.constexpr,
-    K_PAD: tl.constexpr,
-    COIN_SALT: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    req_row = row // NUM_TOKENS_PER_REQ
-    spec_pos = row - req_row * NUM_TOKENS_PER_REQ
-    pool_idx = tl.load(req_pool_indices_ptr + req_row)
-
-    temperature = tl.maximum(
-        tl.load(temperature_pool_ptr + pool_idx).to(tl.float32), 1.0e-20
-    )
-    top_k = tl.load(top_k_pool_ptr + pool_idx)
-    top_k = tl.minimum(tl.maximum(top_k, 1), vocab_size)
-    top_p = tl.load(top_p_pool_ptr + pool_idx).to(tl.float32)
-    min_p_log_threshold = tl.full((), float("-inf"), tl.float32)
-    if min_p_pool_ptr is not None:
-        min_p = tl.load(min_p_pool_ptr + pool_idx).to(tl.float32)
-        min_p_log_threshold = tl.log(tl.maximum(min_p, 1.0e-20))
-
-    seed = tl.load(seed_pool_ptr + pool_idx).to(tl.int64)
-    offset = tl.load(offsets_pool_ptr + pool_idx).to(tl.int64) + spec_pos
-    gumbel_seed = tl.randint(seed, offset)
-
+    """A row's best ``min(top_k, TOPK_PAD)`` (logits, ids) from the stage-1
+    per-block lists, sorted by logit then lowest id; ``-inf`` and int32 max
+    past them."""
     rank_offsets = tl.arange(0, TOPK_PAD)
     block_offsets = tl.arange(0, NUM_BLOCKS_PAD)
     block_mask = block_offsets < num_blocks
@@ -436,6 +396,75 @@ def _top_k_top_p_gumbel_stage2_kernel(
             top_logits = tl.where(rank_offsets == rank, best_logit, top_logits)
             top_ids = tl.where(rank_offsets == rank, best_id, top_ids)
             block_cursors += tl.where(block_offsets == best_block, 1, 0)
+
+    return top_logits, top_ids
+
+
+@triton.jit
+def _top_k_top_p_gumbel_stage2_kernel(
+    candidate_ids_ptr,
+    candidate_logits_ptr,
+    req_pool_indices_ptr,
+    temperature_pool_ptr,
+    top_k_pool_ptr,
+    top_p_pool_ptr,
+    min_p_pool_ptr,
+    seed_pool_ptr,
+    offsets_pool_ptr,
+    out_ptr,
+    row_accept_ptr,
+    verify_candidates_ptr,
+    slot_ptr,
+    pos_ptr,
+    q_ptr,
+    q_ids_ptr,
+    candidate_row_stride: tl.constexpr,
+    num_blocks: tl.constexpr,
+    vocab_size: tl.constexpr,
+    TOPK_PAD: tl.constexpr,
+    NUM_BLOCKS_PAD: tl.constexpr,
+    NUM_TOKENS_PER_REQ: tl.constexpr,
+    HAS_DRAFT_Q: tl.constexpr,
+    verify_candidates_row_stride: tl.constexpr,
+    verify_candidates_col_stride: tl.constexpr,
+    slot_pool_stride: tl.constexpr,
+    q_pool_stride: tl.constexpr,
+    q_slot_stride: tl.constexpr,
+    NUM_CANDIDATES: tl.constexpr,
+    K_PAD: tl.constexpr,
+    COIN_SALT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    req_row = row // NUM_TOKENS_PER_REQ
+    spec_pos = row - req_row * NUM_TOKENS_PER_REQ
+    pool_idx = tl.load(req_pool_indices_ptr + req_row)
+
+    temperature = tl.maximum(
+        tl.load(temperature_pool_ptr + pool_idx).to(tl.float32), 1.0e-20
+    )
+    top_k = tl.load(top_k_pool_ptr + pool_idx)
+    top_k = tl.minimum(tl.maximum(top_k, 1), vocab_size)
+    top_p = tl.load(top_p_pool_ptr + pool_idx).to(tl.float32)
+    min_p_log_threshold = tl.full((), float("-inf"), tl.float32)
+    if min_p_pool_ptr is not None:
+        min_p = tl.load(min_p_pool_ptr + pool_idx).to(tl.float32)
+        min_p_log_threshold = tl.log(tl.maximum(min_p, 1.0e-20))
+
+    seed = tl.load(seed_pool_ptr + pool_idx).to(tl.int64)
+    offset = tl.load(offsets_pool_ptr + pool_idx).to(tl.int64) + spec_pos
+    gumbel_seed = tl.randint(seed, offset)
+
+    rank_offsets = tl.arange(0, TOPK_PAD)
+    top_logits, top_ids = _merge_top_k_candidates(
+        candidate_ids_ptr,
+        candidate_logits_ptr,
+        row,
+        top_k,
+        candidate_row_stride,
+        num_blocks,
+        TOPK_PAD,
+        NUM_BLOCKS_PAD,
+    )
 
     scaled_logits = top_logits / temperature
     max_logit = tl.max(scaled_logits, axis=0)
