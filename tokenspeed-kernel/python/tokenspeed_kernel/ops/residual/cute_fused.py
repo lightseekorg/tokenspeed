@@ -252,9 +252,6 @@ def _epilogue_threads(token_tile: int, down_token_parts: int) -> int:
     )
 
 
-_RG_OVERRIDE = {}
-
-
 def _reduction_groups(hc_count: int, hidden_size: int, lowrank: int) -> int:
     return 16 if lowrank > 6 * 64 and hc_count * hidden_size >= 4 * lowrank else 1
 
@@ -729,7 +726,7 @@ def _model_tactic(
         n = 96 if rows <= 96 else 128 if rows <= 128 else 192 if rows <= 192 else 256
         stages = 8 if n == 96 else 6 if n == 128 else 4
     if hc_count == 4 and hidden_size == 8192 and lowrank == 1024 and 16 < rows <= 24:
-        # A finite24-token bucket avoids the eight padded rows ofN32.
+        # A finite 24-token bucket avoids the eight padded rows of N32.
         n = 24
     pipes, _, _ = _local_pipeline_parameters(n, hc_count, hidden_size, lowrank)
     if reduction_groups > 1:
